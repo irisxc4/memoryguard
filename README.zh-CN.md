@@ -33,16 +33,24 @@ Agent 写入记忆
 
 ### 安装
 
+**一行安装（推荐）：**
+
+```bash
+pip install git+https://github.com/irisxc4/memoryguard.git
+```
+
+带 GUI 桌面窗口（可选）：
+
+```bash
+pip install "git+https://github.com/irisxc4/memoryguard.git#egg=memoryguard[gui]"
+```
+
+**从源码安装：**
+
 ```bash
 git clone https://github.com/irisxc4/memoryguard.git
 cd memoryguard
 pip install -e .
-```
-
-或直接用 PYTHONPATH，无需安装：
-
-```bash
-export PYTHONPATH="/path/to/memoryguard/src:$PYTHONPATH"
 ```
 
 验证安装：

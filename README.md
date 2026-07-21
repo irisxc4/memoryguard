@@ -34,16 +34,24 @@ GUI 事后治理——无需手动批准每次写入。）
 
 ### Install
 
+**One-line install (recommended):**
+
+```bash
+pip install git+https://github.com/irisxc4/memoryguard.git
+```
+
+With GUI support (optional, for desktop window):
+
+```bash
+pip install "git+https://github.com/irisxc4/memoryguard.git#egg=memoryguard[gui]"
+```
+
+**Or from source:**
+
 ```bash
 git clone https://github.com/irisxc4/memoryguard.git
 cd memoryguard
 pip install -e .
-```
-
-Or set `PYTHONPATH` directly without installing:
-
-```bash
-export PYTHONPATH="/path/to/memoryguard/src:$PYTHONPATH"
 ```
 
 Verify the installation:
