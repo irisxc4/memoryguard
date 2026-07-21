@@ -2,7 +2,7 @@
 
 > Local-first MCP memory backend and governance console for coding agents.
 >
-> 本地优先的 MCP 记忆后端与治理台，面向编程 Agent。
+> 本地优先的 MCP 记忆后端与治理台，面向编程 Agent。([中文文档](README.zh-CN.md))
 
 MemoryGuard lets multiple coding agents write to one shared memory layer, then
 automatically organizes, quarantines, supersedes, and rolls back memories —
@@ -35,7 +35,7 @@ GUI 事后治理——无需手动批准每次写入。）
 ### Install
 
 ```bash
-git clone https://github.com/<your-org>/memoryguard.git
+git clone https://github.com/irisxc4/memoryguard.git
 cd memoryguard
 pip install -e .
 ```
@@ -194,8 +194,8 @@ Agent writes memory
 
 | Tool | Description |
 |---|---|
-| `memoryguard_extract_memories` | Extract memory segments from a source file |
-| `memoryguard_discover_mcp_resources` | Scan user-configured MCP servers (read-only) |
+| `memoryguard_extract_memories` | Extract memory segments from a source file (read-only preview) |
+| `memoryguard_accept_candidates` | Accept extracted candidates and write to shared memory |
 
 ### Semantic & Provider
 
@@ -235,7 +235,7 @@ No. The MCP backend accepts writes and auto-organizes them. The GUI only
 governs the results afterward.
 
 **Is my memory uploaded anywhere?**
-No. All data stays in local JSONL files under `.memoryguard/`.
+No. All data stays in a local SQLite database under `.memoryguard/`.
 
 **Can I roll back changes?**
 Yes. All governance actions are versioned. You can restore, un-supersede, and
