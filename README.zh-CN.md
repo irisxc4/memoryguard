@@ -61,7 +61,26 @@ memoryguard doctor
 
 ### 配置你的 Agent
 
-MemoryGuard 自带 provider 适配器，自动写入 MCP 配置和指令文件。也可手动配置——见安装指南：
+**一行配置（自动写入 MCP 配置和指令文件）：**
+
+```bash
+# Claude Code
+memoryguard source add . && python -m memoryguard.provider_adapters install claude
+
+# Codex
+memoryguard source add . && python -m memoryguard.provider_adapters install codex
+
+# Cursor
+memoryguard source add . && python -m memoryguard.provider_adapters install cursor
+```
+
+或直接在 Agent 里调 MCP 工具：
+
+```
+memoryguard_provider_install(provider="claude")
+```
+
+**手动配置** - 见安装指南：
 
 - [Claude Code](docs/install-claude-code.md)
 - [Codex](docs/install-codex.md)

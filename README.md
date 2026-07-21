@@ -62,8 +62,26 @@ memoryguard doctor
 
 ### Configure your Agent
 
-MemoryGuard ships provider adapters that write the MCP config and instruction
-file for you. You can also configure manually — see the install guides:
+**One-line setup (auto-writes MCP config + instruction file):**
+
+```bash
+# Claude Code
+memoryguard source add . && python -m memoryguard.provider_adapters install claude
+
+# Codex
+memoryguard source add . && python -m memoryguard.provider_adapters install codex
+
+# Cursor
+memoryguard source add . && python -m memoryguard.provider_adapters install cursor
+```
+
+Or use the MCP tool directly from your agent:
+
+```
+memoryguard_provider_install(provider="claude")
+```
+
+**Manual config** - see the install guides for details:
 
 - [Claude Code](docs/install-claude-code.md)
 - [Codex](docs/install-codex.md)
