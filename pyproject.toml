@@ -1,22 +1,29 @@
 [project]
-name = "memoryguard"
+name = "agent-memguard"
 version = "0.1.0"
-description = "Local-first Agent governance Skill + CLI + GUI"
+description = "Local-first MCP memory backend and governance console for coding agents"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "MemoryGuard Contributors" }]
-keywords = ["agent", "governance", "memory", "rag", "skill", "local-first"]
+keywords = ["agent", "governance", "memory", "mcp", "skill", "local-first", "claude", "cursor", "codex"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries",
 ]
 # 首期零运行时第三方依赖：纯标准库实现，保证无网络、无供应链风险。
-# 仅在确有需要时（如 HTML 模板引擎、YAML 解析）再按可选依赖引入。
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/irisxc4/memoryguard"
+Repository = "https://github.com/irisxc4/memoryguard"
+Documentation = "https://github.com/irisxc4/memoryguard#readme"
+Issues = "https://github.com/irisxc4/memoryguard/issues"
 
 [project.scripts]
 memoryguard = "memoryguard.cli:main"

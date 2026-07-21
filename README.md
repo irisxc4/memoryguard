@@ -37,13 +37,13 @@ GUI 事后治理——无需手动批准每次写入。）
 **One-line install (recommended):**
 
 ```bash
-pip install git+https://github.com/irisxc4/memoryguard.git
+pip install agent-memguard
 ```
 
 With GUI support (optional, for desktop window):
 
 ```bash
-pip install "git+https://github.com/irisxc4/memoryguard.git#egg=memoryguard[gui]"
+pip install "agent-memguard[gui]"
 ```
 
 **Or from source:**

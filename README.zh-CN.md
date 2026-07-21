@@ -36,13 +36,13 @@ Agent 写入记忆
 **一行安装（推荐）：**
 
 ```bash
-pip install git+https://github.com/irisxc4/memoryguard.git
+pip install agent-memguard
 ```
 
 带 GUI 桌面窗口（可选）：
 
 ```bash
-pip install "git+https://github.com/irisxc4/memoryguard.git#egg=memoryguard[gui]"
+pip install "agent-memguard[gui]"
 ```
 
 **从源码安装：**
