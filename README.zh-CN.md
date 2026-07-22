@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hero-governance-console.svg" alt="MemoryGuard 治理台：已整理的共享记忆、覆盖关系和版本回滚历史" width="960" />
+  <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard 治理台：已整理的共享记忆、覆盖关系和版本回滚历史" width="960" />
 </p>
 
 <h1 align="center">MemoryGuard</h1>
@@ -42,7 +42,7 @@ MemoryGuard 是本地的控制层，位于编程 Agent 与其共享记忆之间�
 ## 看看治理闭环
 
 <p align="center">
-  <img src="docs/assets/write-organize-rollback.svg" alt="演示：Agent 写入重复记忆，MemoryGuard 覆盖过期版本，操作者再恢复到先前版本" width="900" />
+  <img src="docs/assets/write-organize-rollback.png" alt="演示：Agent 写入重复记忆，MemoryGuard 覆盖过期版本，操作者再恢复到先前版本" width="900" />
 </p>
 
 ```text
@@ -94,7 +94,7 @@ pip install "agent-memguard[gui]"
 ## 你能治理什么
 
 <p align="center">
-  <img src="docs/assets/governance-evidence.svg" alt="MemoryGuard 的冲突、敏感内容隔离、覆盖链与版本历史证据视图" width="900" />
+  <img src="docs/assets/governance-evidence.png" alt="MemoryGuard 的冲突、敏感内容隔离、覆盖链与版本历史证据视图" width="900" />
 </p>
 
 | 信号 | 你可以做什么 |
