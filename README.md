@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
+  <img src="docs/assets/hero-governance-console.svg" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
 </p>
 
 <h1 align="center">MemoryGuard</h1>
@@ -42,7 +42,7 @@ MemoryGuard is the local control layer between your coding agents and their shar
 ## See the governance loop
 
 <p align="center">
-  <img src="docs/assets/write-organize-rollback.gif" alt="A MemoryGuard demo: an agent writes a duplicate memory, MemoryGuard supersedes the stale version, then the operator restores a previous version" width="900" />
+  <img src="docs/assets/write-organize-rollback.svg" alt="A MemoryGuard demo: an agent writes a duplicate memory, MemoryGuard supersedes the stale version, then the operator restores a previous version" width="900" />
 </p>
 
 ```text
@@ -94,7 +94,7 @@ For explicit configuration and provider-specific behavior, see the [Claude Code]
 ## What you can govern
 
 <p align="center">
-  <img src="docs/assets/governance-evidence.png" alt="MemoryGuard evidence views for a conflict, a quarantined secret, a supersede chain, and version history" width="900" />
+  <img src="docs/assets/governance-evidence.svg" alt="MemoryGuard evidence views for a conflict, a quarantined secret, a supersede chain, and version history" width="900" />
 </p>
 
 | Signal | What you can do |
