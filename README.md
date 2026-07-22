@@ -1,68 +1,69 @@
-# MemoryGuard
+<p align="center">
+  <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
+</p>
 
-> Local-first MCP memory backend and governance console for coding agents.
+<h1 align="center">MemoryGuard</h1>
+
+<p align="center">
+  <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
+  A local-first MCP memory layer that organizes writes automatically and keeps every governance decision reversible.
+</p>
+
+<p align="center">
+  <a href="https://pypi.org/project/agent-memguard/"><img src="https://img.shields.io/pypi/v/agent-memguard.svg?label=PyPI" alt="PyPI version" /></a>
+  <a href="https://github.com/irisxc4/memoryguard/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10 or newer" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2ea44f" alt="MIT license" /></a>
+  <a href="README.zh-CN.md">中文文档</a>
+</p>
+
+> Your agents can write freely. MemoryGuard classifies, deduplicates, supersedes, quarantines, and compresses shared memory on every write - then lets you inspect, correct, or roll back the result afterward.
 >
-> 本地优先的 MCP 记忆后端与治理台，面向编程 Agent。([中文文档](README.zh-CN.md))
+> **No account. No server. No telemetry. Your memory stays local.**
 
-MemoryGuard lets multiple coding agents write to one shared memory layer, then
-automatically organizes, quarantines, supersedes, and rolls back memories —
-without turning the GUI into an approval queue.
+<p align="center">
+  <a href="#install-in-60-seconds">Install in 60 seconds</a> ·
+  <a href="#see-the-governance-loop">See the governance loop</a> ·
+  <a href="#what-memoryguard-is-and-isnt">What it is and isn't</a>
+</p>
 
-## What It Does
+## Why MemoryGuard
 
-MemoryGuard provides a local MCP stdio memory backend that coding agents
-(Claude Code, Codex, Cursor, and others) can write to using the same memory
-mechanisms they already use. Every write is auto-organized — classified,
-deduplicated, superseded, quarantined, or compressed — so the shared memory
-stays clean. A governance console lets you observe, edit, merge, roll back,
-and resolve conflicts after the fact, not by approving every write.
+Persistent memory solves only half the problem. When several coding agents write into the same context, memory can become duplicated, stale, contradictory, or unsafe to reuse.
 
-（中文：MemoryGuard 提供本地 MCP 记忆后端，Agent 按原有方式写入，系统自动整理，
-GUI 事后治理——无需手动批准每次写入。）
+MemoryGuard is the local control layer between your coding agents and their shared memory:
 
-## Features
+| Instead of | MemoryGuard gives you |
+|---|---|
+| A growing pile of unreviewed notes | Write-time classification, deduplication, superseding, conflict detection, quarantine, derivation, and compression |
+| Approving every agent write by hand | Automatic writes; human review only when you need it |
+| Treating an overwrite as permanent | History, evidence, supersede chains, and rollback |
+| Sending project context to another service | A local MCP stdio server with local SQLite storage |
 
-- **MCP memory backend** — 6 core tools: read / search / write / update / delete / status
-- **Auto-organize** — classify / dedup / supersede / conflict / quarantine / derive / compress
-- **Multi-agent shared memory groups** — multiple agents write to one governed memory
-- **GUI governance console** — observe, edit, merge, lock, restore, roll back (not an approval queue)
-- **Provider adapters** — one-command setup for Claude Code / Codex / Cursor
-- **Rollback and version history** — all governance actions are versioned and reversible
-- **No account, no server, no telemetry** — everything stays local
+## See the governance loop
 
-## Quick Start
+<p align="center">
+  <img src="docs/assets/write-organize-rollback.gif" alt="A MemoryGuard demo: an agent writes a duplicate memory, MemoryGuard supersedes the stale version, then the operator restores a previous version" width="900" />
+</p>
 
-### Install
+```text
+Agent writes memory
+  -> MemoryGuard MCP write
+  -> auto-organize
+      classify · deduplicate · supersede · detect conflict · quarantine · compress
+  -> active shared memory
+  -> governance console
+      inspect · correct · merge · lock · restore · roll back
+```
 
-**One-line install (recommended):**
+The console is **not an approval queue**. Agents keep moving; you govern the outcome with evidence when it matters.
+
+## Install in 60 seconds
 
 ```bash
 pip install agent-memguard
 ```
 
-With GUI support (optional, for desktop window):
-
-```bash
-pip install "agent-memguard[gui]"
-```
-
-**Or from source:**
-
-```bash
-git clone https://github.com/irisxc4/memoryguard.git
-cd memoryguard
-pip install -e .
-```
-
-Verify the installation:
-
-```bash
-memoryguard doctor
-```
-
-### Configure your Agent
-
-**One-line setup (auto-writes MCP config + instruction file):**
+Choose the coding agent you use. Each command adds MemoryGuard as an MCP server and writes its instruction file.
 
 ```bash
 # Claude Code
@@ -75,212 +76,113 @@ memoryguard source add . && python -m memoryguard.provider_adapters install code
 memoryguard source add . && python -m memoryguard.provider_adapters install cursor
 ```
 
-Or use the MCP tool directly from your agent:
-
-```
-memoryguard_provider_install(provider="claude")
-```
-
-**Manual config** - see the install guides for details:
-
-- [Claude Code](docs/install-claude-code.md)
-- [Codex](docs/install-codex.md)
-- [Cursor](docs/install-cursor.md)
-
-<details>
-<summary>Manual MCP config (all agents use the same server)</summary>
-
-**Claude Code** — `.mcp.json` (project root):
-
-```json
-{
-  "mcpServers": {
-    "memoryguard": {
-      "command": "python",
-      "args": ["-m", "memoryguard.mcp_server"]
-    }
-  }
-}
-```
-
-**Codex** — `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.memoryguard]
-command = "python"
-args = ["-m", "memoryguard.mcp_server"]
-```
-
-**Cursor** — `~/.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "memoryguard": {
-      "command": "python",
-      "args": ["-m", "memoryguard.mcp_server"]
-    }
-  }
-}
-```
-
-</details>
-
-### Use
+Then restart your agent and verify the environment:
 
 ```bash
-memoryguard doctor            # diagnose installation and environment
-memoryguard mcp-status        # query MCP memory backend status
-python -m memoryguard.mcp_server  # start the MCP stdio server (run by your agent)
-memoryguard audit .           # read-only workspace scan, generate report
-memoryguard open .            # open the latest report
+memoryguard doctor
+memoryguard mcp-status
 ```
 
-Once your agent is configured, it writes memories through the
-`memoryguard_memory_write` MCP tool. MemoryGuard auto-organizes every write.
-Open the GUI to observe and govern the results.
+Need a desktop window for the governance console?
 
-## How It Works
+```bash
+pip install "agent-memguard[gui]"
+```
 
-MemoryGuard has three layers:
+For explicit configuration and provider-specific behavior, see the [Claude Code](docs/install-claude-code.md), [Codex](docs/install-codex.md), and [Cursor](docs/install-cursor.md) guides.
 
-| Layer | Role |
+## What you can govern
+
+<p align="center">
+  <img src="docs/assets/governance-evidence.png" alt="MemoryGuard evidence views for a conflict, a quarantined secret, a supersede chain, and version history" width="900" />
+</p>
+
+| Signal | What you can do |
 |---|---|
-| **Data layer** | Agent native memory, files, external MCP, documents — provides raw evidence, no governance |
-| **Memory layer** | MemoryGuard MCP shared memory backend — the single shared source of truth; agents write here; auto-organize runs on every write |
-| **Governance layer** | GUI + CLI — observe, edit, merge, lock, restore, roll back after the fact |
+| Duplicate or stale memory | See the supersede chain and restore the prior version if needed |
+| Conflicting memories | Surface the conflict and resolve it deliberately |
+| Secrets, tokens, or credentials | Quarantine them instead of leaving them in active shared memory |
+| A wrong governance decision | Inspect its history and roll the shared memory back to a version snapshot |
+| Multiple coding agents | Bind agents to a governed shared-memory group |
 
-```
-Agent writes memory
-  → memoryguard_memory_write (MCP tool)
-  → raw event
-  → auto-organize (classify / dedup / supersede / conflict / quarantine / derive / compress)
-  → active shared memory
-  → GUI governance (observe / correct / override / roll back)
-```
+## What MemoryGuard is - and isn't
 
-## Commands
+MemoryGuard is a **local MCP memory backend and governance console** for coding agents. It provides a shared source of truth and organizes writes as they arrive.
+
+It is not a cloud service, an account system, or a human gate that blocks every memory write. It also does not pretend every agent's native memory can be disabled: provider support is reported as redirected, observed, or unsupported where appropriate.
+
+## Architecture
+
+| Layer | Responsibility |
+|---|---|
+| **Evidence layer** | Agent-native memory, files, documents, and external MCP descriptors; raw inputs, not governance truth |
+| **Memory layer** | MemoryGuard's local MCP shared-memory backend; the governed shared source of truth |
+| **Governance layer** | GUI and CLI for observation, evidence, corrections, and reversible changes |
+
+## Core surfaces
+
+| Surface | Use it for |
+|---|---|
+| MCP memory backend | Read, search, write, update, delete, and inspect shared-memory status |
+| Auto-organizer | Classify, deduplicate, supersede, detect conflicts, quarantine, derive, and compress on write |
+| Governance console | Review raw writes, conflicts, quarantine, supersede chains, and versions |
+| Provider adapters | Set up Claude Code, Codex, or Cursor from one command |
+| CLI | Audit local sources, manage authorized inputs, inspect reports, and manage memory builds/releases |
+
+The complete MCP tool reference and CLI command reference are below for evaluation and integration work.
+
+<details>
+<summary><strong>CLI commands</strong></summary>
 
 | Command | Description |
 |---|---|
-| `audit [path]` | Read-only scan, generate report |
-| `open [path]` | Open latest report in a window |
+| `audit [path]` | Read-only scan; generate a report |
+| `open [path]` | Open the latest report in a window |
 | `explain <finding_id>` | Explain a finding's evidence and risk |
-| `plan <finding_ids...>` | Generate minimal fix plan (no write) |
-| `apply <plan_id>` | Apply a plan: backup + patch + rescan |
+| `plan <finding_ids...>` | Generate a minimal fix plan without writing |
+| `apply <plan_id>` | Apply a plan: backup, patch, and rescan |
 | `verify` | Rescan and compare before/after |
 | `undo <change_id>` | Restore from backup and re-verify |
-| `source <action>` | Manage authorized sources (list / add / remove / preview) |
-| `scan` | Read-only scan, build coverage ledger |
-| `import <action> <bundle>` | Offline import bundle (preview / create) |
-| `memory <action>` | Memory build & release (build-plan / build-apply / verify / rollback) |
+| `source <action>` | Manage authorized sources |
+| `scan` | Read-only scan and coverage ledger |
+| `import <action> <bundle>` | Preview or create an offline import bundle |
+| `memory <action>` | Memory build, verify, and release rollback workflows |
 | `doctor` | Diagnose installation and environment |
-| `mcp-status` | Query MCP memory backend status |
+| `mcp-status` | Inspect MCP shared-memory status |
 
-## MCP Tools
+</details>
 
-### Memory Backend (6 core tools)
+<details>
+<summary><strong>MCP tools</strong></summary>
 
-| Tool | Description |
+| Group | Tools |
 |---|---|
-| `memoryguard_memory_read` | Read a single memory record by ID |
-| `memoryguard_memory_search` | Search memories by query, kind, or status |
-| `memoryguard_memory_write` | Write a new memory; auto-organizes on write |
-| `memoryguard_memory_update` | Update a memory (body / kind / status) |
-| `memoryguard_memory_delete` | Soft-delete a memory |
-| `memoryguard_memory_status` | Get shared memory group status |
+| Memory backend | `memoryguard_memory_read`, `memoryguard_memory_search`, `memoryguard_memory_write`, `memoryguard_memory_update`, `memoryguard_memory_delete`, `memoryguard_memory_status` |
+| Audit and scan | `memoryguard_audit`, `memoryguard_explain`, `memoryguard_list_sources`, `memoryguard_scan_summary`, `memoryguard_neuron_graph`, `memoryguard_import_preview`, `memoryguard_build_plan` |
+| Agent binding | `memoryguard_binding_create`, `memoryguard_binding_list` |
+| External MCP | `memoryguard_external_mcp_list`, `memoryguard_external_mcp_import` |
+| Document extraction | `memoryguard_extract_memories`, `memoryguard_accept_candidates` |
+| Semantic and provider | `memoryguard_semantic_check`, `memoryguard_provider_install` |
 
-### Audit & Scan
+</details>
 
-| Tool | Description |
-|---|---|
-| `memoryguard_audit` | Read-only workspace scan |
-| `memoryguard_explain` | Explain a finding's evidence and risk |
-| `memoryguard_list_sources` | List authorized sources |
-| `memoryguard_scan_summary` | Scan + coverage ledger |
-| `memoryguard_neuron_graph` | Read neuron graph projection |
-| `memoryguard_import_preview` | Preview an import bundle |
-| `memoryguard_build_plan` | Generate a memory build plan (no write) |
+## Privacy and safety boundaries
 
-### Agent Binding
-
-| Tool | Description |
-|---|---|
-| `memoryguard_binding_create` | Bind an agent to a share group |
-| `memoryguard_binding_list` | List agent bindings |
-
-### External MCP
-
-| Tool | Description |
-|---|---|
-| `memoryguard_external_mcp_list` | List imported external MCP descriptors |
-| `memoryguard_external_mcp_import` | Import an external MCP descriptor (L0–L4 classification) |
-
-### Document & Discovery
-
-| Tool | Description |
-|---|---|
-| `memoryguard_extract_memories` | Extract memory segments from a source file (read-only preview) |
-| `memoryguard_accept_candidates` | Accept extracted candidates and write to shared memory |
-
-### Semantic & Provider
-
-| Tool | Description |
-|---|---|
-| `memoryguard_semantic_check` | Check text for semantic duplicates / conflicts |
-| `memoryguard_provider_install` | Install provider adapter (Claude / Codex / Cursor) |
-
-## Governance GUI
-
-The GUI is a **governance console, not an approval queue**. Agents write
-memories through MCP; MemoryGuard auto-organizes them. The GUI then shows you:
-
-- Recent raw writes from agents
-- Auto-organize results (classify / dedup / compress)
-- Supersede chains (what was covered and why)
-- Conflict queue (memories that need human arbitration)
-- Quarantine queue (secrets / tokens / credentials isolated automatically)
-- Derived memories (procedures / preferences from repeated behavior)
-
-Governance actions: **edit, merge, split, lock, restore, delete, roll back**.
-Every action is versioned and reversible.
-
-## FAQ
-
-**Does MemoryGuard require a server or account?**
-No. It runs as a local MCP stdio server. No account, no cloud, no telemetry.
-
-**Does it fully replace my agent's native memory?**
-MemoryGuard redirects writes to the MCP backend where the agent supports it.
-Some agents cannot fully disable native memory — MemoryGuard uses a
-redirected / observed / unsupported classification instead of pretending
-everything can be turned off.
-
-**Does the GUI approve every write?**
-No. The MCP backend accepts writes and auto-organizes them. The GUI only
-governs the results afterward.
-
-**Is my memory uploaded anywhere?**
-No. All data stays in a local SQLite database under `.memoryguard/`.
-
-**Can I roll back changes?**
-Yes. All governance actions are versioned. You can restore, un-supersede, and
-roll back to any previous version.
+- MemoryGuard runs as a local MCP stdio server; it requires no account, remote server, or telemetry.
+- Shared memory is stored locally in SQLite under `.memoryguard/`.
+- Source scanning is read-only by default. Changes use explicit plans, backups, rescans, and undo paths.
+- A quarantined memory is deliberately kept out of active shared memory until you decide what to do with it.
 
 ## Roadmap
 
-- **Now (open-source core):** local MCP memory backend + auto-organize + GUI governance + provider adapters + rollback. This repository.
-- **Later:** enhanced governance features (decay, derivation, governance reports). No timeline committed.
-- **Later:** team and enterprise features. No timeline committed.
-
-We do not promise dates for future features. The open-source core is designed
-to be fully usable on its own.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+- **Now:** local MCP backend, auto-organization, governance console, provider adapters, and rollback.
+- **Later:** enhanced governance signals such as decay, derivation, and governance reports. No committed date.
+- **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). By submitting a PR you agree to the
-[CLA](CLA.md).
+Issues and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md); by submitting a pull request, you agree to the [CLA](CLA.md).
+
+## License
+
+[MIT](LICENSE)
