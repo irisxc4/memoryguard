@@ -2,9 +2,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml setup.py ./
+COPY pyproject.toml setup.py README.md LICENSE ./
 COPY src/ ./src/
-COPY README.md ./
 
 RUN pip install --no-cache-dir -e .
 

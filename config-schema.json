@@ -1,0 +1,1 @@
+{"type":"object","properties":{"workspace":{"type":"string","default":".","description":"Workspace path for memory storage"}},"required":[]}

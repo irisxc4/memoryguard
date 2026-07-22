@@ -13,6 +13,9 @@ startCommand:
   args:
     - -m
     - memoryguard.mcp_server
+build:
+  dockerfile: Dockerfile
+  dockerBuildPath: .
 displayName: MemoryGuard
 description: >
   Local-first MCP memory backend and governance console for coding agents.
