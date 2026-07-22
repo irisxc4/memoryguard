@@ -3,8 +3,12 @@ startCommand:
   type: stdio
   configSchema:
     type: object
-    properties: {}
-    description: MemoryGuard MCP server configuration
+    properties:
+      workspace:
+        type: string
+        default: "."
+        description: Workspace path for memory storage
+    required: []
   command: python
   args:
     - -m
