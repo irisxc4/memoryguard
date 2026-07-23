@@ -467,6 +467,9 @@ class SourceRegistry:
     def list_sources(self) -> list[SourceRoot]:
         return [r for r in self.roots.values() if r.enabled]
 
+    def list_all_sources(self) -> list[SourceRoot]:
+        return list(self.roots.values())
+
     def get(self, root_id: str) -> SourceRoot | None:
         return self.roots.get(root_id)
 
@@ -504,6 +507,14 @@ class SourceRegistry:
             self._save()
             return True
         return False
+
+    def set_enabled(self, root_id: str, enabled: bool) -> SourceRoot | None:
+        root = self.roots.get(root_id)
+        if not root:
+            return None
+        root.enabled = bool(enabled)
+        self._save()
+        return root
 
     def preview(self, path: str, root_type: SourceRootType) -> dict[str, Any]:
         """预览：不写配置，返回预计文件数和排除规则。"""

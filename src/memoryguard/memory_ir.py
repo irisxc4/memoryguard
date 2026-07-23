@@ -161,6 +161,40 @@ def _extract_title(segment_text: str) -> str:
     return segment_text[:40].replace("\n", " ").strip()
 
 
+def _looks_english_text(text: str) -> bool:
+    if not text:
+        return False
+    latin = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return latin >= 12 and latin > cjk * 2
+
+
+def _compact_english_snippet(text: str, limit: int = 160) -> str:
+    text = " ".join(str(text or "").replace("\n", " ").split())
+    replacements = {
+        "memory": "记忆", "project": "项目", "preference": "偏好", "rule": "规则",
+        "workflow": "流程", "procedure": "流程", "constraint": "约束", "fact": "事实",
+        "use": "使用", "should": "应", "must": "必须", "avoid": "避免",
+        "file": "文件", "files": "文件", "folder": "文件夹", "source": "来源", "truth": "事实依据",
+        "agent": "智能体", "global": "全局", "local": "本地", "compact": "简洁",
+    }
+    words = text[:limit].split()
+    mapped = [replacements.get(w.strip(".,:;()[]{}\"'").lower(), w) for w in words[:36]]
+    return " ".join(mapped).strip()
+
+
+def _localize_memory_text(title: str, body: str, kind: MemoryKind) -> tuple[str, str, str, str, str]:
+    if not _looks_english_text(title + " " + body):
+        return title, body, title, body, "zh"
+    kind_labels = {
+        MemoryKind.FACT: "事实", MemoryKind.PREFERENCE: "偏好", MemoryKind.PROJECT: "项目",
+        MemoryKind.EPISODE: "事件", MemoryKind.PROCEDURE: "流程", MemoryKind.CORRECTION: "纠错",
+    }
+    zh_title = f"{kind_labels.get(kind, '记忆')}：{_compact_english_snippet(title or body, 72)}"
+    zh_body = f"中文整理：{_compact_english_snippet(body or title, 420)}"
+    return zh_title, zh_body, title, body, "zh"
+
+
 @dataclass
 class MemoryIR:
     """Memory IR 容器：所有 MemoryRecord + DuplicateGroup + DecisionEvent。"""
@@ -188,6 +222,9 @@ class MemoryIR:
             records.append(MemoryRecord(
                 memory_id=r["memory_id"], kind=MemoryKind(r["kind"]),
                 title=r["title"], body=r["body"], scope=r.get("scope", "project"),
+                original_title=r.get("original_title", ""),
+                original_body=r.get("original_body", ""),
+                display_language=r.get("display_language", "zh"),
                 confidence=r.get("confidence", 0.5), provenance=provs,
                 status=MemoryStatus(r.get("status", "candidate")),
                 completeness=Completeness(r.get("completeness", "verifiable")),
@@ -219,9 +256,43 @@ class MemoryNormalizer:
         self.ir_path = self.mg_dir / "ir" / "current.json"
         self.decisions_path = self.mg_dir / "ir" / "decisions.jsonl"
 
+    def ensure_localized(self, ir: MemoryIR) -> bool:
+        changed = False
+        for rec in ir.records:
+            if rec.original_body:
+                continue
+            title, body, original_title, original_body, display_language = _localize_memory_text(rec.title, rec.body, rec.kind)
+            if title != rec.title or body != rec.body or original_body != rec.body:
+                rec.title = title
+                rec.body = body
+                rec.original_title = original_title
+                rec.original_body = original_body
+                rec.display_language = display_language
+                changed = True
+        return changed
+
+    def filter_by_source_policies(self, ir: MemoryIR, snapshot: SourceSnapshot,
+                                  root_policies: dict[str, dict[str, str]] | None = None) -> bool:
+        object_to_root = {obj.source_object_id: obj.source_root_id for obj in snapshot.source_objects}
+        def allowed(rec: MemoryRecord) -> bool:
+            for prov in rec.provenance:
+                root_id = object_to_root.get(prov.source_object_id, "")
+                policy = (root_policies or {}).get(root_id, {})
+                if policy.get("source_category") in {"conversation_history", "runtime_evidence", "ignored_runtime_data"}:
+                    return False
+                if policy.get("ingestion_policy") in {"evidence_only", "govern_only", "ignore"}:
+                    return False
+            return True
+        before = len(ir.records)
+        ir.records = [rec for rec in ir.records if allowed(rec)]
+        valid_ids = {rec.memory_id for rec in ir.records}
+        ir.duplicate_groups = [g for g in ir.duplicate_groups if all(mid in valid_ids for mid in g.member_ids)]
+        return len(ir.records) != before
+
     def normalize(self, snapshot: SourceSnapshot,
                   duplicate_threshold: float = 0.75,
-                  root_map: dict[str, str] | None = None) -> MemoryIR:
+                  root_map: dict[str, str] | None = None,
+                  root_policies: dict[str, dict[str, str]] | None = None) -> MemoryIR:
         """从快照生成 Memory IR。
 
         v3.1 §1.3 P0：必须传入 root_map（root_id -> root.path），
@@ -230,8 +301,13 @@ class MemoryNormalizer:
         records: list[MemoryRecord] = []
         # v3.1 §1.3：扫描和规范化使用同一次稳定内容读取，前后哈希不一致标记 changed_during_scan
         for obj in snapshot.source_objects:
+            policy = (root_policies or {}).get(obj.source_root_id, {})
             if _is_instruction_or_skill(obj.relative_path):
-                continue  # Instruction/Skill 不进入 IR
+                continue
+            if policy.get("source_category") in {"conversation_history", "runtime_evidence", "ignored_runtime_data"}:
+                continue
+            if policy.get("ingestion_policy") in {"evidence_only", "govern_only", "ignore"}:
+                continue
             content = self._read_source_content(obj, root_map)
             if content is None:
                 continue
@@ -243,9 +319,10 @@ class MemoryNormalizer:
                 continue
             segments = _split_into_segments(content)
             for locator, text in segments:
-                title = _extract_title(text)
-                body = text
-                kind = _infer_kind(title, body)
+                original_title = _extract_title(text)
+                original_body = text
+                kind = _infer_kind(original_title, original_body)
+                title, body, stored_original_title, stored_original_body, display_language = _localize_memory_text(original_title, original_body, kind)
                 excerpt_hash = stable_hash(text)
                 memory_id = stable_hash(obj.source_object_id, locator, excerpt_hash)
                 prov = Provenance(
@@ -254,7 +331,9 @@ class MemoryNormalizer:
                 )
                 rec = MemoryRecord(
                     memory_id=memory_id, kind=kind, title=title, body=body,
-                    scope="project", confidence=0.5, provenance=[prov],
+                    scope="project", original_title=stored_original_title,
+                    original_body=stored_original_body, display_language=display_language,
+                    confidence=0.5, provenance=[prov],
                     status=MemoryStatus.CANDIDATE,
                     completeness=Completeness.VERIFIABLE,
                     created_at=_now_iso(),

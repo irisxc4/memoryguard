@@ -16,7 +16,10 @@
 from __future__ import annotations
 
 import http.server
+import os
 import socket
+import subprocess
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -56,8 +59,8 @@ def open_native_window(html_content: str, title: str = "MemoryGuard") -> int:
     webview.create_window(
         title=title,
         html=html_content,
-        width=1200,
-        height=800,
+        width=1440,
+        height=900,
         min_size=(800, 600),
     )
     webview.start()
@@ -68,6 +71,10 @@ def open_native_window(html_content: str, title: str = "MemoryGuard") -> int:
 # 2. localhost 浏览器窗口（降级路径）
 # ---------------------------------------------------------------------------
 
+import json as _json
+from urllib.parse import urlparse
+from .interactive import render_interactive_html
+
 
 def _find_free_port() -> int:
     """绑定 127.0.0.1 随机端口（spec §1.3 安全要求）。"""
@@ -76,31 +83,164 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def open_localhost_window(html_content: str, *, auto_open: bool = True) -> tuple[int, str]:
-    """启动临时本地 HTTP server，返回 (退出码, URL)。
+def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[int, str]:
+    """启动临时本地 HTTP server + JSON API，返回 (退出码, URL)。
 
-    退出码：0 成功，3 无法绑定。
-    阻塞调用：Ctrl+C 或 server.shutdown() 后返回。
+    安全加固：
+    - 无通配 CORS（同源 only）
+    - 会话令牌验证
+    - API 方法白名单
+    - 变更 API 走请求队列（沙箱模式）
     """
+    from .security import (
+        generate_session_token,
+        READONLY_API_METHODS,
+        MUTATION_API_METHODS,
+        ALL_ALLOWED_METHODS,
+        is_allowed_method,
+        is_mutation_method,
+        detect_sandbox_mode,
+        RequestQueue,
+    )
+
     port = _find_free_port()
     if port == 0:
         return 3, ""
 
-    html_bytes = html_content.encode("utf-8")
+    api = GovernanceApi(workspace)
+    session_token = generate_session_token()
+    is_sandbox = detect_sandbox_mode()
+    request_queue = RequestQueue(workspace)
+
+    # 将 session_token 注入 HTML
+    html = render_interactive_html()
+    html = html.replace(
+        "</head>",
+        f'<script>window.__MG_SESSION__="{session_token}";'
+        f'window.__MG_SANDBOX__={str(is_sandbox).lower()};</script></head>',
+    )
+    html_bytes = html.encode("utf-8")
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html_bytes)))
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html_bytes)))
+                self.end_headers()
+                self.wfile.write(html_bytes)
+            elif parsed.path == "/api/health":
+                self._json_response(200, {"ok": True, "sandbox": is_sandbox})
+            else:
+                self.send_error(404)
+
+        def do_POST(self):  # noqa: N802
+            parsed = urlparse(self.path)
+            if not parsed.path.startswith("/api/"):
+                self.send_error(404)
+                return
+            method = parsed.path[len("/api/"):]
+
+            # 验证会话令牌
+            token = self.headers.get("X-Session-Token", "")
+            if token != session_token:
+                self._json_response(403, {"error": "invalid_session_token"})
+                return
+
+            # 验证方法白名单
+            if not is_allowed_method(method):
+                self._json_response(501, {"error": f"unknown method: {method}"})
+                return
+
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                args = _json.loads(body.decode("utf-8")) if body else []
+            except Exception as e:
+                self.send_error(400, str(e))
+                return
+
+            # 特殊方法：请求队列管理
+            if method == "submit_request":
+                target_method = args[0] if args else ""
+                target_args = args[1] if len(args) > 1 else []
+                if not is_mutation_method(target_method):
+                    self._json_response(400, {"error": "not a mutation method"})
+                    return
+                req = request_queue.submit(target_method, target_args)
+                self._json_response(200, {"ok": True, "request": req.to_dict()})
+                return
+
+            if method == "get_request_status":
+                req_id = args[0] if args else ""
+                req = request_queue.get(req_id)
+                if req:
+                    self._json_response(200, req.to_dict())
+                else:
+                    self._json_response(404, {"error": "request not found"})
+                return
+
+            if method == "list_pending_requests":
+                pending = request_queue.list_pending()
+                self._json_response(200, {"requests": [r.to_dict() for r in pending]})
+                return
+
+            # 变更 API：沙箱模式下只创建请求
+            if is_mutation_method(method):
+                if is_sandbox:
+                    req = request_queue.submit(method, args)
+                    self._json_response(200, {
+                        "ok": True,
+                        "deferred": True,
+                        "request": req.to_dict(),
+                        "message": "请求已提交，等待桌面执行器确认",
+                    })
+                    return
+                # 非沙箱模式：直接执行，注入 confirmed=True
+                import inspect as _inspect
+                _fn = getattr(api, method, None)
+                if _fn and callable(_fn):
+                    _sig = _inspect.signature(_fn)
+                    _params = list(_sig.parameters.keys())
+                    if "confirmed" in _params:
+                        _cidx = _params.index("confirmed")
+                        args = list(args)
+                        while len(args) <= _cidx:
+                            args.append(_sig.parameters[_params[len(args)]].default)
+                        args[_cidx] = True
+
+            # 只读 API 或非沙箱变更：直接执行
+            fn = getattr(api, method, None)
+            if not callable(fn):
+                self._json_response(501, {"error": f"method not implemented: {method}"})
+                return
+            try:
+                result = fn(*args) if args else fn()
+                result = result if result is not None else {}
+                self._json_response(200, result)
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+
+        def _json_response(self, status: int, data: dict) -> None:
+            payload = _json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            # 无通配 CORS：同源 only
             self.end_headers()
-            self.wfile.write(html_bytes)
+            self.wfile.write(payload)
+
+        def do_OPTIONS(self):  # noqa: N802
+            # 同源 only，不需要 CORS 预检
+            self.send_error(405)
 
         def log_message(self, *args):  # 静默
             pass
 
     server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
     url = f"http://127.0.0.1:{port}/"
+    print(f"MemoryGuard GUI running at {url} (sandbox={is_sandbox})")
     if auto_open:
         try:
             webbrowser.open(url)
@@ -136,6 +276,100 @@ def open_report_window(html_content: str, *, title: str = "MemoryGuard") -> int:
 # 交互式治理面板（参考 merakagent Tab 布局，非平面报告）
 # ---------------------------------------------------------------------------
 
+# 敏感内容正则模式（用于 _mask_content）
+import re as _re
+
+_SENSITIVE_PATTERNS: list[tuple[str, _re.Pattern]] = [
+    ("aws_access_key", _re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("aws_secret_key", _re.compile(r'(?i)aws_secret_access_key["\']?\s*[:=]\s*["\']?[A-Za-z0-9/+=]{40}')),
+    ("generic_api_key", _re.compile(r'(?i)(api[_-]?key|apikey|token|secret|password|passwd|pwd)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
+    ("bearer_token", _re.compile(r'(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*')),
+    ("private_key", _re.compile(r'-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----')),
+    ("connection_string", _re.compile(r'(?i)(mongodb|postgres|postgresql|redis|amqp)://[^\s"\']+')),
+    ("jwt", _re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
+]
+
+# 隔离规则匹配的模式（与 SharedMemoryStore 隔离规则保持一致）
+_QUARANTINE_PATTERNS: list[tuple[str, _re.Pattern]] = [
+    ("aws_key", _re.compile(r'AKIA[0-9A-Z]{16}')),
+    ("private_key", _re.compile(r'-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----')),
+    ("api_key", _re.compile(r'(?i)(api[_-]?key|apikey)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
+    ("password", _re.compile(r'(?i)(password|passwd|pwd)["\']?\s*[:=]\s*["\']?[^\s"\']{8,}')),
+    ("token", _re.compile(r'(?i)(token|secret)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
+    ("bearer", _re.compile(r'(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*')),
+    ("connection_string", _re.compile(r'(?i)(mongodb|postgres|postgresql|redis|amqp)://[^\s"\']+')),
+    ("jwt", _re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
+]
+
+
+def _mask_content(content: str, max_len: int = 120) -> str:
+    """统一脱敏：先正则替换敏感模式，再截断，再掩码。
+
+    任何包含敏感模式的内容都会被完全掩码，不泄露原文。
+    """
+    if not content:
+        return ""
+    for pattern_name, pattern in _SENSITIVE_PATTERNS:
+        if pattern.search(content):
+            return "••••[REDACTED:" + pattern_name + "]••••"
+    return content[:max_len]
+
+
+def _mask_preview(content: str) -> str:
+    """隔离队列脱敏：前6 + 中间省略 + 后4。"""
+    if not content:
+        return ""
+    for pattern_name, pattern in _SENSITIVE_PATTERNS:
+        if pattern.search(content):
+            return "••••[REDACTED:" + pattern_name + "]••••"
+    if len(content) > 20:
+        return content[:6] + "••••••" + content[-4:]
+    return "••••"
+
+
+def _private_data_paths(instance) -> list[str]:
+    paths = [
+        Path(s.get("resolved_path", "")).resolve()
+        for s in instance.surfaces
+        if s.get("status") == "found"
+        and s.get("resolved_path")
+        and s.get("evidence_role") == "private_data_evidence"
+    ]
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for path in sorted(paths, key=lambda item: len(item.parts)):
+        key = str(path).casefold()
+        if key in seen:
+            continue
+        if any(root == path or root in path.parents for root in roots):
+            continue
+        roots.append(path)
+        seen.add(key)
+    return [str(path) for path in roots]
+
+
+def _found_surface_count(instance, evidence_role: str = "") -> int:
+    return sum(
+        1 for s in instance.surfaces
+        if s.get("status") == "found" and (not evidence_role or s.get("evidence_role") == evidence_role)
+    )
+
+
+def _support_level_from_capability(target_capability) -> str:
+    """根据 target_capability 推导 support_level。
+
+    EXPORT_ONLY -> "C"（仅发现）
+    SKILL_GATEWAY -> "B"（可读）
+    NATIVE_TAKEOVER -> "A"（已接管）
+    其他 -> "C"
+    """
+    value = getattr(target_capability, "value", target_capability)
+    return {
+        "export_only": "C",
+        "skill_gateway": "B",
+        "native_takeover": "A",
+    }.get(value, "C")
+
 
 class GovernanceApi:
     """pywebview JS API 类（v3 五入口架构，spec §7.2）。
@@ -156,6 +390,50 @@ class GovernanceApi:
     def _set_window(self, window) -> None:
         """注入 pywebview window 实例（用于 create_file_dialog）。"""
         self._window = window
+
+    # ------------------------------------------------------------------
+    # 安全层：请求队列管理（pywebview 模式下也需要）
+    # ------------------------------------------------------------------
+
+    def get_api_method_registry(self) -> dict:
+        """返回 API 方法注册表，供前端动态生成变更方法列表。
+
+        统一单一来源：前端不再维护自己的 MUTATION_METHODS 列表。
+        """
+        from .security import READONLY_API_METHODS, MUTATION_API_METHODS, _SECURITY_API_METHODS
+        return {
+            "readonly": sorted(READONLY_API_METHODS),
+            "mutation": sorted(MUTATION_API_METHODS),
+            "security": sorted(_SECURITY_API_METHODS),
+        }
+
+    def get_sandbox_status(self) -> dict:
+        """返回当前沙箱状态。"""
+        from .security import detect_sandbox_mode
+        return {"sandbox": detect_sandbox_mode()}
+
+    def submit_request(self, method: str, args: list | None = None) -> dict:
+        """提交变更请求到请求队列。"""
+        from .security import RequestQueue, is_mutation_method
+        if not is_mutation_method(method):
+            return {"error": "not a mutation method"}
+        rq = RequestQueue(self.workspace)
+        req = rq.submit(method, args or [])
+        return {"ok": True, "request": req.to_dict()}
+
+    def get_request_status(self, request_id: str) -> dict:
+        """查询请求状态。"""
+        from .security import RequestQueue
+        rq = RequestQueue(self.workspace)
+        req = rq.get(request_id)
+        return req.to_dict() if req else {"error": "request not found"}
+
+    def list_pending_requests(self) -> dict:
+        """列出所有待执行请求。"""
+        from .security import RequestQueue
+        rq = RequestQueue(self.workspace)
+        pending = rq.list_pending()
+        return {"requests": [r.to_dict() for r in pending]}
 
     # ------------------------------------------------------------------
     # 路径选择器（替代 prompt()）
@@ -205,14 +483,39 @@ class GovernanceApi:
     # ------------------------------------------------------------------
 
     def discover_agents(self) -> dict:
-        """v3.1 §3.2 检测本机已安装的 Agent 实例。"""
+        """v3.2 改动包2：检测本机 Agent，集成安装检测器。"""
         from .agent_locator import AgentLocator
+        from .agent_install_detector import AgentInstallDetector, DEFAULT_INSTALL_PROBES
+        from .agent_cleanup import AgentCleanup
         locator = AgentLocator(self.workspace)
         instances, ledgers = locator.detect_instances()
-        # 持久化 discovery 结果
-        if instances:
+        detector = AgentInstallDetector(self.workspace)
+        cleanup = AgentCleanup(self.workspace)
+        ignored_candidates = cleanup._load_uninstalled_candidates()
+
+        enriched_instances = []
+        for inst in instances:
+            install_probes = DEFAULT_INSTALL_PROBES.get(inst.product, [])
+            data_paths = _private_data_paths(inst)
+            assessment = detector.assess_lifecycle(inst.product, install_probes, data_paths, profile_id=inst.profile_id)
+            # 检查是否被忽略
+            is_ignored = assessment.candidate_id in ignored_candidates
+            if is_ignored:
+                assessment = detector.assess_lifecycle(inst.product, install_probes, data_paths, marked_ignored=True, profile_id=inst.profile_id)
+            # not_detected 不显示
+            if assessment.lifecycle_state == "not_detected":
+                continue
+            inst_dict = inst.to_dict()
+            inst_dict["lifecycle_state"] = assessment.lifecycle_state
+            inst_dict["install_confidence"] = assessment.install_confidence
+            inst_dict["support_level"] = _support_level_from_capability(inst.target_capability)
+            inst_dict["last_activity_at"] = assessment.last_activity_at
+            inst_dict["candidate_id"] = assessment.candidate_id
+            inst_dict["install_evidence"] = [e.to_dict() for e in assessment.install_evidence]
+            enriched_instances.append(inst_dict)
+
+        if enriched_instances:
             locator.save_discovery(instances, ledgers)
-        # 聚合发现账本
         agg_counts = {"found": 0, "missing": 0, "unsupported": 0,
                       "permission_denied": 0, "excluded_by_user": 0,
                       "not_applicable": 0, "unaccounted_count": 0}
@@ -221,7 +524,7 @@ class GovernanceApi:
             for k in agg_counts:
                 agg_counts[k] += cnt.get(k, 0)
         return {
-            "instances": [i.to_dict() for i in instances],
+            "instances": enriched_instances,
             "discovery_ledger": agg_counts,
             "platform": locator.context.platform,
             "host_id": locator.context.host_id,
@@ -230,13 +533,47 @@ class GovernanceApi:
     def get_selection_tree(self, instance_id: str) -> dict:
         """v3.1 §4.3 返回分类勾选树。"""
         from .agent_locator import AgentLocator
+        from .source_registry import SourceRegistry
         locator = AgentLocator(self.workspace)
-        return locator.get_selection_tree(instance_id)
+        tree = locator.get_selection_tree(instance_id)
+        if "error" in tree:
+            return tree
+        reg = SourceRegistry(self.workspace)
+        roots = [r for r in reg.list_all_sources() if r.agent_instance_id == instance_id]
+        by_discovery = {r.discovery_object_id: r for r in roots if r.discovery_object_id}
+        by_path = {str(Path(r.path).resolve()): r for r in roots if r.path}
+
+        def mark_file(f: dict) -> None:
+            root = None
+            dobj = f.get("discovery_object_id", "")
+            if dobj:
+                root = by_discovery.get(dobj)
+            if root is None and f.get("path"):
+                try:
+                    root = by_path.get(str(Path(f["path"]).resolve()))
+                except OSError:
+                    root = None
+            if root is not None:
+                f["default_selected"] = bool(root.enabled)
+                f["saved_selected"] = bool(root.enabled)
+                f["source_root_id"] = root.root_id
+            else:
+                f["saved_selected"] = None
+
+        for scope_obj in tree.get("scopes", []):
+            for proj in scope_obj.get("projects", []):
+                for cat in proj.get("categories", []):
+                    for f in cat.get("files", []):
+                        mark_file(f)
+            for cat in scope_obj.get("categories", []):
+                for f in cat.get("files", []):
+                    mark_file(f)
+        return tree
 
     def commit_selection(self, instance_id: str, selected: list, confirmed: bool = False) -> dict:
-        """v3.1 §4.3 写入 SelectionManifest + 授权 SourceRoot。
+        """v3.2 改动包1：写入 SelectionManifest + 授权 SourceRoot（含 scope）。
 
-        selected 是 [{category, path}, ...] 列表。
+        selected 是 [{category, path, scope, scope_source, project_ref, discovery_object_id}, ...] 列表。
         """
         if not confirmed:
             return {"error": "需要确认才能提交勾选"}
@@ -249,33 +586,108 @@ class GovernanceApi:
         from .source_registry import SourceRegistry
         import json
 
-        # 加载 instance 信息以获取 profile_id
         from .agent_locator import AgentLocator
         locator = AgentLocator(self.workspace)
         tree = locator.get_selection_tree(instance_id)
         if "error" in tree:
             return tree
-        # path → surface_id / ingestion_policy / etc 映射
+        # v3.2 改动包1：从 scopes 结构提取 path -> surface 映射
         path_to_surface: dict[str, dict] = {}
-        for cat in tree.get("categories", []):
-            for f in cat.get("files", []):
-                path_to_surface[f["path"]] = {
-                    "surface_id": f["surface_id"],
-                    "category": cat["category"],
-                    "ingestion_policy": f["ingestion_policy"],
-                    "ownership": f["ownership"],
-                    "target_role": f["target_role"],
-                }
+        for scope_obj in tree.get("scopes", []):
+            scope = scope_obj.get("scope", "unknown")
+            scope_source = scope_obj.get("scope_source", "fallback")
+            for proj in scope_obj.get("projects", []):
+                project_ref = proj.get("project_ref", "")
+                proj_ss = proj.get("scope_source", scope_source)
+                for cat in proj.get("categories", []):
+                    for f in cat.get("files", []):
+                        path_to_surface[f["path"]] = {
+                            "surface_id": f.get("surface_id", ""),
+                            "category": cat["category"],
+                            "ingestion_policy": f.get("ingestion_policy", "extract_candidates"),
+                            "ownership": f.get("ownership", "unknown"),
+                            "target_role": f.get("target_role", "none"),
+                            "scope": f.get("scope", scope),
+                            "scope_source": f.get("scope_source", proj_ss),
+                            "project_ref": f.get("project_ref", project_ref),
+                            "discovery_object_id": f.get("discovery_object_id", ""),
+                        }
+            for cat in scope_obj.get("categories", []):
+                for f in cat.get("files", []):
+                    path_to_surface[f["path"]] = {
+                        "surface_id": f.get("surface_id", ""),
+                        "category": cat["category"],
+                        "ingestion_policy": f.get("ingestion_policy", "extract_candidates"),
+                        "ownership": f.get("ownership", "unknown"),
+                        "target_role": f.get("target_role", "none"),
+                        "scope": f.get("scope", scope),
+                        "scope_source": f.get("scope_source", scope_source),
+                        "project_ref": f.get("project_ref", ""),
+                        "discovery_object_id": f.get("discovery_object_id", ""),
+                    }
 
-        # 写入 SelectionManifest
         sel_dir = Path(self.workspace) / ".memoryguard" / "selections"
         sel_dir.mkdir(parents=True, exist_ok=True)
         selection_id = stable_hash("sel", instance_id, _now_iso())
         entries: list[SelectionEntry] = []
+        if not selected:
+            reg = SourceRegistry(self.workspace)
+            visible_discovery_ids = {surf.get("discovery_object_id", "") for surf in path_to_surface.values() if surf.get("discovery_object_id")}
+            visible_paths = {str(Path(path).resolve()) for path in path_to_surface if path}
+            disabled_count = 0
+            for root in reg.list_all_sources():
+                if root.agent_instance_id != instance_id:
+                    continue
+                root_path = str(Path(root.path).resolve()) if root.path else ""
+                visible = (root.discovery_object_id and root.discovery_object_id in visible_discovery_ids) or root_path in visible_paths
+                if visible and root.enabled:
+                    root.enabled = False
+                    disabled_count += 1
+            reg._save()
+            return {"selection_id": selection_id, "added_source_count": 0, "updated_source_count": 0, "disabled_source_count": disabled_count, "total_selected": 0}
+        # v3.2 改动包1 P0：服务端以 discovery_object_id 为唯一授权依据
+        discovery_object_ids = [item.get("discovery_object_id", "") for item in selected if item.get("discovery_object_id")]
+        validation = locator.validate_discovery_objects(instance_id, discovery_object_ids)
+        # 过滤掉验证失败的条目
+        validated_selected = []
+        for item in selected:
+            dobj_id = item.get("discovery_object_id", "")
+            if dobj_id and validation.get(dobj_id, {}).get("valid"):
+                # 从服务端回填所有字段，不信任客户端
+                server_info = validation[dobj_id].get("file_info") or validation[dobj_id].get("surface") or {}
+                item["path"] = server_info["path"]
+                item["category"] = server_info.get("category", "unknown")
+                item["scope"] = server_info.get("scope", "unknown")
+                item["scope_source"] = server_info.get("scope_source", "fallback")
+                item["project_ref"] = server_info.get("project_ref", "")
+                item["surface_id"] = server_info.get("surface_id", "")
+                item["ingestion_policy"] = server_info.get("ingestion_policy", "extract_candidates")
+                item["ownership"] = server_info.get("ownership", "external_read_only")
+                item["target_role"] = server_info.get("target_role", "none")
+                validated_selected.append(item)
+            elif not dobj_id:
+                # 没有 discovery_object_id 的条目直接拒绝
+                continue
+            else:
+                # 验证失败的条目直接拒绝
+                continue
+        selected = validated_selected
+        if not selected:
+            return {"error": "所有 discovery_object_id 验证失败，无有效条目"}
         for item in selected:
             path = item.get("path", "")
             cat_str = item.get("category", "unknown")
-            surf = path_to_surface.get(path, {})
+            surf = dict(path_to_surface.get(path, {}))
+            surf.update({
+                "surface_id": item.get("surface_id", surf.get("surface_id", "")),
+                "ingestion_policy": item.get("ingestion_policy", surf.get("ingestion_policy", "extract_candidates")),
+                "ownership": item.get("ownership", surf.get("ownership", "external_read_only")),
+                "target_role": item.get("target_role", surf.get("target_role", "none")),
+            })
+            scope = item.get("scope", "unknown")
+            scope_source = item.get("scope_source", "fallback")
+            project_ref = item.get("project_ref", "")
+            dobj_id = item.get("discovery_object_id", "")
             try:
                 cat_enum = SourceCategory(cat_str)
             except ValueError:
@@ -297,6 +709,9 @@ class GovernanceApi:
                 resolved_path=path, category=cat_enum,
                 ingestion_policy=ing, ownership=own, target_role=tr,
                 selected=True,
+                scope=scope, scope_source=scope_source,
+                project_ref=project_ref,
+                discovery_object_id=dobj_id,
             ))
         manifest = SelectionManifest(
             selection_id=selection_id, instance_id=instance_id,
@@ -306,6 +721,8 @@ class GovernanceApi:
                 "selected_count": len(entries),
                 "native_memory_count": sum(1 for e in entries if e.category == SourceCategory.NATIVE_MEMORY),
                 "control_surface_count": sum(1 for e in entries if e.category == SourceCategory.CONTROL_SURFACE),
+                "user_scope_count": sum(1 for e in entries if e.scope == "user"),
+                "project_scope_count": sum(1 for e in entries if e.scope == "project"),
             },
         )
         (sel_dir / f"{selection_id}.json").write_text(
@@ -313,11 +730,21 @@ class GovernanceApi:
             encoding="utf-8",
         )
 
-        # 授权 SourceRoot（每个 path 一个 SourceRoot）
-        # v3.1 §4.3：root_id 一致性 —— SourceRegistry.add() 内部用
-        # "src-" + stable_hash(str(p), type.value) 做去重，所以这里直接调用 add()，
-        # 然后幂等地补充 v3.1 §4.2 字段。已存在且已设置 agent_instance_id 的跳过。
         reg = SourceRegistry(self.workspace)
+        selected_discovery_ids = {e.discovery_object_id for e in entries if e.discovery_object_id}
+        selected_paths = {str(Path(e.resolved_path).resolve()) for e in entries if e.resolved_path}
+        visible_discovery_ids = {surf.get("discovery_object_id", "") for surf in path_to_surface.values() if surf.get("discovery_object_id")}
+        visible_paths = {str(Path(path).resolve()) for path in path_to_surface if path}
+        disabled_count = 0
+        for root in reg.list_all_sources():
+            if root.agent_instance_id != instance_id:
+                continue
+            root_path = str(Path(root.path).resolve()) if root.path else ""
+            visible = (root.discovery_object_id and root.discovery_object_id in visible_discovery_ids) or root_path in visible_paths
+            selected_now = (root.discovery_object_id and root.discovery_object_id in selected_discovery_ids) or root_path in selected_paths
+            if visible and not selected_now and root.enabled:
+                root.enabled = False
+                disabled_count += 1
         added_count = 0
         updated_count = 0
         for entry in entries:
@@ -330,9 +757,9 @@ class GovernanceApi:
                                display_name=f"{tree.get('product', 'agent')}/{entry.surface_id}")
             except (ValueError, OSError):
                 continue
-            # 幂等补充 v3.1 §4.2 新字段
             if root.agent_instance_id and root.agent_instance_id != instance_id:
-                continue  # 已被其他 instance 占用，不覆盖
+                continue
+            root.enabled = True
             if not root.agent_instance_id:
                 root.agent_instance_id = instance_id
                 root.surface_id = entry.surface_id
@@ -340,14 +767,28 @@ class GovernanceApi:
                 root.ingestion_policy = entry.ingestion_policy.value
                 root.ownership = entry.ownership.value
                 root.target_role = entry.target_role.value
+                root.scope = entry.scope
+                root.scope_source = entry.scope_source
+                root.project_ref = entry.project_ref
+                root.discovery_object_id = entry.discovery_object_id
                 added_count += 1
             else:
+                root.surface_id = entry.surface_id or root.surface_id
+                root.source_category = entry.category.value
+                root.ingestion_policy = entry.ingestion_policy.value
+                root.ownership = entry.ownership.value
+                root.target_role = entry.target_role.value
+                root.scope = entry.scope
+                root.scope_source = entry.scope_source
+                root.project_ref = entry.project_ref
+                root.discovery_object_id = entry.discovery_object_id
                 updated_count += 1
         reg._save()
         return {
             "selection_id": selection_id,
             "added_source_count": added_count,
             "updated_source_count": updated_count,
+            "disabled_source_count": disabled_count,
             "total_selected": len(entries),
         }
 
@@ -399,13 +840,214 @@ class GovernanceApi:
     # ProjectionApi（spec §7.3）：神经图纯投影
     # ------------------------------------------------------------------
 
-    def get_neuron_graph(self) -> dict:
+    def set_projection_source_enabled(self, root_id: str, enabled: bool) -> dict:
+        from .source_registry import SourceRegistry
+        reg = SourceRegistry(self.workspace)
+        root = reg.set_enabled(root_id, enabled)
+        if not root:
+            return {"ok": False, "error": "source root not found", "root_id": root_id}
+        return {"ok": True, "root": root.to_dict(), "source_map": self.get_projection_source_map()}
+
+    def get_projection_source_map(self) -> dict:
+        from .source_registry import SourceRegistry
+        reg = SourceRegistry(self.workspace)
+        roots = reg.list_all_sources()
+        known_agents = sorted({r.agent_instance_id for r in roots if r.agent_instance_id})
+        single_agent_id = known_agents[0] if len(known_agents) == 1 else ""
+        native_categories = {"native_memory", "project_memory"}
+        excluded_categories = {"conversation_history", "runtime_evidence", "ignored_runtime_data"}
+        excluded_policies = {"evidence_only", "govern_only", "ignore"}
+        entries = []
+        for root in roots:
+            enabled = bool(root.enabled)
+            source_category = root.source_category
+            agent_instance_id = root.agent_instance_id
+            surface_id = root.surface_id
+            project_ref = root.project_ref
+            scope_source = root.scope_source
+            if root.scope == "project" and root.source_category in {"", "unknown"}:
+                source_category = "knowledge_source"
+                if not project_ref:
+                    project_ref = Path(root.path).resolve().name if root.path else "当前项目"
+                if not scope_source or scope_source == "fallback":
+                    scope_source = "project_workspace"
+                if not agent_instance_id and single_agent_id:
+                    agent_instance_id = single_agent_id
+                if not surface_id:
+                    surface_id = "project_workspace"
+            native_eligible = enabled and source_category in native_categories
+            logical_eligible = enabled and not native_eligible and source_category not in excluded_categories and root.ingestion_policy not in excluded_policies
+            if native_eligible:
+                projection_mode = "native_memory_projection"
+            elif logical_eligible:
+                projection_mode = "logical_reconstruction_projection"
+            else:
+                projection_mode = "evidence_only"
+            entries.append({
+                "root_id": root.root_id,
+                "display_name": root.display_name,
+                "path": root.path,
+                "enabled": enabled,
+                "agent_instance_id": agent_instance_id,
+                "surface_id": surface_id,
+                "scope": root.scope,
+                "scope_source": scope_source,
+                "project_ref": project_ref,
+                "source_category": source_category,
+                "ingestion_policy": root.ingestion_policy,
+                "target_role": root.target_role,
+                "ownership": root.ownership,
+                "projection_mode": projection_mode,
+                "logical_eligible": logical_eligible,
+                "native_eligible": native_eligible,
+            })
+        return {
+            "entries": entries,
+            "summary": {
+                "total": len(entries),
+                "enabled": sum(1 for e in entries if e["enabled"]),
+                "logical_reconstruction": sum(1 for e in entries if e["logical_eligible"]),
+                "native_memory": sum(1 for e in entries if e["native_eligible"]),
+                "evidence_only": sum(1 for e in entries if e["projection_mode"] == "evidence_only"),
+            },
+        }
+
+    def get_neuron_graph(self, mode: str = "reconstructed") -> dict:
         """纯读取神经图投影。未构建时返回 {empty: true, reason: 'not_built'}。"""
         from .projection import ProjectionBuilder
-        pb = ProjectionBuilder(self.workspace)
-        return pb.get_or_empty()
+        graph_mode = "native" if mode == "native" else "reconstructed"
+        pb = ProjectionBuilder(self.workspace, graph_mode)
+        graph = pb.get_or_empty()
+        graph = self._hydrate_neuron_graph_from_ir(graph)
+        graph["source_map"] = self.get_projection_source_map()
+        graph["projection_kind"] = "native_memory_projection" if graph_mode == "native" else "reconstructed_governance_projection"
+        graph["mode"] = graph_mode
+        return graph
 
-    def build_projection(self, confirmed: bool = False) -> dict:
+    def _looks_english_text(self, text: str) -> bool:
+        if not text:
+            return False
+        latin = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        return latin >= 12 and latin > cjk * 2
+
+    def _compact_english_snippet(self, text: str, limit: int = 80) -> str:
+        text = " ".join(str(text or "").replace("\n", " ").split())
+        replacements = {
+            "memory": "记忆", "project": "项目", "preference": "偏好", "rule": "规则",
+            "workflow": "流程", "procedure": "流程", "constraint": "约束", "fact": "事实",
+            "use": "使用", "should": "应", "must": "必须", "avoid": "避免",
+            "file": "文件", "folder": "文件夹", "source": "来源", "agent": "智能体",
+        }
+        words = text[:limit].split()
+        mapped = [replacements.get(w.strip(".,:;()[]{}\"'").lower(), w) for w in words[:16]]
+        return " ".join(mapped).strip()
+
+    def _localized_record_fields(self, rec: dict) -> dict:
+        kind_labels = {
+            "fact": "事实", "preference": "偏好", "project": "项目", "episode": "事件",
+            "procedure": "流程", "correction": "纠错", "workflow": "流程", "constraint": "约束",
+        }
+        title = rec.get("title") or rec.get("memory_id", "")[:8]
+        body = rec.get("body") or ""
+        kind = rec.get("kind", "")
+        original_title = rec.get("original_title") or title
+        original_body = rec.get("original_body") or body
+        if rec.get("display_language") == "zh" and (rec.get("original_body") or not self._looks_english_text(title + " " + body)):
+            return {
+                "original_title": original_title,
+                "original_body": original_body,
+                "title_zh": title,
+                "body_zh": body,
+            }
+        if self._looks_english_text(title + " " + body):
+            base = self._compact_english_snippet(title or body, 64)
+            summary = self._compact_english_snippet(body or title, 220)
+            return {
+                "original_title": original_title,
+                "original_body": original_body,
+                "title_zh": f"{kind_labels.get(kind, '记忆')}：{base}",
+                "body_zh": f"中文辅助摘要：{summary}",
+            }
+        return {
+            "original_title": original_title,
+            "original_body": original_body,
+            "title_zh": title,
+            "body_zh": body,
+        }
+
+    def _hydrate_neuron_graph_from_ir(self, graph: dict) -> dict:
+        if not graph or graph.get("empty"):
+            return graph
+        ir_path = Path(self.workspace).resolve() / ".memoryguard" / "ir" / "current.json"
+        if not ir_path.exists():
+            return graph
+        try:
+            data = _json.loads(ir_path.read_text(encoding="utf-8"))
+        except Exception:
+            return graph
+        records = {r.get("memory_id"): r for r in data.get("records", []) if r.get("memory_id")}
+        duplicate_groups = data.get("duplicate_groups", [])
+        related_by_id: dict[str, list[dict]] = {mid: [] for mid in records}
+        for group in duplicate_groups:
+            members = [mid for mid in group.get("member_ids", []) if mid in records]
+            if len(members) < 2:
+                continue
+            for mid in members:
+                related_by_id.setdefault(mid, [])
+                for other in members:
+                    if other == mid:
+                        continue
+                    rec = records[other]
+                    localized = self._localized_record_fields(rec)
+                    related_by_id[mid].append({
+                        "memory_id": other,
+                        "title": rec.get("title") or other[:8],
+                        "kind": rec.get("kind", ""),
+                        "body_preview": (rec.get("body") or "")[:160],
+                        "relation": "duplicate_candidate",
+                        **localized,
+                    })
+        for node in graph.get("nodes", []):
+            memory_id = node.get("memory_id")
+            member_ids = node.get("member_ids") or []
+            if memory_id and memory_id in records:
+                rec = records[memory_id]
+                localized = self._localized_record_fields(rec)
+                node.update({k: v for k, v in localized.items() if v})
+                if not node.get("title"):
+                    node["title"] = rec.get("title", "")
+                if not node.get("body"):
+                    node["body"] = rec.get("body", "")
+                if not node.get("scope"):
+                    node["scope"] = rec.get("scope", "project")
+                if not node.get("kind"):
+                    node["kind"] = rec.get("kind", "")
+                if node.get("confidence") in (None, ""):
+                    node["confidence"] = rec.get("confidence", 0.0)
+                if not node.get("completeness"):
+                    node["completeness"] = rec.get("completeness", "")
+                node["related"] = related_by_id.get(memory_id, [])[:12]
+            if member_ids:
+                members = []
+                for mid in member_ids:
+                    rec = records.get(mid)
+                    if not rec:
+                        continue
+                    localized = self._localized_record_fields(rec)
+                    members.append({
+                        "memory_id": mid,
+                        "title": rec.get("title") or mid[:8],
+                        "kind": rec.get("kind", ""),
+                        "body_preview": (rec.get("body") or "")[:180],
+                        **localized,
+                    })
+                node["members"] = members
+                if not node.get("body") and members:
+                    node["body"] = "\n".join(f"- {m['title']}: {m['body_preview']}" for m in members)
+        return graph
+
+    def build_projection(self, confirmed: bool = False, mode: str = "reconstructed") -> dict:
         """构建神经图投影（需用户确认）。
 
         v3.1 §6.3：构建时同步为每个 agent_instance 创建 ManagedStore initial
@@ -423,13 +1065,20 @@ class GovernanceApi:
 
         reg = SourceRegistry(self.workspace)
         snap = reg.scan(ScanBudget())
-        root_map = {r.root_id: r.path for r in reg.list_sources()}
+        roots = reg.list_sources()
+        root_map = {r.root_id: r.path for r in roots}
+        root_policies = {r.root_id: {"source_category": r.source_category, "ingestion_policy": r.ingestion_policy} for r in roots}
 
         norm = MemoryNormalizer(self.workspace)
         ir = norm.load()
         if ir is None or ir.snapshot_id != snap.snapshot_id:
-            ir = norm.normalize(snap, root_map=root_map)
+            ir = norm.normalize(snap, root_map=root_map, root_policies=root_policies)
             norm.save(ir)
+        else:
+            changed = norm.filter_by_source_policies(ir, snap, root_policies)
+            changed = norm.ensure_localized(ir) or changed
+            if changed:
+                norm.save(ir)
 
         # 建立 source_object_id → source_root_id → agent_instance_id 映射
         obj_to_root = {obj.source_object_id: obj.source_root_id
@@ -513,23 +1162,117 @@ class GovernanceApi:
             "drifted": False,
         }
 
-        pb = ProjectionBuilder(self.workspace)
+        graph_mode = "native" if mode == "native" else "reconstructed"
+        pb = ProjectionBuilder(self.workspace, graph_mode)
         proj = pb.build(ir, meta=meta)
         pb.save(proj)
-        return proj.to_dict()
+        result = proj.to_dict()
+        result["mode"] = graph_mode
+        result["projection_kind"] = "native_memory_projection" if graph_mode == "native" else "reconstructed_governance_projection"
+        return result
 
-    def delete_projection(self, confirmed: bool = False) -> dict:
+    def delete_projection(self, confirmed: bool = False, mode: str = "reconstructed") -> dict:
         """删除神经图投影文件。投影可从 IR + DecisionLog 完整重建。"""
         if not confirmed:
             return {"error": "需要确认才能删除投影"}
         from .projection import ProjectionBuilder
-        pb = ProjectionBuilder(self.workspace)
+        graph_mode = "native" if mode == "native" else "reconstructed"
+        pb = ProjectionBuilder(self.workspace, graph_mode)
         pb.delete()
-        return {"ok": True, "deleted": True}
+        return {"ok": True, "deleted": True, "mode": graph_mode}
 
     # ------------------------------------------------------------------
     # SourceApi（spec §7.2）
     # ------------------------------------------------------------------
+
+    def list_publish_targets(self) -> dict:
+        from .source_registry import SourceRegistry
+        native_categories = {"native_memory", "project_memory"}
+        targets = []
+        for root in SourceRegistry(self.workspace).list_all_sources():
+            if not root.enabled or root.source_category not in native_categories:
+                continue
+            path = Path(root.path)
+            target_file = path if path.suffix else path / "memory.md"
+            targets.append({
+                "root_id": root.root_id,
+                "display_name": root.display_name,
+                "target_file": str(target_file),
+                "source_category": root.source_category,
+                "agent_instance_id": root.agent_instance_id,
+                "surface_id": root.surface_id,
+                "scope": root.scope,
+                "project_ref": root.project_ref,
+                "ownership": root.ownership,
+                "target_role": root.target_role,
+                "is_agent_native_memory": root.source_category == "native_memory" and root.ownership == "agent_managed" and root.target_role == "takeover_input",
+                "path_kind": "file" if path.suffix else "folder_default_memory_md",
+            })
+        return {"targets": targets, "total": len(targets)}
+
+    def choose_publish_target_path(self, kind: str = "file") -> dict:
+        import platform
+        import subprocess
+        if platform.system().lower() == "windows":
+            try:
+                if kind == "folder":
+                    script = "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = '选择写回记忆文件夹'; $d.ShowNewFolderButton = $true; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }"
+                else:
+                    script = "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = '选择写回记忆文件'; if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }"
+                completed = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", script], capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=300)
+                if completed.returncode != 0:
+                    return {"ok": False, "error": (completed.stderr or "PowerShell 文件选择框失败").strip()}
+                selected = (completed.stdout or "").strip().splitlines()[-1] if (completed.stdout or "").strip() else ""
+                target = str(Path(selected) / "memory.md") if selected and kind == "folder" else selected
+                return {"ok": bool(target), "target_file": target}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            if kind == "folder":
+                selected = filedialog.askdirectory(title="选择写回记忆文件夹")
+                target = str(Path(selected) / "memory.md") if selected else ""
+            else:
+                selected = filedialog.askopenfilename(title="选择写回记忆文件")
+                target = selected or ""
+            root.destroy()
+            return {"ok": bool(target), "target_file": target}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def publish_reconstructed_memory(self, target_file: str, confirmed: bool = False) -> dict:
+        if not confirmed:
+            return {"error": "需要确认才能发布重构记忆"}
+        from .memory_ir import MemoryNormalizer
+        from .native_file_release import SafeNativeFilePublisher
+        norm = MemoryNormalizer(self.workspace)
+        ir = norm.load()
+        if ir is None:
+            return {"error": "没有可发布的重构记忆"}
+        lines = ["# Memory", ""]
+        for rec in ir.records:
+            status = rec.status.value if hasattr(rec.status, "value") else str(rec.status)
+            if status in {"rejected", "quarantined"}:
+                continue
+            lines.extend([f"## {rec.title}", "", rec.body, ""])
+        content = "\n".join(lines).encode("utf-8")
+        result = SafeNativeFilePublisher(self.workspace).apply({Path(target_file): content}, label="reconstructed-memory")
+        return result.to_dict()
+
+    def rollback_native_memory_release(self, release_id: str, force: bool = False, confirmed: bool = False) -> dict:
+        if not confirmed:
+            return {"error": "需要确认才能回滚原生记忆"}
+        from .native_file_release import SafeNativeFilePublisher
+        return SafeNativeFilePublisher(self.workspace).rollback(release_id, force=force).to_dict()
+
+    def list_native_memory_releases(self) -> dict:
+        from .native_file_release import SafeNativeFilePublisher
+        releases = SafeNativeFilePublisher(self.workspace).list_releases()
+        return {"releases": releases, "total": len(releases)}
 
     def list_sources(self) -> dict:
         from .source_registry import SourceRegistry
@@ -561,30 +1304,103 @@ class GovernanceApi:
         }
 
     def mark_agent_uninstalled(self, product: str, dir_path: str = "",
-                               reason: str = "") -> dict:
-        """标记 Agent 为已卸载，后续扫描跳过。"""
+                               reason: str = "", candidate_id: str = "") -> dict:
+        """v3.2 改动包2：标记 Agent 为已卸载，以 candidate_id 为单位。"""
         from .agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(self.workspace)
-        return cleanup.mark_uninstalled(product, dir_path=dir_path, reason=reason)
+        cid = candidate_id or product  # 向后兼容
+        return cleanup.mark_uninstalled(cid, product=product, dir_path=dir_path, reason=reason)
 
-    def unmark_agent_uninstalled(self, product: str) -> dict:
-        """取消已卸载标记。"""
+    def unmark_agent_uninstalled(self, product: str, candidate_id: str = "") -> dict:
+        """v3.2 改动包2：取消已卸载标记，以 candidate_id 为单位。"""
         from .agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(self.workspace)
-        return cleanup.unmark_uninstalled(product)
+        cid = candidate_id or product
+        return cleanup.unmark_uninstalled(cid, product=product)
 
-    def archive_agent_dir(self, product: str, dir_path: str,
-                          reason: str = "") -> dict:
-        """归档 Agent 目录到 .memoryguard/cleanup/archived-agents/。可恢复。"""
+    def _resolve_candidate_context(self, candidate_id: str) -> dict:
+        from .agent_locator import AgentLocator
+        from .agent_install_detector import AgentInstallDetector, DEFAULT_INSTALL_PROBES
+        locator = AgentLocator(self.workspace)
+        instances, _ = locator.detect_instances()
+        detector = AgentInstallDetector(self.workspace)
+        for inst in instances:
+            data_paths = _private_data_paths(inst)
+            assessment = detector.assess_lifecycle(
+                inst.product, DEFAULT_INSTALL_PROBES.get(inst.product, []), data_paths,
+                profile_id=inst.profile_id,
+            )
+            if assessment.candidate_id == candidate_id:
+                return {"instance": inst, "assessment": assessment, "data_paths": data_paths}
+        return {}
+
+    def archive_agent_dir(self, product: str = "", dir_path: str = "",
+                          reason: str = "", candidate_id: str = "",
+                          dry_run: bool = False,
+                          allowed_data_paths: list | None = None) -> dict:
+        """v3.2 改动包2：归档 Agent 目录，以 candidate_id 为单位。可恢复。"""
+        from .agent_cleanup import AgentCleanup
+        if isinstance(dry_run, str):
+            dry_run = dry_run.lower() in ("true", "1", "yes")
+        if not candidate_id:
+            return {"error": "candidate_id_required"}
+        context = self._resolve_candidate_context(candidate_id)
+        if not context:
+            return {"error": "candidate_not_found", "candidate_id": candidate_id}
+        data_paths = context["data_paths"]
+        if not data_paths:
+            return {"error": "no_private_data_evidence", "candidate_id": candidate_id}
+        target_path = dir_path or data_paths[0]
         from .agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(self.workspace)
-        return cleanup.archive_agent_dir(product, dir_path, reason=reason)
+        return cleanup.archive_agent_dir(
+            candidate_id, context["instance"].product, target_path, reason=reason,
+            dry_run=dry_run, allowed_data_paths=data_paths,
+        )
 
     def restore_archived_agent(self, archive_id: str) -> dict:
         """从归档恢复 Agent 目录。"""
         from .agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(self.workspace)
         return cleanup.restore_archived(archive_id)
+
+    def delete_archived_agent(self, archive_id: str) -> dict:
+        """永久删除归档（不可恢复）。"""
+        from .agent_cleanup import AgentCleanup
+        cleanup = AgentCleanup(self.workspace)
+        return cleanup.delete_archived(archive_id)
+
+    def open_agent_folder(self, dir_path: str = "", candidate_id: str = "") -> dict:
+        if not dir_path:
+            if not candidate_id:
+                return {"error": "path_required"}
+            context = self._resolve_candidate_context(candidate_id)
+            if not context or not context.get("data_paths"):
+                return {"error": "candidate_path_not_found", "candidate_id": candidate_id}
+            dir_path = context["data_paths"][0]
+        path = Path(dir_path).expanduser().resolve()
+        if not path.exists():
+            return {"error": "path_not_found", "path": str(path)}
+        target = path if path.is_dir() else path.parent
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(target))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as exc:
+            return {"error": "open_folder_failed", "reason": str(exc), "path": str(target)}
+        return {"ok": True, "path": str(target)}
+
+    def _purge_agent_dir_disabled(self, product: str = "", dir_path: str = "",
+                                  candidate_id: str = "", dry_run: bool = False) -> dict:
+        return {
+            "error": "direct_purge_disabled",
+            "reason": "直接删除在当前沙箱/系统权限环境下不可靠，已改为打开文件夹由用户手动处理。",
+            "dir_path": dir_path,
+            "candidate_id": candidate_id,
+        }
 
     def list_archived_agents(self) -> dict:
         """列出所有归档的 Agent。"""
@@ -599,15 +1415,16 @@ class GovernanceApi:
         return {"history": cleanup.list_cleanup_history()}
 
     def list_agents(self) -> dict:
-        """v3.2 数据页 Agent 卡片：返回已发现的 Agent 实例列表。
-
-        每个卡片含：instance_id, product, profile_id, surfaces 摘要,
-        已绑定 SourceRoot 数量, native_memory_mode 预期。
-        """
+        """v3.2 数据页 Agent 卡片：返回已发现的 Agent 实例列表（含生命周期）。"""
         from .agent_locator import AgentLocator
+        from .agent_install_detector import AgentInstallDetector, DEFAULT_INSTALL_PROBES
         from .source_registry import SourceRegistry
+        from .agent_cleanup import AgentCleanup
         locator = AgentLocator(self.workspace)
         instances, _ledgers = locator.detect_instances()
+        detector = AgentInstallDetector(self.workspace)
+        cleanup = AgentCleanup(self.workspace)
+        ignored_candidates = cleanup._load_uninstalled_candidates()
         reg = SourceRegistry(self.workspace)
         # root_id -> agent_instance_id 映射，统计每个 agent 的 SourceRoot 数量
         agent_root_counts: dict[str, int] = {}
@@ -615,26 +1432,114 @@ class GovernanceApi:
             if r.agent_instance_id:
                 agent_root_counts[r.agent_instance_id] = agent_root_counts.get(r.agent_instance_id, 0) + 1
         cards = []
+        residuals = []
         for inst in instances:
-            found_count = sum(1 for s in inst.surfaces if s.get("status") == "found")
-            cards.append({
+            install_probes = DEFAULT_INSTALL_PROBES.get(inst.product, [])
+            data_paths = _private_data_paths(inst)
+            assessment = detector.assess_lifecycle(inst.product, install_probes, data_paths, profile_id=inst.profile_id)
+            is_ignored = assessment.candidate_id in ignored_candidates
+            if is_ignored:
+                assessment = detector.assess_lifecycle(inst.product, install_probes, data_paths, marked_ignored=True, profile_id=inst.profile_id)
+            if assessment.lifecycle_state == "not_detected":
+                continue
+            found_count = _found_surface_count(inst)
+            card = {
                 "instance_id": inst.instance_id,
                 "product": inst.product,
                 "profile_id": inst.profile_id,
                 "target_capability": inst.target_capability.value,
                 "surface_count": len(inst.surfaces),
                 "found_surface_count": found_count,
+                "private_data_surface_count": _found_surface_count(inst, "private_data_evidence"),
+                "shared_surface_count": _found_surface_count(inst, "shared_surface"),
                 "bound_source_count": agent_root_counts.get(inst.instance_id, 0),
                 "platform": inst.platform,
                 "host_id": inst.host_id,
+                "lifecycle_state": assessment.lifecycle_state,
+                "install_confidence": assessment.install_confidence,
+                "support_level": _support_level_from_capability(inst.target_capability),
+                "candidate_id": assessment.candidate_id,
+                "last_activity_at": assessment.last_activity_at,
+            }
+            if assessment.lifecycle_state in {"installed", "installed_no_data"}:
+                cards.append(card)
+            elif assessment.lifecycle_state in {"data_only", "uncertain", "ignored"}:
+                residuals.append(card)
+        return {"agents": cards, "residuals": residuals, "total": len(cards), "residual_total": len(residuals)}
+
+    def get_residual_cleanup(self, instance_id: str = "", candidate_id: str = "") -> dict:
+        """v3.2 改动包2：残留与清理页面数据。"""
+        from .agent_locator import AgentLocator
+        from .agent_install_detector import AgentInstallDetector, DEFAULT_INSTALL_PROBES
+        from .agent_cleanup import AgentCleanup
+        locator = AgentLocator(self.workspace)
+        instances, _ = locator.detect_instances()
+        detector = AgentInstallDetector(self.workspace)
+        cleanup = AgentCleanup(self.workspace)
+
+        target_inst = None
+        target_assessment = None
+        target_data_paths: list[str] = []
+        for inst in instances:
+            data_paths = _private_data_paths(inst)
+            assessment = detector.assess_lifecycle(
+                inst.product, DEFAULT_INSTALL_PROBES.get(inst.product, []), data_paths,
+                profile_id=inst.profile_id,
+            )
+            if (instance_id and inst.instance_id == instance_id) or (candidate_id and assessment.candidate_id == candidate_id):
+                target_inst = inst
+                target_assessment = assessment
+                target_data_paths = data_paths
+                break
+        if not target_inst or not target_assessment:
+            target = candidate_id or instance_id
+            return {"error": f"candidate not found: {target}"}
+
+        archive_previews = []
+        items = []
+        for idx, dp in enumerate(target_data_paths):
+            evidence_id = target_assessment.data_evidence[idx].dir_path if idx < len(target_assessment.data_evidence) else dp
+            dry_run = cleanup.archive_agent_dir(
+                target_assessment.candidate_id, target_inst.product, dp, dry_run=True,
+                allowed_data_paths=target_data_paths,
+            )
+            archive_previews.append({
+                "data_evidence_id": evidence_id,
+                "path": dp,
+                "dry_run": dry_run,
             })
-        return {"agents": cards, "total": len(cards)}
+            items.append({
+                "data_evidence_id": evidence_id,
+                "path": dp,
+                "residual_type": "private_data_evidence",
+                "description": "产品私有数据残留，可归档到 MemoryGuard 可恢复归档区。",
+                "archive_preview": dry_run,
+            })
+
+        archives = cleanup.list_archives()
+
+        return {
+            "instance_id": target_inst.instance_id,
+            "product": target_inst.product,
+            "candidate_id": target_assessment.candidate_id,
+            "lifecycle_state": target_assessment.lifecycle_state,
+            "install_confidence": target_assessment.install_confidence,
+            "install_evidence": [e.to_dict() for e in target_assessment.install_evidence],
+            "data_evidence": [e.to_dict() for e in target_assessment.data_evidence],
+            "archive_previews": archive_previews,
+            "items": items,
+            "archives": archives,
+        }
 
     def get_agent_data(self, instance_id: str) -> dict:
         """v3.2 数据页：返回单个 Agent 的完整数据视图。
 
-        按数据类别分组：native_memory / control_surface / skill_surface /
-        conversation_history / project_document。
+        按 scope -> project_ref -> category 三层分组：
+        - user / unknown scope：直接挂 categories
+        - project scope：按 project_ref 拆 projects，每个 project 下挂 categories
+
+        如果 SourceRegistry 中没有该 Agent 的授权来源，
+        回退到展示 discovered surfaces（标注"待授权"）。
         """
         from .source_registry import SourceRegistry, ScanBudget
         reg = SourceRegistry(self.workspace)
@@ -642,23 +1547,42 @@ class GovernanceApi:
         # 该 Agent 的 SourceRoot 列表
         agent_roots = [r for r in reg.list_sources() if r.agent_instance_id == instance_id]
         root_map = {r.root_id: r for r in agent_roots}
-        # 按 source_category 分组
-        categories: dict[str, list[dict]] = {}
-        for obj in snap.source_objects:
-            root = root_map.get(obj.source_root_id)
-            if not root:
-                continue
-            cat = root.source_category or "unknown"
-            categories.setdefault(cat, []).append({
-                "root_id": obj.source_root_id,
-                "root_path": root.path,
-                "display_name": root.display_name,
-                "relative_path": obj.relative_path,
-                "media_type": obj.media_type,
-                "content_hash": obj.content_hash,
-                "read_status": obj.read_status,
-                "captured_at": obj.captured_at,
-            })
+        has_authorized_sources = len(agent_roots) > 0
+        # 按 scope -> project_ref -> category 三层分组
+        scope_map: dict[str, dict[str, dict[str, list[dict]]]] = {}
+        if has_authorized_sources:
+            for obj in snap.source_objects:
+                root = root_map.get(obj.source_root_id)
+                if not root:
+                    continue
+                scope = root.scope or "unknown"
+                project_ref = root.project_ref or ""
+                cat = root.source_category or "unknown"
+                root_path = Path(root.path).expanduser().resolve()
+                full_path = root_path if root.type.value == "selected_file" else (root_path / obj.relative_path).resolve()
+                if not full_path.exists():
+                    continue
+                file_info = {
+                    "root_id": obj.source_root_id,
+                    "root_path": root.path,
+                    "display_name": root.display_name,
+                    "relative_path": obj.relative_path,
+                    "media_type": obj.media_type,
+                    "content_hash": obj.content_hash,
+                    "read_status": obj.read_status,
+                    "captured_at": obj.captured_at,
+                    "scope": scope,
+                    "scope_source": root.scope_source,
+                    "project_ref": project_ref,
+                    "discovery_object_id": root.discovery_object_id,
+                    "authorized": True,
+                    "exists": True,
+                }
+                scope_map.setdefault(scope, {})
+                pr_key = project_ref or "_no_project"
+                scope_map[scope].setdefault(pr_key, {})
+                scope_map[scope][pr_key].setdefault(cat, [])
+                scope_map[scope][pr_key][cat].append(file_info)
         # Agent 基本信息
         from .agent_locator import AgentLocator
         locator = AgentLocator(self.workspace)
@@ -670,11 +1594,86 @@ class GovernanceApi:
             "profile_id": inst.profile_id if inst else "",
             "surfaces": inst.surfaces if inst else [],
         }
+        # 如果没有授权来源，回退到 discovered surfaces
+        if not has_authorized_sources and inst:
+            cat_labels = {
+                "native_memory": "原生记忆", "control_surface": "控制面",
+                "skill_surface": "Skill 表面", "conversation_history": "会话历史",
+                "runtime_evidence": "运行证据", "knowledge_source": "知识来源",
+                "project_memory": "项目记忆", "unknown": "其他",
+            }
+            for s in inst.surfaces:
+                if s.get("status") != "found":
+                    continue
+                resolved = s.get("resolved_path", "")
+                if resolved and not Path(resolved).expanduser().exists():
+                    continue
+                scope = s.get("scope", "unknown")
+                cat = s.get("category") or s.get("surface_role") or "unknown"
+                label = cat_labels.get(cat, cat)
+                file_info = {
+                    "root_id": "",
+                    "root_path": s.get("resolved_path", ""),
+                    "display_name": s.get("surface_id", ""),
+                    "relative_path": s.get("resolved_path", ""),
+                    "media_type": "text/plain",
+                    "content_hash": "",
+                    "read_status": "discovered",
+                    "captured_at": "",
+                    "scope": scope,
+                    "scope_source": "profile_declared",
+                    "project_ref": "",
+                    "discovery_object_id": s.get("surface_id", ""),
+                    "authorized": False,
+                }
+                scope_map.setdefault(scope, {})
+                scope_map[scope].setdefault("_no_project", {})
+                scope_map[scope]["_no_project"].setdefault(label, [])
+                scope_map[scope]["_no_project"][label].append(file_info)
+        # 构建返回结构
+        scopes_output = []
+        for scope in ["user", "project", "unknown"]:
+            if scope not in scope_map:
+                continue
+            projects = scope_map[scope]
+            if scope == "project":
+                project_list = []
+                for pr_key, cat_map in projects.items():
+                    project_ref = pr_key if pr_key != "_no_project" else ""
+                    categories = [{"category": cat, "files": files} for cat, files in cat_map.items()]
+                    project_list.append({"project_ref": project_ref or "(未归属)", "categories": categories})
+                scopes_output.append({"scope": scope, "projects": project_list})
+            else:
+                cat_map = projects.get("_no_project", {})
+                categories = [{"category": cat, "files": files} for cat, files in cat_map.items()]
+                scopes_output.append({"scope": scope, "categories": categories})
+        total_files = 0
+        category_set = set()
+        all_categories = []
+        for scope_obj in scopes_output:
+            if "projects" in scope_obj:
+                for proj in scope_obj["projects"]:
+                    for cat in proj.get("categories", []):
+                        total_files += len(cat.get("files", []))
+                        category_set.add(cat.get("category", ""))
+                        all_categories.append(cat)
+            else:
+                for cat in scope_obj.get("categories", []):
+                    total_files += len(cat.get("files", []))
+                    category_set.add(cat.get("category", ""))
+                    all_categories.append(cat)
+        # 兼容旧契约：扁平 categories 字典，同名分类合并而非覆盖
+        flat_categories: dict[str, list] = {}
+        for cat in all_categories:
+            key = cat.get("category", "unknown")
+            flat_categories.setdefault(key, []).extend(cat.get("files", []))
         return {
             "agent": agent_info,
-            "categories": categories,
-            "total_files": sum(len(files) for files in categories.values()),
-            "category_count": len(categories),
+            "scopes": scopes_output,
+            "categories": flat_categories,
+            "total_files": total_files,
+            "category_count": len(category_set),
+            "has_authorized_sources": has_authorized_sources,
         }
 
     def enter_multi_agent_mode(self) -> dict:
@@ -907,11 +1906,106 @@ class GovernanceApi:
         return {"conflicts": [c.to_dict() for c in conflicts], "total": len(conflicts)}
 
     def get_quarantine(self, share_group_id: str = "default") -> dict:
-        """隔离队列。"""
+        """隔离队列（安全修复：后端返回 masked_preview，前端永远拿不到原文）。"""
         from .shared_memory_store import SharedMemoryStore
         store = SharedMemoryStore(self.workspace, share_group_id)
         entries = store.list_quarantine()
-        return {"quarantine": [e.to_dict() for e in entries], "total": len(entries)}
+        result = []
+        for e in entries:
+            masked = _mask_preview(e.original_content or "")
+            result.append({
+                "quarantine_id": e.quarantine_id,
+                "memory_id": e.memory_id,
+                "masked_preview": masked,
+                "reason": e.reason,
+                "detected_pattern": e.detected_pattern,
+                "quarantined_at": e.quarantined_at,
+                "released": e.released,
+            })
+        return {"quarantine": result, "total": len(result)}
+
+    def get_governance_snapshot(self, share_group_id: str = "default") -> dict:
+        """只读聚合：总览状态栏 + 概念图事件卡所需的所有数据，一次调用返回。"""
+        from .shared_memory_store import SharedMemoryStore
+        store = SharedMemoryStore(self.workspace, share_group_id)
+
+        # 状态统计
+        status = store.status()
+
+        # 最近写入事件（取最新 5 条）
+        events = store.list_events()
+        recent_events = events[-5:] if len(events) > 5 else events
+        latest_event = None
+        if recent_events:
+            e = recent_events[-1]
+            latest_event = {
+                "event_id": e.event_id,
+                "agent_instance_id": e.agent_instance_id,
+                "created_at": e.created_at,
+                "raw_content_preview": _mask_content(e.raw_content or "", 120),
+                "auto_actions": [{"action": a.get("action", a.get("type", "auto")),
+                                  "target": a.get("target", "")} for a in (e.auto_actions or [])],
+            }
+
+        # 最新覆盖决策
+        decisions = [d for d in store.list_decisions() if d.action == "auto_supersede"]
+        latest_supersede = None
+        if decisions:
+            d = decisions[-1]
+            target_ids = d.target_ids or []
+            records = {r.memory_id: r for r in store.list_records()}
+            old_id = target_ids[0] if len(target_ids) > 0 else ""
+            new_id = target_ids[1] if len(target_ids) > 1 else ""
+            old_rec = records.get(old_id)
+            new_rec = records.get(new_id)
+            latest_supersede = {
+                "decision_id": d.event_id,
+                "old_memory_id": old_id,
+                "new_memory_id": new_id,
+                "old_content_preview": _mask_content(old_rec.body if old_rec else "", 100),
+                "new_content_preview": _mask_content(new_rec.body if new_rec else "", 100),
+                "reason": d.reason,
+                "created_at": d.created_at,
+            }
+
+        # 未解决冲突
+        conflicts = [c for c in store.list_conflicts() if c.status == "unresolved"]
+        first_conflict_reason = conflicts[0].reason if conflicts else ""
+
+        # 未释放隔离项（脱敏）
+        quarantine_entries = [e for e in store.list_quarantine() if not e.released]
+        quarantine_summary = []
+        for e in quarantine_entries[:5]:
+            masked = _mask_preview(e.original_content or "")
+            quarantine_summary.append({
+                "quarantine_id": e.quarantine_id,
+                "masked_preview": masked,
+                "reason": e.reason,
+                "detected_pattern": e.detected_pattern,
+                "quarantined_at": e.quarantined_at,
+            })
+
+        # 可回滚版本数
+        versions = store.list_versions()
+
+        return {
+            "status": {
+                "active_count": status.get("active_count", 0),
+                "total_count": status.get("total_count", 0),
+            },
+            "latest_event": latest_event,
+            "latest_supersede": latest_supersede,
+            "conflicts": {
+                "count": len(conflicts),
+                "first_reason": first_conflict_reason,
+            },
+            "quarantine": {
+                "count": len(quarantine_entries),
+                "items": quarantine_summary,
+            },
+            "rollback_ready": len(versions),
+            "has_events": len(events) > 0,
+        }
 
     def get_memory_status(self, share_group_id: str = "default") -> dict:
         """共享组状态统计。"""
@@ -938,8 +2032,8 @@ class GovernanceApi:
                 "decision_id": d.event_id,
                 "old_memory_id": old_id,
                 "new_memory_id": new_id,
-                "old_content_preview": (old_rec.body if old_rec else "")[:100],
-                "new_content_preview": (new_rec.body if new_rec else "")[:100],
+                "old_content_preview": _mask_content(old_rec.body if old_rec else "", 100),
+                "new_content_preview": _mask_content(new_rec.body if new_rec else "", 100),
                 "reason": d.reason,
                 "created_at": d.created_at,
             })
@@ -1105,12 +2199,16 @@ class GovernanceApi:
         if root is None:
             return {"error": "source root not found"}
         root_path = Path(root.path).resolve()
-        # canonical containment：resolve 后必须仍在 root_path 之内
-        full = (root_path / relative_path).resolve()
-        try:
-            full.relative_to(root_path)
-        except ValueError:
-            return {"error": "path escapes source root (containment violation)"}
+        if root.type.value == "selected_file":
+            full = root_path
+            containment_root = root_path.parent
+        else:
+            containment_root = root_path
+            full = (root_path / relative_path).resolve()
+            try:
+                full.relative_to(containment_root)
+            except ValueError:
+                return {"error": "path escapes source root (containment violation)"}
         if not full.exists() or not full.is_file():
             return {"error": "file not found"}
         # 符号链接防护：不允许 symlink 指向 root 之外
@@ -1119,7 +2217,7 @@ class GovernanceApi:
             if target is None:
                 return {"error": "symlink target unreadable"}
             try:
-                target.relative_to(root_path)
+                target.relative_to(containment_root)
             except ValueError:
                 return {"error": "symlink escapes source root"}
         # 文件大小限制（防止误读大文件）
@@ -1425,7 +2523,9 @@ class GovernanceApi:
                 records = ad.normalize(convs)
                 return {"provider": d.provider,
                         "conversation_count": len(convs),
-                        "memory_record_count": len(records)}
+                        "extract_candidate_count": len(records),
+                        "memory_record_count": 0,
+                        "written_to_ir": False}
         return {"error": "unsupported bundle format"}
 
     # ------------------------------------------------------------------
@@ -1680,11 +2780,103 @@ class GovernanceApi:
         return {"ok": True}
 
 
+class SafeBridgeApi:
+    """受限桥接 API：pywebview js_api 的安全代理。
+
+    只暴露两个真实方法（pywebview 可枚举）：
+    - call_readonly(method, args): 只读方法，直接转发
+    - request_mutation(method, args): 变更方法，沙箱模式下走请求队列
+
+    前端统一通过这两个方法调用，不再直接访问 method 属性。
+    """
+
+    def __init__(self, workspace: str):
+        self._inner = GovernanceApi(workspace)
+        self._workspace = workspace
+
+    def _set_window(self, window) -> None:
+        self._inner._set_window(window)
+
+    def call_readonly(self, method: str, args: list | None = None) -> dict:
+        """调用只读方法。
+
+        严格校验方法是否在只读注册表中，拒绝变更方法。
+        """
+        from .security import is_readonly_method
+
+        if not is_readonly_method(method):
+            return {"error": f"not a readonly method: {method}"}
+
+        fn = getattr(self._inner, method, None)
+        if not callable(fn):
+            return {"error": f"method not found: {method}"}
+
+        try:
+            result = fn(*(args or []))
+            return result if result is not None else {}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def request_mutation(self, method: str, args: list | None = None) -> dict:
+        """调用变更方法。
+
+        沙箱模式下走请求队列；非沙箱模式下注入 confirmed=True 后直接执行。
+        """
+        from .security import is_mutation_method, detect_sandbox_mode
+
+        if not is_mutation_method(method):
+            return {"error": f"not a mutation method: {method}"}
+
+        # 沙箱模式：走请求队列，返回 deferred 标记
+        if detect_sandbox_mode():
+            result = self._inner.submit_request(method, args or [])
+            return {
+                "ok": True,
+                "deferred": True,
+                "request": result.get("request", result),
+                "message": "请求已提交，等待桌面执行器确认",
+            }
+
+        # 非沙箱：注入 confirmed=True 后直接执行
+        fn = getattr(self._inner, method, None)
+        if not callable(fn):
+            return {"error": f"method not found: {method}"}
+
+        try:
+            import inspect
+            sig = inspect.signature(fn)
+            params = list(sig.parameters.keys())
+            call_args = list(args or [])
+            if "confirmed" in params:
+                cidx = params.index("confirmed")
+                while len(call_args) <= cidx:
+                    call_args.append(sig.parameters[params[len(call_args)]].default)
+                call_args[cidx] = True
+            result = fn(*call_args)
+            return result if result is not None else {}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_api_method_registry(self) -> dict:
+        """返回 API 方法注册表，供前端动态加载。"""
+        return self._inner.get_api_method_registry()
+
+    def get_sandbox_status(self) -> dict:
+        """返回沙箱状态。"""
+        return self._inner.get_sandbox_status()
+
+    def pick_path(self, for_files: bool = False) -> dict:
+        """系统目录/文件选择器。"""
+        return self._inner.pick_path(for_files)
+
+
 def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面板") -> int:
     """打开交互式治理面板（非平面报告）。
 
-    通过 pywebview js_api 暴露 GovernanceApi，前端 JS 可调 audit/plan/apply/undo。
-    使用本地文件模式（url=）而非内联 HTML（html=），以便加载 Cytoscape.js 等本地 JS 库。
+    通过 pywebview js_api 暴露 SafeBridgeApi（受限桥接 API）：
+    - 只读方法直接转发到 GovernanceApi
+    - 变更方法在沙箱模式下走请求队列
+    - 不直接暴露完整 GovernanceApi 对象
     返回退出码：0 成功，3 pywebview 不可用。
     """
     if not has_native_gui():
@@ -1693,7 +2885,7 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     import webview
     from .interactive import render_interactive_html
 
-    api = GovernanceApi(workspace)
+    api = SafeBridgeApi(workspace)
     html = render_interactive_html()
 
     # 写 HTML + cytoscape.js 到 .memoryguard/ui/ 目录，用 url= 加载本地文件
@@ -1709,7 +2901,7 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
 
     window = webview.create_window(
         title, url=str(html_path), js_api=api,
-        width=1200, height=800, min_size=(800, 600),
+        width=1440, height=900, min_size=(800, 600),
     )
     # v3.1：注入 window 引用，使 pick_path 能调用 create_file_dialog
     api._set_window(window)

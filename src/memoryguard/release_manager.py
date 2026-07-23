@@ -82,8 +82,10 @@ class ReleaseManager:
         """
         snapshot = self.registry.scan(budget)
         # v3.1 §1.3：传 root_map 给 normalizer
-        root_map = {r.root_id: r.path for r in self.registry.list_sources()}
-        ir = self.normalizer.normalize(snapshot, root_map=root_map)
+        roots = self.registry.list_sources()
+        root_map = {r.root_id: r.path for r in roots}
+        root_policies = {r.root_id: {"source_category": r.source_category, "ingestion_policy": r.ingestion_policy} for r in roots}
+        ir = self.normalizer.normalize(snapshot, root_map=root_map, root_policies=root_policies)
         self.normalizer.save(ir)
         return snapshot, ir
 

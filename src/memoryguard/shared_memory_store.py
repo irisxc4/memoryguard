@@ -123,12 +123,38 @@ class SharedMemoryStore:
         self.root = self.workspace / ".memoryguard" / "shared-memory" / share_group_id
         self.versions_dir = self.root / "versions"  # 仅用于旧数据迁移探测
         self.db_path = self.root / "memory.db"
+        # JSONL 备份路径（可从 memory.db 重建）
+        self.records_bak_path = self.root / "records.jsonl"
+        self.events_bak_path = self.root / "events.jsonl"
+        self.decisions_bak_path = self.root / "decisions.jsonl"
+        self.conflicts_bak_path = self.root / "conflicts.jsonl"
+        self.quarantine_bak_path = self.root / "quarantine.jsonl"
         self._ensure_dirs()
         self._init_db()
         self._migrate_from_jsonl()
 
     def _ensure_dirs(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def _append_jsonl(self, path: Path, obj: Any) -> None:
+        """追加一行 JSON 到 JSONL 备份文件。"""
+        line = json.dumps(obj.to_dict() if hasattr(obj, "to_dict") else obj,
+                          ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    def export_jsonl_backup(self) -> None:
+        """全量导出所有 JSONL 备份（可从 memory.db 重建）。"""
+        for path, items in [
+            (self.records_bak_path, self.list_records()),
+            (self.events_bak_path, self.list_events()),
+            (self.decisions_bak_path, self.list_decisions()),
+            (self.conflicts_bak_path, self.list_conflicts()),
+            (self.quarantine_bak_path, self.list_quarantine()),
+        ]:
+            with open(path, "w", encoding="utf-8") as f:
+                for item in items:
+                    f.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
 
     # ------------------------------------------------------------------
     # 连接与建表
@@ -297,6 +323,7 @@ class SharedMemoryStore:
         """追加原始写入事件。"""
         with self._tx() as conn:
             self._insert_event(conn, event)
+        self._append_jsonl(self.events_bak_path, event)
 
     def update_event(self, event: MemoryEvent) -> None:
         """更新事件（回填 auto_actions）。仅在已存在时更新。"""
@@ -315,21 +342,25 @@ class SharedMemoryStore:
         """追加记忆记录到 records 表。"""
         with self._tx() as conn:
             self._insert_record(conn, record)
+        self._append_jsonl(self.records_bak_path, record)
 
     def append_decision(self, decision: DecisionEvent) -> None:
         """追加决策事件。"""
         with self._tx() as conn:
             self._insert_decision(conn, decision)
+        self._append_jsonl(self.decisions_bak_path, decision)
 
     def append_conflict(self, group: ConflictGroup) -> None:
         """追加冲突组。"""
         with self._tx() as conn:
             self._insert_conflict(conn, group)
+        self._append_jsonl(self.conflicts_bak_path, group)
 
     def append_quarantine(self, entry: QuarantineEntry) -> None:
         """追加隔离条目。"""
         with self._tx() as conn:
             self._insert_quarantine(conn, entry)
+        self._append_jsonl(self.quarantine_bak_path, entry)
 
     # ------------------------------------------------------------------
     # 读取
@@ -714,7 +745,20 @@ class SharedMemoryStore:
     # ------------------------------------------------------------------
 
     def _migrate_from_jsonl(self) -> None:
-        """检测旧 JSONL 文件并迁移到 SQLite，迁移后重命名为 .bak。"""
+        """检测旧 JSONL 文件并迁移到 SQLite，迁移后重命名为 .bak。
+
+        仅在 memory.db 为空（首次创建）时执行迁移。
+        如果 db 已有数据，JSONL 文件是备份格式，不迁移。
+        """
+        # 如果 db 已有 records，说明不是首次初始化，跳过迁移
+        try:
+            with self._db() as conn:
+                count = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+                if count > 0:
+                    return
+        except Exception:
+            pass
+
         jsonl_map = [
             ("records.jsonl", self._migrate_records_jsonl),
             ("events.jsonl", self._migrate_events_jsonl),

@@ -2,7 +2,7 @@
   <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard</h1>
+<h1 align="center">MemoryGuard v0.2.0</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -178,6 +178,32 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 - **Now:** local MCP backend, auto-organization, governance console, provider adapters, and rollback.
 - **Later:** enhanced governance signals such as decay, derivation, and governance reports. No committed date.
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
+
+## Changelog
+
+### v0.2.0 (2026-07-23)
+
+**重构记忆发布与回滚**:
+- 重构记忆 → 投影文件 → 目标文件的完整发布链路
+- 目标文件 hash 校验：发布后若目标文件被修改，禁止回滚（避免误伤后续修改）
+- 发布状态追踪：`applied_verified` / `rolled_back` / `published`
+- 回滚版本列表 UI：只展示真正可回滚的版本，清晰显示状态
+
+**UI/UX 改进**:
+- 回滚版本选择弹窗：radio 单选 + 确认按钮，替代 prompt 输入
+- 神经图谱：节点点击自动展开详情，操作反馈即时显示
+- 重构记忆自动确认写入：不再每个光点都需要手动接受
+
+**安全与稳定性**:
+- 目录可写性预检：发布前检查目标目录权限，避免 PermissionError
+- 备份校验：`existed_before=true` 时必须有 backup_path 存在
+- 目标文件存在性检查：文件不存在时给出明确原因
+
+**新增测试**:
+- 发布目标验证测试
+- 回滚状态判定测试
+- 投影模式测试
+- 安全测试
 
 ## Contributing
 
