@@ -43,6 +43,9 @@ def main() -> int:
         print("\n=== 1. 文档可在数据页读取但未自动进入记忆 ===")
         content = api.get_source_file_content(root_id, "team.md")
         all_pass &= _check("源文件可读", "MemoryGuard 共享事实源" in content.get("content", ""))
+        single = api.add_source(str(doc), SourceRootType.SELECTED_FILE.value, "team.md", confirmed=True)
+        single_content = api.get_source_file_content(single["root_id"], "team.md")
+        all_pass &= _check("单文件来源读取不重复拼接文件名", "MemoryGuard 共享事实源" in single_content.get("content", ""), f"result={single_content}")
         store = SharedMemoryStore(workspace, "doc-group")
         all_pass &= _check("萃取前共享记忆为空", len(store.list_records()) == 0)
 

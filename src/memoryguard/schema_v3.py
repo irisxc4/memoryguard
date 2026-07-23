@@ -175,6 +175,24 @@ class TakeoverState(str, Enum):
     PARTIAL = "partial"
 
 
+class LifecycleState(str, Enum):
+    """v3.2 改动包1：Agent 程序生命周期状态（与数据状态分离）。"""
+    INSTALLED = "installed"                    # 安装证据强 + 有数据
+    INSTALLED_NO_DATA = "installed_no_data"    # 安装证据强 + 无数据
+    DATA_ONLY = "data_only"                    # 无安装证据 + 有数据残留
+    UNCERTAIN = "uncertain"                    # 证据不完整 + 有数据
+    NOT_DETECTED = "not_detected"              # 无安装证据 + 无数据
+    IGNORED = "ignored"                        # 用户标记忽略
+
+
+class SupportLevel(str, Enum):
+    """v3.2 改动包1：Agent 支持等级。"""
+    A_FULL = "A"               # 安装、记忆位置、项目映射、解析器均经过 fixture 验证
+    B_PARTIAL = "B"            # 可发现本地文件，但项目映射或格式解析不完整
+    C_DISCOVERY_ONLY = "C"     # 只发现疑似目录，需要用户手动确认
+    D_IMPORT_ONLY = "D"        # 仅支持导入官方导出包
+
+
 # ---------------------------------------------------------------------------
 # v3.2 §3：MCP 记忆后端 + 治理层
 # ---------------------------------------------------------------------------
@@ -263,6 +281,7 @@ class MemorySurface:
     ingestion_policy: IngestionPolicy = IngestionPolicy.EXTRACT_CANDIDATES
     ownership: Ownership = Ownership.EXTERNAL_READ_ONLY
     target_role: TargetRole = TargetRole.NONE
+    evidence_role: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -274,6 +293,7 @@ class MemorySurface:
             "category": self.category.value,
             "ingestion_policy": self.ingestion_policy.value,
             "ownership": self.ownership.value, "target_role": self.target_role.value,
+            "evidence_role": self.evidence_role,
         }
 
     @classmethod
@@ -291,6 +311,7 @@ class MemorySurface:
             ingestion_policy=IngestionPolicy(data.get("ingestion_policy", "extract_candidates")),
             ownership=Ownership(data.get("ownership", "external_read_only")),
             target_role=TargetRole(data.get("target_role", "none")),
+            evidence_role=data.get("evidence_role", ""),
         )
 
 
@@ -307,6 +328,12 @@ class AgentProfile:
     surfaces: list[MemorySurface] = field(default_factory=list)
     target_capability: TargetCapability = TargetCapability.EXPORT_ONLY
     evidence_urls: list[str] = field(default_factory=list)
+    # v3.2 改动包1：声明式安装探针
+    install_probes: list[dict[str, Any]] = field(default_factory=list)
+    # v3.2 改动包1：支持等级
+    support_level: SupportLevel = SupportLevel.C_DISCOVERY_ONLY
+    # v3.2 改动包1：项目解析器声明
+    project_resolvers: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -318,6 +345,9 @@ class AgentProfile:
             "surfaces": [s.to_dict() for s in self.surfaces],
             "target_capability": self.target_capability.value,
             "evidence_urls": list(self.evidence_urls),
+            "install_probes": list(self.install_probes),
+            "support_level": self.support_level.value,
+            "project_resolvers": list(self.project_resolvers),
         }
 
     @classmethod
@@ -331,6 +361,9 @@ class AgentProfile:
             surfaces=[MemorySurface.from_dict(s) for s in data.get("surfaces", [])],
             target_capability=TargetCapability(data.get("target_capability", "export_only")),
             evidence_urls=list(data.get("evidence_urls", [])),
+            install_probes=list(data.get("install_probes", [])),
+            support_level=SupportLevel(data.get("support_level", "C")),
+            project_resolvers=list(data.get("project_resolvers", [])),
         )
 
 
@@ -348,6 +381,11 @@ class AgentInstance:
     config_root: str = ""
     surfaces: list[dict[str, Any]] = field(default_factory=list)  # 探测结果，含 status/path
     target_capability: TargetCapability = TargetCapability.EXPORT_ONLY
+    # v3.2 改动包1：生命周期评估
+    lifecycle_state: str = "not_detected"  # LifecycleState.value
+    install_confidence: float = 0.0
+    support_level: str = "C"  # SupportLevel.value
+    last_activity_at: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -357,6 +395,10 @@ class AgentInstance:
             "workspace": self.workspace, "config_root": self.config_root,
             "surfaces": list(self.surfaces),
             "target_capability": self.target_capability.value,
+            "lifecycle_state": self.lifecycle_state,
+            "install_confidence": self.install_confidence,
+            "support_level": self.support_level,
+            "last_activity_at": self.last_activity_at,
         }
 
 
@@ -375,6 +417,47 @@ class DiscoveryEntry:
             "profile_id": self.profile_id, "surface_id": self.surface_id,
             "status": self.status.value, "resolved_path": self.resolved_path,
             "reason": self.reason,
+        }
+
+
+@dataclass
+class DiscoveryObject:
+    """v3.2 改动包1：稳定的发现对象，不再用路径做主键。"""
+    discovery_object_id: str    # hash(instance_id, surface_id, canonical_path, object_locator)
+    instance_id: str
+    surface_id: str
+    canonical_path: str
+    scope: str                  # user / project / unknown
+    scope_source: str           # profile_declared / project_resolver / fallback
+    project_ref: str            # 项目引用，无法确认时为空
+    content_type: str           # SourceCategory.value
+    read_strategy: str          # IngestionPolicy.value
+    default_selected: bool
+    default_reason: str         # 默认选中/不选中的原因
+    confidence: float
+    last_modified: str          # ISO 时间
+    is_backed_up: bool = False
+    is_authorized: bool = False
+    is_governed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "discovery_object_id": self.discovery_object_id,
+            "instance_id": self.instance_id,
+            "surface_id": self.surface_id,
+            "canonical_path": self.canonical_path,
+            "scope": self.scope,
+            "scope_source": self.scope_source,
+            "project_ref": self.project_ref,
+            "content_type": self.content_type,
+            "read_strategy": self.read_strategy,
+            "default_selected": self.default_selected,
+            "default_reason": self.default_reason,
+            "confidence": self.confidence,
+            "last_modified": self.last_modified,
+            "is_backed_up": self.is_backed_up,
+            "is_authorized": self.is_authorized,
+            "is_governed": self.is_governed,
         }
 
 
@@ -429,6 +512,10 @@ class SelectionEntry:
     target_role: TargetRole
     selected: bool = True
     file_level: list[dict[str, Any]] = field(default_factory=list)  # 细化到文件级
+    scope: str = "project"           # user / project / unknown
+    scope_source: str = "fallback"   # profile_declared / project_resolver / fallback
+    project_ref: str = ""
+    discovery_object_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -437,7 +524,25 @@ class SelectionEntry:
             "ingestion_policy": self.ingestion_policy.value,
             "ownership": self.ownership.value, "target_role": self.target_role.value,
             "selected": self.selected, "file_level": list(self.file_level),
+            "scope": self.scope, "scope_source": self.scope_source,
+            "project_ref": self.project_ref, "discovery_object_id": self.discovery_object_id,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SelectionEntry":
+        return cls(
+            surface_id=data["surface_id"], resolved_path=data["resolved_path"],
+            category=SourceCategory(data.get("category", "unknown")),
+            ingestion_policy=IngestionPolicy(data.get("ingestion_policy", "extract_candidates")),
+            ownership=Ownership(data.get("ownership", "external_read_only")),
+            target_role=TargetRole(data.get("target_role", "none")),
+            selected=data.get("selected", True),
+            file_level=list(data.get("file_level", [])),
+            scope=data.get("scope", "project"),
+            scope_source=data.get("scope_source", "fallback"),
+            project_ref=data.get("project_ref", ""),
+            discovery_object_id=data.get("discovery_object_id", ""),
+        )
 
 
 @dataclass
@@ -508,6 +613,10 @@ class SourceRoot:
     ingestion_policy: str = "extract_candidates"  # IngestionPolicy.value
     ownership: str = "external_read_only"  # Ownership.value
     target_role: str = "none"             # TargetRole.value
+    # v3.2 改动包1：作用域来源和项目引用
+    scope_source: str = "fallback"  # profile_declared / project_resolver / fallback
+    project_ref: str = ""           # 项目引用
+    discovery_object_id: str = ""   # 关联的发现对象 ID
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -522,6 +631,9 @@ class SourceRoot:
             "source_category": self.source_category,
             "ingestion_policy": self.ingestion_policy,
             "ownership": self.ownership, "target_role": self.target_role,
+            "scope_source": self.scope_source,
+            "project_ref": self.project_ref,
+            "discovery_object_id": self.discovery_object_id,
         }
 
     @classmethod
@@ -542,6 +654,9 @@ class SourceRoot:
             ingestion_policy=data.get("ingestion_policy", "extract_candidates"),
             ownership=data.get("ownership", "external_read_only"),
             target_role=data.get("target_role", "none"),
+            scope_source=data.get("scope_source", "fallback"),
+            project_ref=data.get("project_ref", ""),
+            discovery_object_id=data.get("discovery_object_id", ""),
         )
 
 
@@ -687,6 +802,9 @@ class MemoryRecord:
     title: str
     body: str
     scope: str = "project"
+    original_title: str = ""
+    original_body: str = ""
+    display_language: str = "zh"
     confidence: float = 0.5
     provenance: list[Provenance] = field(default_factory=list)
     status: MemoryStatus = MemoryStatus.CANDIDATE
@@ -697,6 +815,9 @@ class MemoryRecord:
         return {
             "memory_id": self.memory_id, "kind": self.kind.value,
             "title": self.title, "body": self.body, "scope": self.scope,
+            "original_title": self.original_title,
+            "original_body": self.original_body,
+            "display_language": self.display_language,
             "confidence": self.confidence,
             "provenance": [p.to_dict() for p in self.provenance],
             "status": self.status.value, "completeness": self.completeness.value,

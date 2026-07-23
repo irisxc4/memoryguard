@@ -157,24 +157,22 @@ def _is_within_cwd_or_explicit(workspace: Path, args: argparse.Namespace) -> boo
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    """按 spec §6.1 降级链打开报告。
+    """按 spec §6.1 降级链打开治理面板。
 
     顺序: 桌面原生窗口 -> localhost 浏览器 -> 静态 HTML 文件 -> 文本+JSON 路径
     退出码: 0 成功, 1 无报告, 3 所有 GUI 能力不可用（已降级到文本）
     """
     workspace = Path(args.path).resolve()
-    html_path = workspace / REPORTS_DIR / "report.html"
-    json_path = workspace / REPORTS_DIR / "report.json"
-    if not html_path.exists():
-        print(f"error: no report found. run `memoryguard audit {args.path}` first.", file=sys.stderr)
-        return 1
-
-    html_content = html_path.read_text(encoding="utf-8")
     mode = getattr(args, "mode", "auto")
 
-    # --mode html 跳过窗口，直接静态文件
+    from .interactive import render_interactive_html
+    interactive_html = render_interactive_html()
+
     if mode == "html":
-        return _open_static_html(html_path)
+        ui_path = workspace / ".memoryguard" / "ui" / "index.html"
+        ui_path.parent.mkdir(parents=True, exist_ok=True)
+        ui_path.write_text(interactive_html, encoding="utf-8")
+        return _open_static_html(ui_path)
 
     # 1. 桌面原生窗口（pywebview 可选依赖）
     if mode in ("auto", "native"):
@@ -192,12 +190,15 @@ def cmd_open(args: argparse.Namespace) -> int:
         from .gui import open_localhost_window
 
         print("opening localhost window (press Ctrl+C to close)...")
-        rc, url = open_localhost_window(html_content, auto_open=True)
+        rc, url = open_localhost_window(str(workspace), auto_open=True)
         if rc == 0:
             return 0
 
     # 3. 静态 HTML 文件（webbrowser.open file://）
-    return _open_static_html(html_path)
+    ui_path = workspace / ".memoryguard" / "ui" / "index.html"
+    ui_path.parent.mkdir(parents=True, exist_ok=True)
+    ui_path.write_text(interactive_html, encoding="utf-8")
+    return _open_static_html(ui_path)
 
 
 def _open_static_html(html_path: Path) -> int:
@@ -865,6 +866,25 @@ def cmd_mcp_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_desktop(args: argparse.Namespace) -> int:
+    """启动 MemoryGuard Desktop Executor（可信执行端）。"""
+    from .desktop_executor import main as desktop_main
+    argv = []
+    if getattr(args, "workspace", "."):
+        argv.append(args.workspace)
+    if getattr(args, "auto_confirm", False):
+        argv.append("--auto-confirm")
+    if getattr(args, "watch", False):
+        argv.append("--watch")
+    if getattr(args, "request", ""):
+        argv.extend(["--request", args.request])
+    if getattr(args, "uri", ""):
+        argv.extend(["--uri", args.uri])
+    if getattr(args, "register_uri", False):
+        argv.append("--register-uri")
+    return desktop_main(argv)
+
+
 # ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
@@ -958,7 +978,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp_status.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_mcp_status.set_defaults(func=cmd_mcp_status)
 
+    p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
+    p_desktop.add_argument("-w", "--workspace", default=".", help="workspace path")
+    p_desktop.add_argument("--auto-confirm", action="store_true", help="skip confirmation (testing only)")
+    p_desktop.add_argument("--watch", action="store_true", help="continuously poll for new requests")
+    p_desktop.add_argument("--request", default="", help="process a specific request ID")
+    p_desktop.add_argument("--uri", default="", help="launch from memoryguard:// URI")
+    p_desktop.add_argument("--register-uri", action="store_true", help="register memoryguard:// URI protocol")
+    p_desktop.set_defaults(func=cmd_desktop)
+
     return parser
+
+
+def gui_main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    workspace = Path(argv[0] if argv else ".").resolve()
+    from .gui import has_native_gui, open_interactive_window
+    if has_native_gui():
+        return open_interactive_window(str(workspace), title=f"MemoryGuard - {workspace.name}")
+    report = run_audit(workspace)
+    out_dir = workspace / REPORTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = out_dir / "report.html"
+    html_path.write_text(render_html_report(report), encoding="utf-8")
+    webbrowser.open(html_path.resolve().as_uri())
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

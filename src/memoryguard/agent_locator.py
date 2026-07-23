@@ -232,6 +232,7 @@ class AgentLocator:
                 "ownership": surface.ownership.value,
                 "target_role": surface.target_role.value,
                 "classification_confidence": surface.classification_confidence,
+                "evidence_role": surface.evidence_role,
             })
         instance = AgentInstance(
             instance_id=instance_id,
@@ -249,26 +250,54 @@ class AgentLocator:
         return instance, ledger
 
     def get_selection_tree(self, instance_id: str) -> dict[str, Any]:
-        """v3.1 §4.3 返回分类勾选树。
+        """v3.2 改动包1：返回作用域优先的分类勾选树。
 
-        结构：
+        结构从按 category 分组改为按 scope -> project_ref -> category 三层分组：
         {
           "instance_id": ...,
           "profile_id": ...,
-          "categories": [
+          "product": ...,
+          "scopes": [
             {
-              "category": "native_memory",
-              "files": [
+              "scope": "user",
+              "scope_source": "profile_declared",
+              "categories": [
                 {
-                  "path": "/abs/path",
-                  "surface_id": "...",
-                  "ingestion_policy": "import_verbatim",
-                  "ownership": "agent_managed",
-                  "target_role": "takeover_input",
-                  "default_selected": True,
-                  "status": "found"
+                  "category": "native_memory",
+                  "files": [
+                    {
+                      "path": "/abs/path",
+                      "surface_id": "...",
+                      "scope": "user",
+                      "scope_source": "profile_declared",
+                      "project_ref": "",
+                      "discovery_object_id": "...",
+                      "ingestion_policy": "import_verbatim",
+                      "ownership": "agent_managed",
+                      "target_role": "takeover_input",
+                      "default_selected": True,
+                      "default_reason": "原生记忆默认选中",
+                      "status": "found",
+                      "confidence": 0.95,
+                      "last_modified": "..."
+                    }
+                  ]
                 }
               ]
+            },
+            {
+              "scope": "project",
+              "projects": [
+                {
+                  "project_ref": "MemoryGuard",
+                  "scope_source": "project_resolver",
+                  "categories": [...]
+                }
+              ]
+            },
+            {
+              "scope": "unknown",
+              "categories": [...]
             }
           ]
         }
@@ -277,31 +306,220 @@ class AgentLocator:
         instance = next((i for i in instances if i.instance_id == instance_id), None)
         if instance is None:
             return {"error": f"instance not found: {instance_id}"}
-        # 按 category 分组
-        cat_map: dict[str, list[dict[str, Any]]] = {}
+
+        # 按 scope -> project_ref -> category 三层分组
+        scope_map: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+        # scope_map[scope][project_ref][category] = [files]
+
         for s in instance.surfaces:
             if s.get("status") != "found":
-                continue  # 只展示找到的表面
+                continue
+            scope = s.get("scope", "user")
             cat = s.get("category", "unknown")
-            cat_map.setdefault(cat, []).append({
-                "path": s["resolved_path"],
-                "surface_id": s["surface_id"],
-                "ingestion_policy": s.get("ingestion_policy", "extract_candidates"),
-                "ownership": s.get("ownership", "external_read_only"),
-                "target_role": s.get("target_role", "none"),
-                "default_selected": s.get("ingestion_policy") == "import_verbatim",
-                "status": s["status"],
-            })
-        categories = [
-            {"category": cat, "files": files}
-            for cat, files in cat_map.items()
-        ]
+            resolved = s.get("resolved_path", "")
+
+            # 项目根目录展开：如果该 surface 是项目根目录，展开子目录
+            effective_surfaces = [s]
+            if self._is_project_root_surface(resolved):
+                expanded = self._expand_project_root(resolved, s)
+                if expanded:
+                    effective_surfaces = expanded
+
+            for es in effective_surfaces:
+                es_resolved = es.get("resolved_path", "")
+                # 项目归属：scope=project 时尝试从路径解析项目名
+                project_ref = ""
+                scope_source = "profile_declared"
+                if es.get("_expanded_project_ref"):
+                    project_ref = es["_expanded_project_ref"]
+                    scope_source = "project_resolver"
+                elif scope == "project":
+                    project_ref = self._resolve_project_ref(es_resolved)
+                    scope_source = "project_resolver" if project_ref else "fallback"
+                elif scope == "user":
+                    project_ref = ""
+                    scope_source = "profile_declared"
+                else:
+                    scope_source = "fallback"
+
+                es_scope = es.get("scope", scope)
+
+                # 生成稳定的 discovery_object_id
+                canonical_path = es_resolved.replace("\\", "/")
+                surface_id = es.get("surface_id", "")
+                dobj_id = stable_hash(instance_id, surface_id, canonical_path, "v1")
+
+                # 默认选中策略
+                ing = es.get("ingestion_policy", "extract_candidates")
+                default_selected = ing == "import_verbatim"
+                default_reason = self._default_selection_reason(ing, cat)
+
+                file_info = {
+                    "path": es_resolved,
+                    "surface_id": surface_id,
+                    "scope": es_scope,
+                    "scope_source": scope_source,
+                    "project_ref": project_ref,
+                    "discovery_object_id": dobj_id,
+                    "ingestion_policy": ing,
+                    "ownership": es.get("ownership", "external_read_only"),
+                    "target_role": es.get("target_role", "none"),
+                    "default_selected": default_selected,
+                    "default_reason": default_reason,
+                    "status": es.get("status", "found"),
+                    "confidence": es.get("classification_confidence", 0.5),
+                    "last_modified": "",
+                }
+
+                scope_map.setdefault(es_scope, {})
+                pr_key = project_ref or "_no_project"
+                scope_map[es_scope].setdefault(pr_key, {})
+                scope_map[es_scope][pr_key].setdefault(cat, [])
+                scope_map[es_scope][pr_key][cat].append(file_info)
+
+        # 构建返回结构
+        scopes_output = []
+        for scope in ["user", "project", "unknown"]:
+            if scope not in scope_map:
+                continue
+            projects = scope_map[scope]
+            if scope == "project":
+                # 按项目分组
+                project_list = []
+                for pr_key, cat_map in projects.items():
+                    project_ref = pr_key if pr_key != "_no_project" else ""
+                    categories = [
+                        {"category": cat, "files": files}
+                        for cat, files in cat_map.items()
+                    ]
+                    project_list.append({
+                        "project_ref": project_ref or "(未归属)",
+                        "scope_source": "project_resolver" if project_ref else "fallback",
+                        "categories": categories,
+                    })
+                scopes_output.append({
+                    "scope": scope,
+                    "scope_source": "project_resolver",
+                    "projects": project_list,
+                })
+            else:
+                # user / unknown 直接按 category 分组
+                cat_map = projects.get("_no_project", {})
+                categories = [
+                    {"category": cat, "files": files}
+                    for cat, files in cat_map.items()
+                ]
+                scopes_output.append({
+                    "scope": scope,
+                    "scope_source": "profile_declared" if scope == "user" else "fallback",
+                    "categories": categories,
+                })
+
         return {
             "instance_id": instance_id,
             "profile_id": instance.profile_id,
             "product": instance.product,
-            "categories": categories,
+            "scopes": scopes_output,
         }
+
+    def _resolve_project_ref(self, path: str) -> str:
+        """从路径尝试解析项目名。
+
+        规则：
+        - workspace 下的固定 Surface -> 项目名为 workspace 本身的名称
+        - ~/.claude/projects/<project_dir> -> 取 <project_dir>
+        - ~/.codex/sessions/<project_dir> -> 取 <project_dir>
+        - ~/.cursor/projects/<project_dir> -> 取 <project_dir>
+        - ~/.codeium/windsurf/memories/<project_dir> -> 取 <project_dir>
+        - ~/.trae-cn/memory/projects/<project_dir> -> 取 <project_dir>
+        - ~/.zcode/cli/agents/<project_dir> -> 取 <project_dir>
+        - 无法确认时返回空（进入 unknown）
+        """
+        if not path:
+            return ""
+        p = Path(path)
+        try:
+            ws = self.workspace.resolve()
+            pr = p.resolve()
+            # 真实父子路径判断，避免 C:\project 和 C:\project-old 误判
+            if pr == ws or ws in pr.parents:
+                return ws.name
+        except (ValueError, OSError):
+            pass
+        normalized = path.replace("\\", "/")
+        # 各 Agent 的项目目录模式
+        project_patterns = [
+            "/.claude/projects/",
+            "/.codex/sessions/",
+            "/.cursor/projects/",
+            "/.codeium/windsurf/memories/",
+            "/.trae-cn/memory/projects/",
+            "/.zcode/cli/agents/",
+            "/.trae-cn/work/",
+        ]
+        for pattern in project_patterns:
+            if pattern in normalized:
+                parts = normalized.split(pattern)
+                if len(parts) > 1 and parts[1]:
+                    # 取第一级目录名（可能后面还有子路径）
+                    segments = parts[1].split("/")
+                    if segments and segments[0]:
+                        return segments[0]
+        return ""
+
+    # 需要展开子目录的项目根目录模式
+    _PROJECT_ROOT_PATTERNS = [
+        "/.claude/projects",
+        "/.codex/sessions",
+        "/.cursor/projects",
+        "/.codeium/windsurf/memories",
+        "/.trae-cn/memory/projects",
+        "/.zcode/cli/agents",
+    ]
+
+    def _is_project_root_surface(self, resolved_path: str) -> bool:
+        """判断该 surface 路径是否是项目根目录（含多个项目子目录）。"""
+        if not resolved_path:
+            return False
+        normalized = resolved_path.replace("\\", "/")
+        for pattern in self._PROJECT_ROOT_PATTERNS:
+            if normalized.rstrip("/").endswith(pattern):
+                return True
+        return False
+
+    def _expand_project_root(self, resolved_path: str, surface: dict) -> list[dict]:
+        """展开项目根目录，为每个子目录生成一个 DiscoveryObject。
+
+        返回展开后的 surface 列表，每个带独立 project_ref 和 resolved_path。
+        """
+        root = Path(resolved_path)
+        if not root.exists() or not root.is_dir():
+            return []
+        expanded = []
+        for sub in sorted(root.iterdir()):
+            if not sub.is_dir():
+                continue
+            # 跳过隐藏目录和缓存目录
+            if sub.name.startswith(".") or sub.name.startswith("_"):
+                continue
+            expanded_surface = dict(surface)
+            expanded_surface["resolved_path"] = str(sub)
+            expanded_surface["surface_id"] = surface.get("surface_id", "") + ":" + sub.name
+            expanded_surface["_expanded_project_ref"] = sub.name
+            expanded.append(expanded_surface)
+        return expanded
+
+    @staticmethod
+    def _default_selection_reason(ingestion_policy: str, category: str) -> str:
+        """默认选中/不选中的原因。"""
+        reasons = {
+            "import_verbatim": "原生记忆默认选中，读取后仍需确认治理",
+            "extract_candidates": "普通文档需手动勾选",
+            "govern_only": "规则/指令文件默认治理，不自动萃取为事实",
+            "evidence_only": "运行证据仅用于评估，默认不选",
+            "ignore": "密钥/认证/缓存始终排除",
+        }
+        return reasons.get(ingestion_policy, "按策略处理")
 
     def save_discovery(self, instances: list[AgentInstance],
                        ledgers: dict[str, DiscoveryLedger]) -> Path:
@@ -324,6 +542,51 @@ class AgentLocator:
             encoding="utf-8",
         )
         return out_path
+
+    def validate_discovery_objects(self, instance_id: str,
+                                   discovery_object_ids: list[str]) -> dict[str, dict]:
+        """验证 discovery_object_id 是否属于当前 Agent 实例。
+
+        返回 {discovery_object_id: {valid: bool, file_info: dict|None, reason: str}}
+        """
+        tree = self.get_selection_tree(instance_id)
+        if "error" in tree:
+            return {dobj_id: {"valid": False, "file_info": None, "reason": "instance not found"} for dobj_id in discovery_object_ids}
+
+        server_index: dict[str, dict] = {}
+        for scope_obj in tree.get("scopes", []):
+            for proj in scope_obj.get("projects", []):
+                for cat in proj.get("categories", []):
+                    for f in cat.get("files", []):
+                        dobj_id = f.get("discovery_object_id", "")
+                        if dobj_id:
+                            info = dict(f)
+                            info["category"] = cat.get("category", "unknown")
+                            info["scope"] = scope_obj.get("scope", info.get("scope", "unknown"))
+                            info["scope_source"] = proj.get("scope_source", scope_obj.get("scope_source", info.get("scope_source", "fallback")))
+                            info["project_ref"] = proj.get("project_ref", info.get("project_ref", ""))
+                            server_index[dobj_id] = info
+            for cat in scope_obj.get("categories", []):
+                for f in cat.get("files", []):
+                    dobj_id = f.get("discovery_object_id", "")
+                    if dobj_id:
+                        info = dict(f)
+                        info["category"] = cat.get("category", "unknown")
+                        info["scope"] = scope_obj.get("scope", info.get("scope", "unknown"))
+                        info["scope_source"] = scope_obj.get("scope_source", info.get("scope_source", "fallback"))
+                        server_index[dobj_id] = info
+
+        result = {}
+        for dobj_id in discovery_object_ids:
+            if dobj_id not in server_index:
+                result[dobj_id] = {"valid": False, "file_info": None, "reason": "discovery_object_id not found in server snapshot"}
+            else:
+                f = server_index[dobj_id]
+                if f.get("status") != "found":
+                    result[dobj_id] = {"valid": False, "file_info": None, "reason": f"surface status is {f.get('status')}, not found"}
+                else:
+                    result[dobj_id] = {"valid": True, "file_info": f, "reason": ""}
+        return result
 
 
 def compute_takeover_state(instance: AgentInstance,

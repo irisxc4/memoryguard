@@ -180,6 +180,18 @@ def _codex_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
+        MemorySurface(
+            surface_id="codex_user_config",
+            path_template="%HOME%/.codex",
+            surface_role="control_surface",
+            scope="user", load_order=20,
+            loader_evidence="https://openai.com/index/introducing-codex/",
+            classification_confidence=0.90,
+            category=SourceCategory.CONTROL_SURFACE,
+            ingestion_policy=IngestionPolicy.GOVERN_ONLY,
+            ownership=Ownership.EXTERNAL_READ_ONLY,
+            target_role=TargetRole.NONE,
+        ),
     ]
     return AgentProfile(
         profile_id="codex@profile-1",
@@ -842,11 +854,30 @@ def _qoder_profile() -> AgentProfile:
 _BUILTIN_PROFILES: list[AgentProfile] = []
 
 
+def infer_surface_evidence_role(surface: MemorySurface) -> str:
+    if surface.evidence_role:
+        return surface.evidence_role
+    template = surface.path_template.replace("\\", "/")
+    if template.startswith("gui-only://"):
+        return "content_source"
+    if "%WORKSPACE%" in template or "%WORKSPACE_PARENT%" in template:
+        return "shared_surface"
+    if "%HOME%" in template or "%APPDATA%" in template:
+        return "private_data_evidence"
+    return "content_source"
+
+
+def apply_surface_evidence_roles(profile: AgentProfile) -> AgentProfile:
+    for surface in profile.surfaces:
+        surface.evidence_role = infer_surface_evidence_role(surface)
+    return profile
+
+
 def _load_builtins() -> None:
     global _BUILTIN_PROFILES
     if _BUILTIN_PROFILES:
         return
-    _BUILTIN_PROFILES = [
+    _BUILTIN_PROFILES = [apply_surface_evidence_roles(profile) for profile in [
         _claude_code_profile(),
         _codex_profile(),
         _cursor_profile(),
@@ -856,7 +887,7 @@ def _load_builtins() -> None:
         _lingma_profile(),
         _openclaw_profile(),
         _qoder_profile(),
-    ]
+    ]]
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +910,7 @@ class AgentProfileRegistry:
             for f in self.profiles_dir.glob("*.json"):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8"))
-                    profiles.append(AgentProfile.from_dict(data))
+                    profiles.append(apply_surface_evidence_roles(AgentProfile.from_dict(data)))
                 except (OSError, ValueError, KeyError):
                     continue  # 损坏 Profile 静默跳过
         return profiles

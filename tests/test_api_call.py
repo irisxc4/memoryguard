@@ -1,79 +1,60 @@
-"""调用 GovernanceApi 各方法，展示交互式面板背后的数据。"""
-import json
+"""GovernanceApi smoke tests."""
 from pathlib import Path
-from memoryguard.gui import GovernanceApi
+import sys
 
-ws = r"H:\ai\workspace\工具项目\memoryguard\tests\fixtures\workspace"
-api = GovernanceApi(ws)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-print("=" * 60)
-print("1. run_audit() - 全扫描 + 规则引擎")
-print("=" * 60)
-r = api.run_audit()
-print(f"  对象: {r['summary']['object_count']}, 问题: {len(r['findings'])}, 健康: {r['health_score']}")
-for f in r["findings"][:3]:
-    print(f"    [{f['severity']}] {f['rule_id']}: {f['evidence'][:60]}")
+from memoryguard.gui import GovernanceApi  # noqa: E402
 
-print()
-print("=" * 60)
-print("2. get_neuron_graph() - 光点神经树快照（核心）")
-print("=" * 60)
-g = api.get_neuron_graph()
-s = g["stats"]
-print(f"  记忆片段: {s['claim_count']}")
-print(f"  光点节点: {s['node_count']} (topic={s['topic_count']}, anchor={s['anchor_count']})")
-print(f"  状态: tentative={s['tentative_count']}, confirmed={s['confirmed_count']}")
-print(f"  边: {s['edge_count']}")
-print(f"  合并建议: {len(g['merge_suggestions'])}")
-print()
-print("  神经树节点:")
-for n in g["nodes"][:10]:
-    kind = n["node_kind"]
-    cnt = n.get("claim_count", 0)
-    decay = n.get("decay_score", 0)
-    print(f"    [{n['status']:9s}] {kind:14s} {n['label'][:30]:30s} claim={cnt} decay={decay:.2f}")
 
-print()
-print("=" * 60)
-print("3. 萃取的记忆片段（KnowledgeClaim）")
-print("=" * 60)
-for c in g["claims"][:8]:
-    print(f"  #{c['id']} [{c['memory_type']:12s}] {c['display_label'][:40]}")
-    print(f"     body: {c['body'][:60]}...")
-    print(f"     source: {c['source']}")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "workspace"
 
-print()
-print("=" * 60)
-print("4. 治理操作演示: promote_neuron (晋升一个 tentative)")
-print("=" * 60)
-tentative = [n for n in g["nodes"] if n["status"] == "tentative"]
-if tentative:
-    tid = tentative[0]["light_id"]
-    print(f"  晋升前: {tentative[0]['label']} (tentative)")
-    r = api.promote_neuron(tid)
-    print(f"  promote_neuron('{tid}') -> ok={r['ok']}")
-    # 找晋升后的节点
-    promoted = [n for n in r["snapshot"]["nodes"] if n["light_id"] == tid]
-    if promoted:
-        print(f"  晋升后: {promoted[0]['label']} ({promoted[0]['status']})")
-else:
-    print("  无 tentative 节点可晋升")
 
-print()
-print("=" * 60)
-print("5. 治理操作演示: dissolve_neuron (凋亡一个 topic)")
-print("=" * 60)
-topics = [n for n in g["nodes"] if n["node_kind"] == "topic" and n["status"] != "dissolved" and n["light_id"] != "main"]
-if topics:
-    did = topics[0]["light_id"]
-    print(f"  凋亡前: {topics[0]['label']} ({topics[0]['status']})")
-    r = api.dissolve_neuron(did)
-    print(f"  dissolve_neuron('{did}') -> ok={r['ok']}")
-    dissolved = [n for n in r["snapshot"]["nodes"] if n["light_id"] == did]
-    if dissolved:
-        print(f"  凋亡后: {dissolved[0]['label']} ({dissolved[0]['status']})")
+def test_run_audit_returns_report_summary() -> None:
+    api = GovernanceApi(str(FIXTURE_WORKSPACE))
 
-print()
-print("=" * 60)
-print("全部调用完成。交互式面板窗口仍在桌面运行，可点击操作。")
-print("=" * 60)
+    result = api.run_audit()
+
+    assert "summary" in result
+    assert "findings" in result
+    assert "health_score" in result
+    assert isinstance(result["findings"], list)
+
+
+def test_get_neuron_graph_supports_empty_projection() -> None:
+    api = GovernanceApi(str(FIXTURE_WORKSPACE))
+
+    graph = api.get_neuron_graph()
+
+    assert isinstance(graph, dict)
+    if graph.get("empty"):
+        assert "reason" in graph
+    else:
+        assert "stats" in graph
+        assert "nodes" in graph
+
+
+def test_pyproject_declares_windowed_gui_entry() -> None:
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "[project.gui-scripts]" in pyproject
+    assert 'memoryguard-gui = "memoryguard.cli:gui_main"' in pyproject
+    assert (PROJECT_ROOT / "MemoryGuard.pyw").exists()
+
+
+def test_gui_main_falls_back_to_static_html_without_localhost(monkeypatch, tmp_path) -> None:
+    from memoryguard import cli
+    from memoryguard import gui
+
+    opened = []
+    monkeypatch.setattr(gui, "has_native_gui", lambda: False)
+    monkeypatch.setattr(cli, "run_audit", lambda workspace: {"workspace": str(workspace)})
+    monkeypatch.setattr(cli, "render_html_report", lambda report: "<html>MemoryGuard</html>")
+    monkeypatch.setattr(cli.webbrowser, "open", lambda url: opened.append(url) or True)
+
+    result = cli.gui_main([str(tmp_path)])
+
+    assert result == 0
+    assert opened == [(tmp_path / ".memoryguard" / "reports" / "report.html").resolve().as_uri()]
+    assert (tmp_path / ".memoryguard" / "reports" / "report.html").exists()

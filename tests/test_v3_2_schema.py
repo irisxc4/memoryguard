@@ -34,7 +34,7 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
-def test_agent_binding_round_trip() -> bool:
+def test_agent_binding_round_trip() -> None:
     """AgentBinding to_dict -> from_dict 一致。"""
     original = AgentBinding(
         binding_id=stable_hash("binding", "agent-1", "group-1"),
@@ -56,10 +56,11 @@ def test_agent_binding_round_trip() -> bool:
         and restored.status == original.status
         and restored.redirect_paths == original.redirect_paths
     )
-    return _check("AgentBinding round-trip", ok)
+    _check("AgentBinding round-trip", ok)
+    assert ok, "AgentBinding round-trip"
 
 
-def test_memory_event_round_trip() -> bool:
+def test_memory_event_round_trip() -> None:
     """MemoryEvent to_dict -> from_dict 一致。"""
     original = MemoryEvent(
         event_id=stable_hash("event", "test", _now_iso()),
@@ -79,10 +80,11 @@ def test_memory_event_round_trip() -> bool:
         and restored.metadata == original.metadata
         and restored.auto_actions == original.auto_actions
     )
-    return _check("MemoryEvent round-trip", ok)
+    _check("MemoryEvent round-trip", ok)
+    assert ok, "MemoryEvent round-trip"
 
 
-def test_shared_memory_record_round_trip() -> bool:
+def test_shared_memory_record_round_trip() -> None:
     """SharedMemoryRecord to_dict -> from_dict 一致。"""
     original = SharedMemoryRecord(
         memory_id=stable_hash("mem", "test", _now_iso()),
@@ -115,10 +117,11 @@ def test_shared_memory_record_round_trip() -> bool:
         and restored.locked == original.locked
         and restored.agent_instance_id == original.agent_instance_id
     )
-    return _check("SharedMemoryRecord round-trip", ok)
+    _check("SharedMemoryRecord round-trip", ok)
+    assert ok, "SharedMemoryRecord round-trip"
 
 
-def test_conflict_group_round_trip() -> bool:
+def test_conflict_group_round_trip() -> None:
     """ConflictGroup to_dict -> from_dict 一致。"""
     original = ConflictGroup(
         group_id=stable_hash("conflict", _now_iso()),
@@ -135,10 +138,11 @@ def test_conflict_group_round_trip() -> bool:
         and restored.reason == original.reason
         and restored.status == original.status
     )
-    return _check("ConflictGroup round-trip", ok)
+    _check("ConflictGroup round-trip", ok)
+    assert ok, "ConflictGroup round-trip"
 
 
-def test_quarantine_entry_round_trip() -> bool:
+def test_quarantine_entry_round_trip() -> None:
     """QuarantineEntry to_dict -> from_dict 一致。"""
     original = QuarantineEntry(
         quarantine_id=stable_hash("quar", _now_iso()),
@@ -158,10 +162,11 @@ def test_quarantine_entry_round_trip() -> bool:
         and restored.original_content == original.original_content
         and restored.released == original.released
     )
-    return _check("QuarantineEntry round-trip", ok)
+    _check("QuarantineEntry round-trip", ok)
+    assert ok, "QuarantineEntry round-trip"
 
 
-def test_enum_values() -> bool:
+def test_enum_values() -> None:
     """验证 v3.2 枚举值。"""
     all_pass = True
     # DataPageMode
@@ -210,10 +215,10 @@ def test_enum_values() -> bool:
     all_pass &= _check("ExternalMCPLevel.L4",
                        ExternalMCPLevel.L4_MEMORYGUARD_MCP.value == "L4_memoryguard_mcp")
 
-    return all_pass
+    assert all_pass
 
 
-def test_supersede_chain() -> bool:
+def test_supersede_chain() -> None:
     """验证覆盖链：old.status=SHADOWED, new.supersedes=[old_id]。"""
     old_mem = SharedMemoryRecord(
         memory_id="old-1",
@@ -236,28 +241,24 @@ def test_supersede_chain() -> bool:
         and new_mem.supersedes == ["old-1"]
         and new_mem.kind == MemoryKind.CORRECTION
     )
-    return _check("supersede chain (old=shadowed, new.supersedes=[old_id])", ok)
+    _check("supersede chain (old=shadowed, new.supersedes=[old_id])", ok)
+    assert ok, "supersede chain (old=shadowed, new.supersedes=[old_id])"
 
 
 def main() -> int:
     print("=== v3.2 Schema Round-Trip Tests ===\n")
-    all_pass = True
-    all_pass &= test_enum_values()
+    test_enum_values()
     print()
-    all_pass &= test_agent_binding_round_trip()
-    all_pass &= test_memory_event_round_trip()
-    all_pass &= test_shared_memory_record_round_trip()
-    all_pass &= test_conflict_group_round_trip()
-    all_pass &= test_quarantine_entry_round_trip()
-    all_pass &= test_supersede_chain()
+    test_agent_binding_round_trip()
+    test_memory_event_round_trip()
+    test_shared_memory_record_round_trip()
+    test_conflict_group_round_trip()
+    test_quarantine_entry_round_trip()
+    test_supersede_chain()
 
     print("\n" + "=" * 50)
-    if all_pass:
-        print("All v3.2 schema tests PASSED")
-        return 0
-    else:
-        print("Some tests FAILED")
-        return 1
+    print("All v3.2 schema tests PASSED")
+    return 0
 
 
 if __name__ == "__main__":

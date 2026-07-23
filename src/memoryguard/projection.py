@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .memory_ir import MemoryIR
-from .schema_v3 import MemoryStatus, stable_hash, _now_iso
+from .schema_v3 import DuplicateDecision, MemoryStatus, stable_hash, _now_iso
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,16 @@ class ProjectionNode:
     kind: str = ""  # MemoryKind
     provenance_count: int = 0
     bg: str = "#5b8def"
+    title: str = ""
+    body: str = ""
+    original_title: str = ""
+    original_body: str = ""
+    display_language: str = "zh"
+    scope: str = ""
+    confidence: float = 0.0
+    completeness: str = ""
+    cluster_count: int = 0
+    member_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,6 +58,11 @@ class ProjectionNode:
             "node_kind": self.node_kind, "status": self.status,
             "memory_id": self.memory_id, "kind": self.kind,
             "provenance_count": self.provenance_count, "bg": self.bg,
+            "title": self.title, "body": self.body,
+            "original_title": self.original_title, "original_body": self.original_body,
+            "display_language": self.display_language, "scope": self.scope,
+            "confidence": self.confidence, "completeness": self.completeness,
+            "cluster_count": self.cluster_count, "member_ids": list(self.member_ids),
         }
 
 
@@ -126,9 +141,11 @@ KIND_COLORS = {
 class ProjectionBuilder:
     """从 Memory IR + DecisionLog 重建神经图投影。"""
 
-    def __init__(self, workspace: str | Path):
+    def __init__(self, workspace: str | Path, mode: str = "reconstructed"):
         self.workspace = Path(workspace).resolve()
-        self.proj_path = self.workspace / ".memoryguard" / "projections" / "neuron.json"
+        mode_name = "native" if mode == "native" else "reconstructed"
+        self.mode = mode_name
+        self.proj_path = self.workspace / ".memoryguard" / "projections" / f"{mode_name}.json"
 
     def build(self, ir: MemoryIR, meta: dict[str, Any] | None = None) -> NeuronProjection:
         """从 IR 构建投影。不自动晋升/凋亡。
@@ -145,23 +162,64 @@ class ProjectionBuilder:
             id=root_id, parent_id="", label="Memory Root", node_kind="root",
         ))
 
-        # 按 kind 分组为 topic 节点
+        records_by_id = {rec.memory_id: rec for rec in ir.records if rec.status != MemoryStatus.REJECTED}
+        cluster_members: dict[str, list[str]] = {}
+        clustered_ids: set[str] = set()
+        for grp in ir.duplicate_groups:
+            if grp.decision == DuplicateDecision.KEEP_ALL:
+                continue
+            members = [mid for mid in grp.member_ids if mid in records_by_id]
+            if len(members) < 2:
+                continue
+            kinds = {records_by_id[mid].kind.value for mid in members}
+            if len(kinds) != 1:
+                continue
+            cluster_id = "cluster-" + stable_hash(grp.group_id, *members)[:12]
+            cluster_members[cluster_id] = members
+            clustered_ids.update(members)
+
         kind_groups: dict[str, list[str]] = {}
-        for rec in ir.records:
-            if rec.status == MemoryStatus.REJECTED:
-                continue  # 被拒绝的不显示
+        for rec in records_by_id.values():
             kind_groups.setdefault(rec.kind.value, []).append(rec.memory_id)
 
-        # topic 节点
         for kind, record_ids in kind_groups.items():
             topic_id = "topic-" + kind
             nodes.append(ProjectionNode(
                 id=topic_id, parent_id=root_id, label=kind, node_kind="topic",
                 bg=KIND_COLORS.get(kind, "#5b8def"),
             ))
-            # claim_anchor 节点
+            for cluster_id, member_ids in cluster_members.items():
+                if records_by_id[member_ids[0]].kind.value != kind:
+                    continue
+                member_records = [records_by_id[mid] for mid in member_ids]
+                primary = member_records[0]
+                title = primary.title or primary.memory_id[:8]
+                body = "\n".join(
+                    f"- {(rec.title or rec.memory_id[:8])}: {rec.body[:160]}"
+                    for rec in member_records
+                )
+                provenance_count = sum(len(rec.provenance) for rec in member_records)
+                avg_confidence = sum(rec.confidence for rec in member_records) / len(member_records)
+                nodes.append(ProjectionNode(
+                    id=cluster_id, parent_id=topic_id, label=f"{title} 等 {len(member_records)} 条",
+                    node_kind="duplicate_cluster", memory_id=primary.memory_id,
+                    kind=kind, provenance_count=provenance_count,
+                    bg=KIND_COLORS.get(kind, "#5b8def"),
+                    title=f"相似片段组：{title}", body=body,
+                    original_title=primary.original_title, original_body=primary.original_body,
+                    display_language=primary.display_language, scope=primary.scope,
+                    confidence=avg_confidence, completeness=primary.completeness.value,
+                    cluster_count=len(member_records), member_ids=member_ids,
+                ))
+                edges.append(ProjectionEdge(
+                    id="e-" + stable_hash(cluster_id, topic_id),
+                    source=topic_id, target=cluster_id,
+                    edge_type="derived_from",
+                ))
             for rid in record_ids:
-                rec = next((r for r in ir.records if r.memory_id == rid), None)
+                if rid in clustered_ids:
+                    continue
+                rec = records_by_id.get(rid)
                 if not rec:
                     continue
                 node_id = "claim-" + rid[:12]
@@ -171,30 +229,23 @@ class ProjectionBuilder:
                     node_kind="claim_anchor", memory_id=rid,
                     kind=rec.kind.value, provenance_count=len(rec.provenance),
                     bg=KIND_COLORS.get(rec.kind.value, "#5b8def"),
+                    title=rec.title, body=rec.body,
+                    original_title=rec.original_title, original_body=rec.original_body,
+                    display_language=rec.display_language, scope=rec.scope,
+                    confidence=rec.confidence, completeness=rec.completeness.value,
                 ))
-                # derived_from 边
                 edges.append(ProjectionEdge(
                     id="e-" + stable_hash(node_id, topic_id),
                     source=topic_id, target=node_id,
                     edge_type="derived_from",
                 ))
 
-        # 重复组边
-        for grp in ir.duplicate_groups:
-            if len(grp.member_ids) < 2:
-                continue
-            for i in range(1, len(grp.member_ids)):
-                src = "claim-" + grp.member_ids[0][:12]
-                tgt = "claim-" + grp.member_ids[i][:12]
-                edges.append(ProjectionEdge(
-                    id="e-dup-" + stable_hash(src, tgt),
-                    source=src, target=tgt, edge_type="duplicate",
-                ))
-
+        projection_meta = dict(meta or {})
+        projection_meta["projection_mode"] = self.mode
         proj = NeuronProjection(
             snapshot_id=ir.snapshot_id, built_at=_now_iso(),
             nodes=nodes, edges=edges,
-            meta=dict(meta) if meta else {},
+            meta=projection_meta,
         )
         # v3.1 §6.3：确定性 content_hash（不含 built_at 和 meta，仅基于图结构）
         proj.content_hash = self._compute_content_hash(proj)
@@ -212,15 +263,26 @@ class ProjectionBuilder:
     def save(self, proj: NeuronProjection) -> None:
         """持久化到 .memoryguard/projections/neuron.json。"""
         self.proj_path.parent.mkdir(parents=True, exist_ok=True)
+        tombstone = self.proj_path.with_suffix(self.proj_path.suffix + ".deleted")
+        if tombstone.exists():
+            tombstone.unlink()
         self.proj_path.write_text(
             json.dumps(proj.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8")
 
     def load(self) -> NeuronProjection | None:
-        if not self.proj_path.exists():
+        tombstone = self.proj_path.with_suffix(self.proj_path.suffix + ".deleted")
+        if tombstone.exists():
+            return None
+        path = self.proj_path
+        if not path.exists() and self.mode == "reconstructed":
+            legacy_path = self.workspace / ".memoryguard" / "projections" / "neuron.json"
+            if legacy_path.exists():
+                path = legacy_path
+        if not path.exists():
             return None
         try:
-            data = json.loads(self.proj_path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             return NeuronProjection(
                 snapshot_id=data.get("snapshot_id", ""),
                 built_at=data.get("built_at", ""),
@@ -234,8 +296,14 @@ class ProjectionBuilder:
 
     def delete(self) -> None:
         """删除投影（可从 IR + decisions 重建）。"""
+        self.proj_path.parent.mkdir(parents=True, exist_ok=True)
         if self.proj_path.exists():
             self.proj_path.unlink()
+        if self.mode == "reconstructed":
+            legacy_path = self.workspace / ".memoryguard" / "projections" / "neuron.json"
+            if legacy_path.exists():
+                legacy_path.unlink()
+        self.proj_path.with_suffix(self.proj_path.suffix + ".deleted").write_text("deleted", encoding="utf-8")
 
     def get_or_empty(self) -> dict[str, Any]:
         """GUI API 用：未构建时返回 empty 状态。"""

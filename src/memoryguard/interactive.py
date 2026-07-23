@@ -45,7 +45,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; }
 body {
-  position: relative; overflow: hidden; display: flex; flex-direction: column;
+  position: relative; overflow: hidden;
   background:
     radial-gradient(circle at 14% 12%, rgba(48, 170, 133, 0.10), transparent 30rem),
     radial-gradient(circle at 84% 82%, rgba(78, 150, 125, 0.07), transparent 34rem),
@@ -73,17 +73,17 @@ code {
 ::-webkit-scrollbar-thumb { background: rgba(110, 231, 196, .22); border-radius: 8px; }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* 顶部：品牌本身就是一个活跃神经元 */
-.header {
-  position: relative; z-index: 10; min-height: 72px; padding: 0 28px;
-  display: flex; align-items: center; justify-content: space-between; gap: 24px;
-  border-bottom: 1px solid var(--line); background: rgba(4, 11, 9, .80);
+/* 三栏布局：侧栏 + 主工作区 + 状态栏 */
+.app-shell { display: flex; height: 100%; overflow: hidden; }
+
+/* 左侧导航 224px */
+.sidebar {
+  position: relative; z-index: 10; width: 224px; flex: none;
+  display: flex; flex-direction: column; padding: 18px 0;
+  border-right: 1px solid var(--line); background: rgba(4, 11, 9, .88);
   backdrop-filter: blur(20px);
 }
-.header-left, .header-right, .brand { display: flex; align-items: center; }
-.header-left { gap: 20px; min-width: 0; }
-.header-right { gap: 12px; flex: none; }
-.brand { gap: 12px; }
+.sidebar-brand { display: flex; align-items: center; gap: 12px; padding: 0 20px 18px; }
 .brand-orb {
   position: relative; width: 28px; height: 28px; flex: none; border-radius: 50%;
   border: 1px solid rgba(188, 255, 235, .74);
@@ -98,12 +98,38 @@ code {
 .brand-orb::after { width: 15px; transform: rotate(150deg); }
 .brand-copy strong { display: block; font-size: 15px; letter-spacing: .06em; }
 .brand-copy span { display: block; color: var(--muted); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; }
-.ws-path {
-  max-width: min(42vw, 620px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--muted); font-size: 12px;
+.sidebar-nav { flex: 1; padding: 0 10px; overflow-y: auto; }
+.nav-section-label { padding: 14px 10px 6px; color: var(--faint); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
+.nav-item {
+  position: relative; display: flex; align-items: center; gap: 9px; padding: 9px 10px; margin-bottom: 2px;
+  color: var(--muted); cursor: pointer; font-size: 12px; border-radius: 8px; transition: all .16s ease;
 }
+.nav-item::before { content: ""; width: 5px; height: 5px; border: 1px solid var(--faint); border-radius: 50%; transition: all .16s ease; flex: none; }
+.nav-item:hover { color: var(--fg); background: rgba(110, 231, 196, .04); }
+.nav-item.active { color: var(--accent-bright); background: rgba(110, 231, 196, .10); }
+.nav-item.active::before { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+.nav-item .count { min-width: 18px; text-align: right; color: var(--faint); font-size: 10px; flex: 1; }
+.sidebar-footer { padding: 12px 20px 0; border-top: 1px solid var(--line); }
+.reader-toggle { display: grid; gap: 8px; margin-bottom: 12px; }
+.reader-toggle-label { color: var(--faint); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
+.reader-toggle-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.reader-toggle button { padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(110,231,196,.04); color: var(--muted); font-size: 11px; cursor: pointer; }
+.reader-toggle button.active { color: var(--accent-bright); border-color: rgba(110,231,196,.42); background: rgba(110,231,196,.12); }
+.local-badge { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.local-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+
+/* 主工作区 */
+.main-wrapper { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+.topbar {
+  position: relative; z-index: 9; min-height: 56px; padding: 0 24px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  border-bottom: 1px solid var(--line); background: rgba(4, 11, 9, .64); backdrop-filter: blur(14px);
+}
+.topbar-left { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex: none; }
+.ws-path { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .health-badge {
-  display: inline-flex; align-items: center; gap: 7px; padding: 6px 10px;
+  display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px;
   color: var(--fg); border: 1px solid var(--line); border-radius: 999px;
   background: rgba(110, 231, 196, .06); font-size: 12px; font-weight: 600;
 }
@@ -122,29 +148,55 @@ code {
 .btn-icon { min-width: 32px; padding: 5px 8px; }
 .btn:disabled { opacity: .38; cursor: not-allowed; transform: none; }
 
-/* Tab 是一条突触链，不使用胶囊导航 */
-.tab-bar {
-  position: relative; z-index: 9; min-height: 50px; padding: 0 28px;
-  display: flex; align-items: stretch; gap: 28px; border-bottom: 1px solid var(--line);
-  background: rgba(4, 11, 9, .64); backdrop-filter: blur(14px);
-}
-.tab {
-  position: relative; display: flex; align-items: center; gap: 8px; padding: 0 2px;
-  color: var(--muted); cursor: pointer; font-size: 12px; letter-spacing: .03em;
-  transition: color .18s ease;
-}
-.tab::before { content: ""; width: 5px; height: 5px; border: 1px solid var(--faint); border-radius: 50%; transition: all .18s ease; }
-.tab::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 1px; background: transparent; }
-.tab:hover { color: var(--fg); }
-.tab.active { color: var(--accent-bright); }
-.tab.active::before { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 12px var(--accent); }
-.tab.active::after { background: linear-gradient(90deg, transparent, var(--accent), transparent); box-shadow: 0 0 12px var(--accent); }
-.tab .count { min-width: 18px; color: var(--faint); font-size: 10px; }
-
 .content {
-  position: relative; z-index: 1; flex: 1; width: 100%; max-width: 1540px; margin: 0 auto;
-  overflow: auto; padding: 26px 28px 38px;
+  position: relative; z-index: 1; flex: 1; width: 100%;
+  overflow: auto; padding: 24px 28px 38px;
 }
+
+/* 右侧状态栏 280px */
+.status-rail {
+  width: 280px; flex: none; padding: 20px 18px; overflow-y: auto;
+  border-left: 1px solid var(--line); background: rgba(4, 11, 9, .72); backdrop-filter: blur(14px);
+}
+.status-rail h3 { margin-bottom: 14px; font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.status-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 12px; margin-bottom: 7px;
+  border: 1px solid var(--line); border-radius: 10px; background: rgba(110, 231, 196, .03);
+  cursor: pointer; transition: border-color .16s ease, background .16s ease, transform .16s ease;
+}
+.status-item:hover { border-color: var(--line-strong); background: rgba(110, 231, 196, .07); transform: translateX(-2px); }
+.status-item .status-label { color: var(--muted); font-size: 12px; }
+.status-item .status-num { font-size: 18px; font-weight: 560; color: var(--accent-bright); }
+.status-item.alert .status-num { color: var(--orange); }
+.status-item.danger .status-num { color: var(--red); }
+.status-item.zero .status-num { color: var(--faint); }
+.status-rail .rail-link { display: block; margin-top: 12px; padding: 8px 12px; color: var(--muted); font-size: 11px; border: 1px solid var(--line); border-radius: 8px; text-align: center; cursor: pointer; transition: all .16s ease; }
+.status-rail .rail-link:hover { color: var(--accent); border-color: var(--line-strong); }
+
+/* 概念图：Governance Flow 事件卡 */
+.flow-canvas { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+.flow-card {
+  position: relative; overflow: hidden; padding: 18px; min-height: 130px;
+  border: 1px solid var(--line); border-radius: 14px; cursor: pointer;
+  background: linear-gradient(145deg, rgba(15, 35, 29, .82), rgba(7, 18, 15, .78));
+  transition: border-color .16s ease, transform .16s ease;
+}
+.flow-card:hover { transform: translateY(-2px); }
+.flow-card::before { content: ""; position: absolute; top: 0; left: 0; width: 3px; height: 100%; }
+.flow-card.cyan::before { background: var(--accent); box-shadow: 0 0 14px var(--accent); }
+.flow-card.gray::before { background: var(--faint); }
+.flow-card.amber::before { background: var(--orange); box-shadow: 0 0 14px var(--orange); }
+.flow-card.red::before { background: var(--red); box-shadow: 0 0 14px var(--red); }
+.flow-card .flow-kicker { font-size: 9px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.flow-card.cyan .flow-kicker { color: var(--accent); }
+.flow-card.amber .flow-kicker { color: var(--orange); }
+.flow-card.red .flow-kicker { color: var(--red); }
+.flow-card .flow-title { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.flow-card .flow-body { color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.flow-card .flow-time { margin-top: 8px; color: var(--faint); font-size: 10px; }
+.flow-card.empty { cursor: default; }
+.flow-card.empty:hover { transform: none; }
+.flow-arrow { display: flex; align-items: center; justify-content: center; color: var(--faint); font-size: 20px; }
 .view-heading { margin-bottom: 18px; }
 .eyebrow { color: var(--accent); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; }
 .view-heading h2 { margin-top: 4px; font-size: 24px; font-weight: 560; letter-spacing: -.03em; }
@@ -200,6 +252,18 @@ code {
 .chip-medium { color: var(--orange); border-color: rgba(233,187,100,.28); }
 .chip-low, .chip-confirmed { color: var(--accent); }
 .chip-info, .chip-tentative { color: #9fc4b8; }
+.modal-backdrop { position: fixed; inset: 0; z-index: 2000; display: grid; place-items: center; padding: 22px; background: rgba(0,0,0,.58); backdrop-filter: blur(7px); }
+.modal-card { width: min(720px, 96vw); max-height: min(720px, 88vh); overflow: auto; border: 1px solid var(--line-strong); border-radius: 18px; background: rgba(5, 18, 14, .98); box-shadow: 0 24px 80px rgba(0,0,0,.48); }
+.modal-head { padding: 18px 20px 12px; border-bottom: 1px solid var(--line); }
+.modal-head h3 { margin: 0 0 6px; font-size: 18px; }
+.modal-head p { margin: 0; color: var(--muted); font-size: 12px; }
+.modal-body { padding: 14px 20px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px 18px; border-top: 1px solid var(--line); }
+.release-option { display: flex; gap: 12px; align-items: flex-start; padding: 12px 13px; margin-bottom: 9px; border: 1px solid var(--line); border-radius: 12px; cursor: pointer; background: rgba(255,255,255,.018); }
+.release-option:hover { border-color: var(--line-strong); background: rgba(110,231,196,.045); }
+.release-option input { margin-top: 3px; accent-color: var(--accent); }
+.release-title { font-weight: 700; font-size: 13px; }
+.release-meta { margin-top: 4px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .finding-item, .plan-item {
   position: relative; padding: 15px 16px 15px 22px; margin-bottom: 9px; cursor: pointer;
   border: 1px solid var(--line); border-radius: 11px; background: rgba(10, 26, 21, .70);
@@ -289,7 +353,7 @@ tbody tr:last-child td { border-bottom: 0; }
 
 /* 神经元画布 */
 .neuron-shell {
-  position: relative; min-height: calc(100vh - 188px); overflow: hidden;
+  position: relative; min-height: calc(100vh - 120px); overflow: hidden;
   border: 1px solid var(--line); border-radius: 18px;
   background: radial-gradient(circle at 50% 48%, rgba(37, 104, 83, .14), transparent 38%), rgba(3, 10, 8, .74);
   box-shadow: var(--shadow), inset 0 0 80px rgba(0, 0, 0, .30);
@@ -309,7 +373,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .neuron-title h2 { font-size: 18px; font-weight: 560; }
 .neuron-title p { margin-top: 4px; color: var(--muted); font-size: 11px; }
 .canvas-actions { display: flex; gap: 8px; }
-.neuron-stage { position: relative; width: 100%; height: calc(100vh - 188px); min-height: 610px; }
+.neuron-stage { position: relative; width: 100%; height: calc(100vh - 120px); min-height: 610px; }
 .neuron-canvas { position: absolute; inset: 0; }
 .neuron-stats {
   position: absolute; z-index: 11; left: 18px; bottom: 18px; max-width: calc(100% - 390px);
@@ -355,6 +419,7 @@ tbody tr:last-child td { border-bottom: 0; }
   transform: translateX(-50%) rotate(45deg); border-right: 1px solid rgba(110,231,196,.42); border-bottom: 1px solid rgba(110,231,196,.42); background: #071611;
 }
 .neuron-popover.below::after { top: -6px; bottom: auto; border: 0; border-left: 1px solid rgba(110,231,196,.42); border-top: 1px solid rgba(110,231,196,.42); }
+.neuron-detail-body { color: #d5ebe3; font-size: 12px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
 .popover-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; }
 .popover-head h3 { font-size: 15px; font-weight: 600; }
 .popover-kicker { color: var(--accent); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
@@ -377,21 +442,23 @@ tbody tr:last-child td { border-bottom: 0; }
 .toast.success { border-color: rgba(110,231,196,.52); }
 .toast.error { border-color: rgba(255,125,136,.55); }
 
+@media (max-width: 1024px) {
+  .status-rail { display: none; }
+}
 @media (max-width: 900px) {
-  .header { padding: 0 16px; }
+  .sidebar { width: 64px; }
+  .sidebar-brand .brand-copy, .nav-item .count, .nav-section-label, .sidebar-footer { display: none; }
+  .nav-item { justify-content: center; }
   .ws-path { display: none; }
-  .tab-bar { padding: 0 16px; gap: 18px; overflow-x: auto; }
-  .tab { flex: none; }
   .content { padding: 18px 16px 28px; }
-  .overview-hero, .overview-grid { grid-template-columns: 1fr; }
+  .overview-grid, .flow-canvas { grid-template-columns: 1fr; }
   .neuron-shell, .neuron-stage { min-height: 680px; height: calc(100vh - 170px); }
   .neuron-stats { max-width: calc(100% - 36px); bottom: 18px; right: 18px; }
   .merge-dock { right: 18px; bottom: 112px; }
 }
 @media (max-width: 620px) {
   .brand-copy span, .health-badge { display: none; }
-  .header-right .btn { padding-inline: 10px; }
-  .metrics { grid-template-columns: 1fr 1fr; }
+  .topbar-right .btn { padding-inline: 10px; }
   .neuron-title p, .neuron-legend { display: none; }
   .canvas-actions { flex-direction: column; }
   .merge-dock { width: calc(100% - 36px); max-height: 150px; bottom: 130px; }
@@ -438,40 +505,75 @@ tbody tr:last-child td { border-bottom: 0; }
   background: rgba(4,13,10,.78); color: #cce5dc; font-family: "JetBrains Mono", Consolas, "Courier New", monospace;
   font-size: 12px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 70vh; overflow: auto;
 }
+.source-map-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+.source-map-table { width: 100%; border-collapse: collapse; min-width: 980px; }
+.source-map-table th, .source-map-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 12px; }
+.source-map-table th { color: var(--muted); font-weight: 700; background: rgba(12,34,27,.72); }
+.source-map-table tr:last-child td { border-bottom: 0; }
+.path-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.muted-row { opacity: .58; }
 </style>
 </head>
 <body>
-<header class="header">
-  <div class="header-left">
-    <div class="brand" aria-label="MemoryGuard">
+<div class="app-shell">
+  <!-- 左侧导航 224px -->
+  <aside class="sidebar">
+    <div class="sidebar-brand">
       <span class="brand-orb" aria-hidden="true"></span>
-      <span class="brand-copy"><strong>MemoryGuard</strong><span>Local cognition control</span></span>
+      <span class="brand-copy"><strong>MemoryGuard</strong><span>Local governance</span></span>
     </div>
-    <span class="ws-path" id="ws-path">正在连接本地工作区…</span>
-  </div>
-  <div class="header-right">
-    <span class="health-badge" id="health-badge">健康度 --</span>
-    <button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button>
-  </div>
-</header>
+    <nav class="sidebar-nav" role="tablist" aria-label="治理模块">
+      <div class="nav-section-label">治理视图</div>
+      <div class="nav-item active" role="tab" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源<span class="count" id="sources-count"></span></div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号<span class="count" id="findings-count"></span></div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="releases" onclick="switchTab('releases')">变更记录<span class="count" id="releases-count"></span></div>
+      <div class="nav-section-label">操作</div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="governance" onclick="switchTab('governance')">治理台</div>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="reader-toggle">
+        <div class="reader-toggle-label">阅读语言</div>
+        <div class="reader-toggle-buttons">
+          <button type="button" id="reader-zh" class="active" onclick="setReaderLanguage('zh')">中文</button>
+          <button type="button" id="reader-original" onclick="setReaderLanguage('original')">原文</button>
+        </div>
+      </div>
+      <span class="local-badge">Local only · No telemetry</span>
+    </div>
+  </aside>
 
-<nav class="tab-bar" role="tablist" aria-label="治理模块">
-  <div class="tab active" role="tab" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</div>
-  <div class="tab" role="tab" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源<span class="count" id="sources-count"></span></div>
-  <div class="tab" role="tab" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></div>
-  <div class="tab" role="tab" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号<span class="count" id="findings-count"></span></div>
-  <div class="tab" role="tab" tabindex="0" data-tab="releases" onclick="switchTab('releases')">变更记录<span class="count" id="releases-count"></span></div>
-  <div class="tab" role="tab" tabindex="0" data-tab="governance" onclick="switchTab('governance')">治理台</div>
-</nav>
+  <!-- 主工作区 -->
+  <div class="main-wrapper">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="ws-path" id="ws-path">正在连接本地工作区…</span>
+      </div>
+      <div class="topbar-right">
+        <span class="health-badge" id="health-badge">健康度 --</span>
+        <button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button>
+      </div>
+    </header>
+    <main class="content" id="content"><div class="loading">正在建立本地治理视图</div></main>
+  </div>
 
-<main class="content" id="content"><div class="loading">正在建立本地治理视图</div></main>
+  <!-- 右侧状态栏 280px -->
+  <aside class="status-rail" id="status-rail">
+    <h3>治理状态</h3>
+    <div id="status-rail-content"><div class="loading" style="min-height:120px">连接中…</div></div>
+  </aside>
+</div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-let state = { report: null, activeTab: 'overview', plans: [], changes: [], releases: [], lastPlan: null };
+let state = { report: null, activeTab: 'overview', plans: [], changes: [], releases: [], lastPlan: null, governanceSnapshot: null };
 let neuronGraph = null;
+let projectionMode = localStorage.getItem('memoryguard.projectionMode') || 'native';
 let cyInstance = null;
 let selectedNeuronId = null;
+let selectedNeuronNode = null;
+let readerLanguage = localStorage.getItem('memoryguard.readerLanguage') || 'zh';
 let sourcesScope = 'all';      // 数据源 sub-tab: 'all' | 'user' | 'project'
 let discoveryResult = null;    // 缓存 discover_agents 结果
 let activeAgentInstanceId = '';  // v3.2：当前选中的 Agent 卡片
@@ -485,14 +587,108 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 }
 
-async function callApi(method, ...args) {
-  if (window.pywebview && window.pywebview.api) return await window.pywebview.api[method](...args);
-  const resp = await fetch('/api/' + method, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(args) });
-  if (!resp.ok) throw new Error('API ' + method + ' 返回 ' + resp.status);
+function setReaderLanguage(language) {
+  readerLanguage = language;
+  localStorage.setItem('memoryguard.readerLanguage', language);
+  document.getElementById('reader-zh')?.classList.toggle('active', language === 'zh');
+  document.getElementById('reader-original')?.classList.toggle('active', language === 'original');
+  renderStatusRail();
+}
+
+function displayTitle(item) {
+  if (readerLanguage === 'zh') return item.title_zh || item.zh_title || item.title || item.memory_id || '';
+  return item.original_title || item.title || item.title_zh || item.memory_id || '';
+}
+
+function displayBody(item) {
+  if (readerLanguage === 'zh') return item.body_zh || item.zh_summary || item.body || item.body_preview || '';
+  return item.original_body || item.body || item.body_zh || item.body_preview || '';
+}
+
+let MUTATION_METHODS = null;  // 从后端动态加载
+
+async function getMutationMethods() {
+  if (MUTATION_METHODS !== null) return MUTATION_METHODS;
+  try {
+    const registry = await callApiRaw('get_api_method_registry');
+    MUTATION_METHODS = new Set(registry.mutation || []);
+  } catch(e) {
+    MUTATION_METHODS = new Set();
+  }
+  return MUTATION_METHODS;
+}
+
+let _sandboxMode = null;
+
+async function isSandboxMode() {
+  if (_sandboxMode !== null) return _sandboxMode;
+  if (window.__MG_SANDBOX__ !== undefined) { _sandboxMode = window.__MG_SANDBOX__; return _sandboxMode; }
+  try {
+    const r = await callApiRaw('get_sandbox_status');
+    _sandboxMode = r.sandbox;
+  } catch(e) { _sandboxMode = false; }
+  return _sandboxMode;
+}
+
+async function callApiRaw(method, ...args) {
+  if (window.pywebview && window.pywebview.api) {
+    return await window.pywebview.api[method](...args);
+  }
+  const headers = {'Content-Type': 'application/json'};
+  if (window.__MG_SESSION__) headers['X-Session-Token'] = window.__MG_SESSION__;
+  const resp = await fetch('/api/' + method, { method: 'POST', headers, body: JSON.stringify(args) });
+  if (!resp.ok) {
+    const errBody = await resp.json().catch(() => ({}));
+    throw new Error(errBody.error || ('API ' + method + ' 返回 ' + resp.status));
+  }
   return await resp.json();
 }
 
+async function callApi(method, ...args) {
+  // pywebview 模式：通过 call_readonly / request_mutation 桥接
+  if (window.pywebview && window.pywebview.api) {
+    const mutMethods = await getMutationMethods();
+    if (mutMethods.has(method)) {
+      // 变更方法：走 request_mutation 桥接
+      const result = await window.pywebview.api.request_mutation(method, args);
+      if (result && result.deferred) {
+        showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
+      }
+      return result;
+    }
+    // 只读方法：走 call_readonly 桥接
+    return await window.pywebview.api.call_readonly(method, args);
+  }
+  // localhost 模式
+  const headers = {'Content-Type': 'application/json'};
+  if (window.__MG_SESSION__) headers['X-Session-Token'] = window.__MG_SESSION__;
+  const resp = await fetch('/api/' + method, { method: 'POST', headers, body: JSON.stringify(args) });
+  if (!resp.ok) {
+    const errBody = await resp.json().catch(() => ({}));
+    throw new Error(errBody.error || ('API ' + method + ' 返回 ' + resp.status));
+  }
+  const result = await resp.json();
+  if (result && result.deferred) {
+    showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
+  }
+  return result;
+}
+
+function waitForPywebview(timeoutMs) {
+  return new Promise((resolve) => {
+    if (window.pywebview && window.pywebview.api) return resolve(true);
+    let elapsed = 0;
+    const interval = setInterval(() => {
+      elapsed += 100;
+      if (window.pywebview && window.pywebview.api) { clearInterval(interval); resolve(true); }
+      else if (elapsed >= timeoutMs) { clearInterval(interval); resolve(false); }
+    }, 100);
+  });
+}
+
 async function init() {
+  const ready = await waitForPywebview(5000);
+  if (!ready) { showToast('GUI 桥接未就绪，请稍后重试', 'error'); return; }
   try { state.report = await callApi('get_audit'); renderAll(); }
   catch (e) { showToast('扫描失败：' + e, 'error'); }
 }
@@ -505,15 +701,20 @@ async function runAudit() {
 
 function switchTab(tab) {
   state.activeTab = tab;
-  document.querySelectorAll('.tab').forEach(el => {
+  if (tab !== 'neurons') {
+    selectedNeuronId = null;
+    selectedNeuronNode = null;
+  }
+  document.querySelectorAll('.nav-item').forEach(el => {
     const active = el.dataset.tab === tab;
     el.classList.toggle('active', active);
     el.setAttribute('aria-selected', active ? 'true' : 'false');
   });
+  renderStatusRail();
   renderContent();
 }
 
-document.querySelectorAll('.tab').forEach(el => el.addEventListener('keydown', event => {
+document.querySelectorAll('.nav-item').forEach(el => el.addEventListener('keydown', event => {
   if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); switchTab(el.dataset.tab); }
 }));
 
@@ -524,12 +725,108 @@ function renderAll() {
   const r = state.report;
   document.getElementById('ws-path').textContent = r.workspace;
   const badge = document.getElementById('health-badge');
+  document.getElementById('reader-zh')?.classList.toggle('active', readerLanguage === 'zh');
+  document.getElementById('reader-original')?.classList.toggle('active', readerLanguage === 'original');
   badge.textContent = '健康度 ' + Math.round(r.health_score) + '/100';
   badge.style.color = r.health_score >= 70 ? 'var(--accent)' : r.health_score >= 40 ? 'var(--orange)' : 'var(--red)';
   document.getElementById('findings-count').textContent = r.findings.length || '';
   document.getElementById('sources-count').textContent = '';
   document.getElementById('releases-count').textContent = state.releases ? state.releases.length : '';
   renderContent();
+  loadGovernanceSnapshot();
+}
+
+async function loadGovernanceSnapshot() {
+  try {
+    state.governanceSnapshot = await callApi('get_governance_snapshot');
+    renderStatusRail();
+    if (state.activeTab === 'overview') renderOverview();
+  } catch (e) { /* 静默失败，状态栏显示占位 */ }
+}
+
+function renderStatusRail() {
+  const container = document.getElementById('status-rail-content');
+  const title = document.querySelector('#status-rail h3');
+  if (!container) return;
+  if (state.activeTab === 'neurons' && selectedNeuronNode) {
+    if (title) title.textContent = '节点详情';
+    container.innerHTML = renderNeuronRailDetail(selectedNeuronNode);
+    return;
+  }
+  if (title) title.textContent = state.activeTab === 'neurons' ? '神经图详情' : '治理状态';
+  if (state.activeTab === 'neurons') {
+    container.innerHTML = `<div class="status-item zero"><span class="status-label">当前选择</span><span class="status-num">—</span></div>
+      <div class="rail-link" onclick="switchTab('governance')">进入治理台 →</div>`;
+    return;
+  }
+  const snap = state.governanceSnapshot;
+  if (!snap) {
+    container.innerHTML = '<div class="loading" style="min-height:60px">连接中…</div>';
+    return;
+  }
+  const activeCount = snap.status ? snap.status.active_count : 0;
+  const conflictCount = snap.conflicts ? snap.conflicts.count : 0;
+  const quarantineCount = snap.quarantine ? snap.quarantine.count : 0;
+  const rollbackCount = snap.rollback_ready || 0;
+  const conflictClass = conflictCount > 0 ? 'alert' : 'zero';
+  const quarantineClass = quarantineCount > 0 ? 'danger' : 'zero';
+  const rollbackClass = rollbackCount > 0 ? '' : 'zero';
+  container.innerHTML = `
+    <div class="status-item" onclick="switchTab('governance')">
+      <span class="status-label">Active memories</span>
+      <span class="status-num">${activeCount}</span>
+    </div>
+    <div class="status-item ${conflictClass}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('conflicts'),50)">
+      <span class="status-label">Conflicts</span>
+      <span class="status-num">${conflictCount}</span>
+    </div>
+    <div class="status-item ${quarantineClass}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('quarantine'),50)">
+      <span class="status-label">Quarantined</span>
+      <span class="status-num">${quarantineCount}</span>
+    </div>
+    <div class="status-item ${rollbackClass}" onclick="switchTab('releases')">
+      <span class="status-label">Rollback ready</span>
+      <span class="status-num">${rollbackCount}</span>
+    </div>
+    <div class="rail-link" onclick="switchTab('governance')">打开治理台 →</div>`;
+}
+
+function renderNeuronRailDetail(node) {
+  const childCount = (neuronGraph && neuronGraph.nodes ? neuronGraph.nodes : []).filter(n => n.parent_id === node.id).length;
+  const isAnchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
+  const kindText = memoryKindLabel(node.kind || node.label || '');
+  const title = isAnchor ? (displayTitle(node) || node.label || '未命名记忆') : (node.node_kind === 'topic' ? kindText : '记忆根节点');
+  if (!isAnchor) {
+    return `<div class="status-item zero"><span class="status-label">${escapeHtml(node.node_kind === 'topic' ? '主题' : '节点')}</span><span class="status-num">${childCount}</span></div>
+      <div class="neuron-detail-body">${escapeHtml(node.node_kind === 'topic' ? `该主题下有 ${childCount} 个记忆节点。点击小光点查看具体内容。` : `当前投影共有 ${(neuronGraph.nodes || []).length} 个节点。`)}</div>
+      <div class="rail-link" onclick="switchTab('governance')">进入治理台 →</div>`;
+  }
+  const members = (node.members || []).map(m => `<div class="raw-file-row" onclick="selectNeuronByMemory('${escapeHtml(m.memory_id || '')}')">
+    <div><code>${escapeHtml(displayTitle(m) || m.memory_id || '')}</code><div class="surface-meta">${escapeHtml(displayBody(m) || m.body_preview || '')}</div></div>
+    <span class="chip chip-info">${escapeHtml(memoryKindLabel(m.kind || ''))}</span>
+  </div>`).join('');
+  const related = (node.related || []).map(r => `<div class="raw-file-row" onclick="selectNeuronByMemory('${escapeHtml(r.memory_id || '')}')">
+    <div><code>${escapeHtml(displayTitle(r) || r.memory_id || '')}</code><div class="surface-meta">${escapeHtml(displayBody(r) || r.body_preview || '')}</div></div>
+    <span class="chip chip-medium">相关</span>
+  </div>`).join('');
+  const actionTarget = node.memory_id || node.id || '';
+  return `<div class="popover-kicker">${escapeHtml(kindText)}</div>
+    <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(title)}</h3>
+    <div class="neuron-detail-body">${escapeHtml(displayBody(node) || '暂无正文内容')}</div>
+    <div class="row"><span class="key">作用域</span><span>${escapeHtml(node.scope || 'project')}</span></div>
+    <div class="row"><span class="key">置信度</span><span>${escapeHtml(String(node.confidence ?? '—'))}</span></div>
+    <div class="row"><span class="key">完整性</span><span>${escapeHtml(node.completeness || '—')}</span></div>
+    <div class="row"><span class="key">来源</span><span>${node.provenance_count || 0} 个来源证据</span></div>
+    ${node.cluster_count ? `<div class="row"><span class="key">合并片段</span><span>${node.cluster_count} 条</span></div>` : ''}
+    <div class="row"><span class="key">记录 ID</span><code style="overflow-wrap:anywhere">${escapeHtml(actionTarget)}</code></div>
+    <div class="finding-actions" style="margin:12px 0 10px;display:flex;flex-wrap:wrap;gap:6px">
+      <span class="chip chip-confirmed">自动纳入重构</span>
+      <button class="btn btn-danger" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','exclude')">删除/排除</button>
+      <button class="btn" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','quarantine')">隔离</button>
+      <button class="btn" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','merge')">合并</button>
+    </div>
+    ${members ? `<div class="claim-list"><h4>合并片段</h4>${members}</div>` : ''}
+    ${related ? `<div class="claim-list"><h4>相关联</h4>${related}</div>` : ''}`;
 }
 
 function renderContent() {
@@ -545,11 +842,66 @@ function renderContent() {
 
 async function renderNeurons() {
   setContent('<div class="loading">正在读取神经图投影</div>');
-  try { neuronGraph = await callApi('get_neuron_graph'); renderNeuronGraph(); }
+  try { neuronGraph = await callApi('get_neuron_graph', projectionMode); renderNeuronGraph(); }
   catch (e) {
     showToast('神经图构建失败：' + e, 'error');
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>神经图构建失败：${escapeHtml(e)}</p></div></div>`);
   }
+}
+
+function kindColor(kind) {
+  const colors = {
+    fact: '#6ee7c4', preference: '#f6ad55', project: '#63b3ed', episode: '#fc8181', procedure: '#b794f4', correction: '#f687b3', workflow: '#b794f4', constraint: '#fbd38d'
+  };
+  return colors[kind] || '#6ee7c4';
+}
+
+function memoryKindLabel(kind) {
+  const labels = {
+    fact: '事实', preference: '偏好', project: '项目', episode: '事件', procedure: '流程', correction: '纠错',
+    constraint: '约束', workflow: '流程', decision: '决策', context: '上下文', instruction: '指令', unknown: '未知'
+  };
+  return labels[kind] || kind || '未知';
+}
+
+function neuronHashUnit(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return ((hash >>> 0) % 10000) / 10000;
+}
+
+function neuronNodePositions(nodes) {
+  const positions = {};
+  const children = {};
+  nodes.forEach(node => {
+    const parent = node.parent_id || '';
+    if (!children[parent]) children[parent] = [];
+    children[parent].push(node);
+  });
+  positions.main = { x: 0, y: 0 };
+  const topics = (children.main || []).filter(n => n.node_kind === 'topic');
+  topics.forEach((node, index) => {
+    const angle = index * 2.399963 + neuronHashUnit(node.id) * .8;
+    const radius = 230 + neuronHashUnit(node.id + ':r') * 110;
+    positions[node.id] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+  });
+  nodes.forEach(node => {
+    if (positions[node.id]) return;
+    const parent = positions[node.parent_id || 'main'] || positions.main;
+    const siblings = children[node.parent_id || ''] || [];
+    const index = Math.max(0, siblings.findIndex(s => s.id === node.id));
+    const angle = index * 2.399963 + neuronHashUnit(node.id) * 1.7;
+    const radius = 70 + neuronHashUnit(node.id + ':leaf') * 260;
+    positions[node.id] = {
+      x: parent.x + Math.cos(angle) * radius + (neuronHashUnit(node.id + ':x') - .5) * 90,
+      y: parent.y + Math.sin(angle) * radius + (neuronHashUnit(node.id + ':y') - .5) * 90,
+    };
+  });
+  return positions;
 }
 
 function graphElements(graph) {
@@ -557,22 +909,26 @@ function graphElements(graph) {
   // node: id / parent_id / label / node_kind / memory_id / kind / provenance_count
   // edge: id / source / target / edge_type
   const elements = [];
+  const positions = neuronNodePositions(graph.nodes || []);
   for (const node of graph.nodes || []) {
     const root = node.node_kind === 'root';
-    const anchor = node.node_kind === 'claim_anchor';
+    const anchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
+    const cluster = node.node_kind === 'duplicate_cluster';
     // v3：用 provenance_count 替代旧 claim_count 决定大小
     const provCount = node.provenance_count || 0;
-    const size = root ? 66 : anchor ? 7 : Math.max(27, Math.min(54, 25 + provCount * 3.2));
+    const size = root ? 66 : cluster ? Math.max(15, Math.min(30, 12 + (node.cluster_count || 2) * 4)) : anchor ? 7 : Math.max(27, Math.min(54, 25 + provCount * 3.2));
     elements.push({ data: {
       id: node.id,
-      label: anchor ? '' : String(node.label || '').slice(0, 18),
+      label: anchor ? '' : String(node.node_kind === 'topic' ? memoryKindLabel(node.label) : (node.label || '')).slice(0, 18),
       kind: node.node_kind,
       memory_id: node.memory_id || '',
       record_kind: node.kind || '',
+      cluster_count: node.cluster_count || 0,
       provenance_count: provCount,
       size,
+      bg: node.bg || kindColor(node.kind || node.label || ''),
       opacity: 0.85,
-    }});
+    }, position: positions[node.id] || { x: 0, y: 0 }});
   }
   for (const edge of graph.edges || []) {
     elements.push({ data: {
@@ -596,11 +952,73 @@ function renderMergeDock(suggestions) {
   </aside>`;
 }
 
+function projectionModeLabel(mode) {
+  return {
+    native_memory_projection: '原生记忆投影',
+    logical_reconstruction_projection: '逻辑重构投影',
+    evidence_only: '证据/萃取来源'
+  }[mode] || mode || '未知';
+}
+
+function sourceCategoryLabel(category) {
+  return {
+    native_memory: '原生记忆', project_memory: '项目记忆', knowledge_source: '知识文档',
+    conversation_history: '会话历史', runtime_evidence: '运行证据', ignored_runtime_data: '忽略运行数据',
+    control_surface: '控制面', skill_surface: '技能面'
+  }[category] || category || '未知';
+}
+
+function renderProjectionSourceMap(sourceMap) {
+  const entries = sourceMap?.entries || [];
+  const summary = sourceMap?.summary || {};
+  const rows = entries.length ? entries.map(renderProjectionSourceEntry).join('') : '<tr><td colspan="7" class="empty-note">暂无映射条目</td></tr>';
+  return `<section class="card projection-source-map">
+    <div class="card-head"><div><h2>当前数据源映射</h2><p>这里只读展示数据源页已勾选的 Agent / 项目 / 来源。勾选和取消请回到数据源页处理。</p></div>
+      <div class="chips"><span class="chip chip-info">启用 ${summary.enabled || 0}/${summary.total || 0}</span><span class="chip chip-info">原生 ${summary.native_memory || 0}</span><span class="chip chip-info">逻辑 ${summary.logical_reconstruction || 0}</span><span class="chip chip-medium">证据 ${summary.evidence_only || 0}</span></div></div>
+    <div class="source-map-table-wrap"><table class="source-map-table"><thead><tr><th>状态</th><th>投影</th><th>来源</th><th>Agent</th><th>项目/范围</th><th>策略</th><th>路径</th></tr></thead><tbody>${rows}</tbody></table></div>
+  </section>`;
+}
+
+function renderProjectionSourceEntry(entry) {
+  const eligible = entry.logical_eligible || entry.native_eligible;
+  const mode = projectionModeLabel(entry.projection_mode);
+  const path = entry.path || '';
+  const project = entry.project_ref || (entry.scope === 'project' ? '当前项目' : entry.scope || '未知');
+  return `<tr class="${entry.enabled ? '' : 'muted-row'}">
+    <td><span class="chip ${entry.enabled ? 'chip-confirmed' : 'chip-medium'}">${entry.enabled ? '已勾选' : '未勾选'}</span></td>
+    <td><span class="chip ${eligible ? 'chip-confirmed' : 'chip-medium'}">${escapeHtml(mode)}</span></td>
+    <td><strong>${escapeHtml(entry.display_name || entry.surface_id || entry.root_id)}</strong><div class="surface-meta">${escapeHtml(sourceCategoryLabel(entry.source_category))}</div></td>
+    <td>${escapeHtml(entry.agent_instance_id || '未绑定')}<div class="surface-meta">${escapeHtml(entry.surface_id || '—')}</div></td>
+    <td>${escapeHtml(project)}</td>
+    <td>${escapeHtml(entry.ingestion_policy || '')}</td>
+    <td class="path-cell">${escapeHtml(path)}</td>
+  </tr>`;
+}
+
+function projectionModeControls() {
+  const nativeActive = projectionMode === 'native' ? 'btn-primary' : '';
+  const reconstructedActive = projectionMode === 'reconstructed' ? 'btn-primary' : '';
+  return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>投影模式</h2><p>原生投影查看当前真实记忆；重构治理投影用于自动治理、萃取并发布回原生记忆。</p></div></div>
+    <div class="finding-actions">
+      <button class="btn ${nativeActive}" type="button" onclick="switchProjectionMode('native')">原生记忆投影</button>
+      <button class="btn ${reconstructedActive}" type="button" onclick="switchProjectionMode('reconstructed')">重构治理投影</button>
+      <button class="btn" type="button" onclick="switchTab('sources')">去数据源页调整</button>
+    </div></section>`;
+}
+
+async function switchProjectionMode(mode) {
+  projectionMode = mode === 'native' ? 'native' : 'reconstructed';
+  localStorage.setItem('memoryguard.projectionMode', projectionMode);
+  await renderNeurons();
+}
+
 function renderNeuronGraph() {
   const graph = neuronGraph;
   // 顶部 7 项状态信息（v3.1 §6.1）：Agent 实例 / Profile / 规范版本 / Release / 接管状态 / 覆盖状态 / 是否漂移
   // 后端 meta 结构：{agent_instances: [...], instance_count, coverage, coverage_status, release_count, drifted}
   const meta = (graph && graph.meta) || {};
+  const sourceMapPanel = renderProjectionSourceMap(graph?.source_map || {});
+  const modeControls = projectionModeControls();
   const instances = meta.agent_instances || [];
   // 每个 agent_instance 一组 chip：产品名 + 接管状态 + 规范版本 + 记录数
   const instanceChips = instances.length ? instances.map(inst => {
@@ -631,38 +1049,45 @@ function renderNeuronGraph() {
     setContent(`<div class="view-heading"><span class="eyebrow">Live cognition map</span><h2>记忆核心</h2>
       <p>神经图是 Memory IR 的可视化投影，不是事实源。删除后可从 IR + DecisionLog 完整重建。图上治理操作会写入 DecisionLog 并生成新规范版本。</p></div>
       ${metaBar}
+      ${modeControls}
+      ${sourceMapPanel}
       <section class="card projection-gate">
         <div class="gate-orb" aria-hidden="true"></div>
         <div class="gate-body">
           <h3>当前状态：未构建</h3>
           <p class="gate-reason">${escapeHtml(reasonText)}</p>
           <div class="gate-warning">
-            <strong>构建投影会扫描所有授权来源并规范化为 Memory IR。</strong><br>
-            原始记忆文件不会被修改，投影可随时删除重建。<br>
-            此操作不写入受管目标，仅生成可视化投影。
+            <strong>${projectionMode === 'native' ? '原生投影读取当前真实记忆。' : '重构治理会自动萃取、合并和清理记忆。'}</strong><br>
+            ${projectionMode === 'native' ? '此操作只生成当前原生记忆的可视化图。' : '确认发布时才会封存备份并写回原生记忆。'}
           </div>
           <div class="finding-actions">
-            <button class="btn btn-primary" type="button" onclick="buildProjection()">构建投影</button>
+            <button class="btn btn-primary" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '构建原生投影' : '构建重构投影'}</button>
           </div>
         </div>
       </section>`);
     return;
   }
   const stats = graph.stats || {};
+  const publishActions = projectionMode === 'reconstructed' ? `<button class="btn btn-primary" type="button" onclick="publishReconstructedMemory()">确认发布</button><button class="btn" type="button" onclick="rollbackNativeMemoryRelease()">回滚发布</button>` : '';
   const suggestions = [];
   selectedNeuronId = null;
+  selectedNeuronNode = null;
+  renderStatusRail();
   document.getElementById('neuron-count').textContent = stats.node_count || '';
   setContent(`<div class="view-heading"><span class="eyebrow">Live cognition map</span><h2>记忆核心</h2>
-    <p>点击任意光点，在原位查看证据并治理。滚轮缩放，拖拽探索。图上操作会写入 DecisionLog 并生成新规范版本。</p></div>
+    <p>点击任意光点，在右侧查看可读内容。滚轮缩放，拖拽探索；治理操作请到治理台处理。</p></div>
     ${metaBar}
+    ${modeControls}
+    ${sourceMapPanel}
     <section class="neuron-shell">
     <div class="neuron-toolbar">
-      <div class="neuron-title"><span class="eyebrow">Cognition control surface</span><h2>可操作神经图</h2>
-        <p>图上接受/排除/隔离/合并操作会写入 DecisionLog，重建规范版本并生成发布计划。</p></div>
+      <div class="neuron-title"><span class="eyebrow">Cognition map</span><h2>可读神经图</h2>
+        <p>点击节点查看记忆内容；接受、排除、隔离、合并等操作统一在治理台完成。</p></div>
       <div class="canvas-actions">
         <button class="btn" type="button" onclick="fitNeuronGraph()">重置视野</button>
-        <button class="btn" type="button" onclick="deleteProjection()">删除投影</button>
-        <button class="btn btn-primary" type="button" onclick="buildProjection()">重建投影</button>
+        <button class="btn" type="button" onclick="deleteProjection()">删除当前投影</button>
+        <button class="btn" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '重建原生投影' : '重建重构投影'}</button>
+        ${publishActions}
       </div>
     </div>
     <div class="neuron-stage" id="neuron-stage">
@@ -694,7 +1119,7 @@ function renderNeuronGraph() {
     elements: graphElements(graph),
     style: [
       { selector: 'node', style: {
-        'width': 'data(size)', 'height': 'data(size)', 'background-color': '#173b31',
+        'width': 'data(size)', 'height': 'data(size)', 'background-color': 'data(bg)',
         'background-opacity': 'data(opacity)', 'border-width': 1.4, 'border-color': '#6ee7c4',
         'label': 'data(label)', 'color': '#cce5dc', 'font-size': 9.5,
         'font-family': 'Segoe UI, PingFang SC, sans-serif', 'font-weight': 500,
@@ -707,8 +1132,11 @@ function renderNeuronGraph() {
         'border-color': '#bcffeb', 'font-size': 11,
       }},
       { selector: 'node[kind = "claim_anchor"]', style: {
-        'background-color': '#6ee7c4', 'background-opacity': .62, 'border-width': 0,
-        'label': '',
+        'background-opacity': .68, 'border-width': 0, 'label': '',
+      }},
+      { selector: 'node[kind = "duplicate_cluster"]', style: {
+        'background-opacity': .78, 'border-width': 1.8,
+        'border-color': '#d8ffe9', 'label': '',
       }},
       { selector: 'node[status = "tentative"]', style: {
         'background-color': '#2b2a20', 'border-color': '#e9bb64', 'border-style': 'dashed',
@@ -721,13 +1149,17 @@ function renderNeuronGraph() {
       { selector: 'edge[etype = "related"]', style: { 'line-style': 'dashed', 'line-opacity': .12 }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
       { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.5 }},
-      { selector: ':selected', style: { 'opacity': 0, 'text-opacity': 0 }},
+      { selector: 'node:selected', style: {
+        'border-width': 3, 'border-color': '#fff6c7', 'shadow-blur': 28,
+        'shadow-color': '#fff3a3', 'shadow-opacity': .46,
+      }},
+      { selector: 'node.pulse', style: {
+        'border-width': 4, 'border-color': '#ffffff', 'shadow-blur': 42,
+        'shadow-color': '#ffffff', 'shadow-opacity': .62,
+      }},
     ],
     layout: {
-      name: 'cose', animate: true, animationDuration: 650, randomize: true,
-      nodeRepulsion: 9500, idealEdgeLength: 94, edgeElasticity: 90,
-      nestingFactor: .85, gravity: .28, numIter: 1100, initialTemp: 150, coolingFactor: .97,
-      minTemp: 1, nodeOverlap: 26, padding: 76,
+      name: 'preset', animate: true, animationDuration: 720, fit: true, padding: 86,
     },
     minZoom: .22, maxZoom: 3.6,
   });
@@ -752,54 +1184,40 @@ function fitNeuronGraph() {
   if (cyInstance) cyInstance.animate({ fit: { eles: cyInstance.elements(), padding: 72 }, duration: 340 });
 }
 
-function selectNeuron(nodeId) {
-  // v3.1 §6.2：节点气泡显示真实可验证字段 + 7 种图上治理操作
-  // 字段：record_id / kind / scope / priority / status / 来源与定位 / 冲突重复关系 / 当前发布状态 / 目标兼容性 / 风险与隔离原因
-  // 操作：接受候选 / 排除并填写原因 / 隔离敏感或不确定内容 / 标记替代关系 / 确认合并候选 / 修改作用域和优先级 / 生成发布计划
+function findNeuronByMemory(memoryId) {
+  return (neuronGraph.nodes || []).find(item => item.memory_id === memoryId
+    || (item.member_ids || []).includes(memoryId)
+    || (item.members || []).some(member => member.memory_id === memoryId)
+    || (item.related || []).some(related => related.memory_id === memoryId));
+}
+
+function focusNeuronNode(nodeId) {
+  if (!cyInstance) return;
+  const cyNode = cyInstance.getElementById(nodeId);
+  if (!cyNode || !cyNode.length) return;
+  cyInstance.animate({ center: { eles: cyNode }, zoom: Math.max(cyInstance.zoom(), 1.18) }, { duration: 420 });
+  cyNode.flashClass('pulse', 900);
+}
+
+function selectNeuron(nodeId, focus = true) {
   const node = (neuronGraph.nodes || []).find(item => item.id === nodeId);
   const popover = document.getElementById('neuron-popover');
-  if (!node || !popover) return;
+  if (!node) return;
   selectedNeuronId = nodeId;
+  selectedNeuronNode = node;
   if (cyInstance) {
     cyInstance.elements().unselect();
     cyInstance.getElementById(nodeId).select();
   }
-  const childCount = (neuronGraph.nodes || []).filter(n => n.parent_id === nodeId).length;
-  const isAnchor = node.node_kind === 'claim_anchor';
-  const popoverBody = isAnchor
-    ? `<div class="row"><span class="key">record_id</span><code style="overflow-wrap:anywhere">${escapeHtml(node.memory_id || '')}</code></div>
-       <div class="row"><span class="key">kind</span><span>${escapeHtml(node.kind || '')}</span></div>
-       <div class="row"><span class="key">scope</span><span>${escapeHtml(node.scope || 'project')}</span></div>
-       <div class="row"><span class="key">priority</span><span>${escapeHtml(String(node.priority ?? '—'))}</span></div>
-       <div class="row"><span class="key">status</span><span>${escapeHtml(node.decision_state || node.status || 'candidate')}</span></div>
-       <div class="row"><span class="key">来源</span><span>${node.provenance_count || 0} 个 provenance</span></div>
-       <div class="row"><span class="key">发布</span><span>${escapeHtml(node.release_state || 'unpublished')}</span></div>
-       <div class="row"><span class="key">兼容</span><span>${escapeHtml((node.target_compatibility || []).join(', ') || '—')}</span></div>
-       ${node.risk_count ? `<div class="row"><span class="key">风险</span><span style="color:var(--red)">${node.risk_count} 条</span></div>` : ''}`
-    : `<div class="row"><span class="key">子节点</span><span>${childCount}</span></div>
-       <div class="row"><span class="key">节点类型</span><span>${escapeHtml(node.node_kind || '')}</span></div>`;
-  const governanceActions = isAnchor ? `
-    <div class="finding-actions" style="flex-direction:column;align-items:stretch;gap:6px">
-      <div style="font-size:10px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-top:6px">图上治理操作 → DecisionEvent</div>
-      <div style="display:flex;flex-wrap:wrap;gap:6px">
-        <button class="btn btn-primary" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','accept')">接受候选</button>
-        <button class="btn btn-danger" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','exclude')">排除</button>
-        <button class="btn" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','quarantine')">隔离</button>
-        <button class="btn" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','supersede')">标记替代</button>
-        <button class="btn" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','merge')">确认合并</button>
-        <button class="btn" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','rescope')">改作用域</button>
-        <button class="btn" type="button" onclick="neuronAction('${escapeHtml(nodeId)}','plan')">生成发布计划</button>
-      </div>
-    </div>` : '';
-  popover.innerHTML = `<div class="popover-head">
-      <div><div class="popover-kicker">${escapeHtml(node.node_kind)}</div><h3>${escapeHtml(node.label || '未命名节点')}</h3></div>
-      <button class="btn btn-icon" type="button" aria-label="关闭" onclick="hideNeuronPopover()">×</button>
-    </div>
-    <div class="row"><span class="key">节点 ID</span><code>${escapeHtml(node.id || '')}</code></div>
-    ${popoverBody}
-    ${governanceActions}`;
-  popover.classList.add('show');
-  requestAnimationFrame(() => positionNeuronPopover(nodeId));
+  if (popover) popover.classList.remove('show');
+  renderStatusRail();
+  if (focus) focusNeuronNode(nodeId);
+}
+
+function selectNeuronByMemory(memoryId) {
+  const node = findNeuronByMemory(memoryId);
+  if (!node) return showToast('未找到关联节点', 'error');
+  selectNeuron(node.id, true);
 }
 
 async function neuronAction(nodeId, action) {
@@ -835,9 +1253,11 @@ function positionNeuronPopover(nodeId) {
 
 function hideNeuronPopover() {
   selectedNeuronId = null;
+  selectedNeuronNode = null;
   const popover = document.getElementById('neuron-popover');
   if (popover) popover.classList.remove('show');
   if (cyInstance) cyInstance.elements().unselect();
+  renderStatusRail();
 }
 
 async function doPromote(lightId) {
@@ -852,30 +1272,143 @@ async function doMerge(fromId, toId) {
   showToast('v3 已移除合并操作（神经图是纯投影）', 'error');
 }
 
+async function refreshNeuronGraph(message = '') {
+  neuronGraph = await callApi('get_neuron_graph', projectionMode);
+  renderNeuronGraph();
+  if (message) showToast(message, 'success');
+}
+
 async function buildProjection() {
-  // v3 spec §7.3：神经图是纯投影，需用户确认（带警告）
-  if (!confirm('此操作将扫描所有授权来源并规范化为 Memory IR，然后构建神经图投影。\n\n'
-    + '· 原始记忆文件不会被修改\n'
-    + '· 投影可随时删除重建\n'
-    + '· 此操作不写入受管目标，仅生成可视化投影\n\n'
-    + '继续？')) return;
-  setContent('<div class="loading">正在扫描来源并构建投影</div>');
+  const native = projectionMode === 'native';
+  const message = native
+    ? '构建原生记忆投影？\n\n· 读取数据源页已勾选的原生/项目记忆\n· 只生成当前真实记忆图\n· 不写入记忆文件\n\n继续？'
+    : '构建重构治理投影？\n\n· 自动萃取、合并、清理已勾选来源\n· 生成可发布的新记忆结构\n· 确认发布时才会封存备份并写回\n\n继续？';
+  if (!confirm(message)) return;
+  setContent(`<div class="loading">正在构建${native ? '原生记忆' : '重构治理'}投影</div>`);
   try {
-    const result = await callApi('build_projection', true);
+    const result = await callApi('build_projection', true, projectionMode);
     if (result.error) return showToast(result.error, 'error');
-    neuronGraph = await callApi('get_neuron_graph'); renderNeuronGraph(); showToast('投影构建完成', 'success');
+    await refreshNeuronGraph(native ? '原生投影构建完成' : '重构投影构建完成');
   } catch (e) { showToast('构建失败：' + e, 'error'); }
 }
 
 async function deleteProjection() {
-  if (!confirm('删除当前神经图投影？\n\n投影可从 Memory IR + DecisionLog 完整重建，不会丢失任何原始记忆或决策。')) return;
+  if (!confirm(`删除当前${projectionMode === 'native' ? '原生' : '重构'}投影？\n\n只删除投影文件，不删除原生记忆。`)) return;
   try {
-    const result = await callApi('delete_projection', true);
+    const result = await callApi('delete_projection', true, projectionMode);
     if (result.error) return showToast(result.error, 'error');
-    neuronGraph = await callApi('get_neuron_graph');
-    renderNeuronGraph();
-    showToast('投影已删除，可随时重建', 'success');
+    await refreshNeuronGraph('当前投影已删除，可随时重建');
   } catch (e) { showToast('删除失败：' + e, 'error'); }
+}
+
+async function publishReconstructedMemory() {
+  try {
+    const data = await callApi('list_publish_targets');
+    const targets = (data.targets || []).filter(t => t.is_agent_native_memory);
+    if (!targets.length) {
+      showToast('未解析到可写入的 Agent 原生记忆入口，请先在数据源页扫描并勾选原生记忆。', 'error');
+      return;
+    }
+    if (targets.length === 1) {
+      await publishToAgentNativeTarget(targets[0]);
+      return;
+    }
+    showPublishTargetModal(targets);
+  } catch (e) { showToast('发布失败：' + e, 'error'); }
+}
+
+async function publishToAgentNativeTarget(targetInfo) {
+  const target = targetInfo.target_file;
+  if (!confirm(`确认发布到 Agent 原生记忆入口？\n\nAgent：${targetInfo.agent_instance_id || '未知'}\n入口：${targetInfo.display_name || targetInfo.surface_id || ''}\n路径：${target}\n\n后台会执行：封存备份 → staged 写入 → 原子替换 → 校验。`)) return;
+  const result = await callApi('publish_reconstructed_memory', target, true);
+  if (!result.ok) return showToast((result.errors && result.errors[0]) || result.error || '发布失败', 'error');
+  await refreshNeuronGraph(`发布完成：${result.release_id}，已写入 Agent 原生记忆入口`);
+}
+
+function showPublishTargetModal(targets) {
+  closePublishTargetModal();
+  const rows = targets.map((t, i) => `<label class="release-option">
+    <input type="radio" name="publish-target" value="${i}" ${i === 0 ? 'checked' : ''}>
+    <span><div class="release-title">${escapeHtml(t.display_name || t.surface_id || t.root_id)}</div><div class="release-meta">Agent：${escapeHtml(t.agent_instance_id || '未知')} · ${escapeHtml(t.target_file || '')}</div></span>
+  </label>`).join('');
+  const modal = document.createElement('div');
+  modal.id = 'publish-target-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="选择 Agent 原生记忆入口">
+    <div class="modal-head"><h3>选择 Agent 原生记忆入口</h3><p>只列出已解析到的 agent-managed 原生记忆入口。</p></div>
+    <div class="modal-body">${rows}</div>
+    <div class="modal-actions"><button class="btn" type="button" onclick="closePublishTargetModal()">取消</button><button class="btn btn-primary" type="button" onclick="confirmPublishTargetModal()">确认发布</button></div>
+  </div>`;
+  modal.__targets = targets;
+  modal.addEventListener('click', (event) => { if (event.target === modal) closePublishTargetModal(); });
+  document.body.appendChild(modal);
+}
+
+function closePublishTargetModal() {
+  const modal = document.getElementById('publish-target-modal');
+  if (modal) modal.remove();
+}
+
+async function confirmPublishTargetModal() {
+  const modal = document.getElementById('publish-target-modal');
+  const selected = document.querySelector('input[name="publish-target"]:checked');
+  if (!modal || !selected) return showToast('请选择 Agent 原生记忆入口', 'error');
+  const targetInfo = modal.__targets[Number(selected.value)];
+  closePublishTargetModal();
+  if (targetInfo) await publishToAgentNativeTarget(targetInfo);
+}
+
+function formatReleaseVersionList(releases) {
+  return (releases || []).slice(0, 20).map((r, i) => `${i + 1}. ${r.release_id} · ${r.rollback_reason || r.status || ''} · ${r.created_at || ''}`).join('\n');
+}
+
+async function rollbackNativeMemoryRelease() {
+  try {
+    const data = await callApi('list_native_memory_releases');
+    const allReleases = data.releases || [];
+    const releases = allReleases.filter(r => r.can_rollback);
+    if (!releases.length) {
+      const versions = allReleases.length ? '\n\n版本状态：\n' + formatReleaseVersionList(allReleases) : '\n\n暂无成功发布的版本记录。';
+      alert('没有可恢复的已发布版本。' + versions);
+      return;
+    }
+    showRollbackModal(releases.slice(0, 20));
+  } catch (e) { showToast('读取回滚版本失败：' + e, 'error'); }
+}
+
+function showRollbackModal(releases) {
+  closeRollbackModal();
+  const rows = releases.map((r, i) => `<label class="release-option">
+    <input type="radio" name="rollback-release" value="${escapeHtml(r.release_id)}" ${i === 0 ? 'checked' : ''}>
+    <span><div class="release-title">${escapeHtml(r.release_id)}</div><div class="release-meta">${escapeHtml(r.created_at || '')}</div></span>
+  </label>`).join('');
+  const modal = document.createElement('div');
+  modal.id = 'rollback-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="选择恢复版本">
+    <div class="modal-head"><h3>选择要恢复的版本</h3><p>只列出当前可安全恢复的已发布版本。</p></div>
+    <div class="modal-body">${rows}</div>
+    <div class="modal-actions"><button class="btn" type="button" onclick="closeRollbackModal()">取消</button><button class="btn btn-primary" type="button" onclick="confirmRollbackModal()">确认恢复</button></div>
+  </div>`;
+  modal.addEventListener('click', (event) => { if (event.target === modal) closeRollbackModal(); });
+  document.body.appendChild(modal);
+}
+
+function closeRollbackModal() {
+  const modal = document.getElementById('rollback-modal');
+  if (modal) modal.remove();
+}
+
+async function confirmRollbackModal() {
+  const selected = document.querySelector('input[name="rollback-release"]:checked');
+  if (!selected) return showToast('请选择要恢复的版本', 'error');
+  const releaseId = selected.value;
+  try {
+    const result = await callApi('rollback_native_memory_release', releaseId, false, true);
+    if (!result.ok) return showToast((result.errors && result.errors[0]) || result.error || '回滚失败', 'error');
+    closeRollbackModal();
+    await refreshNeuronGraph(`回滚完成：${releaseId}`);
+  } catch (e) { showToast('回滚失败：' + e, 'error'); }
 }
 
 async function reExtract() {
@@ -885,31 +1418,75 @@ async function reExtract() {
 
 function renderOverview() {
   const report = state.report;
+  const snap = state.governanceSnapshot;
+
+  // 空状态：没有记忆写入事件
+  if (!snap || !snap.has_events) {
+    setContent(`<div class="view-heading"><span class="eyebrow">Governance Flow</span><h2>总览</h2>
+      <p>概念图式的治理流控制台。新写入 -> 覆盖 / 冲突 / 隔离，实时展示真实事件。</p></div>
+      <section class="card empty-state"><div><div class="empty-orb"></div>
+        <p>尚无记忆写入事件</p>
+        <p style="margin-top:6px;font-size:11px">连接本地 Agent 或导入示例工作区以查看治理流</p>
+      </div></section>
+      <div class="flow-canvas">
+        <div class="flow-card empty cyan"><div class="flow-kicker">新写入</div><div class="flow-title">等待事件</div><div class="flow-body">Agent 写入记忆后，事件将出现在这里。</div></div>
+        <div class="flow-card empty gray"><div class="flow-kicker">覆盖</div><div class="flow-title">等待事件</div><div class="flow-body">auto_supersede 决策将出现在这里。</div></div>
+        <div class="flow-card empty amber"><div class="flow-kicker">冲突</div><div class="flow-title">等待事件</div><div class="flow-body">运行期冲突将出现在这里。</div></div>
+        <div class="flow-card empty red"><div class="flow-kicker">隔离</div><div class="flow-title">等待事件</div><div class="flow-body">隔离项将出现在这里。</div></div>
+      </div>`);
+    return;
+  }
+
+  // 四张事件卡
+  const evt = snap.latest_event;
+  const sup = snap.latest_supersede;
+  const conf = snap.conflicts;
+  const quar = snap.quarantine;
+
+  const evtCard = evt ? `<div class="flow-card cyan" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('recent_events'),50)">
+    <div class="flow-kicker">最新记忆写入</div>
+    <div class="flow-title">${escapeHtml(evt.agent_instance_id || 'unknown')}</div>
+    <div class="flow-body">${escapeHtml(evt.raw_content_preview || '(无内容)')}${evt.auto_actions && evt.auto_actions.length ? '<br>自动处理：' + evt.auto_actions.map(a => escapeHtml(a.action)).join(', ') : ''}</div>
+    <div class="flow-time">${escapeHtml(evt.created_at || '')}</div>
+  </div>` : `<div class="flow-card empty cyan"><div class="flow-kicker">新写入</div><div class="flow-title">暂无事件</div></div>`;
+
+  const supCard = sup ? `<div class="flow-card gray" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('supersede'),50)">
+    <div class="flow-kicker">被覆盖的旧记忆</div>
+    <div class="flow-title">auto_supersede</div>
+    <div class="flow-body">新：${escapeHtml((sup.new_content_preview || '').slice(0, 80))}<br>旧：${escapeHtml((sup.old_content_preview || '').slice(0, 80))}<br>原因：${escapeHtml(sup.reason || '')}</div>
+    <div class="flow-time">${escapeHtml(sup.created_at || '')}</div>
+  </div>` : `<div class="flow-card empty gray"><div class="flow-kicker">覆盖</div><div class="flow-title">暂无覆盖</div></div>`;
+
+  const confCard = conf && conf.count > 0 ? `<div class="flow-card amber" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('conflicts'),50)">
+    <div class="flow-kicker">未解决冲突</div>
+    <div class="flow-title">${conf.count} 组冲突</div>
+    <div class="flow-body">${escapeHtml(conf.first_reason || '点击查看冲突队列')}</div>
+  </div>` : `<div class="flow-card empty amber"><div class="flow-kicker">冲突</div><div class="flow-title">无未解决冲突</div></div>`;
+
+  const quarCard = quar && quar.count > 0 ? `<div class="flow-card red" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('quarantine'),50)">
+    <div class="flow-kicker">隔离项</div>
+    <div class="flow-title">${quar.count} 条隔离</div>
+    <div class="flow-body">${quar.items && quar.items.length ? '模式：' + escapeHtml(quar.items[0].detected_pattern || '') + ' · ' + escapeHtml(quar.items[0].masked_preview || '') : '点击查看隔离队列'}</div>
+  </div>` : `<div class="flow-card empty red"><div class="flow-kicker">隔离</div><div class="flow-title">无隔离项</div></div>`;
+
+  // 健康分摘要（保留原有信息但缩小为次要）
   const summary = report.summary;
+  const health = Math.max(0, Math.min(100, Number(report.health_score || 0)));
   const severity = Object.entries(summary.finding_count_by_severity || {})
     .map(([name, count]) => `<span class="chip chip-${escapeHtml(name)}">${escapeHtml(name)} · ${count}</span>`).join('');
-  const health = Math.max(0, Math.min(100, Number(report.health_score || 0)));
   const invisible = summary.invisible_count > 0 ? `<section class="card"><div class="card-head"><div><h2>不可见范围</h2><p>治理边界之外的对象会明确显示，不会静默忽略。</p></div></div>
     ${report.invisible.map(item => `<div class="finding-evidence">${escapeHtml(item.path)} · ${escapeHtml(item.reason)}</div>`).join('')}</section>` : '';
-  setContent(`<div class="view-heading"><span class="eyebrow">System pulse</span><h2>本地认知治理总览</h2><p>一次扫描看清 Agent 指令、技能、记忆和本地 RAG 的健康状态。</p></div>
-    <div class="overview-hero">
-      <section class="card health-orbit"><div class="health-ring" style="--health-angle:${health * 3.6}deg">
-        <div class="health-ring-content"><strong>${Math.round(health)}</strong><span>HEALTH SIGNAL</span></div></div></section>
-      <section class="card"><div class="card-head"><div><h2>治理信号</h2><p>当前工作区的可见对象与风险密度</p></div></div>
-        <div class="metrics">
-          <div class="metric"><div class="num">${summary.object_count}</div><div class="label">已识别对象</div></div>
-          <div class="metric"><div class="num">${report.findings.length}</div><div class="label">风险信号</div></div>
-          <div class="metric"><div class="num">${summary.invisible_count}</div><div class="label">不可见范围</div></div>
-          <div class="metric"><div class="num">18</div><div class="label">治理规则</div></div>
-        </div>
-      </section>
-    </div>
+
+  setContent(`<div class="view-heading"><span class="eyebrow">Governance Flow</span><h2>总览</h2>
+    <p>概念图式的治理流控制台。新写入 -> 覆盖 / 冲突 / 隔离，实时展示真实事件。</p></div>
+    <div class="flow-canvas">${evtCard}${supCard}${confCard}${quarCard}</div>
     <div class="overview-grid">
       <section class="card"><div class="card-head"><div><h2>风险频谱</h2><p>仅保留有决策价值的严重度信号</p></div></div><div class="chips">${severity || '<span class="chip chip-low">当前未发现风险</span>'}</div></section>
-      <section class="card"><div class="card-head"><div><h2>扫描脉冲</h2></div></div><div class="scan-list">
-        <div class="scan-row"><span>耗时</span><strong>${report.duration_ms} ms</strong></div>
+      <section class="card"><div class="card-head"><div><h2>健康度</h2></div></div><div class="scan-list">
+        <div class="scan-row"><span>健康分</span><strong style="color:${health >= 70 ? 'var(--accent)' : health >= 40 ? 'var(--orange)' : 'var(--red)'}">${Math.round(health)}/100</strong></div>
+        <div class="scan-row"><span>已识别对象</span><strong>${summary.object_count}</strong></div>
+        <div class="scan-row"><span>风险信号</span><strong>${report.findings.length}</strong></div>
         <div class="scan-row"><span>生成时间</span><strong>${escapeHtml(report.generated_at)}</strong></div>
-        <div class="scan-row"><span>执行位置</span><strong>仅限本机</strong></div>
       </div></section>
     </div>${invisible}`);
 }
@@ -1015,40 +1592,76 @@ function renderSourcesView(sourcesResult, rawResult, agentData) {
 
   // v3.2 Agent 卡片
   const agents = (agentCardsData && agentCardsData.agents) || [];
+  const residuals = (agentCardsData && agentCardsData.residuals) || [];
+  const lifecycleLabels = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
+  const lifecycleChips = { installed: 'confirmed', installed_no_data: 'info', data_only: 'medium', uncertain: 'info', ignored: 'low', not_detected: 'low' };
   const agentCardsHtml = agents.length ? agents.map(a => {
     const isActive = a.instance_id === activeAgentInstanceId;
+    const lifecycle = a.lifecycle_state || 'uncertain';
     return `<div class="agent-card ${isActive ? 'active' : ''}" onclick="selectAgentCard('${escapeHtml(a.instance_id)}')">
       <div class="agent-name">${escapeHtml(a.product)}</div>
-      <div class="agent-meta">${a.found_surface_count}/${a.surface_count} 表面 · ${a.bound_source_count} 来源</div>
+      <div class="agent-meta">${a.found_surface_count}/${a.surface_count} 表面 · 私有 ${a.private_data_surface_count || 0} · 共享 ${a.shared_surface_count || 0} · ${a.bound_source_count} 来源</div>
       <div class="agent-badge">${escapeHtml(a.target_capability || 'export_only')}</div>
+      <span class="chip chip-${lifecycleChips[lifecycle] || 'info'}">${escapeHtml(lifecycleLabels[lifecycle] || lifecycle)}</span>
     </div>`;
-  }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">未发现 Agent，点击"检测本机 Agent"</div></div>';
+  }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">未发现已安装 Agent，点击"检测本机 Agent"</div></div>';
+  const residualCardsHtml = residuals.length ? residuals.map(r => {
+    const lifecycle = r.lifecycle_state || 'uncertain';
+    return `<div class="agent-card" onclick="showResidualCleanup('${escapeHtml(r.instance_id)}')">
+      <div class="agent-name">${escapeHtml(r.product)}</div>
+      <div class="agent-meta">私有残留 ${r.private_data_surface_count || 0} · 共享表面 ${r.shared_surface_count || 0}</div>
+      <span class="chip chip-${lifecycleChips[lifecycle] || 'medium'}">${escapeHtml(lifecycleLabels[lifecycle] || lifecycle)}</span>
+    </div>`;
+  }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">无私有残留数据。</div></div>';
   const addCards = `<div class="agent-card add-card" onclick="addSourceDialog()"><div class="agent-name">+ 手动来源</div></div>
     <div class="agent-card add-card" onclick="importBundleDialog()"><div class="agent-name">+ 外部 MCP</div></div>`;
 
-  // 选中 Agent 的分类数据视图
-  const categories = (agentData && agentData.categories) || {};
   const catLabels = {
     native_memory: '原生记忆', control_surface: '控制面', skill_surface: 'Skill 表面',
     conversation_history: '会话历史', runtime_evidence: '运行证据', knowledge_source: '知识来源',
     unknown: '其他', project_memory: '项目记忆',
   };
-  const agentDataHtml = agentData ? Object.entries(categories).map(([cat, files]) => {
-    const label = catLabels[cat] || cat;
+  const scopeLabels = {user: '全局/用户', project: '项目', unknown: '未归属'};
+  const renderFiles = (files) => `<div class="raw-file-list">
+    ${(files || []).map(f => {
+      const canOpen = !!f.root_id && f.authorized !== false && f.read_status !== 'discovered';
+      const safeRoot = escapeHtml(f.root_id || '');
+      const safePath = escapeHtml(f.relative_path || '').replaceAll("'", "\\'");
+      const clickAttr = canOpen ? ` onclick="viewSourceFile('${safeRoot}','${safePath}')"` : '';
+      const statusText = canOpen ? (f.read_status || '') : '仅发现，需先授权';
+      return `<div class="raw-file-row"${clickAttr} style="${canOpen ? '' : 'cursor:default;opacity:.72'}">
+        <span class="raw-file-path"><code>${escapeHtml(f.relative_path || '').replaceAll('\\', '/')}</code></span>
+        <span class="chip chip-${canOpen && f.read_status === 'read' ? 'confirmed' : 'medium'}">${escapeHtml(statusText)}</span>
+        <span style="color:var(--faint);font-size:10px">${escapeHtml(f.media_type || '')}</span>
+      </div>`;
+    }).join('')}
+  </div>`;
+  const renderCategory = (cat) => {
+    const label = catLabels[cat.category] || cat.category || 'unknown';
+    const files = cat.files || [];
     return `<div style="margin-bottom:14px">
       <div class="finding-header"><span class="finding-rule">${escapeHtml(label)}</span>
         <span class="chip chip-info">${files.length} 个文件</span></div>
-      <div class="raw-file-list">
-        ${files.map(f => `<div class="raw-file-row" onclick="viewSourceFile('${escapeHtml(f.root_id)}','${escapeHtml(f.relative_path).replaceAll("'", "\\'")}')">
-          <span class="raw-file-path"><code>${escapeHtml(f.relative_path).replaceAll('\\', '/')}</code></span>
-          <span class="chip chip-${f.read_status === 'read' ? 'confirmed' : 'medium'}">${escapeHtml(f.read_status)}</span>
-          <span style="color:var(--faint);font-size:10px">${escapeHtml(f.media_type || '')}</span>
-        </div>`).join('')}
-      </div>
+      ${renderFiles(files)}
     </div>`;
-  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>选中一个 Agent 卡片查看其数据。</p></div>';
+  };
+  const renderScope = (scopeObj) => {
+    const scope = scopeObj.scope || 'unknown';
+    const label = scopeLabels[scope] || scope;
+    const directCategories = (scopeObj.categories || []).map(renderCategory).join('');
+    const projectHtml = (scopeObj.projects || []).map(proj => `<details class="scope-block" style="margin:12px 0 0 12px">
+      <summary class="finding-header" style="cursor:pointer"><span class="finding-rule">${escapeHtml(label)} · ${escapeHtml(proj.project_ref || '未命名项目')}</span>
+        <span class="chip chip-info">${escapeHtml(proj.scope_source || scopeObj.scope_source || '')}</span></summary>
+      ${(proj.categories || []).map(renderCategory).join('') || '<div class="empty-state"><p>该项目下暂无可显示文件。</p></div>'}
+    </details>`).join('');
+    return `<details class="scope-block" style="margin-bottom:18px" ${scope === 'user' ? 'open' : ''}>
+      <summary class="finding-header" style="cursor:pointer"><span class="finding-rule">${escapeHtml(label)}</span>
+        <span class="chip chip-info">${escapeHtml(scopeObj.scope_source || '')}</span></summary>
+      ${directCategories}${projectHtml || (!directCategories ? '<div class="empty-state"><p>该作用域暂无可显示文件。</p></div>' : '')}
+    </details>`;
+  };
+  const agentDataHtml = agentData ? ((agentData.scopes || []).map(renderScope).join('') || '<div class="empty-state"><div class="empty-orb"></div><p>该 Agent 暂无已发现数据。</p></div>') : '<div class="empty-state"><div class="empty-orb"></div><p>选中一个 Agent 卡片查看其数据。</p></div>';
 
-  // 覆盖率
   const covCard = `<section class="card">
     <div class="card-head"><div><h2>覆盖率账本</h2><p>证明扫描完整性，unaccounted_count 必须为 0</p></div></div>
     <div class="chips">
@@ -1062,32 +1675,28 @@ function renderSourcesView(sourcesResult, rawResult, agentData) {
     </div>
   </section>`;
 
-  // 快速操作
-  const actionsCard = `<section class="card"><div class="card-head"><div><h2>快速操作</h2>
-    <p>自动检测本机已安装的 Agent · 手工添加文件/文件夹 · 导入 ChatAI 网页版导出包</p></div>
-    <div class="finding-actions">
-      <button class="btn btn-primary" type="button" onclick="discoverAgents()">检测本机 Agent</button>
-      <button class="btn" type="button" onclick="addSourceDialog()">手工添加文件/文件夹</button>
-      <button class="btn" type="button" onclick="importBundleDialog()">导入离线导出包</button>
-    </div></div>
-    <div class="gate-warning" style="margin-top:0">
-      <strong>网页 ChatAI 记忆导出导入：</strong>ChatGPT/Claude/Gemini 的网页版通常在「Settings -> Data export」导出 zip 包，
-      解压后是 conversations.json。点上面"导入离线导出包"选择 zip 或解压后的目录/文件即可。
-    </div></section>`;
-
   const agentInfo = agentData && agentData.agent ? agentData.agent : null;
   setContent(`<div class="view-heading"><span class="eyebrow">Sources</span><h2>数据源</h2>
-    <p>v3.2 数据页：顶部 Agent 卡片切换，下方显示该 Agent 的原生记忆、控制面、Skill、会话历史、项目文档。文档不是记忆，只在数据页。</p></div>
-    ${actionsCard}
-    ${covCard}
-    <section class="card"><div class="card-head"><div><h2>Agent 卡片</h2>
-      <p>点击卡片切换数据视图。${agents.length} 个 Agent 已发现。</p></div></div>
+    <p>顶部选择 Agent，下方查看其数据。全局/项目可折叠展开。</p></div>
+    <section class="card"><div class="card-head"><div><h2>Agent 摘要</h2>
+      <p>${agents.length} 个已安装 · ${residuals.length} 个残留候选 · 点击卡片切换数据视图</p></div>
+      <div class="finding-actions">
+        <button class="btn btn-primary" type="button" onclick="discoverAgents()">检测本机 Agent</button>
+        <button class="btn" type="button" onclick="addSourceDialog()">手工添加</button>
+        <button class="btn" type="button" onclick="importBundleDialog()">导入导出包</button>
+      </div></div>
       <div class="agent-cards">${agentCardsHtml}${addCards}</div></section>
+    ${residuals.length ? `<details class="card" style="margin-bottom:16px">
+      <summary class="card-head" style="cursor:pointer"><div><h2>残留与清理</h2>
+        <p>${residuals.length} 个候选 · 点击展开查看</p></div></summary>
+      <div class="agent-cards" style="padding:16px">${residualCardsHtml}</div>
+    </details>` : ''}
     <section class="card"><div class="card-head"><div><h2>${agentInfo ? escapeHtml(agentInfo.product) + ' 数据视图' : 'Agent 数据视图'}</h2>
       <p>${agentData ? agentData.total_files + ' 个文件，' + agentData.category_count + ' 个类别' : '选中 Agent 后显示数据'}</p></div>
       ${agentInfo ? `<div class="finding-actions"><button class="btn" type="button" onclick="selectAgentInstance('${escapeHtml(agentInfo.instance_id)}')">勾选授权</button>
         <button class="btn btn-primary" type="button" onclick="enterMultiAgentMode()">进入多 Agent 共享 MCP 模式</button></div>` : ''}</div>
-      ${agentDataHtml}</section>`);
+      ${agentDataHtml}</section>
+    ${covCard}`);
 }
 
 async function enterMultiAgentMode() {
@@ -1279,33 +1888,47 @@ function showDiscoveryResult(result) {
   const scopeSectionsHtml = scopeOrder.map(scope => {
     const list = surfacesByScope[scope] || [];
     const foundCount = list.filter(s => s.status === 'found').length;
-    return `<section class="card">
-      <div class="card-head"><div><h2>${SCOPE_LABEL[scope] || scope}</h2>
-        <p>${foundCount} / ${list.length} 个表面已发现</p></div></div>
+    return `<details class="card" style="margin-bottom:12px">
+      <summary class="card-head" style="cursor:pointer"><div><h2>${SCOPE_LABEL[scope] || scope}</h2>
+        <p>${foundCount} / ${list.length} 个表面已发现 · 点击展开</p></div></summary>
       ${list.length ? list.map(surfaceRowHtml).join('') : '<div class="empty-state" style="min-height:80px"><p>此层级无候选表面</p></div>'}
-    </section>`;
+    </details>`;
   }).join('');
 
   // Agent 实例摘要
+  const LIFECYCLE_LABEL = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
+  const LIFECYCLE_CHIP = { installed: 'confirmed', installed_no_data: 'info', data_only: 'medium', uncertain: 'info', ignored: 'low', not_detected: 'low' };
+  const SUPPORT_CHIP = { A: 'confirmed', B: 'info', C: 'medium', D: 'high' };
   const instancesHtml = instances.length ? instances.map(inst => {
     const foundCount = (inst.surfaces || []).filter(s => s.status === 'found').length;
     const totalCount = (inst.surfaces || []).length;
+    const lifecycle = inst.lifecycle_state || inst.install_state || 'pending';
+    const lifecycleLabel = LIFECYCLE_LABEL[lifecycle] || lifecycle;
+    const lifecycleChip = LIFECYCLE_CHIP[lifecycle] || 'info';
+    const supportLevel = inst.support_level || '';
+    const supportChip = SUPPORT_CHIP[supportLevel] || 'info';
     return `<article class="plan-item verified">
       <div class="finding-header">
         <span class="finding-rule">${escapeHtml(inst.product)}</span>
         <span class="chip chip-confirmed">${foundCount}/${totalCount} 表面</span>
+        <span class="chip chip-${lifecycleChip}">${escapeHtml(lifecycleLabel)}</span>
+        ${supportLevel ? `<span class="chip chip-${supportChip}">支持 ${escapeHtml(supportLevel)}</span>` : ''}
         <span class="chip chip-info">${escapeHtml(inst.target_capability || 'export_only')}</span>
       </div>
       <div class="row"><span class="key">profile</span><code>${escapeHtml(inst.profile_id || '')}</code></div>
       <div class="row"><span class="key">platform</span><span>${escapeHtml(inst.platform || '')} · ${escapeHtml(inst.host_id || '')}</span></div>
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="selectAgentInstance('${escapeHtml(inst.instance_id)}')">勾选授权</button>
+        <button class="btn" type="button" onclick="showResidualCleanup('${escapeHtml(inst.instance_id)}')">残留与清理</button>
       </div>
     </article>`;
   }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>未检测到任何已安装 Agent。可手工添加文件/文件夹。</p></div>';
 
   setContent(`<div class="view-heading"><span class="eyebrow">Discovery</span><h2>本机 Agent 检测</h2>
-    <p>有限候选发现：只检测 Profile 声明的固定路径，不递归扫描用户主目录，候选阶段不读取正文。结果按 全局/用户 · 项目 两层作用域分组，与 Agent 自身的记忆层级一致。</p></div>
+    <p>有限候选发现：只检测 Profile 声明的固定路径，不递归扫描用户主目录，候选阶段不读取正文。</p></div>
+    <section class="card"><div class="card-head"><div><h2>Agent 摘要</h2><p>${instances.length} 个 Agent · 点击操作</p></div></div>
+      ${instancesHtml}</section>
+    ${scopeSectionsHtml}
     <section class="card"><div class="card-head"><div><h2>发现账本</h2>
       <p>所有已知表面 100% 进入账本，unaccounted 必须为 0</p></div></div>
       <div class="chips">
@@ -1315,9 +1938,6 @@ function showDiscoveryResult(result) {
         <span class="chip chip-${(ledger.unaccounted_count || 0) === 0 ? 'confirmed' : 'high'}">unaccounted · ${ledger.unaccounted_count || 0}</span>
         <span class="chip chip-info">total · ${ledger.surface_count || 0}</span>
       </div></section>
-    ${scopeSectionsHtml}
-    <section class="card"><div class="card-head"><div><h2>Agent 实例摘要</h2><p>${instances.length} 个</p></div></div>
-      ${instancesHtml}</section>
     <div class="finding-actions" style="margin-top:14px">
       <button class="btn" type="button" onclick="renderSources()">← 返回数据源</button>
     </div>`);
@@ -1332,33 +1952,200 @@ async function selectAgentInstance(instanceId) {
   } catch (e) { showToast('加载失败：' + e, 'error'); }
 }
 
+async function showResidualCleanup(instanceId) {
+  setContent('<div class="loading">正在加载残留数据…</div>');
+  showToast('正在加载残留数据…');
+  try {
+    const result = await callApi('get_residual_cleanup', instanceId);
+    if (result.error) {
+      setContent(`<div class="view-heading"><span class="eyebrow">Residual</span><h2>残留与清理</h2></div>
+        <div class="card empty-state"><div><div class="empty-orb"></div>
+        <p>加载失败：${escapeHtml(result.error)}</p></div></div>
+        <div class="finding-actions"><button class="btn" type="button" onclick="discoverAgents()">返回检测</button></div>`);
+      showToast(result.error, 'error');
+      return;
+    }
+    const items = result.items || [];
+    const candidateId = result.candidate_id || '';
+    const productName = result.product || instanceId;
+    const lifecycleLabel = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
+    const lifecycle = lifecycleLabel[result.lifecycle_state] || result.lifecycle_state || '';
+    const installEvHtml = (result.install_evidence || []).map(e => `<div class="row"><span class="key">${escapeHtml(e.probe_type)}</span><span style="color:${e.found ? 'var(--accent)' : 'var(--danger)'}">${e.found ? '命中' : '未命中'}: ${escapeHtml(e.detail || '')}</span></div>`).join('');
+    const dataEvHtml = (result.data_evidence || []).map(e => `<div class="row"><span class="key">${escapeHtml(e.dir_path || '')}</span><span>${e.exists ? `${e.file_count} 文件` : '不存在'}</span></div>`).join('');
+    const itemsHtml = items.length ? items.map((it, idx) => {
+      const preview = it.archive_preview || {};
+      const previewOk = preview.ok !== false;
+      const safeIdx = idx;
+      return `<article class="plan-item" data-candidate-id="${escapeHtml(candidateId)}" data-item-path="${escapeHtml(it.path || '')}" data-instance-id="${escapeHtml(instanceId)}">
+        <div class="finding-header">
+          <span class="finding-rule">${escapeHtml(it.path || '')}</span>
+          <span class="chip chip-info">${escapeHtml(it.residual_type || '')}</span>
+        </div>
+        <div class="finding-evidence">${escapeHtml(it.description || '')}</div>
+        ${preview.error ? `<div style="color:var(--danger);font-size:11px;margin-top:4px">归档预检失败：${escapeHtml(preview.error)}</div>` : previewOk ? `<div style="color:var(--accent);font-size:11px;margin-top:4px">可归档（dry-run 通过）</div>` : ''}
+        <div class="finding-actions" style="margin-top:8px">
+          <button class="btn btn-primary" type="button" onclick="archiveResidualByIdx(${safeIdx})">归档此项</button>
+          <button class="btn" type="button" onclick="openResidualFolderByIdx(${safeIdx})">打开文件夹</button>
+        </div>
+      </article>`;
+    }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>无残留数据。</p></div>';
+    const archivesHtml = (result.archives || []).slice(0, 10).map((a, idx) => `<div class="plan-item" data-archive-id="${escapeHtml(a.archive_id || '')}" data-instance-id="${escapeHtml(instanceId)}">
+      <div class="finding-header">
+        <span class="finding-rule">${escapeHtml(a.product || '')} · ${escapeHtml(a.original_path || '')}</span>
+        <span class="chip chip-info">${escapeHtml(a.archive_id || '')}</span>
+      </div>
+      <div class="finding-evidence">归档原因: ${escapeHtml(a.reason || '')} · 归档时间: ${escapeHtml(a.archived_at || '')}</div>
+      <div class="finding-actions" style="margin-top:8px">
+        <button class="btn" type="button" onclick="restoreArchivedByIdx(${idx})">恢复</button>
+        <button class="btn" type="button" style="border-color:var(--danger);color:var(--danger)" onclick="deleteArchivedByIdx(${idx})">永久删除</button>
+      </div>
+    </div>`).join('');
+    setContent(`<div class="view-heading"><span class="eyebrow">Residual</span><h2>残留与清理</h2>
+      <p><strong>${escapeHtml(productName)}</strong> · ${escapeHtml(lifecycle)} · candidate: <code>${escapeHtml(candidateId)}</code></p></div>
+      <section class="card"><div class="card-head"><div><h2>安装证据</h2><p>${(result.install_evidence || []).length} 条探针</p></div></div>
+        ${installEvHtml || '<div class="empty-state"><p>无安装探针配置。</p></div>'}</section>
+      <section class="card"><div class="card-head"><div><h2>数据残留</h2><p>${items.length} 个残留项 · 可归档或打开文件夹手动处理</p></div></div>
+        ${itemsHtml}</section>
+      ${dataEvHtml ? `<section class="card"><div class="card-head"><div><h2>数据证据明细</h2></div></div>${dataEvHtml}</section>` : ''}
+      ${archivesHtml ? `<section class="card"><div class="card-head"><div><h2>归档历史</h2><p>可恢复或永久删除</p></div></div>${archivesHtml}</section>` : ''}
+      <div class="finding-actions" style="margin-top:14px">
+        <button class="btn" type="button" onclick="discoverAgents()">返回检测</button>
+      </div>`);
+  } catch (e) {
+    setContent(`<div class="view-heading"><span class="eyebrow">Residual</span><h2>残留与清理</h2></div>
+      <div class="card empty-state"><div><div class="empty-orb"></div>
+      <p>加载异常：${escapeHtml(String(e))}</p></div></div>
+      <div class="finding-actions"><button class="btn" type="button" onclick="discoverAgents()">返回检测</button></div>`);
+    showToast('加载失败：' + e, 'error');
+  }
+}
+
+async function archiveResidualByIdx(idx) {
+  const articles = document.querySelectorAll('.plan-item[data-candidate-id]');
+  const el = articles[idx];
+  if (!el) return showToast('未找到残留项', 'error');
+  const candidateId = el.getAttribute('data-candidate-id');
+  const dirPath = el.getAttribute('data-item-path');
+  const instanceId = el.getAttribute('data-instance-id');
+  if (!candidateId || !dirPath) return showToast('缺少归档参数', 'error');
+  if (!confirm('确认归档此目录到 MemoryGuard 可恢复归档区？\n' + dirPath)) return;
+  showToast('正在归档…');
+  try {
+    const result = await callApi('archive_agent_dir', '', dirPath, '', candidateId, false);
+    if (result.error) return showToast('归档失败：' + result.error, 'error');
+    showToast('归档成功，可从归档历史恢复');
+    showResidualCleanup(instanceId);
+  } catch (e) {
+    showToast('归档失败：' + e, 'error');
+  }
+}
+
+async function openResidualFolderByIdx(idx) {
+  const articles = document.querySelectorAll('.plan-item[data-candidate-id]');
+  const el = articles[idx];
+  if (!el) return showToast('未找到残留项', 'error');
+  const candidateId = el.getAttribute('data-candidate-id');
+  const dirPath = el.getAttribute('data-item-path');
+  if (!candidateId || !dirPath) return showToast('缺少打开参数', 'error');
+  try {
+    const result = await callApi('open_agent_folder', dirPath, candidateId);
+    if (result.error) return showToast('打开失败：' + (result.reason || result.error), 'error');
+    showToast('已打开文件夹，请在系统文件管理器中手动处理', 'info');
+  } catch (e) {
+    showToast('打开失败：' + e, 'error');
+  }
+}
+
+async function restoreArchivedByIdx(idx) {
+  const items = document.querySelectorAll('.plan-item[data-archive-id]');
+  const el = items[idx];
+  if (!el) return showToast('未找到归档项', 'error');
+  const archiveId = el.getAttribute('data-archive-id');
+  const instanceId = el.getAttribute('data-instance-id');
+  if (!archiveId) return showToast('缺少归档 ID', 'error');
+  if (!confirm('确认恢复此归档到原路径？\n' + archiveId)) return;
+  showToast('正在恢复…');
+  try {
+    const result = await callApi('restore_archived_agent', archiveId);
+    if (result.error) return showToast('恢复失败：' + result.error, 'error');
+    showToast('恢复成功');
+    showResidualCleanup(instanceId);
+  } catch (e) {
+    showToast('恢复失败：' + e, 'error');
+  }
+}
+
+async function deleteArchivedByIdx(idx) {
+  const items = document.querySelectorAll('.plan-item[data-archive-id]');
+  const el = items[idx];
+  if (!el) return showToast('未找到归档项', 'error');
+  const archiveId = el.getAttribute('data-archive-id');
+  const instanceId = el.getAttribute('data-instance-id');
+  if (!archiveId) return showToast('缺少归档 ID', 'error');
+  if (!confirm('永久删除此归档？此操作不可恢复！\n' + archiveId)) return;
+  showToast('正在删除…');
+  try {
+    const result = await callApi('delete_archived_agent', archiveId);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
+    if (result.error) return showToast('删除失败：' + (result.reason || result.error), 'error');
+    showToast('已永久删除');
+    showResidualCleanup(instanceId);
+  } catch (e) {
+    showToast('删除失败：' + e, 'error');
+  }
+}
+
 function showSelectionTree(instanceId, tree) {
-  const categories = tree.categories || [];
-  const catsHtml = categories.map(cat => {
-    const files = (cat.files || []).map(f => {
-      const checked = f.default_selected ? 'checked' : '';
-      return `<label class="raw-file-row" style="cursor:pointer">
-        <input type="checkbox" data-cat="${escapeHtml(cat.category)}" data-path="${escapeHtml(f.path)}" ${checked}>
-        <span class="raw-file-path"><code>${escapeHtml(f.path)}</code></span>
-        <span class="chip chip-${f.ingestion_policy === 'import_verbatim' ? 'confirmed' : 'info'}">${escapeHtml(f.ingestion_policy || '')}</span>
-      </label>`;
-    }).join('');
-    return `<div style="margin-bottom:14px">
-      <div class="finding-header"><span class="finding-rule">${escapeHtml(cat.category)}</span>
-        <span class="chip chip-info">${cat.files.length} 个文件</span></div>
-      <div class="raw-file-list">${files}</div>
+  const scopes = tree.scopes || [];
+  const scopeTabs = `
+    <div class="scope-tabs">
+      <div class="scope-tab active" data-scope="all" onclick="filterSelectionScope('all')">全部</div>
+      <div class="scope-tab" data-scope="user" onclick="filterSelectionScope('user')">全局/用户</div>
+      <div class="scope-tab" data-scope="project" onclick="filterSelectionScope('project')">项目</div>
+      <div class="scope-tab" data-scope="unknown" onclick="filterSelectionScope('unknown')">未归属</div>
     </div>`;
-  }).join('');
+  const scopeLabels = { user: '全局/用户', project: '项目', unknown: '未归属' };
+  const scopeSourceLabels = { profile_declared: 'Profile声明', project_resolver: '项目解析器', fallback: '默认' };
+  let treeHtml = '';
+  for (const scopeObj of scopes) {
+    const scope = scopeObj.scope;
+    const scopeLabel = scopeLabels[scope] || scope;
+    const scopeSourceLabel = scopeSourceLabels[scopeObj.scope_source] || scopeObj.scope_source || '';
+    if (scope === 'project' && scopeObj.projects) {
+      for (const proj of scopeObj.projects) {
+        treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}" data-project="${escapeHtml(proj.project_ref || '')}">
+          <div class="finding-header" style="margin:14px 0 8px">
+            <span class="finding-rule">${scopeLabel} · ${escapeHtml(proj.project_ref || '')}</span>
+            <span class="chip chip-info">${escapeHtml(proj.scope_source || scopeObj.scope_source || '')}</span>
+          </div>`;
+        for (const cat of (proj.categories || [])) {
+          treeHtml += renderSelectionCategory(cat, scope, proj.project_ref);
+        }
+        treeHtml += `</div>`;
+      }
+    } else {
+      treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}">
+        <div class="finding-header" style="margin:14px 0 8px">
+          <span class="finding-rule">${scopeLabel}</span>
+          <span class="chip chip-info">${escapeHtml(scopeSourceLabel)}</span>
+        </div>`;
+      for (const cat of (scopeObj.categories || [])) {
+        treeHtml += renderSelectionCategory(cat, scope);
+      }
+      treeHtml += `</div>`;
+    }
+  }
   setContent(`<div class="view-heading"><span class="eyebrow">Selection</span><h2>分类勾选授权</h2>
-    <p>勾选要纳入治理的表面。原生记忆会被完整接管和备份，普通文档只萃取选中片段。</p></div>
+    <p>勾选要纳入治理的表面。当前阶段：已发现。完整治理流程：已发现 -> 已授权扫描 -> 已备份 -> 已纳入治理 -> 已生成受管记忆 -> 已发布 -> 已验证生效。</p></div>
     <section class="card">
       <div class="card-head"><div><h2>授权摘要</h2>
         <p>instance: <code>${escapeHtml(instanceId)}</code></p></div></div>
       <div class="row"><span class="key">ownership</span><span>原生记忆 → agent_managed；普通文档 → external_read_only</span></div>
       <div class="row"><span class="key">backup</span><span>仅原生记忆会做基线备份，普通文档不整库复制</span></div>
     </section>
-    <section class="card"><div class="card-head"><div><h2>分类树</h2></div></div>
-      ${catsHtml}
+    <section class="card"><div class="card-head"><div><h2>作用域树</h2></div></div>
+      ${scopeTabs}
+      ${treeHtml}
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="confirmSelection('${escapeHtml(instanceId)}')">确认授权</button>
         <button class="btn" type="button" onclick="renderSources()">取消</button>
@@ -1366,9 +2153,69 @@ function showSelectionTree(instanceId, tree) {
     </section>`);
 }
 
+function renderSelectionCategory(cat, scope, projectRef) {
+  projectRef = projectRef || '';
+  const catLabels = {
+    native_memory: '原生记忆', control_surface: '控制面', skill_surface: 'Skill 表面',
+    conversation_history: '会话历史', runtime_evidence: '运行证据', knowledge_source: '知识来源',
+    unknown: '其他', project_memory: '项目记忆',
+  };
+  const scopeTags = { user: '全局', project: '项目', unknown: '未归属' };
+  const catLabel = catLabels[cat.category] || cat.category;
+  const files = (cat.files || []).map(f => {
+    const checked = f.default_selected ? 'checked' : '';
+    const persisted = f.saved_selected === true ? '已保存勾选' : f.saved_selected === false ? '已保存取消' : '默认建议';
+    const persistedChip = f.saved_selected === true ? 'confirmed' : f.saved_selected === false ? 'medium' : 'info';
+    const fScope = f.scope || scope;
+    const scopeSource = f.scope_source || '';
+    const fProjectRef = f.project_ref || projectRef;
+    const discoveryId = f.discovery_object_id || '';
+    const confidence = f.confidence != null ? (f.confidence * 100).toFixed(0) + '%' : '';
+    const reason = f.default_reason || '';
+    const scopeTag = scopeTags[fScope] || fScope;
+    const metaParts = [scopeTag, catLabel];
+    if (reason) metaParts.push(escapeHtml(reason));
+    if (confidence) metaParts.push('置信度 ' + confidence);
+    return `<label class="raw-file-row" style="cursor:pointer">
+      <input type="checkbox" data-cat="${escapeHtml(cat.category)}" data-path="${escapeHtml(f.path)}" data-scope="${escapeHtml(fScope)}" data-scope-source="${escapeHtml(scopeSource)}" data-project-ref="${escapeHtml(fProjectRef)}" data-discovery-object-id="${escapeHtml(discoveryId)}" ${checked}>
+      <span class="raw-file-path">
+        <code>${escapeHtml(f.path)}</code>
+        <div class="surface-meta">${metaParts.join(' · ')}</div>
+      </span>
+      <span class="chip chip-${persistedChip}">${escapeHtml(persisted)}</span>
+      <span class="chip chip-${f.ingestion_policy === 'import_verbatim' ? 'confirmed' : 'info'}">${escapeHtml(f.ingestion_policy || '')}</span>
+    </label>`;
+  }).join('');
+  return `<div style="margin-bottom:14px">
+    <div class="finding-header"><span class="finding-rule">${escapeHtml(catLabel)}</span>
+      <span class="chip chip-info">${(cat.files || []).length} 个文件</span></div>
+    <div class="raw-file-list">${files}</div>
+  </div>`;
+}
+
+function filterSelectionScope(scope) {
+  document.querySelectorAll('.scope-tab').forEach(el => {
+    el.classList.toggle('active', el.dataset.scope === scope);
+  });
+  document.querySelectorAll('.selection-group').forEach(g => {
+    if (scope === 'all') {
+      g.style.display = '';
+    } else {
+      g.style.display = g.dataset.scope === scope ? '' : 'none';
+    }
+  });
+}
+
 async function confirmSelection(instanceId) {
   const checks = document.querySelectorAll('input[type=checkbox][data-cat]:checked');
-  const selected = Array.from(checks).map(c => ({ category: c.dataset.cat, path: c.dataset.path }));
+  const selected = Array.from(checks).map(c => ({
+    category: c.dataset.cat,
+    path: c.dataset.path,
+    scope: c.dataset.scope || 'project',
+    scope_source: c.dataset.scopeSource || 'fallback',
+    project_ref: c.dataset.projectRef || '',
+    discovery_object_id: c.dataset.discoveryObjectId || ''
+  }));
   if (!selected.length) return showToast('请至少勾选一个文件', 'error');
   showToast('正在写入 SelectionManifest…');
   try {
@@ -1427,7 +2274,7 @@ function showImportPreview(path, preview) {
   const inv = preview.inventory || {};
   const invText = Object.keys(inv).map(k => `· ${k}: ${JSON.stringify(inv[k]).slice(0, 200)}`).join('\n');
   setContent(`<div class="view-heading"><span class="eyebrow">Import preview</span><h2>离线导出包预览</h2>
-    <p>检测到的 provider 和 inventory。确认后导入到 Memory IR。</p></div>
+    <p>检测到的 provider 和 inventory。会话内容默认只作为证据/萃取来源，不直接写入长期记忆。</p></div>
     <section class="card">
       <div class="card-head"><div><h2>检测结果</h2></div>
         <span class="chip chip-confirmed">${escapeHtml(preview.provider || 'unknown')}</span></div>
@@ -1441,8 +2288,8 @@ function showImportPreview(path, preview) {
     </section>
     <section class="card">
       <div class="gate-warning">
-        <strong>导入会把会话解析为 MemoryRecord，写入 Memory IR。</strong><br>
-        原始文件不会被修改。导入后可在"神经图"tab 构建投影查看。
+        <strong>会话不会默认写入 Memory IR。</strong><br>
+        原始文件不会被修改；需要像文档一样先萃取候选，用户接受后才进入长期记忆。
       </div>
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="confirmImport('${escapeHtml(path).replaceAll("'", "\\'")}')">确认导入</button>
@@ -1452,15 +2299,15 @@ function showImportPreview(path, preview) {
 }
 
 async function confirmImport(path) {
-  if (!confirm('确认导入此导出包？\n· 会话解析为 MemoryRecord 写入 IR\n· 原始文件不被修改\n· 可在神经图 tab 构建投影查看')) return;
-  showToast('正在导入…');
+  if (!confirm('确认解析此导出包？\n· 会话只作为证据/萃取来源\n· 不直接写入长期记忆\n· 原始文件不被修改')) return;
+  showToast('正在解析…');
   try {
     const result = await callApi('create_import', path, true);
     if (result.error) {
       showToast(result.error, 'error');
       return;
     }
-    showToast(`导入完成：${result.conversation_count} 个会话 → ${result.memory_record_count} 条记忆`, 'success');
+    showToast(`解析完成：${result.conversation_count} 个会话，未直接写入长期记忆`, 'success');
     renderSources();
   } catch (e) {
     showToast('导入失败：' + e, 'error');
@@ -1483,9 +2330,14 @@ async function removeSource(rootId) {
 }
 
 async function viewSourceFile(rootId, relativePath) {
+  if (!rootId) return showToast('该条目只是发现结果，尚未授权为可读取来源', 'info');
   try {
     const result = await callApi('get_source_file_content', rootId, relativePath);
-    if (result.error) return showToast(result.error, 'error');
+    if (result.error) {
+      showToast(result.error === 'file not found' ? '文件已不存在，请刷新数据源' : result.error, 'error');
+      if (result.error === 'file not found' || result.error === 'source root not found') renderSources();
+      return;
+    }
     const escaped = escapeHtml(result.content);
     const lines = result.content.split('\n').length;
     const safePath = escapeHtml(relativePath).replaceAll('\\', '/').replaceAll("'", "\\'");
@@ -1542,6 +2394,7 @@ async function acceptExtractCandidates(extractId, rootId, relativePath) {
   showToast('正在写入记忆…');
   try {
     const result = await callApi('accept_candidates', extractId, candidateIds);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已接受 ' + result.total + ' 条记忆', 'success');
     showAcceptResult(rootId, relativePath, result);
@@ -1737,6 +2590,7 @@ async function rollbackRelease(releaseId) {
   showToast('正在回滚…');
   try {
     const result = await callApi('rollback_release', releaseId, true);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已回滚', 'success');
     await renderReleases();
@@ -1937,17 +2791,13 @@ async function renderQuarantine() {
       return;
     }
     const items = entries.map(e => {
-      const content = e.original_content || '';
-      const masked = content.length > 20
-        ? content.slice(0, 6) + '••••••' + content.slice(-4)
-        : '••••';
       return `<article class="plan-item">
         <div class="finding-header">
           <span class="finding-rule">隔离 ${escapeHtml((e.quarantine_id || '').slice(0, 16))}</span>
           <span class="chip chip-high">quarantined</span>
         </div>
         <div class="row"><span class="key">memory_id</span><code>${escapeHtml(e.memory_id || '')}</code></div>
-        <div class="row"><span class="key">原内容</span><span style="font-family:monospace">${escapeHtml(masked)}</span></div>
+        <div class="row"><span class="key">原内容</span><span style="font-family:monospace">${escapeHtml(e.masked_preview || '••••')}</span></div>
         <div class="row"><span class="key">原因</span><span>${escapeHtml(e.reason || '')}</span></div>
         <div class="row"><span class="key">匹配模式</span><code>${escapeHtml(e.detected_pattern || '')}</code></div>
         <div class="row"><span class="key">隔离时间</span><span>${escapeHtml(e.quarantined_at || '')}</span></div>
@@ -1971,6 +2821,7 @@ async function releaseQuarantine(quarantineId) {
   showToast('正在释放…');
   try {
     const result = await callApi('release_quarantine', quarantineId);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已释放', 'success');
     renderQuarantine();
@@ -1982,6 +2833,7 @@ async function deleteQuarantine(quarantineId) {
   showToast('正在删除…');
   try {
     const result = await callApi('delete_quarantine', quarantineId);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已删除', 'success');
     renderQuarantine();
@@ -2027,6 +2879,7 @@ async function rollbackToVersion(versionId) {
   showToast('正在回滚…');
   try {
     const result = await callApi('rollback_memory', versionId);
+    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已回滚到目标版本', 'success');
     renderRollback();
@@ -2040,7 +2893,7 @@ function showToast(message, type) {
 }
 
 window.addEventListener('pywebviewready', init);
-setTimeout(() => { if (!state.report) init(); }, 1000);
+setTimeout(() => { if (!state.report && window.pywebview && window.pywebview.api) init(); }, 2000);
 </script>
 </body>
 </html>"""
