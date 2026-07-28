@@ -1,0 +1,3 @@
+{"timestamp": "t", "type": "message", "payload": {"role": "user", "content": "remember that I prefer pytest"}}
+{"timestamp": "t", "type": "tool_call", "payload": {"name": "shell"}}
+{"timestamp": "t", "type": "message", "payload": {"role": "assistant", "content": "sure"}}

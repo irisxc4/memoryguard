@@ -1,0 +1,3 @@
+{"intent": "setup", "actions": ["init"], "outcome": "ok", "learned": "Use uv for deps"}
+{"intent": "chat", "actions": ["talk"], "outcome": "", "learned": ""}
+{"type": "tool_call", "name": "x"}

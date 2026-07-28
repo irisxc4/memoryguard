@@ -282,6 +282,8 @@ class MemorySurface:
     ownership: Ownership = Ownership.EXTERNAL_READ_ONLY
     target_role: TargetRole = TargetRole.NONE
     evidence_role: str = ""
+    # 项目根展开后，再按 glob 落到真实文件节点（相对项目子目录）
+    file_globs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -294,6 +296,7 @@ class MemorySurface:
             "ingestion_policy": self.ingestion_policy.value,
             "ownership": self.ownership.value, "target_role": self.target_role.value,
             "evidence_role": self.evidence_role,
+            "file_globs": list(self.file_globs),
         }
 
     @classmethod
@@ -312,6 +315,7 @@ class MemorySurface:
             ownership=Ownership(data.get("ownership", "external_read_only")),
             target_role=TargetRole(data.get("target_role", "none")),
             evidence_role=data.get("evidence_role", ""),
+            file_globs=list(data.get("file_globs") or []),
         )
 
 
@@ -607,7 +611,8 @@ class SourceRoot:
     exclude: list[str] = field(default_factory=list)
     enabled: bool = True
     # v3.1 §4.2 新字段
-    agent_instance_id: str = ""           # 关联 AgentInstance
+    agent_instance_id: str = ""           # 关联 AgentInstance（遗留主归属）
+    authorized_agent_ids: list[str] = field(default_factory=list)  # 多对多授权
     surface_id: str = ""                  # 关联 MemorySurface
     source_category: str = "unknown"      # SourceCategory.value
     ingestion_policy: str = "extract_candidates"  # IngestionPolicy.value
@@ -617,8 +622,14 @@ class SourceRoot:
     scope_source: str = "fallback"  # profile_declared / project_resolver / fallback
     project_ref: str = ""           # 项目引用
     discovery_object_id: str = ""   # 关联的发现对象 ID
+    # per-agent 启用态：共享根避免互相改全局 enabled
+    agent_enabled: dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        # 兼容：若只有 agent_instance_id，序列化时补进 authorized 列表视图
+        auth_ids = list(self.authorized_agent_ids or [])
+        if self.agent_instance_id and self.agent_instance_id not in auth_ids:
+            auth_ids = [self.agent_instance_id, *auth_ids]
         return {
             "root_id": self.root_id, "type": self.type.value,
             "display_name": self.display_name, "path": self.path,
@@ -627,6 +638,8 @@ class SourceRoot:
             "include": list(self.include), "exclude": list(self.exclude),
             "enabled": self.enabled,
             "agent_instance_id": self.agent_instance_id,
+            "authorized_agent_ids": auth_ids,
+            "agent_enabled": dict(self.agent_enabled or {}),
             "surface_id": self.surface_id,
             "source_category": self.source_category,
             "ingestion_policy": self.ingestion_policy,
@@ -638,6 +651,14 @@ class SourceRoot:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SourceRoot":
+        auth_ids = list(data.get("authorized_agent_ids", []) or [])
+        legacy = data.get("agent_instance_id", "") or ""
+        if legacy and legacy not in auth_ids:
+            auth_ids = [legacy, *auth_ids]
+        raw_enabled = data.get("agent_enabled", {}) or {}
+        agent_enabled = {
+            str(k): bool(v) for k, v in dict(raw_enabled).items() if str(k)
+        }
         return cls(
             root_id=data["root_id"], type=SourceRootType(data["type"]),
             display_name=data["display_name"], path=data["path"],
@@ -648,7 +669,9 @@ class SourceRoot:
             include=list(data.get("include", [])),
             exclude=list(data.get("exclude", [])),
             enabled=data.get("enabled", True),
-            agent_instance_id=data.get("agent_instance_id", ""),
+            agent_instance_id=legacy,
+            authorized_agent_ids=auth_ids,
+            agent_enabled=agent_enabled,
             surface_id=data.get("surface_id", ""),
             source_category=data.get("source_category", "unknown"),
             ingestion_policy=data.get("ingestion_policy", "extract_candidates"),
@@ -805,6 +828,7 @@ class MemoryRecord:
     original_title: str = ""
     original_body: str = ""
     display_language: str = "zh"
+    localization_mode: str = "none"  # none | heuristic | model
     confidence: float = 0.5
     provenance: list[Provenance] = field(default_factory=list)
     status: MemoryStatus = MemoryStatus.CANDIDATE
@@ -818,6 +842,7 @@ class MemoryRecord:
             "original_title": self.original_title,
             "original_body": self.original_body,
             "display_language": self.display_language,
+            "localization_mode": self.localization_mode,
             "confidence": self.confidence,
             "provenance": [p.to_dict() for p in self.provenance],
             "status": self.status.value, "completeness": self.completeness.value,

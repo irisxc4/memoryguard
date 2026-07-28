@@ -89,6 +89,42 @@ class DetectionContext:
         )
 
 
+# 勾选授权：仅 Agent 长期/原生记忆；其余按用途分流展示
+MEMORY_SELECTABLE_CATEGORIES: frozenset[str] = frozenset({
+    "native_memory",
+    "project_memory",
+})
+# 下方可点开萃取（非常规记忆层）
+EXTRACT_DISPLAY_CATEGORIES: frozenset[str] = frozenset({
+    "conversation_history",
+    "runtime_evidence",
+    "knowledge_source",
+})
+# 控制面 / Skill 为规则与指令层，不进记忆勾选也不展示
+HIDDEN_SURFACE_CATEGORIES: frozenset[str] = frozenset({
+    "control_surface",
+    "skill_surface",
+    "ignored_runtime_data",
+})
+SESSION_DISPLAY_CATEGORIES: frozenset[str] = EXTRACT_DISPLAY_CATEGORIES
+
+
+def session_overview_title(path: str, project_ref: str = "") -> str:
+    """从会话文件路径生成可读概览标题（不参与勾选）。"""
+    p = Path(path.replace("\\", "/"))
+    stem = p.stem or p.name
+    parent = p.parent.name
+    if project_ref and project_ref not in ("", "(未归属)"):
+        base = project_ref
+    elif parent and parent.lower() not in ("projects", "sessions", "transcripts", "agent-transcripts"):
+        base = parent
+    else:
+        base = stem
+    if len(base) > 40:
+        base = base[:36] + "…"
+    return f"会话 · {base}"
+
+
 class AgentLocator:
     """v3.1 §3.2 有限候选发现器。
 
@@ -233,6 +269,7 @@ class AgentLocator:
                 "target_role": surface.target_role.value,
                 "classification_confidence": surface.classification_confidence,
                 "evidence_role": surface.evidence_role,
+                "file_globs": list(surface.file_globs or []),
             })
         instance = AgentInstance(
             instance_id=instance_id,
@@ -319,14 +356,26 @@ class AgentLocator:
             resolved = s.get("resolved_path", "")
 
             # 项目根目录展开：如果该 surface 是项目根目录，展开子目录
+            # 再按 file_globs 落到真实文件节点
             effective_surfaces = [s]
-            if self._is_project_root_surface(resolved):
+            has_globs = bool(s.get("file_globs"))
+            if self._is_date_tree_root(resolved):
+                effective_surfaces = self._expand_date_tree(resolved, s)
+            elif self._is_project_root_surface(resolved):
                 expanded = self._expand_project_root(resolved, s)
-                if expanded:
+                # 声明了 file_globs 时，即使无匹配也不得回退到整目录节点
+                if has_globs:
                     effective_surfaces = expanded
+                elif expanded:
+                    effective_surfaces = expanded
+            elif has_globs and Path(resolved).is_dir():
+                effective_surfaces = self._expand_files_in_dir(Path(resolved), s, project_ref="")
 
             for es in effective_surfaces:
                 es_resolved = es.get("resolved_path", "")
+                file_cat = es.get("category") or cat
+                if file_cat in HIDDEN_SURFACE_CATEGORIES:
+                    continue
                 # 项目归属：scope=project 时尝试从路径解析项目名
                 project_ref = ""
                 scope_source = "profile_declared"
@@ -349,10 +398,17 @@ class AgentLocator:
                 surface_id = es.get("surface_id", "")
                 dobj_id = stable_hash(instance_id, surface_id, canonical_path, "v1")
 
-                # 默认选中策略
+                # 默认选中策略：仅记忆层面可勾选；会话/证据只读展示
                 ing = es.get("ingestion_policy", "extract_candidates")
-                default_selected = ing == "import_verbatim"
-                default_reason = self._default_selection_reason(ing, cat)
+                selectable = file_cat in MEMORY_SELECTABLE_CATEGORIES
+                default_selected = (
+                    selectable
+                    and ing == "import_verbatim"
+                    and not es.get("_is_truncation_marker")
+                )
+                default_reason = es.get("default_reason_override") or self._default_selection_reason(ing, file_cat)
+                if file_cat in SESSION_DISPLAY_CATEGORIES:
+                    default_reason = "可点开萃取，不纳入记忆勾选"
 
                 file_info = {
                     "path": es_resolved,
@@ -369,13 +425,18 @@ class AgentLocator:
                     "status": es.get("status", "found"),
                     "confidence": es.get("classification_confidence", 0.5),
                     "last_modified": "",
+                    "is_file_node": bool(es.get("_is_file_node")),
+                    "selectable": selectable,
+                    "display_only": not selectable,
                 }
+                if file_cat in SESSION_DISPLAY_CATEGORIES:
+                    file_info["session_title"] = session_overview_title(es_resolved, project_ref)
 
                 scope_map.setdefault(es_scope, {})
                 pr_key = project_ref or "_no_project"
                 scope_map[es_scope].setdefault(pr_key, {})
-                scope_map[es_scope][pr_key].setdefault(cat, [])
-                scope_map[es_scope][pr_key][cat].append(file_info)
+                scope_map[es_scope][pr_key].setdefault(file_cat, [])
+                scope_map[es_scope][pr_key][file_cat].append(file_info)
 
         # 构建返回结构
         scopes_output = []
@@ -403,17 +464,35 @@ class AgentLocator:
                     "projects": project_list,
                 })
             else:
-                # user / unknown 直接按 category 分组
+                # user / unknown：无 project_ref 时扁平 categories；
+                # 展开后的项目子目录（如 ~/.claude/projects/<proj>）走 projects 列表
+                project_list = []
+                for pr_key, cat_map in projects.items():
+                    if pr_key == "_no_project":
+                        continue
+                    project_ref = pr_key
+                    categories = [
+                        {"category": cat, "files": files}
+                        for cat, files in cat_map.items()
+                    ]
+                    project_list.append({
+                        "project_ref": project_ref,
+                        "scope_source": "project_resolver",
+                        "categories": categories,
+                    })
                 cat_map = projects.get("_no_project", {})
                 categories = [
                     {"category": cat, "files": files}
                     for cat, files in cat_map.items()
                 ]
-                scopes_output.append({
+                scope_entry: dict[str, Any] = {
                     "scope": scope,
                     "scope_source": "profile_declared" if scope == "user" else "fallback",
                     "categories": categories,
-                })
+                }
+                if project_list:
+                    scope_entry["projects"] = project_list
+                scopes_output.append(scope_entry)
 
         return {
             "instance_id": instance_id,
@@ -467,47 +546,139 @@ class AgentLocator:
                         return segments[0]
         return ""
 
-    # 需要展开子目录的项目根目录模式
+    # 需要展开子目录的项目根目录模式（不含 Codex sessions 日期树）
     _PROJECT_ROOT_PATTERNS = [
         "/.claude/projects",
-        "/.codex/sessions",
         "/.cursor/projects",
         "/.codeium/windsurf/memories",
         "/.trae-cn/memory/projects",
         "/.zcode/cli/agents",
+    ]
+    # 日期分区树：展开文件但不把 YYYY 当年/月当 project_ref
+    _DATE_TREE_ROOT_PATTERNS = [
+        "/.codex/sessions",
     ]
 
     def _is_project_root_surface(self, resolved_path: str) -> bool:
         """判断该 surface 路径是否是项目根目录（含多个项目子目录）。"""
         if not resolved_path:
             return False
-        normalized = resolved_path.replace("\\", "/")
+        normalized = resolved_path.replace("\\", "/").rstrip("/")
         for pattern in self._PROJECT_ROOT_PATTERNS:
-            if normalized.rstrip("/").endswith(pattern):
+            if normalized.endswith(pattern):
                 return True
         return False
 
-    def _expand_project_root(self, resolved_path: str, surface: dict) -> list[dict]:
-        """展开项目根目录，为每个子目录生成一个 DiscoveryObject。
+    def _is_date_tree_root(self, resolved_path: str) -> bool:
+        if not resolved_path:
+            return False
+        normalized = resolved_path.replace("\\", "/").rstrip("/")
+        return any(normalized.endswith(p) for p in self._DATE_TREE_ROOT_PATTERNS)
 
-        返回展开后的 surface 列表，每个带独立 project_ref 和 resolved_path。
+    def _expand_project_root(self, resolved_path: str, surface: dict) -> list[dict]:
+        """展开项目根目录：一级子目录 + 可选 file_globs 到文件节点。
+
+        预算：每项目最多 MAX_FILES_PER_PROJECT 个文件；超出写入 truncation 标记。
         """
         root = Path(resolved_path)
         if not root.exists() or not root.is_dir():
             return []
-        expanded = []
+        globs = list(surface.get("file_globs") or [])
+        expanded: list[dict] = []
         for sub in sorted(root.iterdir()):
             if not sub.is_dir():
                 continue
-            # 跳过隐藏目录和缓存目录
             if sub.name.startswith(".") or sub.name.startswith("_"):
                 continue
-            expanded_surface = dict(surface)
-            expanded_surface["resolved_path"] = str(sub)
-            expanded_surface["surface_id"] = surface.get("surface_id", "") + ":" + sub.name
-            expanded_surface["_expanded_project_ref"] = sub.name
-            expanded.append(expanded_surface)
+            if globs:
+                files = self._expand_files_in_dir(sub, surface, project_ref=sub.name)
+                expanded.extend(files)
+            else:
+                expanded_surface = dict(surface)
+                expanded_surface["resolved_path"] = str(sub)
+                expanded_surface["surface_id"] = surface.get("surface_id", "") + ":" + sub.name
+                expanded_surface["_expanded_project_ref"] = sub.name
+                expanded.append(expanded_surface)
         return expanded
+
+    def _expand_date_tree(self, resolved_path: str, surface: dict) -> list[dict]:
+        """Codex sessions 等日期树：直接 glob 文件，project_ref 置空。"""
+        root = Path(resolved_path)
+        if not root.exists() or not root.is_dir():
+            return []
+        globs = list(surface.get("file_globs") or ["**/*.jsonl"])
+        # 在根上直接 glob，不把 YYYY 当项目名
+        surface_copy = dict(surface)
+        surface_copy["file_globs"] = globs
+        return self._expand_files_in_dir(root, surface_copy, project_ref="")
+
+    MAX_FILES_PER_PROJECT = 200
+
+    def _expand_files_in_dir(self, base: Path, surface: dict, *, project_ref: str) -> list[dict]:
+        """按 file_globs 在 base 下展开文件节点。"""
+        globs = list(surface.get("file_globs") or [])
+        if not globs:
+            return []
+        found: list[Path] = []
+        seen: set[str] = set()
+        truncated = False
+        for pattern in globs:
+            try:
+                matches = sorted(base.glob(pattern))
+            except (OSError, ValueError):
+                continue
+            for p in matches:
+                if not p.is_file():
+                    continue
+                # 逻辑路径必须在 base 下
+                try:
+                    p.relative_to(base)
+                except ValueError:
+                    continue
+                # 符号链接目标不得逃逸；目录 junction 导致 resolve 跨卷时保留逻辑路径
+                try:
+                    resolved_file = p.resolve()
+                    resolved_base = base.resolve()
+                    resolved_file.relative_to(resolved_base)
+                except (ValueError, OSError):
+                    if p.is_symlink():
+                        continue
+                    # 非 symlink 文件但祖先是 junction：用逻辑路径，读时再做 containment
+                key = str(p)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if len(found) >= self.MAX_FILES_PER_PROJECT:
+                    truncated = True
+                    break
+                found.append(p)
+            if truncated:
+                break
+
+        out: list[dict] = []
+        for p in found:
+            rel = str(p.relative_to(base)).replace("\\", "/")
+            node = dict(surface)
+            node["resolved_path"] = str(p)
+            node["surface_id"] = f"{surface.get('surface_id', '')}:{project_ref or base.name}:{rel}"
+            node["_expanded_project_ref"] = project_ref or base.name
+            node["_is_file_node"] = True
+            node["_relative_path"] = rel
+            out.append(node)
+        if truncated:
+            # 显式截断节点，禁止静默丢弃
+            marker = dict(surface)
+            marker["resolved_path"] = str(base)
+            marker["surface_id"] = f"{surface.get('surface_id', '')}:{project_ref}:__truncated__"
+            marker["_expanded_project_ref"] = project_ref or base.name
+            marker["status"] = "found"
+            marker["ingestion_policy"] = "ignore"
+            marker["default_reason_override"] = (
+                f"file_globs truncated at {self.MAX_FILES_PER_PROJECT} files"
+            )
+            marker["_is_truncation_marker"] = True
+            out.append(marker)
+        return out
 
     @staticmethod
     def _default_selection_reason(ingestion_policy: str, category: str) -> str:

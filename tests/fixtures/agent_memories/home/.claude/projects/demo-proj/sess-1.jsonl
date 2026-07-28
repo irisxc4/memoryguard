@@ -1,0 +1,4 @@
+{"type": "message", "message": {"role": "user", "content": "Please remember that I prefer short answers"}}
+{"type": "tool_call", "tool_call": {"name": "bash", "input": "ls"}}
+{"type": "message", "message": {"role": "assistant", "content": "Noted."}}
+{"type": "message", "message": {"role": "user", "content": "hello"}}

@@ -1,0 +1,3 @@
+{"role": "user", "content": "I prefer TypeScript strict mode"}
+{"type": "tool_call", "name": "read"}
+{"role": "assistant", "content": "ok"}

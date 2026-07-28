@@ -31,17 +31,12 @@ from .schema_v3 import (
 
 
 def _claude_code_profile() -> AgentProfile:
-    """Claude Code Profile（v3.1 §14.2 官方文档依据）。
+    """Claude Code Profile（v3.2 行业标准记忆布局）。
 
-    Claude Code 的本地数据按作用域分三层：
-    - 全局/用户级（~/.claude/）：跨项目的用户偏好、会话历史、命令历史
-    - 项目级（<workspace>/）：项目指令、项目本地覆盖
-    - 目录级（<workspace>/.claude/）：项目本地配置与会话
-
-    官方文档：https://docs.anthropic.com/zh-CN/docs/claude-code/memory
+    四层：Auto Memory 索引 / memory/*.md / session jsonl / subagents jsonl
     """
     surfaces = [
-        # ---- 项目级 ----
+        # ---- 项目级控制面 ----
         MemorySurface(
             surface_id="claude_project_md",
             path_template="%WORKSPACE%/CLAUDE.md",
@@ -78,7 +73,7 @@ def _claude_code_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
-        # ---- 用户级（~/.claude/）----
+        # ---- 用户级控制面 ----
         MemorySurface(
             surface_id="claude_user_md",
             path_template="%HOME%/.claude/CLAUDE.md",
@@ -103,23 +98,39 @@ def _claude_code_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
+        # ---- 原生记忆：projects/<project>/memory/*.md ----
         MemorySurface(
-            surface_id="claude_user_projects_history",
+            surface_id="claude_project_native_memory",
             path_template="%HOME%/.claude/projects",
-            surface_role="conversation_history",
+            surface_role="native_memory",
             scope="user", load_order=22,
             loader_evidence="https://docs.anthropic.com/zh-CN/docs/claude-code/memory",
-            classification_confidence=0.85,
+            classification_confidence=0.95,
+            category=SourceCategory.NATIVE_MEMORY,
+            ingestion_policy=IngestionPolicy.IMPORT_VERBATIM,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.TAKEOVER_INPUT,
+            file_globs=["memory/*.md", "memory/MEMORY.md"],
+        ),
+        # ---- 会话历史：projects/<project>/*.jsonl + subagents ----
+        MemorySurface(
+            surface_id="claude_project_sessions",
+            path_template="%HOME%/.claude/projects",
+            surface_role="conversation_history",
+            scope="user", load_order=23,
+            loader_evidence="https://docs.anthropic.com/zh-CN/docs/claude-code/memory",
+            classification_confidence=0.90,
             category=SourceCategory.CONVERSATION_HISTORY,
-            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
             ownership=Ownership.AGENT_MANAGED,
             target_role=TargetRole.NONE,
+            file_globs=["*.jsonl", "**/subagents/agent-*.jsonl"],
         ),
         MemorySurface(
             surface_id="claude_user_todos",
             path_template="%HOME%/.claude/todos",
             surface_role="runtime_evidence",
-            scope="user", load_order=23,
+            scope="user", load_order=24,
             loader_evidence="https://docs.anthropic.com/zh-CN/docs/claude-code/memory",
             classification_confidence=0.70,
             category=SourceCategory.RUNTIME_EVIDENCE,
@@ -131,7 +142,7 @@ def _claude_code_profile() -> AgentProfile:
             surface_id="claude_user_command_history",
             path_template="%HOME%/.claude/history.jsonl",
             surface_role="runtime_evidence",
-            scope="user", load_order=24,
+            scope="user", load_order=25,
             loader_evidence="https://docs.anthropic.com/zh-CN/docs/claude-code/memory",
             classification_confidence=0.70,
             category=SourceCategory.RUNTIME_EVIDENCE,
@@ -143,18 +154,18 @@ def _claude_code_profile() -> AgentProfile:
     return AgentProfile(
         profile_id="claude-code@profile-1",
         product="claude-code",
-        profile_version="1",
+        profile_version="2",
         supported_platforms=["windows", "macos", "linux"],
-        verified_product_versions=[],  # 首版无真实 fixture
+        verified_product_versions=[],
         detection_rules=[],
         surfaces=surfaces,
-        target_capability=TargetCapability.EXPORT_ONLY,  # 无 Loader fixture，只能 export
+        target_capability=TargetCapability.EXPORT_ONLY,
         evidence_urls=["https://docs.anthropic.com/zh-CN/docs/claude-code/memory"],
     )
 
 
 def _codex_profile() -> AgentProfile:
-    """Codex Profile（v3.1 §14.1 官方文档依据）。"""
+    """Codex Profile（v3.2：sessions JSONL + state sqlite 元数据）。"""
     surfaces = [
         MemorySurface(
             surface_id="codex_agents_md",
@@ -192,11 +203,36 @@ def _codex_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
+        MemorySurface(
+            surface_id="codex_sessions",
+            path_template="%HOME%/.codex/sessions",
+            surface_role="conversation_history",
+            scope="user", load_order=21,
+            loader_evidence="https://openai.com/index/introducing-codex/",
+            classification_confidence=0.90,
+            category=SourceCategory.CONVERSATION_HISTORY,
+            ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+            file_globs=["**/rollout-*.jsonl", "**/*.jsonl"],
+        ),
+        MemorySurface(
+            surface_id="codex_state_sqlite",
+            path_template="%HOME%/.codex/state_5.sqlite",
+            surface_role="runtime_evidence",
+            scope="user", load_order=22,
+            loader_evidence="https://openai.com/index/introducing-codex/",
+            classification_confidence=0.80,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+        ),
     ]
     return AgentProfile(
         profile_id="codex@profile-1",
         product="codex",
-        profile_version="1",
+        profile_version="2",
         supported_platforms=["windows", "macos", "linux"],
         verified_product_versions=[],
         detection_rules=[],
@@ -207,13 +243,8 @@ def _codex_profile() -> AgentProfile:
 
 
 def _cursor_profile() -> AgentProfile:
-    """Cursor Profile（v3.1 §14.3 官方文档依据）。
-
-    官方页面没有给出稳定的本地 Memories 文件路径，只能发现公开项目 Rules。
-    但 ~/.cursor/ 目录下有全局配置和插件，可作为控制面发现。
-    """
+    """Cursor Profile（v3.2：agent-transcripts JSONL + state.vscdb 元数据）。"""
     surfaces = [
-        # ---- 项目级 ----
         MemorySurface(
             surface_id="cursor_project_rules",
             path_template="%WORKSPACE%/.cursor/rules",
@@ -226,7 +257,6 @@ def _cursor_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
-        # ---- 用户级 ----
         MemorySurface(
             surface_id="cursor_global_config",
             path_template="%HOME%/.cursor",
@@ -252,6 +282,56 @@ def _cursor_profile() -> AgentProfile:
             target_role=TargetRole.NONE,
         ),
         MemorySurface(
+            surface_id="cursor_agent_transcripts",
+            path_template="%HOME%/.cursor/projects",
+            surface_role="conversation_history",
+            scope="user", load_order=22,
+            loader_evidence="https://docs.cursor.com/context/rules",
+            classification_confidence=0.90,
+            category=SourceCategory.CONVERSATION_HISTORY,
+            ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+            file_globs=["**/agent-transcripts/**/*.jsonl"],
+        ),
+        MemorySurface(
+            surface_id="cursor_state_vscdb",
+            path_template="%APPDATA%/Cursor/User/globalStorage/state.vscdb",
+            surface_role="runtime_evidence",
+            scope="user", load_order=23,
+            loader_evidence="https://docs.cursor.com/context/rules",
+            classification_confidence=0.70,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+        ),
+        # macOS / Linux：Cursor 状态库不在 APPDATA；用独立模板避免误解析到 ~/Cursor
+        MemorySurface(
+            surface_id="cursor_state_vscdb_macos",
+            path_template="%HOME%/Library/Application Support/Cursor/User/globalStorage/state.vscdb",
+            surface_role="runtime_evidence",
+            scope="user", load_order=24,
+            loader_evidence="https://docs.cursor.com/context/rules",
+            classification_confidence=0.60,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+        ),
+        MemorySurface(
+            surface_id="cursor_state_vscdb_linux",
+            path_template="%HOME%/.config/Cursor/User/globalStorage/state.vscdb",
+            surface_role="runtime_evidence",
+            scope="user", load_order=25,
+            loader_evidence="https://docs.cursor.com/context/rules",
+            classification_confidence=0.60,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+        ),
+        MemorySurface(
             surface_id="cursor_memories_gui_only",
             path_template="gui-only://cursor/settings/memories",
             surface_role="native_memory",
@@ -267,7 +347,7 @@ def _cursor_profile() -> AgentProfile:
     return AgentProfile(
         profile_id="cursor@profile-1",
         product="cursor",
-        profile_version="1",
+        profile_version="2",
         supported_platforms=["windows", "macos", "linux"],
         verified_product_versions=[],
         detection_rules=[],
@@ -390,21 +470,48 @@ def _trae_profile() -> AgentProfile:
             loader_evidence="https://www.trae.com/ide/memory",
             classification_confidence=0.95,
             category=SourceCategory.NATIVE_MEMORY,
-            ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
+            ingestion_policy=IngestionPolicy.IMPORT_VERBATIM,
             ownership=Ownership.AGENT_MANAGED,
             target_role=TargetRole.TAKEOVER_INPUT,
         ),
         MemorySurface(
-            surface_id="trae_memory_projects",
+            surface_id="trae_project_memory",
             path_template="%HOME%/.trae-cn/memory/projects",
             surface_role="native_memory",
             scope="user", load_order=11,
             loader_evidence="https://www.trae.com/ide/memory",
+            classification_confidence=0.90,
+            category=SourceCategory.NATIVE_MEMORY,
+            ingestion_policy=IngestionPolicy.IMPORT_VERBATIM,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.TAKEOVER_INPUT,
+            file_globs=["project_memory.md"],
+        ),
+        MemorySurface(
+            surface_id="trae_session_memory",
+            path_template="%HOME%/.trae-cn/memory/projects",
+            surface_role="conversation_history",
+            scope="user", load_order=12,
+            loader_evidence="https://www.trae.com/ide/memory",
             classification_confidence=0.85,
+            category=SourceCategory.CONVERSATION_HISTORY,
+            ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+            file_globs=["**/session_memory_*.jsonl"],
+        ),
+        MemorySurface(
+            surface_id="trae_topics",
+            path_template="%HOME%/.trae-cn/memory/projects",
+            surface_role="native_memory",
+            scope="user", load_order=13,
+            loader_evidence="https://www.trae.com/ide/memory",
+            classification_confidence=0.80,
             category=SourceCategory.NATIVE_MEMORY,
             ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
             ownership=Ownership.AGENT_MANAGED,
-            target_role=TargetRole.TAKEOVER_INPUT,
+            target_role=TargetRole.NONE,
+            file_globs=["**/topics.md"],
         ),
         # ---- 用户级 Rules ----
         MemorySurface(
@@ -475,7 +582,7 @@ def _trae_profile() -> AgentProfile:
     return AgentProfile(
         profile_id="trae@profile-1",
         product="trae",
-        profile_version="1",
+        profile_version="2",
         supported_platforms=["windows", "macos", "linux"],
         verified_product_versions=[],
         detection_rules=[],

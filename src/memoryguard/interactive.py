@@ -2096,7 +2096,9 @@ async function deleteArchivedByIdx(idx) {
 }
 
 function showSelectionTree(instanceId, tree) {
-  const scopes = tree.scopes || [];
+  const MEMORY_SELECT_CATS = new Set(['native_memory', 'project_memory']);
+  const EXTRACT_DISPLAY_CATS = new Set(['conversation_history', 'runtime_evidence', 'knowledge_source']);
+  const extractFiles = [];
   const scopeTabs = `
     <div class="scope-tabs">
       <div class="scope-tab active" data-scope="all" onclick="filterSelectionScope('all')">全部</div>
@@ -2106,51 +2108,110 @@ function showSelectionTree(instanceId, tree) {
     </div>`;
   const scopeLabels = { user: '全局/用户', project: '项目', unknown: '未归属' };
   const scopeSourceLabels = { profile_declared: 'Profile声明', project_resolver: '项目解析器', fallback: '默认' };
+
+  function collectExtractFiles(categories) {
+    for (const cat of categories || []) {
+      if (!EXTRACT_DISPLAY_CATS.has(cat.category)) continue;
+      for (const f of cat.files || []) extractFiles.push({ ...f, category: cat.category });
+    }
+  }
+  function renderScopeCategories(categories, scope, projectRef) {
+    let html = '';
+    for (const cat of categories || []) {
+      if (EXTRACT_DISPLAY_CATS.has(cat.category)) continue;
+      if (!MEMORY_SELECT_CATS.has(cat.category)) continue;
+      html += renderSelectionCategory(cat, scope, projectRef);
+    }
+    return html;
+  }
+
   let treeHtml = '';
-  for (const scopeObj of scopes) {
+  for (const scopeObj of (tree.scopes || [])) {
     const scope = scopeObj.scope;
     const scopeLabel = scopeLabels[scope] || scope;
     const scopeSourceLabel = scopeSourceLabels[scopeObj.scope_source] || scopeObj.scope_source || '';
-    if (scope === 'project' && scopeObj.projects) {
-      for (const proj of scopeObj.projects) {
-        treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}" data-project="${escapeHtml(proj.project_ref || '')}">
+    const projects = scope === 'project' ? (scopeObj.projects || []) : [
+      ...((scopeObj.projects || [])),
+    ];
+    if (scope !== 'project' && (scopeObj.categories || []).length) {
+      collectExtractFiles(scopeObj.categories);
+      const catHtml = renderScopeCategories(scopeObj.categories, scope);
+      if (catHtml) {
+        treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}">
           <div class="finding-header" style="margin:14px 0 8px">
-            <span class="finding-rule">${scopeLabel} · ${escapeHtml(proj.project_ref || '')}</span>
-            <span class="chip chip-info">${escapeHtml(proj.scope_source || scopeObj.scope_source || '')}</span>
-          </div>`;
-        for (const cat of (proj.categories || [])) {
-          treeHtml += renderSelectionCategory(cat, scope, proj.project_ref);
-        }
-        treeHtml += `</div>`;
+            <span class="finding-rule">${scopeLabel}</span>
+            <span class="chip chip-info">${escapeHtml(scopeSourceLabel)}</span>
+          </div>${catHtml}</div>`;
       }
-    } else {
-      treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}">
+    }
+    for (const proj of projects) {
+      collectExtractFiles(proj.categories);
+      const catHtml = renderScopeCategories(proj.categories, scope, proj.project_ref);
+      if (!catHtml) continue;
+      treeHtml += `<div class="selection-group" data-scope="${escapeHtml(scope)}" data-project="${escapeHtml(proj.project_ref || '')}">
         <div class="finding-header" style="margin:14px 0 8px">
-          <span class="finding-rule">${scopeLabel}</span>
-          <span class="chip chip-info">${escapeHtml(scopeSourceLabel)}</span>
-        </div>`;
-      for (const cat of (scopeObj.categories || [])) {
-        treeHtml += renderSelectionCategory(cat, scope);
-      }
-      treeHtml += `</div>`;
+          <span class="finding-rule">${scopeLabel}${proj.project_ref ? ' · ' + escapeHtml(proj.project_ref) : ''}</span>
+          <span class="chip chip-info">${escapeHtml(proj.scope_source || scopeObj.scope_source || '')}</span>
+        </div>${catHtml}</div>`;
     }
   }
+
+  const extractSection = renderExtractFileSection(extractFiles);
   setContent(`<div class="view-heading"><span class="eyebrow">Selection</span><h2>分类勾选授权</h2>
-    <p>勾选要纳入治理的表面。当前阶段：已发现。完整治理流程：已发现 -> 已授权扫描 -> 已备份 -> 已纳入治理 -> 已生成受管记忆 -> 已发布 -> 已验证生效。</p></div>
+    <p>上方只勾选 Agent 长期记忆。下方会话/知识文档可点开萃取。Skill 与控制面不展示。</p></div>
     <section class="card">
-      <div class="card-head"><div><h2>授权摘要</h2>
-        <p>instance: <code>${escapeHtml(instanceId)}</code></p></div></div>
-      <div class="row"><span class="key">ownership</span><span>原生记忆 → agent_managed；普通文档 → external_read_only</span></div>
-      <div class="row"><span class="key">backup</span><span>仅原生记忆会做基线备份，普通文档不整库复制</span></div>
+      <div class="card-head"><div><h2>授权摘要</h2><p>Agent：${escapeHtml(tree.product || instanceId)}</p></div></div>
+      <div class="row"><span class="key">记忆勾选</span><span>原生记忆 · 项目记忆</span></div>
+      <div class="row"><span class="key">可萃取</span><span>会话 · 知识文档（不勾选）</span></div>
+      <div class="row"><span class="key">不展示</span><span>Skill · 控制面（规则层，非记忆）</span></div>
     </section>
-    <section class="card"><div class="card-head"><div><h2>作用域树</h2></div></div>
+    <section class="card"><div class="card-head"><div><h2>记忆来源勾选</h2></div></div>
       ${scopeTabs}
-      ${treeHtml}
+      ${treeHtml || '<div class="empty-state"><p>未发现可勾选的记忆来源。</p></div>'}
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="confirmSelection('${escapeHtml(instanceId)}')">确认授权</button>
         <button class="btn" type="button" onclick="renderSources()">取消</button>
       </div>
-    </section>`);
+    </section>
+    ${extractSection}`);
+}
+
+function renderExtractFileSection(files) {
+  if (!files.length) return '';
+  const catTitles = { conversation_history: '会话历史', knowledge_source: '知识文档', runtime_evidence: '运行证据' };
+  const byCat = {};
+  files.forEach(f => { const c = f.category || 'unknown'; (byCat[c] ||= []).push(f); });
+  const html = Object.keys(byCat).map(cat => {
+    const list = byCat[cat];
+    const rows = list.slice(0, 12).map(f => {
+      const p = escapeHtml(f.path || '').replaceAll("'", "\\'");
+      return `<div class="raw-file-row" style="cursor:pointer;grid-template-columns:1fr auto" onclick="extractSourceFileByPath('${p}')">
+        <span><code>${escapeHtml((f.path || '').split(/[/\\\\]/).slice(-2).join('/'))}</code>
+          <div class="surface-meta">${escapeHtml(f.session_title || catTitles[cat] || cat)}</div></span>
+        <span class="chip chip-info">萃取</span></div>`;
+    }).join('');
+    return `<div style="margin-bottom:12px"><div class="finding-header"><span class="finding-rule">${escapeHtml(catTitles[cat] || cat)}</span>
+      <span class="chip chip-info">${list.length} 个</span></div><div class="raw-file-list">${rows}</div></div>`;
+  }).join('');
+  return `<section class="card"><div class="card-head"><div><h2>可萃取来源</h2>
+    <p>点开进入萃取预览，确认后才写入长期记忆。</p></div></div>${html}</section>`;
+}
+
+async function extractSourceFileByPath(absPath) {
+  if (!absPath) return;
+  try {
+    const data = await callApi('list_sources');
+    const sources = data.sources || [];
+    const full = String(absPath).replace(/\\/g, '/');
+    const hit = sources.find(s => {
+      const p = String(s.path || '').replace(/\\/g, '/');
+      return full.startsWith(p + '/') || full === p;
+    });
+    if (!hit || !hit.root_id) return showToast('请先确认记忆来源授权后再萃取', 'error');
+    const root = String(hit.path).replace(/\\/g, '/');
+    const rel = full.startsWith(root + '/') ? full.slice(root.length + 1) : '';
+    await extractSourceFile(hit.root_id, rel);
+  } catch (e) { showToast('萃取失败：' + e, 'error'); }
 }
 
 function renderSelectionCategory(cat, scope, projectRef) {
@@ -2177,7 +2238,7 @@ function renderSelectionCategory(cat, scope, projectRef) {
     if (reason) metaParts.push(escapeHtml(reason));
     if (confidence) metaParts.push('置信度 ' + confidence);
     return `<label class="raw-file-row" style="cursor:pointer">
-      <input type="checkbox" data-cat="${escapeHtml(cat.category)}" data-path="${escapeHtml(f.path)}" data-scope="${escapeHtml(fScope)}" data-scope-source="${escapeHtml(scopeSource)}" data-project-ref="${escapeHtml(fProjectRef)}" data-discovery-object-id="${escapeHtml(discoveryId)}" ${checked}>
+      <input type="checkbox" data-selectable="true" data-cat="${escapeHtml(cat.category)}" data-path="${escapeHtml(f.path)}" data-scope="${escapeHtml(fScope)}" data-scope-source="${escapeHtml(scopeSource)}" data-project-ref="${escapeHtml(fProjectRef)}" data-discovery-object-id="${escapeHtml(discoveryId)}" ${checked}>
       <span class="raw-file-path">
         <code>${escapeHtml(f.path)}</code>
         <div class="surface-meta">${metaParts.join(' · ')}</div>
@@ -2207,7 +2268,7 @@ function filterSelectionScope(scope) {
 }
 
 async function confirmSelection(instanceId) {
-  const checks = document.querySelectorAll('input[type=checkbox][data-cat]:checked');
+  const checks = document.querySelectorAll('input[type=checkbox][data-selectable="true"]:checked');
   const selected = Array.from(checks).map(c => ({
     category: c.dataset.cat,
     path: c.dataset.path,
@@ -2216,7 +2277,7 @@ async function confirmSelection(instanceId) {
     project_ref: c.dataset.projectRef || '',
     discovery_object_id: c.dataset.discoveryObjectId || ''
   }));
-  if (!selected.length) return showToast('请至少勾选一个文件', 'error');
+  if (!selected.length) return showToast('请至少勾选一个记忆来源（原生/项目记忆）', 'error');
   showToast('正在写入 SelectionManifest…');
   try {
     const result = await callApi('commit_selection', instanceId, selected, true);
