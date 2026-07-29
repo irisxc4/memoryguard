@@ -47,7 +47,11 @@ class TestSecurityModule:
 
     def test_api_whitelist_complete(self):
         """白名单覆盖所有 GovernanceApi public 方法。"""
-        from memoryguard.security import ALL_ALLOWED_METHODS, _SECURITY_API_METHODS
+        from memoryguard.security import (
+            ALL_ALLOWED_METHODS,
+            BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS,
+            _SECURITY_API_METHODS,
+        )
         from memoryguard.gui import GovernanceApi
         import inspect
 
@@ -57,12 +61,16 @@ class TestSecurityModule:
             if not name.startswith("_")
         }
         allowed = ALL_ALLOWED_METHODS | _SECURITY_API_METHODS
-        missing = public_methods - allowed
+        missing = public_methods - allowed - BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS
         assert not missing, f"Missing from whitelist: {missing}"
+        assert not (BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS & allowed)
 
     def test_mutation_methods_include_all_confirmed(self):
         """所有含 confirmed 参数的方法必须在变更白名单中。"""
-        from memoryguard.security import MUTATION_API_METHODS
+        from memoryguard.security import (
+            BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS,
+            MUTATION_API_METHODS,
+        )
         from memoryguard.gui import GovernanceApi
         import inspect
 
@@ -74,7 +82,11 @@ class TestSecurityModule:
             if "confirmed" in sig.parameters:
                 confirmed_methods.add(name)
 
-        missing = confirmed_methods - MUTATION_API_METHODS
+        missing = (
+            confirmed_methods
+            - MUTATION_API_METHODS
+            - BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS
+        )
         assert not missing, f"confirmed methods not in MUTATION_API_METHODS: {missing}"
 
     def test_is_allowed_method(self):

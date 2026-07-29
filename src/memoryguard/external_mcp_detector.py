@@ -5,9 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .auto_organizer import AutoOrganizer
+from .governance_engine import GovernanceEngine
 from .schema_v3 import ExternalMCPLevel, MemoryEvent, stable_hash, _now_iso
-from .shared_memory_store import SharedMemoryStore
 
 
 class ExternalMCPDetector:
@@ -93,10 +92,9 @@ class ExternalMCPDetector:
                        entries: list[dict[str, Any]],
                        agent_instance_id: str = "external-mcp") -> dict[str, Any]:
         self._ensure_dirs()
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        organizer = AutoOrganizer(self.workspace, share_group_id)
+        engine = GovernanceEngine(self.workspace, share_group_id)
         imported = []
-        for entry in entries:
+        for index, entry in enumerate(entries):
             body = str(entry.get("body", "")).strip()
             if not body:
                 continue
@@ -111,15 +109,20 @@ class ExternalMCPDetector:
                 auto_actions=[],
                 created_at=_now_iso(),
             )
-            store.append_event(event)
-            record, actions = organizer.organize(event)
-            event.auto_actions = actions
-            store.update_event(event)
+            result = engine.auto_write(
+                event,
+                idempotency_key=stable_hash(
+                    "external_mcp_import",
+                    server_id,
+                    str(index),
+                    body,
+                ),
+            )
             imported.append({
-                "memory_id": record.memory_id,
-                "status": record.status.value,
-                "kind": record.kind.value,
-                "auto_actions": actions,
+                "memory_id": result["memory_id"],
+                "status": result["status"],
+                "kind": result["kind"],
+                "auto_actions": result["auto_actions"],
             })
         manifest = {
             "server_id": server_id,

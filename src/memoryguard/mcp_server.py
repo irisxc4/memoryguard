@@ -33,6 +33,7 @@ _MUTATING_TOOLS = {
     "memoryguard_external_mcp_import",
     "memoryguard_accept_candidates",
     "memoryguard_provider_install",
+    "memoryguard_apply_enrichments",
 }
 
 
@@ -89,11 +90,14 @@ TOOLS = [
     },
     {
         "name": "memoryguard_neuron_graph",
-        "description": "Read the neuron graph projection (read-only). Returns {empty: true, reason: 'not_built'} if projection not yet built. Use build_plan to generate a build plan first.",
+        "description": "Read the scoped neuron graph projection (read-only). Requires explicit agent_instance_id or share_group_id. Returns {empty: true, reason: 'not_built'|'missing_governance_scope'|...}.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "mode": {"type": "string", "description": "native | reconstructed (default: reconstructed)"},
+                "agent_instance_id": {"type": "string", "description": "single-agent governance scope"},
+                "share_group_id": {"type": "string", "description": "MCP shared-memory scope (mutually exclusive with agent)"},
             },
         },
     },
@@ -109,17 +113,6 @@ TOOLS = [
             "required": ["path"],
         },
     },
-    {
-        "name": "memoryguard_build_plan",
-        "description": "Generate a memory build plan (read-only, no write). Returns BuildManifest with integrity check and diff preview. Apply via GUI or CLI.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "target_path": {"type": "string", "description": "target path (default: .memoryguard/memory-target)"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
-        },
-    },
     # --- v3.2 memory backend tools ---
     {
         "name": "memoryguard_memory_read",
@@ -128,8 +121,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "memory record ID"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["memory_id"],
         },
@@ -142,9 +134,10 @@ TOOLS = [
             "properties": {
                 "query": {"type": "string", "description": "search query"},
                 "kind": {"type": "string", "description": "filter by kind: preference|fact|project|procedure|episode|correction"},
-                "status": {"type": "string", "description": "filter by status: active|shadowed|conflicted|quarantined|deleted"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "status": {"type": "string", "description": "filter by status: active (default)|low_confidence|shadowed|conflicted|quarantined|deleted"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "maximum results to return (default: 5 for conversation recall)"},
+                "semantic": {"type": "string", "enum": ["off", "heuristic", "model"], "description": "optional semantic recall mode (default: off)"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
         },
     },
@@ -158,9 +151,8 @@ TOOLS = [
                 "kind": {"type": "string", "description": "override kind (default: auto-classify). Valid: preference|fact|project|procedure|episode|correction"},
                 "write_policy": {"type": "string", "description": "write policy: auto_accept (default) | auto_quarantine_on_risk | propose_only. propose_only creates a low_confidence candidate without modifying existing memories"},
                 "metadata": {"type": "object", "description": "optional metadata from agent"},
-                "agent_instance_id": {"type": "string", "description": "agent that wrote this memory"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "idempotency_key": {"type": "string", "description": "optional retry key bound to content, metadata, kind and policy"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["body"],
         },
@@ -175,8 +167,8 @@ TOOLS = [
                 "body": {"type": "string", "description": "new body"},
                 "kind": {"type": "string", "description": "new kind"},
                 "status": {"type": "string", "description": "new status"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "idempotency_key": {"type": "string", "description": "optional retry key bound to this target and payload"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["memory_id"],
         },
@@ -188,8 +180,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "memory record ID"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "idempotency_key": {"type": "string", "description": "optional retry key bound to this target"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["memory_id"],
         },
@@ -200,9 +192,45 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-                "share_group_id": {"type": "string", "description": "share group ID (default: default)"},
+                "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
+        },
+    },
+    {
+        "name": "memoryguard_context_bootstrap",
+        "description": (
+            "Build one bounded, read-only long-term-memory context packet for a new task. "
+            "Uses the trusted MCP identity/binding, includes active preferences plus "
+            "task-relevant governed memories, omits sensitive/unsafe states, and never "
+            "replaces or repeats the host's current conversation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "current task or request; required",
+                },
+                "project_hint": {
+                    "type": "string",
+                    "description": "optional project/repository hint used only for relevance",
+                },
+                "max_items": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 12,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 256,
+                    "maximum": 12000,
+                    "default": 6000,
+                },
+            },
+            "required": ["task"],
+            "additionalProperties": False,
         },
     },
     # --- v3.2 agent binding tools ---
@@ -272,7 +300,7 @@ TOOLS = [
     },
     {
         "name": "memoryguard_accept_candidates",
-        "description": "Accept extracted memory candidates and write them to shared memory. Writes to SharedMemoryStore via append_event + AutoOrganizer.organize. Records a DecisionEvent (action=accept_extract). Requires extract_id from a prior extract_memories call and explicit candidate_ids list.",
+        "description": "Accept extracted memory candidates through GovernanceEngine and write them to shared memory. Records governed automatic writes plus a DecisionEvent (action=accept_extract). Requires extract_id from a prior extract_memories call and explicit candidate_ids list.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -303,12 +331,13 @@ TOOLS = [
     # --- v3.2 provider adapter tool ---
     {
         "name": "memoryguard_provider_install",
-        "description": "Install a provider adapter (Claude/Codex/Cursor) to redirect native memory to MemoryGuard MCP. Writes instruction file + MCP config + creates AgentBinding. Idempotent.",
+        "description": "Install/repair the provider's global MCP, redirect rules, and supported user-level lifecycle Hook (Claude/Codex/Cursor; TRAE reports MCP+rules fallback). Ensures the trusted Agent has a personal binding unless an explicit shared binding already exists. Requires admin capability; idempotent.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "description": "provider name: claude|codex|cursor"},
+                "provider": {"type": "string", "description": "provider name: claude|codex|cursor|trae"},
                 "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "agent_instance_id": {"type": "string", "description": "trusted Agent identity (normally from MEMORYGUARD_AGENT_ID)"},
             },
             "required": ["provider"],
         },
@@ -324,6 +353,78 @@ TOOLS = [
                 "workspace": {"type": "string", "description": "workspace path (default: .)"},
             },
             "required": ["agent_instance_id"],
+        },
+    },
+    # --- v3.3 host AI enrichment tools ---
+    {
+        "name": "memoryguard_list_pending_enrichments",
+        "description": "List pending memory enrichment tasks. Skill path: after build_and_enrich returns host_action_required, YOU (host agent) must classify+translate each task and call apply_enrichments — do not ask the user to pick a CLI.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "limit": {"type": "integer", "description": "max tasks to return (default: 50)"},
+                "agent_instance_id": {"type": "string", "description": "filter by agent scope (optional)"},
+                "share_group_id": {"type": "string", "description": "filter by share group scope (optional)"},
+            },
+        },
+    },
+    {
+        "name": "memoryguard_apply_enrichments",
+        "description": "Apply host-agent enrichment results to Memory IR / SharedMemoryStore. Each result: task_id, kind, title, body, confidence. After YOU enrich pending tasks, call this then memoryguard_build_and_enrich again to refresh the graph.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "results": {
+                    "type": "array",
+                    "description": "enrichment results to apply",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": {"type": "string"},
+                            "kind": {"type": "string", "description": "preference|fact|project|procedure|episode|correction"},
+                            "title": {"type": "string", "description": "translated/organized title"},
+                            "body": {"type": "string", "description": "translated/organized body"},
+                            "confidence": {"type": "number", "description": "0.0-1.0"},
+                            "rationale": {"type": "string"},
+                        },
+                        "required": ["task_id", "kind", "title", "body"],
+                    },
+                },
+                "agent_instance_id": {"type": "string", "description": "scope filter (optional)"},
+                "share_group_id": {"type": "string", "description": "share group scope (optional)"},
+            },
+            "required": ["results"],
+        },
+    },
+    {
+        "name": "memoryguard_enrichment_status",
+        "description": "Check enrichment queue status: pending/applied counts. Primary enrich happens inside build_projection; use this to see residuals.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "agent_instance_id": {"type": "string", "description": "filter by agent scope (optional)"},
+                "share_group_id": {"type": "string", "description": "filter by share group (optional)"},
+            },
+        },
+    },
+    # --- v3.3 build projection + auto enrich ---
+    {
+        "name": "memoryguard_build_and_enrich",
+        "description": "Build memory projection. Default enrich_mode=host: YOU are the LLM. If pending_tasks / host_action_required, immediately classify+translate, call apply_enrichments, then call this again. Multi-agent GUI may pass enrich_mode=cli with a chosen Agent CLI. Do not require a separate AI-整理 button.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "agent_instance_id": {"type": "string", "description": "agent instance ID for scoped projection"},
+                "mode": {"type": "string", "description": "projection mode: reconstructed (default) or native"},
+                "share_group_id": {"type": "string", "description": "share group ID (optional)"},
+                "enrich_mode": {"type": "string", "description": "host (default) | cli | auto | heuristic"},
+                "llm_agent": {"type": "string", "description": "CLI agent id when enrich_mode=cli (codex|claude|cursor|…)"},
+                "llm_cli": {"type": "string", "description": "CLI path when enrich_mode=cli"},
+            },
         },
     },
 ]
@@ -364,8 +465,18 @@ def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -
                 return _mcp_error(f"invalid kind '{kind_val}'. Valid: {sorted(_VALID_KINDS)}")
         from .shared_memory_store import SharedMemoryStore
 
-        store = SharedMemoryStore(workspace, _get_share_group_id(args)[0])
-        if store.get_record(memory_id) is None:
+        group_id, access_err, _ = _resolve_access(
+            args,
+            workspace,
+        )
+        if access_err:
+            return _mcp_error(access_err)
+        try:
+            store = SharedMemoryStore(workspace, group_id, read_only=True)
+        except FileNotFoundError:
+            return _mcp_error(f"group not found: {group_id}")
+        target = store.get_record(memory_id)
+        if target is None:
             return _mcp_error(f"memory not found: {memory_id}")
         return None
 
@@ -397,16 +508,42 @@ def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -
 
     if name == "memoryguard_provider_install":
         provider = str(args.get("provider", "")).lower()
-        if provider not in {"claude", "codex", "cursor"}:
-            return _mcp_error(f"unknown provider '{provider}'. Supported: claude|codex|cursor")
+        if provider not in {"claude", "codex", "cursor", "trae"}:
+            return _mcp_error(f"unknown provider '{provider}'. Supported: claude|codex|cursor|trae")
         return None
 
     return None
 
 
+def _resolve_workspace(args: dict[str, Any]) -> Path:
+    """解析稳定控制目录。
+
+    用户级 MCP 会从任意项目启动，不能把宿主当前目录当作 MemoryGuard
+    数据目录。显式参数仅供管理/测试覆盖；正常 Agent 连接走安装时写入的环境变量。
+    """
+    explicit = str(args.get("workspace", "") or "").strip()
+    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+    return Path(explicit or configured or ".").expanduser().resolve()
+
+
+def _resolve_memory_workspace(args: dict[str, Any]) -> Path:
+    """共享记忆始终服从安装身份，防止对话参数把存储切到当前项目。"""
+    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return _resolve_workspace(args)
+
+
 def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """执行工具，返回 MCP tool result。"""
-    workspace = Path(args.get("workspace", ".")).resolve()
+    workspace = (
+        _resolve_memory_workspace(args)
+        if (
+            name.startswith("memoryguard_memory_")
+            or name == "memoryguard_context_bootstrap"
+        )
+        else _resolve_workspace(args)
+    )
 
     # 写操作：先做本地参数预检，再执行
     if name in _MUTATING_TOOLS:
@@ -486,14 +623,41 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     if name == "memoryguard_neuron_graph":
         api = _get_governance_api(workspace)
-        proj = api.get_neuron_graph()
-        if proj.get("empty"):
-            text = f"Neuron graph: {proj.get('reason', 'not_built')}\nUse build_plan to generate a plan, then apply via GUI/CLI to build projection."
+        agent_id = str(args.get("agent_instance_id", "") or "").strip()
+        share_id = str(args.get("share_group_id", "") or "").strip()
+        if agent_id and share_id:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "error: conflicting_governance_scope; provide exactly one of agent_instance_id or share_group_id",
+                }],
+                "isError": True,
+            }
+        if not agent_id and not share_id:
+            return {
+                "content": [{
+                    "type": "text",
+                    "text": "error: missing_governance_scope; provide agent_instance_id or share_group_id",
+                }],
+                "isError": True,
+            }
+        mode = str(args.get("mode", "reconstructed") or "reconstructed")
+        if share_id:
+            proj = api.get_neuron_graph(mode=mode, share_group_id=share_id)
+        else:
+            proj = api.get_neuron_graph(mode=mode, agent_instance_id=agent_id)
+        if proj.get("empty") or proj.get("error"):
+            text = (
+                f"Neuron graph: {proj.get('reason') or proj.get('error') or 'not_built'}\n"
+                "Build via GUI/CLI with the same explicit scope."
+            )
             return {"content": [{"type": "text", "text": text}]}
         nodes = proj.get("nodes", [])
         edges = proj.get("edges", [])
+        scope = proj.get("scope") or {}
         text = (
             f"Neuron graph projection:\n"
+            f"  scope: {scope}\n"
             f"  snapshot: {proj.get('snapshot_id', '')}\n"
             f"  built_at: {proj.get('built_at', '')}\n"
             f"  nodes: {len(nodes)}  edges: {len(edges)}\n"
@@ -517,23 +681,6 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
         return {"content": [{"type": "text", "text": text}]}
 
-    if name == "memoryguard_build_plan":
-        api = _get_governance_api(workspace)
-        target_path = args.get("target_path", "")
-        plan = api.create_build_plan(target_path)
-        text = (
-            f"Build plan: {plan.get('plan_id', '')}\n"
-            f"  snapshot: {plan.get('snapshot_id', '')}\n"
-            f"  target_profile: {plan.get('target_profile', '')}\n"
-            f"  coverage: {plan.get('coverage_status', '')}\n"
-            f"  integrity: {plan.get('integrity_ok', False)}\n"
-            f"  published: {plan.get('manifest', {}).get('published_record_count', 0)}\n"
-            f"  unaccounted: {plan.get('manifest', {}).get('unaccounted_record_count', 0)}\n"
-            f"  diff: {plan.get('diff_preview', {})}\n"
-            f"Apply via GUI or: memoryguard memory build-apply {plan.get('plan_id','')} --yes"
-        )
-        return {"content": [{"type": "text", "text": text}]}
-
     # --- v3.2 memory backend tools ---
     if name == "memoryguard_memory_read":
         return _handle_memory_read(args)
@@ -547,9 +694,17 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _handle_memory_delete(args)
     if name == "memoryguard_memory_status":
         return _handle_memory_status(args)
+    if name == "memoryguard_context_bootstrap":
+        return _handle_context_bootstrap(args)
 
     # --- v3.2 agent binding tools ---
     if name == "memoryguard_binding_create":
+        # P0-A: binding_create 升为 admin capability,防止自助提权
+        from .access_context import load_access_context
+        ctx = load_access_context()
+        ok, err = ctx.require_admin()
+        if not ok:
+            return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
         api = _get_governance_api(workspace)
         result = api.bind_agent(
             agent_instance_id=args["agent_instance_id"],
@@ -567,7 +722,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         for b in result["bindings"]:
             text += (
                 f"  - {b['binding_id'][:12]}  agent={b['agent_instance_id']}  "
-                f"group={b['share_group_id']}  status={b['status']}  mode={b['native_memory_mode']}\n"
+                f"group={b['share_group_id']} kind={b.get('group_kind', 'shared')} "
+                f"members={b.get('member_count', 0)} status={b['status']}  mode={b['native_memory_mode']}\n"
+                f"      canonical_store: {b.get('canonical_store_path', '')}\n"
             )
         return {"content": [{"type": "text", "text": text}]}
 
@@ -666,19 +823,38 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     # --- v3.2 provider adapter tool ---
     if name == "memoryguard_provider_install":
-        from .provider_adapters import ClaudeAdapter, CodexAdapter, CursorAdapter
+        from .provider_adapters import ClaudeAdapter, CodexAdapter, CursorAdapter, TraeAdapter
+        from .access_context import load_access_context
+        from .agent_binding import AgentBindingStore
 
         provider = args.get("provider", "").lower()
         adapter_map = {
             "claude": ClaudeAdapter,
             "codex": CodexAdapter,
             "cursor": CursorAdapter,
+            "trae": TraeAdapter,
         }
         adapter_cls = adapter_map.get(provider)
         if adapter_cls is None:
-            return {"content": [{"type": "text", "text": f"error: unknown provider '{provider}'. Supported: claude|codex|cursor"}], "isError": True}
+            return {"content": [{"type": "text", "text": f"error: unknown provider '{provider}'. Supported: claude|codex|cursor|trae"}], "isError": True}
+        # 正式安装/接管时才创建个人组；已有共享绑定保持不变。
+        ctx = load_access_context()
+        ok_admin, admin_err = ctx.require_admin()
+        if not ok_admin:
+            return {"content": [{"type": "text", "text": f"error: {admin_err}"}], "isError": True}
+        agent_id, identity_err = ctx.resolve_agent(str(args.get("agent_instance_id", "") or ""))
+        if identity_err:
+            return {"content": [{"type": "text", "text": f"error: {identity_err}"}], "isError": True}
+        binding_store = AgentBindingStore(workspace)
+        ensured = binding_store.ensure_personal_memory_group(agent_id)
+        binding = ensured.get("binding") or {}
+        group_id = str(binding.get("share_group_id", "") or ensured.get("group_id", ""))
         adapter = adapter_cls(str(workspace))
-        result = adapter.install(str(workspace))
+        result = adapter.install(
+            str(workspace), share_group_id=group_id,
+            agent_instance_id=agent_id, global_scope=True,
+        )
+        result["binding"] = ensured
         return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
     # --- v3.2 agent group resolution tool ---
@@ -703,6 +879,107 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
         return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
+    # --- v3.3 host AI enrichment tools ---
+    if name == "memoryguard_list_pending_enrichments":
+        from .host_enrichment import list_pending
+        limit = int(args.get("limit", 50))
+        agent_id = args.get("agent_instance_id", "")
+        share_group_id = args.get("share_group_id", "")
+        tasks = list_pending(
+            workspace, limit=limit,
+            agent_instance_id=agent_id, share_group_id=share_group_id,
+        )
+        # 精简输出,给宿主 AI 的每条 task 包含分类和翻译所需的信息
+        simplified = []
+        for t in tasks:
+            simplified.append({
+                "task_id": t["task_id"],
+                "memory_id": t["memory_id"],
+                "ops": t["ops"],
+                "input": t["input"],
+                "hint": "classify kind + translate title/body to user's language; return task_id, kind, title_zh, body_zh, confidence",
+            })
+        result = {
+            "pending_count": len(simplified),
+            "tasks": simplified,
+            "next_step": "classify/translate then call memoryguard_apply_enrichments",
+        }
+        return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
+
+    if name == "memoryguard_apply_enrichments":
+        from .host_enrichment import apply_results
+        results = args.get("results", [])
+        if not results or not isinstance(results, list):
+            return _mcp_error("results must be a non-empty list")
+        agent_id = args.get("agent_instance_id", "")
+        share_group_id = args.get("share_group_id", "")
+        stats = apply_results(
+            workspace, results,
+            agent_instance_id=agent_id, share_group_id=share_group_id,
+        )
+        if stats.get("rebuild_suggested"):
+            stats["next_step"] = "call build_projection / memoryguard_build_and_enrich to refresh graph"
+        return {"content": [{"type": "text", "text": json.dumps(stats, ensure_ascii=False, indent=2)}]}
+
+    if name == "memoryguard_enrichment_status":
+        from .host_enrichment import get_status
+        agent_id = args.get("agent_instance_id", "")
+        share_group_id = args.get("share_group_id", "")
+        status = get_status(workspace, agent_instance_id=agent_id, share_group_id=share_group_id)
+        status["mode"] = "build_integrated"
+        return {"content": [{"type": "text", "text": json.dumps(status, ensure_ascii=False, indent=2)}]}
+
+    # --- v3.3 build projection (MCP 入口,含 LLM 整理) ---
+    if name == "memoryguard_build_and_enrich":
+        from .gui import GovernanceApi
+        agent_id = args.get("agent_instance_id", "")
+        mode = args.get("mode", "reconstructed")
+        share_group_id = args.get("share_group_id", "")
+        enrich_mode = str(args.get("enrich_mode", "host") or "host").strip().lower()
+        llm_agent = str(args.get("llm_agent", "") or "")
+        llm_cli = str(args.get("llm_cli", "") or "")
+        if share_group_id:
+            scope = {"mode": "share_group", "share_group_id": share_group_id}
+        else:
+            scope = {"mode": "agent", "agent_instance_id": agent_id} if agent_id else {"mode": "agent"}
+        api = GovernanceApi(str(workspace))
+        result = api.build_projection(
+            confirmed=True, mode=mode, scope=scope,
+            agent_instance_id=agent_id, share_group_id=share_group_id,
+            enrich_mode=enrich_mode,
+            llm_agent=llm_agent,
+            llm_cli=llm_cli,
+        )
+        if "error" in result:
+            return _mcp_error(result["error"])
+        enr = result.get("enrichment", {}) or {}
+        pending_tasks = enr.get("pending_tasks") or []
+        host_needed = bool(enr.get("host_action_required") or pending_tasks)
+        summary = {
+            "projection_built": True,
+            "node_count": len(result.get("nodes", [])),
+            "scoped_record_count": result.get("scoped_record_count", 0),
+            "enrichment": {
+                k: v for k, v in enr.items() if k != "pending_tasks"
+            },
+            "pending_tasks": pending_tasks[:80],
+            "host_action_required": host_needed,
+            "host_protocol": {
+                "you_are_the_llm": True,
+                "steps": [
+                    "If host_action_required: classify+translate each pending_task yourself (kind/title/body/confidence)",
+                    "Call memoryguard_apply_enrichments with results",
+                    "Call memoryguard_build_and_enrich again to refresh the neuron graph",
+                ],
+            } if host_needed else None,
+            "next_step": (
+                "HOST ACTION REQUIRED: you are the enricher. Apply enrichments then rebuild."
+                if host_needed
+                else f"构建完成；已整理 {enr.get('auto_applied', 0)} 条。"
+            ),
+        }
+        return {"content": [{"type": "text", "text": json.dumps(summary, ensure_ascii=False, indent=2)}]}
+
     return {"content": [{"type": "text", "text": f"error: unknown tool {name}"}], "isError": True}
 
 
@@ -711,40 +988,43 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _get_share_group_id(args: dict[str, Any], workspace: Path | None = None) -> tuple[str, str | None]:
-    """根据 args 推导 share_group_id。返回 (group_id, error_message)。
+def _get_share_group_id(args: dict[str, Any], workspace: Path | None = None,
+                        *, strict: bool | None = None) -> tuple[str, str | None]:
+    """S1.2: 服务端解析 binding,禁止显式 group 覆盖。"""
+    if strict is None:
+        strict = os.environ.get("MEMORYGUARD_STRICT_BINDING", "") == "1"
 
-    优先级：
-    1. 用户显式指定的 share_group_id（非 "default"）— 直接返回
-    2. agent_instance_id 对应的 active AgentBinding 的 share_group_id
-    3. "default"（向后兼容）
-
-    如果 agent_instance_id 存在但无绑定，写 stderr warning。
-    环境变量 MEMORYGUARD_STRICT_BINDING=1 时，调用方应拒绝写入。
-    """
     explicit_group = args.get("share_group_id", "default")
-    if explicit_group and explicit_group != "default":
-        return (explicit_group, None)
+    # S1.2: 忽略请求中的显式 share_group_id,只从 binding 解析
+    # (admin API 走独立路径,不经此函数)
+    _ = explicit_group  # 保留变量但不使用
 
     agent_id = args.get("agent_instance_id", "")
     if not agent_id:
+        if strict:
+            return ("", "missing agent_instance_id; strict binding mode requires it")
         return ("default", None)
 
     # 查 AgentBinding，由 binding 派生 group_id
-    ws = workspace or Path(args.get("workspace", ".")).resolve()
+    ws = workspace or _resolve_memory_workspace(args)
     try:
         from .agent_binding import AgentBindingStore
 
         binding_store = AgentBindingStore(ws)
         bindings = binding_store.find_by_agent(agent_id, include_inactive=False)
+        if len(bindings) > 1:
+            return ("", f"multiple active bindings for agent_instance_id={agent_id!r}")
         if bindings:
             return (bindings[0].share_group_id, None)
     except Exception as e:
-        # 查询失败不阻塞写入，只警告
+        if strict:
+            return ("", f"failed to query binding for '{agent_id}': {e}")
         print(f"Warning: failed to query agent binding for '{agent_id}': {e}", file=sys.stderr)
         return ("default", None)
 
-    # agent 存在但无绑定
+    # agent 存在但无 binding
+    if strict:
+        return ("", f"agent '{agent_id}' has no active binding; access denied in strict mode")
     warning_msg = (
         f"agent '{agent_id}' has no binding, writing to default group. "
         f"Run 'memoryguard agent bind {agent_id}' to bind."
@@ -753,11 +1033,82 @@ def _get_share_group_id(args: dict[str, Any], workspace: Path | None = None) -> 
     return ("default", warning_msg)
 
 
+# ---------------------------------------------------------------------------
+# P0-D: 统一 secret 脱敏入口(所有写入路径共用)
+# ---------------------------------------------------------------------------
+
+
+def _redact_secret(body: str) -> tuple[str, str]:
+    """统一 secret 检测+脱敏。返回 (safe_body, secret_pattern)。
+
+    secret_pattern 非空表示检测到 secret(已脱敏)。
+    所有写入路径(write/update/edit/import/accept)必须调用此函数。
+    """
+    from .auto_organizer import SECRET_PATTERNS
+    safe_body = body
+    secret_hit = ""
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(body):
+            secret_hit = pattern.pattern[:50]
+            break
+    if secret_hit:
+        for pattern in SECRET_PATTERNS:
+            safe_body = pattern.sub("[REDACTED]", safe_body)
+    return (safe_body, secret_hit)
+
+
+def _resolve_access(
+    args: dict[str, Any],
+    workspace: Path,
+) -> tuple[str | None, str | None, "AccessContext | None"]:
+    """P0-A: 统一身份校验 + group 解析。
+
+    返回 (group_id, error_message, access_ctx)。
+    error_message 非空时调用方必须拒绝。
+    Active trusted binding is the read/write capability boundary.  This API
+    intentionally has no separate, unenforced ``require_write`` mode.
+    """
+    from .access_context import load_access_context
+    ctx = load_access_context()
+
+    # 可信 MCP 环境是身份事实源；请求参数缺省时自动注入，显式提供时仅做一致性校验。
+    claimed_agent = str(args.get("agent_instance_id", "") or "")
+    agent_id, err = ctx.resolve_agent(claimed_agent)
+    if err:
+        return (None, err, ctx)
+    args["agent_instance_id"] = agent_id
+
+    # P0-A: 默认 strict binding
+    group_id, binding_err = _get_share_group_id(args, workspace, strict=ctx.strict_binding)
+    if binding_err:
+        return (None, binding_err, ctx)
+    if not group_id:
+        return (None, "no share_group_id resolved; access denied", ctx)
+    maintenance_marker = (
+        workspace / ".memoryguard" / "shared-memory" / group_id / ".maintenance"
+    )
+    if maintenance_marker.exists():
+        return (None, f"memory group is in maintenance: {group_id}", ctx)
+
+    return (group_id, None, ctx)
+
+
+# ---------------------------------------------------------------------------
+# Memory handlers(P0-A/B/D 全部加固)
+# ---------------------------------------------------------------------------
+
+
 def _handle_memory_read(args: dict[str, Any]) -> dict[str, Any]:
+    """P0-B: 只读路径用 read_only=True,不存在的 group 不建库。"""
     from .shared_memory_store import SharedMemoryStore
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id = _get_share_group_id(args)[0]
-    store = SharedMemoryStore(workspace, group_id)
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
+    try:
+        store = SharedMemoryStore(workspace, group_id, read_only=True)
+    except FileNotFoundError:
+        return {"content": [{"type": "text", "text": f"error: group not found: {group_id}"}], "isError": True}
     record = store.get_record(args["memory_id"])
     if record is None:
         return {"content": [{"type": "text", "text": f"error: memory not found: {args['memory_id']}"}], "isError": True}
@@ -765,32 +1116,84 @@ def _handle_memory_read(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _handle_memory_search(args: dict[str, Any]) -> dict[str, Any]:
+    """B1/B2: FTS5 全文搜索 + BM25 排序 + 可选语义召回 + 元数据。
+
+    semantic 参数:off(默认)/heuristic/model
+    """
     from .shared_memory_store import SharedMemoryStore
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id = _get_share_group_id(args)[0]
-    store = SharedMemoryStore(workspace, group_id)
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
+    try:
+        store = SharedMemoryStore(workspace, group_id, read_only=True)
+    except FileNotFoundError:
+        return {"content": [{"type": "text", "text": f"error: group not found: {group_id}"}], "isError": True}
     query = args.get("query", "")
     kind = args.get("kind")
-    status = args.get("status")
-    records = store.list_records(status=status, kind=kind)
-    # 简单关键词搜索
-    if query:
-        query_lower = query.lower()
-        records = [r for r in records if query_lower in r.body.lower()]
-    text = f"Found {len(records)} records:\n"
-    for r in records[:20]:
-        text += f"  [{r.status.value}] [{r.kind.value}] {r.memory_id[:8]}  {r.body[:60]}\n"
+    # Conversation recall is fail-closed: historical/unsafe states require an
+    # explicit governance query and must never enter prompts by omission.
+    status = args.get("status") or "active"
+    semantic = args.get("semantic", "off")
+    limit = max(1, min(20, int(args.get("limit", 5))))
+
+    # B1: FTS5 全文搜索(主路径)
+    fts_results = store.search_fts(query, status=status, kind=kind, limit=limit)
+
+    # B1: 可选语义召回(heuristic 用 HashBackend,model 用 provider embedding)
+    semantic_results: list[dict] = []
+    if semantic in ("heuristic", "model") and query:
+        try:
+            from .semantic_dedup import SemanticDedup
+            dedup = SemanticDedup(workspace, group_id)
+            # 用 semantic 查找相似记忆
+            sem_dups = dedup.find_semantic_duplicates(query, threshold=0.60)
+            fts_ids = {r["record"]["memory_id"] for r in fts_results}
+            for dup in sem_dups:
+                if dup.memory_id not in fts_ids:
+                    rec = store.get_record(dup.memory_id)
+                    if (
+                        rec
+                        and rec.status.value == status
+                        and (not kind or rec.kind.value == kind)
+                    ):
+                        semantic_results.append({
+                            "record": rec.to_dict(),
+                            "bm25_score": 0.0,
+                            "semantic_score": dup.similarity,
+                            "share_group_id": group_id,
+                            "agent_instance_id": rec.agent_instance_id,
+                            "kind": rec.kind.value,
+                            "provenance": rec.provenance,
+                            "confidence": rec.confidence,
+                        })
+        except Exception:
+            pass  # 语义召回失败不影响 FTS 结果
+
+    # 合并结果
+    all_results = fts_results + semantic_results[:limit - len(fts_results)]
+    text = f"Found {len(fts_results)} FTS + {len(semantic_results)} semantic results:\n"
+    for r in all_results[:limit]:
+        rec = r["record"]
+        score = r.get("bm25_score", 0.0)
+        sem = r.get("semantic_score", "")
+        sem_str = f" sem={sem:.2f}" if sem else ""
+        text += (
+            f"  [score={score:.3f}{sem_str}] "
+            f"[{rec['status']}] [{rec['kind']}] {rec['memory_id'][:8]}  "
+            f"agent={r.get('agent_instance_id', '?')[:12]}  {rec['body'][:60]}\n"
+        )
     return {"content": [{"type": "text", "text": text}]}
 
 
 def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
-    from .shared_memory_store import SharedMemoryStore
-    from .auto_organizer import AutoOrganizer
+    """P0-A/D: 身份校验 + secret 脱敏。"""
+    from .governance_engine import GovernanceEngine
     from .schema_v3 import MemoryEvent, stable_hash, _now_iso, MemoryKind, MemoryWritePolicy
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id, binding_warning = _get_share_group_id(args, workspace)
-    if binding_warning and os.environ.get('MEMORYGUARD_STRICT_BINDING', '') == '1':
-        return {'content': [{'type': 'text', 'text': f'error: unbound agent rejected (MEMORYGUARD_STRICT_BINDING=1). {binding_warning}'}], 'isError': True}
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
     body = args["body"]
     agent_instance_id = args.get("agent_instance_id", "")
     metadata = args.get("metadata", {})
@@ -806,46 +1209,48 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
         if kind_override not in _VALID_KINDS:
             return {"content": [{"type": "text", "text": f"error: invalid kind '{kind_override}'. Valid: {sorted(_VALID_KINDS)}"}], "isError": True}
 
-    # 创建事件
+    # P0-D: 统一 secret 脱敏
+    safe_body, secret_hit = _redact_secret(body)
+    if secret_hit:
+        metadata = dict(metadata)
+        metadata["_secret_detected"] = secret_hit
+
+    # 创建事件(用脱敏后的 body)
     event = MemoryEvent(
-        event_id=stable_hash("event", body, _now_iso()),
+        event_id=stable_hash("event", safe_body, _now_iso()),
         agent_instance_id=agent_instance_id,
         share_group_id=group_id,
-        raw_content=body,
+        raw_content=safe_body,
         metadata=metadata,
         auto_actions=[],
         created_at=_now_iso(),
     )
-    store = SharedMemoryStore(workspace, group_id)
-    store.append_event(event)
-    # 自动整理
-    organizer = AutoOrganizer(workspace, group_id)
-    record, actions = organizer.organize(
-        event, kind_override=kind_override, write_policy=write_policy)
-    # 回填 auto_actions
-    event.auto_actions = actions
-    store.update_event(event)
-    result = {
-        "memory_id": record.memory_id,
-        "status": record.status.value,
-        "kind": record.kind.value,
-        "auto_actions": actions,
-    }
+    result = GovernanceEngine(workspace, group_id).auto_write(
+        event,
+        kind_override=kind_override,
+        write_policy=write_policy,
+        idempotency_key=str(args.get("idempotency_key", "") or ""),
+    )
+    if not result["ok"]:
+        return _mcp_error(result["blocked_reason"])
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
-    from .shared_memory_store import SharedMemoryStore
-    from .schema_v3 import DecisionEvent, stable_hash, _now_iso, SharedMemoryStatus, MemoryKind
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id = _get_share_group_id(args)[0]
-    store = SharedMemoryStore(workspace, group_id)
+    """Agent governance update; it is not a human/manual override."""
+    from .governance_engine import GovernanceEngine
+    from .schema_v3 import SharedMemoryStatus, MemoryKind
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
     memory_id = args["memory_id"]
     body = args.get("body")
     kind = args.get("kind")
     status = args.get("status")
+    decision_actor = f"agent:{args.get('agent_instance_id', '') or 'unknown'}"
 
-    # 写入前校验枚举值，非法值不落盘
+    # 写入前校验枚举值
     _VALID_STATUSES = {s.value for s in SharedMemoryStatus}
     _VALID_KINDS = {k.value for k in MemoryKind}
     if status is not None and status not in _VALID_STATUSES:
@@ -853,63 +1258,90 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
     if kind is not None and kind not in _VALID_KINDS:
         return {"content": [{"type": "text", "text": f"error: invalid kind '{kind}'. Valid: {sorted(_VALID_KINDS)}"}], "isError": True}
 
-    if body:
-        record = store.get_record(memory_id)
-        store._update_record_field(memory_id, "body", body)
-        store._update_record_field(memory_id, "updated_at", _now_iso())
-        decision = DecisionEvent(
-            event_id=stable_hash("update_body", memory_id, _now_iso()),
-            actor="user", action="update_body",
-            target_ids=[memory_id], reason="user edit",
-            created_at=_now_iso(),
-        )
-        store.append_decision(decision)
-    if kind:
-        record = store.get_record(memory_id)
-        old_kind = record.kind.value if record else ""
-        store._update_record_field(memory_id, "kind", kind)
-        decision = DecisionEvent(
-            event_id=stable_hash("update_kind", memory_id, _now_iso()),
-            actor="user", action="update_kind",
-            target_ids=[memory_id],
-            reason=f"kind: {old_kind} -> {kind}",
-            created_at=_now_iso(),
-        )
-        store.append_decision(decision)
-    if status:
-        record = store.get_record(memory_id)
-        old_status = record.status.value if record else ""
-        store._update_record_field(memory_id, "status", status)
-        decision = DecisionEvent(
-            event_id=stable_hash("update_status", memory_id, _now_iso()),
-            actor="user", action="update_status",
-            target_ids=[memory_id],
-            reason=f"status: {old_status} -> {status}",
-            created_at=_now_iso(),
-        )
-        store.append_decision(decision)
-    record = store.get_record(memory_id)
-    if record is None:
-        return {"content": [{"type": "text", "text": f"error: memory not found: {memory_id}"}], "isError": True}
-    return {"content": [{"type": "text", "text": json.dumps(record.to_dict(), ensure_ascii=False, indent=2)}]}
+    # P0-D: body 更新前做 secret 脱敏
+    if body is not None:
+        safe_body, secret_hit = _redact_secret(body)
+        body = safe_body
+    result = GovernanceEngine(workspace, group_id).agent_update(
+        memory_id,
+        actor=decision_actor,
+        body=body,
+        kind=kind,
+        status=status,
+        idempotency_key=str(args.get("idempotency_key", "") or ""),
+    )
+    if not result["ok"]:
+        return _mcp_error(result["blocked_reason"])
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_delete(args: dict[str, Any]) -> dict[str, Any]:
-    from .shared_memory_store import SharedMemoryStore
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id = _get_share_group_id(args)[0]
-    store = SharedMemoryStore(workspace, group_id)
-    store.delete(args["memory_id"])
-    return {"content": [{"type": "text", "text": f"Deleted: {args['memory_id']} (soft delete)"}]}
+    from .governance_engine import GovernanceEngine
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
+    result = GovernanceEngine(workspace, group_id).agent_delete(
+        args["memory_id"],
+        actor=f"agent:{args.get('agent_instance_id', '') or 'unknown'}",
+        idempotency_key=str(args.get("idempotency_key", "") or ""),
+    )
+    if not result["ok"]:
+        return _mcp_error(result["blocked_reason"])
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_status(args: dict[str, Any]) -> dict[str, Any]:
+    """P0-B: 只读路径用 read_only=True。"""
     from .shared_memory_store import SharedMemoryStore
-    workspace = Path(args.get("workspace", ".")).resolve()
-    group_id = _get_share_group_id(args)[0]
-    store = SharedMemoryStore(workspace, group_id)
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
+    try:
+        store = SharedMemoryStore(workspace, group_id, read_only=True)
+    except FileNotFoundError:
+        return {"content": [{"type": "text", "text": f"error: group not found: {group_id}"}], "isError": True}
     status = store.status()
     return {"content": [{"type": "text", "text": json.dumps(status, ensure_ascii=False, indent=2)}]}
+
+
+def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
+    """Return one trusted, bounded long-term-memory packet for a new task."""
+    from .context_bootstrap import (
+        DEFAULT_MAX_CHARS,
+        DEFAULT_MAX_ITEMS,
+        build_context_packet,
+    )
+    from .shared_memory_store import SharedMemoryStore
+
+    task = str(args.get("task", "") or "").strip()
+    if not task:
+        return _mcp_error("task is required")
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return _mcp_error(err)
+    try:
+        store = SharedMemoryStore(workspace, group_id, read_only=True)
+    except FileNotFoundError:
+        return _mcp_error(f"group not found: {group_id}")
+    try:
+        packet = build_context_packet(
+            store,
+            task=task,
+            project_hint=str(args.get("project_hint", "") or ""),
+            max_items=int(args.get("max_items", DEFAULT_MAX_ITEMS)),
+            max_chars=int(args.get("max_chars", DEFAULT_MAX_CHARS)),
+        )
+    except (TypeError, ValueError) as exc:
+        return _mcp_error(str(exc))
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(packet, ensure_ascii=False, indent=2),
+        }],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -998,6 +1430,15 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 def serve_stdio() -> int:
     """MCP stdio 主循环。从 stdin 读 JSON-RPC，向 stdout 写响应。"""
+    # MCP stdio 协议固定使用 UTF-8。Windows 中文系统的管道默认可能是
+    # GBK；工具描述或记忆正文含中文时会让宿主无法解码整条 JSON-RPC。
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+    # A3: 启动预检,打印身份与权限态
+    from .access_context import preflight_check
+    preflight_check()
     for line in sys.stdin:
         line = line.strip()
         if not line:

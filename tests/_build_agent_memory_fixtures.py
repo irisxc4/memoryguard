@@ -51,9 +51,17 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    # Codex sessions + sqlite
+    # Codex sessions + sqlite + native memories
     codex = ROOT / "home" / ".codex" / "sessions" / "2026" / "07" / "28"
     codex.mkdir(parents=True, exist_ok=True)
+    (ROOT / "home" / ".codex" / "memories").mkdir(parents=True, exist_ok=True)
+    (ROOT / "home" / ".codex" / "memories" / "MEMORY.md").write_text(
+        "# Codex Memory Index\n- preferences.md\n", encoding="utf-8",
+    )
+    (ROOT / "home" / ".codex" / "memories" / "preferences.md").write_text(
+        "---\ntype: preference\n---\nUser prefers pytest and type hints.\n",
+        encoding="utf-8",
+    )
     (codex / "rollout-demo.jsonl").write_text(
         "\n".join([
             json.dumps({"timestamp": "t", "type": "message", "payload": {"role": "user", "content": "remember that I prefer pytest"}}),

@@ -210,7 +210,7 @@ class ReportGenerator:
 # ===========================================================================
 
 
-# 分类关键词（镜像 auto_organizer._classify，保持行为一致）
+# 分类关键词（单一权威词表；顺序决定多关键词命中时的优先级）
 _CLASSIFY_KEYWORDS: list[tuple[str, list[str]]] = [
     ("preference", ["偏好", "喜欢", "prefer", "like", "习惯"]),
     ("procedure", ["步骤", "流程", "procedure", "step", "how to"]),
@@ -218,6 +218,18 @@ _CLASSIFY_KEYWORDS: list[tuple[str, list[str]]] = [
     ("episode", ["事件", "episode", "发生", "happened"]),
     ("correction", ["纠正", "更正", "correction", "actually", "不对", "错误", "应该是"]),
 ]
+
+_VALID_KINDS = {kind for kind, _ in _CLASSIFY_KEYWORDS} | {"fact"}
+
+
+def classify_kind(content: str, metadata: dict | str = "") -> str:
+    """单一权威启发式分类入口（返回 MemoryKind 字符串值）。"""
+    del metadata  # 预留 Pro/上下文分类扩展
+    text = content.lower()
+    for kind, keywords in _CLASSIFY_KEYWORDS:
+        if any(k in text for k in keywords):
+            return kind
+    return "fact"
 
 # 纠错关键词（镜像 auto_organizer._is_correction）
 _CORRECTION_KEYWORDS: list[str] = [
@@ -264,12 +276,8 @@ class CommunityPolicy(
     # ------------------------------------------------------------------
 
     def classify(self, content: str, metadata: dict) -> str:
-        """启发式分类（镜像 auto_organizer._classify）。"""
-        text = content.lower()
-        for kind, keywords in _CLASSIFY_KEYWORDS:
-            if any(k in text for k in keywords):
-                return kind
-        return "fact"
+        """启发式分类（委托 classify_kind）。"""
+        return classify_kind(content, metadata)
 
     def should_supersede(self, new_content: str, old_record: dict) -> bool:
         """纠错内容且旧记录未锁定时覆盖（镜像 auto_organizer organize 流程 3a）。"""

@@ -204,10 +204,44 @@ def _codex_profile() -> AgentProfile:
             target_role=TargetRole.NONE,
         ),
         MemorySurface(
+            surface_id="codex_native_memories",
+            path_template="%HOME%/.codex/memories",
+            surface_role="native_memory",
+            scope="user", load_order=20,
+            loader_evidence="https://developers.openai.com/codex/memories",
+            classification_confidence=0.95,
+            category=SourceCategory.NATIVE_MEMORY,
+            ingestion_policy=IngestionPolicy.IMPORT_VERBATIM,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.TAKEOVER_INPUT,
+            # 官方 artefacts：汇总 md + rollout_summaries/ + skills/
+            file_globs=[
+                "MEMORY.md",
+                "memory_summary.md",
+                "raw_memories.md",
+                "*.md",
+                "rollout_summaries/**/*.md",
+                "skills/**/*.md",
+                "skills/**/SKILL.md",
+            ],
+        ),
+        MemorySurface(
+            surface_id="codex_memories_sqlite",
+            path_template="%HOME%/.codex/memories_1.sqlite",
+            surface_role="runtime_evidence",
+            scope="user", load_order=21,
+            loader_evidence="https://developers.openai.com/codex/memories",
+            classification_confidence=0.85,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
+            target_role=TargetRole.NONE,
+        ),
+        MemorySurface(
             surface_id="codex_sessions",
             path_template="%HOME%/.codex/sessions",
             surface_role="conversation_history",
-            scope="user", load_order=21,
+            scope="user", load_order=23,
             loader_evidence="https://openai.com/index/introducing-codex/",
             classification_confidence=0.90,
             category=SourceCategory.CONVERSATION_HISTORY,
@@ -220,7 +254,7 @@ def _codex_profile() -> AgentProfile:
             surface_id="codex_state_sqlite",
             path_template="%HOME%/.codex/state_5.sqlite",
             surface_role="runtime_evidence",
-            scope="user", load_order=22,
+            scope="user", load_order=24,
             loader_evidence="https://openai.com/index/introducing-codex/",
             classification_confidence=0.80,
             category=SourceCategory.RUNTIME_EVIDENCE,
@@ -343,6 +377,8 @@ def _cursor_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
+        # Settings Memories 未在本地导出明文；state.vscdb 主要为会话气泡/composer
+        # 证据，不能当作可勾选长期记忆。长期记忆入口仍以 gui-only 声明缺口。
     ]
     return AgentProfile(
         profile_id="cursor@profile-1",
@@ -437,7 +473,8 @@ def _trae_profile() -> AgentProfile:
     - Memory（记忆）：~/.trae-cn/memory/user_profile.md + projects/<encoded-path>/
     - Rules（规则）：~/.trae-cn/user_rules/*.md
     - Skills（技能）：~/.trae-cn/skills/<skill-name>/
-    - MCP：~/.trae-cn/mcps/<server-id>/
+    - MCP：<workspace>/.trae/mcp.json（项目级）或
+      %APPDATA%/TRAE SOLO CN/User/mcp.json（用户级）
 
     本机实测目录结构（2026-07）：
     ~/.trae-cn/
@@ -451,7 +488,7 @@ def _trae_profile() -> AgentProfile:
         algorithmic-art/ figma/ frontend-skill/ graphify/
         react-best-practices/ security-best-practices/
       mcps/
-        s_<server-id>/        # MCP 服务器配置
+        s_<server-id>/        # MCP 运行时工具元数据缓存
       plugins/
         trae-remote-official/
       work/
@@ -503,11 +540,11 @@ def _trae_profile() -> AgentProfile:
         MemorySurface(
             surface_id="trae_topics",
             path_template="%HOME%/.trae-cn/memory/projects",
-            surface_role="native_memory",
+            surface_role="conversation_history",
             scope="user", load_order=13,
             loader_evidence="https://www.trae.com/ide/memory",
             classification_confidence=0.80,
-            category=SourceCategory.NATIVE_MEMORY,
+            category=SourceCategory.CONVERSATION_HISTORY,
             ingestion_policy=IngestionPolicy.EXTRACT_CANDIDATES,
             ownership=Ownership.AGENT_MANAGED,
             target_role=TargetRole.NONE,
@@ -539,17 +576,43 @@ def _trae_profile() -> AgentProfile:
             ownership=Ownership.EXTERNAL_READ_ONLY,
             target_role=TargetRole.NONE,
         ),
-        # ---- 用户级 MCP 配置 ----
+        # ---- 项目级 MCP 配置 ----
         MemorySurface(
-            surface_id="trae_mcps",
-            path_template="%HOME%/.trae-cn/mcps",
+            surface_id="trae_project_mcp_config",
+            path_template="%WORKSPACE%/.trae/mcp.json",
             surface_role="control_surface",
-            scope="user", load_order=40,
-            loader_evidence="https://www.trae.com/ide/mcp",
-            classification_confidence=0.80,
+            scope="project", load_order=39,
+            loader_evidence="https://www.trae.ai/changelog",
+            classification_confidence=0.95,
             category=SourceCategory.CONTROL_SURFACE,
             ingestion_policy=IngestionPolicy.GOVERN_ONLY,
             ownership=Ownership.EXTERNAL_READ_ONLY,
+            target_role=TargetRole.NONE,
+        ),
+        # ---- 用户级 MCP 配置 ----
+        MemorySurface(
+            surface_id="trae_user_mcp_config",
+            path_template="%APPDATA%/TRAE SOLO CN/User/mcp.json",
+            surface_role="control_surface",
+            scope="user", load_order=40,
+            loader_evidence="local-observation://trae-cn/user-mcp-json",
+            classification_confidence=0.95,
+            category=SourceCategory.CONTROL_SURFACE,
+            ingestion_policy=IngestionPolicy.GOVERN_ONLY,
+            ownership=Ownership.EXTERNAL_READ_ONLY,
+            target_role=TargetRole.NONE,
+        ),
+        # ---- MCP 运行时缓存（不是安装入口）----
+        MemorySurface(
+            surface_id="trae_mcps",
+            path_template="%HOME%/.trae-cn/mcps",
+            surface_role="runtime_evidence",
+            scope="user", load_order=41,
+            loader_evidence="https://www.trae.com/ide/mcp",
+            classification_confidence=0.80,
+            category=SourceCategory.RUNTIME_EVIDENCE,
+            ingestion_policy=IngestionPolicy.EVIDENCE_ONLY,
+            ownership=Ownership.AGENT_MANAGED,
             target_role=TargetRole.NONE,
         ),
         # ---- 工作区会话 ----

@@ -11,7 +11,13 @@ reqs = [
     {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "memoryguard_open", "arguments": {"workspace": ws}}},
 ]
 stdin = "\n".join(json.dumps(r) for r in reqs) + "\n"
-p = subprocess.run([sys.executable, "-m", "memoryguard.mcp_server"], input=stdin, capture_output=True, text=True)
+p = subprocess.run(
+    [sys.executable, "-m", "memoryguard.mcp_server"],
+    input=stdin,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+)
 if p.stderr:
     print("stderr:", p.stderr[:500])
 for line in p.stdout.strip().splitlines():

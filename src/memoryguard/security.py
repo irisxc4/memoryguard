@@ -28,7 +28,8 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     # Agent 发现 / 选择树
     "discover_agents", "get_selection_tree", "get_agent_data",
     # 神经元图（只读）
-    "get_neuron_graph", "get_projection_source_map", "list_native_memory_releases", "list_publish_targets", "choose_publish_target_path",
+    "get_neuron_graph", "get_projection_source_map", "get_governance_scope",
+    "list_native_memory_releases", "list_publish_targets", "choose_publish_target_path",
     # 来源管理（只读）
     "list_sources", "preview_source", "scan_sources",
     "get_raw_memory", "get_source_file_content",
@@ -37,6 +38,7 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     "list_cleanup_history", "list_agents", "get_residual_cleanup", "open_agent_folder",
     # 绑定（只读）
     "list_bindings", "check_binding_drift", "get_shared_group_preview",
+    "get_host_hook_status",
     # 外部 MCP（只读）
     "list_external_mcp_servers", "preview_external_mcp_import",
     "detect_external_mcp",
@@ -45,13 +47,20 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     "list_memory_versions", "get_recent_events", "get_auto_actions",
     "get_supersede_chain", "get_conflicts", "get_quarantine",
     "get_governance_snapshot", "get_memory_status", "get_supersede_decisions",
+    "list_share_groups", "get_global_memory_status", "get_memory_source_map",
     # 萃取 / 导入（只读）
-    "extract_preview", "preview_import", "get_memory_ir",
-    # 构建 / 发布（只读）
-    "create_build_plan", "verify_release", "list_releases", "list_history",
+    "extract_preview", "extract_preview_by_path", "preview_import", "get_memory_ir",
+    # 旧发布历史（只读兼容；不再暴露构建/写回）
+    "list_releases", "list_history",
+    # 存储治理（只读）
+    "plan_memoryguard_gc", "get_storage_overview",
     # 安全层（只读）
     "get_sandbox_status", "get_request_status", "list_pending_requests",
     "pick_path",
+    # Host AI 整理（只读）
+    "list_pending_enrichments", "get_enrichment_status",
+    "get_host_enrichment_guide",
+    "get_build_progress", "list_host_llm_agents",
 })
 
 # 变更 API：修改文件、删除目录、归档、绑定、记忆治理等
@@ -59,7 +68,8 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
 MUTATION_API_METHODS: frozenset[str] = frozenset({
     # Agent 选择 / 投影
     "commit_selection", "neuron_decide", "set_projection_source_enabled",
-    "build_projection", "delete_projection",
+    "set_governance_scope", "build_projection", "start_build_projection",
+    "cancel_build_projection", "delete_projection",
     # 来源管理（变更）
     "add_source", "remove_source",
     # Agent 候选 / 清理 / 归档（变更）
@@ -69,6 +79,12 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     # 多 Agent 模式 / 绑定（变更）
     "enter_multi_agent_mode", "exit_multi_agent_mode",
     "bind_agent", "bind_agents_to_shared_group", "unbind_agent",
+    "ensure_personal_memory_group", "leave_shared_group_to_personal",
+    "dissolve_shared_group",
+    "export_memory_group", "clear_memory_group", "archive_memory_group",
+    "install_shared_group_mcp_redirects",
+    "set_host_hook_mode", "uninstall_host_hook",
+    "import_native_memories_to_group", "commit_shared_memory_governance",
     # 外部 MCP 导入（变更）
     "import_external_mcp_entries",
     # 记忆治理（变更）
@@ -77,14 +93,23 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     "resolve_conflict", "release_quarantine", "delete_quarantine",
     # 萃取 / 导入（变更）
     "accept_candidates", "create_import",
-    # 构建 / 发布（变更）
-    "apply_build", "rollback_release", "publish_reconstructed_memory", "rollback_native_memory_release",
+    # 存储治理（变更）
+    "apply_memoryguard_gc",
     # 计划执行 / 回滚
     "apply_plan", "undo_change",
+    # Host AI 整理（变更:写回 IR；主路径已并入 build）
+    "apply_enrichments",
 })
 
 # 所有允许的 API 方法
 ALL_ALLOWED_METHODS: frozenset[str] = READONLY_API_METHODS | MUTATION_API_METHODS
+
+# 保留在 GovernanceApi 内仅供旧数据兼容/内部测试的原生写回实现。
+# 产品入口（GUI bridge、MCP、CLI）必须明确拒绝这些方法。
+BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS: frozenset[str] = frozenset({
+    "create_build_plan", "apply_build", "verify_release", "rollback_release",
+    "publish_reconstructed_memory", "rollback_native_memory_release",
+})
 
 # 安全层自身的方法（不属于只读或变更，但需要允许调用）
 _SECURITY_API_METHODS: frozenset[str] = frozenset({
@@ -135,11 +160,14 @@ def detect_sandbox_mode() -> bool:
     """检测当前进程是否在沙箱中运行。
 
     启发式：
-    - 环境变量 MEMORYGUARD_SANDBOX=1
+    - 环境变量 MEMORYGUARD_SANDBOX=1 / 0（显式 0 优先，覆盖 IDE 标记）
     - TRAE/Cursor/Claude Code 等 IDE 启动的子进程
     - 进程令牌受限（Windows）
     """
-    if os.environ.get("MEMORYGUARD_SANDBOX", "") == "1":
+    explicit = os.environ.get("MEMORYGUARD_SANDBOX", "").strip().lower()
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    if explicit in ("1", "true", "yes", "on"):
         return True
     # IDE 启动的子进程通常带有特定环境变量
     ide_markers = [

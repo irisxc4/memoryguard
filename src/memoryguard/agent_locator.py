@@ -109,6 +109,54 @@ HIDDEN_SURFACE_CATEGORIES: frozenset[str] = frozenset({
 SESSION_DISPLAY_CATEGORIES: frozenset[str] = EXTRACT_DISPLAY_CATEGORIES
 
 
+def _read_codex_memories_flags(config_path: Path) -> dict[str, bool | None]:
+    """读取 ~/.codex/config.toml 的 [memories] 开关（无 tomllib 依赖，轻量解析）。"""
+    out: dict[str, bool | None] = {
+        "generate_memories": None,
+        "use_memories": None,
+    }
+    if not config_path.is_file():
+        return out
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            in_section = line.lower() in {"[memories]", "[memories.memories]"}
+            continue
+        if not in_section or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip().lower()
+        val = val.split("#", 1)[0].strip().lower()
+        if key in out and val in {"true", "false"}:
+            out[key] = val == "true"
+    return out
+
+
+def _count_codex_stage1_rows(db_path: Path) -> int | None:
+    """统计 memories_1.sqlite stage1_outputs 行数；失败返回 None。"""
+    if not db_path.is_file():
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*) FROM stage1_outputs"
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            con.close()
+    except Exception:
+        return None
+
+
 def session_overview_title(path: str, project_ref: str = "") -> str:
     """从会话文件路径生成可读概览标题（不参与勾选）。"""
     p = Path(path.replace("\\", "/"))
@@ -364,12 +412,27 @@ class AgentLocator:
             elif self._is_project_root_surface(resolved):
                 expanded = self._expand_project_root(resolved, s)
                 # 声明了 file_globs 时，即使无匹配也不得回退到整目录节点
+                # （避免 ~/.claude/projects 整树被误授权）
                 if has_globs:
                     effective_surfaces = expanded
                 elif expanded:
                     effective_surfaces = expanded
             elif has_globs and Path(resolved).is_dir():
-                effective_surfaces = self._expand_files_in_dir(Path(resolved), s, project_ref="")
+                expanded = self._expand_files_in_dir(Path(resolved), s, project_ref="")
+                if expanded:
+                    effective_surfaces = expanded
+                elif cat in MEMORY_SELECTABLE_CATEGORIES:
+                    # 专用记忆目录已找到但尚无 md：保留目录节点供勾选/提示
+                    # （例如 Codex memories 未开启时 ~/.codex/memories 为空）
+                    node = dict(s)
+                    node["_empty_glob_match"] = True
+                    node["_is_file_node"] = False
+                    node["default_reason_override"] = (
+                        "已找到记忆目录，但尚未生成 MEMORY.md 等文件"
+                    )
+                    effective_surfaces = [node]
+                else:
+                    effective_surfaces = []
 
             for es in effective_surfaces:
                 es_resolved = es.get("resolved_path", "")
@@ -428,6 +491,7 @@ class AgentLocator:
                     "is_file_node": bool(es.get("_is_file_node")),
                     "selectable": selectable,
                     "display_only": not selectable,
+                    "empty_glob_match": bool(es.get("_empty_glob_match")),
                 }
                 if file_cat in SESSION_DISPLAY_CATEGORIES:
                     file_info["session_title"] = session_overview_title(es_resolved, project_ref)
@@ -494,12 +558,87 @@ class AgentLocator:
                     scope_entry["projects"] = project_list
                 scopes_output.append(scope_entry)
 
+        notes = self._selection_discovery_notes(instance)
         return {
             "instance_id": instance_id,
             "profile_id": instance.profile_id,
             "product": instance.product,
             "scopes": scopes_output,
+            "discovery_notes": notes,
         }
+
+    def _selection_discovery_notes(self, instance: AgentInstance) -> list[dict[str, Any]]:
+        """选择树提示：例如 Codex memories 功能关闭、目录为空。"""
+        notes: list[dict[str, Any]] = []
+        product = getattr(instance, "product", "") or ""
+        if product == "codex":
+            notes.extend(self._codex_memories_notes(instance))
+        elif product == "cursor":
+            notes.extend(self._cursor_memories_notes(instance))
+        return notes
+
+    def _cursor_memories_notes(self, instance: AgentInstance) -> list[dict[str, Any]]:
+        notes: list[dict[str, Any]] = []
+        gui = next(
+            (s for s in instance.surfaces if s.get("surface_id") == "cursor_memories_gui_only"),
+            None,
+        )
+        if gui and gui.get("status") in {"unsupported", "missing", "found"}:
+            notes.append({
+                "level": "warn",
+                "code": "cursor_memories_gui_only",
+                "message": (
+                    "Cursor Settings Memories 当前无本地明文记忆文件可勾选"
+                    "（gui-only 表面）。state.vscdb 主要是会话气泡/composer 证据，不是长期记忆库。"
+                ),
+                "hint": "可勾选/萃取：agent-transcripts；长期记忆请走 MemoryGuard 共享 MCP 接管。",
+            })
+        return notes
+
+    def _codex_memories_notes(self, instance: AgentInstance) -> list[dict[str, Any]]:
+        notes: list[dict[str, Any]] = []
+        mem_surface = next(
+            (s for s in instance.surfaces if s.get("surface_id") == "codex_native_memories"),
+            None,
+        )
+        mem_path = Path((mem_surface or {}).get("resolved_path") or "")
+        cfg_path = Path.home() / ".codex" / "config.toml"
+        flags = _read_codex_memories_flags(cfg_path)
+        if flags.get("generate_memories") is False or flags.get("use_memories") is False:
+            notes.append({
+                "level": "warn",
+                "code": "codex_memories_disabled",
+                "message": (
+                    "Codex config.toml 中 [memories] 已关闭"
+                    f"（generate_memories={flags.get('generate_memories')}, "
+                    f"use_memories={flags.get('use_memories')}）。"
+                    "未开启时不会生成 ~/.codex/memories/*.md，勾选树只能看到空目录。"
+                ),
+                "hint": "在 Codex 设置/Personalization 开启 Enable memories，或编辑 config.toml。",
+            })
+        if mem_path.is_dir():
+            md_count = sum(1 for _ in mem_path.rglob("*.md"))
+            if md_count == 0:
+                notes.append({
+                    "level": "info",
+                    "code": "codex_memories_empty",
+                    "message": f"已找到 {mem_path}，但其中尚无 .md 记忆文件。",
+                    "hint": "可先勾选该目录授权；会话历史请在下方「可萃取来源」中处理。",
+                })
+        sqlite_surface = next(
+            (s for s in instance.surfaces if s.get("surface_id") == "codex_memories_sqlite"),
+            None,
+        )
+        if sqlite_surface and sqlite_surface.get("status") == "found":
+            stage1 = _count_codex_stage1_rows(Path(sqlite_surface.get("resolved_path") or ""))
+            if stage1 == 0:
+                notes.append({
+                    "level": "info",
+                    "code": "codex_memories_sqlite_empty",
+                    "message": "memories_1.sqlite 中 stage1_outputs 为空（尚无抽取中间态）。",
+                    "hint": "这是运行证据，不进入记忆勾选；开启 memories 并产生会话后才会写入。",
+                })
+        return notes
 
     def _resolve_project_ref(self, path: str) -> str:
         """从路径尝试解析项目名。

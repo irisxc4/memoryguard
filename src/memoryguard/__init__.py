@@ -8,5 +8,5 @@
 - 持久层: 项目内 .memoryguard/ 文件
 """
 
-__version__ = "0.1.1"
+__version__ = "0.3.0"
 __all__ = ["__version__"]

@@ -106,50 +106,103 @@ def _is_instruction_or_skill(rel_path: str) -> bool:
     return False
 
 
-def _split_into_segments(content: str) -> list[tuple[str, str]]:
-    """把内容拆成 (locator, text) 段。
-    locator 是 "line:N-M" 或 "heading:Title" 形式。
+def _is_plan_or_ops_doc(rel_path: str) -> bool:
+    """实施计划 / 任务台账等作业文档，不应自动变成长期记忆。"""
+    p = rel_path.replace("\\", "/").lower().lstrip("./")
+    if p.endswith(".plan.md") or p.endswith(".plan.json"):
+        return True
+    markers = (
+        ".cursor/plans/",
+        ".trellis/tasks/",
+        ".trellis/workspace/",
+        "agent-transcripts/",
+        ".codex/sessions/",
+    )
+    return any(m in p or p.startswith(m.lstrip("/")) for m in markers)
+
+
+def _should_skip_auto_ingest(cat: str, ing: str) -> bool:
+    """构建 normalize 时是否跳过自动写入 IR。
+
+    - knowledge_source + extract_candidates：只允许面板「萃取」，不整仓灌进记忆
+    - conversation_history：仅 extract_candidates 保留（既有语义）
     """
-    segments: list[tuple[str, str]] = []
-    lines = content.split("\n")
-    current_heading = ""
-    current_start = 0
-    current_lines: list[str] = []
+    if cat in {"runtime_evidence", "ignored_runtime_data"}:
+        return True
+    if cat == "conversation_history" and ing != "extract_candidates":
+        return True
+    if cat in {"knowledge_source", "control_surface", "skill_surface"} and ing != "import_verbatim":
+        return True
+    if ing in {"evidence_only", "govern_only", "ignore"}:
+        return True
+    return False
 
-    def flush():
-        if current_lines:
-            text = "\n".join(current_lines).strip()
-            if text:
-                locator = f"heading:{current_heading}" if current_heading else f"line:{current_start+1}-{current_start+len(current_lines)}"
-                segments.append((locator, text))
 
-    for i, line in enumerate(lines):
-        m = re.match(r"^#+\s+(.+)$", line)
-        if m:
-            flush()
-            current_heading = m.group(1).strip()
-            current_start = i
-            current_lines = [line]
-        else:
-            if not current_lines:
-                current_start = i
-            current_lines.append(line)
-    flush()
-    return segments
+# P1.2: secret 检测 + 脱敏(与 auto_organizer.SECRET_PATTERNS 一致)
+import re as _re_mod
+_SECRET_PATTERNS: list[_re_mod.Pattern] = [
+    _re_mod.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*\S+"),
+    _re_mod.compile(r"AKIA[0-9A-Z]{16}"),
+    _re_mod.compile(r"ghp_[A-Za-z0-9]{36}"),
+    _re_mod.compile(r"gho_[A-Za-z0-9]{36}"),
+    _re_mod.compile(r"sk-[A-Za-z0-9]{20,}"),
+    _re_mod.compile(r"xox[baprs]-[A-Za-z0-9-]+"),
+    _re_mod.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+]
+
+
+def _detect_secret_in_text(text: str) -> str:
+    """检测 secret,返回匹配模式描述(空串表示无匹配)。"""
+    for pattern in _SECRET_PATTERNS:
+        if pattern.search(text):
+            return pattern.pattern[:50]
+    return ""
+
+
+def _redact_for_enricher(content: str) -> str:
+    """脱敏后送 enricher,防止残留 secret 进入模型 backend。"""
+    redacted = content
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def _safe_confidence(confidence: Any) -> float:
+    """校验模型返回的 confidence,非法值回退 0.5。"""
+    try:
+        val = float(confidence)
+        if not (0.0 <= val <= 1.0):
+            return 0.5
+        return val
+    except (ValueError, TypeError):
+        return 0.5
+
+
+def _enum_or_default(enum_cls, value, default):
+    """P2.2: 统一 enum 防御性解析,非法值用默认值。
+
+    覆盖 MemoryKind / MemoryStatus / Completeness / DuplicateDecision 等所有 enum。
+    """
+    try:
+        return enum_cls(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _split_into_segments(content: str, *, path: str = "", media_type: str = "") -> list[tuple[str, str]]:
+    """薄包装：统一收口到 content_parsers（兼容旧 (locator, text) 元组）。"""
+    from .content_parsers import parse_content
+    segs = parse_content(path or "inline.md", content, media_type=media_type)
+    return [(s.locator, s.body if not s.title else (
+        f"# {s.title}\n{s.body}" if not s.body.lstrip().startswith("#") else s.body
+    )) for s in segs]
 
 
 def _infer_kind(title: str, body: str) -> MemoryKind:
-    """启发式推断 MemoryKind。"""
-    text = (title + " " + body).lower()
-    if any(k in text for k in ["偏好", "喜欢", "prefer", "like", "习惯"]):
-        return MemoryKind.PREFERENCE
-    if any(k in text for k in ["步骤", "流程", "procedure", "step", "how to"]):
-        return MemoryKind.PROCEDURE
-    if any(k in text for k in ["项目", "project", "仓库", "repo"]):
-        return MemoryKind.PROJECT
-    if any(k in text for k in ["事件", "episode", "发生", "happened"]):
-        return MemoryKind.EPISODE
-    return MemoryKind.FACT
+    """启发式推断 MemoryKind（委托 policies.classify_kind）。"""
+    from .policies import classify_kind
+
+    return MemoryKind(classify_kind(f"{title} {body}"))
 
 
 def _extract_title(segment_text: str) -> str:
@@ -161,7 +214,7 @@ def _extract_title(segment_text: str) -> str:
     return segment_text[:40].replace("\n", " ").strip()
 
 
-def _looks_english_text(text: str) -> bool:
+def looks_english_text(text: str) -> bool:
     if not text:
         return False
     latin = sum(1 for ch in text if "a" <= ch.lower() <= "z")
@@ -169,7 +222,7 @@ def _looks_english_text(text: str) -> bool:
     return latin >= 12 and latin > cjk * 2
 
 
-def _compact_english_snippet(text: str, limit: int = 160) -> str:
+def compact_english_snippet(text: str, limit: int = 160) -> str:
     text = " ".join(str(text or "").replace("\n", " ").split())
     replacements = {
         "memory": "记忆", "project": "项目", "preference": "偏好", "rule": "规则",
@@ -183,16 +236,90 @@ def _compact_english_snippet(text: str, limit: int = 160) -> str:
     return " ".join(mapped).strip()
 
 
-def _localize_memory_text(title: str, body: str, kind: MemoryKind) -> tuple[str, str, str, str, str]:
-    if not _looks_english_text(title + " " + body):
-        return title, body, title, body, "zh"
-    kind_labels = {
-        MemoryKind.FACT: "事实", MemoryKind.PREFERENCE: "偏好", MemoryKind.PROJECT: "项目",
-        MemoryKind.EPISODE: "事件", MemoryKind.PROCEDURE: "流程", MemoryKind.CORRECTION: "纠错",
+_KIND_LABELS = {
+    MemoryKind.FACT: "事实", MemoryKind.PREFERENCE: "偏好", MemoryKind.PROJECT: "项目",
+    MemoryKind.EPISODE: "事件", MemoryKind.PROCEDURE: "流程", MemoryKind.CORRECTION: "纠错",
+}
+
+
+_FAKE_ZH_PREFIXES = ("中文整理：", "中文辅助摘要：")
+
+
+def _strip_fake_zh_prefix(text: str) -> str:
+    for prefix in _FAKE_ZH_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):].lstrip()
+    return text
+
+
+def _has_fake_zh_prefix(text: str) -> bool:
+    return any(text.startswith(prefix) for prefix in _FAKE_ZH_PREFIXES)
+
+
+def localize_memory_text(
+    title: str, body: str, kind: MemoryKind,
+) -> tuple[str, str, str, str, str, str]:
+    """Return display fields plus honest localization metadata.
+
+    Returns:
+        title, body, original_title, original_body, display_language, localization_mode
+    """
+    if not looks_english_text(title + " " + body):
+        return title, body, title, body, "zh", "none"
+    kind_label = _KIND_LABELS.get(kind, "记忆")
+    zh_title = f"{kind_label}：{compact_english_snippet(title or body, 72)}"
+    zh_body = compact_english_snippet(body or title, 420)
+    return zh_title, zh_body, title, body, "mixed", "heuristic"
+
+
+def localized_record_fields(rec: dict[str, Any]) -> dict[str, Any]:
+    """Build GUI display fields without implying full translation."""
+    title = rec.get("title") or rec.get("memory_id", "")[:8]
+    body = rec.get("body") or ""
+    kind = rec.get("kind", "")
+    original_title = rec.get("original_title") or title
+    original_body = rec.get("original_body") or body
+    mode = rec.get("localization_mode", "none")
+    display_language = rec.get("display_language", "zh")
+
+    if mode == "heuristic" or display_language == "mixed":
+        return {
+            "original_title": original_title,
+            "original_body": original_body,
+            "title_zh": title,
+            "body_zh": body,
+            "localization_mode": "heuristic",
+            "display_language": display_language,
+        }
+
+    if mode == "none" and looks_english_text(title + " " + body):
+        kind_enum = MemoryKind(kind) if kind in {k.value for k in MemoryKind} else MemoryKind.FACT
+        zh_title, zh_body, orig_title, orig_body, disp_lang, loc_mode = localize_memory_text(
+            title, body, kind_enum,
+        )
+        return {
+            "original_title": orig_title,
+            "original_body": orig_body,
+            "title_zh": zh_title,
+            "body_zh": zh_body,
+            "localization_mode": loc_mode,
+            "display_language": disp_lang,
+        }
+
+    return {
+        "original_title": original_title,
+        "original_body": original_body,
+        "title_zh": title,
+        "body_zh": body,
+        "localization_mode": mode,
+        "display_language": display_language,
     }
-    zh_title = f"{kind_labels.get(kind, '记忆')}：{_compact_english_snippet(title or body, 72)}"
-    zh_body = f"中文整理：{_compact_english_snippet(body or title, 420)}"
-    return zh_title, zh_body, title, body, "zh"
+
+
+# Backward-compatible aliases for internal callers
+_looks_english_text = looks_english_text
+_compact_english_snippet = compact_english_snippet
+_localize_memory_text = localize_memory_text
 
 
 @dataclass
@@ -219,22 +346,29 @@ class MemoryIR:
         records = []
         for r in data.get("records", []):
             provs = [Provenance(**p) for p in r.get("provenance", [])]
+            # P2.2: 统一 _enum_or_default 覆盖所有 enum
+            kind = _enum_or_default(MemoryKind, r.get("kind", "fact"), MemoryKind.FACT)
+            status = _enum_or_default(MemoryStatus, r.get("status", "candidate"), MemoryStatus.CANDIDATE)
+            completeness = _enum_or_default(Completeness, r.get("completeness", "verifiable"), Completeness.VERIFIABLE)
             records.append(MemoryRecord(
-                memory_id=r["memory_id"], kind=MemoryKind(r["kind"]),
+                memory_id=r["memory_id"], kind=kind,
                 title=r["title"], body=r["body"], scope=r.get("scope", "project"),
                 original_title=r.get("original_title", ""),
                 original_body=r.get("original_body", ""),
                 display_language=r.get("display_language", "zh"),
+                localization_mode=r.get("localization_mode", "none"),
                 confidence=r.get("confidence", 0.5), provenance=provs,
-                status=MemoryStatus(r.get("status", "candidate")),
-                completeness=Completeness(r.get("completeness", "verifiable")),
+                status=status,
+                completeness=completeness,
                 created_at=r.get("created_at", ""),
             ))
+        # P2.2: DuplicateDecision 也用 _enum_or_default 防护
         groups = [DuplicateGroup(
             group_id=g["group_id"], member_ids=g["member_ids"],
             similarity_method=g.get("similarity_method", "tfidf_cosine"),
             scores=g.get("scores", []),
-            decision=DuplicateDecision(g.get("decision", "unresolved")),
+            decision=_enum_or_default(DuplicateDecision, g.get("decision", "unresolved"),
+                                      DuplicateDecision.UNRESOLVED),
         ) for g in data.get("duplicate_groups", [])]
         decisions = [DecisionEvent(
             event_id=d["event_id"], actor=d["actor"], action=d["action"],
@@ -250,24 +384,44 @@ class MemoryIR:
 class MemoryNormalizer:
     """从 SourceSnapshot 规范化为 Memory IR。"""
 
-    def __init__(self, workspace: str | Path):
+    def __init__(self, workspace: str | Path, enricher_mode: str | None = None):
         self.workspace = Path(workspace).resolve()
         self.mg_dir = self.workspace / ".memoryguard"
         self.ir_path = self.mg_dir / "ir" / "current.json"
         self.decisions_path = self.mg_dir / "ir" / "decisions.jsonl"
+        self._enricher_mode = enricher_mode
+
+    def _get_enricher(self):
+        from .semantic_enricher import get_enricher
+
+        return get_enricher(self._enricher_mode)
 
     def ensure_localized(self, ir: MemoryIR) -> bool:
         changed = False
         for rec in ir.records:
-            if rec.original_body:
+            needs_migration = _has_fake_zh_prefix(rec.title) or _has_fake_zh_prefix(rec.body)
+            if rec.original_body and not needs_migration:
                 continue
-            title, body, original_title, original_body, display_language = _localize_memory_text(rec.title, rec.body, rec.kind)
-            if title != rec.title or body != rec.body or original_body != rec.body:
+            if needs_migration:
+                src_title = _strip_fake_zh_prefix(rec.original_title or rec.title)
+                src_body = _strip_fake_zh_prefix(rec.original_body or rec.body)
+            else:
+                src_title = rec.title
+                src_body = rec.body
+            title, body, original_title, original_body, display_language, localization_mode = localize_memory_text(
+                src_title, src_body, rec.kind,
+            )
+            if (
+                title != rec.title or body != rec.body or original_body != rec.body
+                or rec.localization_mode != localization_mode
+                or needs_migration
+            ):
                 rec.title = title
                 rec.body = body
                 rec.original_title = original_title
                 rec.original_body = original_body
                 rec.display_language = display_language
+                rec.localization_mode = localization_mode
                 changed = True
         return changed
 
@@ -278,9 +432,9 @@ class MemoryNormalizer:
             for prov in rec.provenance:
                 root_id = object_to_root.get(prov.source_object_id, "")
                 policy = (root_policies or {}).get(root_id, {})
-                if policy.get("source_category") in {"conversation_history", "runtime_evidence", "ignored_runtime_data"}:
-                    return False
-                if policy.get("ingestion_policy") in {"evidence_only", "govern_only", "ignore"}:
+                cat = policy.get("source_category", "")
+                ing = policy.get("ingestion_policy", "")
+                if _should_skip_auto_ingest(cat, ing):
                     return False
             return True
         before = len(ir.records)
@@ -290,7 +444,7 @@ class MemoryNormalizer:
         return len(ir.records) != before
 
     def normalize(self, snapshot: SourceSnapshot,
-                  duplicate_threshold: float = 0.75,
+                  duplicate_threshold: float = 0.80,
                   root_map: dict[str, str] | None = None,
                   root_policies: dict[str, dict[str, str]] | None = None) -> MemoryIR:
         """从快照生成 Memory IR。
@@ -298,31 +452,108 @@ class MemoryNormalizer:
         v3.1 §1.3 P0：必须传入 root_map（root_id -> root.path），
         不能再用 workspace / relative_path 猜路径，否则外部来源会静默丢失。
         """
+        from .content_parsers import parse_file
+        from pathlib import Path
+
         records: list[MemoryRecord] = []
-        # v3.1 §1.3：扫描和规范化使用同一次稳定内容读取，前后哈希不一致标记 changed_during_scan
         for obj in snapshot.source_objects:
             policy = (root_policies or {}).get(obj.source_root_id, {})
             if _is_instruction_or_skill(obj.relative_path):
                 continue
-            if policy.get("source_category") in {"conversation_history", "runtime_evidence", "ignored_runtime_data"}:
+            if _is_plan_or_ops_doc(obj.relative_path):
                 continue
-            if policy.get("ingestion_policy") in {"evidence_only", "govern_only", "ignore"}:
+            cat = policy.get("source_category", "")
+            ing = policy.get("ingestion_policy", "")
+            if _should_skip_auto_ingest(cat, ing):
                 continue
-            content = self._read_source_content(obj, root_map)
-            if content is None:
+
+            full_path = self._resolve_source_path(obj, root_map)
+            if full_path is None:
                 continue
-            # 哈希一致性检查（v3.1 §1.3）
-            import hashlib
-            current_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-            if current_hash != obj.content_hash:
-                # 内容在扫描后发生变化：跳过并记录（不静默）
-                continue
-            segments = _split_into_segments(content)
-            for locator, text in segments:
-                original_title = _extract_title(text)
-                original_body = text
-                kind = _infer_kind(original_title, original_body)
-                title, body, stored_original_title, stored_original_body, display_language = _localize_memory_text(original_title, original_body, kind)
+
+            media = getattr(obj, "media_type", "") or ""
+            is_sqlite = full_path.suffix.lower() in {".sqlite", ".sqlite3", ".db", ".vscdb"} or "sqlite" in media
+            content: str | None = None
+            if not is_sqlite:
+                content = self._read_source_content(obj, root_map)
+                if content is None:
+                    continue
+                # 哈希一致性检查（v3.1 §1.3）— 仅文本路径
+                if obj.read_status != "meta":
+                    current_hash = stable_hash(content)
+                    if current_hash != obj.content_hash:
+                        continue
+
+            surface_hint = policy.get("surface_hint", "")
+            verbatim = ing == "import_verbatim"
+            parsed = parse_file(
+                full_path,
+                media_type=media,
+                surface_hint=surface_hint,
+                content=content,
+                verbatim=verbatim,
+            )
+            # meta 段不进长期记忆 IR
+            parsed = [s for s in parsed if s.signal_level != "meta"]
+            enricher = self._get_enricher()
+            for seg in parsed:
+                locator = seg.locator
+                original_title = seg.title or _extract_title(seg.body)
+                original_body = seg.body
+                text = seg.body
+                secret_hit = _detect_secret_in_text(text)
+                if secret_hit:
+                    kind = MemoryKind.FACT
+                    safe_title = original_title
+                    safe_body = f"[QUARANTINED: {secret_hit}]"
+                    disp_lang = "zh"
+                    loc_mode = "none"
+                    conf = 0.1
+                    status = MemoryStatus.QUARANTINED
+                    completeness = Completeness.UNVERIFIABLE
+                elif verbatim:
+                    # import_verbatim：原样保留 title/body，不用 enricher 改写
+                    if seg.kind_hint:
+                        try:
+                            kind = MemoryKind(seg.kind_hint)
+                        except (ValueError, TypeError):
+                            kind = _infer_kind(original_title, text)
+                    else:
+                        kind = _infer_kind(original_title, text)
+                    safe_title = original_title
+                    safe_body = original_body
+                    disp_lang = "zh" if any("\u4e00" <= ch <= "\u9fff" for ch in text[:80]) else "en"
+                    loc_mode = "none"
+                    conf = 0.9
+                    status = MemoryStatus.CANDIDATE
+                    completeness = (
+                        Completeness.UNVERIFIABLE if seg.truncated else Completeness.VERIFIABLE
+                    )
+                else:
+                    safe_text = _redact_for_enricher(text)
+                    kind_hint = seg.kind_hint or ""
+                    enriched = enricher.enrich(
+                        title=original_title,
+                        body=safe_text,
+                        kind_hint=kind_hint,
+                        metadata={"locator": locator, "source_object_id": obj.source_object_id},
+                    )
+                    try:
+                        kind = MemoryKind(kind_hint) if kind_hint else MemoryKind(enriched.kind)
+                    except (ValueError, TypeError):
+                        try:
+                            kind = MemoryKind(enriched.kind)
+                        except (ValueError, TypeError):
+                            kind = MemoryKind.FACT
+                    safe_title = enriched.title
+                    safe_body = enriched.body
+                    disp_lang = enriched.display_language
+                    loc_mode = enriched.localization_mode
+                    conf = _safe_confidence(enriched.confidence)
+                    status = MemoryStatus.CANDIDATE
+                    completeness = (
+                        Completeness.UNVERIFIABLE if seg.truncated else Completeness.VERIFIABLE
+                    )
                 excerpt_hash = stable_hash(text)
                 memory_id = stable_hash(obj.source_object_id, locator, excerpt_hash)
                 prov = Provenance(
@@ -330,16 +561,16 @@ class MemoryNormalizer:
                     excerpt_hash=excerpt_hash, source_revision=obj.content_hash,
                 )
                 rec = MemoryRecord(
-                    memory_id=memory_id, kind=kind, title=title, body=body,
-                    scope="project", original_title=stored_original_title,
-                    original_body=stored_original_body, display_language=display_language,
-                    confidence=0.5, provenance=[prov],
-                    status=MemoryStatus.CANDIDATE,
-                    completeness=Completeness.VERIFIABLE,
+                    memory_id=memory_id, kind=kind, title=safe_title, body=safe_body,
+                    scope="project", original_title=original_title,
+                    original_body=original_body, display_language=disp_lang,
+                    localization_mode=loc_mode,
+                    confidence=conf, provenance=[prov],
+                    status=status,
+                    completeness=completeness,
                     created_at=_now_iso(),
                 )
                 records.append(rec)
-        # 生成重复候选组（不自动删除）
         groups = self._find_duplicates(records, duplicate_threshold)
         ir = MemoryIR(
             records=records, duplicate_groups=groups,
@@ -347,41 +578,48 @@ class MemoryNormalizer:
         )
         return ir
 
-    def _read_source_content(self, obj: SourceObject,
-                             root_map: dict[str, str] | None = None) -> str | None:
-        """v3.1 §1.3 P0：使用 SourceRoot.path 定位，不再用 workspace/relative_path 猜路径。"""
+    def _resolve_source_path(self, obj: SourceObject,
+                             root_map: dict[str, str] | None = None) -> Path | None:
+        from pathlib import Path
+        import os
         if root_map and obj.source_root_id in root_map:
-            from pathlib import Path
-            import os
             root_path = Path(root_map[obj.source_root_id]).resolve()
-            full = (root_path / obj.relative_path).resolve()
-            # canonical containment 防护
+            # 单文件 root：relative_path 可能是文件名；目录 root：拼接
+            root_as_path = Path(root_map[obj.source_root_id])
+            if root_as_path.is_file():
+                full = root_as_path.resolve()
+            else:
+                full = (root_path / obj.relative_path).resolve()
             try:
-                full.relative_to(root_path)
+                if root_as_path.is_file():
+                    pass
+                else:
+                    full.relative_to(root_path)
             except ValueError:
                 return None
-            # 符号链接防护
             if full.is_symlink():
                 try:
                     target = Path(os.readlink(full)).resolve()
-                    target.relative_to(root_path)
+                    if not root_as_path.is_file():
+                        target.relative_to(root_path)
                 except (ValueError, OSError):
                     return None
             if not full.is_file():
                 return None
-            try:
-                return full.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                return None
-        # 回退：项目目录的相对路径
-        from pathlib import Path
+            return full
         p = self.workspace / obj.relative_path
-        if p.exists():
-            try:
-                return p.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                return None
-        return None
+        return p if p.is_file() else None
+
+    def _read_source_content(self, obj: SourceObject,
+                             root_map: dict[str, str] | None = None) -> str | None:
+        """v3.1 §1.3 P0：使用 SourceRoot.path 定位，不再用 workspace/relative_path 猜路径。"""
+        full = self._resolve_source_path(obj, root_map)
+        if full is None:
+            return None
+        try:
+            return full.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
 
     def _find_duplicates(self, records: list[MemoryRecord],
                          threshold: float) -> list[DuplicateGroup]:
@@ -417,12 +655,44 @@ class MemoryNormalizer:
                 used.update(members)
         return groups
 
+    def _redact_ir_for_persist(self, ir: MemoryIR) -> None:
+        """Redact secrets from all persisted text fields before writing IR."""
+        from .secrets import redact_secrets
+
+        for rec in ir.records:
+            rec.title, _ = redact_secrets(rec.title)
+            rec.body, _ = redact_secrets(rec.body)
+            if rec.original_title:
+                rec.original_title, _ = redact_secrets(rec.original_title)
+            if rec.original_body:
+                rec.original_body, _ = redact_secrets(rec.original_body)
+
     def save(self, ir: MemoryIR) -> None:
-        """持久化 IR 到 .memoryguard/ir/current.json。"""
+        """持久化 IR 到 .memoryguard/ir/current.json。
+
+        P2.1: 写入前备份上一版到 .prev.json(只保留一份,覆盖式)。
+        P2.1: current 和 prev 均使用临时文件 + os.replace() 原子写。
+        """
+        import os
+        import shutil
+        self._redact_ir_for_persist(ir)
         self.ir_path.parent.mkdir(parents=True, exist_ok=True)
-        self.ir_path.write_text(
-            json.dumps(ir.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8")
+        content = json.dumps(ir.to_dict(), ensure_ascii=False, indent=2)
+        # P2.1: 备份上一版到 .prev.json(原子写)
+        prev_path = self.ir_path.with_suffix(".prev.json")
+        if self.ir_path.exists():
+            try:
+                prev_tmp = prev_path.with_suffix(".prev.json.tmp")
+                shutil.copy2(self.ir_path, prev_tmp)
+                os.replace(prev_tmp, prev_path)
+            except OSError:
+                # 备份失败不阻塞主写入,但记录到 stderr
+                import sys
+                print(f"memoryguard: prev backup failed for {prev_path}", file=sys.stderr)
+        # P2.1: current.json 原子写(临时文件 + os.replace)
+        tmp = self.ir_path.with_suffix(".current.json.tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, self.ir_path)
 
     def load(self) -> MemoryIR | None:
         if not self.ir_path.exists():

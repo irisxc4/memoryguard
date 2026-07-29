@@ -29,9 +29,11 @@ from src.memoryguard.gui import GovernanceApi
 from src.memoryguard.managed_store import ManagedStore
 from src.memoryguard.projection import ProjectionBuilder
 from src.memoryguard.schema_v3 import (
-    SourceCategory, SourceRootType, SurfaceStatus, TakeoverState, TargetCapability,
+    IngestionPolicy, Ownership, SourceCategory, SourceRootType, SurfaceStatus,
+    TakeoverState, TargetCapability, TargetRole,
 )
 from src.memoryguard.source_registry import SourceRegistry, ScanBudget
+from src.memoryguard.governance_scope import grant_root_to_agent
 
 
 def _setup_test_workspace(tmp: Path) -> None:
@@ -112,25 +114,32 @@ def main() -> int:
         # 3. 所有授权候选 100% 进入 SourceCoverageLedger
         # -----------------------------------------------------------------
         print("\n=== 3. 所有授权候选进入 SourceCoverageLedger ===")
-        # 先 commit_selection 授权一个 agent 的 surfaces
+        # v3.2 要求显式治理范围。测试夹具直接登记一条隔离在临时目录中的
+        # agent-managed 原生记忆，避免 AgentLocator 读取开发者真实 HOME。
         if instances:
             inst = instances[0]
             inst_id = inst["instance_id"]
-            tree = api.get_selection_tree(inst_id)
-            selected = []
-            for cat in tree.get("categories", []):
-                for f in cat.get("files", []):
-                    selected.append({"category": cat["category"], "path": f["path"]})
-            if selected:
-                sel_result = api.commit_selection(inst_id, selected, confirmed=True)
-                ok3 = sel_result.get("added_source_count", 0) > 0 or sel_result.get("updated_source_count", 0) > 0
-                all_pass &= _check(
-                    "commit_selection 授权 SourceRoot",
-                    ok3,
-                    f"added={sel_result.get('added_source_count')}, updated={sel_result.get('updated_source_count')}",
-                )
-            # 扫描并检查 CoverageLedger
             reg = SourceRegistry(str(tmp))
+            memory_file = tmp / ".claude" / "memory" / "preference.md"
+            memory_root = reg.add(
+                str(memory_file),
+                SourceRootType.SELECTED_FILE,
+                display_name="v3.1 fixture native memory",
+                scope="user",
+            )
+            memory_root.source_category = SourceCategory.NATIVE_MEMORY.value
+            memory_root.ingestion_policy = IngestionPolicy.IMPORT_VERBATIM.value
+            memory_root.ownership = Ownership.AGENT_MANAGED.value
+            memory_root.target_role = TargetRole.TAKEOVER_INPUT.value
+            memory_root.scope_source = "acceptance_fixture"
+            grant_root_to_agent(memory_root, inst_id)
+            reg._save()
+            all_pass &= _check(
+                "临时原生记忆已授权给显式 Agent scope",
+                inst_id in memory_root.authorized_agent_ids,
+                f"agent={inst_id[:8]}, root={memory_root.root_id}",
+            )
+            # 扫描并检查 CoverageLedger
             snap = reg.scan(ScanBudget())
             cov_counts = snap.coverage.counts()
             # v3.1 §1.4 P0：unaccounted_count 必须为 0
@@ -146,7 +155,12 @@ def main() -> int:
         # -----------------------------------------------------------------
         print("\n=== 4. 所有选中对象进入 NormalizationLedger ===")
         # build_projection 会扫描+规范化，生成 Memory IR
-        proj = api.build_projection(confirmed=True)
+        proj = api.build_projection(
+            confirmed=True,
+            mode="native",
+            scope={"mode": "agent", "agent_instance_id": inst_id},
+            enrich_mode="heuristic",
+        )
         # 检查 IR 是否有 records
         from src.memoryguard.memory_ir import MemoryNormalizer
         norm = MemoryNormalizer(str(tmp))

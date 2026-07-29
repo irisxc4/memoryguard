@@ -496,10 +496,12 @@ class AgentInstallDetector:
             )
         try:
             if self._platform == "windows":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
                 result = subprocess.run(
                     ["tasklist", "/FI", f"IMAGENAME eq {process_name}",
                      "/NH", "/FO", "CSV"],
                     capture_output=True, text=True, timeout=5,
+                    creationflags=creationflags,
                 )
                 found = process_name.lower() in result.stdout.lower()
             else:

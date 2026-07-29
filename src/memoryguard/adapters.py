@@ -188,29 +188,46 @@ class GenericImportAdapter(ImportAdapter):
         return {"file_count": len(files), "files": files[:50]}
 
     def parse(self, bundle: Path) -> list[ImportedConversation]:
-        # 通用适配器：把每个文件当作一个"对话"
+        from .content_parsers import parse_file
+        # 通用适配器：经统一解析收口，每个 ParsedSegment 作为一条消息
         convs: list[ImportedConversation] = []
+        files: list[Path] = []
         if bundle.is_file():
-            try:
-                content = bundle.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                return []
-            convs.append(ImportedConversation(
-                conv_id="imp-" + stable_hash(str(bundle)),
-                title=bundle.name,
-                messages=[{"role": "user", "content": content, "created_at": _now_iso()}],
-            ))
+            files = [bundle]
         elif bundle.is_dir():
-            for p in bundle.rglob("*.md"):
-                try:
-                    content = p.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
+            for pattern in ("**/*.md", "**/*.jsonl", "**/*.txt", "**/*.json"):
+                files.extend(bundle.glob(pattern))
+        seen: set[str] = set()
+        for p in files:
+            key = str(p.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                segs = parse_file(p)
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not segs:
+                continue
+            messages = []
+            for seg in segs:
+                if seg.signal_level == "meta":
                     continue
-                convs.append(ImportedConversation(
-                    conv_id="imp-" + stable_hash(str(p)),
-                    title=p.name,
-                    messages=[{"role": "user", "content": content, "created_at": _now_iso()}],
-                ))
+                messages.append({
+                    "role": "user",
+                    "content": seg.body,
+                    "created_at": _now_iso(),
+                    "locator": seg.locator,
+                    "title": seg.title,
+                    "kind_hint": seg.kind_hint,
+                })
+            if not messages:
+                continue
+            convs.append(ImportedConversation(
+                conv_id="imp-" + stable_hash(str(p)),
+                title=p.name,
+                messages=messages,
+            ))
         return convs
 
     def normalize(self, items: list[ImportedConversation]) -> list[MemoryRecord]:
@@ -220,18 +237,25 @@ class GenericImportAdapter(ImportAdapter):
                 body = msg.get("content", "")
                 if not body.strip():
                     continue
-                memory_id = stable_hash(conv.conv_id, msg.get("role", ""), body[:200])
+                locator = msg.get("locator") or f"message:{msg.get('role', 'user')}"
+                title = (msg.get("title") or conv.title or "")[:80]
+                kind_hint = msg.get("kind_hint") or ""
+                try:
+                    kind = MemoryKind(kind_hint) if kind_hint else MemoryKind.EPISODE
+                except (ValueError, TypeError):
+                    kind = MemoryKind.EPISODE
+                memory_id = stable_hash(conv.conv_id, locator, stable_hash(body))
                 rec = MemoryRecord(
-                    memory_id=memory_id, kind=MemoryKind.EPISODE,
-                    title=conv.title[:80], body=body, scope="user",
-                    confidence=0.3,  # 导入的 provider summary 完整性低
+                    memory_id=memory_id, kind=kind,
+                    title=title or conv.title[:80], body=body, scope="user",
+                    confidence=0.3,
                     provenance=[Provenance(
                         source_object_id=conv.conv_id,
-                        locator=f"message:{msg.get('role', 'user')}",
+                        locator=locator,
                         excerpt_hash=stable_hash(body),
                     )],
                     status=MemoryStatus.CANDIDATE,
-                    completeness=Completeness.UNVERIFIABLE,  # 导入内容默认不可验证
+                    completeness=Completeness.UNVERIFIABLE,
                     created_at=_now_iso(),
                 )
                 records.append(rec)
@@ -585,21 +609,24 @@ class GenericMarkdownTarget(TargetAdapter):
 
     def rollback(self, change: ReleaseChange, target_path: Path) -> VerificationResult:
         errors: list[str] = []
-        # 从备份恢复
+        backup_dir = target_path / ".memoryguard-backup"
         for changed in change.changed_paths:
             cp = Path(changed)
-            # 找对应备份
             backup_name = cp.name
-            backup_dir = target_path / ".memoryguard-backup"
-            if not backup_dir.exists():
-                errors.append(f"backup dir missing: {backup_dir}")
-                continue
-            # 找最新的该文件备份
-            backups = sorted(backup_dir.glob(f"{backup_name}.*.bak"), reverse=True)
-            if not backups:
-                errors.append(f"no backup for {backup_name}")
-                continue
-            shutil.copy2(backups[0], cp)
+            backups = (
+                sorted(backup_dir.glob(f"{backup_name}.*.bak"), reverse=True)
+                if backup_dir.exists() else []
+            )
+            if backups:
+                try:
+                    shutil.copy2(backups[0], cp)
+                except OSError as exc:
+                    errors.append(f"failed to restore {backup_name}: {exc}")
+            elif cp.exists():
+                try:
+                    cp.unlink()
+                except OSError as exc:
+                    errors.append(f"failed to delete {backup_name}: {exc}")
         return VerificationResult(
             rescan_match=len(errors) == 0, hashes_match=len(errors) == 0,
             errors=errors,

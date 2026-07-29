@@ -17,6 +17,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="memoryguard-icon.png">
 <title>MemoryGuard · 本地记忆治理</title>
 <script src="cytoscape.min.js"></script>
 <style>
@@ -112,7 +113,7 @@ code {
 .sidebar-footer { padding: 12px 20px 0; border-top: 1px solid var(--line); }
 .reader-toggle { display: grid; gap: 8px; margin-bottom: 12px; }
 .reader-toggle-label { color: var(--faint); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
-.reader-toggle-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.reader-toggle-buttons { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .reader-toggle button { padding: 7px 8px; border: 1px solid var(--line); border-radius: 8px; background: rgba(110,231,196,.04); color: var(--muted); font-size: 11px; cursor: pointer; }
 .reader-toggle button.active { color: var(--accent-bright); border-color: rgba(110,231,196,.42); background: rgba(110,231,196,.12); }
 .local-badge { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
@@ -276,6 +277,7 @@ code {
 .finding-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .finding-rule { font-size: 12px; font-weight: 650; }
 .finding-evidence { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.finding-toggle { color: var(--accent); font-size: 11px; white-space: nowrap; }
 .finding-detail { margin-top: 12px; padding: 12px 0 0; border-top: 1px solid var(--line); font-size: 12px; }
 .row { display: flex; align-items: flex-start; gap: 10px; margin: 5px 0; }
 .key { min-width: 72px; color: var(--muted); }
@@ -310,6 +312,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .scope-tab .count { display: inline-block; min-width: 18px; margin-left: 6px;
   padding: 1px 6px; border-radius: 999px; background: rgba(110, 231, 196, .12);
   color: var(--accent); font-size: 10px; }
+.scope-select {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: 10px;
+  color: var(--fg); background: rgba(7, 24, 18, .96); font: inherit; outline: none;
+}
+.scope-select:focus { box-shadow: 0 0 0 2px rgba(110,231,196,.16); }
 .surface-row {
   display: grid; grid-template-columns: auto 1fr auto auto auto; gap: 10px; align-items: center;
   padding: 10px 12px; margin-bottom: 6px;
@@ -391,8 +398,20 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .legend-item { display: flex; align-items: center; gap: 7px; margin: 5px 0; }
 .legend-node { width: 7px; height: 7px; border: 1px solid var(--accent); border-radius: 50%; box-shadow: 0 0 7px rgba(110,231,196,.48); }
+.legend-node.soma { width: 10px; height: 10px; background: rgba(110,231,196,.18); }
+.legend-node.hub { width: 10px; height: 7px; border-radius: 3px; border-style: dashed; border-color: #7dd3fc; box-shadow: none; }
 .legend-node.tentative { border-style: dashed; border-color: var(--orange); box-shadow: none; }
 .legend-node.anchor { width: 4px; height: 4px; border: 0; background: rgba(110,231,196,.56); }
+.legend-edge { width: 16px; height: 0; border-top: 1.5px solid rgba(110,231,196,.55); }
+.legend-edge.related { border-top-style: dashed; border-top-color: rgba(110,231,196,.4); }
+.legend-edge.shared { border-top-style: dashed; border-top-color: rgba(99,179,237,.7); }
+.detail-section { margin: 10px 0 8px; }
+.detail-section h4 { margin: 0 0 6px; color: var(--accent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.detail-path { color: #c5ddd4; font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.claim-list { margin-top: 10px; }
+.claim-list h4 { margin: 0 0 6px; color: var(--accent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.raw-file-row { cursor: pointer; }
+.raw-file-row:hover { border-color: rgba(110,231,196,.45); }
 .merge-dock {
   position: absolute; z-index: 15; right: 18px; bottom: 18px; width: 310px; max-height: 220px; overflow: auto;
   padding: 12px; border: 1px solid var(--line); border-radius: 12px;
@@ -432,6 +451,30 @@ tbody tr:last-child td { border-bottom: 0; }
 .loading { min-height: 320px; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .loading::before { content: ""; width: 34px; height: 34px; margin-right: 12px; border: 1px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: pulse-spin 1.2s linear infinite; }
 @keyframes pulse-spin { to { transform: rotate(360deg); } }
+
+.build-progress {
+  min-height: 360px; display: flex; flex-direction: column; justify-content: center;
+  gap: 14px; max-width: 520px; margin: 40px auto; padding: 28px 24px;
+  border: 1px solid var(--line); border-radius: 14px; background: rgba(7,22,17,.55);
+}
+.build-progress .bp-kicker { color: var(--accent); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; }
+.build-progress h2 { font-size: 18px; font-weight: 600; margin: 0; }
+.build-progress .bp-msg { color: var(--muted); font-size: 13px; line-height: 1.6; min-height: 40px; }
+.build-progress .bp-bar {
+  height: 8px; border-radius: 999px; background: rgba(110,231,196,.12); overflow: hidden;
+  border: 1px solid rgba(110,231,196,.18);
+}
+.build-progress .bp-bar > i {
+  display: block; height: 100%; width: 0%; background: linear-gradient(90deg, #2a8f6f, #6ee7c4);
+  transition: width .35s ease;
+}
+.build-progress .bp-meta { display: flex; justify-content: space-between; color: var(--faint); font-size: 11px; }
+.build-progress .bp-phases { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.build-progress .bp-phase {
+  padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line); font-size: 10px; color: var(--faint);
+}
+.build-progress .bp-phase.active { border-color: rgba(110,231,196,.5); color: var(--accent); }
+.build-progress .bp-phase.done { border-color: rgba(110,231,196,.28); color: #9fd9c4; }
 .toast {
   position: fixed; z-index: 100; right: 22px; bottom: 22px; min-width: 220px; padding: 11px 14px;
   border: 1px solid var(--line-strong); border-radius: 10px; background: rgba(7,22,17,.94); box-shadow: var(--shadow);
@@ -535,12 +578,13 @@ tbody tr:last-child td { border-bottom: 0; }
     <div class="sidebar-footer">
       <div class="reader-toggle">
         <div class="reader-toggle-label">阅读语言</div>
-        <div class="reader-toggle-buttons">
+        <div class="reader-toggle-buttons" title="英文模式优先显示英文内容；无英文版本时显示来源原文">
+          <button type="button" id="reader-auto" onclick="setReaderLanguage('auto')">自动</button>
           <button type="button" id="reader-zh" class="active" onclick="setReaderLanguage('zh')">中文</button>
-          <button type="button" id="reader-original" onclick="setReaderLanguage('original')">原文</button>
+          <button type="button" id="reader-en" onclick="setReaderLanguage('en')">English</button>
         </div>
       </div>
-      <span class="local-badge">Local only · No telemetry</span>
+      <span class="local-badge">Local only · 构建内 LLM 整理 · MCP 可补做</span>
     </div>
   </aside>
 
@@ -574,11 +618,13 @@ let cyInstance = null;
 let selectedNeuronId = null;
 let selectedNeuronNode = null;
 let readerLanguage = localStorage.getItem('memoryguard.readerLanguage') || 'zh';
+if (readerLanguage === 'original') readerLanguage = 'en';
 let sourcesScope = 'all';      // 数据源 sub-tab: 'all' | 'user' | 'project'
 let discoveryResult = null;    // 缓存 discover_agents 结果
 let activeAgentInstanceId = '';  // v3.2：当前选中的 Agent 卡片
 let agentCardsData = null;     // v3.2：缓存 list_agents 结果
 let dataPageMode = 'single_agent';  // v3.2：single_agent | multi_agent_shared_mcp
+let activeShareGroupId = '';
 let governanceSubTab = 'recent_events';  // 治理台子视图
 
 function escapeHtml(value) {
@@ -590,19 +636,27 @@ function escapeHtml(value) {
 function setReaderLanguage(language) {
   readerLanguage = language;
   localStorage.setItem('memoryguard.readerLanguage', language);
+  document.getElementById('reader-auto')?.classList.toggle('active', language === 'auto');
   document.getElementById('reader-zh')?.classList.toggle('active', language === 'zh');
-  document.getElementById('reader-original')?.classList.toggle('active', language === 'original');
+  document.getElementById('reader-en')?.classList.toggle('active', language === 'en');
   renderStatusRail();
+  renderContent();
 }
 
 function displayTitle(item) {
   if (readerLanguage === 'zh') return item.title_zh || item.zh_title || item.title || item.memory_id || '';
-  return item.original_title || item.title || item.title_zh || item.memory_id || '';
+  if (readerLanguage === 'en') return item.title_en || item.en_title || item.original_title || item.title || item.title_zh || item.memory_id || '';
+  return item.display_language === 'zh'
+    ? (item.title_zh || item.zh_title || item.title || item.original_title || item.memory_id || '')
+    : (item.original_title || item.title || item.title_zh || item.memory_id || '');
 }
 
 function displayBody(item) {
   if (readerLanguage === 'zh') return item.body_zh || item.zh_summary || item.body || item.body_preview || '';
-  return item.original_body || item.body || item.body_zh || item.body_preview || '';
+  if (readerLanguage === 'en') return item.body_en || item.en_body || item.original_body || item.body || item.body_zh || item.body_preview || '';
+  return item.display_language === 'zh'
+    ? (item.body_zh || item.zh_summary || item.body || item.original_body || item.body_preview || '')
+    : (item.original_body || item.body || item.body_zh || item.body_preview || '');
 }
 
 let MUTATION_METHODS = null;  // 从后端动态加载
@@ -686,11 +740,68 @@ function waitForPywebview(timeoutMs) {
   });
 }
 
+async function loadGovernanceScopePreference() {
+  try {
+    const pref = await callApi('get_governance_scope');
+    if (pref && !pref.empty && pref.scope) {
+      if (pref.scope.mode === 'share_group' && pref.scope.share_group_id) {
+        activeShareGroupId = pref.scope.share_group_id;
+        dataPageMode = 'multi_agent_shared_mcp';
+      } else if (pref.scope.agent_instance_id) {
+        activeAgentInstanceId = pref.scope.agent_instance_id;
+      }
+    }
+  } catch (_) {}
+}
+
+function isShareGroupScope() {
+  return dataPageMode === 'multi_agent_shared_mcp' && !!activeShareGroupId;
+}
+
+function memoryGroupKind(groupId) {
+  return String(groupId || '').startsWith('personal-') ? 'personal' : 'shared';
+}
+
+function memoryGroupLabel(groupId) {
+  return memoryGroupKind(groupId) === 'personal' ? '个人记忆层' : '共享记忆层';
+}
+
+function scopeApiArgs() {
+  if (isShareGroupScope()) {
+    return [{ mode: 'share_group', share_group_id: activeShareGroupId }, '', activeShareGroupId];
+  }
+  if (activeAgentInstanceId) {
+    return [{ mode: 'agent', agent_instance_id: activeAgentInstanceId }, activeAgentInstanceId, ''];
+  }
+  return [null, '', ''];
+}
+
+async function setActiveShareGroup(groupId) {
+  activeShareGroupId = groupId || '';
+  if (groupId) {
+    dataPageMode = 'multi_agent_shared_mcp';
+    await callApi('set_governance_scope', { mode: 'share_group', share_group_id: groupId });
+  }
+}
+
 async function init() {
   const ready = await waitForPywebview(5000);
   if (!ready) { showToast('GUI 桥接未就绪，请稍后重试', 'error'); return; }
-  try { state.report = await callApi('get_audit'); renderAll(); }
-  catch (e) { showToast('扫描失败：' + e, 'error'); }
+  try {
+    // scope 偏好失败不阻塞首屏
+    await loadGovernanceScopePreference();
+  } catch (_) {}
+  try {
+    state.report = await callApi('get_audit');
+    renderAll();
+  } catch (e) {
+    showToast('扫描失败：' + e, 'error');
+    // 即使审计失败也渲染空壳，避免永久转圈、无法切 tab
+    if (!state.report) {
+      state.report = { findings: [], summary: {}, workspace: '', health_score: 0 };
+      renderAll();
+    }
+  }
 }
 
 async function runAudit() {
@@ -725,8 +836,9 @@ function renderAll() {
   const r = state.report;
   document.getElementById('ws-path').textContent = r.workspace;
   const badge = document.getElementById('health-badge');
+  document.getElementById('reader-auto')?.classList.toggle('active', readerLanguage === 'auto');
   document.getElementById('reader-zh')?.classList.toggle('active', readerLanguage === 'zh');
-  document.getElementById('reader-original')?.classList.toggle('active', readerLanguage === 'original');
+  document.getElementById('reader-en')?.classList.toggle('active', readerLanguage === 'en');
   badge.textContent = '健康度 ' + Math.round(r.health_score) + '/100';
   badge.style.color = r.health_score >= 70 ? 'var(--accent)' : r.health_score >= 40 ? 'var(--orange)' : 'var(--red)';
   document.getElementById('findings-count').textContent = r.findings.length || '';
@@ -737,8 +849,13 @@ function renderAll() {
 }
 
 async function loadGovernanceSnapshot() {
+  if (!activeShareGroupId) {
+    state.governanceSnapshot = null;
+    renderStatusRail();
+    return;
+  }
   try {
-    state.governanceSnapshot = await callApi('get_governance_snapshot');
+    state.governanceSnapshot = await callApi('get_governance_snapshot', activeShareGroupId);
     renderStatusRail();
     if (state.activeTab === 'overview') renderOverview();
   } catch (e) { /* 静默失败，状态栏显示占位 */ }
@@ -757,6 +874,11 @@ function renderStatusRail() {
   if (state.activeTab === 'neurons') {
     container.innerHTML = `<div class="status-item zero"><span class="status-label">当前选择</span><span class="status-num">—</span></div>
       <div class="rail-link" onclick="switchTab('governance')">进入治理台 →</div>`;
+    return;
+  }
+  if (!activeShareGroupId) {
+    container.innerHTML = `<div class="status-item zero"><span class="status-label">记忆治理组</span><span class="status-num">—</span></div>
+      <div class="rail-link" onclick="switchTab('governance')">选择治理组 →</div>`;
     return;
   }
   const snap = state.governanceSnapshot;
@@ -792,41 +914,71 @@ function renderStatusRail() {
 }
 
 function renderNeuronRailDetail(node) {
-  const childCount = (neuronGraph && neuronGraph.nodes ? neuronGraph.nodes : []).filter(n => n.parent_id === node.id).length;
+  const nodes = (neuronGraph && neuronGraph.nodes) ? neuronGraph.nodes : [];
+  const childCount = nodes.filter(n => n.parent_id === node.id).length;
   const isAnchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
-  const kindText = memoryKindLabel(node.kind || node.label || '');
-  const title = isAnchor ? (displayTitle(node) || node.label || '未命名记忆') : (node.node_kind === 'topic' ? kindText : '记忆根节点');
-  if (!isAnchor) {
-    return `<div class="status-item zero"><span class="status-label">${escapeHtml(node.node_kind === 'topic' ? '主题' : '节点')}</span><span class="status-num">${childCount}</span></div>
-      <div class="neuron-detail-body">${escapeHtml(node.node_kind === 'topic' ? `该主题下有 ${childCount} 个记忆节点。点击小光点查看具体内容。` : `当前投影共有 ${(neuronGraph.nodes || []).length} 个节点。`)}</div>
+  const isHub = node.node_kind === 'source_hub';
+  const kindText = node.node_kind === 'topic' ? topicNodeLabel(node) : memoryKindLabel(node.kind || node.label || '');
+  const title = isAnchor
+    ? (displayTitle(node) || node.label || '未命名记忆')
+    : (isHub ? (node.title || node.label || '同源突触')
+      : (node.node_kind === 'topic' ? kindText : (node.label || '记忆胞体')));
+
+  const linkRows = (items, chip) => (items || []).map(item => {
+    const mid = item.memory_id || '';
+    const rel = item.relation_label || chip || '相关';
+    return `<div class="raw-file-row" onclick="selectNeuronByMemory('${escapeHtml(mid)}')" title="跳转到关联节点">
+      <div><code>${escapeHtml(displayTitle(item) || item.title || mid || '')}</code>
+        <div class="surface-meta">${escapeHtml(displayBody(item) || item.body_preview || '')}</div>
+        ${item.relation_reason ? `<div class="surface-meta">${escapeHtml(item.relation_reason)}</div>` : ''}
+      </div>
+      <span class="chip chip-medium">${escapeHtml(rel)}</span>
+    </div>`;
+  }).join('');
+
+  if (!isAnchor && !isHub) {
+    const role = node.node_kind === 'topic' ? '主题树突' : '记忆胞体';
+    return `<div class="status-item zero"><span class="status-label">${escapeHtml(role)}</span><span class="status-num">${childCount}</span></div>
+      ${node.derivation ? `<div class="detail-section"><h4>衍生路径</h4><div class="detail-path">${escapeHtml(node.derivation)}</div></div>` : ''}
+      ${node.edge_hint ? `<div class="row"><span class="key">连接说明</span><span>${escapeHtml(node.edge_hint)}</span></div>` : ''}
+      <div class="neuron-detail-body">${escapeHtml(node.body || (node.node_kind === 'topic'
+        ? `该主题下有 ${childCount} 个下级节点。点击光点查看具体内容。`
+        : `当前投影共有 ${nodes.length} 个节点。`))}</div>
       <div class="rail-link" onclick="switchTab('governance')">进入治理台 →</div>`;
   }
-  const members = (node.members || []).map(m => `<div class="raw-file-row" onclick="selectNeuronByMemory('${escapeHtml(m.memory_id || '')}')">
-    <div><code>${escapeHtml(displayTitle(m) || m.memory_id || '')}</code><div class="surface-meta">${escapeHtml(displayBody(m) || m.body_preview || '')}</div></div>
-    <span class="chip chip-info">${escapeHtml(memoryKindLabel(m.kind || ''))}</span>
-  </div>`).join('');
-  const related = (node.related || []).map(r => `<div class="raw-file-row" onclick="selectNeuronByMemory('${escapeHtml(r.memory_id || '')}')">
-    <div><code>${escapeHtml(displayTitle(r) || r.memory_id || '')}</code><div class="surface-meta">${escapeHtml(displayBody(r) || r.body_preview || '')}</div></div>
-    <span class="chip chip-medium">相关</span>
-  </div>`).join('');
+
+  let members = node.members || [];
+  if ((!members || !members.length) && isHub) {
+    members = nodes.filter(n => n.parent_id === node.id && n.node_kind === 'claim_anchor').map(n => ({
+      memory_id: n.memory_id || '',
+      title: displayTitle(n) || n.label || '',
+      kind: n.kind || '',
+      body_preview: (displayBody(n) || n.body || '').slice(0, 180),
+    }));
+  }
+  const related = node.related || [];
   const actionTarget = node.memory_id || node.id || '';
-  return `<div class="popover-kicker">${escapeHtml(kindText)}</div>
+  const roleKick = isHub ? '同源突触' : '记忆末梢';
+  return `<div class="popover-kicker">${escapeHtml(kindText)} · ${roleKick}</div>
     <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(title)}</h3>
-    <div class="neuron-detail-body">${escapeHtml(displayBody(node) || '暂无正文内容')}</div>
+    ${node.derivation ? `<div class="detail-section"><h4>衍生路径</h4><div class="detail-path">${escapeHtml(node.derivation)}</div></div>` : ''}
+    ${node.edge_hint ? `<div class="row"><span class="key">连接说明</span><span>${escapeHtml(node.edge_hint)}</span></div>` : ''}
+    <div class="detail-section"><h4>内容</h4><div class="neuron-detail-body">${escapeHtml(displayBody(node) || node.body || '暂无正文内容')}</div></div>
     <div class="row"><span class="key">作用域</span><span>${escapeHtml(node.scope || 'project')}</span></div>
     <div class="row"><span class="key">置信度</span><span>${escapeHtml(String(node.confidence ?? '—'))}</span></div>
     <div class="row"><span class="key">完整性</span><span>${escapeHtml(node.completeness || '—')}</span></div>
     <div class="row"><span class="key">来源</span><span>${node.provenance_count || 0} 个来源证据</span></div>
+    ${node.source_key ? `<div class="row"><span class="key">同源键</span><code style="overflow-wrap:anywhere">${escapeHtml(node.source_key)}</code></div>` : ''}
     ${node.cluster_count ? `<div class="row"><span class="key">合并片段</span><span>${node.cluster_count} 条</span></div>` : ''}
     <div class="row"><span class="key">记录 ID</span><code style="overflow-wrap:anywhere">${escapeHtml(actionTarget)}</code></div>
-    <div class="finding-actions" style="margin:12px 0 10px;display:flex;flex-wrap:wrap;gap:6px">
+    ${isAnchor ? `<div class="finding-actions" style="margin:12px 0 10px;display:flex;flex-wrap:wrap;gap:6px">
       <span class="chip chip-confirmed">自动纳入重构</span>
       <button class="btn btn-danger" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','exclude')">删除/排除</button>
       <button class="btn" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','quarantine')">隔离</button>
       <button class="btn" type="button" onclick="neuronAction('${escapeHtml(actionTarget)}','merge')">合并</button>
-    </div>
-    ${members ? `<div class="claim-list"><h4>合并片段</h4>${members}</div>` : ''}
-    ${related ? `<div class="claim-list"><h4>相关联</h4>${related}</div>` : ''}`;
+    </div>` : ''}
+    ${members && members.length ? `<div class="claim-list"><h4>${isHub ? '突触末梢（点击跳转）' : '合并片段'}</h4>${linkRows(members, '末梢')}</div>` : ''}
+    ${related && related.length ? `<div class="claim-list"><h4>相关连线（点击跳转）</h4>${linkRows(related)}</div>` : ''}`;
 }
 
 function renderContent() {
@@ -840,9 +992,48 @@ function renderContent() {
   }
 }
 
+async function ensureGovernanceScope() {
+  if (isShareGroupScope()) return true;
+  if (activeAgentInstanceId) {
+    try {
+      await callApi('set_governance_scope', {
+        mode: 'agent',
+        agent_instance_id: activeAgentInstanceId,
+      });
+    } catch (_) {}
+    return true;
+  }
+  try {
+    const agents = agentCardsData || await callApi('list_agents');
+    agentCardsData = agents;
+    const list = (agents && agents.agents) || [];
+    if (list.length) {
+      activeAgentInstanceId = list[0].instance_id;
+      await callApi('set_governance_scope', {
+        mode: 'agent',
+        agent_instance_id: activeAgentInstanceId,
+      });
+      return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 async function renderNeurons() {
   setContent('<div class="loading">正在读取神经图投影</div>');
-  try { neuronGraph = await callApi('get_neuron_graph', projectionMode); renderNeuronGraph(); }
+  try {
+    const ok = await ensureGovernanceScope();
+    if (!ok) {
+      setContent(`<div class="card empty-state"><div><div class="empty-orb"></div>
+        <p>请先在数据源页选择 Agent，或进入多 Agent 共享组并设为治理范围。</p>
+        <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="switchTab('sources')">去数据源</button></div>
+      </div></div>`);
+      return;
+    }
+    const [scope, agentId, groupId] = scopeApiArgs();
+    neuronGraph = await callApi('get_neuron_graph', projectionMode, scope, agentId, groupId);
+    renderNeuronGraph();
+  }
   catch (e) {
     showToast('神经图构建失败：' + e, 'error');
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>神经图构建失败：${escapeHtml(e)}</p></div></div>`);
@@ -851,7 +1042,8 @@ async function renderNeurons() {
 
 function kindColor(kind) {
   const colors = {
-    fact: '#6ee7c4', preference: '#f6ad55', project: '#63b3ed', episode: '#fc8181', procedure: '#b794f4', correction: '#f687b3', workflow: '#b794f4', constraint: '#fbd38d'
+    fact: '#6ee7c4', preference: '#f6ad55', project: '#63b3ed', episode: '#fc8181', procedure: '#b794f4', correction: '#f687b3', workflow: '#b794f4', constraint: '#fbd38d',
+    user: '#c084fc', agent: '#38bdf8', session: '#94a3b8', share_group: '#2dd4bf', unknown: '#64748b'
   };
   return colors[kind] || '#6ee7c4';
 }
@@ -859,9 +1051,18 @@ function kindColor(kind) {
 function memoryKindLabel(kind) {
   const labels = {
     fact: '事实', preference: '偏好', project: '项目', episode: '事件', procedure: '流程', correction: '纠错',
-    constraint: '约束', workflow: '流程', decision: '决策', context: '上下文', instruction: '指令', unknown: '未知'
+    constraint: '约束', workflow: '流程', decision: '决策', context: '上下文', instruction: '指令', unknown: '未知',
+    user: '用户来源', agent: 'Agent 来源', session: '会话来源', share_group: '共享项目'
   };
   return labels[kind] || kind || '未知';
+}
+
+function topicNodeLabel(node) {
+  if (!node) return '主题';
+  if (node.label && (String(node.label).includes('来源') || /[\u4e00-\u9fff]/.test(String(node.label)))) {
+    return String(node.label);
+  }
+  return memoryKindLabel(node.kind || node.label || '');
 }
 
 function neuronHashUnit(value) {
@@ -907,19 +1108,25 @@ function neuronNodePositions(nodes) {
 function graphElements(graph) {
   // v3.1 §6.3：统一 v3 图契约
   // node: id / parent_id / label / node_kind / memory_id / kind / provenance_count
-  // edge: id / source / target / edge_type
+  // edge: id / source / target / edge_type (+ strength 粗细)
   const elements = [];
   const positions = neuronNodePositions(graph.nodes || []);
+  const EDGE_STRENGTH = { derived_from: 0.58, related: 0.28, shared_source: 0.4, duplicate: 0.34 };
   for (const node of graph.nodes || []) {
     const root = node.node_kind === 'root';
+    const hub = node.node_kind === 'source_hub';
     const anchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
     const cluster = node.node_kind === 'duplicate_cluster';
     // v3：用 provenance_count 替代旧 claim_count 决定大小
     const provCount = node.provenance_count || 0;
-    const size = root ? 66 : cluster ? Math.max(15, Math.min(30, 12 + (node.cluster_count || 2) * 4)) : anchor ? 7 : Math.max(27, Math.min(54, 25 + provCount * 3.2));
+    const size = root ? 66
+      : hub ? Math.max(22, Math.min(40, 18 + (node.cluster_count || provCount || 2) * 3.5))
+      : cluster ? Math.max(15, Math.min(30, 12 + (node.cluster_count || 2) * 4))
+      : anchor ? 7
+      : Math.max(27, Math.min(54, 25 + provCount * 3.2));
     elements.push({ data: {
       id: node.id,
-      label: anchor ? '' : String(node.node_kind === 'topic' ? memoryKindLabel(node.label) : (node.label || '')).slice(0, 18),
+      label: anchor ? '' : String(node.node_kind === 'topic' ? topicNodeLabel(node) : (node.label || '')).slice(0, 18),
       kind: node.node_kind,
       memory_id: node.memory_id || '',
       record_kind: node.kind || '',
@@ -933,7 +1140,8 @@ function graphElements(graph) {
   for (const edge of graph.edges || []) {
     elements.push({ data: {
       id: edge.id, source: edge.source, target: edge.target,
-      etype: edge.edge_type, strength: 0.35,
+      etype: edge.edge_type || 'derived_from',
+      strength: EDGE_STRENGTH[edge.edge_type] || 0.4,
     }});
   }
   return elements;
@@ -956,6 +1164,7 @@ function projectionModeLabel(mode) {
   return {
     native_memory_projection: '原生记忆投影',
     logical_reconstruction_projection: '逻辑重构投影',
+    shared_memory_projection: '共享记忆',
     evidence_only: '证据/萃取来源'
   }[mode] || mode || '未知';
 }
@@ -963,6 +1172,7 @@ function projectionModeLabel(mode) {
 function sourceCategoryLabel(category) {
   return {
     native_memory: '原生记忆', project_memory: '项目记忆', knowledge_source: '知识文档',
+    shared_memory: 'MCP 实时记忆',
     conversation_history: '会话历史', runtime_evidence: '运行证据', ignored_runtime_data: '忽略运行数据',
     control_surface: '控制面', skill_surface: '技能面'
   }[category] || category || '未知';
@@ -971,26 +1181,28 @@ function sourceCategoryLabel(category) {
 function renderProjectionSourceMap(sourceMap) {
   const entries = sourceMap?.entries || [];
   const summary = sourceMap?.summary || {};
+  const shared = sourceMap?.projection_kind === 'shared_memory_projection';
   const rows = entries.length ? entries.map(renderProjectionSourceEntry).join('') : '<tr><td colspan="7" class="empty-note">暂无映射条目</td></tr>';
   return `<section class="card projection-source-map">
-    <div class="card-head"><div><h2>当前数据源映射</h2><p>这里只读展示数据源页已勾选的 Agent / 项目 / 来源。勾选和取消请回到数据源页处理。</p></div>
-      <div class="chips"><span class="chip chip-info">启用 ${summary.enabled || 0}/${summary.total || 0}</span><span class="chip chip-info">原生 ${summary.native_memory || 0}</span><span class="chip chip-info">逻辑 ${summary.logical_reconstruction || 0}</span><span class="chip chip-medium">证据 ${summary.evidence_only || 0}</span></div></div>
+    <div class="card-head"><div><h2>${shared ? '共享记忆入库来源' : '当前数据源映射'}</h2><p>${shared ? '共享图直接读取 SharedMemoryStore。这里展示 active 记忆最初由 MCP 写入或从哪个已授权来源导入；取消来源不会自动删除已经入库的记忆。' : '这里只读展示数据源页已勾选的 Agent / 项目 / 来源。勾选和取消请回到数据源页处理。'}</p></div>
+      <div class="chips">${shared ? `<span class="chip chip-info">入库来源 ${summary.shared_memory || 0}</span><span class="chip chip-info">参与投影 ${summary.enabled || 0}/${summary.total || 0}</span>` : `<span class="chip chip-info">启用 ${summary.enabled || 0}/${summary.total || 0}</span><span class="chip chip-info">原生 ${summary.native_memory || 0}</span><span class="chip chip-info">逻辑 ${summary.logical_reconstruction || 0}</span><span class="chip chip-medium">证据 ${summary.evidence_only || 0}</span>`}</div></div>
     <div class="source-map-table-wrap"><table class="source-map-table"><thead><tr><th>状态</th><th>投影</th><th>来源</th><th>Agent</th><th>项目/范围</th><th>策略</th><th>路径</th></tr></thead><tbody>${rows}</tbody></table></div>
   </section>`;
 }
 
 function renderProjectionSourceEntry(entry) {
   const eligible = entry.logical_eligible || entry.native_eligible;
+  const sharedOrigin = entry.is_shared_memory_origin === true;
   const mode = projectionModeLabel(entry.projection_mode);
   const path = entry.path || '';
   const project = entry.project_ref || (entry.scope === 'project' ? '当前项目' : entry.scope || '未知');
   return `<tr class="${entry.enabled ? '' : 'muted-row'}">
-    <td><span class="chip ${entry.enabled ? 'chip-confirmed' : 'chip-medium'}">${entry.enabled ? '已勾选' : '未勾选'}</span></td>
+    <td><span class="chip ${(sharedOrigin && entry.participates) || entry.enabled ? 'chip-confirmed' : 'chip-medium'}">${sharedOrigin ? (entry.participates ? `已入库 · ${entry.record_count || 0} 条` : '历史来源') : (entry.enabled ? '已勾选' : '未勾选')}</span></td>
     <td><span class="chip ${eligible ? 'chip-confirmed' : 'chip-medium'}">${escapeHtml(mode)}</span></td>
     <td><strong>${escapeHtml(entry.display_name || entry.surface_id || entry.root_id)}</strong><div class="surface-meta">${escapeHtml(sourceCategoryLabel(entry.source_category))}</div></td>
     <td>${escapeHtml(entry.agent_instance_id || '未绑定')}<div class="surface-meta">${escapeHtml(entry.surface_id || '—')}</div></td>
     <td>${escapeHtml(project)}</td>
-    <td>${escapeHtml(entry.ingestion_policy || '')}</td>
+    <td>${escapeHtml(entry.ingestion_policy || '')}${sharedOrigin && entry.first_imported_at ? `<div class="surface-meta">${escapeHtml(entry.first_imported_at)}</div>` : ''}</td>
     <td class="path-cell">${escapeHtml(path)}</td>
   </tr>`;
 }
@@ -998,7 +1210,7 @@ function renderProjectionSourceEntry(entry) {
 function projectionModeControls() {
   const nativeActive = projectionMode === 'native' ? 'btn-primary' : '';
   const reconstructedActive = projectionMode === 'reconstructed' ? 'btn-primary' : '';
-  return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>投影模式</h2><p>原生投影查看当前真实记忆；重构治理投影用于自动治理、萃取并发布回原生记忆。</p></div></div>
+  return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>投影模式</h2><p>原生投影只读查看当前真实记忆；重构治理投影写入 MemoryGuard 管理层，不覆盖原生记忆文件。</p></div></div>
     <div class="finding-actions">
       <button class="btn ${nativeActive}" type="button" onclick="switchProjectionMode('native')">原生记忆投影</button>
       <button class="btn ${reconstructedActive}" type="button" onclick="switchProjectionMode('reconstructed')">重构治理投影</button>
@@ -1012,23 +1224,37 @@ async function switchProjectionMode(mode) {
   await renderNeurons();
 }
 
-function renderNeuronGraph() {
-  const graph = neuronGraph;
-  // 顶部 7 项状态信息（v3.1 §6.1）：Agent 实例 / Profile / 规范版本 / Release / 接管状态 / 覆盖状态 / 是否漂移
-  // 后端 meta 结构：{agent_instances: [...], instance_count, coverage, coverage_status, release_count, drifted}
+function renderNeuronMetaBar(graph) {
   const meta = (graph && graph.meta) || {};
-  const sourceMapPanel = renderProjectionSourceMap(graph?.source_map || {});
-  const modeControls = projectionModeControls();
+  if (isShareGroupScope()) {
+    const gid = (graph && graph.scope && graph.scope.share_group_id)
+      || meta.share_group_id || activeShareGroupId || '—';
+    const agents = meta.bound_agents || [];
+    const memberChips = agents.length
+      ? agents.map(a => {
+          const label = a.display_name || a.product || '未知 Agent';
+          return `<span class="chip chip-info" title="${escapeHtml(a.agent_instance_id || '')}">成员 · ${escapeHtml(label)}</span>`;
+        }).join('')
+      : '<span class="chip chip-medium">成员 · 无绑定</span>';
+    const groupLabel = memoryGroupLabel(gid);
+    return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>记忆核心状态</h2>
+      <p>${groupLabel}状态（组名 · 成员 · 记忆 · 冲突）</p></div></div>
+      <div class="chips">
+        <span class="chip chip-confirmed" title="${escapeHtml(gid)}">${groupLabel} · ${escapeHtml(gid)}</span>
+        ${memberChips}
+        <span class="chip chip-info">成员数 · ${meta.agent_count || agents.length || 0}</span>
+        <span class="chip chip-info">记忆 · ${meta.active_records || 0}</span>
+        <span class="chip chip-${(meta.conflict_count || 0) ? 'high' : 'confirmed'}">冲突 · ${meta.conflict_count || 0}</span>
+        <span class="chip chip-${meta.coverage_status === 'complete' ? 'confirmed' : 'medium'}">覆盖 · ${escapeHtml(meta.coverage_status || 'unknown')}</span>
+      </div></section>`;
+  }
   const instances = meta.agent_instances || [];
-  // 每个 agent_instance 一组 chip：产品名 + 接管状态 + 规范版本 + 记录数
   const instanceChips = instances.length ? instances.map(inst => {
-    const takeoverClass = (inst.takeover_state === 'operational' || inst.takeover_state === 'runtime_verified') ? 'confirmed'
-      : (inst.takeover_state === 'drifted' || inst.takeover_state === 'partial') ? 'high' : 'medium';
     return `<span class="chip chip-info" title="${escapeHtml(inst.instance_id)}">${escapeHtml(inst.product || 'agent')} · ${escapeHtml(inst.takeover_state || 'not_detected')}</span>
       <span class="chip chip-info">版本 · ${escapeHtml(inst.managed_version ? inst.managed_version.slice(0,8) : '—')}</span>
       <span class="chip chip-info">记录 · ${inst.record_count || 0}</span>`;
   }).join('') : '<span class="chip chip-info">Agent · 未发现</span>';
-  const metaBar = `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>记忆核心状态</h2>
+  return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>记忆核心状态</h2>
     <p>顶部 7 项状态信息（v3.1 §6.1）</p></div></div>
     <div class="chips">
       ${instanceChips}
@@ -1037,8 +1263,18 @@ function renderNeuronGraph() {
       <span class="chip chip-${meta.coverage_status === 'complete' ? 'confirmed' : 'medium'}">覆盖 · ${escapeHtml(meta.coverage_status || 'unknown')}</span>
       <span class="chip chip-${meta.drifted ? 'high' : 'confirmed'}">漂移 · ${meta.drifted ? '是' : '否'}</span>
     </div></section>`;
+}
+
+function renderNeuronGraph() {
+  const graph = neuronGraph;
+  // 顶部状态：单 Agent 用实例条；共享组用组名 + 成员
+  const meta = (graph && graph.meta) || {};
+  const sourceMapPanel = renderProjectionSourceMap(graph?.source_map || {});
+  const modeControls = projectionModeControls();
+  const metaBar = renderNeuronMetaBar(graph);
   // 未构建时显示门控
   if (!graph || graph.empty || !graph.nodes || !graph.nodes.length) {
+    stopNeuronSignalPulses();
     document.getElementById('neuron-count').textContent = '';
     const reason = graph && graph.reason ? graph.reason : 'not_built';
     const reasonText = {
@@ -1057,18 +1293,26 @@ function renderNeuronGraph() {
           <h3>当前状态：未构建</h3>
           <p class="gate-reason">${escapeHtml(reasonText)}</p>
           <div class="gate-warning">
-            <strong>${projectionMode === 'native' ? '原生投影读取当前真实记忆。' : '重构治理会自动萃取、合并和清理记忆。'}</strong><br>
-            ${projectionMode === 'native' ? '此操作只生成当前原生记忆的可视化图。' : '确认发布时才会封存备份并写回原生记忆。'}
+            <strong>${isShareGroupScope() ? '共享 MCP 投影读取 SharedMemoryStore。' : projectionMode === 'native' ? '原生投影读取当前真实记忆。' : '重构治理会自动萃取、合并和清理记忆。'}</strong><br>
+            ${isShareGroupScope() ? '确认正式接管时打版本快照；Agent 通过 MCP 读写共享记忆，不再各自写原生文件。' : projectionMode === 'native' ? '此操作只生成当前原生记忆的可视化图。' : '重构结果保存在 MemoryGuard 管理层；原生记忆文件保持只读。'}
           </div>
           <div class="finding-actions">
-            <button class="btn btn-primary" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '构建原生投影' : '构建重构投影'}</button>
+            <button class="btn btn-primary" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '构建原生投影' : '构建重构投影（含 LLM 整理）'}</button>
           </div>
         </div>
       </section>`);
     return;
   }
   const stats = graph.stats || {};
-  const publishActions = projectionMode === 'reconstructed' ? `<button class="btn btn-primary" type="button" onclick="publishReconstructedMemory()">确认发布</button><button class="btn" type="button" onclick="rollbackNativeMemoryRelease()">回滚发布</button>` : '';
+  const publishActions = isShareGroupScope()
+    ? `<button class="btn btn-primary" type="button" onclick="commitSharedMemoryGovernance()">确认正式接管</button>`
+    : '';
+  const enrichInfo = graph.enrichment || {};
+  const enrichPending = enrichInfo.pending_count || 0;
+  const enrichChip = (isShareGroupScope() || projectionMode === 'reconstructed')
+    ? `<span class="chip chip-info">待整理残留 · ${enrichPending}</span>`
+      + (enrichInfo.auto_applied ? `<span class="chip chip-confirmed">本次整理 · ${enrichInfo.auto_applied}</span>` : '')
+    : '';
   const suggestions = [];
   selectedNeuronId = null;
   selectedNeuronNode = null;
@@ -1084,25 +1328,30 @@ function renderNeuronGraph() {
       <div class="neuron-title"><span class="eyebrow">Cognition map</span><h2>可读神经图</h2>
         <p>点击节点查看记忆内容；接受、排除、隔离、合并等操作统一在治理台完成。</p></div>
       <div class="canvas-actions">
+        ${enrichChip}
         <button class="btn" type="button" onclick="fitNeuronGraph()">重置视野</button>
         <button class="btn" type="button" onclick="deleteProjection()">删除当前投影</button>
-        <button class="btn" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '重建原生投影' : '重建重构投影'}</button>
+        <button class="btn" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '重建原生投影' : '重建投影（含 LLM 整理）'}</button>
         ${publishActions}
       </div>
     </div>
     <div class="neuron-stage" id="neuron-stage">
       <div class="neuron-canvas" id="cy" aria-label="本地记忆神经图画布"></div>
       <div class="neuron-legend">
-        <div class="legend-item"><span class="legend-node"></span>主题节点</div>
-        <div class="legend-item"><span class="legend-node tentative"></span>记忆片段</div>
-        <div class="legend-item"><span class="legend-node anchor"></span>原始记录</div>
+        <div class="legend-item"><span class="legend-node soma"></span>记忆胞体</div>
+        <div class="legend-item"><span class="legend-node"></span>来源/类型主题</div>
+        <div class="legend-item"><span class="legend-node hub"></span>同源突触</div>
+        <div class="legend-item"><span class="legend-node anchor"></span>记忆末梢</div>
+        <div class="legend-item"><span class="legend-edge"></span>衍生轴突</div>
+        <div class="legend-item"><span class="legend-edge related"></span>相似关联</div>
+        <div class="legend-item"><span class="legend-edge shared"></span>同源跨类型</div>
       </div>
       <div class="neuron-stats">
-        <div class="neuron-stat"><strong>${stats.claim_anchor_count || 0}</strong><span>记忆片段</span></div>
-        <div class="neuron-stat"><strong>${stats.node_count || 0}</strong><span>总节点</span></div>
-        <div class="neuron-stat"><strong>${stats.topic_count || 0}</strong><span>主题节点</span></div>
+        <div class="neuron-stat"><strong>${stats.claim_anchor_count || 0}</strong><span>记忆末梢</span></div>
+        <div class="neuron-stat"><strong>${stats.source_hub_count || 0}</strong><span>同源突触</span></div>
+        <div class="neuron-stat"><strong>${stats.related_edge_count || 0}</strong><span>相似关联</span></div>
+        <div class="neuron-stat"><strong>${stats.shared_source_edge_count || 0}</strong><span>同源连线</span></div>
         <div class="neuron-stat"><strong>${stats.edge_count || 0}</strong><span>关系边</span></div>
-        <div class="neuron-stat"><strong>${stats.provenance_total || 0}</strong><span>来源证据</span></div>
       </div>
       ${renderMergeDock(suggestions)}
       <aside class="neuron-popover" id="neuron-popover" role="dialog" aria-live="polite" aria-label="光点治理"></aside>
@@ -1114,6 +1363,7 @@ function renderNeuronGraph() {
     return;
   }
 
+  stopNeuronSignalPulses();
   cyInstance = cytoscape({
     container: document.getElementById('cy'),
     elements: graphElements(graph),
@@ -1125,7 +1375,7 @@ function renderNeuronGraph() {
         'font-family': 'Segoe UI, PingFang SC, sans-serif', 'font-weight': 500,
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 8,
         'text-outline-width': 2, 'text-outline-color': '#040b09', 'text-wrap': 'wrap', 'text-max-width': 92,
-        'transition-property': 'border-width, border-color, background-color, opacity', 'transition-duration': '160ms',
+        'transition-property': 'border-width, border-color, background-color, opacity, shadow-blur', 'transition-duration': '160ms',
       }},
       { selector: 'node[kind = "root"]', style: {
         'background-color': '#6ee7c4', 'background-opacity': .24, 'border-width': 2.5,
@@ -1133,6 +1383,11 @@ function renderNeuronGraph() {
       }},
       { selector: 'node[kind = "claim_anchor"]', style: {
         'background-opacity': .68, 'border-width': 0, 'label': '',
+      }},
+      { selector: 'node[kind = "source_hub"]', style: {
+        'background-opacity': .42, 'border-width': 2.0,
+        'border-color': '#7dd3fc', 'border-style': 'dashed',
+        'font-size': 9, 'shape': 'round-rectangle',
       }},
       { selector: 'node[kind = "duplicate_cluster"]', style: {
         'background-opacity': .78, 'border-width': 1.8,
@@ -1142,11 +1397,24 @@ function renderNeuronGraph() {
         'background-color': '#2b2a20', 'border-color': '#e9bb64', 'border-style': 'dashed',
       }},
       { selector: 'edge', style: {
-        'width': 'mapData(strength, 0, 1, .45, 2.4)', 'line-color': '#6ee7c4', 'line-opacity': .18,
+        'width': 'mapData(strength, 0, 1, .55, 3.2)', 'line-color': '#6ee7c4', 'line-opacity': .22,
         'curve-style': 'unbundled-bezier', 'control-point-distances': 20, 'control-point-weights': .5,
-        'target-arrow-shape': 'none', 'transition-property': 'line-opacity, width', 'transition-duration': '140ms',
+        'target-arrow-shape': 'none', 'transition-property': 'line-opacity, width, line-color', 'transition-duration': '140ms',
       }},
-      { selector: 'edge[etype = "related"]', style: { 'line-style': 'dashed', 'line-opacity': .12 }},
+      { selector: 'edge[etype = "related"]', style: { 'line-style': 'dashed', 'line-opacity': .2, 'line-color': '#9ae6b4' }},
+      { selector: 'edge[etype = "shared_source"]', style: { 'line-style': 'dashed', 'line-color': '#63b3ed', 'line-opacity': .34 }},
+      { selector: 'edge[etype = "duplicate"]', style: { 'line-style': 'dashed', 'line-color': '#f6ad55', 'line-opacity': .28 }},
+      { selector: 'edge.signal', style: {
+        'line-opacity': .95, 'width': 3.6, 'line-color': '#e6fff6',
+        'shadow-blur': 18, 'shadow-color': '#6ee7c4', 'shadow-opacity': .7,
+      }},
+      { selector: 'edge.signal-trail', style: {
+        'line-opacity': .55, 'width': 2.4, 'line-color': '#98f5d0',
+      }},
+      { selector: 'node.signal', style: {
+        'border-width': 3.2, 'border-color': '#ffffff',
+        'shadow-blur': 28, 'shadow-color': '#bcffeb', 'shadow-opacity': .55,
+      }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
       { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.5 }},
       { selector: 'node:selected', style: {
@@ -1177,6 +1445,136 @@ function renderNeuronGraph() {
   cyInstance.on('drag position', 'node', event => {
     if (selectedNeuronId === event.target.id()) positionNeuronPopover(selectedNeuronId);
   });
+  startNeuronSignalPulses(cyInstance);
+}
+
+function stopNeuronSignalPulses() {
+  if (window.__neuronSignalTimer) {
+    clearInterval(window.__neuronSignalTimer);
+    window.__neuronSignalTimer = null;
+  }
+  if (window.__neuronSomaPulse) {
+    clearInterval(window.__neuronSomaPulse);
+    window.__neuronSomaPulse = null;
+  }
+  const pending = window.__neuronSignalChains || [];
+  pending.forEach(id => clearTimeout(id));
+  window.__neuronSignalChains = [];
+  window.__neuronSignalRefs = {};
+  if (cyInstance) {
+    try {
+      cyInstance.edges().removeClass('signal signal-trail');
+      cyInstance.nodes().removeClass('signal');
+    } catch (e) { /* graph torn down */ }
+  }
+}
+
+function _signalRefKey(eleId, cls) {
+  return eleId + '::' + cls;
+}
+
+function _acquireSignal(cy, eleId, cls) {
+  if (!window.__neuronSignalRefs) window.__neuronSignalRefs = {};
+  const key = _signalRefKey(eleId, cls);
+  window.__neuronSignalRefs[key] = (window.__neuronSignalRefs[key] || 0) + 1;
+  const ele = cy.getElementById(eleId);
+  if (ele && ele.length) ele.addClass(cls);
+}
+
+function _releaseSignal(cy, eleId, cls) {
+  if (!window.__neuronSignalRefs) window.__neuronSignalRefs = {};
+  const key = _signalRefKey(eleId, cls);
+  const next = Math.max(0, (window.__neuronSignalRefs[key] || 1) - 1);
+  window.__neuronSignalRefs[key] = next;
+  if (next > 0) return;
+  delete window.__neuronSignalRefs[key];
+  const ele = cy.getElementById(eleId);
+  if (ele && ele.length) ele.removeClass(cls);
+}
+
+function pickNeuronSignalPath(cy) {
+  const leaves = cy.nodes().filter(n => n.data('kind') === 'claim_anchor');
+  if (!leaves.length) return null;
+  const leaf = leaves[Math.floor(Math.random() * leaves.length)];
+  const pathNodes = [];
+  const pathEdges = [];
+  let cur = leaf;
+  const seen = new Set();
+  while (cur && cur.length && !seen.has(cur.id())) {
+    seen.add(cur.id());
+    pathNodes.unshift(cur);
+    const incomers = cur.incomers('edge').filter(e => {
+      const t = e.data('etype');
+      return !t || t === 'derived_from';
+    });
+    if (!incomers.length) break;
+    const edge = incomers[Math.floor(Math.random() * Math.min(incomers.length, 2))];
+    pathEdges.unshift(edge);
+    cur = edge.source();
+    if (cur.data('kind') === 'root') {
+      pathNodes.unshift(cur);
+      break;
+    }
+  }
+  if (pathEdges.length < 1) return null;
+  return { nodes: pathNodes, edges: pathEdges };
+}
+
+function runNeuronSignalPulse(cy, path) {
+  if (!cy || !path || !path.edges.length) return;
+  const stepMs = 120;
+  const holdMs = 220;
+  path.edges.forEach((edge, index) => {
+    const tid = setTimeout(() => {
+      if (!cyInstance || cyInstance !== cy) return;
+      _acquireSignal(cy, edge.id(), 'signal');
+      const src = edge.source();
+      const tgt = edge.target();
+      if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
+      if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
+      const releaseId = setTimeout(() => {
+        if (!cyInstance || cyInstance !== cy) return;
+        _releaseSignal(cy, edge.id(), 'signal');
+        _acquireSignal(cy, edge.id(), 'signal-trail');
+        if (src && src.length) _releaseSignal(cy, src.id(), 'signal');
+        if (tgt && tgt.length) _releaseSignal(cy, tgt.id(), 'signal');
+        const trailId = setTimeout(() => {
+          if (!cyInstance || cyInstance !== cy) return;
+          _releaseSignal(cy, edge.id(), 'signal-trail');
+        }, holdMs + 180);
+        (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(trailId);
+      }, holdMs);
+      (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(releaseId);
+    }, index * stepMs);
+    (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
+  });
+}
+
+function startNeuronSignalPulses(cy) {
+  stopNeuronSignalPulses();
+  if (!cy) return;
+  window.__neuronSomaPulse = setInterval(() => {
+    if (!cyInstance || cyInstance !== cy) return;
+    try {
+      const root = cy.$('node[kind = "root"]');
+      if (root && root.length) root.flashClass('pulse', 700);
+    } catch (e) { /* ignore */ }
+  }, 4200);
+  const fireWave = () => {
+    if (!cyInstance || cyInstance !== cy) return;
+    const count = 3 + Math.floor(Math.random() * 4); // 3-6
+    for (let i = 0; i < count; i++) {
+      const delay = Math.floor(Math.random() * 280);
+      const tid = setTimeout(() => {
+        if (!cyInstance || cyInstance !== cy) return;
+        const path = pickNeuronSignalPath(cy);
+        if (path) runNeuronSignalPulse(cy, path);
+      }, delay);
+      (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
+    }
+  };
+  fireWave();
+  window.__neuronSignalTimer = setInterval(fireWave, 1600);
 }
 
 function fitNeuronGraph() {
@@ -1220,20 +1618,128 @@ function selectNeuronByMemory(memoryId) {
   selectNeuron(node.id, true);
 }
 
+const DECISION_REASON_OPTIONS = {
+  exclude: [
+    { id: 'wrong', label: '内容错误或过时' },
+    { id: 'irrelevant', label: '与当前项目无关' },
+    { id: 'duplicate', label: '重复记忆' },
+    { id: 'privacy', label: '隐私 / 不应保留' },
+    { id: 'low_quality', label: '质量过低，无治理价值' },
+  ],
+  quarantine: [
+    { id: 'secret', label: '含敏感信息（密钥/令牌等）' },
+    { id: 'untrusted', label: '内容可疑 / 不可信' },
+    { id: 'review', label: '待人工复核' },
+    { id: 'policy', label: '与安全策略冲突' },
+  ],
+  supersede: [
+    { id: 'replaced', label: '已被更新内容替代' },
+    { id: 'stale', label: '过时版本' },
+    { id: 'merged', label: '已合并到其他记忆' },
+  ],
+  takeover: [
+    { id: 'mcp_takeover', label: 'MCP 正式接管（推荐）' },
+    { id: 'migration_complete', label: '原生记忆迁移完成' },
+    { id: 'governance_verified', label: '治理结果已人工确认' },
+  ],
+};
+
 async function neuronAction(nodeId, action) {
-  // v3.1 §6.2：图上操作 → 追加 DecisionEvent → 生成新规范版本 → 投影重建
+  // v3.1 §6.2：图上操作 → DecisionEvent → 轻量刷新投影（不跑 LLM）
   let reason = '';
   if (action === 'exclude' || action === 'quarantine' || action === 'supersede') {
-    reason = prompt(action + ' 的原因（必填）：') || '';
-    if (!reason) return showToast('需填写原因', 'error');
+    reason = await pickDecisionReason(action);
+    if (!reason) return;
   }
-  showToast('正在写入 DecisionEvent…');
+  // 先从本地图拿掉，避免「写入中」干等
+  const mid = (selectedNeuronNode && (selectedNeuronNode.memory_id || selectedNeuronNode.id)) || nodeId;
+  optimisticRemoveNeuron(nodeId, mid);
+  showToast('正在写入决策并刷新投影…');
   try {
-    const result = await callApi('neuron_decide', nodeId, action, reason, true);
-    if (result.error) return showToast(result.error, 'error');
-    showToast(`已写入决策，新规范版本：${result.memory_version || ''}`, 'success');
-    neuronGraph = await callApi('get_neuron_graph'); renderNeuronGraph();
-  } catch (e) { showToast('操作失败：' + e, 'error'); }
+    const [scope, agentId, groupId] = scopeApiArgs();
+    const result = await callApi('neuron_decide', nodeId, action, reason, true, scope, agentId, groupId);
+    if (result.error) {
+      showToast(result.error, 'error');
+      await refreshNeuronGraph();
+      return;
+    }
+    const ver = result.memory_version || result.version_id || '';
+    showToast(`已${action === 'exclude' ? '排除' : action === 'quarantine' ? '隔离' : '更新'}${ver ? ' · ' + ver.slice(0, 8) : ''}`, 'success');
+    await refreshNeuronGraph();
+  } catch (e) {
+    showToast('操作失败：' + e, 'error');
+    await refreshNeuronGraph();
+  }
+}
+
+function optimisticRemoveNeuron(nodeId, memoryId) {
+  try {
+    if (cyInstance && !cyInstance.destroyed()) {
+      const el = cyInstance.getElementById(nodeId);
+      if (el && el.length) el.remove();
+      if (memoryId) {
+        cyInstance.nodes().filter(n => n.data('memory_id') === memoryId).remove();
+      }
+    }
+    if (neuronGraph && Array.isArray(neuronGraph.nodes)) {
+      neuronGraph.nodes = neuronGraph.nodes.filter(n =>
+        n.id !== nodeId && n.memory_id !== memoryId && !(n.member_ids || []).includes(memoryId)
+      );
+    }
+    selectedNeuronId = null;
+    selectedNeuronNode = null;
+    renderStatusRail();
+  } catch (_) {}
+}
+
+function pickDecisionReason(action) {
+  const options = DECISION_REASON_OPTIONS[action] || [];
+  if (!options.length) return Promise.resolve(action);
+  return new Promise((resolve) => {
+    closeDecisionReasonModal();
+    const titles = {
+      exclude: '选择排除原因',
+      quarantine: '选择隔离原因',
+      supersede: '选择覆盖原因',
+      takeover: '选择正式接管说明',
+    };
+    const rows = options.map((o, i) => `<label class="release-option">
+      <input type="radio" name="decision-reason" value="${i}" ${i === 0 ? 'checked' : ''}>
+      <span><div class="release-title">${escapeHtml(o.label)}</div></span>
+    </label>`).join('');
+    const modal = document.createElement('div');
+    modal.id = 'decision-reason-modal';
+    modal.className = 'modal-backdrop';
+    modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeHtml(titles[action] || '选择原因')}">
+      <div class="modal-head"><h3>${escapeHtml(titles[action] || '选择原因')}</h3>
+        <p>请点选预设原因，无需手输文字。</p></div>
+      <div class="modal-body">${rows}</div>
+      <div class="modal-actions">
+        <button class="btn" type="button" data-act="cancel">取消</button>
+        <button class="btn btn-primary" type="button" data-act="ok">确认</button>
+      </div>
+    </div>`;
+    const finish = (value) => {
+      closeDecisionReasonModal();
+      resolve(value);
+    };
+    modal.addEventListener('click', (event) => {
+      if (event.target === modal) finish('');
+    });
+    modal.querySelector('[data-act="cancel"]').onclick = () => finish('');
+    modal.querySelector('[data-act="ok"]').onclick = () => {
+      const selected = modal.querySelector('input[name="decision-reason"]:checked');
+      if (!selected) return showToast('请选择一个原因', 'error');
+      const opt = options[Number(selected.value)];
+      finish(opt ? opt.label : '');
+    };
+    document.body.appendChild(modal);
+  });
+}
+
+function closeDecisionReasonModal() {
+  const modal = document.getElementById('decision-reason-modal');
+  if (modal) modal.remove();
 }
 
 function positionNeuronPopover(nodeId) {
@@ -1273,142 +1779,274 @@ async function doMerge(fromId, toId) {
 }
 
 async function refreshNeuronGraph(message = '') {
-  neuronGraph = await callApi('get_neuron_graph', projectionMode);
+  const [scope, agentId, groupId] = scopeApiArgs();
+  neuronGraph = await callApi('get_neuron_graph', projectionMode, scope, agentId, groupId);
   renderNeuronGraph();
   if (message) showToast(message, 'success');
 }
 
-async function buildProjection() {
-  const native = projectionMode === 'native';
-  const message = native
-    ? '构建原生记忆投影？\n\n· 读取数据源页已勾选的原生/项目记忆\n· 只生成当前真实记忆图\n· 不写入记忆文件\n\n继续？'
-    : '构建重构治理投影？\n\n· 自动萃取、合并、清理已勾选来源\n· 生成可发布的新记忆结构\n· 确认发布时才会封存备份并写回\n\n继续？';
-  if (!confirm(message)) return;
-  setContent(`<div class="loading">正在构建${native ? '原生记忆' : '重构治理'}投影</div>`);
+async function pollBuildProgress(jobId) {
+  const maxWaitMs = 10 * 60 * 1000;
+  const started = Date.now();
+  const phases = [
+    { id: 'scan', label: '扫描' },
+    { id: 'normalize', label: '规范化' },
+    { id: 'scope', label: '范围' },
+    { id: 'enrich_queue', label: '入队' },
+    { id: 'enrich', label: 'LLM 整理' },
+    { id: 'graph', label: '出图' },
+    { id: 'save', label: '保存' },
+    { id: 'done', label: '完成' },
+  ];
+  while (Date.now() - started < maxWaitMs) {
+    const prog = await callApi('get_build_progress', jobId);
+    renderBuildProgressPage(prog, phases);
+    renderBuildStatusRail(prog);
+    if (prog.status === 'done') {
+      if (prog.error) return showToast(prog.error, 'error');
+      const enr = (prog.result && prog.result.enrichment) || {};
+      const applied = enr.auto_applied || 0;
+      if (enr.host_action_required || enr.enrich_mode === 'host' || enr.engine === 'host_deferred') {
+        const n = enr.pending_count || (enr.pending_tasks || []).length || 0;
+        await refreshNeuronGraph(n ? `投影已出图，${n} 条待对话 Skill 整理` : '投影已出图（宿主 Skill 未调用模型）');
+        showToast(
+          n
+            ? `宿主 Skill 未在本对话执行。请在 Cursor 聊天说「整理 MemoryGuard pending」或选 Cursor Agent CLI 重建。`
+            : '选了宿主 Skill，但 GUI 不能唤起聊天；图上内容多半是旧启发式，不是本次模型整理。',
+          'info',
+        );
+        return;
+      }
+      await refreshNeuronGraph(applied ? `投影构建完成（已整理 ${applied} 条）` : '投影构建完成');
+      return;
+    }
+    if (prog.status === 'error') return showToast(prog.error || prog.message || '构建失败', 'error');
+    if (prog.status === 'cancelled') return showToast('构建已取消', 'info');
+    await new Promise(r => setTimeout(r, 400));
+  }
+  showToast('构建超时，请稍后刷新神经图', 'error');
+}
+
+function renderBuildProgressPage(prog, phases) {
+  const pct = Math.max(0, Math.min(100, prog.percent != null ? prog.percent : 0));
+  const msg = prog.message || '构建中…';
+  const phase = prog.phase || '';
+  const phaseOrder = phases.map(p => p.id);
+  const idx = Math.max(0, phaseOrder.indexOf(phase));
+  const chips = phases.map((p, i) => {
+    const cls = i < idx ? 'done' : (i === idx || phase === p.id ? 'active' : '');
+    return `<span class="bp-phase ${cls}">${escapeHtml(p.label)}</span>`;
+  }).join('');
+  setContent(`<div class="build-progress" role="status" aria-live="polite">
+    <div class="bp-kicker">Build progress</div>
+    <h2>正在构建投影</h2>
+    <div class="bp-msg">${escapeHtml(msg)}</div>
+    <div class="bp-bar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>
+    <div class="bp-meta"><span>${escapeHtml(phase || 'starting')}</span><span>${pct}%</span></div>
+    <div class="bp-phases">${chips}</div>
+    <div class="finding-actions" style="margin-top:8px">
+      <button class="btn" type="button" onclick="cancelActiveBuild('${escapeHtml(prog.job_id || '')}')">取消构建</button>
+    </div>
+  </div>`);
+}
+
+function renderBuildStatusRail(prog) {
+  const container = document.getElementById('status-rail-content');
+  const title = document.querySelector('#status-rail h3');
+  if (!container) return;
+  if (title) title.textContent = '构建状态';
+  const pct = prog.percent != null ? prog.percent : 0;
+  container.innerHTML = `
+    <div class="status-item"><span class="status-label">阶段</span><span class="status-num" style="font-size:12px">${escapeHtml(prog.phase || '—')}</span></div>
+    <div class="status-item"><span class="status-label">进度</span><span class="status-num">${pct}%</span></div>
+    <div class="neuron-detail-body" style="margin-top:10px">${escapeHtml(prog.message || '构建中…')}</div>
+    <div class="rail-link" onclick="cancelActiveBuild('${escapeHtml(prog.job_id || '')}')">取消构建</div>`;
+}
+
+async function cancelActiveBuild(jobId) {
   try {
-    const result = await callApi('build_projection', true, projectionMode);
+    await callApi('cancel_build_projection', jobId || '', true);
+    showToast('已请求取消构建', 'info');
+  } catch (e) { showToast('取消失败：' + e, 'error'); }
+}
+
+async function buildProjection(llmAgent = '', llmCli = '', skipConfirm = false) {
+  const native = projectionMode === 'native';
+  const shared = isShareGroupScope();
+
+  // 多 Agent / 共享组：必须弹窗选整理引擎；多个 CLI 时也弹窗
+  if (!native && !llmAgent) {
+    try {
+      const agentsResp = await callApi('list_host_llm_agents');
+      const agents = (agentsResp && agentsResp.agents) || [];
+      const needPick = shared || agents.length > 1;
+      if (needPick && agents.length >= 1) {
+        showLlmPickModal({
+          agents,
+          suggested_agent: agentsResp.primary || agents[0].agent || 'host',
+          for_build: true,
+          title: shared ? '多 Agent 共享组：选择整理用 LLM' : '选择构建用 LLM',
+        });
+        return;
+      }
+      if (agents.length === 1) {
+        llmAgent = agents[0].agent || '';
+        llmCli = agents[0].cli || '';
+      } else {
+        showToast('未检测到可用整理引擎，将用本地启发式', 'info');
+      }
+    } catch (e) {
+      showToast('检测 LLM 失败，将用启发式：' + e, 'info');
+    }
+  }
+
+  const llmHint = llmAgent === 'host'
+    ? '\n· LLM：宿主 Skill（GUI 只入队；须在 Cursor 对话里继续整理）'
+    : (llmAgent ? `\n· LLM：${llmAgent}` : '\n· LLM：启发式兜底');
+  const message = shared
+    ? `构建共享 MCP 记忆投影？\n\n· 共享组：${activeShareGroupId}${llmHint}\n· 入队后整理，再生成投影\n\n继续？`
+    : native
+    ? '构建原生记忆投影？\n\n· 读取已勾选原生/项目记忆\n· 只生成当前真实记忆图\n· 不调用 LLM\n\n继续？'
+    : `构建重构治理投影？\n\n· 萃取、合并、清理已勾选来源${llmHint}\n· 分类/翻译后出图\n\n继续？`;
+  if (!skipConfirm && !confirm(message)) return;
+
+  setContent(`<div class="build-progress"><div class="bp-kicker">Build progress</div><h2>正在启动构建</h2><div class="bp-msg">准备中…</div><div class="bp-bar"><i style="width:2%"></i></div><div class="bp-meta"><span>starting</span><span>0%</span></div></div>`);
+  renderBuildStatusRail({ phase: 'starting', message: '正在启动…', percent: 0, job_id: '' });
+  try {
+    const ok = await ensureGovernanceScope();
+    if (!ok) return showToast('缺少治理范围，请先选择 Agent 或共享组', 'error');
+    const [scope, agentId, groupId] = scopeApiArgs();
+    const enrichMode = llmAgent === 'host' ? 'host' : (llmAgent && llmCli ? 'cli' : 'auto');
+    const result = await callApi(
+      'start_build_projection', true, projectionMode, scope, agentId, groupId, llmAgent, llmCli, enrichMode,
+    );
+    if (result.error && !result.job_id) return showToast(result.error, 'error');
+    if (result.job_id) {
+      await pollBuildProgress(result.job_id);
+      return;
+    }
     if (result.error) return showToast(result.error, 'error');
-    await refreshNeuronGraph(native ? '原生投影构建完成' : '重构投影构建完成');
+    await refreshNeuronGraph(shared ? '共享组投影构建完成' : native ? '原生投影构建完成' : '重构投影构建完成');
   } catch (e) { showToast('构建失败：' + e, 'error'); }
 }
 
 async function deleteProjection() {
   if (!confirm(`删除当前${projectionMode === 'native' ? '原生' : '重构'}投影？\n\n只删除投影文件，不删除原生记忆。`)) return;
   try {
-    const result = await callApi('delete_projection', true, projectionMode);
+    const ok = await ensureGovernanceScope();
+    if (!ok) return showToast('缺少治理范围，无法删除投影', 'error');
+    const [scope, agentId, groupId] = scopeApiArgs();
+    const result = await callApi('delete_projection', true, projectionMode, scope, agentId, groupId);
     if (result.error) return showToast(result.error, 'error');
     await refreshNeuronGraph('当前投影已删除，可随时重建');
   } catch (e) { showToast('删除失败：' + e, 'error'); }
 }
 
-async function publishReconstructedMemory() {
-  try {
-    const data = await callApi('list_publish_targets');
-    const targets = (data.targets || []).filter(t => t.is_agent_native_memory);
-    if (!targets.length) {
-      showToast('未解析到可写入的 Agent 原生记忆入口，请先在数据源页扫描并勾选原生记忆。', 'error');
-      return;
-    }
-    if (targets.length === 1) {
-      await publishToAgentNativeTarget(targets[0]);
-      return;
-    }
-    showPublishTargetModal(targets);
-  } catch (e) { showToast('发布失败：' + e, 'error'); }
-}
-
-async function publishToAgentNativeTarget(targetInfo) {
-  const target = targetInfo.target_file;
-  if (!confirm(`确认发布到 Agent 原生记忆入口？\n\nAgent：${targetInfo.agent_instance_id || '未知'}\n入口：${targetInfo.display_name || targetInfo.surface_id || ''}\n路径：${target}\n\n后台会执行：封存备份 → staged 写入 → 原子替换 → 校验。`)) return;
-  const result = await callApi('publish_reconstructed_memory', target, true);
-  if (!result.ok) return showToast((result.errors && result.errors[0]) || result.error || '发布失败', 'error');
-  await refreshNeuronGraph(`发布完成：${result.release_id}，已写入 Agent 原生记忆入口`);
-}
-
-function showPublishTargetModal(targets) {
-  closePublishTargetModal();
-  const rows = targets.map((t, i) => `<label class="release-option">
-    <input type="radio" name="publish-target" value="${i}" ${i === 0 ? 'checked' : ''}>
-    <span><div class="release-title">${escapeHtml(t.display_name || t.surface_id || t.root_id)}</div><div class="release-meta">Agent：${escapeHtml(t.agent_instance_id || '未知')} · ${escapeHtml(t.target_file || '')}</div></span>
+function showLlmPickModal(payload) {
+  closeLlmPickModal();
+  const agents = payload.agents || [];
+  if (!agents.length) {
+    showToast(payload.message || '未检测到可用 Agent CLI', 'error');
+    return;
+  }
+  const suggested = payload.suggested_agent || agents[0].agent;
+  const rows = agents.map((a, i) => `<label class="release-option">
+    <input type="radio" name="llm-pick" value="${i}" ${a.agent === suggested || (!suggested && i === 0) ? 'checked' : ''}>
+    <span><div class="release-title">${escapeHtml(a.label || a.agent)}</div>
+      <div class="release-meta">${escapeHtml(a.agent)}${a.cli ? ' · ' + escapeHtml(a.cli) : ' · Skill/MCP 自动整理'}</div></span>
   </label>`).join('');
+  const head = payload.title || '选择构建用 LLM';
   const modal = document.createElement('div');
-  modal.id = 'publish-target-modal';
+  modal.id = 'llm-pick-modal';
   modal.className = 'modal-backdrop';
-  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="选择 Agent 原生记忆入口">
-    <div class="modal-head"><h3>选择 Agent 原生记忆入口</h3><p>只列出已解析到的 agent-managed 原生记忆入口。</p></div>
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeHtml(head)}">
+    <div class="modal-head"><h3>${escapeHtml(head)}</h3>
+      <p>多 Agent 必须选择整理引擎。「宿主 Skill」只入队，须在 Cursor 对话里继续；要 GUI 内同步整理请选 Cursor Agent / Codex 等 CLI。</p></div>
     <div class="modal-body">${rows}</div>
-    <div class="modal-actions"><button class="btn" type="button" onclick="closePublishTargetModal()">取消</button><button class="btn btn-primary" type="button" onclick="confirmPublishTargetModal()">确认发布</button></div>
+    <div class="modal-actions">
+      <button class="btn" type="button" onclick="closeLlmPickModal()">取消</button>
+      <button class="btn btn-primary" type="button" onclick="confirmLlmPickModal()">确认并构建</button>
+    </div>
   </div>`;
-  modal.__targets = targets;
-  modal.addEventListener('click', (event) => { if (event.target === modal) closePublishTargetModal(); });
+  modal.__agents = agents;
+  modal.__forBuild = true;
+  modal.addEventListener('click', (event) => { if (event.target === modal) closeLlmPickModal(); });
   document.body.appendChild(modal);
 }
 
-function closePublishTargetModal() {
-  const modal = document.getElementById('publish-target-modal');
+function closeLlmPickModal() {
+  const modal = document.getElementById('llm-pick-modal');
   if (modal) modal.remove();
 }
 
-async function confirmPublishTargetModal() {
-  const modal = document.getElementById('publish-target-modal');
-  const selected = document.querySelector('input[name="publish-target"]:checked');
-  if (!modal || !selected) return showToast('请选择 Agent 原生记忆入口', 'error');
-  const targetInfo = modal.__targets[Number(selected.value)];
-  closePublishTargetModal();
-  if (targetInfo) await publishToAgentNativeTarget(targetInfo);
+async function confirmLlmPickModal() {
+  const modal = document.getElementById('llm-pick-modal');
+  const selected = document.querySelector('input[name="llm-pick"]:checked');
+  if (!modal || !selected) return showToast('请选择一个 Agent LLM', 'error');
+  const agent = modal.__agents[Number(selected.value)];
+  closeLlmPickModal();
+  if (!agent) return;
+  await buildProjection(agent.agent || '', agent.cli || '', false);
 }
 
-function formatReleaseVersionList(releases) {
-  return (releases || []).slice(0, 20).map((r, i) => `${i + 1}. ${r.release_id} · ${r.rollback_reason || r.status || ''} · ${r.created_at || ''}`).join('\n');
-}
-
-async function rollbackNativeMemoryRelease() {
+async function commitSharedMemoryGovernance() {
+  const gid = activeShareGroupId;
+  if (!gid) return showToast('请先选择或创建共享组', 'error');
+  const reason = await pickDecisionReason('takeover');
+  if (!reason) return;
+  if (!confirm(`确认对共享组正式接管？\n\n· 共享组：${gid}\n· 对 SharedMemoryStore 打版本快照\n· Agent 已通过 MCP 重定向读写共享记忆\n\n继续？`)) return;
+  showToast('正在提交共享记忆治理…');
   try {
-    const data = await callApi('list_native_memory_releases');
-    const allReleases = data.releases || [];
-    const releases = allReleases.filter(r => r.can_rollback);
-    if (!releases.length) {
-      const versions = allReleases.length ? '\n\n版本状态：\n' + formatReleaseVersionList(allReleases) : '\n\n暂无成功发布的版本记录。';
-      alert('没有可恢复的已发布版本。' + versions);
-      return;
+    const result = await callApi('commit_shared_memory_governance', gid, reason, true);
+    if (result.error) return showToast(result.error, 'error');
+    showToast(`正式接管已确认：${result.version_id || ''}`, 'success');
+    try {
+      await refreshNeuronGraph();
+      if (result.projection_warning) {
+        showToast('正式接管已完成；后台投影重建提示：' + result.projection_warning, 'info');
+      }
+    } catch (refreshError) {
+      showToast('正式接管已完成，但神经图刷新失败：' + refreshError, 'info');
     }
-    showRollbackModal(releases.slice(0, 20));
-  } catch (e) { showToast('读取回滚版本失败：' + e, 'error'); }
+  } catch (e) { showToast('提交失败：' + e, 'error'); }
 }
 
-function showRollbackModal(releases) {
-  closeRollbackModal();
-  const rows = releases.map((r, i) => `<label class="release-option">
-    <input type="radio" name="rollback-release" value="${escapeHtml(r.release_id)}" ${i === 0 ? 'checked' : ''}>
-    <span><div class="release-title">${escapeHtml(r.release_id)}</div><div class="release-meta">${escapeHtml(r.created_at || '')}</div></span>
-  </label>`).join('');
-  const modal = document.createElement('div');
-  modal.id = 'rollback-modal';
-  modal.className = 'modal-backdrop';
-  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="选择恢复版本">
-    <div class="modal-head"><h3>选择要恢复的版本</h3><p>只列出当前可安全恢复的已发布版本。</p></div>
-    <div class="modal-body">${rows}</div>
-    <div class="modal-actions"><button class="btn" type="button" onclick="closeRollbackModal()">取消</button><button class="btn btn-primary" type="button" onclick="confirmRollbackModal()">确认恢复</button></div>
-  </div>`;
-  modal.addEventListener('click', (event) => { if (event.target === modal) closeRollbackModal(); });
-  document.body.appendChild(modal);
-}
-
-function closeRollbackModal() {
-  const modal = document.getElementById('rollback-modal');
-  if (modal) modal.remove();
-}
-
-async function confirmRollbackModal() {
-  const selected = document.querySelector('input[name="rollback-release"]:checked');
-  if (!selected) return showToast('请选择要恢复的版本', 'error');
-  const releaseId = selected.value;
+async function importNativeMemoriesToGroup(groupId) {
+  const gid = groupId || activeShareGroupId;
+  if (!gid) return showToast('缺少共享组 ID', 'error');
+  if (!confirm(`从各 Agent 已勾选的原生/项目记忆导入共享组？\n\n· 共享组：${gid}\n· 一次性迁移，写入 SharedMemoryStore\n\n继续？`)) return;
+  showToast('正在导入原生记忆…');
   try {
-    const result = await callApi('rollback_native_memory_release', releaseId, false, true);
-    if (!result.ok) return showToast((result.errors && result.errors[0]) || result.error || '回滚失败', 'error');
-    closeRollbackModal();
-    await refreshNeuronGraph(`回滚完成：${releaseId}`);
-  } catch (e) { showToast('回滚失败：' + e, 'error'); }
+    const result = await callApi('import_native_memories_to_group', gid, null, true);
+    if (result.error) return showToast(result.error, 'error');
+    await setActiveShareGroup(gid);
+    await refreshNeuronGraph(`导入完成：${result.records_written || 0} 条记录`);
+  } catch (e) { showToast('导入失败：' + e, 'error'); }
+}
+
+async function installSharedGroupMcpRedirects(groupId) {
+  const gid = groupId || activeShareGroupId;
+  if (!gid) return showToast('缺少共享组 ID', 'error');
+  if (!confirm(`为共享组内 Agent 安装全局 MCP + Hook 接管？\n\n· 写入各 Agent 的用户级配置\n· 自动安装宿主支持的生命周期 Hook\n· 固定连接当前 MemoryGuard 控制目录\n· 以后从任意项目启动都读写同一共享记忆\n\n继续？`)) return;
+  showToast('正在安装 MCP 与宿主 Hook…');
+  try {
+    const result = await callApi('install_shared_group_mcp_redirects', gid, true);
+    if (result.error) return showToast(result.error, 'error');
+    const configured = result.configured_count || 0;
+    const skipped = result.skipped_count || 0;
+    const failed = result.error_count || 0;
+    const warnings = result.warning_count || 0;
+    const hookConfigured = result.hook_configured_count || 0;
+    const hookUnsupported = result.hook_unsupported_count || 0;
+    const hookFailed = result.hook_error_count || 0;
+    const warningText = (result.installed || []).flatMap(x => x.warnings || []).join('；');
+    if (result.status === 'failure') {
+      return showToast(`MCP 配置失败：${failed} 个错误，${skipped} 个暂缺自动安装适配器`, 'error');
+    }
+    const suffix = `${skipped ? `，${skipped} 个暂缺自动安装适配器` : ''}${failed ? `，${failed} 个 MCP 失败` : ''}${hookUnsupported ? `，${hookUnsupported} 个宿主无已验证 Hook` : ''}${hookFailed ? `，${hookFailed} 个 Hook 失败` : ''}${warnings ? `，${warnings} 条配置提示` : ''}`;
+    showToast(`全局 MCP 已配置 ${configured} 个 Agent，Hook 已配置 ${hookConfigured} 个${suffix}。请按提示重启/信任 Hook；之后任意项目都会连接当前共享记忆。${warningText ? ` ${warningText}` : ''}`,
+      result.status === 'partial' ? 'info' : 'success');
+  } catch (e) { showToast('安装失败：' + e, 'error'); }
 }
 
 async function reExtract() {
@@ -1497,25 +2135,94 @@ function renderFindings() {
     setContent('<div class="view-heading"><span class="eyebrow">Risk signals</span><h2>风险信号</h2></div><div class="card empty-state"><div><div class="empty-orb"></div><p>没有发现需要处理的风险信号。</p></div></div>');
     return;
   }
-  const items = report.findings.map(finding => `<article class="finding-item sev-${escapeHtml(finding.severity)}" onclick="toggleFinding('${escapeHtml(finding.id)}')">
+  const items = report.findings.map((finding, index) => `<article class="finding-item sev-${escapeHtml(finding.severity)}" role="button" tabindex="0"
+    aria-expanded="${index === 0 ? 'true' : 'false'}"
+    onclick="toggleFinding('${escapeHtml(finding.id)}')"
+    onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleFinding('${escapeHtml(finding.id)}')}">
     <div class="finding-header"><span class="finding-rule"><span class="chip chip-${escapeHtml(finding.severity)}">${escapeHtml(finding.severity)}</span> ${escapeHtml(finding.rule_id)}</span>
-      ${finding.fixable ? '<span style="color:var(--accent);font-size:10px">可生成变更</span>' : ''}</div>
+      <span class="finding-toggle" id="toggle-${escapeHtml(finding.id)}">${index === 0 ? '收起详情' : '展开详情'}</span></div>
     <div class="finding-evidence">${escapeHtml(finding.evidence)}</div>
-    <div class="finding-detail" id="detail-${escapeHtml(finding.id)}" style="display:none">
+    <div class="finding-detail" id="detail-${escapeHtml(finding.id)}" style="display:${index === 0 ? 'block' : 'none'}">
       <div class="row"><span class="key">维度</span><span>${escapeHtml(finding.dimension)}</span></div>
       <div class="row"><span class="key">表面</span><span>${escapeHtml(finding.surface)}</span></div>
       <div class="row"><span class="key">位置</span><code>${escapeHtml(finding.location.path)}:${finding.location.span[0]}</code></div>
       <div class="row"><span class="key">影响</span><span>${escapeHtml(finding.impact)}</span></div>
       <div class="row"><span class="key">建议</span><span>${escapeHtml(finding.suggestion)}</span></div>
       <div class="row"><span class="key">置信度</span><span>${(finding.confidence * 100).toFixed(0)}%</span></div>
-      <div class="finding-actions">${finding.fixable ? `<button class="btn btn-primary" type="button" onclick="event.stopPropagation();generatePlan('${escapeHtml(finding.id)}')">生成修复计划</button>` : ''}</div>
+      <div class="finding-actions">
+        <button class="btn" type="button" onclick="event.stopPropagation();copyFindingForAgent('${escapeHtml(finding.id)}')">复制给 Agent 处理</button>
+        ${finding.fixable ? `<button class="btn btn-primary" type="button" onclick="event.stopPropagation();generatePlan('${escapeHtml(finding.id)}')">生成修复计划</button>` : ''}
+      </div>
     </div></article>`).join('');
-  setContent(`<div class="view-heading"><span class="eyebrow">Risk signals</span><h2>风险信号</h2><p>沿着证据链查看问题，不隐藏扫描盲区。</p></div>${items}`);
+  setContent(`<div class="view-heading"><span class="eyebrow">Risk signals</span><h2>风险信号</h2>
+    <p>带“可生成变更”的风险可由 MemoryGuard 自动修复；其余是诊断证据，请交给 Agent 分析处理，完成后重新扫描验证。</p>
+    <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="copyAllFindingsForAgent()">复制全部风险给 Agent</button></div>
+  </div>${items}`);
 }
 
 function toggleFinding(id) {
   const element = document.getElementById('detail-' + id);
-  if (element) element.style.display = element.style.display === 'none' ? 'block' : 'none';
+  if (!element) return;
+  const open = element.style.display === 'none';
+  element.style.display = open ? 'block' : 'none';
+  const card = element.closest('.finding-item');
+  if (card) card.setAttribute('aria-expanded', open ? 'true' : 'false');
+  const label = document.getElementById('toggle-' + id);
+  if (label) label.textContent = open ? '收起详情' : '展开详情';
+}
+
+function findingAgentPrompt(finding) {
+  const line = finding.location && finding.location.span ? finding.location.span[0] : 1;
+  const path = finding.location && finding.location.path ? finding.location.path : '未知位置';
+  return [
+    '请处理下面的 MemoryGuard 风险信号：',
+    `规则：${finding.rule_id || ''}`,
+    `严重度：${finding.severity || ''}`,
+    `维度/表面：${finding.dimension || ''} / ${finding.surface || ''}`,
+    `位置：${path}:${line}`,
+    `证据：${finding.evidence || ''}`,
+    `影响：${finding.impact || ''}`,
+    `建议：${finding.suggestion || ''}`,
+    '',
+    '要求：先核验证据和根因，再修改被引用的项目内容；不要修改 MemoryGuard 的来源文件，也不要盲目删除。完成后重新运行扫描，确认该风险消失且没有引入回归。',
+  ].join('\n');
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      document.execCommand('copy');
+      area.remove();
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function copyFindingForAgent(findingId) {
+  const finding = (state.report.findings || []).find(item => item.id === findingId);
+  if (!finding) return showToast('未找到风险信号', 'error');
+  const ok = await copyText(findingAgentPrompt(finding));
+  showToast(ok ? '已复制，可直接粘贴给 Agent 处理' : '复制失败，请展开后手动复制证据', ok ? 'success' : 'error');
+}
+
+async function copyAllFindingsForAgent() {
+  const findings = state.report.findings || [];
+  if (!findings.length) return showToast('当前没有风险信号', 'info');
+  const text = findings.map((finding, index) =>
+    `# 风险 ${index + 1}\n${findingAgentPrompt(finding)}`
+  ).join('\n\n---\n\n');
+  const ok = await copyText(text);
+  showToast(ok ? `已复制 ${findings.length} 条风险，可直接粘贴给 Agent 处理` : '复制失败，请逐条复制', ok ? 'success' : 'error');
 }
 
 async function generatePlan(findingId) {
@@ -1568,12 +2275,13 @@ async function renderSources() {
       activeAgentInstanceId = agents[0].instance_id;
     }
     // 加载选中 Agent 的数据 + 来源列表 + 覆盖率
-    const [agentData, sourcesResult, rawResult] = await Promise.all([
+    const [agentData, sourcesResult, rawResult, bindingsResult] = await Promise.all([
       activeAgentInstanceId ? callApi('get_agent_data', activeAgentInstanceId) : Promise.resolve(null),
       callApi('list_sources'),
       callApi('get_raw_memory'),
+      callApi('list_bindings'),
     ]);
-    renderSourcesView(sourcesResult, rawResult, agentData);
+    renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult);
   } catch (e) {
     showToast('数据源加载失败：' + e, 'error');
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>数据源加载失败：${escapeHtml(e)}</p></div></div>`);
@@ -1582,27 +2290,44 @@ async function renderSources() {
 
 function selectAgentCard(instanceId) {
   activeAgentInstanceId = instanceId;
+  dataPageMode = 'single_agent';
+  activeShareGroupId = '';
+  callApi('set_governance_scope', {
+    mode: 'agent',
+    agent_instance_id: instanceId,
+  }).catch(() => {});
   renderSources();
 }
 
-function renderSourcesView(sourcesResult, rawResult, agentData) {
+function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) {
   const sources = sourcesResult.sources || [];
   const cov = rawResult.coverage || {};
   document.getElementById('sources-count').textContent = sources.length || '';
 
   // v3.2 Agent 卡片
   const agents = (agentCardsData && agentCardsData.agents) || [];
+  const activeBindings = ((bindingsResult && bindingsResult.bindings) || []).filter(b => b.status === 'active');
   const residuals = (agentCardsData && agentCardsData.residuals) || [];
   const lifecycleLabels = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
   const lifecycleChips = { installed: 'confirmed', installed_no_data: 'info', data_only: 'medium', uncertain: 'info', ignored: 'low', not_detected: 'low' };
   const agentCardsHtml = agents.length ? agents.map(a => {
     const isActive = a.instance_id === activeAgentInstanceId;
     const lifecycle = a.lifecycle_state || 'uncertain';
+    const binding = activeBindings.find(b => b.agent_instance_id === a.instance_id);
+    const kindLabel = binding ? (binding.group_kind === 'personal' ? '个人记忆层' : '共享记忆层') : '未绑定';
+    const bindingAction = binding
+      ? `<button class="btn" type="button" onclick="event.stopPropagation(); viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button>
+         <button class="btn" type="button" onclick="event.stopPropagation(); installMemoryGroupMcp('${escapeHtml(binding.share_group_id)}')">重新安装 MCP</button>
+         ${binding.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation(); leaveSharedToPersonal('${escapeHtml(a.instance_id)}')">退出共享组并回个人层</button>` : ''}`
+      : `<button class="btn btn-primary" type="button" onclick="event.stopPropagation(); ensurePersonalLayer('${escapeHtml(a.instance_id)}')">启用个人记忆层</button>`;
     return `<div class="agent-card ${isActive ? 'active' : ''}" onclick="selectAgentCard('${escapeHtml(a.instance_id)}')">
       <div class="agent-name">${escapeHtml(a.product)}</div>
       <div class="agent-meta">${a.found_surface_count}/${a.surface_count} 表面 · 私有 ${a.private_data_surface_count || 0} · 共享 ${a.shared_surface_count || 0} · ${a.bound_source_count} 来源</div>
       <div class="agent-badge">${escapeHtml(a.target_capability || 'export_only')}</div>
       <span class="chip chip-${lifecycleChips[lifecycle] || 'info'}">${escapeHtml(lifecycleLabels[lifecycle] || lifecycle)}</span>
+      <div class="surface-meta">${kindLabel}${binding ? ` · ${escapeHtml(binding.share_group_id)} · ${escapeHtml(binding.canonical_store_path || '')}` : ''}</div>
+      ${binding && binding.migration_required ? '<div class="chip chip-medium">待迁移（仅提示）</div>' : ''}
+      <div class="finding-actions">${bindingAction}</div>
     </div>`;
   }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">未发现已安装 Agent，点击"检测本机 Agent"</div></div>';
   const residualCardsHtml = residuals.length ? residuals.map(r => {
@@ -1708,20 +2433,22 @@ async function enterMultiAgentMode() {
 async function renderMultiAgentBinding() {
   setContent('<div class="loading">正在加载 Agent 列表与已有绑定…</div>');
   try {
-    const [agentsResult, bindingsResult] = await Promise.all([
+    const [agentsResult, bindingsResult, hooksResult] = await Promise.all([
       callApi('list_agents'),
       callApi('list_bindings'),
+      callApi('get_host_hook_status'),
     ]);
-    showMultiAgentBinding(agentsResult, bindingsResult);
+    showMultiAgentBinding(agentsResult, bindingsResult, hooksResult);
   } catch (e) {
     showToast('加载失败：' + e, 'error');
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>加载失败：${escapeHtml(e)}</p></div></div>`);
   }
 }
 
-function showMultiAgentBinding(agentsResult, bindingsResult) {
+function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
   const agents = (agentsResult && agentsResult.agents) || [];
   const existingBindings = (bindingsResult && bindingsResult.bindings) || [];
+  const hookAgents = (hooksResult && hooksResult.agents) || [];
   if (!agents.length) {
     setContent(`<div class="view-heading"><span class="eyebrow">Multi-agent</span><h2>多 Agent 共享 MCP 模式</h2></div>
       <div class="card empty-state"><div><div class="empty-orb"></div><p>未发现 Agent。请先在数据源 tab 检测本机 Agent 或手工添加来源。</p></div></div>
@@ -1744,10 +2471,35 @@ function showMultiAgentBinding(agentsResult, bindingsResult) {
     </label>`;
   }).join('');
 
+  const activeBindings = existingBindings.filter(b => b.status === 'active');
+  const personalLayerHtml = agents.map(a => {
+    const b = activeBindings.find(x => x.agent_instance_id === a.instance_id);
+    const hook = hookAgents.find(x => x.agent_instance_id === a.instance_id);
+    const label = b ? (b.group_kind === 'personal' ? '个人记忆层' : '共享记忆层') : '未启用个人记忆层';
+    const action = b
+      ? (b.group_kind === 'shared' ? '' : `<button class="btn" type="button" onclick="ensurePersonalLayer('${escapeHtml(a.instance_id)}')">保持个人层</button>`)
+      : `<button class="btn btn-primary" type="button" onclick="ensurePersonalLayer('${escapeHtml(a.instance_id)}')">启用个人记忆层</button>`;
+    const viewAction = b ? `<button class="btn" type="button" onclick="viewMemoryLayer('${escapeHtml(b.share_group_id)}')">进入记忆层</button>` : '';
+    const hookStatus = hook ? (hook.runtime_verified ? '运行已验证' : (hook.configured ? '已配置待运行' : (hook.supported === false ? '宿主无 Hook' : '未配置'))) : '未配置';
+    const hookChip = hook && hook.runtime_verified ? 'confirmed' : (hook && hook.configured ? 'medium' : 'info');
+    const hookActions = hook && hook.supported !== false
+      ? `<button class="btn" type="button" onclick="setHostHookMode('${escapeHtml(hook.provider)}','${escapeHtml(a.instance_id)}','enforce')">强制</button>
+         <button class="btn" type="button" onclick="setHostHookMode('${escapeHtml(hook.provider)}','${escapeHtml(a.instance_id)}','paused')">暂停 Hook</button>
+         <button class="btn btn-danger" type="button" onclick="uninstallHostHook('${escapeHtml(hook.provider)}')">卸载 Hook</button>`
+      : '';
+    return `<article class="plan-item"><div class="finding-header"><span class="finding-rule">${escapeHtml(a.product || a.instance_id)}</span><span class="chip chip-info">${label}</span><span class="chip chip-${hookChip}">${hookStatus}</span></div>
+      <div class="row"><span class="key">group</span><code>${escapeHtml(b ? b.share_group_id : '未绑定')}</code></div>
+      <div class="row"><span class="key">canonical DB</span><span>${escapeHtml(b ? (b.canonical_store_path || '') : '—')}</span></div>
+      <div class="row"><span class="key">Hook</span><span>${escapeHtml(hookStatus)}${hook && hook.mode ? ` · ${escapeHtml(hook.mode)}` : ''}</span></div>
+      <div class="row"><span class="key">last receipt</span><span>${escapeHtml((hook && hook.last_seen_at) || '—')}</span></div>
+      <div class="finding-actions">${viewAction}${action}${hookActions}${b && b.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="leaveSharedToPersonal('${escapeHtml(a.instance_id)}')">退出共享组并回个人层</button>` : ''}</div></article>`;
+  }).join('');
+
   // 已有共享组分组展示
+  const agentNameById = new Map(agents.map(a => [a.instance_id, a.product || a.instance_id]));
   const groupMap = new Map();
   existingBindings.forEach(b => {
-    if (b.status !== 'active') return;
+    if (b.status !== 'active' || b.group_kind !== 'shared') return;
     if (!groupMap.has(b.share_group_id)) groupMap.set(b.share_group_id, []);
     groupMap.get(b.share_group_id).push(b);
   });
@@ -1756,9 +2508,11 @@ function showMultiAgentBinding(agentsResult, bindingsResult) {
       <span class="finding-rule">共享组 ${escapeHtml(gid.slice(0, 16))}</span>
       <span class="chip chip-confirmed">${binds.length} 个 Agent</span>
     </div>
-    <div class="finding-evidence">${binds.map(b => escapeHtml(b.agent_instance_id)).join(' · ')}</div>
+    <div class="finding-evidence">${binds.map(b => escapeHtml(agentNameById.get(b.agent_instance_id) || b.agent_instance_id)).join(' · ')}</div>
     <div class="finding-actions">
+      <button class="btn" type="button" onclick="activateShareGroup('${escapeHtml(gid)}')">设为治理范围</button>
       <button class="btn" type="button" onclick="previewSharedGroup('${escapeHtml(gid)}')">查看共享组预览</button>
+      <button class="btn btn-danger" type="button" onclick="dissolveSharedGroup('${escapeHtml(gid)}')">解散共享组</button>
     </div>
   </article>`).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>暂无共享组。勾选 Agent 后创建。</p></div>';
 
@@ -1772,6 +2526,7 @@ function showMultiAgentBinding(agentsResult, bindingsResult) {
         <button class="btn" type="button" onclick="exitMultiAgentMode()">退出多 Agent 模式</button>
       </div>
     </section>
+    <section class="card"><div class="card-head"><div><h2>个人记忆层</h2><p>个人层与共享层都使用 MemoryGuard SharedMemoryStore；原生文件仅只读扫描源。</p></div></div>${personalLayerHtml}</section>
     <section class="card"><div class="card-head"><div><h2>已有共享组</h2></div></div>
       ${groupsHtml}
       <div class="finding-actions" style="margin-top:14px">
@@ -1780,18 +2535,46 @@ function showMultiAgentBinding(agentsResult, bindingsResult) {
     </section>`);
 }
 
+async function setHostHookMode(provider, agentId, mode) {
+  const verb = mode === 'paused' ? '暂停' : (mode === 'observe' ? '观察' : '强制');
+  if (!confirm(`确认将 ${provider} 的 MemoryGuard Hook 切换为“${verb}”模式？`)) return;
+  const result = await callApi('set_host_hook_mode', provider, agentId, mode, true);
+  if (!result || result.error || result.ok === false) {
+    return showToast((result && result.error) || 'Hook 模式更新失败', 'error');
+  }
+  showToast(`Hook 已切换为 ${mode}`, 'success');
+  await renderMultiAgentBinding();
+}
+
+async function uninstallHostHook(provider) {
+  if (!confirm(`确认卸载 ${provider} 的 MemoryGuard 用户级 Hook？\n\n只删除 MemoryGuard 自己的 handler；MCP、规则和其他 Hook 保留。`)) return;
+  const result = await callApi('uninstall_host_hook', provider, true);
+  if (!result || result.error || result.ok === false) {
+    return showToast((result && result.error) || 'Hook 卸载失败', 'error');
+  }
+  showToast('MemoryGuard Hook 已卸载', 'success');
+  await renderMultiAgentBinding();
+}
+
 async function createSharedBinding() {
   const checks = document.querySelectorAll('input[type=checkbox][data-agent-id]:checked');
   const agentIds = Array.from(checks).map(c => c.dataset.agentId);
   if (agentIds.length < 2) return showToast('多 Agent 共享组至少需要选择 2 个 Agent', 'error');
-  if (!confirm(`确认创建共享组绑定？\n\n· ${agentIds.length} 个 Agent 将通过 MemoryGuard MCP 共享同一组记忆\n· 每个 Agent 的原生记忆模式默认为 observed\n· 可在共享组预览中查看绑定详情`)) return;
+  if (!confirm(`确认创建共享组绑定？\n\n· ${agentIds.length} 个 Agent 通过 MemoryGuard MCP 共享同一组记忆\n· 原生记忆模式默认为 redirected（MCP 接管）\n· 创建后建议：导入原生记忆 → 安装 MCP 重定向 → 构建投影 → 确认正式接管\n\n继续？`)) return;
   showToast('正在创建绑定…');
   try {
     const result = await callApi('bind_agents_to_shared_group', agentIds);
     if (result.error) return showToast(result.error, 'error');
+    await setActiveShareGroup(result.share_group_id);
     showToast(`已创建共享组，绑定 ${agentIds.length} 个 Agent`, 'success');
     showSharedGroupPreview(result.share_group_id, result.preview);
   } catch (e) { showToast('创建失败：' + e, 'error'); }
+}
+
+async function activateShareGroup(groupId) {
+  await setActiveShareGroup(groupId);
+  showToast(`已切换治理范围到共享组 ${groupId.slice(0, 12)}…`, 'success');
+  switchTab('neurons');
 }
 
 async function previewSharedGroup(groupId) {
@@ -1830,13 +2613,44 @@ function showSharedGroupPreview(groupId, preview) {
     <section class="card"><div class="card-head"><div><h2>绑定详情</h2></div></div>
       ${bindingsHtml}
       <div class="finding-actions" style="margin-top:14px">
+        <button class="btn btn-primary" type="button" onclick="importNativeMemoriesToGroup('${escapeHtml(groupId)}')">导入原生记忆</button>
+        <button class="btn" type="button" onclick="installSharedGroupMcpRedirects('${escapeHtml(groupId)}')">安装 MCP 重定向</button>
+        <button class="btn" type="button" onclick="activateShareGroup('${escapeHtml(groupId)}')">设为治理范围并打开神经图</button>
+        <button class="btn btn-danger" type="button" onclick="dissolveSharedGroup('${escapeHtml(groupId)}')">解散共享组</button>
         <button class="btn" type="button" onclick="renderMultiAgentBinding()">← 返回多 Agent 模式</button>
       </div>
     </section>`);
 }
 
+async function dissolveSharedGroup(groupId) {
+  if (!groupId) return showToast('缺少共享组 ID', 'error');
+  if (!confirm(`确认解散共享组？\n\n· 解绑组内全部 Agent\n· 删除共享组投影\n· 归档 SharedMemoryStore 目录（可从 shared-memory-archived 找回）\n· 不清空已写入的 MCP 重定向文件（需手动恢复）\n\n继续？`)) return;
+  showToast('正在解散共享组…');
+  try {
+    const result = await callApi('dissolve_shared_group', groupId, true, true);
+    if (result.error) return showToast(result.error, 'error');
+    if (activeShareGroupId === groupId) {
+      activeShareGroupId = '';
+      dataPageMode = 'multi_agent_shared_mcp';
+    }
+    const n = result.unbound_count || 0;
+    const arch = result.archived_to ? '，数据已归档' : '';
+    showToast(`已解散共享组，解绑 ${n} 个 Agent${arch}`, 'success');
+    renderMultiAgentBinding();
+  } catch (e) { showToast('解散失败：' + e, 'error'); }
+}
+
 async function exitMultiAgentMode() {
   dataPageMode = 'single_agent';
+  activeShareGroupId = '';
+  try {
+    if (activeAgentInstanceId) {
+      await callApi('set_governance_scope', {
+        mode: 'agent',
+        agent_instance_id: activeAgentInstanceId,
+      });
+    }
+  } catch (_) {}
   showToast('已退回单 Agent 模式');
   renderSources();
 }
@@ -2157,6 +2971,15 @@ function showSelectionTree(instanceId, tree) {
   }
 
   const extractSection = renderExtractFileSection(extractFiles);
+  const notes = (tree.discovery_notes || []).map(n => {
+    const chip = n.level === 'warn' ? 'high' : 'info';
+    return `<article class="plan-item"><div class="finding-header">
+      <span class="finding-rule">${escapeHtml(n.code || 'note')}</span>
+      <span class="chip chip-${chip}">${escapeHtml(n.level || 'info')}</span></div>
+      <p>${escapeHtml(n.message || '')}</p>
+      ${n.hint ? `<div class="surface-meta">${escapeHtml(n.hint)}</div>` : ''}
+    </article>`;
+  }).join('');
   setContent(`<div class="view-heading"><span class="eyebrow">Selection</span><h2>分类勾选授权</h2>
     <p>上方只勾选 Agent 长期记忆。下方会话/知识文档可点开萃取。Skill 与控制面不展示。</p></div>
     <section class="card">
@@ -2165,6 +2988,7 @@ function showSelectionTree(instanceId, tree) {
       <div class="row"><span class="key">可萃取</span><span>会话 · 知识文档（不勾选）</span></div>
       <div class="row"><span class="key">不展示</span><span>Skill · 控制面（规则层，非记忆）</span></div>
     </section>
+    ${notes ? `<section class="card"><div class="card-head"><div><h2>发现提示</h2></div></div>${notes}</section>` : ''}
     <section class="card"><div class="card-head"><div><h2>记忆来源勾选</h2></div></div>
       ${scopeTabs}
       ${treeHtml || '<div class="empty-state"><p>未发现可勾选的记忆来源。</p></div>'}
@@ -2200,6 +3024,7 @@ function renderExtractFileSection(files) {
 async function extractSourceFileByPath(absPath) {
   if (!absPath) return;
   try {
+    // 优先走已授权 SourceRoot；否则对已发现的会话/证据路径直接预览萃取
     const data = await callApi('list_sources');
     const sources = data.sources || [];
     const full = String(absPath).replace(/\\/g, '/');
@@ -2207,11 +3032,59 @@ async function extractSourceFileByPath(absPath) {
       const p = String(s.path || '').replace(/\\/g, '/');
       return full.startsWith(p + '/') || full === p;
     });
-    if (!hit || !hit.root_id) return showToast('请先确认记忆来源授权后再萃取', 'error');
-    const root = String(hit.path).replace(/\\/g, '/');
-    const rel = full.startsWith(root + '/') ? full.slice(root.length + 1) : '';
-    await extractSourceFile(hit.root_id, rel);
+    if (hit && hit.root_id) {
+      const root = String(hit.path).replace(/\\/g, '/');
+      const rel = full.startsWith(root + '/') ? full.slice(root.length + 1) : '';
+      await extractSourceFile(hit.root_id, rel);
+      return;
+    }
+    const result = await callApi(
+      'extract_preview_by_path',
+      absPath,
+      activeAgentInstanceId || '',
+      20,
+    );
+    if (result.error) return showToast(result.error, 'error');
+    showExtractPreviewByPath(absPath, result);
   } catch (e) { showToast('萃取失败：' + e, 'error'); }
+}
+
+function showExtractPreviewByPath(absPath, result) {
+  const candidates = result.candidates || [];
+  if (!candidates.length) {
+    showToast('未萃取到可用候选', 'info');
+    return;
+  }
+  const rows = candidates.map(c => `<label class="raw-file-row" style="cursor:pointer;grid-template-columns:auto 1fr auto">
+    <input type="checkbox" data-candidate-id="${escapeHtml(c.candidate_id)}" checked>
+    <div><code>${escapeHtml(c.kind || '')}</code><div class="surface-meta">${escapeHtml(c.preview || c.body || '')}</div></div>
+    <span class="chip chip-${c.risk_level === 'high' ? 'high' : c.risk_level === 'medium' ? 'medium' : 'info'}">${escapeHtml(c.risk_level || 'low')}</span>
+  </label>`).join('');
+  setContent(`<div class="view-heading"><span class="eyebrow">Extract preview</span><h2>会话/证据萃取预览</h2>
+    <p>来自发现路径（无需先勾选授权）。确认后写入共享记忆库。</p></div>
+    <section class="card"><div class="card-head"><div><h2>文件</h2></div></div>
+      <code style="overflow-wrap:anywhere">${escapeHtml(absPath)}</code></section>
+    <section class="card"><div class="card-head"><div><h2>候选 ${candidates.length}</h2></div></div>
+      <div class="raw-file-list">${rows}</div>
+      <div class="finding-actions" style="margin-top:14px">
+        <button class="btn btn-primary" type="button" onclick="acceptExtractByPath('${escapeHtml(result.extract_id)}')">接受所选候选</button>
+        <button class="btn" type="button" onclick="renderSources()">取消</button>
+      </div>
+    </section>`);
+}
+
+async function acceptExtractByPath(extractId) {
+  const checks = document.querySelectorAll('input[type=checkbox][data-candidate-id]:checked');
+  const ids = Array.from(checks).map(c => c.dataset.candidateId);
+  if (!ids.length) return showToast('请至少选择一个候选', 'error');
+  const gid = activeShareGroupId || 'default';
+  showToast('正在写入候选…');
+  try {
+    const result = await callApi('accept_candidates', extractId, ids, gid, activeAgentInstanceId || 'document-extractor');
+    if (result.error) return showToast(result.error, 'error');
+    showToast(`已写入 ${result.accepted || ids.length} 条候选`, 'success');
+    renderSources();
+  } catch (e) { showToast('写入失败：' + e, 'error'); }
 }
 
 function renderSelectionCategory(cat, scope, projectRef) {
@@ -2296,7 +3169,8 @@ async function addSourceDialog() {
   }
   const path = result.path;
   const isDir = result.is_directory;
-  const name = prompt('显示名称（可留空）：', '') || '';
+  // 显示名称由后端从已选择路径自动推导，避免重复手工录入。
+  const name = '';
   showToast('正在添加来源…');
   try {
     const addResult = await callApi('add_source', path, isDir ? 'directory' : 'file', name, true);
@@ -2513,7 +3387,6 @@ async function renderReleases() {
 }
 
 function renderReleasesView() {
-  const releases = state.releases || [];
   // 规则级修复（spec §11.1 保留 v2.1）
   const plans = state.plans || [];
   // v3.1 §8.4：state.ruleChanges 来自旧 changes/ 的兼容读取
@@ -2550,119 +3423,163 @@ function renderReleasesView() {
     <div class="row"><span class="key">status</span><span>${escapeHtml(rc.status || '')}</span></div>
   </article>`).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>没有规则级修复记录。</p></div>');
 
-  const releasesHtml = releases.length ? releases.map(r => {
-    const status = r.status || 'unknown';
-    const statusClass = status === 'verified' ? 'confirmed' : status === 'rolled_back' ? 'medium' : status === 'failed' ? 'high' : 'info';
-    return `<article class="plan-item ${escapeHtml(status)}">
-      <div class="finding-header">
-        <span class="finding-rule">Release ${escapeHtml((r.event_id || '').slice(-8))}</span>
-        <span class="chip chip-${statusClass}">${escapeHtml(status)}</span>
-      </div>
-      <div class="row"><span class="key">build_id</span><code>${escapeHtml((r.build_id || '').slice(-12))}</code></div>
-      <div class="row"><span class="key">profile</span><span>${escapeHtml(r.target_profile || '')}</span></div>
-      <div class="row"><span class="key">applied_at</span><span>${escapeHtml(r.applied_at || '')}</span></div>
-      <div class="row"><span class="key">changed</span><span>${r.changed_count || 0} 个文件</span></div>
-      <div class="finding-actions">
-        ${status === 'applied' || status === 'verified' ? `<button class="btn" type="button" onclick="verifyRelease('${escapeHtml(r.event_id)}')">重新验证</button>
-        <button class="btn btn-danger" type="button" onclick="rollbackRelease('${escapeHtml(r.event_id)}')">回滚</button>` : ''}
-      </div>
-    </article>`;
-  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>尚无发布记录。先生成构建计划。</p></div>';
-
-  setContent(`<div class="view-heading"><span class="eyebrow">Releases</span><h2>变更记录</h2>
-    <p>两类变更闭环统一时间线。规则级修复（Finding→Plan→Apply→Undo）和发布事务（BuildPlan→Apply→Verify→Rollback）。</p></div>
+  setContent(`<div class="view-heading"><span class="eyebrow">Changes</span><h2>变更记录</h2>
+    <p>这里只记录 MemoryGuard 治理层的规则修复。原生记忆仅用于扫描与投影，文件保持只读。</p></div>
     ${warningsHtml}
     <section class="card"><div class="card-head"><div><h2>规则级修复</h2><p>对单个 Finding 生成最小补丁，备份后应用，重扫验证，可撤销</p></div></div>
       ${plansHtml}</section>
-    <section class="card"><div class="card-head"><div><h2>发布事务</h2><p>从 Memory IR 生成 BuildPlan，展示完整 Diff 后由用户批准</p></div>
-      <div class="finding-actions">
-        <button class="btn btn-primary" type="button" onclick="createBuildPlan()">生成构建计划</button>
-      </div></div>
-      <div class="gate-warning" style="margin-top:0">
-        <strong>发布会完整替换受管目标文件。</strong>回滚以 ReleaseChange 为单位，每次回滚前会备份当前目标状态。
-      </div>
-    </section>
-    <section class="card"><div class="card-head"><div><h2>发布历史</h2><p>${releases.length} 条 memory_release 记录</p></div></div>
-      ${releasesHtml}</section>`);
+    <section class="card"><div class="gate-warning" style="margin-top:0">
+      <strong>只读边界：</strong>治理结果写入 MemoryGuard 管理层与共享记忆库，不覆盖任何 Agent 原生记忆文件。
+    </div></section>`);
 }
 
-async function createBuildPlan() {
-  const targetPath = prompt('目标路径（留空使用默认 .memoryguard/memory-target）：', '') || '';
-  showToast('正在生成构建计划…');
-  try {
-    const plan = await callApi('create_build_plan', targetPath);
-    if (plan.error) return showToast(plan.error, 'error');
-    state.lastPlan = plan;
-    showBuildPlanDetail(plan);
-  } catch (e) { showToast('生成失败：' + e, 'error'); }
+async function ensurePersonalLayer(agentId) {
+  if (!confirm('确认启用该 Agent 的个人记忆层并安装全局 MCP + Hook？\n\n· 创建 MemoryGuard 管理的个人数据库\n· 写入该 Agent 的用户级 MCP、Hook 与记忆规则\n· 原生记忆文件保持只读\n· 已有共享绑定不会被自动切换\n· 安装后按提示重启/信任 Hook')) return;
+  const result = await callApi('ensure_personal_memory_group', agentId, true);
+  if (result && result.error) return showToast(result.error, 'error');
+  const gid = result.group_id || result.share_group_id || (result.binding && result.binding.share_group_id);
+  if (gid) {
+    const install = await callApi('install_shared_group_mcp_redirects', gid, true);
+    if (!install || install.error || install.ok === false) {
+      const detail = install && (install.error || `${install.error_count || 0} 失败，${install.skipped_count || 0} 跳过`);
+      showToast('个人记忆层已创建，但 MCP 未完整安装：' + (detail || '未知错误'), 'error');
+    } else {
+      showToast(`个人记忆层与 MCP 已配置；Hook ${install.hook_configured_count || 0} 个。请按提示重启/信任`, 'success');
+    }
+  } else {
+    showToast('个人记忆层返回结果缺少组 ID', 'error');
+  }
+  if (dataPageMode === 'multi_agent_shared_mcp') await renderMultiAgentBinding(); else await renderSources();
 }
 
-function showBuildPlanDetail(plan) {
-  const manifest = plan.manifest || {};
-  const diff = plan.diff_preview || {};
-  setContent(`<div class="view-heading"><span class="eyebrow">Build plan</span><h2>构建计划 ${escapeHtml((plan.plan_id || '').slice(-8))}</h2>
-    <p>请审阅完整 Diff 和覆盖率状态后批准应用。</p></div>
-    <section class="card">
-      <div class="card-head"><div><h2>完整性</h2><p>BuildManifest 五个完整性条件</p></div>
-        <span class="chip chip-${plan.integrity_ok ? 'confirmed' : 'high'}">${plan.integrity_ok ? 'integrity OK' : 'integrity FAIL'}</span></div>
-      <div class="row"><span class="key">coverage</span><span>${escapeHtml(plan.coverage_status || '')}</span></div>
-      <div class="row"><span class="key">target_profile</span><span>${escapeHtml(plan.target_profile || '')}</span></div>
-      <div class="row"><span class="key">published</span><span>${manifest.published_record_count || 0} 条</span></div>
-      <div class="row"><span class="key">unaccounted</span><span>${manifest.unaccounted_record_count || 0} 条</span></div>
-    </section>
-    <section class="card">
-      <div class="card-head"><div><h2>Diff 预览</h2><p>受管目标文件变更摘要</p></div></div>
-      <pre class="raw-file-content">${escapeHtml(JSON.stringify(diff, null, 2))}</pre>
-    </section>
-    <section class="card">
-      <div class="gate-warning">
-        <strong>应用后会完整替换受管目标文件。</strong>系统会先备份当前目标状态，再原子切换，最后复扫验证。
-      </div>
+async function installMemoryGroupMcp(groupId) {
+  const label = memoryGroupLabel(groupId);
+  if (!confirm(`确认重新安装${label}的全局 MCP + Hook？\n\n· 会更新用户级 MCP、Hook 与记忆规则\n· 不改写原生记忆文件\n· 完成后按提示重启/信任 Hook`)) return;
+  const result = await callApi('install_shared_group_mcp_redirects', groupId, true);
+  if (!result || result.error || result.ok === false) {
+    const detail = result && (result.error || `${result.error_count || 0} 失败，${result.skipped_count || 0} 跳过`);
+    return showToast('MCP 未完整安装：' + (detail || '未知错误'), 'error');
+  }
+  showToast(`MCP 已配置，Hook ${result.hook_configured_count || 0} 个；请按提示重启/信任`, 'success');
+}
+
+async function viewMemoryLayer(groupId) {
+  await setActiveShareGroup(groupId);
+  switchTab('neurons');
+}
+
+async function leaveSharedToPersonal(agentId) {
+  if (!confirm('确认退出共享组并回到个人记忆层？\n\n· 两边记忆不会合并或删除\n· 会更新该 Agent 的全局 MCP 规则指向个人层\n· 完成后需要重启对应 Agent')) return;
+  const result = await callApi('leave_shared_group_to_personal', agentId, true);
+  if (result && result.error) return showToast(result.error, 'error');
+  const gid = result.group_id || result.share_group_id || (result.binding && result.binding.share_group_id);
+  const install = gid ? await callApi('install_shared_group_mcp_redirects', gid, true) : null;
+  if (!install || install.error || install.ok === false) {
+    const detail = install && (install.error || `${install.error_count || 0} 失败，${install.skipped_count || 0} 跳过`);
+    showToast('已切换到个人记忆层，但 MCP 未完整更新：' + (detail || '缺少个人组 ID'), 'error');
+  } else {
+    showToast(`已回到个人记忆层并更新 MCP + Hook（${install.hook_configured_count || 0} 个）；请按提示重启/信任`, 'success');
+  }
+  if (dataPageMode === 'multi_agent_shared_mcp') await renderMultiAgentBinding(); else await renderSources();
+}
+
+async function exportMemoryGroup(groupId) {
+  if (!confirm(`确认导出${memoryGroupLabel(groupId)}？\n\n导出包包含记忆、事件、治理历史、完整版本快照、binding 清单和来源文件映射；不包含原生文件正文。`)) return;
+  const result = await callApi('export_memory_group', groupId, true);
+  if (!result || result.error) return showToast((result && result.error) || '导出失败', 'error');
+  setContent(`<div class="view-heading"><span class="eyebrow">Memory export</span><h2>记忆层已导出</h2>
+    <p>${memoryGroupLabel(groupId)} <code>${escapeHtml(groupId)}</code></p></div>
+    <section class="card"><div class="card-head"><div><h2>导出包</h2><p>原生文件未包含，也未被修改。</p></div></div>
+      <div class="row"><span class="key">路径</span><code>${escapeHtml(result.export_path || '')}</code></div>
+      <div class="row"><span class="key">记录</span><span>${escapeHtml((result.counts && result.counts.records) || 0)}</span></div>
       <div class="finding-actions">
-        <button class="btn btn-primary" type="button" onclick="applyBuildPlan('${escapeHtml(plan.plan_id)}')">批准并应用</button>
-        <button class="btn" type="button" onclick="renderReleases()">取消</button>
+        <button class="btn btn-primary" type="button" onclick="copyText(${JSON.stringify(result.export_path || '')})">复制路径</button>
+        <button class="btn" type="button" onclick="renderGovernance()">返回治理台</button>
       </div>
     </section>`);
 }
 
-async function applyBuildPlan(planId) {
-  if (!confirm('确认应用构建计划？\n\n· 会先备份当前受管目标文件\n· 原子切换为新内容\n· 复扫验证\n· 可通过回滚恢复')) return;
-  showToast('正在应用并验证…');
-  try {
-    const result = await callApi('apply_build', planId, true);
-    if (result.error) return showToast(result.error, 'error');
-    showToast('发布已应用并验证', 'success');
-    await renderReleases();
-  } catch (e) { showToast('应用失败：' + e, 'error'); }
+async function showMemorySourceMap(groupId) {
+  setContent('<div class="loading">正在解析记忆到文件的来源链</div>');
+  const result = await callApi('get_memory_source_map', groupId);
+  if (!result || result.error) return showToast((result && result.error) || '来源映射失败', 'error');
+  const mappings = result.mappings || [];
+  const rows = mappings.length ? mappings.map(item => {
+    const sources = (item.sources || []).map(source => {
+      const location = source.absolute_path || source.relative_path || '无本地文件';
+      const state = source.origin_kind === 'local_file'
+        ? (source.exists ? '文件存在' : source.path_valid ? '文件已移动/删除' : '路径无效或未授权')
+        : 'MCP/衍生来源';
+      return `<div class="source-item">
+        <div><strong>${escapeHtml(source.display_name || source.origin_kind)}</strong></div>
+        <div class="surface-meta">${escapeHtml(state)} · ${escapeHtml(source.scope || '')} · ${escapeHtml(source.locator || '')}</div>
+        <code>${escapeHtml(location)}</code>
+      </div>`;
+    }).join('');
+    return `<article class="plan-item">
+      <div class="finding-header"><span class="finding-rule">${escapeHtml(item.kind)} · ${escapeHtml(item.memory_id)}</span><span class="chip chip-info">${escapeHtml(item.status)}</span></div>
+      <div class="finding-evidence">${escapeHtml(item.body_preview || '')}</div>
+      <div class="source-list">${sources}</div>
+    </article>`;
+  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>当前记忆层为空。</p></div>';
+  setContent(`<div class="view-heading"><span class="eyebrow">Source map</span><h2>记忆文件映射</h2>
+    <p>${memoryGroupLabel(groupId)} · ${result.total_records || 0} 条记忆 · ${result.file_source_count || 0} 条本地文件来源</p></div>
+    <section class="card"><div class="gate-warning" style="margin-top:0"><strong>映射规则：</strong>本地文件只是只读来源；MCP 对话写入没有对应文件；衍生记忆会继续追溯其上游记忆。</div></section>
+    <section class="card">${rows}<div class="finding-actions"><button class="btn" type="button" onclick="renderGovernance()">返回治理台</button></div></section>`);
 }
 
-async function verifyRelease(releaseId) {
-  showToast('正在重新验证…');
-  try {
-    const result = await callApi('verify_release', releaseId);
-    if (result.error) return showToast(result.error, 'error');
-    const ok = result.rescan_match && result.hashes_match;
-    showToast(ok ? '验证通过' : '验证失败', ok ? 'success' : 'error');
-  } catch (e) { showToast('验证失败：' + e, 'error'); }
+async function clearMemoryGroup(groupId) {
+  if (!confirm(`确认清空${memoryGroupLabel(groupId)}？\n\n· 系统会先自动导出可恢复 ZIP\n· 清空全部记忆、事件、治理历史与版本\n· 保留 binding、MCP 配置和空数据库\n· 不修改任何原生文件\n\n此操作完成后只能从导出包恢复。`)) return;
+  const result = await callApi('clear_memory_group', groupId, true);
+  if (!result || result.error) return showToast((result && result.error) || '清空失败', 'error');
+  showToast(`记忆层已清空；备份：${result.export_path || ''}`, 'success');
+  await loadGovernanceSnapshot();
+  renderGovernance();
 }
 
-async function rollbackRelease(releaseId) {
-  if (!confirm('回滚此发布？\n\n· 会先备份当前目标状态\n· 恢复为应用前的内容\n· 复扫验证')) return;
-  showToast('正在回滚…');
-  try {
-    const result = await callApi('rollback_release', releaseId, true);
-    if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
-    if (result.error) return showToast(result.error, 'error');
-    showToast('已回滚', 'success');
-    await renderReleases();
-  } catch (e) { showToast('回滚失败：' + e, 'error'); }
+async function archiveMemoryGroup(groupId) {
+  if (!confirm(`确认归档删除${memoryGroupLabel(groupId)}？\n\n· 系统会先自动导出 ZIP\n· 解绑组内 Agent 并归档整个数据库目录\n· 原生文件不变\n· 现有 MCP 将因无活动 binding 而拒绝读写，直到重新启用记忆层\n\n继续？`)) return;
+  const result = await callApi('archive_memory_group', groupId, true);
+  if (!result || result.error) return showToast((result && result.error) || '归档失败', 'error');
+  activeShareGroupId = '';
+  state.governanceSnapshot = null;
+  showToast(`记忆层已归档；导出：${result.export_path || ''}`, 'success');
+  renderGovernance();
+  renderStatusRail();
 }
 
 // ===========================================================================
 // 治理台 tab：最近写入 / 覆盖记录 / 冲突队列 / 隔离队列 / 版本回滚
 // ===========================================================================
 
-function renderGovernance() {
+async function renderGovernance() {
+  setContent('<div class="loading">正在读取记忆治理组</div>');
+  let groups = [];
+  try {
+    const result = await callApi('list_share_groups');
+    groups = result.groups || [];
+  } catch (e) {
+    setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>记忆治理组加载失败：${escapeHtml(String(e))}</p></div></div>`);
+    return;
+  }
+  if (activeShareGroupId && !groups.some(g => g.share_group_id === activeShareGroupId)) {
+    activeShareGroupId = '';
+  }
+  const groupOptions = groups.map(g => `<option value="${escapeHtml(g.share_group_id)}" ${g.share_group_id === activeShareGroupId ? 'selected' : ''}>
+    ${g.group_kind === 'personal' ? '个人' : '共享'} · ${escapeHtml(g.share_group_id)} · ${g.agent_count || 0} Agent · ${g.active_records || 0} active
+  </option>`).join('');
+  const groupSelector = groups.length
+    ? `<section class="card"><div class="card-head"><div><h2>治理范围</h2><p>选择个人或共享记忆层；所有读取和处置都严格绑定此组。</p></div></div>
+        <select class="scope-select" aria-label="选择记忆治理组" onchange="selectGovernanceGroup(this.value)">
+          <option value="">请选择记忆层</option>${groupOptions}
+        </select></section>`
+    : `<section class="card empty-state"><div><div class="empty-orb"></div><p>尚无个人或共享记忆层。</p>
+        <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="switchTab('sources')">去数据源启用记忆层</button></div></div></section>`;
+  if (!activeShareGroupId) {
+    setContent(`<div class="view-heading"><span class="eyebrow">Governance</span><h2>治理台</h2>
+      <p>请先选择个人或共享记忆层，系统不会再隐式使用 default。</p></div>${groupSelector}`);
+    return;
+  }
   const tabs = [
     { id: 'recent_events', label: '最近写入' },
     { id: 'supersede', label: '覆盖记录' },
@@ -2675,9 +3592,32 @@ function renderGovernance() {
   ).join('');
   setContent(`<div class="view-heading"><span class="eyebrow">Governance</span><h2>治理台</h2>
     <p>记忆治理操作台：最近写入、覆盖记录、冲突队列、隔离队列、版本回滚。</p></div>
+    ${groupSelector}
+    <section class="card"><div class="card-head"><div><h2>记忆层生命周期</h2>
+      <p>导出与映射不会改原生文件；清空保留绑定；归档删除会解绑并使 MCP 安全拒绝。</p></div></div>
+      <div class="finding-actions">
+        <button class="btn" type="button" onclick="showMemorySourceMap('${escapeHtml(activeShareGroupId)}')">文件映射</button>
+        <button class="btn" type="button" onclick="exportMemoryGroup('${escapeHtml(activeShareGroupId)}')">导出记忆层</button>
+        <button class="btn btn-danger" type="button" onclick="clearMemoryGroup('${escapeHtml(activeShareGroupId)}')">清空记忆</button>
+        <button class="btn btn-danger" type="button" onclick="archiveMemoryGroup('${escapeHtml(activeShareGroupId)}')">归档删除记忆层</button>
+      </div>
+    </section>
     <div class="scope-tabs">${tabsHtml}</div>
     <div id="governance-content"><div class="loading">正在加载</div></div>`);
   renderGovernanceSub();
+}
+
+async function selectGovernanceGroup(groupId) {
+  if (!groupId) {
+    activeShareGroupId = '';
+    state.governanceSnapshot = null;
+    renderGovernance();
+    renderStatusRail();
+    return;
+  }
+  await setActiveShareGroup(groupId);
+  await loadGovernanceSnapshot();
+  renderGovernance();
 }
 
 function switchGovernanceSub(subTab) {
@@ -2700,7 +3640,7 @@ async function renderRecentEvents() {
   if (!container) return;
   container.innerHTML = '<div class="loading">正在读取最近写入</div>';
   try {
-    const result = await callApi('get_recent_events');
+    const result = await callApi('get_recent_events', activeShareGroupId);
     if (result.error) return showToast(result.error, 'error');
     const events = result.events || [];
     if (!events.length) {
@@ -2746,7 +3686,7 @@ async function renderSupersedeChain() {
   if (!container) return;
   container.innerHTML = '<div class="loading">正在读取覆盖记录</div>';
   try {
-    const result = await callApi('get_supersede_decisions');
+    const result = await callApi('get_supersede_decisions', activeShareGroupId);
     if (result.error) return showToast(result.error, 'error');
     const decisions = result.decisions || [];
     if (!decisions.length) {
@@ -2779,8 +3719,8 @@ async function renderConflictQueue() {
   container.innerHTML = '<div class="loading">正在读取冲突队列</div>';
   try {
     const [conflictsResult, memResult] = await Promise.all([
-      callApi('get_conflicts'),
-      callApi('list_memory'),
+      callApi('get_conflicts', activeShareGroupId),
+      callApi('list_memory', '', '', activeShareGroupId),
     ]);
     if (conflictsResult.error) return showToast(conflictsResult.error, 'error');
     const conflicts = (conflictsResult.conflicts || []).filter(c => c.status === 'unresolved');
@@ -2832,7 +3772,7 @@ async function resolveConflict(groupId) {
   if (!confirm('确认解决冲突？\n\n· 保留记忆：' + keepId + '\n· 其他成员将被软删除')) return;
   showToast('正在解决冲突…');
   try {
-    const result = await callApi('resolve_conflict', groupId, keepId);
+    const result = await callApi('resolve_conflict', groupId, keepId, activeShareGroupId);
     if (result.error) return showToast(result.error, 'error');
     showToast('冲突已解决', 'success');
     renderConflictQueue();
@@ -2844,7 +3784,7 @@ async function renderQuarantine() {
   if (!container) return;
   container.innerHTML = '<div class="loading">正在读取隔离队列</div>';
   try {
-    const result = await callApi('get_quarantine');
+    const result = await callApi('get_quarantine', activeShareGroupId);
     if (result.error) return showToast(result.error, 'error');
     const entries = (result.quarantine || []).filter(e => !e.released);
     if (!entries.length) {
@@ -2881,7 +3821,7 @@ async function releaseQuarantine(quarantineId) {
   if (!confirm('释放此隔离记忆？\n\n· 记忆将恢复为 active 状态\n· 请确认内容安全')) return;
   showToast('正在释放…');
   try {
-    const result = await callApi('release_quarantine', quarantineId);
+    const result = await callApi('release_quarantine', quarantineId, activeShareGroupId);
     if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已释放', 'success');
@@ -2893,7 +3833,7 @@ async function deleteQuarantine(quarantineId) {
   if (!confirm('永久删除此隔离记忆？\n\n· 记忆将被标记为 deleted\n· 此操作不可撤销')) return;
   showToast('正在删除…');
   try {
-    const result = await callApi('delete_quarantine', quarantineId);
+    const result = await callApi('delete_quarantine', quarantineId, activeShareGroupId);
     if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已删除', 'success');
@@ -2906,7 +3846,7 @@ async function renderRollback() {
   if (!container) return;
   container.innerHTML = '<div class="loading">正在读取版本历史</div>';
   try {
-    const result = await callApi('list_memory_versions');
+    const result = await callApi('list_memory_versions', activeShareGroupId);
     if (result.error) return showToast(result.error, 'error');
     const versions = (result.versions || []).slice().sort((a, b) =>
       (b.created_at || '').localeCompare(a.created_at || ''));
@@ -2939,7 +3879,7 @@ async function rollbackToVersion(versionId) {
   if (!confirm('确认回滚到版本 ' + versionId.slice(0, 16) + '？\n\n· 会先备份当前状态为新版本\n· 恢复为该版本的 records 和 decisions\n· 可通过新版本再次回滚')) return;
   showToast('正在回滚…');
   try {
-    const result = await callApi('rollback_memory', versionId);
+    const result = await callApi('rollback_memory', versionId, activeShareGroupId);
     if (result.deferred) { showToast('请求已提交到桌面执行器', 'info'); return; }
     if (result.error) return showToast(result.error, 'error');
     showToast('已回滚到目标版本', 'success');

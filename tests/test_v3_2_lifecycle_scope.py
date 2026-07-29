@@ -46,18 +46,18 @@ class TestSchemaContracts:
     """测试新增的数据结构。"""
 
     def test_lifecycle_state_enum(self):
-        from src.memoryguard.schema_v3 import LifecycleState
+        from memoryguard.schema_v3 import LifecycleState
         assert LifecycleState.INSTALLED.value == "installed"
         assert LifecycleState.DATA_ONLY.value == "data_only"
         assert LifecycleState.IGNORED.value == "ignored"
 
     def test_support_level_enum(self):
-        from src.memoryguard.schema_v3 import SupportLevel
+        from memoryguard.schema_v3 import SupportLevel
         assert SupportLevel.A_FULL.value == "A"
         assert SupportLevel.D_IMPORT_ONLY.value == "D"
 
     def test_discovery_object_fields(self):
-        from src.memoryguard.schema_v3 import DiscoveryObject
+        from memoryguard.schema_v3 import DiscoveryObject
         obj = DiscoveryObject(
             discovery_object_id="test-id",
             instance_id="inst-1",
@@ -79,7 +79,7 @@ class TestSchemaContracts:
         assert d["scope_source"] == "profile_declared"
 
     def test_source_root_new_fields(self):
-        from src.memoryguard.schema_v3 import SourceRoot, SourceRootType
+        from memoryguard.schema_v3 import SourceRoot, SourceRootType
         root = SourceRoot(
             root_id="test", type=SourceRootType.SELECTED_DIRECTORY,
             display_name="test", path="/test",
@@ -93,7 +93,7 @@ class TestSchemaContracts:
 
     def test_source_root_from_dict_backward_compat(self):
         """旧格式数据（没有新字段）能正确加载。"""
-        from src.memoryguard.schema_v3 import SourceRoot
+        from memoryguard.schema_v3 import SourceRoot
         old_data = {
             "root_id": "test", "type": "selected_directory",
             "display_name": "test", "path": "/test",
@@ -113,7 +113,7 @@ class TestInstallDetection:
     """测试安装检测器。"""
 
     def test_detect_install_path_executable_not_found(self, temp_workspace):
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         evidence = detector.detect_install("nonexistent-product", [
             {"probe_type": "path_executable", "command": "nonexistent-cli-tool-xyz"},
@@ -122,7 +122,7 @@ class TestInstallDetection:
         assert evidence[0].found is False
 
     def test_detect_install_path_executable_found(self, temp_workspace):
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         # python 应该在 PATH 中
         evidence = detector.detect_install("python-test", [
@@ -132,21 +132,21 @@ class TestInstallDetection:
         assert evidence[0].found is True
 
     def test_assess_lifecycle_not_detected(self, temp_workspace):
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         result = detector.assess_lifecycle("nonexistent", [], [])
         assert result.lifecycle_state == "not_detected"
         assert result.install_confidence == 0.0
 
     def test_assess_lifecycle_ignored(self, temp_workspace):
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         result = detector.assess_lifecycle("test", [], [], marked_ignored=True)
         assert result.lifecycle_state == "ignored"
 
     def test_assess_lifecycle_data_only(self, temp_workspace):
         """场景1：程序已卸载、残留目录今天被修改 -> data_only。"""
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         # 创建一个残留数据目录
         data_dir = temp_workspace / ".fake-agent"
         data_dir.mkdir()
@@ -163,7 +163,7 @@ class TestInstallDetection:
 
     def test_assess_lifecycle_installed_no_data(self, temp_workspace):
         """场景2：程序存在、数据目录不存在 -> installed_no_data。"""
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         result = detector.assess_lifecycle(
             "python",
@@ -179,7 +179,7 @@ class TestInstallDetection:
         candidate_id 基于 product + host_id + profile_id，不含 data_paths，
         因此清除残留目录或换工作区不会改变 candidate_id。
         """
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         result1 = detector.assess_lifecycle("trae", [], ["/path1"])
         result2 = detector.assess_lifecycle("trae", [], ["/path2"])
@@ -200,7 +200,7 @@ class TestSelectionTree:
 
     def test_selection_tree_returns_scopes(self, temp_workspace):
         """场景6：全局记忆与项目记忆同时存在 -> scope 正确分离。"""
-        from src.memoryguard.agent_locator import AgentLocator, DetectionContext
+        from memoryguard.agent_locator import AgentLocator, DetectionContext
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
         instances, _ = locator.detect_instances()
@@ -213,7 +213,7 @@ class TestSelectionTree:
 
     def test_selection_tree_scope_values(self, temp_workspace):
         """场景7/8：项目归属解析。"""
-        from src.memoryguard.agent_locator import AgentLocator, DetectionContext
+        from memoryguard.agent_locator import AgentLocator, DetectionContext
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
         instances, _ = locator.detect_instances()
@@ -231,7 +231,7 @@ class TestSelectionTree:
         模拟 ~/.claude/projects/ 下有两个项目目录，
         验证 _resolve_project_ref 能分别返回不同项目名。
         """
-        from src.memoryguard.agent_locator import AgentLocator, DetectionContext
+        from memoryguard.agent_locator import AgentLocator, DetectionContext
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
         home = Path.home()
@@ -246,7 +246,7 @@ class TestSelectionTree:
 
     def test_workspace_not_prefix_match(self, temp_workspace):
         """workspace 父子路径判断：C:\\project 和 C:\\project-old 不应误判为同一项目。"""
-        from src.memoryguard.agent_locator import AgentLocator, DetectionContext
+        from memoryguard.agent_locator import AgentLocator, DetectionContext
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
         # 构造一个名称前缀相同但不是父子关系的路径
@@ -269,8 +269,8 @@ class TestScopeWriteback:
         先尝试默认选中的文件（import_verbatim），若没有则手动选中所有 found 文件，
         确保 SelectionManifest 提交流程始终被测试。
         """
-        from src.memoryguard.gui import GovernanceApi
-        from src.memoryguard.agent_locator import AgentLocator, DetectionContext
+        from memoryguard.gui import GovernanceApi
+        from memoryguard.agent_locator import AgentLocator, DetectionContext
         api = GovernanceApi(temp_workspace)
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
@@ -305,7 +305,7 @@ class TestScopeWriteback:
         result = api.commit_selection(inst.instance_id, selected, confirmed=True)
         assert "error" not in result
         # 验证 SourceRoot 的 scope
-        from src.memoryguard.source_registry import SourceRegistry
+        from memoryguard.source_registry import SourceRegistry
         reg = SourceRegistry(temp_workspace)
         for root in reg.list_sources():
             if root.agent_instance_id == inst.instance_id:
@@ -322,7 +322,7 @@ class TestSafeCleanup:
 
     def test_archive_dry_run(self, temp_workspace):
         """场景10：归档预演模式不实际移动。"""
-        from src.memoryguard.agent_cleanup import AgentCleanup
+        from memoryguard.agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(temp_workspace)
         test_dir = temp_workspace / ".test-agent"
         test_dir.mkdir()
@@ -336,7 +336,7 @@ class TestSafeCleanup:
 
     def test_archive_refuses_symlink(self, temp_workspace):
         """场景12：符号链接归档被拒绝。"""
-        from src.memoryguard.agent_cleanup import AgentCleanup
+        from memoryguard.agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(temp_workspace)
         target = temp_workspace / "real-dir"
         target.mkdir()
@@ -352,7 +352,7 @@ class TestSafeCleanup:
 
     def test_archive_refuses_workspace_root(self, temp_workspace):
         """场景12：禁止归档 workspace 根目录。"""
-        from src.memoryguard.agent_cleanup import AgentCleanup
+        from memoryguard.agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(temp_workspace)
         result = cleanup.archive_agent_dir(
             "test-cid", "test-agent", str(temp_workspace)
@@ -361,7 +361,7 @@ class TestSafeCleanup:
 
     def test_mark_uninstalled_by_candidate_id(self, temp_workspace):
         """场景15：candidate_id 标记卸载不影响同产品其他实例。"""
-        from src.memoryguard.agent_cleanup import AgentCleanup
+        from memoryguard.agent_cleanup import AgentCleanup
         cleanup = AgentCleanup(temp_workspace)
         cleanup.mark_uninstalled("cid-1", product="trae")
         cleanup.mark_uninstalled("cid-2", product="trae")
@@ -385,7 +385,7 @@ class TestNoContentRead:
 
     def test_discovery_phase_reads_no_content(self, temp_workspace):
         """发现阶段只做 stat，不读正文。"""
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         test_file = temp_workspace / ".test-agent" / "secret.txt"
         test_file.parent.mkdir()
         test_file.write_text("SECRET_CONTENT_SHOULD_NOT_BE_READ")
@@ -408,7 +408,7 @@ class TestIntegration:
 
     def test_full_discovery_flow(self, temp_workspace):
         """完整发现流程：安装检测 -> 数据检测 -> 生命周期评估。"""
-        from src.memoryguard.agent_install_detector import AgentInstallDetector
+        from memoryguard.agent_install_detector import AgentInstallDetector
         detector = AgentInstallDetector(temp_workspace)
         results = detector.detect_all([])
         # 不应该崩溃
@@ -416,7 +416,7 @@ class TestIntegration:
 
     def test_unknown_dot_dir_not_treated_as_agent(self, temp_workspace):
         """场景5：未知隐藏目录不应被当作正常 Agent。"""
-        from src.memoryguard.agent_mapping import product_for_dot_dir
+        from memoryguard.agent_mapping import product_for_dot_dir
         assert product_for_dot_dir(".unknown-random-dir") is None
 
 
@@ -424,8 +424,8 @@ class TestLifecycleApiSplit:
     """正常 Agent 与残留候选分流。"""
 
     def _patch_instances(self, monkeypatch, temp_workspace, surfaces):
-        from src.memoryguard.agent_locator import AgentLocator
-        from src.memoryguard.schema_v3 import AgentInstance, TargetCapability
+        from memoryguard.agent_locator import AgentLocator
+        from memoryguard.schema_v3 import AgentInstance, TargetCapability
 
         inst = AgentInstance(
             instance_id="inst-split",
@@ -442,7 +442,7 @@ class TestLifecycleApiSplit:
         return inst
 
     def test_shared_agents_md_does_not_create_data_only_residual(self, temp_workspace, monkeypatch):
-        from src.memoryguard.gui import GovernanceApi
+        from memoryguard.gui import GovernanceApi
 
         agents_md = temp_workspace / "AGENTS.md"
         agents_md.write_text("shared rules", encoding="utf-8")
@@ -461,7 +461,7 @@ class TestLifecycleApiSplit:
         assert result["residual_total"] == 0
 
     def test_private_data_only_goes_to_residuals_and_cleanup_items(self, temp_workspace, monkeypatch):
-        from src.memoryguard.gui import GovernanceApi
+        from memoryguard.gui import GovernanceApi
 
         fake_home = temp_workspace / "fake-home"
         fake_home.mkdir()
@@ -492,7 +492,7 @@ class TestLifecycleApiSplit:
         assert cleanup["items"][0]["residual_type"] == "private_data_evidence"
 
     def test_archive_api_ignores_client_supplied_whitelist(self, temp_workspace, monkeypatch):
-        from src.memoryguard.gui import GovernanceApi
+        from memoryguard.gui import GovernanceApi
 
         fake_home = temp_workspace / "fake-home"
         fake_home.mkdir()
@@ -528,9 +528,9 @@ class TestGovernanceSnapshotSecurity:
     """治理快照安全回归。"""
 
     def test_snapshot_json_does_not_contain_raw_secret(self, temp_workspace):
-        from src.memoryguard.gui import GovernanceApi
-        from src.memoryguard.schema_v3 import MemoryEvent, QuarantineEntry
-        from src.memoryguard.shared_memory_store import SharedMemoryStore
+        from memoryguard.gui import GovernanceApi
+        from memoryguard.schema_v3 import MemoryEvent, QuarantineEntry
+        from memoryguard.shared_memory_store import SharedMemoryStore
 
         secret = "AKIAABCDEFGHIJKLMNOP"
         store = SharedMemoryStore(temp_workspace, "default")
@@ -562,9 +562,9 @@ class TestGovernanceSnapshotSecurity:
         assert "REDACTED:aws_access_key" in payload
 
     def test_supersede_decisions_do_not_contain_raw_secret(self, temp_workspace):
-        from src.memoryguard.gui import GovernanceApi
-        from src.memoryguard.schema_v3 import DecisionEvent, MemoryKind, SharedMemoryRecord, SharedMemoryStatus
-        from src.memoryguard.shared_memory_store import SharedMemoryStore
+        from memoryguard.gui import GovernanceApi
+        from memoryguard.schema_v3 import DecisionEvent, MemoryKind, SharedMemoryRecord, SharedMemoryStatus
+        from memoryguard.shared_memory_store import SharedMemoryStore
 
         secret = "AKIAABCDEFGHIJKLMNOP"
         store = SharedMemoryStore(temp_workspace, "default")
@@ -602,7 +602,7 @@ class TestDiscoveryObjectAuthorization:
     """discovery_object_id 是服务端授权依据。"""
 
     def _patch_tree(self, temp_workspace, monkeypatch):
-        from src.memoryguard.agent_locator import AgentLocator
+        from memoryguard.agent_locator import AgentLocator
 
         authorized_file = temp_workspace / "agent-memory.md"
         authorized_file.write_text("allowed", encoding="utf-8")
@@ -635,7 +635,7 @@ class TestDiscoveryObjectAuthorization:
         return authorized_file
 
     def test_forged_discovery_object_id_is_rejected(self, temp_workspace, monkeypatch):
-        from src.memoryguard.gui import GovernanceApi
+        from memoryguard.gui import GovernanceApi
 
         self._patch_tree(temp_workspace, monkeypatch)
         api = GovernanceApi(str(temp_workspace))
@@ -650,8 +650,8 @@ class TestDiscoveryObjectAuthorization:
         assert result["error"] == "所有 discovery_object_id 验证失败，无有效条目"
 
     def test_commit_selection_uses_server_category_and_path(self, temp_workspace, monkeypatch):
-        from src.memoryguard.gui import GovernanceApi
-        from src.memoryguard.source_registry import SourceRegistry
+        from memoryguard.gui import GovernanceApi
+        from memoryguard.source_registry import SourceRegistry
 
         authorized_file = self._patch_tree(temp_workspace, monkeypatch)
         bogus_file = temp_workspace / "evil.md"

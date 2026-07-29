@@ -16,6 +16,13 @@ venv/
 # MemoryGuard 运行时产物（可完全删除，非事实源）
 .memoryguard/
 
+# 本机 Agent 接管配置与派生图谱（不得发布）
+/.codex/
+/.cursor/
+/.trae/
+/AGENTS.md
+/graphify-out/
+
 # IDE
 .vscode/
 .idea/

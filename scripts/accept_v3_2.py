@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -42,12 +43,57 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def _as_agent(agent_id: str) -> None:
+    """切换可信身份：模拟 MCP 连接以该 agent 身份启动。"""
+    os.environ["MEMORYGUARD_AGENT_ID"] = agent_id
+
+
+def _parse_json(result: dict) -> tuple[dict | None, str]:
+    """解析 tool 返回。失败返回 (None, 原始文本)，不抛异常。"""
+    text = result["content"][0]["text"]
+    try:
+        return (json.loads(text), text)
+    except (ValueError, KeyError):
+        return (None, text)
+
+
 def main() -> int:
     all_pass = True
+
+    # 安全模型适配：验收脚本以管理员身份运行，走真实鉴权链路
+    # (admin 建 binding -> 每次调用前切换到匹配的可信 agent 身份)
+    os.environ["MEMORYGUARD_ADMIN"] = "1"
+    os.environ.pop("MEMORYGUARD_ALLOW_ANON", None)
+
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
         api = GovernanceApi(str(workspace))
         group_id = "test-group"
+
+        # -----------------------------------------------------------------
+        # 0. 安全前置：匿名拒绝 + admin 绑定
+        # -----------------------------------------------------------------
+        print("\n=== 0. 安全前置 ===")
+        os.environ.pop("MEMORYGUARD_AGENT_ID", None)
+        anon_result = execute_tool("memoryguard_memory_write", {
+            "body": "匿名写入必须被拒",
+            "agent_instance_id": "anyone",
+            "workspace": str(workspace),
+        })
+        anon_data, anon_text = _parse_json(anon_result)
+        ok0a = anon_data is None and "denied" in anon_text
+        all_pass &= _check("匿名写入被拒", ok0a, f"resp={anon_text[:80]}")
+
+        for agent in ("claude-code-1", "codex-1", "test-agent"):
+            bind_result = execute_tool("memoryguard_binding_create", {
+                "agent_instance_id": agent,
+                "share_group_id": group_id,
+                "workspace": str(workspace),
+            })
+            bind_data, bind_text = _parse_json(bind_result)
+            ok0b = bind_data is not None and bind_data.get("ok", True)
+            all_pass &= _check(f"admin 绑定 {agent} -> {group_id}", ok0b,
+                               f"resp={bind_text[:80]}" if not ok0b else "")
 
         # -----------------------------------------------------------------
         # 1. MCP 记忆后端启动
@@ -67,39 +113,40 @@ def main() -> int:
         # 2. Agent 写入 MCP
         # -----------------------------------------------------------------
         print("\n=== 2. Agent 写入 MCP ===")
+        _as_agent("claude-code-1")
         result = execute_tool("memoryguard_memory_write", {
             "body": "用户偏好简洁代码",
             "agent_instance_id": "claude-code-1",
             "workspace": str(workspace),
-            "share_group_id": group_id,
         })
-        content = result["content"][0]["text"]
-        data = json.loads(content)
-        ok2 = data["status"] == "active"
-        all_pass &= _check("Agent 写入 -> active", ok2,
-                           f"status={data['status']}, kind={data['kind']}")
-        all_pass &= _check("自动整理执行", len(data.get("auto_actions", [])) > 0,
-                           f"actions={data.get('auto_actions')}")
+        data, raw = _parse_json(result)
+        if data is None:
+            all_pass &= _check("Agent 写入 -> active", False, f"non-JSON resp={raw[:120]}")
+        else:
+            ok2 = data["status"] == "active"
+            all_pass &= _check("Agent 写入 -> active", ok2,
+                               f"status={data['status']}, kind={data['kind']}")
+            all_pass &= _check("自动整理执行", len(data.get("auto_actions", [])) > 0,
+                               f"actions={data.get('auto_actions')}")
 
         # -----------------------------------------------------------------
         # 3. 自动覆盖保留 supersedes
         # -----------------------------------------------------------------
         print("\n=== 3. 自动覆盖保留 supersedes ===")
+        _as_agent("codex-1")
         # 先写入事实
         execute_tool("memoryguard_memory_write", {
             "body": "项目使用 Python 3.8",
             "agent_instance_id": "codex-1",
             "workspace": str(workspace),
-            "share_group_id": group_id,
         })
         # 再写入纠错
         result_corr = execute_tool("memoryguard_memory_write", {
             "body": "纠正：项目使用 Python 3.10",
             "agent_instance_id": "codex-1",
             "workspace": str(workspace),
-            "share_group_id": group_id,
         })
-        corr_data = json.loads(result_corr["content"][0]["text"])
+        corr_data, corr_raw = _parse_json(result_corr)
         store = SharedMemoryStore(workspace, group_id)
         # 检查是否有 shadowed 记录
         shadowed = store.list_records(status="shadowed")
@@ -107,10 +154,13 @@ def main() -> int:
         all_pass &= _check("旧记忆 -> shadowed", ok3a,
                            f"shadowed_count={len(shadowed)}")
         # 检查新记忆的 supersedes
-        new_record = store.get_record(corr_data["memory_id"])
-        ok3b = new_record is not None and len(new_record.supersedes) > 0
-        all_pass &= _check("新记忆 supersedes 非空", ok3b,
-                           f"supersedes={new_record.supersedes if new_record else []}")
+        if corr_data is None:
+            all_pass &= _check("新记忆 supersedes 非空", False, f"non-JSON resp={corr_raw[:120]}")
+        else:
+            new_record = store.get_record(corr_data["memory_id"])
+            ok3b = new_record is not None and len(new_record.supersedes) > 0
+            all_pass &= _check("新记忆 supersedes 非空", ok3b,
+                               f"supersedes={new_record.supersedes if new_record else []}")
         # 检查 DecisionEvent
         decisions = store.list_decisions()
         ok3c = any(d.action == "auto_supersede" for d in decisions)
@@ -120,16 +170,19 @@ def main() -> int:
         # 4. secret 自动 quarantine
         # -----------------------------------------------------------------
         print("\n=== 4. secret 自动 quarantine ===")
+        _as_agent("test-agent")
         result_secret = execute_tool("memoryguard_memory_write", {
             "body": "API_KEY=sk-abc123def456ghi789jkl012mno345pqr678",
             "agent_instance_id": "test-agent",
             "workspace": str(workspace),
-            "share_group_id": group_id,
         })
-        secret_data = json.loads(result_secret["content"][0]["text"])
-        ok4a = secret_data["status"] == "quarantined"
-        all_pass &= _check("secret -> quarantine", ok4a,
-                           f"status={secret_data['status']}")
+        secret_data, secret_raw = _parse_json(result_secret)
+        if secret_data is None:
+            all_pass &= _check("secret -> quarantine", False, f"non-JSON resp={secret_raw[:120]}")
+        else:
+            ok4a = secret_data["status"] == "quarantined"
+            all_pass &= _check("secret -> quarantine", ok4a,
+                               f"status={secret_data['status']}")
         quarantine = store.list_quarantine()
         ok4b = len(quarantine) > 0
         all_pass &= _check("隔离队列非空", ok4b, f"count={len(quarantine)}")

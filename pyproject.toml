@@ -1,16 +1,15 @@
 [project]
 name = "agent-memguard"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first MCP memory backend and governance console for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "MemoryGuard Contributors" }]
 keywords = ["agent", "governance", "memory", "mcp", "skill", "local-first", "claude", "cursor", "codex"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -46,6 +45,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+memoryguard = ["static/*.js", "static/*.png", "static/*.ico"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

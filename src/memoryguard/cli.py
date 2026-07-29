@@ -606,20 +606,64 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 
 def cmd_memory(args: argparse.Namespace) -> int:
-    """记忆构建与发布（spec §4.4）。"""
+    """记忆构建与发布（spec §4.4）。须显式 --agent-instance-id。"""
     import json as _json
     from .adapters import GenericMarkdownTarget
+    from .governance_scope import (
+        filter_ir_for_agent, resolve_governance_scope,
+        resolve_scoped_roots, derive_publish_target_file, root_authorizes_agent,
+    )
     from .release_manager import ReleaseManager
-    from .source_registry import ScanBudget
+    from .source_registry import ScanBudget, SourceRegistry
     workspace = Path(getattr(args, "workspace", ".")).resolve()
     rm = ReleaseManager(workspace)
     action = args.action
+    agent_id = str(getattr(args, "agent_instance_id", "") or "").strip()
+    share_id = str(getattr(args, "share_group_id", "") or "").strip()
+    if share_id:
+        print("error: share_group scope is not supported for memory build/publish; use GUI neuron share_group projection", file=sys.stderr)
+        return 2
+    scope, scope_err = resolve_governance_scope(agent_instance_id=agent_id, mode="agent")
+    if scope is None:
+        print(f"error: {scope_err or 'missing_governance_scope'}; pass --agent-instance-id", file=sys.stderr)
+        return 2
+    gscope = scope
+    scope_dict = gscope.to_dict()
+
+    def _resolve_authorized_root(target_root_id: str):
+        if not target_root_id:
+            return None, "target_root_id_required"
+        reg = SourceRegistry(workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return None, "target_root_not_authorized_for_agent"
+        return root, ""
+
     if action == "build-plan":
         target = GenericMarkdownTarget()
-        target_path = Path(args.target).resolve() if args.target else workspace / ".memoryguard" / "memory-target"
+        target_root_id = str(getattr(args, "target_root_id", "") or "").strip()
+        if not target_root_id:
+            print("error: --target-root-id required for build-plan", file=sys.stderr)
+            return 2
+        root, err = _resolve_authorized_root(target_root_id)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        reg = SourceRegistry(workspace)
         snap, ir = rm.scan_and_normalize(ScanBudget())
-        plan = rm.create_build_plan(ir, target, target_path)
+        roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        allowed = {r.root_id for r in roots}
+        scoped_ir = filter_ir_for_agent(ir, allowed, snap)
+        derived = derive_publish_target_file(root)
+        target_path = derived.parent if derived.suffix else derived
+        plan = rm.create_build_plan(
+            scoped_ir, target, target_path,
+            governance_scope=scope_dict, target_root_id=target_root_id,
+        )
         print(f"plan: {plan.plan_id}")
+        print(f"  scope: agent={gscope.agent_instance_id}")
+        print(f"  target_root_id: {target_root_id}")
+        print(f"  scoped_records: {len(scoped_ir.records)}")
         print(f"  snapshot: {plan.snapshot_id}")
         print(f"  target_profile: {plan.target_profile}")
         print(f"  coverage: {plan.coverage_status}")
@@ -635,36 +679,73 @@ def cmd_memory(args: argparse.Namespace) -> int:
         if not args.yes:
             print("error: apply requires --yes to confirm", file=sys.stderr)
             return 2
+        target_root_id = str(getattr(args, "target_root_id", "") or "").strip()
+        root, err = _resolve_authorized_root(target_root_id)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        derived = derive_publish_target_file(root)
+        target_path = derived.parent if derived.suffix else derived
         target = GenericMarkdownTarget()
-        target_path = Path(args.target).resolve() if args.target else workspace / ".memoryguard" / "memory-target"
-        release = rm.apply_build(args.plan_id, target, target_path, approval=True)
+        try:
+            release = rm.apply_build(
+                args.plan_id, target, target_path, approval=True,
+                expected_scope=scope_dict, expected_target_root_id=target_root_id,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(f"apply: {release.release_id}  status={release.status.value}")
+        print(f"  scope: agent={gscope.agent_instance_id}")
+        print(f"  target_root_id: {target_root_id}")
+        print(f"  target_file: {derived}")
         print(f"  changed: {len(release.changed_paths)}  backups: {len(release.backup_paths)}")
         if release.status.value != "verified":
             print(f"  FAILED: {release.verify_result}", file=sys.stderr)
             return 1
         return 0
     if action == "verify":
+        target_root_id = str(getattr(args, "target_root_id", "") or "").strip()
+        root, err = _resolve_authorized_root(target_root_id)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        derived = derive_publish_target_file(root)
+        target_path = derived.parent if derived.suffix else derived
         target = GenericMarkdownTarget()
-        target_path = Path(args.target).resolve() if args.target else workspace / ".memoryguard" / "memory-target"
-        # 从 changes 读取 manifest
-        change_path = workspace / MG_DIR / "changes" / f"{args.release_id}.json"
-        if not change_path.exists():
+        # 校验 release 绑定
+        release_path = workspace / MG_DIR / "releases" / f"{args.release_id}.json"
+        if not release_path.exists():
+            # 兼容旧 changes/
+            release_path = workspace / MG_DIR / "changes" / f"{args.release_id}.json"
+        if not release_path.exists():
             print(f"error: release not found: {args.release_id}", file=sys.stderr)
             return 1
-        data = _json.loads(change_path.read_text(encoding="utf-8"))
-        # 读取 plan 的 manifest
+        data = _json.loads(release_path.read_text(encoding="utf-8"))
+        try:
+            ReleaseManager.validate_release_binding(
+                data,
+                expected_scope=scope_dict,
+                expected_target_root_id=target_root_id,
+                expected_target_path=target_path,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        change_path = workspace / MG_DIR / "changes" / f"{args.release_id}.json"
         plan_files = list((workspace / MG_DIR / "plans").glob("*.json"))
-        manifest = None
-        for pf in plan_files:
-            pd = _json.loads(pf.read_text(encoding="utf-8"))
-            if pd.get("manifest", {}).get("build_id") == data.get("build_id"):
-                manifest = pd["manifest"]
-                break
+        manifest = data.get("manifest")
+        if manifest is None and change_path.exists():
+            cdata = _json.loads(change_path.read_text(encoding="utf-8"))
+            for pf in plan_files:
+                pd = _json.loads(pf.read_text(encoding="utf-8"))
+                if pd.get("manifest", {}).get("build_id") == cdata.get("build_id"):
+                    manifest = pd["manifest"]
+                    break
         if manifest is None:
-            print(f"error: manifest not found for build {data.get('build_id')}", file=sys.stderr)
+            print(f"error: manifest not found for release {args.release_id}", file=sys.stderr)
             return 1
-        from .schema_v3 import BuildManifest, RecordMappingEntry, RecordMappingKind
+        from .schema_v3 import BuildManifest
         mm = BuildManifest(
             build_id=manifest["build_id"], source_snapshot_id=manifest.get("source_snapshot_id", ""),
             target_profile=manifest.get("target_profile", ""), coverage_status=manifest.get("coverage_status", ""),
@@ -683,9 +764,40 @@ def cmd_memory(args: argparse.Namespace) -> int:
         if not args.yes:
             print("error: rollback requires --yes to confirm", file=sys.stderr)
             return 2
+        target_root_id = str(getattr(args, "target_root_id", "") or "").strip()
+        root, err = _resolve_authorized_root(target_root_id)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
+        derived = derive_publish_target_file(root)
+        target_path = derived.parent if derived.suffix else derived
+        # 校验 release 绑定，禁止用错误目录删文件；无绑定则拒绝
+        release_path = workspace / MG_DIR / "releases" / f"{args.release_id}.json"
+        if not release_path.exists():
+            print(f"error: release not found: {args.release_id}", file=sys.stderr)
+            return 1
+        data = _json.loads(release_path.read_text(encoding="utf-8"))
+        try:
+            ReleaseManager.validate_release_binding(
+                data,
+                expected_scope=scope_dict,
+                expected_target_root_id=target_root_id,
+                expected_target_path=target_path,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         target = GenericMarkdownTarget()
-        target_path = Path(args.target).resolve() if args.target else workspace / ".memoryguard" / "memory-target"
-        rb = rm.rollback_release(args.release_id, target, target_path)
+        try:
+            rb = rm.rollback_release(
+                args.release_id, target, target_path,
+                expected_scope=scope_dict,
+                expected_target_root_id=target_root_id,
+                expected_target_path=target_path,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print(f"rollback: {rb.release_id}  status={rb.status.value}")
         return 0
     print(f"unknown memory action: {action}", file=sys.stderr)
@@ -776,7 +888,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except ImportError as e:
         lines.append(f"  (provider_adapters unavailable: {e})")
 
-    # 8. pywebview（可选）
+    # 8. user-level host hooks
+    lines.append("Host hooks:")
+    try:
+        from .host_hooks import HostHookManager
+
+        hook_status = HostHookManager(workspace).status()
+        for item in hook_status.get("providers", []):
+            if not item.get("supported"):
+                state = "unsupported"
+            elif item.get("runtime_verified"):
+                state = "operational ✓"
+            elif item.get("configured"):
+                state = "configured, awaiting runtime receipt"
+            else:
+                state = "not configured"
+            lines.append(f"  {item.get('provider')}: {state}")
+    except Exception as e:
+        lines.append(f"  error ({e})")
+
+    # 9. pywebview（可选）
     try:
         import webview  # type: ignore  # noqa: F401
         lines.append("GUI (pywebview): available ✓")
@@ -863,6 +994,175 @@ def cmd_mcp_status(args: argparse.Namespace) -> int:
 
     lines.append(f"Total: {len(groups)} groups, {total_records} records, {total_events} events")
     print("\n".join(lines))
+    return 0
+
+
+def _infer_hook_provider(workspace: Path, agent_instance_id: str = "") -> str:
+    """Infer only when evidence is unambiguous; never install into every host."""
+    import os
+
+    explicit = os.environ.get("MEMORYGUARD_PROVIDER", "").strip().lower()
+    if explicit:
+        return explicit
+
+    candidates: set[str] = set()
+    if os.environ.get("CLAUDE_PROJECT_DIR") or os.environ.get("CLAUDE_CONFIG_DIR"):
+        candidates.add("claude")
+    if os.environ.get("CURSOR_PROJECT_DIR") or os.environ.get("CURSOR_VERSION"):
+        candidates.add("cursor")
+    if os.environ.get("CODEX_HOME") or os.environ.get("CODEX_THREAD_ID"):
+        candidates.add("codex")
+    if os.environ.get("TRAE_PROJECT_DIR") or os.environ.get("TRAE_VERSION"):
+        candidates.add("trae")
+
+    if agent_instance_id:
+        try:
+            from .agent_locator import AgentLocator
+
+            instances, _ = AgentLocator(workspace).detect_instances()
+            product = next(
+                (
+                    item.product.lower()
+                    for item in instances
+                    if item.instance_id == agent_instance_id
+                ),
+                "",
+            )
+            aliases = {
+                "claude-code": "claude",
+                "claude": "claude",
+                "codex": "codex",
+                "cursor": "cursor",
+                "trae": "trae",
+            }
+            if product in aliases:
+                candidates.add(aliases[product])
+        except Exception:
+            pass
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if not candidates:
+        raise ValueError(
+            "cannot infer current host; pass --provider "
+            "claude|codex|cursor|trae"
+        )
+    raise ValueError(
+        "host inference is ambiguous: "
+        + ", ".join(sorted(candidates))
+        + "; pass --provider explicitly"
+    )
+
+
+def cmd_hooks(args: argparse.Namespace) -> int:
+    """Install/status/uninstall user-level lifecycle hooks."""
+    import json
+    import os
+
+    from .agent_binding import AgentBindingStore
+    from .host_hooks import HostHookManager, set_hook_mode
+
+    workspace = Path(args.workspace).expanduser().resolve()
+    manager = HostHookManager(workspace)
+    agent_id = (
+        str(getattr(args, "agent_id", "") or "")
+        or os.environ.get("MEMORYGUARD_AGENT_ID", "").strip()
+    )
+    provider = str(getattr(args, "provider", "") or "").lower()
+    try:
+        if provider == "auto":
+            provider = _infer_hook_provider(workspace, agent_id)
+
+        if args.action == "status":
+            result = manager.status(
+                "" if provider in {"", "all"} else provider,
+                agent_instance_id=agent_id,
+            )
+        elif args.action in {"install", "ensure"}:
+            if not agent_id:
+                raise ValueError(
+                    "agent identity is required; pass --agent-id or set "
+                    "MEMORYGUARD_AGENT_ID"
+                )
+            group_id = str(args.share_group_id or "")
+            if not group_id:
+                bindings = AgentBindingStore(workspace).find_by_agent(
+                    agent_id, include_inactive=False,
+                )
+                if not bindings:
+                    raise ValueError(
+                        f"no active binding found for {agent_id!r}"
+                    )
+                group_id = bindings[0].share_group_id
+            result = manager.install(
+                provider,
+                agent_instance_id=agent_id,
+                share_group_id=group_id,
+                mode=args.mode,
+            )
+        elif args.action == "uninstall":
+            result = manager.uninstall(provider)
+        elif args.action == "mode":
+            if not agent_id:
+                raise ValueError("--agent-id is required for mode changes")
+            result = set_hook_mode(
+                workspace,
+                provider,
+                agent_id,
+                args.mode,
+            )
+        else:
+            raise ValueError(f"unknown hooks action: {args.action}")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("status") in {"error", "unsupported"}:
+        return 1
+    return 0
+
+
+def cmd_gc(args: argparse.Namespace) -> int:
+    """`.memoryguard/` GC：默认可重建物优先清的 dry-run 预览。"""
+    from .gc import MemoryGuardGc
+
+    workspace = Path(args.path).resolve()
+    if not workspace.is_dir():
+        print(f"error: workspace not found: {workspace}", file=sys.stderr)
+        return 1
+
+    gc = MemoryGuardGc(
+        workspace,
+        older_than_days=args.older_than_days,
+        keep_releases=args.keep_releases,
+        keep_snapshots=args.keep_snapshots,
+    )
+    dry_run = not args.apply
+    plan = gc.plan(dry_run=dry_run)
+
+    print(f"MemoryGuard gc {'plan' if dry_run else 'apply'}")
+    print(f"  workspace:     {workspace}")
+    print(f"  items:         {len(plan.items)}")
+    print(f"  total_bytes:   {plan.total_bytes}")
+    print(f"  dry_run:       {plan.dry_run}")
+    for item in plan.items:
+        print(f"  - {item.action:16} {item.bytes_estimate:>10} B  {item.path}")
+        print(f"    {item.reason}")
+
+    if dry_run:
+        if plan.items:
+            print("  (dry-run only; pass --apply to execute)")
+        return 0
+
+    result = gc.apply(plan, confirmed=True)
+    if not result.get("ok"):
+        print(f"error: gc apply failed: {result.get('error', 'see results')}", file=sys.stderr)
+        for entry in result.get("results", []):
+            if not entry.get("ok"):
+                print(f"  failed: {entry}", file=sys.stderr)
+        return 1
+    print(f"  applied:       {result.get('applied', 0)}")
+    print(f"  history:       {result.get('history_path', '')}")
     return 0
 
 
@@ -961,15 +1261,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_import.set_defaults(func=cmd_import)
 
-    p_memory = sub.add_parser("memory", help="memory build & release (v3)")
-    p_memory.add_argument("action", choices=("build-plan", "build-apply", "verify", "rollback"))
-    p_memory.add_argument("plan_id", nargs="?", help="plan id for build-apply")
-    p_memory.add_argument("release_id", nargs="?", help="release id for verify/rollback")
-    p_memory.add_argument("--target", default="", help="target path")
-    p_memory.add_argument("--yes", action="store_true", help="confirm apply/rollback")
-    p_memory.add_argument("-w", "--workspace", default=".", help="workspace path")
-    p_memory.set_defaults(func=cmd_memory)
-
     p_doctor = sub.add_parser("doctor", help="diagnose installation and environment")
     p_doctor.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_doctor.set_defaults(func=cmd_doctor)
@@ -977,6 +1268,39 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp_status = sub.add_parser("mcp-status", help="query MCP memory backend status")
     p_mcp_status.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_mcp_status.set_defaults(func=cmd_mcp_status)
+
+    p_hooks = sub.add_parser(
+        "hooks",
+        help="install and inspect user-level host lifecycle hooks",
+    )
+    p_hooks.add_argument(
+        "action",
+        choices=("status", "install", "ensure", "uninstall", "mode"),
+    )
+    p_hooks.add_argument(
+        "--provider",
+        default="auto",
+        choices=("auto", "all", "claude", "codex", "cursor", "trae"),
+        help="host provider; auto requires unambiguous runtime evidence",
+    )
+    p_hooks.add_argument("-w", "--workspace", default=".", help="MemoryGuard control workspace")
+    p_hooks.add_argument("--agent-id", default="", help="trusted Agent instance ID")
+    p_hooks.add_argument("--share-group-id", default="", help="bound memory group; inferred when omitted")
+    p_hooks.add_argument(
+        "--mode",
+        default="enforce",
+        choices=("enforce", "observe", "paused"),
+        help="runtime policy (default: enforce)",
+    )
+    p_hooks.set_defaults(func=cmd_hooks)
+
+    p_gc = sub.add_parser("gc", help="garbage-collect .memoryguard/ artifacts (default dry-run)")
+    p_gc.add_argument("path", nargs="?", default=".", help="workspace path (default: .)")
+    p_gc.add_argument("--apply", action="store_true", help="execute the GC plan (default: dry-run)")
+    p_gc.add_argument("--older-than-days", type=int, default=30, help="native release artifact age threshold")
+    p_gc.add_argument("--keep-releases", type=int, default=20, help="reserved for future release pruning")
+    p_gc.add_argument("--keep-snapshots", type=int, default=3, help="snapshots to retain")
+    p_gc.set_defaults(func=cmd_gc)
 
     p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
     p_desktop.add_argument("-w", "--workspace", default=".", help="workspace path")
@@ -993,9 +1317,22 @@ def build_parser() -> argparse.ArgumentParser:
 def gui_main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     workspace = Path(argv[0] if argv else ".").resolve()
-    from .gui import has_native_gui, open_interactive_window
+    from .gui import (
+        has_native_gui,
+        open_interactive_window,
+        open_localhost_window,
+    )
     if has_native_gui():
-        return open_interactive_window(str(workspace), title=f"MemoryGuard - {workspace.name}")
+        rc = open_interactive_window(
+            str(workspace), title=f"MemoryGuard - {workspace.name}",
+        )
+        if rc == 0:
+            return 0
+    # GUI 启动器的降级也必须保留完整交互能力；静态报告不能展开风险、
+    # 调用治理 API 或展示实时 MCP 记忆层。
+    rc, _ = open_localhost_window(str(workspace), auto_open=True)
+    if rc == 0:
+        return 0
     report = run_audit(workspace)
     out_dir = workspace / REPORTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)

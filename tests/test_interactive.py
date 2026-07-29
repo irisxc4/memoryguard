@@ -14,6 +14,7 @@ from memoryguard.interactive import render_interactive_html  # noqa: E402
 def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     html = render_interactive_html()
 
+    assert '<link rel="icon" type="image/png" href="memoryguard-icon.png">' in html
     stage = html.index('id="neuron-stage"')
     rail = html.index('id="status-rail"')
 
@@ -24,23 +25,25 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "证据/萃取来源" in html
     assert "toggleProjectionSource" not in html
     assert "refreshNeuronGraph" in html
-    assert "publishReconstructedMemory" in html
-    assert "list_publish_targets" in html
+    assert "publishReconstructedMemory" not in html
+    assert "publishToAgentNativeTarget" not in html
     assert "choose_publish_target_path" not in html
-    assert "Agent 原生记忆入口" in html
+    assert "原生记忆文件保持只读" in html
     assert "选择写回目标编号" not in html
-    assert "rollbackNativeMemoryRelease" in html
+    assert "rollbackNativeMemoryRelease" not in html
     assert "showNativeReleaseArchive" not in html
     assert "发布存档" not in html
     assert "manifest_path" not in html
-    assert "showRollbackModal" in html
-    assert "confirmRollbackModal" in html
+    assert "showRollbackModal" not in html
+    assert "confirmRollbackModal" not in html
     assert "选择要恢复的版本编号" not in html
-    assert "确认恢复" in html
-    assert "await refreshNeuronGraph(native ?" in html
+    assert "rollback_native_memory_release" not in html
+    assert "await refreshNeuronGraph(shared ?" in html
     assert "await refreshNeuronGraph('当前投影已删除" in html
-    assert "await refreshNeuronGraph(`发布完成" in html
-    assert "await refreshNeuronGraph(`回滚完成" in html
+    assert "已写入 Agent 原生记忆入口" not in html
+    assert "renderNeuronMetaBar" in html
+    assert "${groupLabel} ·" in html
+    assert "成员 · 无绑定" in html
     assert "点击任意光点，在右侧查看可读内容" in html
     assert "selectedNeuronNode" in html
     assert "findNeuronByMemory" in html
@@ -51,6 +54,15 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "selectNeuronByMemory" in html
     assert "cyInstance.animate({ center: { eles: cyNode }" in html
     assert "flashClass('pulse'" in html
+    assert "startNeuronSignalPulses" in html
+    assert "pickNeuronSignalPath" in html
+    assert "edge.signal" in html
+    assert "相关连线（点击跳转）" in html
+    assert "突触末梢（点击跳转）" in html
+    assert "selectNeuronByMemory" in html
+    assert "同源跨类型" in html
+    assert "相似关联" in html
+    assert "legend-edge shared" in html
     assert "删除/排除" in html
     assert "阅读语言" in html
     assert "setReaderLanguage('zh')" in html
@@ -62,6 +74,14 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "neuronNodePositions" in html
     assert "接受候选" not in html
     assert "确认合并" not in html
+    assert "同源突触" in html
+    assert "记忆末梢" in html
+    assert "来源/类型主题" in html
+    assert "node.derivation" in html
+    assert 'edge[etype = "duplicate"]' in html
+    assert "构建重构投影（含 LLM 整理）" in html
+    assert "重构治理投影用于自动治理、萃取并发布回原生记忆" not in html
+    assert "共享图直接读取 SharedMemoryStore" in html
 
 
 def test_import_copy_treats_conversations_as_evidence_not_memory() -> None:
@@ -132,7 +152,8 @@ def test_neuron_graph_selection_uses_rail_context_not_inner_panel() -> None:
     assert "neuron-detail-panel" not in html
     assert "进入治理台" in html
     assert "点击任意光点，在右侧查看可读内容" in html
-    assert "displayBody(node) || '暂无正文内容'" in html
+    assert "displayBody(node) || node.body || '暂无正文内容'" in html
+    assert "相关连线（点击跳转）" in html
     assert "接受候选" not in html
 
 
@@ -146,3 +167,87 @@ def test_lifecycle_ui_matches_backend_enums_and_residual_split() -> None:
     assert "残留与清理" in html
     assert "Agent 摘要" in html
     assert "const items = result.items || []" in html
+
+
+def test_governance_actions_use_choices_and_explicit_scope() -> None:
+    """治理写操作不能让用户手填路径/ID/原因，也不能隐式落到 default 组。"""
+    html = render_interactive_html()
+
+    assert "prompt(" not in html
+    assert "createBuildPlan" not in html
+    assert "showBuildTargetModal" not in html
+    assert "生成构建计划" not in html
+    assert "发布事务" not in html
+    assert "完整替换受管目标文件" not in html
+    assert "pickDecisionReason('takeover')" in html
+    assert "list_share_groups" in html
+    assert "selectGovernanceGroup" in html
+    assert "callApi('get_recent_events', activeShareGroupId)" in html
+    assert "callApi('get_supersede_decisions', activeShareGroupId)" in html
+    assert "callApi('get_conflicts', activeShareGroupId)" in html
+    assert "callApi('get_quarantine', activeShareGroupId)" in html
+    assert "callApi('list_memory_versions', activeShareGroupId)" in html
+
+
+def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
+    """不可自动修复的风险也必须有明确处理出口，并要求修复后复扫。"""
+    html = render_interactive_html()
+
+    assert "复制全部风险给 Agent" in html
+    assert "复制给 Agent 处理" in html
+    assert "copyFindingForAgent" in html
+    assert "copyAllFindingsForAgent" in html
+    assert "完成后重新扫描验证" in html
+    assert "不要修改 MemoryGuard 的来源文件" in html
+    assert "aria-expanded=\"${index === 0 ? 'true' : 'false'}\"" in html
+    assert "index === 0 ? '收起详情' : '展开详情'" in html
+    assert "element.closest('.finding-item')" in html
+
+
+def test_reader_language_has_explicit_chinese_and_english_modes() -> None:
+    """语言开关应表达显示语言，而不是含义不明的“原文”。"""
+    html = render_interactive_html()
+
+    assert "setReaderLanguage('auto')" in html
+    assert "setReaderLanguage('zh')" in html
+    assert "setReaderLanguage('en')" in html
+    assert 'id="reader-original"' not in html
+    assert ">原文</button>" not in html
+    assert "无英文版本时显示来源原文" in html
+
+
+def test_takeover_success_is_not_relabelled_as_refresh_failure() -> None:
+    """正式接管提交成功后，投影刷新失败只能作为刷新警告。"""
+    html = render_interactive_html()
+
+    assert "正式接管已确认" in html
+    assert "正式接管已完成，但神经图刷新失败" in html
+    assert "await refreshNeuronGraph(`正式接管完成" not in html
+
+
+def test_personal_and_shared_memory_layers_are_distinct_and_reachable() -> None:
+    """个人层不能混进共享组解散区，且切换、安装和图谱入口都必须可达。"""
+    html = render_interactive_html()
+
+    assert "function memoryGroupKind(groupId)" in html
+    assert "个人记忆层" in html
+    assert "共享记忆层" in html
+    assert "viewMemoryLayer" in html
+    assert "installMemoryGroupMcp" in html
+    assert "b.status !== 'active' || b.group_kind !== 'shared'" in html
+    assert "确认启用该 Agent 的个人记忆层并安装全局 MCP" in html
+    assert "MCP 未完整安装" in html
+    assert "选择个人或共享记忆层" in html
+
+
+def test_memory_layer_lifecycle_actions_are_explicit_and_safe() -> None:
+    html = render_interactive_html()
+
+    assert "showMemorySourceMap" in html
+    assert "exportMemoryGroup" in html
+    assert "clearMemoryGroup" in html
+    assert "archiveMemoryGroup" in html
+    assert "系统会先自动导出可恢复 ZIP" in html
+    assert "保留 binding、MCP 配置和空数据库" in html
+    assert "现有 MCP 将因无活动 binding 而拒绝读写" in html
+    assert "原生文件不变" in html

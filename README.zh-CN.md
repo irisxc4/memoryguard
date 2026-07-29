@@ -2,7 +2,7 @@
   <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard 治理台：已整理的共享记忆、覆盖关系和版本回滚历史" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard</h1>
+<h1 align="center">MemoryGuard v0.3.0</h1>
 
 <p align="center">
   <strong>多个编程 Agent 共享记忆，不共享混乱。</strong><br />
@@ -63,7 +63,7 @@ Agent 写入记忆
 pip install agent-memguard
 ```
 
-选择你的编程 Agent。以下命令会写入 MCP 配置与对应指令文件：
+选择你的编程 Agent。以下命令会安装全局 MCP 绑定、记忆重定向规则，以及宿主支持的用户级 Hook：
 
 ```bash
 # Claude Code
@@ -81,6 +81,7 @@ memoryguard source add . && python -m memoryguard.provider_adapters install curs
 ```bash
 memoryguard doctor
 memoryguard mcp-status
+memoryguard hooks status --provider all
 ```
 
 需要桌面治理窗口时：
@@ -126,7 +127,7 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 | MCP 记忆后端 | 读取、搜索、写入、更新、删除及查询共享记忆状态 |
 | 自动整理器 | 写入时分类、去重、覆盖、发现冲突、隔离、衍生和压缩 |
 | 治理台 | 查看原始写入、冲突、隔离、覆盖链和版本 |
-| Provider 适配器 | 一条命令配置 Claude Code、Codex 或 Cursor |
+| Provider 适配器 | 一条命令配置 Claude Code、Codex 或 Cursor 的全局 MCP、重定向规则与 Hook；TRAE 如实使用降级路径 |
 | CLI | 审计本地来源、管理授权输入、查看报告和执行记忆构建/发布流程 |
 
 完整 MCP 工具和 CLI 命令置于下方，供评估与集成时查阅。
@@ -149,6 +150,7 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 | `memory <action>` | 记忆构建、验证与发布回滚流程 |
 | `doctor` | 诊断安装与环境 |
 | `mcp-status` | 查看 MCP 共享记忆状态 |
+| `hooks <action>` | 安装、修复、查看、暂停或卸载宿主 Hook |
 
 </details>
 
@@ -178,6 +180,22 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 - **现在：** 本地 MCP 后端、自动整理、治理台、Provider 适配器与回滚。
 - **之后：** 衰减、衍生记忆、治理报告等增强信号；不承诺具体日期。
 - **之后：** 在需求被验证后探索团队与企业能力；不承诺具体日期。
+
+## 更新日志
+
+### v0.3.0（2026-07-29）
+
+**Hook 自动接管：**
+- Claude Code、Codex、Cursor 支持用户级 Hook；TRAE 保留经过验证的 MCP + 规则降级路径
+- 主 Agent 与子代理仅注入当前任务相关、受限数量的长期记忆
+- 拦截已知原生记忆写入，使长期记忆统一进入 MemoryGuard 管理层
+- CLI 与 GUI 支持强制、观察、暂停、修复、状态检查和卸载
+- 配置可重复执行，只替换 MemoryGuard 自有 Hook，不破坏用户已有 Hook
+
+**MCP 与 Skill：**
+- 全局安装统一写入 MCP、重定向规则与受支持 Hook
+- Skill 首次激活只识别并修复当前宿主，不跨 Agent 猜测安装
+- 运行回执明确区分“已配置”和“已实际生效”
 
 ## 贡献
 

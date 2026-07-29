@@ -26,7 +26,7 @@ APPDATA = FIXTURES / "appdata"
 
 @pytest.fixture(scope="module", autouse=True)
 def _ensure_fixtures():
-    from tests._build_agent_memory_fixtures import main
+    from _build_agent_memory_fixtures import main
     main()
 
 
@@ -93,8 +93,27 @@ def test_selection_tree_lists_second_third_level_files(fake_home, tmp_path):
     cursor_paths = collect(by_product["cursor"].instance_id)
     assert any("agent-transcripts" in p and p.endswith(".jsonl") for p in cursor_paths)
 
+    def collect_files(instance_id: str) -> list[dict]:
+        tree = locator.get_selection_tree(instance_id)
+        files: list[dict] = []
+        for scope in tree.get("scopes", []):
+            for proj in scope.get("projects", []):
+                for cat in proj.get("categories", []):
+                    files.extend(cat.get("files", []))
+            for cat in scope.get("categories", []):
+                files.extend(cat.get("files", []))
+        return files
+
     codex_paths = collect(by_product["codex"].instance_id)
     assert any("rollout-demo.jsonl" in p for p in codex_paths)
+    assert any("/memories/preferences.md" in p.replace("\\", "/") for p in codex_paths)
+    codex_files = collect_files(by_product["codex"].instance_id)
+    assert any(
+        f.get("default_selected")
+        for f in codex_files
+        if "memories" in f.get("path", "").replace("\\", "/")
+        and f.get("ingestion_policy") == "import_verbatim"
+    )
 
     trae_paths = collect(by_product["trae"].instance_id)
     assert any(p.endswith("project_memory.md") for p in trae_paths)
@@ -150,6 +169,42 @@ def test_evidence_only_still_blocked(tmp_path):
     assert ir.records == []
 
 
+def test_plan_docs_and_project_extract_do_not_auto_ingest(tmp_path):
+    """项目目录 + extract_candidates 不得把 .plan.md / 任务台账灌进 IR。"""
+    plans = tmp_path / ".cursor" / "plans"
+    plans.mkdir(parents=True)
+    plan = plans / "ship.plan.md"
+    plan.write_text("# Ship\n\nDo the thing.\n", encoding="utf-8")
+    knowledge = tmp_path / "docs" / "notes.md"
+    knowledge.parent.mkdir(parents=True)
+    knowledge.write_text("# Notes\n\nUseful fact.\n", encoding="utf-8")
+
+    root_id = "proj"
+    objs = []
+    for rel, path in (
+        (".cursor/plans/ship.plan.md", plan),
+        ("docs/notes.md", knowledge),
+    ):
+        content = path.read_text(encoding="utf-8")
+        objs.append(SourceObject(
+            source_object_id=stable_hash(root_id, rel),
+            source_root_id=root_id,
+            relative_path=rel,
+            content_hash=stable_hash(content),
+            media_type="text/markdown",
+        ))
+    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=objs, coverage=CoverageLedger())
+    ir = MemoryNormalizer(tmp_path).normalize(
+        snap,
+        root_map={root_id: str(tmp_path)},
+        root_policies={root_id: {
+            "source_category": "knowledge_source",
+            "ingestion_policy": "extract_candidates",
+        }},
+    )
+    assert ir.records == []
+
+
 def test_frontmatter_kind_survives_normalize(tmp_path):
     p = FIXTURES / "home/.claude/projects/demo-proj/memory/user.md"
     content = p.read_text(encoding="utf-8")
@@ -199,6 +254,70 @@ def test_trae_policies():
     assert by_id["trae_user_profile"].ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
     assert by_id["trae_project_memory"].ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
     assert by_id["trae_session_memory"].ingestion_policy == IngestionPolicy.EXTRACT_CANDIDATES
+    assert by_id["trae_topics"].category == SourceCategory.CONVERSATION_HISTORY
+    assert by_id["trae_topics"].ingestion_policy == IngestionPolicy.EXTRACT_CANDIDATES
+
+
+def test_codex_native_memories_surface():
+    profile = _codex_profile()
+    by_id = {s.surface_id: s for s in profile.surfaces}
+    mem = by_id["codex_native_memories"]
+    assert mem.category == SourceCategory.NATIVE_MEMORY
+    assert mem.ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
+    assert "MEMORY.md" in (mem.file_globs or [])
+    assert any("rollout_summaries" in g for g in (mem.file_globs or []))
+
+
+def test_empty_native_memory_dir_still_selectable(tmp_path, monkeypatch):
+    """专用记忆目录存在但 glob 无匹配时，仍应露出可勾选目录节点。"""
+    from memoryguard.schema_v3 import AgentInstance, DiscoveryLedger, TargetCapability
+
+    home = tmp_path / "home"
+    mem = home / ".codex" / "memories"
+    mem.mkdir(parents=True)
+    (home / ".codex" / "config.toml").write_text(
+        "[memories]\ngenerate_memories = false\nuse_memories = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    mem_info = {
+        "surface_id": "codex_native_memories",
+        "resolved_path": str(mem),
+        "status": "found",
+        "scope": "user",
+        "category": "native_memory",
+        "ingestion_policy": "import_verbatim",
+        "ownership": "agent_managed",
+        "target_role": "takeover_input",
+        "classification_confidence": 0.95,
+        "file_globs": ["MEMORY.md", "memory_summary.md", "raw_memories.md", "*.md"],
+    }
+    inst = AgentInstance(
+        instance_id="codex-test",
+        profile_id="codex@profile-1",
+        product="codex",
+        profile_version="2",
+        surfaces=[mem_info],
+        target_capability=TargetCapability.EXPORT_ONLY,
+    )
+    locator = AgentLocator(tmp_path)
+    monkeypatch.setattr(
+        AgentLocator,
+        "detect_instances",
+        lambda self: ([inst], {"codex-test": DiscoveryLedger(instance_id="codex-test")}),
+    )
+    tree = locator.get_selection_tree("codex-test")
+    files = []
+    for scope in tree.get("scopes", []):
+        for cat in scope.get("categories", []):
+            files.extend(cat.get("files", []))
+    assert files, "empty memories dir must still appear"
+    assert any(f.get("empty_glob_match") for f in files)
+    assert any(f.get("selectable") for f in files)
+    notes = tree.get("discovery_notes", [])
+    assert any(n.get("code") == "codex_memories_disabled" for n in notes)
+    assert any(n.get("code") == "codex_memories_empty" for n in notes)
 
 
 def test_empty_file_globs_do_not_fallback_to_directory(fake_home, tmp_path):

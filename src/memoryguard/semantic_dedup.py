@@ -189,11 +189,32 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
+class ProviderEmbeddingBackend:
+    """通过 provider_api 自动注入的真 embedding 后端。
+
+    用 provider API 的 embed 方法,失败回退 HashBackend。
+    """
+
+    def __init__(self):
+        from .provider_api import get_provider
+        self._provider = get_provider()
+        self._fallback = HashBackend()
+
+    def embed_text(self, text: str) -> list[float]:
+        if self._provider is None:
+            return self._fallback.embed_text(text)
+        try:
+            return self._provider.embed(text)
+        except Exception:
+            return self._fallback.embed_text(text)
+
+
 class SemanticDedup:
     """基于 embedding 的语义去重。
 
     补充 AutoOrganizer 的 Jaccard 启发式，处理跨语言、改写等场景。
     默认使用 HashBackend（纯标准库），可通过 backend 参数注入外部实现。
+    若 provider_api 已配置,自动用 ProviderEmbeddingBackend。
     """
 
     def __init__(
@@ -203,7 +224,16 @@ class SemanticDedup:
         backend: EmbeddingBackend | None = None,
     ):
         self.store = SharedMemoryStore(workspace, share_group_id)
-        self.backend: EmbeddingBackend = backend or HashBackend()
+        if backend is not None:
+            self.backend: EmbeddingBackend = backend
+        else:
+            # 自动检测 provider
+            from .provider_api import get_provider
+            provider = get_provider(workspace)
+            if provider is not None:
+                self.backend = ProviderEmbeddingBackend()
+            else:
+                self.backend = HashBackend()
 
     def embed_text(self, text: str) -> list[float]:
         """生成文本的 embedding 向量。"""

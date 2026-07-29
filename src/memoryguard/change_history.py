@@ -28,6 +28,7 @@ from typing import Any
 class HistoryRecordType(str, Enum):
     RULE_CHANGE = "rule_change"
     MEMORY_RELEASE = "memory_release"
+    NATIVE_FILE_RELEASE = "native_file_release"
     INVALID = "invalid_history_entry"
 
 
@@ -53,6 +54,8 @@ class HistoryEvent:
     applied_at: str = ""
     status: str = ""
     changed_count: int = 0
+    target_root_id: str = ""
+    governance_scope: dict[str, Any] = field(default_factory=dict)
     # 原始数据（用于 rollback 路由）
     raw_data: dict[str, Any] = field(default_factory=dict)
 
@@ -68,15 +71,18 @@ class HistoryEvent:
             "applied_at": self.applied_at,
             "status": self.status,
             "changed_count": self.changed_count,
+            "target_root_id": self.target_root_id,
+            "governance_scope": dict(self.governance_scope or {}),
         }
 
 
 def detect_record_type(data: dict[str, Any]) -> HistoryRecordType:
     """按字段形状识别记录类型（v3.1 §8.2）。
 
-    - change_id + plan_id → rule_change
-    - release_id + build_id → memory_release
-    - 其他 → invalid_history_entry
+    - change_id + plan_id -> rule_change
+    - release_id + build_id -> memory_release
+    - release_id (nrel-前缀) + label -> native_file_release
+    - 其他 -> invalid_history_entry
     """
     has_change_keys = "change_id" in data and "plan_id" in data
     has_release_keys = "release_id" in data and "build_id" in data
@@ -86,6 +92,10 @@ def detect_record_type(data: dict[str, Any]) -> HistoryRecordType:
         return HistoryRecordType.RULE_CHANGE
     if rt == "memory_release" or has_release_keys:
         return HistoryRecordType.MEMORY_RELEASE
+    # P1.6: native_file_release(SafeNativeFilePublisher 的 manifest)
+    release_id = data.get("release_id", "")
+    if release_id and str(release_id).startswith("nrel-") and "files" in data:
+        return HistoryRecordType.NATIVE_FILE_RELEASE
     return HistoryRecordType.INVALID
 
 
@@ -143,16 +153,31 @@ def load_history_record(path: Path) -> tuple[HistoryEvent | None, HistoryWarning
         ), None
 
     # memory_release
+    if rt == HistoryRecordType.MEMORY_RELEASE:
+        return HistoryEvent(
+            file_name=path.name,
+            record_type=rt.value,
+            schema_version=data.get("schema_version", "3.0"),
+            event_id=data.get("release_id", ""),
+            build_id=data.get("build_id", ""),
+            target_profile=data.get("target_profile", ""),
+            applied_at=data.get("applied_at", ""),
+            status=data.get("status", ""),
+            changed_count=len(data.get("changed_paths", [])),
+            target_root_id=str(data.get("target_root_id", "") or ""),
+            governance_scope=dict(data.get("governance_scope") or {}),
+            raw_data=data,
+        ), None
+
+    # P1.6: native_file_release(SafeNativeFilePublisher manifest)
     return HistoryEvent(
         file_name=path.name,
         record_type=rt.value,
-        schema_version=data.get("schema_version", "3.0"),
+        schema_version=data.get("schema_version", "native-v1"),
         event_id=data.get("release_id", ""),
-        build_id=data.get("build_id", ""),
-        target_profile=data.get("target_profile", ""),
-        applied_at=data.get("applied_at", ""),
+        applied_at=data.get("created_at", data.get("applied_at", "")),
         status=data.get("status", ""),
-        changed_count=len(data.get("changed_paths", [])),
+        changed_count=len(data.get("files", [])),
         raw_data=data,
     ), None
 
@@ -171,15 +196,18 @@ def list_change_history(workspace: Path) -> dict[str, Any]:
     读取顺序：
         1. .memoryguard/releases/*.json  新记忆发布
         2. .memoryguard/changes/*.json   旧规则修复 + 旧误写的 Release
+        3. .memoryguard/native_releases/*/manifest.json  旧原生文件发布(P1.6)
     """
     mg_dir = workspace / ".memoryguard"
     releases_dir = mg_dir / "releases"
     changes_dir = mg_dir / "changes"
+    native_releases_dir = mg_dir / "native_releases"
 
     items: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     releases_count = 0
     changes_count = 0
+    native_count = 0
     # v3.1 §8.3：用 event_id 去重，避免同一 Release 同时在 releases/ 和 changes/ 出现两次
     seen_event_ids: set[str] = set()
 
@@ -219,6 +247,29 @@ def list_change_history(workspace: Path) -> dict[str, Any]:
                     "missing_keys": warn.missing_keys,
                 })
 
+    # 3. P1.6: native_releases/*/manifest.json(旧原生文件发布)
+    if native_releases_dir.exists():
+        for release_dir in sorted(native_releases_dir.iterdir()):
+            if not release_dir.is_dir():
+                continue
+            manifest_path = release_dir / "manifest.json"
+            if not manifest_path.exists():
+                continue
+            native_count += 1
+            event, warn = load_history_record(manifest_path)
+            if event:
+                if event.event_id and event.event_id in seen_event_ids:
+                    continue
+                if event.event_id:
+                    seen_event_ids.add(event.event_id)
+                items.append(event.to_dict())
+            if warn:
+                warnings.append({
+                    "file_name": warn.file_name,
+                    "reason": warn.reason,
+                    "missing_keys": warn.missing_keys,
+                })
+
     # 按时间倒序（applied_at 为空时排到末尾）
     items.sort(key=lambda x: x.get("applied_at", ""), reverse=True)
 
@@ -227,6 +278,7 @@ def list_change_history(workspace: Path) -> dict[str, Any]:
         "warnings": warnings,
         "releases_dir_count": releases_count,
         "changes_dir_count": changes_count,
+        "native_releases_count": native_count,
     }
 
 

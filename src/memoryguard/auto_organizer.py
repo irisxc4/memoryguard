@@ -53,12 +53,32 @@ class AutoOrganizer:
     4. 新记忆 -> ACTIVE
     """
 
-    def __init__(self, workspace: str | Path, share_group_id: str):
-        self.store = SharedMemoryStore(workspace, share_group_id)
+    def __init__(
+        self,
+        workspace: str | Path,
+        share_group_id: str,
+        enricher_mode: str | None = None,
+        *,
+        store: SharedMemoryStore | None = None,
+        engine: Any | None = None,
+    ):
+        self.store = store or SharedMemoryStore(workspace, share_group_id)
+        if engine is None:
+            from .governance_engine import GovernanceEngine
+            engine = GovernanceEngine(
+                workspace, share_group_id, store=self.store,
+            )
+        self.governance = engine
         self.semantic_dedup = SemanticDedup(workspace, share_group_id)
         # 接入 PolicyRegistry（局部导入避免循环依赖：policies.py 导入了 SECRET_PATTERNS）
         from .policies import PolicyRegistry
         self.registry = PolicyRegistry()
+        # P1.5: 接入 semantic_enricher,支持 model/heuristic/off 三种模式
+        self._enricher_mode = enricher_mode
+
+    def _get_enricher(self):
+        from .semantic_enricher import get_enricher
+        return get_enricher(self._enricher_mode)
 
     def organize(self, event: MemoryEvent, kind_override: str = "",
                  write_policy: str = "auto_accept") -> tuple[SharedMemoryRecord, list[dict]]:
@@ -75,12 +95,67 @@ class AutoOrganizer:
         actions: list[dict[str, Any]] = []
         propose_only = write_policy == "propose_only"
 
-        # 1. 分类（通过 PolicyRegistry 统一入口）
-        kind_str = self.registry.get('organizer').classify(
-            event.raw_content, event.metadata)
-        kind = MemoryKind(kind_str)
-        confidence = self._confidence(event.raw_content, kind)
-        actions.append({"action": "classify", "kind": kind.value, "confidence": confidence})
+        # P1.2/P1.5: secret 检测必须在 enricher 之前,防止原始 api_key 进入模型 backend
+        # S3.1: 也检查 MCP 层标记的 _secret_detected(原文已脱敏,但需走 quarantine)
+        secret_match = self._detect_secret(event.raw_content)
+        if not secret_match and event.metadata.get("_secret_detected"):
+            secret_match = event.metadata["_secret_detected"]
+        if secret_match:
+            # 隔离路径:不调模型,用 heuristic 分类(避免 secret 泄露给 backend)
+            from .policies import classify_kind
+            kind_str = classify_kind(event.raw_content)
+            kind = MemoryKind(kind_str)
+            confidence = self._confidence(event.raw_content, kind)
+            actions.append({"action": "classify", "kind": kind.value, "confidence": confidence,
+                            "enrichment_mode": "heuristic_secret_safe"})
+            if kind_override:
+                kind = MemoryKind(kind_override)
+                actions.append({"action": "classify_override", "kind": kind.value,
+                                "reason": "user specified kind"})
+                decision = DecisionEvent(
+                    event_id=stable_hash("classify_override", event.event_id, _now_iso()),
+                    actor="user", action="classify_override",
+                    target_ids=[], reason="user specified kind",
+                    created_at=_now_iso(),
+                )
+                self.store.append_decision(decision)
+            if propose_only:
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.LOW_CONFIDENCE, confidence=confidence,
+                )
+                self.store.append_record(record)
+                actions.append({"action": "propose_only",
+                                "reason": "write policy is propose_only"})
+                actions.append({"action": "risk_flag",
+                                "reason": f"检测到敏感信息（未隔离）: {secret_match}"})
+                return record, actions
+            record = self._create_record(
+                event, kind, SharedMemoryStatus.QUARANTINED, confidence=confidence,
+            )
+            self.store.append_record(record)
+            self.governance.quarantine(
+                record.memory_id,
+                reason=f"检测到敏感信息: {secret_match}",
+                pattern=secret_match,
+                original_content=event.raw_content,
+                actor="auto",
+                manual_override=False,
+            )
+            actions.append({"action": "quarantine", "reason": secret_match})
+            return record, actions
+
+        # P1.2/P1.5: 非隔离内容先脱敏再送 enricher(防止残留 secret 进入模型)
+        safe_content = self._redact_for_enricher(event.raw_content)
+        enricher = self._get_enricher()
+        enriched = enricher.enrich(
+            title="", body=safe_content, kind_hint=kind_override,
+            metadata=event.metadata,
+        )
+        # P1.2: 校验模型返回的 kind 和 confidence
+        kind = self._safe_kind(enriched.kind, event.raw_content)
+        confidence = self._safe_confidence(enriched.confidence)
+        actions.append({"action": "classify", "kind": kind.value, "confidence": confidence,
+                        "enrichment_mode": enriched.enrichment_mode})
 
         # kind_override 优先于自动分类
         if kind_override:
@@ -109,37 +184,53 @@ class AutoOrganizer:
         elif compressed_body != event.raw_content:
             event.raw_content = compressed_body
 
-        # 2. 隔离检查（secret/token/credential）
-        secret_match = self._detect_secret(event.raw_content)
-        if secret_match:
-            if propose_only:
-                # propose_only: 不隔离，只标记风险
-                record = self._create_record(
-                    event, kind, SharedMemoryStatus.LOW_CONFIDENCE, confidence=confidence,
-                )
-                self.store.append_record(record)
-                actions.append({"action": "propose_only",
-                                "reason": "write policy is propose_only"})
-                actions.append({"action": "risk_flag",
-                                "reason": f"检测到敏感信息（未隔离）: {secret_match}"})
-                return record, actions
+        # 3. 去重检查
+        # 纠错内容用更低阈值查找相关记忆(P2.3: 0.50->0.60 减少 false positive)
+        is_correction = self._is_correction(event, [])
+        dedup_threshold = 0.60 if is_correction else 0.80
+        override_policy = self.governance.evaluate_auto_write(
+            event.raw_content, threshold=dedup_threshold,
+        )
+        if override_policy.get("policy") == "suppress":
+            protected = self.store.get_record(
+                override_policy["protected_id"]
+            )
+            reason = override_policy["blocked_reason"]
+            actions.append({
+                "action": "manual_override_suppressed",
+                "protected_id": protected.memory_id,
+                "protected_status": protected.status.value,
+                "reason": reason,
+            })
+            self.governance.record_auto_policy(
+                protected_id=protected.memory_id,
+                reason=reason,
+            )
+            return protected, actions
+        if override_policy.get("policy") == "low_confidence_candidate":
+            protected = self.store.get_record(
+                override_policy["protected_id"]
+            )
             record = self._create_record(
-                event, kind, SharedMemoryStatus.QUARANTINED, confidence=confidence,
+                event,
+                kind,
+                SharedMemoryStatus.LOW_CONFIDENCE,
+                confidence=min(confidence, 0.44),
             )
             self.store.append_record(record)
-            self.store.quarantine_memory(
-                record.memory_id,
-                reason=f"检测到敏感信息: {secret_match}",
-                pattern=secret_match,
-                original_content=event.raw_content,
+            reason = override_policy["blocked_reason"]
+            actions.append({
+                "action": "manual_override_conflict_candidate",
+                "protected_id": protected.memory_id,
+                "candidate_id": record.memory_id,
+                "reason": reason,
+            })
+            self.governance.record_auto_policy(
+                protected_id=protected.memory_id,
+                candidate_id=record.memory_id,
+                reason=reason,
             )
-            actions.append({"action": "quarantine", "reason": secret_match})
             return record, actions
-
-        # 3. 去重检查
-        # 纠错内容用更低阈值查找相关记忆
-        is_correction = self._is_correction(event, [])
-        dedup_threshold = 0.50 if is_correction else 0.85
         duplicates = self._find_duplicates(event.raw_content, threshold=dedup_threshold)
 
         # 3-semantic. Jaccard 没找到时，尝试 semantic 检查（跨语言/改写）
@@ -162,41 +253,40 @@ class AutoOrganizer:
             # 3a. 纠错/更新 -> supersede
             if self._is_correction(event, duplicates):
                 old = duplicates[0]
-                if not old.locked:
-                    if propose_only:
-                        # propose_only: 不覆盖，创建 low_confidence
-                        record = self._create_record(
-                            event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
-                            confidence=confidence,
-                        )
-                        self.store.append_record(record)
-                        actions.append({"action": "propose_only",
-                                        "reason": "write policy is propose_only"})
-                        return record, actions
-                    if write_policy == "auto_quarantine_on_risk":
-                        # 不覆盖，改为 conflicted + low_confidence
-                        record = self._create_record(
-                            event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
-                            confidence=confidence,
-                        )
-                        self.store.append_record(record)
-                        member_ids = [old.memory_id, record.memory_id]
-                        explanation = self._explain_conflict(
-                            event.raw_content, [old])
-                        group_id = self.store.conflict(member_ids, explanation)
-                        actions.append({"action": "conflict",
-                                        "group_id": group_id,
-                                        "reason": explanation})
-                        return record, actions
+                if propose_only:
+                    # propose_only: 不覆盖，创建 low_confidence
                     record = self._create_record(
-                        event, kind, SharedMemoryStatus.ACTIVE,
-                        supersedes=[old.memory_id], confidence=confidence,
+                        event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
+                        confidence=confidence,
                     )
                     self.store.append_record(record)
-                    self.store.supersede(old.memory_id, record.memory_id,
-                                          "auto_supersede: correction")
-                    actions.append({"action": "supersede", "old_id": old.memory_id})
+                    actions.append({"action": "propose_only",
+                                    "reason": "write policy is propose_only"})
                     return record, actions
+                if write_policy == "auto_quarantine_on_risk":
+                    # 不覆盖，改为 conflicted + low_confidence
+                    record = self._create_record(
+                        event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
+                        confidence=confidence,
+                    )
+                    self.store.append_record(record)
+                    member_ids = [old.memory_id, record.memory_id]
+                    explanation = self._explain_conflict(
+                        event.raw_content, [old])
+                    group_id = self.store.conflict(member_ids, explanation)
+                    actions.append({"action": "conflict",
+                                    "group_id": group_id,
+                                    "reason": explanation})
+                    return record, actions
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.ACTIVE,
+                    supersedes=[old.memory_id], confidence=confidence,
+                )
+                self.store.append_record(record)
+                self.store.supersede(old.memory_id, record.memory_id,
+                                      "auto_supersede: correction")
+                actions.append({"action": "supersede", "old_id": old.memory_id})
+                return record, actions
             # 3b. 冲突 -> conflict group
             elif self._is_conflict(event, duplicates) or (
                 semantic_matched and self._has_kind_conflict(duplicates, kind)
@@ -271,20 +361,9 @@ class AutoOrganizer:
     # ------------------------------------------------------------------
 
     def _classify(self, content: str) -> MemoryKind:
-        """启发式分类。"""
-        text = content.lower()
-        if any(k in text for k in ["偏好", "喜欢", "prefer", "like", "习惯"]):
-            return MemoryKind.PREFERENCE
-        if any(k in text for k in ["步骤", "流程", "procedure", "step", "how to"]):
-            return MemoryKind.PROCEDURE
-        if any(k in text for k in ["项目", "project", "仓库", "repo"]):
-            return MemoryKind.PROJECT
-        if any(k in text for k in ["事件", "episode", "发生", "happened"]):
-            return MemoryKind.EPISODE
-        if any(k in text for k in ["纠正", "更正", "correction", "actually",
-                                    "不对", "错误", "应该是"]):
-            return MemoryKind.CORRECTION
-        return MemoryKind.FACT
+        """启发式分类（委托 PolicyRegistry / classify_kind）。"""
+        kind_str = self.registry.get("organizer").classify(content, {})
+        return MemoryKind(kind_str)
 
     def _confidence(self, content: str, kind: MemoryKind) -> float:
         text = content.strip()
@@ -316,6 +395,39 @@ class AutoOrganizer:
             selected = lines[:8]
         body = "\n".join(selected).strip()
         return body[:1200]
+
+    # ------------------------------------------------------------------
+    # P1.2/P1.5: secret 安全 + 模型返回校验
+    # ------------------------------------------------------------------
+
+    def _redact_for_enricher(self, content: str) -> str:
+        """脱敏后送 enricher,防止残留 secret 进入模型 backend。
+
+        对 SECRET_PATTERNS 匹配的内容替换为 [REDACTED]。
+        这是第二道防线(secret 检测是第一道,但可能漏检)。
+        """
+        redacted = content
+        for pattern in SECRET_PATTERNS:
+            redacted = pattern.sub("[REDACTED]", redacted)
+        return redacted
+
+    def _safe_kind(self, kind_str: str, original_content: str) -> MemoryKind:
+        """校验模型返回的 kind,非法值回退 heuristic。"""
+        try:
+            return MemoryKind(kind_str)
+        except (ValueError, TypeError):
+            from .policies import classify_kind
+            return MemoryKind(classify_kind(original_content))
+
+    def _safe_confidence(self, confidence: Any) -> float:
+        """校验模型返回的 confidence,非法值回退 0.5。"""
+        try:
+            val = float(confidence)
+            if not (0.0 <= val <= 1.0):
+                return 0.5
+            return val
+        except (ValueError, TypeError):
+            return 0.5
 
     def _derive_repeated_memory(self, content: str, kind: MemoryKind) -> dict[str, Any] | None:
         tokens = self._tokenize(content)
@@ -454,9 +566,17 @@ class AutoOrganizer:
                        status: SharedMemoryStatus,
                        supersedes: list[str] | None = None,
                        confidence: float = 0.5) -> SharedMemoryRecord:
-        """创建 SharedMemoryRecord。"""
+        """创建 SharedMemoryRecord。
+
+        同源键优先用 metadata 的 source_root_id + relative_path（同文件多段可聚突触）；
+        无文件元数据时回退 event_id。
+        """
         memory_id = stable_hash("mem", event.raw_content, event.agent_instance_id,
                                 _now_iso())
+        meta = event.metadata if isinstance(event.metadata, dict) else {}
+        rel = str(meta.get("relative_path") or "").strip().replace("\\", "/")
+        source_object_id = f"share-file:{rel}" if rel else event.event_id
+        locator = str(meta.get("locator") or "event")
         return SharedMemoryRecord(
             memory_id=memory_id,
             body=event.raw_content,
@@ -464,8 +584,8 @@ class AutoOrganizer:
             status=status,
             confidence=confidence,
             provenance=[Provenance(
-                source_object_id=event.event_id,
-                locator="event",
+                source_object_id=source_object_id,
+                locator=locator,
                 excerpt_hash=stable_hash(event.raw_content),
                 source_revision="",
             )],

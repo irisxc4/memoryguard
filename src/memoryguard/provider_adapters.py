@@ -1,23 +1,27 @@
-"""Provider adapters: 把 Claude/Codex/Cursor 的原生记忆机制重定向到 MemoryGuard MCP。
+"""Provider adapters: 把宿主 Agent 的原生记忆机制重定向到 MemoryGuard MCP。
 
-每个 adapter 做 two things：
+每个 adapter 做三件事：
 1. 写入宿主特定的指令文件，明确告诉 Agent 调用 memoryguard_memory_write MCP 工具记录记忆，
    不要用原生记忆机制（编辑 CLAUDE.md/AGENTS.md/.cursorrules 等）。
 2. 生成/更新宿主的 MCP 配置，让它能启动 MemoryGuard MCP 服务器。
+3. 明确请求全局接管时，通过 HostHookManager 安装该宿主已验证的用户级 Hook。
 
 设计：
 - install() 幂等：重复调用不产生重复配置（指令用标记段落替换，MCP 配置用 JSON key 覆盖）
 - uninstall() 干净移除 install() 写入的内容（只动 memoryguard 段落/key，不碰用户其他内容）
-- status() 返回 {installed: bool, instruction_file: str, mcp_configured: bool}
+- status() 区分 configured 与 runtime_verified；写入配置不等于宿主已经连接
+- Hook 配置由 host_hooks 深模块统一拥有；Provider adapter 不复制宿主 Hook 细节
 - 纯标准库，不引入新依赖
-- 配置路径跨平台（Path.home() / 环境变量）
+- 有 workspace 时优先项目级配置，避免不同项目的 Agent 身份互相覆盖
+- 无 workspace 时才使用 Path.home() / 环境变量指向的用户级配置
 - MCP 启动命令用 python（要求 memoryguard 已 pip install），跨机器可移植
 """
 from __future__ import annotations
 
 import json
 import os
-import sys
+import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -39,23 +43,36 @@ _TOML_END = "# END memoryguard:provider-redirect"
 
 
 # 共用指令正文：告诉 Agent 所有记忆操作走 MCP 工具
-_INSTRUCTION_BODY = """\
-## MemoryGuard 记忆重定向
+def _instruction_body(share_group_id: str = "default") -> str:
+    gid = share_group_id or "default"
+    return f"""\
+## MemoryGuard 记忆重定向（正式接管）
 
-当你需要记录或回忆任何长期记忆时，必须通过 MemoryGuard MCP 工具，不要使用原生记忆机制
-（如编辑本指令文件、写入本地 memory.md/notes.md、或使用 GUI 记忆功能）。
+长期记忆的**唯一真相源**是 MemoryGuard MCP 共享库（share_group_id=`{gid}`）。
+不要使用各 Agent 原生记忆文件或 GUI 内置记忆；所有读写必须走 MCP。
+宿主支持时，用户级 MemoryGuard Hook 会自动注入限额上下文、拦截可见的原生
+记忆写入，并在明确的长期候选遗漏时续跑一次；不得绕过或删除该 Hook。
 
 ### 记录记忆
 调用 `memoryguard_memory_write` 工具：
 - `body`（必填）：记忆内容
 - `kind`（可选）：preference|fact|project|procedure|episode|correction，留空则自动分类
-- `agent_instance_id`（可选）：你的 Agent 标识
-- `share_group_id`（可选）：共享组 ID，默认 "default"
+- 不要传 `agent_instance_id` 或覆盖 `share_group_id`；MCP 连接已可信绑定到当前 Agent 和共享组
 
 ### 搜索 / 读取
+- `memoryguard_context_bootstrap`：新任务开始时一次性加载有预算的长期记忆上下文
 - `memoryguard_memory_search`：按 query / kind / status 搜索
 - `memoryguard_memory_read`：按 memory_id 读取单条
 - `memoryguard_memory_status`：查看共享组状态
+
+### 选择性回忆与对话注入
+- 每个新任务优先调用一次 `memoryguard_context_bootstrap`，传入当前 `task`；同一任务不得重复调用
+- Claude/Codex Hook 已提供本轮 bootstrap 上下文时不要重复调用；Cursor 以 Hook 的首次工具门控为准
+- bootstrap 只补充长期记忆/长期规则；宿主当前对话上下文保持原样，不替换、不重复注入
+- bootstrap 已负责 active-only、敏感省略、相关性、去重和预算；不要再用多个散乱 search 重建启动上下文
+- 仅在 bootstrap 后仍需精确治理查询时调用 `memoryguard_memory_search`
+- 历史对话文件只是可选来源，必须先萃取为长期记忆；禁止把历史对话全文注入当前任务
+- 需要精确原文时再用 `memoryguard_memory_read` 读取命中的单条记录
 
 ### 更新 / 删除
 - `memoryguard_memory_update`：更新 body / kind / status
@@ -63,9 +80,12 @@ _INSTRUCTION_BODY = """\
 
 ### 规则
 - 不要为了"记住"而编辑 CLAUDE.md / AGENTS.md / .cursorrules 等指令文件
-- 不要把记忆写入本地文件
-- 所有记忆操作都走 MCP 工具，确保被 MemoryGuard 治理（去重、冲突检测、隔离、影子保留）
+- 不要把记忆写入 ~/.codex/memories、~/.claude/projects/*/memory 等本地文件
+- 所有记忆操作都走 MCP，由 MemoryGuard 面板治理（去重、冲突、隔离、版本、supersede）
 """
+
+
+_INSTRUCTION_BODY = _instruction_body()
 
 
 # ===========================================================================
@@ -82,16 +102,32 @@ def _mcp_command() -> list[str]:
     return ["python", "-m", MCP_MODULE]
 
 
-def _mcp_server_config() -> dict[str, Any]:
+def _mcp_server_config(
+    agent_instance_id: str = "",
+    memoryguard_workspace: str | Path = "",
+) -> dict[str, Any]:
     """返回 MemoryGuard MCP server 的配置片段（JSON 格式，Claude/Cursor 通用）。"""
     cmd = _mcp_command()
-    return {
+    config: dict[str, Any] = {
         "command": cmd[0],
         "args": cmd[1:],
     }
+    env: dict[str, str] = {}
+    if agent_instance_id:
+        env["MEMORYGUARD_AGENT_ID"] = agent_instance_id
+    if memoryguard_workspace:
+        env["MEMORYGUARD_WORKSPACE"] = str(
+            Path(memoryguard_workspace).expanduser().resolve()
+        )
+    if env:
+        config["env"] = env
+    return config
 
 
-def _mcp_toml_section() -> str:
+def _mcp_toml_section(
+    agent_instance_id: str = "",
+    memoryguard_workspace: str | Path = "",
+) -> str:
     """返回 MemoryGuard MCP server 的 TOML 配置段落（Codex 用）。
 
     用 json.dumps 产出合法的 TOML basic string（自动转义反斜杠）。
@@ -99,11 +135,24 @@ def _mcp_toml_section() -> str:
     cmd = _mcp_command()
     command_str = json.dumps(cmd[0])  # TOML basic string 与 JSON string 语法兼容
     args_items = ", ".join(json.dumps(a) for a in cmd[1:])
-    return (
+    lines = [
         f"[mcp_servers.{MCP_SERVER_NAME}]\n"
         f"command = {command_str}\n"
         f"args = [{args_items}]"
-    )
+    ]
+    env_items: list[str] = []
+    if agent_instance_id:
+        env_items.append(
+            f"MEMORYGUARD_AGENT_ID = {json.dumps(agent_instance_id)}"
+        )
+    if memoryguard_workspace:
+        resolved = str(Path(memoryguard_workspace).expanduser().resolve())
+        env_items.append(
+            f"MEMORYGUARD_WORKSPACE = {json.dumps(resolved)}"
+        )
+    if env_items:
+        lines.append(f"\nenv = {{ {', '.join(env_items)} }}")
+    return "".join(lines)
 
 
 def _replace_section(text: str, begin_marker: str, end_marker: str,
@@ -122,7 +171,7 @@ def _replace_section(text: str, begin_marker: str, end_marker: str,
         parts.append(f"{begin_marker}\n{section_content}\n{end_marker}")
         if after:
             parts.append("\n" + after)
-        return "".join(parts)
+        return "".join(parts).rstrip("\n") + "\n"
     # 追加新段落
     stripped = text.rstrip()
     if stripped:
@@ -148,14 +197,99 @@ def _remove_section(text: str, begin_marker: str, end_marker: str) -> str:
 
 def _read_text(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return ""
 
 
-def _write_text(path: Path, content: str) -> None:
+def _read_text_for_update(path: Path) -> str:
+    """更新配置时严格读取；已有文件损坏不能被当成空文件覆盖。"""
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read existing config as UTF-8: {path}: {exc}") from exc
+
+
+def _load_json_for_update(path: Path) -> dict[str, Any]:
+    text = _read_text_for_update(path)
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON config: {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"invalid JSON config root (expected object): {path}")
+    return data
+
+
+def _validate_toml(text: str, path: Path) -> None:
+    if not text.strip():
+        return
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"invalid TOML config: {path}: {exc}") from exc
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """同目录临时文件 + os.replace，避免中途写坏配置。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.memoryguard-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _apply_file_transaction(updates: list[tuple[Path, str | None]]) -> None:
+    """原子应用一组文本更新；任一步失败则恢复所有原文件。"""
+    merged: dict[Path, str | None] = {}
+    for path, content in updates:
+        merged[path] = content
+    ordered = list(merged.items())
+    snapshots = {
+        path: path.read_bytes() if path.exists() else None
+        for path, _ in ordered
+    }
+    try:
+        for path, content in ordered:
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(path, content.encode("utf-8"))
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for path, _ in reversed(ordered):
+            original = snapshots[path]
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _atomic_write_bytes(path, original)
+            except Exception as rollback_exc:
+                rollback_errors.append(f"{path}: {rollback_exc}")
+        if rollback_errors:
+            raise RuntimeError(
+                f"provider config update failed: {exc}; rollback failed: "
+                + "; ".join(rollback_errors)
+            ) from exc
+        raise
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -164,11 +298,6 @@ def _load_json(path: Path) -> dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
-
-
-def _save_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _set_mcp_server(data: dict[str, Any], server_name: str, config: dict[str, Any]) -> None:
@@ -189,6 +318,24 @@ def _has_mcp_server(data: dict[str, Any], server_name: str) -> bool:
     return server_name in data.get("mcpServers", {})
 
 
+def _other_adapter_uses_project_agents_md(
+    workspace: Path, *, excluding: str,
+) -> bool:
+    """AGENTS.md 是 Codex/TRAE 共用面；卸载单方时不得破坏另一方。"""
+    if excluding != "codex":
+        codex_text = _read_text(workspace / ".codex" / "config.toml")
+        if (
+            f"[mcp_servers.{MCP_SERVER_NAME}]" in codex_text
+            or _TOML_BEGIN in codex_text
+        ):
+            return True
+    if excluding != "trae":
+        trae_data = _load_json(workspace / ".trae" / "mcp.json")
+        if _has_mcp_server(trae_data, MCP_SERVER_NAME):
+            return True
+    return False
+
+
 # ===========================================================================
 # 基类
 # ===========================================================================
@@ -203,54 +350,111 @@ class ProviderAdapter:
 
     provider_name: str = "base"
 
-    def _bind_with_store(self, redirect_paths: list[str]) -> str | None:
-        """联动 AgentBindingStore 创建 binding。失败记 stderr 返回 None，不抛异常。"""
-        try:
-            from .agent_binding import AgentBindingStore
-            from .schema_v3 import NativeMemoryMode
-            store = AgentBindingStore(self.workspace)
-            binding = store.bind_agent(
-                agent_instance_id=self.provider_name,
-                share_group_id="default",
-                mcp_server_name=MCP_SERVER_NAME,
-                native_memory_mode=NativeMemoryMode.REDIRECTED,
-                redirect_paths=redirect_paths,
-            )
-            return binding.binding_id
-        except Exception as e:
-            print(f"memoryguard: bind_agent failed for {self.provider_name}: {e}", file=sys.stderr)
-            return None
-
-    def _unbind_with_store(self) -> str | None:
-        """联动 AgentBindingStore 解绑该 provider 的 active binding。失败不抛异常。"""
+    def _find_binding(self, agent_instance_id: str = "",
+                      share_group_id: str = "") -> tuple[str | None, str | None]:
+        """只读查找现有真实 binding；adapter 不创建或解绑授权关系。"""
+        if not agent_instance_id:
+            return None, None
         try:
             from .agent_binding import AgentBindingStore
             store = AgentBindingStore(self.workspace)
-            bindings = store.find_by_agent(self.provider_name, include_inactive=False)
-            if not bindings:
-                return None
-            binding_id = bindings[0].binding_id
-            store.unbind_agent(binding_id)
-            return binding_id
-        except Exception as e:
-            print(f"memoryguard: unbind_agent failed for {self.provider_name}: {e}", file=sys.stderr)
-            return None
-
-    def _find_binding(self) -> tuple[str | None, str | None]:
-        """查找该 provider 的 active binding，返回 (binding_id, binding_status)。"""
-        try:
-            from .agent_binding import AgentBindingStore
-            store = AgentBindingStore(self.workspace)
-            bindings = store.find_by_agent(self.provider_name, include_inactive=False)
+            bindings = store.find_by_agent(agent_instance_id, include_inactive=False)
+            if share_group_id:
+                bindings = [
+                    binding for binding in bindings
+                    if binding.share_group_id == share_group_id
+                ]
             if not bindings:
                 return None, None
             b = bindings[0]
             return b.binding_id, b.status.value
-        except Exception as e:
-            print(f"memoryguard: find binding failed for {self.provider_name}: {e}", file=sys.stderr)
+        except Exception:
             return None, None
 
-    def install(self, workspace: str | Path = "") -> dict[str, Any]:
+    def _require_active_binding(self, agent_instance_id: str,
+                                share_group_id: str) -> str:
+        """安装前先验证真实身份和授权，禁止生成不可用的匿名 MCP 配置。"""
+        if not agent_instance_id:
+            raise ValueError("agent_instance_id is required for MCP installation")
+        binding_id, binding_status = self._find_binding(
+            agent_instance_id, share_group_id
+        )
+        if not binding_id or binding_status != "active":
+            raise ValueError(
+                f"active binding not found for agent_instance_id="
+                f"{agent_instance_id!r}, share_group_id={share_group_id!r}"
+            )
+        return binding_id
+
+    def _install_host_hook(
+        self,
+        *,
+        enabled: bool,
+        agent_instance_id: str,
+        share_group_id: str,
+    ) -> dict[str, Any]:
+        """Install the user-level hook only for an explicit global takeover."""
+        from .host_hooks import HostHookManager
+
+        if not enabled:
+            return {
+                "provider": self.provider_name,
+                "supported": True,
+                "configured": False,
+                "status": "not_requested",
+                "runtime_verified": False,
+            }
+        manager = HostHookManager(self.workspace)
+        try:
+            return manager.install(
+                self.provider_name,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+                mode="enforce",
+            )
+        except Exception as exc:
+            return {
+                "provider": self.provider_name,
+                "supported": True,
+                "configured": False,
+                "status": "error",
+                "runtime_verified": False,
+                "error": str(exc),
+            }
+
+    def _configured_result(self, *, instruction_path: Path, mcp_path: Path,
+                           binding_id: str,
+                           warnings: list[str] | None = None,
+                           hook: dict[str, Any] | None = None) -> dict[str, Any]:
+        hook_result = dict(hook or {})
+        result_warnings = list(warnings or [])
+        if hook_result.get("status") == "error":
+            result_warnings.append(
+                f"Hook 安装失败：{hook_result.get('error', 'unknown error')}"
+            )
+        elif hook_result and not hook_result.get("supported", True):
+            result_warnings.append(
+                "该宿主没有已验证的用户级 Hook seam；当前仅安装 MCP + 规则重定向"
+            )
+        return {
+            "provider": self.provider_name,
+            "configured": True,
+            "installed": True,  # 兼容旧 API：仅表示配置文件已安装
+            "status": "configured",
+            "restart_required": True,
+            "runtime_verified": False,
+            "instruction_file": str(instruction_path),
+            "mcp_config_file": str(mcp_path),
+            "binding_id": binding_id,
+            "hook": hook_result,
+            "hook_configured": bool(hook_result.get("configured")),
+            "hook_runtime_verified": bool(hook_result.get("runtime_verified")),
+            "warnings": result_warnings,
+        }
+
+    def install(self, workspace: str | Path = "", share_group_id: str = "default",
+                agent_instance_id: str = "",
+                global_scope: bool = False) -> dict[str, Any]:
         raise NotImplementedError
 
     def uninstall(self) -> dict[str, Any]:
@@ -269,7 +473,7 @@ class ClaudeAdapter(ProviderAdapter):
     """Claude Code adapter。
 
     - 指令文件：<workspace>/CLAUDE.md（项目级）；无 workspace 时 ~/.claude/CLAUDE.md（用户级）
-    - MCP 配置：<workspace>/.mcp.json（Claude Code 官方项目级 MCP 配置格式）
+    - MCP 配置：<workspace>/.mcp.json（项目级）；全局用户级为 ~/.claude.json
     - 支持环境变量 CLAUDE_CONFIG_DIR 覆盖 ~/.claude/
     """
 
@@ -280,7 +484,8 @@ class ClaudeAdapter(ProviderAdapter):
         self.workspace = Path(workspace).resolve() if workspace else Path.home()
 
     def _config_dir(self) -> Path:
-        return Path(os.environ.get("CLAUDE_CONFIG_DIR", "")) or (Path.home() / ".claude")
+        configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        return Path(configured).expanduser() if configured else Path.home() / ".claude"
 
     def _instruction_path(self) -> Path:
         if self._has_workspace:
@@ -288,66 +493,80 @@ class ClaudeAdapter(ProviderAdapter):
         return self._config_dir() / "CLAUDE.md"
 
     def _mcp_config_path(self) -> Path:
-        return self.workspace / ".mcp.json"
+        if self._has_workspace:
+            return self.workspace / ".mcp.json"
+        return Path.home() / ".claude.json"
 
-    def install(self, workspace: str | Path = "") -> dict[str, Any]:
+    def install(self, workspace: str | Path = "", share_group_id: str = "default",
+                agent_instance_id: str = "",
+                global_scope: bool = False) -> dict[str, Any]:
         if workspace:
-            self._has_workspace = True
             self.workspace = Path(workspace).resolve()
+            self._has_workspace = True
+        if global_scope:
+            self._has_workspace = False
+        binding_id = self._require_active_binding(
+            agent_instance_id, share_group_id
+        )
 
-        # 1. 写指令（标记段落，保留用户其他内容）
+        # 先生成并验证全部内容，再事务写入。
         instr_path = self._instruction_path()
-        content = _read_text(instr_path)
-        new_content = _replace_section(content, _BEGIN_MARKER, _END_MARKER, _INSTRUCTION_BODY)
-        _write_text(instr_path, new_content)
+        content = _read_text_for_update(instr_path)
+        body = _instruction_body(share_group_id)
+        new_content = _replace_section(content, _BEGIN_MARKER, _END_MARKER, body)
 
-        # 2. 写 MCP 配置（JSON merge，只动 memoryguard key）
         mcp_path = self._mcp_config_path()
-        data = _load_json(mcp_path)
-        _set_mcp_server(data, MCP_SERVER_NAME, _mcp_server_config())
-        _save_json(mcp_path, data)
-
-        return {
-            "provider": self.provider_name,
-            "installed": True,
-            "instruction_file": str(instr_path),
-            "mcp_config_file": str(mcp_path),
-            "binding_id": self._bind_with_store([str(instr_path), str(mcp_path)]),
-        }
+        data = _load_json_for_update(mcp_path)
+        _set_mcp_server(
+            data,
+            MCP_SERVER_NAME,
+            _mcp_server_config(agent_instance_id, self.workspace),
+        )
+        new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
+        _apply_file_transaction([
+            (instr_path, new_content),
+            (mcp_path, new_mcp_content),
+        ])
+        hook = self._install_host_hook(
+            enabled=global_scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        return self._configured_result(
+            instruction_path=instr_path,
+            mcp_path=mcp_path,
+            binding_id=binding_id,
+            hook=hook,
+        )
 
     def uninstall(self) -> dict[str, Any]:
         instr_path = self._instruction_path()
 
-        # 1. 移除指令段落
-        content = _read_text(instr_path)
+        content = _read_text_for_update(instr_path)
+        instruction_update: str | None = content if instr_path.exists() else None
         if _BEGIN_MARKER in content:
             new_content = _remove_section(content, _BEGIN_MARKER, _END_MARKER)
-            if new_content.strip():
-                _write_text(instr_path, new_content)
-            else:
-                try:
-                    instr_path.unlink()
-                except OSError:
-                    pass
+            instruction_update = new_content if new_content.strip() else None
 
-        # 2. 移除 MCP 配置中的 memoryguard key
         mcp_path = self._mcp_config_path()
-        data = _load_json(mcp_path)
+        data = _load_json_for_update(mcp_path)
         _remove_mcp_server(data, MCP_SERVER_NAME)
-        if data:
-            _save_json(mcp_path, data)
-        else:
-            try:
-                mcp_path.unlink()
-            except OSError:
-                pass
+        mcp_update = (
+            json.dumps(data, ensure_ascii=False, indent=2) if data else None
+        )
+        _apply_file_transaction([
+            (instr_path, instruction_update),
+            (mcp_path, mcp_update),
+        ])
 
         return {
             "provider": self.provider_name,
             "installed": False,
+            "configured": False,
+            "status": "not_configured",
             "instruction_file": str(instr_path),
             "mcp_config_file": str(mcp_path),
-            "binding_id": self._unbind_with_store(),
+            "binding_id": None,
         }
 
     def status(self) -> dict[str, Any]:
@@ -360,11 +579,24 @@ class ClaudeAdapter(ProviderAdapter):
         data = _load_json(mcp_path)
         mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
 
-        binding_id, binding_status = self._find_binding()
+        agent_id = str(
+            data.get("mcpServers", {})
+            .get(MCP_SERVER_NAME, {})
+            .get("env", {})
+            .get("MEMORYGUARD_AGENT_ID", "")
+            or ""
+        )
+        binding_id, binding_status = self._find_binding(agent_id)
+        configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
-            "installed": instruction_installed and mcp_configured,
+            "installed": configured,
+            "configured": configured,
+            "status": "configured" if configured else "not_configured",
+            "restart_required": configured,
+            "runtime_verified": False,
             "instruction_file": str(instr_path),
             "mcp_configured": mcp_configured,
+            "configured_agent_instance_id": agent_id,
             "binding_id": binding_id,
             "binding_status": binding_status,
         }
@@ -379,7 +611,7 @@ class CodexAdapter(ProviderAdapter):
     """Codex CLI adapter。
 
     - 指令文件：<workspace>/AGENTS.md（项目级）；无 workspace 时 ~/.codex/AGENTS.md
-    - MCP 配置：~/.codex/config.toml（用户级，TOML 格式）
+    - MCP 配置：<workspace>/.codex/config.toml（项目级）；无 workspace 时 ~/.codex/config.toml
       段落：[mcp_servers.memoryguard]
     """
 
@@ -395,68 +627,98 @@ class CodexAdapter(ProviderAdapter):
         return Path.home() / ".codex" / "AGENTS.md"
 
     def _mcp_config_path(self) -> Path:
+        if self._has_workspace:
+            return self.workspace / ".codex" / "config.toml"
         return Path.home() / ".codex" / "config.toml"
 
-    def install(self, workspace: str | Path = "") -> dict[str, Any]:
+    def install(self, workspace: str | Path = "", share_group_id: str = "default",
+                agent_instance_id: str = "",
+                global_scope: bool = False) -> dict[str, Any]:
         if workspace:
-            self._has_workspace = True
             self.workspace = Path(workspace).resolve()
+            self._has_workspace = True
+        if global_scope:
+            self._has_workspace = False
+        binding_id = self._require_active_binding(
+            agent_instance_id, share_group_id
+        )
 
-        # 1. 写指令（AGENTS.md，HTML 注释标记段落）
         instr_path = self._instruction_path()
-        content = _read_text(instr_path)
-        new_content = _replace_section(content, _BEGIN_MARKER, _END_MARKER, _INSTRUCTION_BODY)
-        _write_text(instr_path, new_content)
+        content = _read_text_for_update(instr_path)
+        body = _instruction_body(share_group_id)
+        new_content = _replace_section(content, _BEGIN_MARKER, _END_MARKER, body)
 
-        # 2. 写 MCP 配置（config.toml，# 注释标记段落）
         mcp_path = self._mcp_config_path()
-        toml_content = _read_text(mcp_path)
-        section = _mcp_toml_section()
+        toml_content = _read_text_for_update(mcp_path)
+        section = _mcp_toml_section(agent_instance_id, self.workspace)
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
-        _write_text(mcp_path, new_toml)
-
-        return {
-            "provider": self.provider_name,
-            "installed": True,
-            "instruction_file": str(instr_path),
-            "mcp_config_file": str(mcp_path),
-            "binding_id": self._bind_with_store([str(instr_path), str(mcp_path)]),
-        }
+        _validate_toml(new_toml, mcp_path)
+        _apply_file_transaction([
+            (instr_path, new_content),
+            (mcp_path, new_toml),
+        ])
+        hook = self._install_host_hook(
+            enabled=global_scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        warnings = (
+            ["Codex 仅在用户信任该项目后加载项目级 .codex/config.toml"]
+            if self._has_workspace else []
+        )
+        global_path = Path.home() / ".codex" / "config.toml"
+        if self._has_workspace and global_path != mcp_path:
+            global_text = _read_text(global_path)
+            if _TOML_BEGIN in global_text or (
+                "[mcp_servers.memoryguard]" in global_text
+            ):
+                warnings.append(
+                    "检测到旧用户级 MemoryGuard MCP 配置；项目配置优先，"
+                    "验证项目连接后可移除旧全局条目"
+                )
+        return self._configured_result(
+            instruction_path=instr_path,
+            mcp_path=mcp_path,
+            binding_id=binding_id,
+            warnings=warnings,
+            hook=hook,
+        )
 
     def uninstall(self) -> dict[str, Any]:
         instr_path = self._instruction_path()
 
-        # 1. 移除指令段落
-        content = _read_text(instr_path)
-        if _BEGIN_MARKER in content:
+        content = _read_text_for_update(instr_path)
+        instruction_update: str | None = content if instr_path.exists() else None
+        keep_shared_instruction = (
+            self._has_workspace
+            and _other_adapter_uses_project_agents_md(
+                self.workspace, excluding=self.provider_name
+            )
+        )
+        if _BEGIN_MARKER in content and not keep_shared_instruction:
             new_content = _remove_section(content, _BEGIN_MARKER, _END_MARKER)
-            if new_content.strip():
-                _write_text(instr_path, new_content)
-            else:
-                try:
-                    instr_path.unlink()
-                except OSError:
-                    pass
+            instruction_update = new_content if new_content.strip() else None
 
-        # 2. 移除 TOML 中的 memoryguard 段落
         mcp_path = self._mcp_config_path()
-        toml_content = _read_text(mcp_path)
+        toml_content = _read_text_for_update(mcp_path)
+        mcp_update: str | None = toml_content if mcp_path.exists() else None
         if _TOML_BEGIN in toml_content:
             new_toml = _remove_section(toml_content, _TOML_BEGIN, _TOML_END)
-            if new_toml.strip():
-                _write_text(mcp_path, new_toml)
-            else:
-                try:
-                    mcp_path.unlink()
-                except OSError:
-                    pass
+            _validate_toml(new_toml, mcp_path)
+            mcp_update = new_toml if new_toml.strip() else None
+        _apply_file_transaction([
+            (instr_path, instruction_update),
+            (mcp_path, mcp_update),
+        ])
 
         return {
             "provider": self.provider_name,
             "installed": False,
+            "configured": False,
+            "status": "not_configured",
             "instruction_file": str(instr_path),
             "mcp_config_file": str(mcp_path),
-            "binding_id": self._unbind_with_store(),
+            "binding_id": None,
         }
 
     def status(self) -> dict[str, Any]:
@@ -469,11 +731,29 @@ class CodexAdapter(ProviderAdapter):
         toml_content = _read_text(mcp_path)
         mcp_configured = _TOML_BEGIN in toml_content and _TOML_END in toml_content
 
-        binding_id, binding_status = self._find_binding()
+        agent_id = ""
+        try:
+            data = tomllib.loads(toml_content) if toml_content.strip() else {}
+            agent_id = str(
+                data.get("mcp_servers", {})
+                .get(MCP_SERVER_NAME, {})
+                .get("env", {})
+                .get("MEMORYGUARD_AGENT_ID", "")
+                or ""
+            )
+        except tomllib.TOMLDecodeError:
+            mcp_configured = False
+        binding_id, binding_status = self._find_binding(agent_id)
+        configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
-            "installed": instruction_installed and mcp_configured,
+            "installed": configured,
+            "configured": configured,
+            "status": "configured" if configured else "not_configured",
+            "restart_required": configured,
+            "runtime_verified": False,
             "instruction_file": str(instr_path),
             "mcp_configured": mcp_configured,
+            "configured_agent_instance_id": agent_id,
             "binding_id": binding_id,
             "binding_status": binding_status,
         }
@@ -489,7 +769,7 @@ class CursorAdapter(ProviderAdapter):
 
     - 指令文件：<workspace>/.cursor/rules/memoryguard.mdc（新格式，MemoryGuard 专属文件）
       无 workspace 时 ~/.cursor/rules/memoryguard.mdc
-    - MCP 配置：~/.cursor/mcp.json（用户级 JSON）
+    - MCP 配置：<workspace>/.cursor/mcp.json（项目级）；无 workspace 时 ~/.cursor/mcp.json
     """
 
     provider_name = "cursor"
@@ -504,9 +784,11 @@ class CursorAdapter(ProviderAdapter):
         return Path.home() / ".cursor" / "rules" / "memoryguard.mdc"
 
     def _mcp_config_path(self) -> Path:
+        if self._has_workspace:
+            return self.workspace / ".cursor" / "mcp.json"
         return Path.home() / ".cursor" / "mcp.json"
 
-    def _instruction_content(self) -> str:
+    def _instruction_content(self, share_group_id: str = "default") -> str:
         """生成 MDC 文件完整内容（含 frontmatter + 标记段落）。"""
         frontmatter = (
             "---\n"
@@ -515,62 +797,85 @@ class CursorAdapter(ProviderAdapter):
             "globs: []\n"
             "---\n"
         )
+        body = _instruction_body(share_group_id)
         return (
             frontmatter
             + _BEGIN_MARKER + "\n"
-            + _INSTRUCTION_BODY + "\n"
+            + body + "\n"
             + _END_MARKER + "\n"
         )
 
-    def install(self, workspace: str | Path = "") -> dict[str, Any]:
+    def install(self, workspace: str | Path = "", share_group_id: str = "default",
+                agent_instance_id: str = "",
+                global_scope: bool = False) -> dict[str, Any]:
         if workspace:
-            self._has_workspace = True
             self.workspace = Path(workspace).resolve()
+            self._has_workspace = True
+        if global_scope:
+            self._has_workspace = False
+        binding_id = self._require_active_binding(
+            agent_instance_id, share_group_id
+        )
 
-        # 1. 写指令（MDC 文件是 MemoryGuard 专属，整体覆盖）
         instr_path = self._instruction_path()
-        _write_text(instr_path, self._instruction_content())
+        new_instruction = self._instruction_content(share_group_id)
 
-        # 2. 写 MCP 配置（JSON merge）
         mcp_path = self._mcp_config_path()
-        data = _load_json(mcp_path)
-        _set_mcp_server(data, MCP_SERVER_NAME, _mcp_server_config())
-        _save_json(mcp_path, data)
-
-        return {
-            "provider": self.provider_name,
-            "installed": True,
-            "instruction_file": str(instr_path),
-            "mcp_config_file": str(mcp_path),
-            "binding_id": self._bind_with_store([str(instr_path), str(mcp_path)]),
-        }
+        data = _load_json_for_update(mcp_path)
+        _set_mcp_server(
+            data,
+            MCP_SERVER_NAME,
+            _mcp_server_config(agent_instance_id, self.workspace),
+        )
+        new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
+        _apply_file_transaction([
+            (instr_path, new_instruction),
+            (mcp_path, new_mcp_content),
+        ])
+        hook = self._install_host_hook(
+            enabled=global_scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        warnings: list[str] = []
+        global_path = Path.home() / ".cursor" / "mcp.json"
+        if self._has_workspace and global_path != mcp_path:
+            global_data = _load_json(global_path)
+            if _has_mcp_server(global_data, MCP_SERVER_NAME):
+                warnings.append(
+                    "检测到旧用户级 MemoryGuard MCP 配置；请先验证项目级连接，"
+                    "再从 Cursor 全局 MCP 设置移除旧条目"
+                )
+        return self._configured_result(
+            instruction_path=instr_path,
+            mcp_path=mcp_path,
+            binding_id=binding_id,
+            warnings=warnings,
+            hook=hook,
+        )
 
     def uninstall(self) -> dict[str, Any]:
-        # 1. 删除 MDC 指令文件
         instr_path = self._instruction_path()
-        try:
-            instr_path.unlink()
-        except OSError:
-            pass
 
-        # 2. 移除 MCP 配置中的 memoryguard key
         mcp_path = self._mcp_config_path()
-        data = _load_json(mcp_path)
+        data = _load_json_for_update(mcp_path)
         _remove_mcp_server(data, MCP_SERVER_NAME)
-        if data:
-            _save_json(mcp_path, data)
-        else:
-            try:
-                mcp_path.unlink()
-            except OSError:
-                pass
+        mcp_update = (
+            json.dumps(data, ensure_ascii=False, indent=2) if data else None
+        )
+        _apply_file_transaction([
+            (instr_path, None),
+            (mcp_path, mcp_update),
+        ])
 
         return {
             "provider": self.provider_name,
             "installed": False,
+            "configured": False,
+            "status": "not_configured",
             "instruction_file": str(instr_path),
             "mcp_config_file": str(mcp_path),
-            "binding_id": self._unbind_with_store(),
+            "binding_id": None,
         }
 
     def status(self) -> dict[str, Any]:
@@ -585,11 +890,203 @@ class CursorAdapter(ProviderAdapter):
         data = _load_json(mcp_path)
         mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
 
-        binding_id, binding_status = self._find_binding()
+        agent_id = str(
+            data.get("mcpServers", {})
+            .get(MCP_SERVER_NAME, {})
+            .get("env", {})
+            .get("MEMORYGUARD_AGENT_ID", "")
+            or ""
+        )
+        binding_id, binding_status = self._find_binding(agent_id)
+        configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
-            "installed": instruction_installed and mcp_configured,
+            "installed": configured,
+            "configured": configured,
+            "status": "configured" if configured else "not_configured",
+            "restart_required": configured,
+            "runtime_verified": False,
             "instruction_file": str(instr_path),
             "mcp_configured": mcp_configured,
+            "configured_agent_instance_id": agent_id,
             "binding_id": binding_id,
             "binding_status": binding_status,
         }
+
+
+# ===========================================================================
+# TRAE Adapter
+# ===========================================================================
+
+
+class TraeAdapter(ProviderAdapter):
+    """TRAE IDE / TRAE CN adapter。
+
+    - 指令文件：<workspace>/AGENTS.md（TRAE 支持项目/子仓库 AGENTS.md）
+    - MCP 配置：<workspace>/.trae/mcp.json（TRAE 项目级 MCP）
+    - 无 workspace 时回退到 TRAE 用户级 mcp.json 与 user_rules/
+
+    `.trae-cn/mcps/` 是 TRAE 的运行时工具元数据缓存，不是可写安装入口。
+    """
+
+    provider_name = "trae"
+
+    def __init__(self, workspace: str | Path = ""):
+        self._has_workspace = bool(workspace)
+        self.workspace = Path(workspace).resolve() if workspace else Path.home()
+
+    @staticmethod
+    def _user_mcp_config_path() -> Path:
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            candidates = [
+                Path(appdata) / "TRAE SOLO CN" / "User" / "mcp.json",
+                Path(appdata) / "TRAE" / "User" / "mcp.json",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate
+            return candidates[0]
+        return Path.home() / ".trae" / "mcp.json"
+
+    def _instruction_path(self) -> Path:
+        if self._has_workspace:
+            return self.workspace / "AGENTS.md"
+        return Path.home() / ".trae-cn" / "user_rules" / "memoryguard.md"
+
+    def _mcp_config_path(self) -> Path:
+        if self._has_workspace:
+            return self.workspace / ".trae" / "mcp.json"
+        return self._user_mcp_config_path()
+
+    def install(self, workspace: str | Path = "", share_group_id: str = "default",
+                agent_instance_id: str = "",
+                global_scope: bool = False) -> dict[str, Any]:
+        if workspace:
+            self.workspace = Path(workspace).resolve()
+            self._has_workspace = True
+        if global_scope:
+            self._has_workspace = False
+        binding_id = self._require_active_binding(
+            agent_instance_id, share_group_id
+        )
+
+        instr_path = self._instruction_path()
+        content = _read_text_for_update(instr_path)
+        body = _instruction_body(share_group_id)
+        new_content = _replace_section(content, _BEGIN_MARKER, _END_MARKER, body)
+
+        mcp_path = self._mcp_config_path()
+        data = _load_json_for_update(mcp_path)
+        _set_mcp_server(
+            data,
+            MCP_SERVER_NAME,
+            _mcp_server_config(agent_instance_id, self.workspace),
+        )
+        new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
+        _apply_file_transaction([
+            (instr_path, new_content),
+            (mcp_path, new_mcp_content),
+        ])
+        hook = self._install_host_hook(
+            enabled=global_scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+
+        warnings: list[str] = []
+        global_path = self._user_mcp_config_path()
+        if self._has_workspace and global_path != mcp_path:
+            global_data = _load_json(global_path)
+            if _has_mcp_server(global_data, MCP_SERVER_NAME):
+                warnings.append(
+                    "检测到旧用户级 MemoryGuard MCP 配置；请先验证项目级连接，"
+                    "再从 TRAE 全局 MCP 设置移除旧条目"
+                )
+        return self._configured_result(
+            instruction_path=instr_path,
+            mcp_path=mcp_path,
+            binding_id=binding_id,
+            warnings=warnings,
+            hook=hook,
+        )
+
+    def uninstall(self) -> dict[str, Any]:
+        instr_path = self._instruction_path()
+        content = _read_text_for_update(instr_path)
+        instruction_update: str | None = content if instr_path.exists() else None
+        keep_shared_instruction = (
+            self._has_workspace
+            and _other_adapter_uses_project_agents_md(
+                self.workspace, excluding=self.provider_name
+            )
+        )
+        if _BEGIN_MARKER in content and not keep_shared_instruction:
+            new_content = _remove_section(content, _BEGIN_MARKER, _END_MARKER)
+            instruction_update = new_content if new_content.strip() else None
+
+        mcp_path = self._mcp_config_path()
+        data = _load_json_for_update(mcp_path)
+        _remove_mcp_server(data, MCP_SERVER_NAME)
+        mcp_update = (
+            json.dumps(data, ensure_ascii=False, indent=2) if data else None
+        )
+        _apply_file_transaction([
+            (instr_path, instruction_update),
+            (mcp_path, mcp_update),
+        ])
+
+        return {
+            "provider": self.provider_name,
+            "installed": False,
+            "configured": False,
+            "status": "not_configured",
+            "instruction_file": str(instr_path),
+            "mcp_config_file": str(mcp_path),
+            "binding_id": None,
+        }
+
+    def status(self) -> dict[str, Any]:
+        instr_path = self._instruction_path()
+        mcp_path = self._mcp_config_path()
+
+        content = _read_text(instr_path)
+        instruction_installed = (
+            _BEGIN_MARKER in content and _END_MARKER in content
+        )
+        data = _load_json(mcp_path)
+        mcp_configured = _has_mcp_server(data, MCP_SERVER_NAME)
+        agent_id = str(
+            data.get("mcpServers", {})
+            .get(MCP_SERVER_NAME, {})
+            .get("env", {})
+            .get("MEMORYGUARD_AGENT_ID", "")
+            or ""
+        )
+        binding_id, binding_status = self._find_binding(agent_id)
+        configured = instruction_installed and mcp_configured and bool(agent_id)
+        return {
+            "installed": configured,
+            "configured": configured,
+            "status": "configured" if configured else "not_configured",
+            "restart_required": configured,
+            "runtime_verified": False,
+            "instruction_file": str(instr_path),
+            "mcp_configured": mcp_configured,
+            "configured_agent_instance_id": agent_id,
+            "binding_id": binding_id,
+            "binding_status": binding_status,
+        }
+
+
+PROVIDER_ADAPTERS: dict[str, type[ProviderAdapter]] = {
+    "claude-code": ClaudeAdapter,
+    "claude": ClaudeAdapter,
+    "codex": CodexAdapter,
+    "cursor": CursorAdapter,
+    "trae": TraeAdapter,
+}
+
+
+def get_provider_adapter_class(product: str) -> type[ProviderAdapter] | None:
+    """按规范化 product ID 返回自动安装适配器。"""
+    return PROVIDER_ADAPTERS.get((product or "").strip().lower())

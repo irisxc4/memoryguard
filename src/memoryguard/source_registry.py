@@ -54,6 +54,20 @@ class ScanBudget:
 # ---------------------------------------------------------------------------
 
 TEXT_EXTS = {".md", ".markdown", ".txt", ".json", ".jsonl", ".rst", ".yaml", ".yml", ".toml"}
+META_EXTS = {".sqlite", ".sqlite3", ".db", ".vscdb"}
+
+# 项目目录默认排除：作业台账 / IDE 缓存，避免整仓计划被灌进记忆
+DEFAULT_PROJECT_EXCLUDE = [
+    ".memoryguard/**",
+    ".git/**",
+    "node_modules/**",
+    "__pycache__/**",
+    ".cursor/**",
+    ".trellis/**",
+    ".agents/**",
+    "**/*.plan.md",
+]
+
 INSTRUCTION_FILES = {"AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "GEMINI.md", "CODEBUDDY.md",
                      ".cursorrules", ".windsurfrules", "copilot-instructions.md"}
 TEXT_MEDIA_TYPES = {
@@ -62,6 +76,8 @@ TEXT_MEDIA_TYPES = {
     ".jsonl": "application/x-jsonlines", ".rst": "text/x-rst",
     ".yaml": "application/yaml", ".yml": "application/yaml",
     ".toml": "application/toml",
+    ".sqlite": "application/x-sqlite3", ".sqlite3": "application/x-sqlite3",
+    ".db": "application/x-sqlite3", ".vscdb": "application/x-sqlite3",
 }
 
 
@@ -249,6 +265,29 @@ class DirectoryAdapter(SourceAdapter):
             )
             return None, entry
         ext = candidate.suffix.lower()
+        if ext in META_EXTS:
+            media_type = TEXT_MEDIA_TYPES.get(ext, "application/x-sqlite3")
+            try:
+                st = candidate.stat()
+                content_hash = stable_hash(str(candidate), str(st.st_size), str(int(st.st_mtime)))
+            except OSError as e:
+                entry = CoverageEntry(
+                    source_root_id=root_id, relative_path=rel,
+                    status=CandidateStatus.UNREADABLE, reason=str(e),
+                    size=size, media_type=media_type,
+                )
+                return None, entry
+            obj = SourceObject(
+                source_object_id=source_object_id, source_root_id=root_id,
+                relative_path=rel, content_hash=content_hash,
+                media_type=media_type, read_status="meta", captured_at=_now_iso(),
+            )
+            entry = CoverageEntry(
+                source_root_id=root_id, relative_path=rel,
+                status=CandidateStatus.READ, size=size, media_type=media_type,
+                reason="sqlite meta-read only",
+            )
+            return obj, entry
         if ext not in TEXT_EXTS and candidate.name not in INSTRUCTION_FILES:
             entry = CoverageEntry(
                 source_root_id=root_id, relative_path=rel,
@@ -338,15 +377,38 @@ class SelectedFileAdapter(SourceAdapter):
         rel = candidate.name
         root_id = self.root.root_id
         source_object_id = stable_hash(root_id, normalize_rel_path(rel))
+        ext = candidate.suffix.lower()
+        media_type = TEXT_MEDIA_TYPES.get(ext, "text/plain")
         try:
             size = candidate.stat().st_size
-            content = candidate.read_text(encoding="utf-8")
         except OSError as e:
             return None, CoverageEntry(
                 source_root_id=root_id, relative_path=rel,
                 status=CandidateStatus.UNREADABLE, reason=str(e))
-        ext = candidate.suffix.lower()
-        media_type = TEXT_MEDIA_TYPES.get(ext, "text/plain")
+        if ext in META_EXTS:
+            try:
+                st = candidate.stat()
+                content_hash = stable_hash(str(candidate), str(st.st_size), str(int(st.st_mtime)))
+            except OSError as e:
+                return None, CoverageEntry(
+                    source_root_id=root_id, relative_path=rel,
+                    status=CandidateStatus.UNREADABLE, reason=str(e), size=size)
+            obj = SourceObject(
+                source_object_id=source_object_id, source_root_id=root_id,
+                relative_path=rel, content_hash=content_hash,
+                media_type=media_type, read_status="meta", captured_at=_now_iso(),
+            )
+            return obj, CoverageEntry(
+                source_root_id=root_id, relative_path=rel,
+                status=CandidateStatus.READ, size=size, media_type=media_type,
+                reason="sqlite meta-read only",
+            )
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return None, CoverageEntry(
+                source_root_id=root_id, relative_path=rel,
+                status=CandidateStatus.UNREADABLE, reason=str(e), size=size)
         obj = SourceObject(
             source_object_id=source_object_id, source_root_id=root_id,
             relative_path=rel, content_hash=stable_hash(content),
@@ -445,8 +507,20 @@ class SourceRegistry:
                 root_id=project_id, type=SourceRootType.PROJECT_DIRECTORY,
                 display_name="项目目录", path=str(self.workspace),
                 scope="project", authorized_at=_now_iso(),
-                include=[], exclude=[".memoryguard/**", ".git/**", "node_modules/**", "__pycache__/**"],
+                include=[], exclude=list(DEFAULT_PROJECT_EXCLUDE),
             )
+        else:
+            # 合并默认排除，修历史配置把 .cursor/plans 扫进记忆的问题
+            root = self.roots[project_id]
+            merged = list(root.exclude or [])
+            changed = False
+            for pat in DEFAULT_PROJECT_EXCLUDE:
+                if pat not in merged:
+                    merged.append(pat)
+                    changed = True
+            if changed:
+                root.exclude = merged
+                self._save()
 
     def _save(self) -> None:
         self.mg_dir.mkdir(parents=True, exist_ok=True)

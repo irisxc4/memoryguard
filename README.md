@@ -2,7 +2,7 @@
   <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.2.0</h1>
+<h1 align="center">MemoryGuard v0.3.0</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -63,7 +63,8 @@ The console is **not an approval queue**. Agents keep moving; you govern the out
 pip install agent-memguard
 ```
 
-Choose the coding agent you use. Each command adds MemoryGuard as an MCP server and writes its instruction file.
+Choose the coding agent you use. Each command installs the global MCP binding,
+redirect rules, and the verified user-level Hook supported by that host.
 
 ```bash
 # Claude Code
@@ -81,6 +82,7 @@ Then restart your agent and verify the environment:
 ```bash
 memoryguard doctor
 memoryguard mcp-status
+memoryguard hooks status --provider all
 ```
 
 Need a desktop window for the governance console?
@@ -126,7 +128,7 @@ It is not a cloud service, an account system, or a human gate that blocks every 
 | MCP memory backend | Read, search, write, update, delete, and inspect shared-memory status |
 | Auto-organizer | Classify, deduplicate, supersede, detect conflicts, quarantine, derive, and compress on write |
 | Governance console | Review raw writes, conflicts, quarantine, supersede chains, and versions |
-| Provider adapters | Set up Claude Code, Codex, or Cursor from one command |
+| Provider adapters | Set up global MCP, redirect rules, and Hooks for Claude Code, Codex, or Cursor; report the TRAE fallback honestly |
 | CLI | Audit local sources, manage authorized inputs, inspect reports, and manage memory builds/releases |
 
 The complete MCP tool reference and CLI command reference are below for evaluation and integration work.
@@ -149,6 +151,7 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 | `memory <action>` | Memory build, verify, and release rollback workflows |
 | `doctor` | Diagnose installation and environment |
 | `mcp-status` | Inspect MCP shared-memory status |
+| `hooks <action>` | Install, repair, inspect, pause, or remove host Hooks |
 
 </details>
 
@@ -180,6 +183,20 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Changelog
+
+### v0.3.0 (2026-07-29)
+
+**Hook-only automatic takeover**:
+- User-level Hook management for Claude Code, Codex, and Cursor; TRAE keeps the verified MCP + rules fallback
+- Bounded, task-relevant context injection for main agents and subagents
+- Native-memory write interception so long-term memory stays in the MemoryGuard-managed store
+- Enforce, observe, pause, repair, status, and uninstall controls in CLI and GUI
+- Idempotent configuration merges that preserve unrelated user hooks
+
+**MCP and Skill integration**:
+- Global provider installation now installs MCP, redirect rules, and supported Hooks together
+- First Skill activation detects only the current host and repairs its integration
+- Runtime receipts expose whether the takeover path is actually operational
 
 ### v0.2.0 (2026-07-23)
 

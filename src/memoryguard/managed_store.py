@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -211,6 +212,41 @@ class ManagedStore:
         self._set_active_version_id(version_id)
         return self.load_version(version_id)  # type: ignore[return-value]
 
+    def sync_records_from_ir(
+        self,
+        records: list[MemoryRecord],
+        *,
+        notes: str = "ir sync",
+    ) -> MemoryVersion:
+        """投影重建时同步当前 agent 的 active 记录快照（保留决策历史）。"""
+        cur_vid = self.get_active_version_id()
+        if cur_vid is None:
+            return self.create_initial_version(records)
+        cur_records = self.list_records(cur_vid)
+        cur_decisions = self.list_decisions(cur_vid)
+        # 保留已有决策改写的 status：以 IR 为底，再叠加同 id 的当前 status
+        status_by_id = {r.memory_id: r.status for r in cur_records}
+        synced: list[MemoryRecord] = []
+        for rec in records:
+            if rec.memory_id in status_by_id:
+                rec = copy.deepcopy(rec)
+                rec.status = status_by_id[rec.memory_id]
+            synced.append(rec)
+        event_id = stable_hash("sync", notes, self.agent_instance_id, _now_iso())
+        new_decision = DecisionEvent(
+            event_id=event_id, actor="system", action="sync",
+            target_ids=[r.memory_id for r in synced[:32]],
+            before_hash=self._records_hash(cur_records),
+            after_hash=self._records_hash(synced),
+            reason=notes, created_at=_now_iso(),
+        )
+        new_vid = stable_hash(cur_vid, event_id, _now_iso())
+        self._write_version(
+            new_vid, synced, cur_decisions + [new_decision], parent_version_id=cur_vid,
+        )
+        self._set_active_version_id(new_vid)
+        return self.load_version(new_vid)  # type: ignore[return-value]
+
     def apply_decision(self, action: str, target_ids: list[str],
                        reason: str = "", actor: str = "user") -> MemoryVersion:
         """v3.1 §6.2 图上治理操作 → 追加 DecisionEvent → 生成新规范版本。
@@ -347,7 +383,12 @@ class ManagedStore:
         return versions
 
 
-def find_record_by_node_id(workspace: str | Path, node_id: str) -> tuple[str | None, MemoryRecord | None]:
+def find_record_by_node_id(
+    workspace: str | Path,
+    node_id: str,
+    *,
+    agent_instance_id: str = "",
+) -> tuple[str | None, MemoryRecord | None]:
     """根据神经图节点 ID 找到对应版本和记录。
 
     支持的 node_id 格式：
@@ -355,26 +396,29 @@ def find_record_by_node_id(workspace: str | Path, node_id: str) -> tuple[str | N
     2. 投影节点 ID "claim-<memory_id[:12]>"
     3. stable_hash(memory_id)
 
-    本函数遍历所有 agent_instance 的活跃版本，匹配 memory_id 或节点 id。
+    若提供 agent_instance_id，只在该 ManagedStore 内查找（防跨 Agent 命中）。
     """
     ws = Path(workspace).resolve()
     mm_root = ws / ".memoryguard" / "managed-memory"
     if not mm_root.exists():
         return None, None
-    # 投影节点 ID → memory_id 前缀
     memory_id_prefix = ""
     if node_id.startswith("claim-"):
-        memory_id_prefix = node_id[6:]  # 去掉 "claim-" 前缀
-    for inst_dir in mm_root.iterdir():
-        if not inst_dir.is_dir():
-            continue
+        memory_id_prefix = node_id[6:]
+    instance_dirs = []
+    if agent_instance_id:
+        inst = mm_root / agent_instance_id
+        if inst.is_dir():
+            instance_dirs = [inst]
+    else:
+        instance_dirs = [p for p in mm_root.iterdir() if p.is_dir()]
+    for inst_dir in instance_dirs:
         store = ManagedStore(ws, inst_dir.name)
         records = store.list_records()
         for r in records:
             if r.memory_id == node_id or stable_hash(r.memory_id) == node_id:
                 vid = store.get_active_version_id()
                 return vid, r
-            # 投影节点 ID 匹配：claim-<memory_id[:12]>
             if memory_id_prefix and r.memory_id.startswith(memory_id_prefix):
                 vid = store.get_active_version_id()
                 return vid, r

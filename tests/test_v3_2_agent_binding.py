@@ -80,10 +80,30 @@ def main() -> int:
                            f"status={active_check.get('status')}")
 
         print("\n=== 4. 解绑 ===")
-        unbound = api.unbind_agent(drift_binding["binding_id"])
+        unbound = api.unbind_agent(drift_binding["binding_id"], _admin_override=True)
         all_pass &= _check("解绑成功", unbound.get("binding", {}).get("status") == BindingStatus.INACTIVE.value)
         active_bindings = api.list_bindings(include_inactive=False).get("bindings", [])
         all_pass &= _check("active 列表不含已解绑", all(b["binding_id"] != drift_binding["binding_id"] for b in active_bindings))
+
+        print("\n=== 5. 解散共享组 ===")
+        denied = api.dissolve_shared_group("team-alpha", confirmed=False, _admin_override=True)
+        all_pass &= _check("无确认拒绝解散", "error" in denied)
+        dissolved = api.dissolve_shared_group(
+            "team-alpha", confirmed=True, archive_data=True, _admin_override=True,
+        )
+        all_pass &= _check("解散成功", dissolved.get("ok") is True, str(dissolved))
+        all_pass &= _check("解绑数 >= 2", dissolved.get("unbound_count", 0) >= 2,
+                           f"n={dissolved.get('unbound_count')}")
+        all_pass &= _check("共享记忆已归档", bool(dissolved.get("archived_to")),
+                           str(dissolved.get("archived_to")))
+        archived = Path(dissolved.get("archived_to") or "")
+        all_pass &= _check("归档目录存在", archived.is_dir() if archived else False, str(archived))
+        all_pass &= _check("原 shared-memory 目录已移走", not shared_dir.exists())
+        active_after = [
+            b for b in api.list_bindings(include_inactive=False).get("bindings", [])
+            if b.get("share_group_id") == "team-alpha"
+        ]
+        all_pass &= _check("解散后无 active binding", len(active_after) == 0, f"n={len(active_after)}")
 
     print("\n" + "=" * 50)
     if all_pass:

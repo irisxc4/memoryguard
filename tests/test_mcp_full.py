@@ -11,7 +11,13 @@ reqs = [
     {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "memoryguard_extract_memories", "arguments": {"workspace": ws}}},
 ]
 stdin = "\n".join(json.dumps(r) for r in reqs) + "\n"
-p = subprocess.run([sys.executable, "-m", "memoryguard.mcp_server"], input=stdin, capture_output=True, text=True)
+p = subprocess.run(
+    [sys.executable, "-m", "memoryguard.mcp_server"],
+    input=stdin,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+)
 if p.stderr:
     print("stderr:", p.stderr[:300])
 print("=== MCP 响应 ===")
@@ -40,7 +46,13 @@ reqs2 = [
     {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "memoryguard_neuron_graph", "arguments": {"workspace": ws}}},
 ]
 stdin2 = "\n".join(json.dumps(r) for r in reqs2) + "\n"
-p2 = subprocess.run([sys.executable, "-m", "memoryguard.mcp_server"], input=stdin2, capture_output=True, text=True)
+p2 = subprocess.run(
+    [sys.executable, "-m", "memoryguard.mcp_server"],
+    input=stdin2,
+    capture_output=True,
+    text=True,
+    encoding="utf-8",
+)
 for line in p2.stdout.strip().splitlines():
     d = json.loads(line)
     if "result" in d and "content" in d["result"]:

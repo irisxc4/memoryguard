@@ -25,6 +25,10 @@ import webbrowser
 from pathlib import Path
 
 
+class BuildCancelled(Exception):
+    """用户取消构建投影。"""
+
+
 # ---------------------------------------------------------------------------
 # 能力探测
 # ---------------------------------------------------------------------------
@@ -38,6 +42,39 @@ def has_native_gui() -> bool:
         return True
     except ImportError:
         return False
+
+
+def _window_icon_path() -> Path | None:
+    """Return the packaged raster icon derived from the UI brand orb."""
+    suffix = ".ico" if sys.platform == "win32" else ".png"
+    path = Path(__file__).parent / "static" / f"memoryguard-icon{suffix}"
+    return path if path.is_file() else None
+
+
+def _set_windows_app_user_model_id() -> bool:
+    """Give hosted pythonw windows an independent Windows taskbar identity."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        return (
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MemoryGuard.Desktop",
+            )
+            == 0
+        )
+    except (AttributeError, OSError):
+        return False
+
+
+def _start_webview(webview) -> None:
+    """Start pywebview with the MemoryGuard window/taskbar icon."""
+    icon_path = _window_icon_path()
+    if icon_path:
+        webview.start(icon=str(icon_path))
+    else:
+        webview.start()
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +92,7 @@ def open_native_window(html_content: str, title: str = "MemoryGuard") -> int:
         return 3
     import webview
 
+    _set_windows_app_user_model_id()
     # pywebview 加载 HTML 字符串，无需临时文件、无需 HTTP server
     webview.create_window(
         title=title,
@@ -63,7 +101,7 @@ def open_native_window(html_content: str, title: str = "MemoryGuard") -> int:
         height=900,
         min_size=(800, 600),
     )
-    webview.start()
+    _start_webview(webview)
     return 0
 
 
@@ -81,6 +119,230 @@ def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _auto_enrich_tasks(workspace: str | Path, tasks: list[dict],
+                       on_progress=None, *, allow_host_cli: bool = True,
+                       llm_agent: str = "", llm_cli: str = "") -> list[dict]:
+    """自动整理 pending 任务,三层降级:
+
+    1. Provider API (已配 API key 时)
+    2. 宿主 Agent CLI (codex exec / claude --print,不需要 API key)
+    3. Heuristic (兜底)
+
+    返回 apply_results 所需的 results 列表。
+    重构/共享组构建默认 allow_host_cli=True（质量依赖 LLM）。
+    """
+    from .semantic_enricher import get_enricher
+    from .provider_api import get_provider
+
+    def _note(msg: str) -> None:
+        if callable(on_progress):
+            try:
+                on_progress(msg)
+            except Exception:
+                pass
+
+    if not tasks:
+        return []
+
+    if allow_host_cli:
+        provider = get_provider(workspace)
+        if provider is not None and not (llm_agent and llm_cli):
+            _note(f"正在用 Provider API 整理 {len(tasks)} 条记忆…")
+            enricher = get_enricher("model", workspace)
+            return _enrich_with_enricher(tasks, enricher, source="provider")
+
+        # 第 2 层:宿主 Agent CLI (不需要 API key)
+        try:
+            from .host_agent_backend import batch_enrich_via_cli, detect_available_agents
+            agent = llm_agent
+            cli = llm_cli
+            if not agent or not cli:
+                agents = detect_available_agents()
+                if agents:
+                    agent = agents[0]["agent"]
+                    cli = agents[0]["cli"]
+            if agent and cli:
+                label = agent
+                _note(f"正在用 {label} 整理 {len(tasks)} 条记忆…")
+                results = batch_enrich_via_cli(
+                    tasks, agent=agent, cli_path=cli, workspace=workspace,
+                )
+                if results:
+                    return results
+        except Exception as e:
+            import logging
+            logging.getLogger("memoryguard").warning("host CLI enrich failed: %s", e)
+
+    # 第 3 层:Heuristic 兜底
+    _note(f"正在用本地规则整理 {len(tasks)} 条记忆…")
+    enricher = get_enricher("heuristic")
+    return _enrich_with_enricher(tasks, enricher, source="heuristic")
+
+
+def _enrich_pending_during_build(
+    workspace: str | Path,
+    *,
+    agent_instance_id: str = "",
+    share_group_id: str = "",
+    llm_agent: str = "",
+    llm_cli: str = "",
+    progress=None,
+    enrich_mode: str = "auto",
+) -> dict:
+    """构建路径：对当前 scope 的 pending 做整理并 apply（不自动二次建图）。
+
+    enrich_mode:
+      - auto: Provider → 本机 CLI → heuristic（GUI/无 Skill 时）
+      - host: 不调 CLI；把 pending 留给宿主 Skill/MCP 对话模型（主路径）
+      - cli: 仅 Provider/CLI，不强制 heuristic apply
+      - heuristic: 仅本地规则
+    """
+    from .host_enrichment import list_pending, apply_results, get_status
+
+    mode = (enrich_mode or "auto").strip().lower()
+    if mode not in {"auto", "host", "cli", "heuristic"}:
+        mode = "auto"
+
+    tasks = list_pending(
+        workspace,
+        limit=500,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+    )
+    if not tasks:
+        st = get_status(
+            workspace,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        return {
+            "applied": 0,
+            "rejected": 0,
+            "pending_before": 0,
+            "pending_count": st.get("pending", 0),
+            "engine": "host_deferred" if mode == "host" else "none",
+            "enrich_mode": mode,
+            "pending_tasks": [],
+            # host 模式即使无 pending：也要让 UI 知道「没调模型」
+            "host_action_required": mode == "host",
+            "hint": (
+                "宿主 Skill 模式：GUI 未调用对话模型。"
+                if mode == "host" else ""
+            ),
+        }
+
+    def _note(msg: str) -> None:
+        if callable(progress):
+            try:
+                progress("enrich", msg, None)
+            except Exception:
+                pass
+
+    # Skill/MCP 主路径：宿主对话模型就是 LLM，构建进程不得抢走整理权
+    if mode == "host":
+        _note(f"已入队 {len(tasks)} 条，等待宿主 Skill 在对话中整理…")
+        return {
+            "applied": 0,
+            "rejected": 0,
+            "pending_before": len(tasks),
+            "pending_count": len(tasks),
+            "engine": "host_deferred",
+            "enrich_mode": "host",
+            "pending_tasks": tasks,
+            "host_action_required": True,
+            "hint": "宿主 Agent 须立即 classify+translate 后调用 apply_enrichments",
+        }
+
+    allow_cli = mode in {"auto", "cli"}
+    if mode == "heuristic":
+        allow_cli = False
+
+    results = _auto_enrich_tasks(
+        workspace,
+        tasks,
+        on_progress=_note,
+        allow_host_cli=allow_cli,
+        llm_agent=llm_agent,
+        llm_cli=llm_cli,
+    )
+    engine = "heuristic"
+    if results:
+        sources = {r.get("source") for r in results}
+        if "provider" in sources:
+            engine = "provider"
+        elif "host_cli" in sources or "model" in sources:
+            engine = "host_cli"
+    if not results:
+        return {
+            "applied": 0,
+            "rejected": 0,
+            "pending_before": len(tasks),
+            "pending_count": len(tasks),
+            "engine": "none",
+            "enrich_mode": mode,
+            "pending_tasks": tasks if mode == "cli" else [],
+            "host_action_required": mode == "cli",
+            "warning": "LLM 未返回结果，保留启发式/原文",
+        }
+    stats = apply_results(
+        workspace,
+        results,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+    )
+    st = get_status(
+        workspace,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+    )
+    return {
+        **stats,
+        "pending_before": len(tasks),
+        "pending_count": st.get("pending", 0),
+        "engine": engine,
+        "enrich_mode": mode,
+        "pending_tasks": [],
+        "host_action_required": False,
+    }
+
+
+def _enrich_with_enricher(tasks: list[dict], enricher, source: str = "model") -> list[dict]:
+    """用 enricher 逐条处理 tasks。
+
+    source: provider|host_cli|heuristic (调用方给的初始值)
+    但最终 source 按 enriched.enrichment_mode 校正:
+    - enrichment_mode == "heuristic" -> source = "heuristic" (即使走 provider 路径但内部 fallback)
+    - enrichment_mode == "model" -> 保持调用方给的 source
+    """
+    results = []
+    for task in tasks:
+        inp = task.get("input", {})
+        title = inp.get("title", "")
+        body = inp.get("body", "")
+        kind_hint = inp.get("kind_hint", "")
+        try:
+            enriched = enricher.enrich(title=title, body=body, kind_hint=kind_hint)
+            # 按 enrichment_mode 校正 source
+            final_source = source
+            mode = getattr(enriched, "enrichment_mode", "")
+            if mode == "heuristic":
+                final_source = "heuristic"
+            elif mode == "passthrough":
+                final_source = "heuristic"
+            results.append({
+                "task_id": task["task_id"],
+                "kind": enriched.kind,
+                "title": enriched.title,
+                "body": enriched.body,
+                "confidence": enriched.confidence,
+                "rationale": enriched.rationale,
+                "source": final_source,
+            })
+        except Exception:
+            continue
+    return results
 
 
 def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[int, str]:
@@ -109,8 +371,18 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
 
     api = GovernanceApi(workspace)
     session_token = generate_session_token()
+    # 网页环境绑定 127.0.0.1,等价于本地 GUI
+    # 显式关闭沙箱模式(localhost 本地环境,写操作可直接执行)
+    import os as _os
+    _os.environ["MEMORYGUARD_SANDBOX"] = "0"
     is_sandbox = detect_sandbox_mode()
     request_queue = RequestQueue(workspace)
+
+    # 自动设 admin,让前端能调用写/治理操作(session_token + 白名单已保护)
+    if not _os.environ.get("MEMORYGUARD_ADMIN"):
+        _os.environ["MEMORYGUARD_ADMIN"] = "1"
+    if not _os.environ.get("MEMORYGUARD_ALLOW_ANON"):
+        _os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
 
     # 将 session_token 注入 HTML
     html = render_interactive_html()
@@ -120,6 +392,26 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
         f'window.__MG_SANDBOX__={str(is_sandbox).lower()};</script></head>',
     )
     html_bytes = html.encode("utf-8")
+
+    # 准备静态文件目录(cytoscape.min.js 等)
+    import shutil as _shutil
+    ui_dir = Path(workspace) / ".memoryguard" / "ui"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+    static_src = Path(__file__).parent / "static" / "cytoscape.min.js"
+    if static_src.exists():
+        _shutil.copy2(static_src, ui_dir / "cytoscape.min.js")
+    icon_src = Path(__file__).parent / "static" / "memoryguard-icon.png"
+    if icon_src.exists():
+        _shutil.copy2(icon_src, ui_dir / "memoryguard-icon.png")
+
+    _MIME_TYPES = {
+        ".js": "application/javascript",
+        ".css": "text/css",
+        ".html": "text/html; charset=utf-8",
+        ".json": "application/json",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+    }
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
@@ -133,7 +425,22 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
             elif parsed.path == "/api/health":
                 self._json_response(200, {"ok": True, "sandbox": is_sandbox})
             else:
-                self.send_error(404)
+                # 静态文件服务(cytoscape.min.js 等)
+                req_path = parsed.path.lstrip("/")
+                # 防路径穿越
+                safe_name = Path(req_path).name
+                file_path = ui_dir / safe_name
+                if safe_name and file_path.exists() and file_path.is_file():
+                    ext = file_path.suffix.lower()
+                    mime = _MIME_TYPES.get(ext, "application/octet-stream")
+                    data = file_path.read_bytes()
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_error(404)
 
         def do_POST(self):  # noqa: N802
             parsed = urlparse(self.path)
@@ -216,7 +523,13 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 self._json_response(501, {"error": f"method not implemented: {method}"})
                 return
             try:
-                result = fn(*args) if args else fn()
+                # 对有 _admin_override 参数的方法,自动注入 True(网页=本地环境)
+                import inspect as _inspect2
+                _sig2 = _inspect2.signature(fn)
+                _kwargs = {}
+                if "_admin_override" in _sig2.parameters:
+                    _kwargs["_admin_override"] = True
+                result = fn(*args, **_kwargs) if args else fn(**_kwargs)
                 result = result if result is not None else {}
                 self._json_response(200, result)
             except Exception as e:
@@ -371,6 +684,256 @@ def _support_level_from_capability(target_capability) -> str:
     }.get(value, "C")
 
 
+def _resolve_publish_target_dir(target_file: str | Path) -> tuple[Path, Path | None, list[str]]:
+    """Map a file or directory path to GenericMarkdownTarget's target directory."""
+    target = Path(target_file)
+    warnings: list[str] = []
+    exact_file: Path | None = None
+    if (target.suffix.lower() in {".md", ".markdown", ".txt"}
+            or target.is_file()
+            or (not target.exists() and target.suffix)):
+        target_dir = target.parent
+        exact_file = target.resolve()
+        if target.name.lower() != "memory.md":
+            warnings.append(
+                f"GenericMarkdownTarget writes memory.md; also copying to {target.name}"
+            )
+    else:
+        target_dir = target
+    return target_dir, exact_file, warnings
+
+
+def _build_publish_ir(ir, workspace, use_distilled: bool):
+    """Prepare publish_ir from distilled groups or filtered raw records."""
+    from dataclasses import replace
+
+    from .distiller import MemoryDistiller, _is_publishable
+    from .memory_ir import MemoryIR
+    from .schema_v3 import MemoryKind, MemoryRecord, MemoryStatus
+
+    distill_stats = None
+    source_record_map: dict[str, list[str]] = {}
+    if use_distilled:
+        distiller = MemoryDistiller(workspace)
+        distilled = distiller.distill(ir)
+        try:
+            distiller.save(distilled)
+        except OSError:
+            pass
+        distill_stats = distilled.stats
+        records: list[MemoryRecord] = []
+        for grp in distilled.groups:
+            memory_id = grp.group_id or (
+                grp.source_record_ids[0] if grp.source_record_ids else ""
+            )
+            try:
+                kind = MemoryKind(grp.kind)
+            except ValueError:
+                kind = MemoryKind.FACT
+            if grp.source_record_ids:
+                source_record_map[memory_id] = list(grp.source_record_ids)
+            records.append(MemoryRecord(
+                memory_id=memory_id,
+                kind=kind,
+                title=grp.title,
+                body=grp.body,
+                status=MemoryStatus.CANDIDATE,
+            ))
+    else:
+        records = []
+        for rec in ir.records:
+            if not _is_publishable(rec):
+                continue
+            records.append(replace(rec))
+    publish_ir = MemoryIR(
+        records=records,
+        snapshot_id=ir.snapshot_id,
+        created_at=ir.created_at,
+    )
+    return publish_ir, distill_stats, source_record_map
+
+
+def _redact_publish_ir(ir, source_record_map: dict[str, list[str]] | None = None):
+    """Redact secrets in-place on publish_ir records; return redaction audit entries."""
+    from .secrets import labels_in_redacted_text, redact_secrets
+
+    source_record_map = source_record_map or {}
+    redactions: list[dict] = []
+    for rec in ir.records:
+        redacted_title, title_labels = redact_secrets(rec.title)
+        redacted_body, body_labels = redact_secrets(rec.body)
+        rec.title = redacted_title
+        rec.body = redacted_body
+        fields: list[str] = []
+        patterns: list[str] = []
+        all_title_labels = sorted(set(title_labels) | set(labels_in_redacted_text(rec.title)))
+        all_body_labels = sorted(set(body_labels) | set(labels_in_redacted_text(rec.body)))
+        if all_title_labels:
+            fields.append("title")
+            patterns.extend(all_title_labels)
+        if all_body_labels:
+            fields.append("body")
+            patterns.extend(all_body_labels)
+        if fields:
+            audit_id = (
+                source_record_map[rec.memory_id][0]
+                if rec.memory_id in source_record_map and source_record_map[rec.memory_id]
+                else rec.memory_id
+            )
+            entry: dict = {
+                "memory_id": audit_id,
+                "fields": fields,
+                "patterns": sorted(set(patterns)),
+            }
+            if rec.memory_id in source_record_map:
+                entry["source_record_ids"] = source_record_map[rec.memory_id]
+            redactions.append(entry)
+    return ir, redactions
+
+
+def _infer_target_dir_from_release(data: dict) -> Path:
+    for cp in data.get("changed_paths", []):
+        p = Path(cp)
+        if p.name == "memory.md":
+            return p.parent
+    if data.get("changed_paths"):
+        return Path(data["changed_paths"][0]).parent
+    raise ValueError(f"cannot infer target directory for release {data.get('release_id', '')}")
+
+
+def _release_ok(status) -> bool:
+    from .schema_v3 import ReleaseStatus
+
+    status_val = status.value if hasattr(status, "value") else str(status)
+    return status_val in (ReleaseStatus.VERIFIED.value, ReleaseStatus.APPLIED.value)
+
+
+def _verify_takeover(target_dir: Path, exact_file: Path | None, ir,
+                     surface_id: str = "",
+                     capability: str = "export_only") -> dict:
+    """真实 Loader 复读验证(LRN-007):用 Profile 专用 Loader 解析目标文件。
+
+    无效格式(二进制/无标题)Loader 返回空列表,验证失败。
+    无 loader 时(export_only)返回 verified=False,不能声称已接管。
+    """
+    from .native_memory_loader import verify_takeover as _loader_verify
+    from .schema_v3 import TargetCapability
+    target = exact_file or (target_dir / "memory.md")
+    try:
+        cap = TargetCapability(capability) if capability else TargetCapability.EXPORT_ONLY
+    except ValueError:
+        cap = TargetCapability.EXPORT_ONLY
+    result = _loader_verify(target, ir.records, surface_id=surface_id, capability=cap)
+    return result.__dict__ if hasattr(result, "__dict__") else dict(result)
+
+
+def _rewrite_release_json_for_exact_file(
+    release,
+    workspace: str | Path,
+    *,
+    published_target_file: str,
+    exact_file_existed_before: bool,
+) -> None:
+    """Persist updated release paths plus exact_file sidecar metadata."""
+    import json
+
+    releases_dir = Path(workspace) / ".memoryguard" / "releases"
+    releases_dir.mkdir(parents=True, exist_ok=True)
+    release_path = releases_dir / f"{release.release_id}.json"
+    if release_path.exists():
+        data = json.loads(release_path.read_text(encoding="utf-8"))
+    else:
+        data = release.to_dict()
+        data["schema_version"] = "3.1"
+        data["record_type"] = "memory_release"
+    data["changed_paths"] = list(release.changed_paths)
+    data["backup_paths"] = list(release.backup_paths)
+    data["published_target_file"] = published_target_file
+    data["exact_file_existed_before"] = exact_file_existed_before
+    # Atomic write: never truncate the live release JSON mid-write.
+    tmp = release_path.with_name(release_path.name + ".tmp")
+    tmp.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(tmp, release_path)
+
+
+def _sync_exact_file_into_release(release, target_dir: Path, exact_file: Path, workspace):
+    """Copy memory.md → exact_file and fold the path into the same ReleaseChange.
+
+    Backup naming matches GenericMarkdownTarget.install so rollback glob
+    ``{name}.*.bak`` restores or unlinks correctly.
+    """
+    import json
+    import shutil
+
+    from .schema_v3 import stable_hash, _now_iso
+
+    memory_md = target_dir / "memory.md"
+    if not memory_md.exists():
+        raise FileNotFoundError(f"memory.md missing after apply_build: {memory_md}")
+
+    existed_before = exact_file.exists()
+    exact_resolved = str(exact_file.resolve())
+    backup_path: Path | None = None
+
+    try:
+        if existed_before:
+            backup_dir = target_dir / ".memoryguard-backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"{exact_file.name}.{stable_hash(_now_iso())}.bak"
+            shutil.copy2(exact_file, backup_path)
+
+        exact_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = exact_file.with_name(exact_file.name + ".memoryguard-publish.tmp")
+        shutil.copy2(memory_md, tmp)
+        os.replace(tmp, exact_file)
+
+        release.changed_paths = list(release.changed_paths) + [exact_resolved]
+        if backup_path is not None:
+            release.backup_paths = list(release.backup_paths) + [str(backup_path)]
+
+        _rewrite_release_json_for_exact_file(
+            release,
+            workspace,
+            published_target_file=exact_resolved,
+            exact_file_existed_before=existed_before,
+        )
+        return release
+    except Exception:
+        # Ensure rollback can see exact_file even if rewrite failed mid-sync.
+        if exact_resolved not in release.changed_paths:
+            release.changed_paths = list(release.changed_paths) + [exact_resolved]
+        if backup_path is not None and str(backup_path) not in release.backup_paths:
+            release.backup_paths = list(release.backup_paths) + [str(backup_path)]
+        try:
+            _rewrite_release_json_for_exact_file(
+                release,
+                workspace,
+                published_target_file=exact_resolved,
+                exact_file_existed_before=existed_before,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        raise
+
+
+def _verify_exact_file_after_rollback(data: dict) -> list[str]:
+    """Post-rollback checks for published_target_file sidecar state."""
+    published = data.get("published_target_file")
+    if not published:
+        return []
+    exact = Path(published)
+    existed_before = bool(data.get("exact_file_existed_before"))
+    if existed_before:
+        if not exact.exists():
+            return [f"published_target_file missing after rollback: {published}"]
+    elif exact.exists():
+        return [f"published_target_file still present after rollback: {published}"]
+    return []
+
+
 class GovernanceApi:
     """pywebview JS API 类（v3 五入口架构，spec §7.2）。
 
@@ -386,10 +949,53 @@ class GovernanceApi:
         self.workspace = workspace
         self._report = None
         self._window = None  # pywebview window 引用，由 open_interactive_window 注入
+        self._build_jobs: dict[str, dict] = {}
+        import threading
+        self._build_lock = threading.Lock()
+        self._active_build_job: str | None = None
 
     def _set_window(self, window) -> None:
         """注入 pywebview window 实例（用于 create_file_dialog）。"""
         self._window = window
+
+    def _parse_scope(self, scope: dict | None = None, *,
+                     agent_instance_id: str = "",
+                     share_group_id: str = "",
+                     mode: str = "") -> tuple[dict | None, str]:
+        """显式 scope 校验。不读 preference 作授权。GUI/CLI/MCP 共用 resolver。"""
+        from .governance_scope import resolve_governance_scope
+        ok, err = resolve_governance_scope(
+            scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            mode=mode,
+        )
+        if ok is None:
+            return None, err or "missing_governance_scope"
+        return ok.to_dict(), ""
+
+    def get_governance_scope(self) -> dict:
+        """读取 UI 偏好 scope（非授权依据）。"""
+        from .governance_scope import load_scope_preference
+        pref = load_scope_preference(self.workspace)
+        if pref is None:
+            return {"empty": True, "reason": "no_preference"}
+        return {"empty": False, "scope": pref.to_dict()}
+
+    def set_governance_scope(self, scope: dict | None = None, *,
+                             agent_instance_id: str = "",
+                             share_group_id: str = "",
+                             mode: str = "",
+                             _admin_override: bool = False) -> dict:
+        """写入 UI 偏好 scope。"""
+        from .governance_scope import GovernanceScope, save_scope_preference
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id, mode=mode,
+        )
+        if err:
+            return {"error": err}
+        return save_scope_preference(self.workspace, GovernanceScope.from_dict(parsed))
 
     # ------------------------------------------------------------------
     # 安全层：请求队列管理（pywebview 模式下也需要）
@@ -448,12 +1054,24 @@ class GovernanceApi:
         返回 {path, is_directory} 或 {error: 'cancelled'}。
         """
         if self._window is None:
-            # 无 pywebview window 时回退到 prompt
-            path = input("输入路径：" if not for_files else "输入文件路径：")
-            if not path:
+            # 无 pywebview 时用系统文件对话框，禁止手填路径
+            try:
+                import tkinter as tk
+                from tkinter import filedialog
+                root = tk.Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
+                if for_files:
+                    selected = filedialog.askopenfilename(title="选择导入文件")
+                else:
+                    selected = filedialog.askdirectory(title="选择来源目录")
+                root.destroy()
+            except Exception as exc:
+                return {"error": f"path_picker_unavailable: {exc}"}
+            if not selected:
                 return {"error": "cancelled"}
             from pathlib import Path
-            p = Path(path)
+            p = Path(selected)
             return {"path": str(p.resolve()), "is_directory": p.is_dir()}
         try:
             import webview
@@ -531,9 +1149,14 @@ class GovernanceApi:
         }
 
     def get_selection_tree(self, instance_id: str) -> dict:
-        """v3.1 §4.3 返回分类勾选树。"""
+        """v3.1 §4.3 返回分类勾选树。
+
+        修复:将 SourceRegistry 中 scope="project" 的 SourceRoot(如 src-project-default)
+        也注入到勾选树中,让用户能在 Agent 下看到并勾选项目目录。
+        """
         from .agent_locator import AgentLocator
         from .source_registry import SourceRegistry
+        from .schema_v3 import SourceRootType
         locator = AgentLocator(self.workspace)
         tree = locator.get_selection_tree(instance_id)
         if "error" in tree:
@@ -568,6 +1191,66 @@ class GovernanceApi:
             for cat in scope_obj.get("categories", []):
                 for f in cat.get("files", []):
                     mark_file(f)
+
+        # 修复:将 scope="project" 的 SourceRoot(含 src-project-default)注入勾选树
+        # 这些 SourceRoot 的 agent_instance_id 可能为空,但用户仍需看到并勾选
+        project_roots = [
+            r for r in reg.list_all_sources()
+            if r.scope == "project" and r.type == SourceRootType.PROJECT_DIRECTORY
+        ]
+        if project_roots:
+            # 找到或创建 project scope 区块
+            project_scope = None
+            for s in tree.get("scopes", []):
+                if s.get("scope") == "project":
+                    project_scope = s
+                    break
+            if project_scope is None:
+                project_scope = {
+                    "scope": "project",
+                    "scope_source": "source_registry",
+                    "projects": [],
+                    "categories": [],
+                }
+                tree.setdefault("scopes", []).append(project_scope)
+            # 确保有 projects 列表
+            project_scope.setdefault("projects", [])
+            # 为每个 project root 创建一个 project 区块
+            for root in project_roots:
+                root_path = Path(root.path).resolve() if root.path else None
+                if root_path and not root_path.exists():
+                    continue
+                # 检查是否已有同名 project
+                existing_proj = next(
+                    (p for p in project_scope["projects"]
+                     if p.get("project_ref") == root.display_name),
+                    None,
+                )
+                if existing_proj is None:
+                    existing_proj = {
+                        "project_ref": root.display_name,
+                        "scope_source": "source_registry",
+                        "categories": [],
+                    }
+                    project_scope["projects"].append(existing_proj)
+                # 注入项目目录作为一个 category
+                project_dir_cat = {
+                    "category": "project_directory",
+                    "category_label": "项目目录",
+                    "files": [{
+                        "surface_id": root.root_id,
+                        "discovery_object_id": "",  # 项目目录不来自 discovery
+                        "path": str(root_path) if root_path else root.path,
+                        "display_name": root.display_name,
+                        "root_id": root.root_id,
+                        "default_selected": bool(root.enabled),
+                        "saved_selected": bool(root.enabled),
+                        "source_root_id": root.root_id,
+                        "is_project_directory": True,
+                    }],
+                }
+                existing_proj.setdefault("categories", []).append(project_dir_cat)
+
         return tree
 
     def commit_selection(self, instance_id: str, selected: list, confirmed: bool = False) -> dict:
@@ -584,6 +1267,10 @@ class GovernanceApi:
             SourceCategory, IngestionPolicy, Ownership, TargetRole,
         )
         from .source_registry import SourceRegistry
+        from .governance_scope import (
+            grant_root_to_agent, revoke_root_from_agent, root_authorizes_agent, save_scope_preference,
+            GovernanceScope,
+        )
         import json
 
         from .agent_locator import AgentLocator
@@ -635,24 +1322,66 @@ class GovernanceApi:
             visible_discovery_ids = {surf.get("discovery_object_id", "") for surf in path_to_surface.values() if surf.get("discovery_object_id")}
             visible_paths = {str(Path(path).resolve()) for path in path_to_surface if path}
             disabled_count = 0
+            revoked_count = 0
             for root in reg.list_all_sources():
-                if root.agent_instance_id != instance_id:
+                if not root_authorizes_agent(root, instance_id):
                     continue
                 root_path = str(Path(root.path).resolve()) if root.path else ""
                 visible = (root.discovery_object_id and root.discovery_object_id in visible_discovery_ids) or root_path in visible_paths
-                if visible and root.enabled:
-                    root.enabled = False
-                    disabled_count += 1
+                if not visible:
+                    continue
+                revoke_root_from_agent(root, instance_id)
+                revoked_count += 1
+                # 仅当没有任何 agent 仍授权时才禁用
+                if not (getattr(root, "authorized_agent_ids", None) or []) and not root.agent_instance_id:
+                    if root.enabled:
+                        root.enabled = False
+                        disabled_count += 1
             reg._save()
-            return {"selection_id": selection_id, "added_source_count": 0, "updated_source_count": 0, "disabled_source_count": disabled_count, "total_selected": 0}
+            save_scope_preference(
+                self.workspace,
+                GovernanceScope(mode="agent", agent_instance_id=instance_id),
+            )
+            return {
+                "selection_id": selection_id,
+                "added_source_count": 0,
+                "updated_source_count": 0,
+                "disabled_source_count": disabled_count,
+                "revoked_authorization_count": revoked_count,
+                "total_selected": 0,
+                "governance_scope": {"mode": "agent", "agent_instance_id": instance_id},
+            }
         # v3.2 改动包1 P0：服务端以 discovery_object_id 为唯一授权依据
+        # 修复:对 is_project_directory=True 的条目(来自 SourceRegistry 的项目目录),
+        # 跳过 discovery 验证,直接用 SourceRegistry 中的信息
+        reg = SourceRegistry(self.workspace)
         discovery_object_ids = [item.get("discovery_object_id", "") for item in selected if item.get("discovery_object_id")]
-        validation = locator.validate_discovery_objects(instance_id, discovery_object_ids)
+        validation = locator.validate_discovery_objects(instance_id, discovery_object_ids) if discovery_object_ids else {}
         # 过滤掉验证失败的条目
         validated_selected = []
         for item in selected:
             dobj_id = item.get("discovery_object_id", "")
-            if dobj_id and validation.get(dobj_id, {}).get("valid"):
+            if item.get("is_project_directory"):
+                # 项目目录条目:不来自 discovery,直接通过
+                # 从 SourceRegistry 回填信息
+                root_id = item.get("source_root_id") or item.get("root_id", "")
+                proj_root = next((r for r in reg.list_all_sources() if r.root_id == root_id), None)
+                if proj_root:
+                    item["path"] = proj_root.path
+                    item["category"] = "project_directory"
+                    item["scope"] = proj_root.scope or "project"
+                    item["scope_source"] = "source_registry"
+                    item["project_ref"] = proj_root.display_name or "项目目录"
+                    item["surface_id"] = root_id
+                    item["ingestion_policy"] = "extract_candidates"
+                    item["ownership"] = "external_read_only"
+                    item["target_role"] = "none"
+                    validated_selected.append(item)
+                elif not dobj_id:
+                    continue
+                else:
+                    pass  # 有 dobj_id 的走下面正常流程
+            elif dobj_id and validation.get(dobj_id, {}).get("valid"):
                 # 从服务端回填所有字段，不信任客户端
                 server_info = validation[dobj_id].get("file_info") or validation[dobj_id].get("surface") or {}
                 item["path"] = server_info["path"]
@@ -691,7 +1420,8 @@ class GovernanceApi:
             try:
                 cat_enum = SourceCategory(cat_str)
             except ValueError:
-                cat_enum = SourceCategory.UNKNOWN
+                # 项目目录不在枚举中,归为 KNOWLEDGE_SOURCE
+                cat_enum = SourceCategory.KNOWLEDGE_SOURCE if cat_str == "project_directory" else SourceCategory.UNKNOWN
             try:
                 ing = IngestionPolicy(surf.get("ingestion_policy", "extract_candidates"))
             except ValueError:
@@ -730,138 +1460,335 @@ class GovernanceApi:
             encoding="utf-8",
         )
 
-        reg = SourceRegistry(self.workspace)
+        # reg 已在前面创建(用于 is_project_directory 查找)
         selected_discovery_ids = {e.discovery_object_id for e in entries if e.discovery_object_id}
         selected_paths = {str(Path(e.resolved_path).resolve()) for e in entries if e.resolved_path}
         visible_discovery_ids = {surf.get("discovery_object_id", "") for surf in path_to_surface.values() if surf.get("discovery_object_id")}
         visible_paths = {str(Path(path).resolve()) for path in path_to_surface if path}
         disabled_count = 0
+        revoked_count = 0
         for root in reg.list_all_sources():
-            if root.agent_instance_id != instance_id:
+            from .schema_v3 import SourceRootType
+            is_proj_dir = (root.type == SourceRootType.PROJECT_DIRECTORY)
+            # 多对多：按授权判断，不再要求唯一 agent_instance_id
+            if not is_proj_dir and not root_authorizes_agent(root, instance_id) and root.agent_instance_id not in ("", instance_id):
                 continue
             root_path = str(Path(root.path).resolve()) if root.path else ""
             visible = (root.discovery_object_id and root.discovery_object_id in visible_discovery_ids) or root_path in visible_paths
             selected_now = (root.discovery_object_id and root.discovery_object_id in selected_discovery_ids) or root_path in selected_paths
-            if visible and not selected_now and root.enabled:
-                root.enabled = False
-                disabled_count += 1
+            if is_proj_dir:
+                visible = visible or (root_path != "")
+                selected_now = selected_now or any(
+                    e.surface_id == root.root_id or
+                    (hasattr(e, 'is_project_directory') and e.is_project_directory and
+                     str(Path(e.resolved_path).resolve()) == root_path)
+                    for e in entries
+                )
+            if visible and not selected_now and root_authorizes_agent(root, instance_id):
+                revoke_root_from_agent(root, instance_id)
+                revoked_count += 1
+                if not (getattr(root, "authorized_agent_ids", None) or []) and not root.agent_instance_id:
+                    if root.enabled:
+                        root.enabled = False
+                        disabled_count += 1
         added_count = 0
         updated_count = 0
         for entry in entries:
             p = Path(entry.resolved_path)
             if not p.exists():
                 continue
+            # 修复:对项目目录条目,更新已有的 src-project-default 而非创建新的
+            if entry.category.value == "project_directory" or entry.surface_id == "src-project-default":
+                existing_root = next(
+                    (r for r in reg.list_all_sources()
+                     if r.root_id == "src-project-default" or r.path == str(p.resolve())),
+                    None,
+                )
+                if existing_root:
+                    # 更新已有 root:多对多授权当前 agent（项目根可被多 agent 共享）
+                    grant_root_to_agent(existing_root, instance_id)
+                    existing_root.enabled = True
+                    existing_root.scope = entry.scope or "project"
+                    existing_root.scope_source = entry.scope_source or "source_registry"
+                    existing_root.project_ref = entry.project_ref or existing_root.display_name
+                    updated_count += 1
+                    continue
             root_type = SourceRootType.SELECTED_DIRECTORY if p.is_dir() else SourceRootType.SELECTED_FILE
             try:
                 root = reg.add(entry.resolved_path, root_type,
                                display_name=f"{tree.get('product', 'agent')}/{entry.surface_id}")
             except (ValueError, OSError):
                 continue
-            if root.agent_instance_id and root.agent_instance_id != instance_id:
-                continue
+            was_authorized = root_authorizes_agent(root, instance_id)
             root.enabled = True
-            if not root.agent_instance_id:
-                root.agent_instance_id = instance_id
-                root.surface_id = entry.surface_id
-                root.source_category = entry.category.value
-                root.ingestion_policy = entry.ingestion_policy.value
-                root.ownership = entry.ownership.value
-                root.target_role = entry.target_role.value
-                root.scope = entry.scope
-                root.scope_source = entry.scope_source
-                root.project_ref = entry.project_ref
-                root.discovery_object_id = entry.discovery_object_id
-                added_count += 1
-            else:
-                root.surface_id = entry.surface_id or root.surface_id
-                root.source_category = entry.category.value
-                root.ingestion_policy = entry.ingestion_policy.value
-                root.ownership = entry.ownership.value
-                root.target_role = entry.target_role.value
-                root.scope = entry.scope
-                root.scope_source = entry.scope_source
-                root.project_ref = entry.project_ref
-                root.discovery_object_id = entry.discovery_object_id
+            grant_root_to_agent(root, instance_id)
+            root.surface_id = entry.surface_id or root.surface_id
+            root.source_category = entry.category.value
+            root.ingestion_policy = entry.ingestion_policy.value
+            root.ownership = entry.ownership.value
+            root.target_role = entry.target_role.value
+            root.scope = entry.scope
+            root.scope_source = entry.scope_source
+            root.project_ref = entry.project_ref
+            root.discovery_object_id = entry.discovery_object_id
+            if was_authorized:
                 updated_count += 1
+            else:
+                added_count += 1
         reg._save()
+        save_scope_preference(
+            self.workspace,
+            GovernanceScope(mode="agent", agent_instance_id=instance_id),
+        )
         return {
             "selection_id": selection_id,
             "added_source_count": added_count,
             "updated_source_count": updated_count,
             "disabled_source_count": disabled_count,
+            "revoked_authorization_count": revoked_count,
             "total_selected": len(entries),
+            "governance_scope": {"mode": "agent", "agent_instance_id": instance_id},
         }
 
     # ------------------------------------------------------------------
     # 图上治理操作（v3.1 §6.2）
     # ------------------------------------------------------------------
 
-    def neuron_decide(self, node_id: str, action: str,
-                      reason: str = "", confirmed: bool = False) -> dict:
-        """v3.1 §6.2 图上操作 → 追加 DecisionEvent → 新规范版本。
+    def _shared_memory_decide(
+        self,
+        memory_id: str,
+        action: str,
+        reason: str,
+        share_group_id: str,
+    ) -> dict:
+        from .governance_engine import GovernanceEngine
+        from .shared_memory_store import SharedMemoryStore
 
-        action ∈ {accept, exclude, quarantine, supersede, merge, rescope, plan}
+        store = SharedMemoryStore(self.workspace, share_group_id)
+        engine = GovernanceEngine(
+            self.workspace, share_group_id, store=store,
+        )
+        record = store.get_record(memory_id)
+        if record is None:
+            return {"error": f"memory not found in share group: {memory_id}"}
+
+        act = (action or "").strip().lower()
+        if act in ("exclude", "delete", "reject", "supersede"):
+            transition = engine.human_delete(memory_id)
+        elif act == "quarantine":
+            transition = engine.quarantine(
+                memory_id,
+                reason=reason or "panel quarantine",
+                pattern="user_quarantine",
+                original_content=record.body,
+                actor="user",
+                manual_override=True,
+            )
+        elif act == "merge":
+            return {"error": "merge not supported for shared memory; edit records via governance panel"}
+        else:
+            return {"error": f"unsupported action: {action}"}
+
+        if not transition["ok"]:
+            return {"error": transition["blocked_reason"]}
+        version_id = transition["version_id"]
+        # 决策后只做轻量出图，禁止再跑 LLM 整理（否则点排除会卡很久）
+        self._rebuild_projection_light(
+            {"mode": "share_group", "share_group_id": share_group_id},
+            mode="reconstructed",
+        )
+        return {
+            "ok": True,
+            "memory_id": memory_id,
+            "action": act,
+            "version_id": version_id,
+            "share_group_id": share_group_id,
+            "scope": {"mode": "share_group", "share_group_id": share_group_id},
+        }
+
+    def neuron_decide(self, node_id: str, action: str,
+                      reason: str = "", confirmed: bool = False,
+                      scope: dict | None = None,
+                      agent_instance_id: str = "",
+                      share_group_id: str = "") -> dict:
+        """v3.1 §6.2 图上操作 → DecisionEvent → 新规范版本。
+
+        agent scope：ManagedStore。
+        share_group scope：SharedMemoryStore（MCP 正式接管）。
         """
         if not confirmed:
             return {"error": "需要确认才能执行治理操作"}
+        parsed, err = self._parse_scope(
+            scope,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        if err or not parsed:
+            return {"error": err or "missing_governance_scope"}
+
+        if parsed.get("mode") == "share_group":
+            return self._shared_memory_decide(
+                memory_id=node_id,
+                action=action,
+                reason=reason,
+                share_group_id=parsed["share_group_id"],
+            )
+
+        if parsed.get("mode") != "agent":
+            return {"error": "agent_scope_required"}
+        agent_id = parsed["agent_instance_id"]
         from .managed_store import ManagedStore, find_record_by_node_id
-        # 找到记录对应的 agent_instance_id
-        vid, record = find_record_by_node_id(self.workspace, node_id)
+        _vid, record = find_record_by_node_id(
+            self.workspace, node_id, agent_instance_id=agent_id,
+        )
         if record is None:
-            return {"error": f"node not found in any managed store: {node_id}"}
-        # 找 agent_instance_id
-        from pathlib import Path
-        ws = Path(self.workspace).resolve()
-        mm_root = ws / ".memoryguard" / "managed-memory"
-        agent_instance_id = None
-        for inst_dir in mm_root.iterdir():
-            if not inst_dir.is_dir():
-                continue
-            store = ManagedStore(ws, inst_dir.name)
-            recs = store.list_records()
-            if any(r.memory_id == record.memory_id for r in recs):
-                agent_instance_id = inst_dir.name
-                break
-        if agent_instance_id is None:
-            return {"error": "agent instance not found for record"}
-        store = ManagedStore(ws, agent_instance_id)
+            return {"error": f"node not found in managed store for agent: {agent_id}"}
+        store = ManagedStore(self.workspace, agent_id)
         new_version = store.apply_decision(
             action=action, target_ids=[record.memory_id],
             reason=reason, actor="user",
         )
+        # 决策后轻量刷新投影（不入队、不调 LLM），图上立刻消失
+        self._rebuild_projection_light(parsed, mode="reconstructed")
         return {
             "memory_version": new_version.version_id,
             "action": action,
             "target_id": record.memory_id,
             "decision_count": new_version.decision_count,
+            "agent_instance_id": agent_id,
+            "scope": parsed,
         }
+
+    def _rebuild_projection_light(self, parsed: dict, mode: str = "reconstructed") -> dict:
+        """治理决策后的快速投影刷新：只重画出图，跳过扫描入队与 LLM。"""
+        from .governance_scope import (
+            GovernanceScope, build_shared_memory_graph, scope_storage_key,
+            share_group_projection_path, authorized_roots_digest,
+            resolve_scoped_roots,
+        )
+        from .projection import ProjectionBuilder
+        from .memory_ir import MemoryIR
+        from .managed_store import ManagedStore
+        from .schema_v3 import MemoryStatus, _now_iso
+        import json as _json
+
+        gscope = GovernanceScope.from_dict(parsed)
+        if gscope is None:
+            return {"error": "invalid_governance_scope"}
+
+        if gscope.mode == "share_group":
+            graph = build_shared_memory_graph(self.workspace, gscope.share_group_id)
+            out_path = share_group_projection_path(self.workspace, gscope)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tomb = out_path.with_suffix(out_path.suffix + ".deleted")
+            if tomb.exists():
+                tomb.unlink()
+            graph["built"] = True
+            graph["scope"] = parsed
+            graph["enrichment"] = {
+                "mode": "skipped_light_rebuild",
+                "hint": "决策刷新未跑 LLM；完整整理请用「重建投影」",
+            }
+            out_path.write_text(_json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")
+            return graph
+
+        agent_id = gscope.agent_instance_id
+        store = ManagedStore(self.workspace, agent_id)
+        hide = {
+            MemoryStatus.REJECTED,
+            MemoryStatus.QUARANTINED,
+            MemoryStatus.SUPERSEDED,
+        }
+        records = [r for r in store.list_records() if r.status not in hide]
+        light_ir = MemoryIR(
+            records=records,
+            snapshot_id=f"light-{agent_id}",
+            created_at=_now_iso(),
+            duplicate_groups=[],
+        )
+        from .source_registry import SourceRegistry
+        reg = SourceRegistry(self.workspace)
+        scoped_roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        allowed_ids = {r.root_id for r in scoped_roots}
+        graph_mode = "native" if mode == "native" else "reconstructed"
+        key = scope_storage_key(gscope)
+        pb = ProjectionBuilder(self.workspace, graph_mode, scope_key=key)
+        meta = {
+            "governance_scope": parsed,
+            "authorized_root_ids": sorted(allowed_ids),
+            "authorized_roots_digest": authorized_roots_digest(allowed_ids),
+            "light_rebuild": True,
+        }
+        proj = pb.build(light_ir, meta=meta)
+        pb.save(proj)
+        result = proj.to_dict()
+        result["mode"] = graph_mode
+        result["scope"] = parsed
+        result["enrichment"] = {
+            "mode": "skipped_light_rebuild",
+            "hint": "决策刷新未跑 LLM；完整整理请用「重建投影」",
+        }
+        return result
 
     # ------------------------------------------------------------------
     # ProjectionApi（spec §7.3）：神经图纯投影
     # ------------------------------------------------------------------
 
-    def set_projection_source_enabled(self, root_id: str, enabled: bool) -> dict:
+    def set_projection_source_enabled(self, root_id: str, enabled: bool,
+                                      scope: dict | None = None,
+                                      agent_instance_id: str = "") -> dict:
         from .source_registry import SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, root_authorizes_agent, set_root_enabled_for_agent,
+        )
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, mode="agent",
+        )
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"ok": False, "error": err or "agent_scope_required", "root_id": root_id}
+        gscope = GovernanceScope.from_dict(parsed)
         reg = SourceRegistry(self.workspace)
-        root = reg.set_enabled(root_id, enabled)
-        if not root:
+        root = next((r for r in reg.list_all_sources() if r.root_id == root_id), None)
+        if root is None:
             return {"ok": False, "error": "source root not found", "root_id": root_id}
-        return {"ok": True, "root": root.to_dict(), "source_map": self.get_projection_source_map()}
+        if not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"ok": False, "error": "root_not_authorized_for_agent", "root_id": root_id}
+        set_root_enabled_for_agent(root, gscope.agent_instance_id, bool(enabled))
+        reg._save()
+        return {
+            "ok": True,
+            "root": root.to_dict(),
+            "source_map": self.get_projection_source_map(scope=parsed),
+            "scope": parsed,
+        }
 
-    def get_projection_source_map(self) -> dict:
+    def get_projection_source_map(self, scope: dict | None = None,
+                                  agent_instance_id: str = "",
+                                  share_group_id: str = "",
+                                  mode: str = "") -> dict:
         from .source_registry import SourceRegistry
+        from .governance_scope import resolve_scoped_roots, root_authorizes_agent
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id, mode=mode,
+        )
+        if err:
+            return {"error": err, "entries": [], "summary": {}}
         reg = SourceRegistry(self.workspace)
-        roots = reg.list_all_sources()
-        known_agents = sorted({r.agent_instance_id for r in roots if r.agent_instance_id})
-        single_agent_id = known_agents[0] if len(known_agents) == 1 else ""
+        if parsed["mode"] == "share_group":
+            return self._get_share_group_projection_source_map(
+                parsed["share_group_id"], parsed, reg,
+            )
+        agent_id = parsed["agent_instance_id"]
+        roots, _ = resolve_scoped_roots(reg.list_all_sources(), parsed, enabled_only=False)
         native_categories = {"native_memory", "project_memory"}
         excluded_categories = {"conversation_history", "runtime_evidence", "ignored_runtime_data"}
         excluded_policies = {"evidence_only", "govern_only", "ignore"}
+        from .governance_scope import is_root_enabled_for_agent
         entries = []
         for root in roots:
-            enabled = bool(root.enabled)
+            enabled = is_root_enabled_for_agent(root, agent_id)
             source_category = root.source_category
-            agent_instance_id = root.agent_instance_id
             surface_id = root.surface_id
             project_ref = root.project_ref
             scope_source = root.scope_source
@@ -871,8 +1798,6 @@ class GovernanceApi:
                     project_ref = Path(root.path).resolve().name if root.path else "当前项目"
                 if not scope_source or scope_source == "fallback":
                     scope_source = "project_workspace"
-                if not agent_instance_id and single_agent_id:
-                    agent_instance_id = single_agent_id
                 if not surface_id:
                     surface_id = "project_workspace"
             native_eligible = enabled and source_category in native_categories
@@ -888,7 +1813,8 @@ class GovernanceApi:
                 "display_name": root.display_name,
                 "path": root.path,
                 "enabled": enabled,
-                "agent_instance_id": agent_instance_id,
+                "agent_instance_id": agent_id if root_authorizes_agent(root, agent_id) else root.agent_instance_id,
+                "authorized_agent_ids": list(getattr(root, "authorized_agent_ids", []) or []),
                 "surface_id": surface_id,
                 "scope": root.scope,
                 "scope_source": scope_source,
@@ -910,73 +1836,460 @@ class GovernanceApi:
                 "native_memory": sum(1 for e in entries if e["native_eligible"]),
                 "evidence_only": sum(1 for e in entries if e["projection_mode"] == "evidence_only"),
             },
+            "scope": parsed,
         }
 
-    def get_neuron_graph(self, mode: str = "reconstructed") -> dict:
-        """纯读取神经图投影。未构建时返回 {empty: true, reason: 'not_built'}。"""
+    def _get_share_group_projection_source_map(
+        self,
+        share_group_id: str,
+        parsed_scope: dict,
+        registry,
+    ) -> dict:
+        """列出共享库 active 记录的真实入库来源。
+
+        共享图不直接扫描 SourceRoot，而是读取 SharedMemoryStore。来源映射因此
+        必须从记录 provenance → MemoryEvent.metadata 反查，不能复用单 Agent
+        的“当前勾选根”口径，更不能固定返回 0。
+        """
+        from .shared_memory_store import SharedMemoryStore
+
+        try:
+            store = SharedMemoryStore(
+                self.workspace, share_group_id, read_only=True,
+            )
+        except FileNotFoundError:
+            return {
+                "entries": [],
+                "summary": {
+                    "total": 0, "enabled": 0, "shared_memory": 0,
+                    "logical_reconstruction": 0, "native_memory": 0,
+                    "evidence_only": 0,
+                },
+                "scope": parsed_scope,
+                "projection_kind": "shared_memory_projection",
+            }
+
+        records = store.list_records(status="active")
+        event_by_id = {
+            event.event_id: event for event in store.list_events()
+        }
+        events_by_relative_path: dict[str, list] = {}
+        for event in event_by_id.values():
+            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            relative = str(metadata.get("relative_path", "") or "").strip().replace("\\", "/")
+            if relative:
+                events_by_relative_path.setdefault(relative, []).append(event)
+        roots_by_id = {
+            root.root_id: root for root in registry.list_all_sources()
+        }
+        origins: dict[str, dict] = {}
+
+        for record in records:
+            record_origins: dict[str, tuple[object | None, dict]] = {}
+            for provenance in list(record.provenance or []):
+                source_id = str(provenance.source_object_id or "")
+                events = []
+                direct_event = event_by_id.get(source_id)
+                if direct_event is not None:
+                    events.append(direct_event)
+                elif source_id.startswith("share-file:"):
+                    relative = source_id.split(":", 1)[1].strip().replace("\\", "/")
+                    events.extend(events_by_relative_path.get(relative, []))
+                for event in events:
+                    metadata = (
+                        dict(event.metadata or {})
+                        if isinstance(event.metadata, dict)
+                        else {}
+                    )
+                    root_id = str(metadata.get("source_root_id", "") or "")
+                    if root_id:
+                        record_origins.setdefault(root_id, (event, metadata))
+            if not record_origins:
+                runtime_agent = str(record.agent_instance_id or "unknown")
+                record_origins[f"mcp:{runtime_agent}"] = (None, {})
+
+            for origin_id, (event, metadata) in record_origins.items():
+                item = origins.setdefault(origin_id, {
+                    "record_ids": set(),
+                    "agent_ids": set(),
+                    "metadata": metadata,
+                    "first_imported_at": "",
+                })
+                item["record_ids"].add(record.memory_id)
+                agent_id = str(
+                    getattr(event, "agent_instance_id", "")
+                    or record.agent_instance_id
+                    or ""
+                )
+                if agent_id:
+                    item["agent_ids"].add(agent_id)
+                created_at = str(
+                    getattr(event, "created_at", "")
+                    or record.created_at
+                    or ""
+                )
+                if created_at and (
+                    not item["first_imported_at"]
+                    or created_at < item["first_imported_at"]
+                ):
+                    item["first_imported_at"] = created_at
+
+        entries: list[dict] = []
+        for origin_id, info in sorted(origins.items()):
+            agent_ids = sorted(info["agent_ids"])
+            if origin_id.startswith("mcp:"):
+                agent_id = origin_id.split(":", 1)[1]
+                entries.append({
+                    "root_id": origin_id,
+                    "display_name": f"MCP 实时写入 · {agent_id}",
+                    "path": "SharedMemoryStore",
+                    "enabled": True,
+                    "participates": True,
+                    "agent_instance_id": agent_id,
+                    "authorized_agent_ids": [agent_id],
+                    "surface_id": "memoryguard_mcp",
+                    "scope": "share_group",
+                    "scope_source": "mcp_runtime",
+                    "project_ref": share_group_id,
+                    "source_category": "shared_memory",
+                    "ingestion_policy": "mcp_write",
+                    "target_role": "shared_memory_truth",
+                    "ownership": "memoryguard_managed",
+                    "projection_mode": "shared_memory_projection",
+                    "logical_eligible": True,
+                    "native_eligible": False,
+                    "is_shared_memory_origin": True,
+                    "record_count": len(info["record_ids"]),
+                    "first_imported_at": info["first_imported_at"],
+                })
+                continue
+
+            root = roots_by_id.get(origin_id)
+            metadata = info["metadata"]
+            entries.append({
+                "root_id": origin_id,
+                "display_name": (
+                    root.display_name if root is not None
+                    else str(metadata.get("relative_path", "") or origin_id)
+                ),
+                "path": root.path if root is not None else "",
+                "enabled": bool(root.enabled) if root is not None else False,
+                "participates": True,
+                "agent_instance_id": (
+                    agent_ids[0] if len(agent_ids) == 1
+                    else "、".join(agent_ids)
+                ),
+                "authorized_agent_ids": (
+                    list(root.authorized_agent_ids or [])
+                    if root is not None else agent_ids
+                ),
+                "surface_id": (
+                    root.surface_id if root is not None
+                    else str(metadata.get("relative_path", "") or "")
+                ),
+                "scope": root.scope if root is not None else "unknown",
+                "scope_source": (
+                    root.scope_source if root is not None
+                    else "historical_event"
+                ),
+                "project_ref": (
+                    root.project_ref if root is not None else ""
+                ),
+                "source_category": (
+                    root.source_category if root is not None
+                    else str(metadata.get("source_category", "") or "unknown")
+                ),
+                "ingestion_policy": (
+                    root.ingestion_policy if root is not None
+                    else str(metadata.get("extraction_origin", "") or "historical")
+                ),
+                "target_role": (
+                    root.target_role if root is not None else "historical_input"
+                ),
+                "ownership": (
+                    root.ownership if root is not None else "historical"
+                ),
+                "projection_mode": "shared_memory_projection",
+                "logical_eligible": True,
+                "native_eligible": False,
+                "is_shared_memory_origin": True,
+                "record_count": len(info["record_ids"]),
+                "first_imported_at": info["first_imported_at"],
+            })
+
+        return {
+            "entries": entries,
+            "summary": {
+                "total": len(entries),
+                "enabled": sum(1 for entry in entries if entry["participates"]),
+                "shared_memory": len(entries),
+                "logical_reconstruction": 0,
+                "native_memory": sum(
+                    1 for entry in entries
+                    if entry["source_category"] in {
+                        "native_memory", "project_memory",
+                    }
+                ),
+                "evidence_only": 0,
+            },
+            "scope": parsed_scope,
+            "projection_kind": "shared_memory_projection",
+        }
+
+    def get_neuron_graph(self, mode: str = "reconstructed",
+                           scope: dict | None = None,
+                           agent_instance_id: str = "",
+                           share_group_id: str = "") -> dict:
+        """读取 scoped 神经图投影。缺 scope 时 fail closed。"""
+        from .governance_scope import (
+            GovernanceScope, scope_storage_key, share_group_projection_path,
+            resolve_scoped_roots, filter_ir_for_agent, projection_auth_matches,
+            authorized_roots_digest, share_group_status_meta,
+        )
         from .projection import ProjectionBuilder
+        from .memory_ir import MemoryNormalizer
+        from .source_registry import SourceRegistry
+        import json as _json_mod
+
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        if err:
+            return {"empty": True, "reason": err, "error": err}
+        gscope = GovernanceScope.from_dict(parsed)
+
+        if gscope.mode == "share_group":
+            path = share_group_projection_path(self.workspace, gscope)
+            status_meta = share_group_status_meta(self.workspace, gscope.share_group_id)
+            tomb = path.with_suffix(path.suffix + ".deleted")
+            if tomb.exists() or not path.exists():
+                empty = {
+                    "empty": True,
+                    "reason": "not_built",
+                    "scope": parsed,
+                    "mode": "share_group",
+                    "projection_kind": "shared_memory_projection",
+                    "meta": status_meta,
+                }
+                empty["source_map"] = self.get_projection_source_map(scope=parsed)
+                return empty
+            try:
+                graph = _json_mod.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return {
+                    "empty": True, "reason": "not_built", "error": "projection_corrupt",
+                    "scope": parsed, "meta": status_meta,
+                }
+            if graph.get("empty"):
+                graph["scope"] = parsed
+                graph["source_map"] = self.get_projection_source_map(scope=parsed)
+                meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
+                meta.update(status_meta)
+                graph["meta"] = meta
+                return graph
+            expected = authorized_roots_digest([f"share:{gscope.share_group_id}"])
+            meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
+            if str(meta.get("authorized_roots_digest", "") or "") != expected:
+                return {
+                    "empty": True,
+                    "reason": "not_built",
+                    "error": "projection_auth_stale",
+                    "scope": parsed,
+                    "mode": "share_group",
+                    "projection_kind": "shared_memory_projection",
+                    "source_map": self.get_projection_source_map(scope=parsed),
+                    "meta": status_meta,
+                }
+            meta.update(status_meta)
+            graph["meta"] = meta
+            graph["scope"] = parsed
+            graph["source_map"] = self.get_projection_source_map(scope=parsed)
+            # 共享组无原生 IR：从投影边/子节点补 members + related，供详情跳转
+            return self._hydrate_neuron_graph_from_projection(graph)
+
         graph_mode = "native" if mode == "native" else "reconstructed"
-        pb = ProjectionBuilder(self.workspace, graph_mode)
+        key = scope_storage_key(gscope)
+        pb = ProjectionBuilder(self.workspace, graph_mode, scope_key=key)
         graph = pb.get_or_empty()
-        graph = self._hydrate_neuron_graph_from_ir(graph)
-        graph["source_map"] = self.get_projection_source_map()
-        graph["projection_kind"] = "native_memory_projection" if graph_mode == "native" else "reconstructed_governance_projection"
+        if graph.get("empty"):
+            empty = {
+                "empty": True,
+                "reason": graph.get("reason", "not_built"),
+                "scope": parsed,
+                "mode": graph_mode,
+                "projection_kind": (
+                    "native_memory_projection" if graph_mode == "native"
+                    else "reconstructed_governance_projection"
+                ),
+            }
+            empty["source_map"] = self.get_projection_source_map(scope=parsed)
+            return empty
+
+        reg = SourceRegistry(self.workspace)
+        scoped_roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        allowed_ids = {r.root_id for r in scoped_roots}
+        meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
+        if not projection_auth_matches(meta, allowed_ids):
+            return {
+                "empty": True,
+                "reason": "not_built",
+                "error": "projection_auth_stale",
+                "scope": parsed,
+                "mode": graph_mode,
+                "projection_kind": (
+                    "native_memory_projection" if graph_mode == "native"
+                    else "reconstructed_governance_projection"
+                ),
+                "source_map": self.get_projection_source_map(scope=parsed),
+            }
+        if not allowed_ids:
+            return {
+                "empty": True,
+                "reason": "not_built",
+                "error": "projection_auth_stale",
+                "scope": parsed,
+                "mode": graph_mode,
+                "projection_kind": (
+                    "native_memory_projection" if graph_mode == "native"
+                    else "reconstructed_governance_projection"
+                ),
+                "source_map": self.get_projection_source_map(scope=parsed),
+            }
+
+        # 投影本身已按 scope 构建；hydrate 补正文。related 限制在当前授权 IR 内。
+        norm = MemoryNormalizer(self.workspace)
+        global_ir = norm.load()
+        related_allow: set[str] | None = None
+        if global_ir is not None:
+            snap = None
+            try:
+                from .source_registry import ScanBudget
+                snap = reg.scan(ScanBudget())
+            except Exception:
+                snap = None
+            scoped_ir = filter_ir_for_agent(global_ir, allowed_ids, snap)
+            related_allow = {r.memory_id for r in scoped_ir.records}
+            # 投影上已有的 memory_id 也允许补齐（即使 provenance 暂未映射到 root）
+            for node in graph.get("nodes", []):
+                mid = node.get("memory_id")
+                if mid:
+                    related_allow.add(mid)
+                for mid in node.get("member_ids") or []:
+                    related_allow.add(mid)
+            for grp in global_ir.duplicate_groups:
+                members = set(grp.member_ids or [])
+                if members & related_allow:
+                    related_allow |= members
+
+        graph = self._hydrate_neuron_graph_from_ir(graph, allowed_memory_ids=related_allow)
+        graph = self._hydrate_neuron_graph_from_projection(graph)
+        graph["source_map"] = self.get_projection_source_map(scope=parsed)
+        graph["projection_kind"] = (
+            "native_memory_projection" if graph_mode == "native"
+            else "reconstructed_governance_projection"
+        )
         graph["mode"] = graph_mode
+        graph["scope"] = parsed
         return graph
 
-    def _looks_english_text(self, text: str) -> bool:
-        if not text:
-            return False
-        latin = sum(1 for ch in text if "a" <= ch.lower() <= "z")
-        cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-        return latin >= 12 and latin > cjk * 2
-
-    def _compact_english_snippet(self, text: str, limit: int = 80) -> str:
-        text = " ".join(str(text or "").replace("\n", " ").split())
-        replacements = {
-            "memory": "记忆", "project": "项目", "preference": "偏好", "rule": "规则",
-            "workflow": "流程", "procedure": "流程", "constraint": "约束", "fact": "事实",
-            "use": "使用", "should": "应", "must": "必须", "avoid": "避免",
-            "file": "文件", "folder": "文件夹", "source": "来源", "agent": "智能体",
-        }
-        words = text[:limit].split()
-        mapped = [replacements.get(w.strip(".,:;()[]{}\"'").lower(), w) for w in words[:16]]
-        return " ".join(mapped).strip()
-
     def _localized_record_fields(self, rec: dict) -> dict:
-        kind_labels = {
-            "fact": "事实", "preference": "偏好", "project": "项目", "episode": "事件",
-            "procedure": "流程", "correction": "纠错", "workflow": "流程", "constraint": "约束",
-        }
-        title = rec.get("title") or rec.get("memory_id", "")[:8]
-        body = rec.get("body") or ""
-        kind = rec.get("kind", "")
-        original_title = rec.get("original_title") or title
-        original_body = rec.get("original_body") or body
-        if rec.get("display_language") == "zh" and (rec.get("original_body") or not self._looks_english_text(title + " " + body)):
-            return {
-                "original_title": original_title,
-                "original_body": original_body,
-                "title_zh": title,
-                "body_zh": body,
-            }
-        if self._looks_english_text(title + " " + body):
-            base = self._compact_english_snippet(title or body, 64)
-            summary = self._compact_english_snippet(body or title, 220)
-            return {
-                "original_title": original_title,
-                "original_body": original_body,
-                "title_zh": f"{kind_labels.get(kind, '记忆')}：{base}",
-                "body_zh": f"中文辅助摘要：{summary}",
-            }
-        return {
-            "original_title": original_title,
-            "original_body": original_body,
-            "title_zh": title,
-            "body_zh": body,
-        }
+        from .memory_ir import localized_record_fields
+        return localized_record_fields(rec)
 
-    def _hydrate_neuron_graph_from_ir(self, graph: dict) -> dict:
+    def _hydrate_neuron_graph_from_projection(self, graph: dict) -> dict:
+        """从投影自身的边/子节点补齐 members 与 related（共享组与跨类型边）。
+
+        不依赖 Memory IR；已有 related/members 时追加去重，不覆盖已有条目。
+        """
+        if not graph or graph.get("empty"):
+            return graph
+        nodes = graph.get("nodes") or []
+        edges = graph.get("edges") or []
+        by_id = {n.get("id"): n for n in nodes if n.get("id")}
+        children: dict[str, list[dict]] = {}
+        by_memory: dict[str, dict] = {}
+        for n in nodes:
+            children.setdefault(str(n.get("parent_id") or ""), []).append(n)
+            mid = n.get("memory_id")
+            if mid:
+                by_memory[mid] = n
+
+        label_map = {
+            "related": "相似关联",
+            "shared_source": "同源跨类型",
+            "duplicate": "重复候选",
+        }
+        related_by_mid: dict[str, list[dict]] = {}
+        for edge in edges:
+            etype = str(edge.get("edge_type") or "")
+            if etype not in label_map:
+                continue
+            a = by_id.get(edge.get("source"))
+            b = by_id.get(edge.get("target"))
+            if not a or not b:
+                continue
+            for src, dst in ((a, b), (b, a)):
+                mid = src.get("memory_id")
+                oid = dst.get("memory_id")
+                if not mid or not oid or mid == oid:
+                    continue
+                bucket = related_by_mid.setdefault(mid, [])
+                if any(x.get("memory_id") == oid and x.get("relation") == etype for x in bucket):
+                    continue
+                bucket.append({
+                    "memory_id": oid,
+                    "title": dst.get("title") or dst.get("label") or oid[:8],
+                    "kind": dst.get("kind") or "",
+                    "body_preview": (dst.get("body") or "")[:160],
+                    "relation": etype,
+                    "relation_label": label_map[etype],
+                    "relation_reason": str(edge.get("reason") or edge.get("label") or ""),
+                })
+
+        for node in nodes:
+            kind = node.get("node_kind")
+            member_ids = list(node.get("member_ids") or [])
+            if not member_ids and kind == "source_hub":
+                member_ids = [
+                    c.get("memory_id")
+                    for c in children.get(node.get("id") or "", [])
+                    if c.get("node_kind") == "claim_anchor" and c.get("memory_id")
+                ]
+                node["member_ids"] = member_ids
+            if member_ids and not node.get("members"):
+                members = []
+                for mid in member_ids:
+                    claim = by_memory.get(mid)
+                    if not claim:
+                        continue
+                    members.append({
+                        "memory_id": mid,
+                        "title": claim.get("title") or claim.get("label") or mid[:8],
+                        "kind": claim.get("kind") or "",
+                        "body_preview": (claim.get("body") or "")[:180],
+                    })
+                if members:
+                    node["members"] = members
+            mid = node.get("memory_id")
+            if not mid:
+                continue
+            extra = related_by_mid.get(mid) or []
+            if not extra:
+                continue
+            existing = list(node.get("related") or [])
+            seen = {(x.get("memory_id"), x.get("relation") or x.get("relation_label")) for x in existing}
+            for item in extra:
+                key = (item.get("memory_id"), item.get("relation"))
+                if key in seen:
+                    continue
+                existing.append(item)
+                seen.add(key)
+            node["related"] = existing[:12]
+        return graph
+
+    def _hydrate_neuron_graph_from_ir(self, graph: dict,
+                                     allowed_memory_ids: set | None = None) -> dict:
         if not graph or graph.get("empty"):
             return graph
         ir_path = Path(self.workspace).resolve() / ".memoryguard" / "ir" / "current.json"
@@ -987,6 +2300,8 @@ class GovernanceApi:
         except Exception:
             return graph
         records = {r.get("memory_id"): r for r in data.get("records", []) if r.get("memory_id")}
+        if allowed_memory_ids is not None:
+            records = {mid: rec for mid, rec in records.items() if mid in allowed_memory_ids}
         duplicate_groups = data.get("duplicate_groups", [])
         related_by_id: dict[str, list[dict]] = {mid: [] for mid in records}
         for group in duplicate_groups:
@@ -1006,6 +2321,8 @@ class GovernanceApi:
                         "kind": rec.get("kind", ""),
                         "body_preview": (rec.get("body") or "")[:160],
                         "relation": "duplicate_candidate",
+                        "relation_label": "重复候选",
+                        "relation_reason": f"同属重复组 {str(group.get('group_id', ''))[:8]}",
                         **localized,
                     })
         for node in graph.get("nodes", []):
@@ -1047,98 +2364,234 @@ class GovernanceApi:
                     node["body"] = "\n".join(f"- {m['title']}: {m['body_preview']}" for m in members)
         return graph
 
-    def build_projection(self, confirmed: bool = False, mode: str = "reconstructed") -> dict:
-        """构建神经图投影（需用户确认）。
+    def build_projection(self, confirmed: bool = False, mode: str = "reconstructed",
+                         scope: dict | None = None,
+                         agent_instance_id: str = "",
+                         share_group_id: str = "",
+                         progress=None,
+                         llm_agent: str = "",
+                         llm_cli: str = "",
+                         enrich_mode: str = "auto") -> dict:
+        """构建 scoped 神经图投影。重构/共享组路径会入队并用 LLM 整理后再出图。
 
-        v3.1 §6.3：构建时同步为每个 agent_instance 创建 ManagedStore initial
-        version（若不存在），并聚合 7 项 meta 信息注入投影。
+        enrich_mode: auto|host|cli|heuristic
+        llm_agent=host/skill/mcp 时强制 host（留给 Skill 对话模型整理）。
         """
         if not confirmed:
             return {"error": "需要确认才能构建投影"}
+
+        resolved_enrich = (enrich_mode or "auto").strip().lower()
+        if (llm_agent or "").strip().lower() in {"host", "skill", "mcp"}:
+            resolved_enrich = "host"
+            llm_agent, llm_cli = "host", ""
+        elif llm_agent and llm_cli and resolved_enrich == "auto":
+            resolved_enrich = "cli"
+
+        def _progress(phase: str, message: str, percent: int | None = None) -> None:
+            if not callable(progress):
+                return
+            # 允许 BuildCancelled 向上抛出以便中断构建
+            progress(phase, message, percent)
+
+        from .governance_scope import (
+            GovernanceScope, build_shared_memory_graph, scope_storage_key,
+            resolve_scoped_roots, filter_ir_for_agent, save_scope_preference,
+            share_group_projection_path, authorized_roots_digest,
+        )
         from .memory_ir import MemoryNormalizer
         from .projection import ProjectionBuilder
         from .source_registry import SourceRegistry, ScanBudget
         from .managed_store import ManagedStore
         from .agent_locator import AgentLocator, compute_takeover_state
-        from .schema_v3 import TakeoverState
         from pathlib import Path
+        import json as _json
 
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        if err:
+            return {"error": err}
+        gscope = GovernanceScope.from_dict(parsed)
+        save_scope_preference(self.workspace, gscope)
+
+        if gscope.mode == "share_group":
+            apply_stats: dict = {"applied": 0, "rejected": 0, "engine": "none"}
+            if mode != "native":
+                from .host_enrichment import enqueue_from_shared_store, get_status
+                _progress("enrich_queue", "正在入队待整理项…", 25)
+                enqueued = enqueue_from_shared_store(
+                    self.workspace, gscope.share_group_id, reason="share_group_rebuild",
+                )
+                if resolved_enrich == "host":
+                    _progress("enrich", "宿主 Skill 模式：不在 GUI 内调模型，等待对话整理…", 45)
+                else:
+                    _progress("enrich", "正在用 LLM 整理共享记忆…", 45)
+                apply_stats = _enrich_pending_during_build(
+                    self.workspace,
+                    share_group_id=gscope.share_group_id,
+                    llm_agent=llm_agent,
+                    llm_cli=llm_cli,
+                    progress=progress,
+                    enrich_mode=resolved_enrich,
+                )
+                apply_stats["enqueued"] = enqueued
+                # host：只要选了宿主 Skill，就算暂无 pending 也不能谎称「已模型整理」
+                if resolved_enrich == "host":
+                    apply_stats["engine"] = apply_stats.get("engine") or "host_deferred"
+                    if apply_stats.get("pending_count", 0) > 0:
+                        apply_stats["host_action_required"] = True
+                    apply_stats["hint"] = (
+                        "宿主 Skill 未在对话中执行：请让 Cursor 对话调用 "
+                        "memoryguard_list_pending_enrichments → 整理 → apply → 再 build。"
+                        "GUI 无法自动唤起当前聊天。"
+                    )
+            _progress("graph", "正在构建共享组投影…", 75)
+            graph = build_shared_memory_graph(self.workspace, gscope.share_group_id)
+            out_path = share_group_projection_path(self.workspace, gscope)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            tomb = out_path.with_suffix(out_path.suffix + ".deleted")
+            if tomb.exists():
+                tomb.unlink()
+            out_path.write_text(_json.dumps(graph, ensure_ascii=False, indent=2), encoding="utf-8")
+            graph["built"] = True
+            from .host_enrichment import get_status
+            enr_status = get_status(self.workspace, share_group_id=gscope.share_group_id)
+            graph["enrichment"] = {
+                "pending_count": enr_status["pending"],
+                "applied_count": enr_status["applied"],
+                "enqueued": apply_stats.get("enqueued", 0),
+                "auto_applied": apply_stats.get("applied", 0),
+                "auto_rejected": apply_stats.get("rejected", 0),
+                "engine": apply_stats.get("engine", "none"),
+                "enrich_mode": apply_stats.get("enrich_mode", resolved_enrich),
+                "host_action_required": bool(apply_stats.get("host_action_required")),
+                "pending_tasks": apply_stats.get("pending_tasks") or [],
+                "mode": "build_integrated",
+                "hint": apply_stats.get("hint") or (
+                    "宿主 Skill 请立即整理 pending 后 apply"
+                    if apply_stats.get("host_action_required")
+                    else "构建内已整理；残留 pending 可用 MCP list/apply 补做"
+                ),
+            }
+            graph["scope"] = parsed
+            _progress("done", "共享组投影已生成", 100)
+            return graph
+
+        _progress("scan", "正在扫描已授权来源…", 8)
         reg = SourceRegistry(self.workspace)
         snap = reg.scan(ScanBudget())
-        roots = reg.list_sources()
-        root_map = {r.root_id: r.path for r in roots}
-        root_policies = {r.root_id: {"source_category": r.source_category, "ingestion_policy": r.ingestion_policy} for r in roots}
-
+        all_roots = reg.list_sources()
+        root_map = {r.root_id: r.path for r in all_roots}
+        root_policies = {
+            r.root_id: {
+                "source_category": r.source_category,
+                "ingestion_policy": r.ingestion_policy,
+            }
+            for r in all_roots
+        }
+        _progress("normalize", "正在规范化记忆 IR…", 22)
         norm = MemoryNormalizer(self.workspace)
-        ir = norm.load()
-        if ir is None or ir.snapshot_id != snap.snapshot_id:
-            ir = norm.normalize(snap, root_map=root_map, root_policies=root_policies)
-            norm.save(ir)
+        global_ir = norm.load()
+        if global_ir is None or global_ir.snapshot_id != snap.snapshot_id:
+            global_ir = norm.normalize(snap, root_map=root_map, root_policies=root_policies)
+            norm.ensure_localized(global_ir)
+            norm.save(global_ir)
         else:
-            changed = norm.filter_by_source_policies(ir, snap, root_policies)
-            changed = norm.ensure_localized(ir) or changed
+            changed = norm.filter_by_source_policies(global_ir, snap, root_policies)
+            changed = norm.ensure_localized(global_ir) or changed
             if changed:
-                norm.save(ir)
+                norm.save(global_ir)
 
-        # 建立 source_object_id → source_root_id → agent_instance_id 映射
-        obj_to_root = {obj.source_object_id: obj.source_root_id
-                       for obj in snap.source_objects}
-        root_to_instance = {r.root_id: r.agent_instance_id
-                            for r in reg.list_sources() if r.agent_instance_id}
+        apply_stats = {"applied": 0, "rejected": 0, "engine": "none"}
+        _progress("scope", "正在按治理范围筛选记忆…", 40)
+        scoped_roots, rerr = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        if rerr:
+            return {"error": rerr}
+        allowed_ids = {r.root_id for r in scoped_roots}
+        scoped_ir = filter_ir_for_agent(global_ir, allowed_ids, snap)
 
-        # 按 agent_instance_id 分组 records
-        instance_records: dict[str, list] = {}
-        for rec in ir.records:
-            for prov in rec.provenance:
-                root_id = obj_to_root.get(prov.source_object_id, "")
-                inst_id = root_to_instance.get(root_id, "")
-                if inst_id:
-                    instance_records.setdefault(inst_id, []).append(rec)
-                    break
+        agent_id = gscope.agent_instance_id
+        # 重构路径：入队 → LLM 整理 → 重载 IR 再出图（避免用旧内存建图）
+        if mode != "native":
+            from .host_enrichment import enqueue_from_ir
+            _progress("enrich_queue", "正在入队待整理项…", 48)
+            enqueue_from_ir(
+                self.workspace,
+                scoped_ir,
+                scope={"mode": "agent", "agent_instance_id": agent_id},
+                reason="projection_rebuild",
+            )
+            if resolved_enrich == "host":
+                _progress("enrich", "宿主 Skill 模式：不在 GUI 内调模型，等待对话整理…", 58)
+            else:
+                _progress("enrich", "正在用 LLM 整理记忆…", 58)
+            apply_stats = _enrich_pending_during_build(
+                self.workspace,
+                agent_instance_id=agent_id,
+                llm_agent=llm_agent,
+                llm_cli=llm_cli,
+                progress=progress,
+                enrich_mode=resolved_enrich,
+            )
+            if resolved_enrich == "host":
+                apply_stats["engine"] = apply_stats.get("engine") or "host_deferred"
+                if apply_stats.get("pending_count", 0) > 0:
+                    apply_stats["host_action_required"] = True
+                apply_stats["hint"] = (
+                    "宿主 Skill 未在对话中执行：请让 Cursor 对话调用 "
+                    "memoryguard_list_pending_enrichments → 整理 → apply → 再 build。"
+                    "GUI 无法自动唤起当前聊天。"
+                )
+            if apply_stats.get("applied", 0) > 0:
+                reloaded = norm.load()
+                if reloaded is not None:
+                    global_ir = reloaded
+                    scoped_ir = filter_ir_for_agent(global_ir, allowed_ids, snap)
 
-        # 为每个 agent_instance 创建/更新 ManagedStore initial version
-        managed_meta: dict[str, dict] = {}
-        for inst_id, recs in instance_records.items():
-            store = ManagedStore(self.workspace, inst_id)
-            if store.get_active_version_id() is None:
-                store.create_initial_version(recs)
-            active = store.get_active_version()
-            managed_meta[inst_id] = {
+        store = ManagedStore(self.workspace, agent_id)
+        if store.get_active_version_id() is None:
+            store.create_initial_version(scoped_ir.records)
+        else:
+            store.sync_records_from_ir(scoped_ir.records, notes="projection rebuild sync")
+        active = store.get_active_version()
+        managed_meta = {
+            agent_id: {
                 "version_id": active.version_id if active else "",
-                "record_count": len(recs),
+                "record_count": len(scoped_ir.records),
                 "decision_count": active.decision_count if active else 0,
             }
+        }
 
-        # 聚合 7 项状态 meta
+        _progress("graph", "正在生成神经图投影…", 78)
         locator = AgentLocator(self.workspace)
         instances, ledgers = locator.detect_instances()
         cov_counts = snap.coverage.counts()
         cov_status = snap.coverage.status().value
-        # 读取已发布的 release（若有）
         releases_list: list[dict] = []
         try:
             from .release_manager import ReleaseManager
-            rm = ReleaseManager(self.workspace)
-            releases_list = rm.list_releases()
+            releases_list = ReleaseManager(self.workspace).list_releases()
         except Exception:
             pass
 
         agent_instances_meta = []
         for inst in instances:
+            if inst.instance_id != agent_id:
+                continue
             inst_ledger = ledgers.get(inst.instance_id)
             mm = managed_meta.get(inst.instance_id, {})
             has_managed = bool(mm)
-            # 接管状态机
             takeover_state = compute_takeover_state(
                 instance=inst,
                 ledger=inst_ledger,
                 selection_committed=has_managed,
                 canonicalized=has_managed,
-                release_planned=any(r.get("instance_id") == inst.instance_id
-                                    for r in releases_list),
-                published=any(r.get("instance_id") == inst.instance_id
-                              and r.get("status") == "applied"
-                              for r in releases_list),
+                release_planned=any(r.get("instance_id") == inst.instance_id for r in releases_list),
+                published=any(
+                    r.get("instance_id") == inst.instance_id and r.get("status") == "applied"
+                    for r in releases_list
+                ),
                 runtime_verified=False,
                 drifted=False,
             )
@@ -1160,55 +2613,282 @@ class GovernanceApi:
             "coverage_status": cov_status,
             "release_count": len(releases_list),
             "drifted": False,
+            "governance_scope": parsed,
+            "authorized_root_ids": sorted(allowed_ids),
+            "authorized_roots_digest": authorized_roots_digest(allowed_ids),
         }
-
         graph_mode = "native" if mode == "native" else "reconstructed"
-        pb = ProjectionBuilder(self.workspace, graph_mode)
-        proj = pb.build(ir, meta=meta)
+        key = scope_storage_key(gscope)
+        pb = ProjectionBuilder(self.workspace, graph_mode, scope_key=key)
+        proj = pb.build(scoped_ir, meta=meta)
+        _progress("save", "正在保存投影…", 92)
         pb.save(proj)
         result = proj.to_dict()
         result["mode"] = graph_mode
-        result["projection_kind"] = "native_memory_projection" if graph_mode == "native" else "reconstructed_governance_projection"
+        result["scope"] = parsed
+        result["projection_kind"] = (
+            "native_memory_projection" if graph_mode == "native"
+            else "reconstructed_governance_projection"
+        )
+        result["scoped_record_count"] = len(scoped_ir.records)
+        result["scoped_root_count"] = len(scoped_roots)
+        from .host_enrichment import get_status
+        enr_status = get_status(self.workspace, agent_instance_id=agent_id)
+        result["enrichment"] = {
+            "pending_count": enr_status["pending"],
+            "applied_count": enr_status["applied"],
+            "auto_applied": apply_stats.get("applied", 0),
+            "auto_rejected": apply_stats.get("rejected", 0),
+            "engine": apply_stats.get("engine", "none"),
+            "enrich_mode": apply_stats.get("enrich_mode", resolved_enrich if mode != "native" else "none"),
+            "host_action_required": bool(apply_stats.get("host_action_required")),
+            "pending_tasks": apply_stats.get("pending_tasks") or [],
+            "mode": "build_integrated" if mode != "native" else "skipped",
+            "hint": apply_stats.get("hint") or (
+                "宿主 Skill 请立即整理 pending 后 apply"
+                if apply_stats.get("host_action_required")
+                else "构建内已整理；残留 pending 可用 MCP list/apply 补做"
+            ),
+        }
+        _progress("done", "构建完成", 100)
         return result
 
-    def delete_projection(self, confirmed: bool = False, mode: str = "reconstructed") -> dict:
-        """删除神经图投影文件。投影可从 IR + DecisionLog 完整重建。"""
+    def start_build_projection(self, confirmed: bool = False, mode: str = "reconstructed",
+                               scope: dict | None = None,
+                               agent_instance_id: str = "",
+                               share_group_id: str = "",
+                               llm_agent: str = "",
+                               llm_cli: str = "",
+                               enrich_mode: str = "auto") -> dict:
+        """后台启动构建（含 LLM 整理），立即返回 job_id。"""
+        if not confirmed:
+            return {"error": "需要确认才能构建投影"}
+        import threading
+        import uuid
+
+        with self._build_lock:
+            if self._active_build_job:
+                active = self._build_jobs.get(self._active_build_job) or {}
+                if active.get("status") == "running":
+                    return {
+                        "error": "构建进行中，请勿重复点击",
+                        "busy": True,
+                        "job_id": self._active_build_job,
+                        "status": "running",
+                    }
+            job_id = uuid.uuid4().hex[:12]
+            self._build_jobs[job_id] = {
+                "job_id": job_id,
+                "status": "running",
+                "phase": "starting",
+                "message": "正在启动构建…",
+                "percent": 0,
+                "result": None,
+                "error": "",
+                "cancel_requested": False,
+            }
+            self._active_build_job = job_id
+
+        def _run() -> None:
+            def progress(phase: str, message: str, percent: int | None = None) -> None:
+                with self._build_lock:
+                    job = self._build_jobs.get(job_id)
+                    if not job:
+                        return
+                    if job.get("cancel_requested"):
+                        raise BuildCancelled("用户取消构建")
+                    job["phase"] = phase
+                    job["message"] = message
+                    if percent is not None:
+                        job["percent"] = percent
+
+            try:
+                result = self.build_projection(
+                    confirmed=True,
+                    mode=mode,
+                    scope=scope,
+                    agent_instance_id=agent_instance_id,
+                    share_group_id=share_group_id,
+                    progress=progress,
+                    llm_agent=llm_agent,
+                    llm_cli=llm_cli,
+                    enrich_mode=enrich_mode,
+                )
+                with self._build_lock:
+                    job = self._build_jobs.get(job_id)
+                    if not job:
+                        return
+                    if job.get("cancel_requested"):
+                        job["status"] = "cancelled"
+                        job["message"] = "构建已取消"
+                        job["phase"] = "cancelled"
+                        job["percent"] = job.get("percent") or 0
+                        job["error"] = ""
+                    elif result.get("error"):
+                        job["status"] = "error"
+                        job["error"] = str(result["error"])
+                        job["message"] = str(result["error"])
+                        job["percent"] = 100
+                    else:
+                        job["status"] = "done"
+                        job["result"] = result
+                        job["message"] = "构建完成"
+                        job["phase"] = "done"
+                        job["percent"] = 100
+            except BuildCancelled:
+                with self._build_lock:
+                    job = self._build_jobs.get(job_id)
+                    if job:
+                        job["status"] = "cancelled"
+                        job["message"] = "构建已取消"
+                        job["phase"] = "cancelled"
+                        job["error"] = ""
+            except Exception as exc:
+                with self._build_lock:
+                    job = self._build_jobs.get(job_id)
+                    if job:
+                        if job.get("cancel_requested"):
+                            job["status"] = "cancelled"
+                            job["message"] = "构建已取消"
+                            job["phase"] = "cancelled"
+                            job["error"] = ""
+                        else:
+                            job["status"] = "error"
+                            job["error"] = str(exc)
+                            job["message"] = str(exc)
+                            job["percent"] = 100
+            finally:
+                with self._build_lock:
+                    if self._active_build_job == job_id:
+                        self._active_build_job = None
+
+        threading.Thread(target=_run, daemon=True, name=f"mg-build-{job_id}").start()
+        return {"job_id": job_id, "status": "running", "message": "正在启动构建…"}
+
+    def cancel_build_projection(self, job_id: str = "", confirmed: bool = False) -> dict:
+        """请求取消正在进行的构建任务。"""
+        if not confirmed:
+            return {"error": "需要确认才能取消构建"}
+        with self._build_lock:
+            jid = job_id or self._active_build_job or ""
+            job = self._build_jobs.get(jid) if jid else None
+            if not job:
+                return {"error": "没有可取消的构建任务", "job_id": jid}
+            if job.get("status") != "running":
+                return {
+                    "ok": True,
+                    "job_id": jid,
+                    "status": job.get("status"),
+                    "message": "任务已不在运行",
+                }
+            job["cancel_requested"] = True
+            job["message"] = "正在取消…"
+            return {"ok": True, "job_id": jid, "status": "cancelling", "message": "正在取消…"}
+
+    def get_build_progress(self, job_id: str = "") -> dict:
+        """读取构建任务进度（只读）。"""
+        with self._build_lock:
+            jid = job_id or self._active_build_job or ""
+            job = self._build_jobs.get(jid) if jid else None
+            if not job:
+                return {"status": "unknown", "error": "job not found", "job_id": jid}
+            out = {
+                "job_id": job.get("job_id", jid),
+                "status": job.get("status", "unknown"),
+                "phase": job.get("phase", ""),
+                "message": job.get("message", ""),
+                "percent": job.get("percent", 0),
+                "error": job.get("error", ""),
+                "cancel_requested": bool(job.get("cancel_requested")),
+            }
+            if job.get("status") == "done":
+                out["result"] = job.get("result")
+            return out
+
+    def delete_projection(self, confirmed: bool = False, mode: str = "reconstructed",
+                          scope: dict | None = None,
+                          agent_instance_id: str = "",
+                          share_group_id: str = "") -> dict:
+        """删除当前 scope 的投影文件。"""
         if not confirmed:
             return {"error": "需要确认才能删除投影"}
+        from .governance_scope import GovernanceScope, scope_storage_key, share_group_projection_path
         from .projection import ProjectionBuilder
+
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+        )
+        if err:
+            return {"error": err}
+        gscope = GovernanceScope.from_dict(parsed)
         graph_mode = "native" if mode == "native" else "reconstructed"
-        pb = ProjectionBuilder(self.workspace, graph_mode)
+        if gscope.mode == "share_group":
+            path = share_group_projection_path(self.workspace, gscope)
+            if path.exists():
+                path.unlink()
+            tomb = path.with_suffix(path.suffix + ".deleted")
+            tomb.parent.mkdir(parents=True, exist_ok=True)
+            tomb.write_text("deleted", encoding="utf-8")
+            return {"ok": True, "deleted": True, "mode": "share_group", "scope": parsed}
+        key = scope_storage_key(gscope)
+        pb = ProjectionBuilder(self.workspace, graph_mode, scope_key=key)
         pb.delete()
-        return {"ok": True, "deleted": True, "mode": graph_mode}
+        return {"ok": True, "deleted": True, "mode": graph_mode, "scope": parsed}
 
     # ------------------------------------------------------------------
     # SourceApi（spec §7.2）
     # ------------------------------------------------------------------
 
-    def list_publish_targets(self) -> dict:
+    def list_publish_targets(self, scope: dict | None = None,
+                               agent_instance_id: str = "") -> dict:
+        """列出当前 agent scope 可写回的 native 目标。"""
         from .source_registry import SourceRegistry
+        from .governance_scope import root_authorizes_agent, resolve_scoped_roots, GovernanceScope
+
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, mode="agent",
+        )
+        if err:
+            return {"error": err, "targets": [], "total": 0}
+        if parsed["mode"] != "agent":
+            return {"error": "agent_scope_required", "targets": [], "total": 0}
+        gscope = GovernanceScope.from_dict(parsed)
         native_categories = {"native_memory", "project_memory"}
+        roots, _ = resolve_scoped_roots(
+            SourceRegistry(self.workspace).list_all_sources(), gscope, enabled_only=True,
+        )
+        from .governance_scope import derive_publish_target_file, is_root_enabled_for_agent
         targets = []
-        for root in SourceRegistry(self.workspace).list_all_sources():
-            if not root.enabled or root.source_category not in native_categories:
+        for root in roots:
+            if root.source_category not in native_categories:
                 continue
+            if not root_authorizes_agent(root, gscope.agent_instance_id):
+                continue
+            if not is_root_enabled_for_agent(root, gscope.agent_instance_id):
+                continue
+            target_file = derive_publish_target_file(root)
             path = Path(root.path)
-            target_file = path if path.suffix else path / "memory.md"
             targets.append({
                 "root_id": root.root_id,
                 "display_name": root.display_name,
                 "target_file": str(target_file),
                 "source_category": root.source_category,
-                "agent_instance_id": root.agent_instance_id,
+                "agent_instance_id": gscope.agent_instance_id,
+                "authorized_agent_ids": list(getattr(root, "authorized_agent_ids", []) or []),
                 "surface_id": root.surface_id,
                 "scope": root.scope,
                 "project_ref": root.project_ref,
                 "ownership": root.ownership,
                 "target_role": root.target_role,
-                "is_agent_native_memory": root.source_category == "native_memory" and root.ownership == "agent_managed" and root.target_role == "takeover_input",
+                "is_agent_native_memory": (
+                    root.source_category == "native_memory"
+                    and root.ownership == "agent_managed"
+                    and root.target_role == "takeover_input"
+                ),
                 "path_kind": "file" if path.suffix else "folder_default_memory_md",
             })
-        return {"targets": targets, "total": len(targets)}
+        return {"targets": targets, "total": len(targets), "scope": parsed}
 
     def choose_publish_target_path(self, kind: str = "file") -> dict:
         import platform
@@ -1244,35 +2924,396 @@ class GovernanceApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def publish_reconstructed_memory(self, target_file: str, confirmed: bool = False) -> dict:
+    def publish_reconstructed_memory(self, target_file: str = "", confirmed: bool = False,
+                                   use_distilled: bool = True,
+                                   scope: dict | None = None,
+                                   agent_instance_id: str = "",
+                                   target_root_id: str = "") -> dict:
         if not confirmed:
             return {"error": "需要确认才能发布重构记忆"}
-        from .memory_ir import MemoryNormalizer
-        from .native_file_release import SafeNativeFilePublisher
-        norm = MemoryNormalizer(self.workspace)
-        ir = norm.load()
-        if ir is None:
-            return {"error": "没有可发布的重构记忆"}
-        lines = ["# Memory", ""]
-        for rec in ir.records:
-            status = rec.status.value if hasattr(rec.status, "value") else str(rec.status)
-            if status in {"rejected", "quarantined"}:
-                continue
-            lines.extend([f"## {rec.title}", "", rec.body, ""])
-        content = "\n".join(lines).encode("utf-8")
-        result = SafeNativeFilePublisher(self.workspace).apply({Path(target_file): content}, label="reconstructed-memory")
-        return result.to_dict()
+        import os
+        from .adapters import GenericMarkdownTarget
+        from .memory_ir import MemoryIR, MemoryNormalizer
+        from .release_manager import ReleaseManager
+        from .source_registry import SourceRegistry, ScanBudget
+        from .managed_store import ManagedStore
+        from .governance_scope import (
+            GovernanceScope, filter_ir_for_agent, resolve_scoped_roots,
+            root_authorizes_agent, derive_publish_target_file, is_root_enabled_for_agent,
+        )
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, mode="agent",
+        )
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None:
+            return {"error": f"target_root_not_found: {target_root_id}"}
+        if not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
+        if not is_root_enabled_for_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_disabled_for_agent"}
+        native_categories = {"native_memory", "project_memory"}
+        if root.source_category not in native_categories:
+            return {"error": "target_root_not_publishable_category"}
+        # 服务端派生路径；客户端 target_file 仅作一致性校验（可空）
+        derived = derive_publish_target_file(root)
+        if target_file:
+            try:
+                if Path(target_file).resolve() != derived:
+                    return {"error": "target_file_mismatch_root"}
+            except OSError:
+                return {"error": "target_file_mismatch_root"}
+        target_file = str(derived)
+        if os.environ.get("MEMORYGUARD_PUBLISH_RAW") == "1":
+            use_distilled = False
 
-    def rollback_native_memory_release(self, release_id: str, force: bool = False, confirmed: bool = False) -> dict:
+        agent_id = gscope.agent_instance_id
+        store = ManagedStore(self.workspace, agent_id)
+        norm = MemoryNormalizer(self.workspace)
+        global_ir = norm.load()
+        snap = reg.scan(ScanBudget())
+        scoped_roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        allowed_ids = {r.root_id for r in scoped_roots}
+        if not allowed_ids:
+            return {"error": "no_authorized_roots"}
+        if global_ir is None:
+            return {"error": "没有可发布的重构记忆"}
+        if norm.ensure_localized(global_ir):
+            norm.save(global_ir)
+        # 合成 obj→root：文件缺失时 scan 可能漏对象，仍按稳定 hash 归属（防误拒）
+        from .source_registry import normalize_rel_path
+        from .schema_v3 import stable_hash
+        obj_to_root = {obj.source_object_id: obj.source_root_id for obj in snap.source_objects}
+        for r in scoped_roots:
+            p = Path(r.path)
+            if p.suffix:
+                oid = stable_hash(r.root_id, normalize_rel_path(p.name))
+                obj_to_root.setdefault(oid, r.root_id)
+            else:
+                for name in ("memory.md", p.name):
+                    oid = stable_hash(r.root_id, normalize_rel_path(name))
+                    obj_to_root.setdefault(oid, r.root_id)
+        scoped_ir = filter_ir_for_agent(
+            global_ir, allowed_ids, snap, obj_to_root=obj_to_root,
+        )
+        # ManagedStore 仅覆盖 status；rejected 不发布；不得整条替换绕过过滤
+        if store.get_active_version_id() is not None:
+            import copy as _copy
+            managed_by_id = {r.memory_id: r for r in store.list_records()}
+            merged = []
+            for rec in scoped_ir.records:
+                managed = managed_by_id.get(rec.memory_id)
+                if managed is None:
+                    merged.append(rec)
+                    continue
+                status_val = getattr(managed.status, "value", str(managed.status))
+                if status_val == "rejected":
+                    continue
+                overlay = _copy.deepcopy(rec)
+                overlay.status = managed.status
+                merged.append(overlay)
+            ir = MemoryIR(
+                records=merged,
+                duplicate_groups=list(scoped_ir.duplicate_groups),
+                snapshot_id=scoped_ir.snapshot_id or f"managed-{agent_id}",
+            )
+        else:
+            ir = scoped_ir
+        if not ir.records:
+            return {"error": "scoped_ir_empty"}
+        publish_ir, distill_stats, source_map = _build_publish_ir(
+            ir, self.workspace, use_distilled,
+        )
+        publish_ir, redactions = _redact_publish_ir(publish_ir, source_map)
+        target_dir, exact_file, path_warnings = _resolve_publish_target_dir(target_file)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        rm = ReleaseManager(self.workspace)
+        target_adapter = GenericMarkdownTarget()
+        try:
+            plan = rm.create_build_plan(
+                publish_ir, target_adapter, target_dir,
+                governance_scope=parsed, target_root_id=target_root_id,
+            )
+            release = rm.apply_build(
+                plan.plan_id, target_adapter, target_dir, approval=True,
+                expected_scope=parsed, expected_target_root_id=target_root_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        ok = _release_ok(release.status)
+        errors: list[str] = []
+        if ok and exact_file is not None and exact_file.name.lower() != "memory.md":
+            try:
+                release = _sync_exact_file_into_release(
+                    release, target_dir, exact_file, self.workspace,
+                )
+            except Exception as exc:
+                try:
+                    rb = rm.rollback_release(
+                        release.release_id,
+                        target_adapter,
+                        target_dir,
+                        release_override=release,
+                        expected_scope=parsed,
+                        expected_target_root_id=target_root_id,
+                        expected_target_path=target_dir,
+                    )
+                    ok = False
+                    errors = [f"exact_file sync failed: {exc}"]
+                    rb_result = (rb.verify_result or {}).get("rollback_result", {})
+                    errors.extend(rb_result.get("errors", []))
+                    release = rb
+                except Exception as rb_exc:
+                    vr = target_adapter.rollback(release, target_dir)
+                    ok = False
+                    errors = [
+                        f"exact_file sync failed: {exc}",
+                        f"rollback: {rb_exc}",
+                        *list(vr.errors or []),
+                    ]
+        releases_dir = Path(self.workspace) / ".memoryguard" / "releases"
+        manifest_path = str(releases_dir / f"{release.release_id}.json")
+        if not ok and not errors:
+            vr = release.verify_result or {}
+            errors = list(vr.get("errors", []))
+        out: dict = {
+            "ok": ok,
+            "release_id": release.release_id,
+            "status": release.status.value if hasattr(release.status, "value") else str(release.status),
+            "build_id": release.build_id,
+            "record_type": "memory_release",
+            "distilled": use_distilled,
+            "verify_result": release.verify_result,
+            "manifest_path": manifest_path,
+            "errors": errors,
+            "published_record_count": plan.manifest.published_record_count,
+            "record_mapping_count": len(plan.manifest.record_mappings),
+            "scope": parsed,
+            "target_root_id": target_root_id,
+            "published_target_file": str(derived),
+        }
+        if ok and exact_file is not None and exact_file.name.lower() != "memory.md":
+            out["published_target_file"] = str(exact_file.resolve())
+            out["sidecar_memory_md"] = str(target_dir / "memory.md")
+        if distill_stats is not None:
+            out["distill_stats"] = distill_stats
+        if redactions:
+            out["redactions"] = redactions
+        if path_warnings:
+            out["warnings"] = path_warnings
+        if ok:
+            targets = self.list_publish_targets(scope=parsed).get("targets", [])
+            matched_target = next(
+                (t for t in targets if t.get("root_id") == target_root_id),
+                None,
+            )
+            if matched_target:
+                surface_id = matched_target.get("surface_id", "") or "generic_markdown"
+                is_native = matched_target.get("is_agent_native_memory", False)
+                capability = "native_takeover" if is_native else "export_only"
+                verify_result = _verify_takeover(
+                    target_dir, exact_file, publish_ir,
+                    surface_id=surface_id, capability=capability,
+                )
+                out["takeover_verify"] = verify_result
+                try:
+                    releases_dir = Path(self.workspace) / ".memoryguard" / "releases"
+                    release_path = releases_dir / f"{release.release_id}.json"
+                    if release_path.exists():
+                        rdata = _json.loads(release_path.read_text(encoding="utf-8"))
+                        rdata["takeover_verify"] = verify_result
+                        rdata["runtime_verified"] = verify_result.get("runtime_verified", False)
+                        tmp = release_path.with_name(release_path.name + ".tmp")
+                        tmp.write_text(
+                            _json.dumps(rdata, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        os.replace(tmp, release_path)
+                except Exception:
+                    pass
+        return out
+
+    def rollback_native_memory_release(
+        self,
+        release_id: str,
+        force: bool = False,
+        confirmed: bool = False,
+        scope: dict | None = None,
+        agent_instance_id: str = "",
+        target_root_id: str = "",
+    ) -> dict:
         if not confirmed:
             return {"error": "需要确认才能回滚原生记忆"}
+        from .adapters import GenericMarkdownTarget
+        from .change_history import get_release
         from .native_file_release import SafeNativeFilePublisher
-        return SafeNativeFilePublisher(self.workspace).rollback(release_id, force=force).to_dict()
+        from .release_manager import ReleaseManager
+        from .schema_v3 import ReleaseStatus
+        from .source_registry import SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, derive_publish_target_file, root_authorizes_agent,
+        )
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
+        derived = derive_publish_target_file(root)
+        derived_dir = derived.parent if derived.suffix else derived
+        file_root = bool(Path(root.path).suffix) or bool(derived.suffix)
+        try:
+            derived_res = derived.resolve()
+            derived_dir_res = derived_dir.resolve()
+        except OSError:
+            return {"error": "target_root_path_unresolvable"}
 
-    def list_native_memory_releases(self) -> dict:
+        def _path_authorized(path: Path) -> bool:
+            try:
+                p = path.resolve()
+            except OSError:
+                return False
+            if file_root:
+                # 单文件 root：只允许精确命中目标文件，禁止同目录兄弟
+                return p == derived_res
+            if p == derived_dir_res:
+                return True
+            try:
+                p.relative_to(derived_dir_res)
+                return True
+            except ValueError:
+                return False
+
+        if release_id.startswith("nrel-"):
+            pub = SafeNativeFilePublisher(self.workspace)
+            native_manifest = Path(self.workspace) / ".memoryguard" / "native_releases" / release_id / "manifest.json"
+            if not native_manifest.exists():
+                return {"error": "release not found"}
+            import json as _json
+            manifest = _json.loads(native_manifest.read_text(encoding="utf-8"))
+            targets = [Path(item.get("target_path", "")) for item in manifest.get("files", [])]
+            if not targets or any(not _path_authorized(t) for t in targets if str(t)):
+                return {"error": "native_release_not_authorized_for_agent"}
+            return pub.rollback(release_id, force=force).to_dict()
+
+        data = get_release(Path(self.workspace), release_id)
+        if data is not None:
+            try:
+                ReleaseManager.validate_release_binding(
+                    data,
+                    expected_scope=parsed,
+                    expected_target_root_id=target_root_id,
+                    expected_target_path=derived_dir,
+                )
+            except ValueError as exc:
+                return {"error": str(exc)}
+            target_dir = derived_dir
+            rm = ReleaseManager(self.workspace)
+            target = GenericMarkdownTarget()
+            rb = rm.rollback_release(
+                release_id, target, target_dir,
+                expected_scope=parsed,
+                expected_target_root_id=target_root_id,
+                expected_target_path=derived_dir,
+            )
+            rb_result = rb.verify_result.get("rollback_result", {})
+            errors = list(rb_result.get("errors", []))
+            errors.extend(_verify_exact_file_after_rollback(data))
+            ok = (
+                rb.status == ReleaseStatus.ROLLED_BACK
+                and not errors
+                and rb_result.get("rescan_match", False)
+            )
+            return {
+                "ok": ok,
+                "release_id": rb.release_id,
+                "status": rb.status.value if hasattr(rb.status, "value") else str(rb.status),
+                "errors": errors,
+            }
+        native_manifest = (
+            Path(self.workspace) / ".memoryguard" / "native_releases" / release_id / "manifest.json"
+        )
+        if native_manifest.exists():
+            return {"error": "native_release_missing_scope_binding"}
+        return {"error": f"release not found: {release_id}"}
+
+    def list_native_memory_releases(
+        self,
+        scope: dict | None = None,
+        agent_instance_id: str = "",
+    ) -> dict:
+        from .change_history import get_release
         from .native_file_release import SafeNativeFilePublisher
-        releases = SafeNativeFilePublisher(self.workspace).list_releases()
-        return {"releases": releases, "total": len(releases)}
+        from .release_manager import ReleaseManager
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        # 无 scope 时仍可列出，但仅返回带绑定且匹配当前 agent 的项；无 scope → 空列表 fail closed
+        agent_filter = ""
+        if parsed and parsed.get("mode") == "agent":
+            agent_filter = parsed.get("agent_instance_id", "")
+        elif agent_instance_id:
+            agent_filter = agent_instance_id
+        native = SafeNativeFilePublisher(self.workspace).list_releases()
+        for item in native:
+            item["source"] = "native_file"
+            # 旧 native 无 scope 绑定：仅在未过滤时可见；有 agent_filter 时隐藏
+            item["governance_scope"] = {}
+            item["target_root_id"] = ""
+        rm_items: list[dict] = []
+        for event in ReleaseManager(self.workspace).list_releases():
+            release_id = event.get("event_id", "")
+            raw = get_release(Path(self.workspace), release_id) if release_id else None
+            status = event.get("status", "")
+            changed = list(raw.get("changed_paths", [])) if raw else []
+            can_rollback = status in ("verified", "applied")
+            scope_data = (raw or {}).get("governance_scope") or event.get("governance_scope") or {}
+            root_id = str((raw or {}).get("target_root_id") or event.get("target_root_id") or "")
+            rm_items.append({
+                "release_id": release_id,
+                "label": raw.get("label", "") if raw else "",
+                "created_at": event.get("applied_at", ""),
+                "applied_at": event.get("applied_at", ""),
+                "status": status,
+                "file_count": len(changed) or event.get("changed_count", 0),
+                "targets": changed,
+                "can_rollback": can_rollback,
+                "rollback_reason": (
+                    "可恢复" if can_rollback
+                    else "已经恢复过" if status == "rolled_back"
+                    else ""
+                ),
+                "source": "release_manager",
+                "target_profile": event.get("target_profile", ""),
+                "governance_scope": scope_data,
+                "target_root_id": root_id,
+            })
+        seen: set[str] = set()
+        merged: list[dict] = []
+        for item in native + rm_items:
+            rid = item.get("release_id", "")
+            if rid and rid in seen:
+                continue
+            if agent_filter:
+                item_agent = str((item.get("governance_scope") or {}).get("agent_instance_id", "") or "")
+                if item.get("source") == "native_file" and not item_agent:
+                    continue  # 无绑定的旧 native 在显式 agent 过滤下不可见
+                if item_agent and item_agent != agent_filter:
+                    continue
+                if item.get("source") == "release_manager" and not item_agent:
+                    continue
+            if rid:
+                seen.add(rid)
+            merged.append(item)
+        merged.sort(key=lambda x: x.get("applied_at") or x.get("created_at", ""), reverse=True)
+        return {"releases": merged, "total": len(merged)}
 
     def list_sources(self) -> dict:
         from .source_registry import SourceRegistry
@@ -1542,10 +3583,19 @@ class GovernanceApi:
         回退到展示 discovered surfaces（标注"待授权"）。
         """
         from .source_registry import SourceRegistry, ScanBudget
+        from .schema_v3 import SourceRootType
         reg = SourceRegistry(self.workspace)
         snap = reg.scan(ScanBudget())
         # 该 Agent 的 SourceRoot 列表
         agent_roots = [r for r in reg.list_sources() if r.agent_instance_id == instance_id]
+        # 修复:项目目录(src-project-default)的 agent_instance_id 可能为空,
+        # 但只要 enabled=True 就应该出现在数据视图中
+        project_dir_roots = [
+            r for r in reg.list_sources()
+            if r.scope == "project" and r.type == SourceRootType.PROJECT_DIRECTORY
+            and r.enabled and r not in agent_roots
+        ]
+        agent_roots.extend(project_dir_roots)
         root_map = {r.root_id: r for r in agent_roots}
         has_authorized_sources = len(agent_roots) > 0
         # 按 scope -> project_ref -> category 三层分组
@@ -1692,12 +3742,52 @@ class GovernanceApi:
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         bindings = store.list_bindings(include_inactive=include_inactive)
-        return {"bindings": [b.to_dict() for b in bindings], "total": len(bindings)}
+        enriched = []
+        for b in bindings:
+            item = b.to_dict()
+            item.update(store.group_status(b.share_group_id, agent_instance_id=b.agent_instance_id))
+            enriched.append(item)
+        return {"bindings": enriched, "total": len(enriched)}
+
+    def ensure_personal_memory_group(self, agent_instance_id: str,
+                                     confirmed: bool = False,
+                                     *, _admin_override: bool = False) -> dict:
+        """正式单 Agent 接管入口：未绑定才创建个人组，已有共享绑定保持不动。"""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .agent_binding import AgentBindingStore
+        return AgentBindingStore(self.workspace).ensure_personal_memory_group(agent_instance_id)
+
+    def leave_shared_group_to_personal(self, agent_instance_id: str,
+                                       confirmed: bool = False,
+                                       *, _admin_override: bool = False) -> dict:
+        """显式退出共享组；个人库与共享库均保留，不做合并。"""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .agent_binding import AgentBindingStore
+        return AgentBindingStore(self.workspace).leave_shared_group_to_personal(
+            agent_instance_id, confirmed=True,
+        )
 
     def bind_agent(self, agent_instance_id: str, share_group_id: str,
                    mcp_server_name: str = "memoryguard",
                    native_memory_mode: str = "observed",
-                   redirect_paths: list[str] | None = None) -> dict:
+                   redirect_paths: list[str] | None = None,
+                   *, _admin_override: bool = False) -> dict:
+        # A2: GUI/桌面 bind_agent 与 MCP 对齐,非 admin 拒绝
+        # 本地 GUI 可通过 _admin_override=True 绕过(有文件系统权限的场景)
+        from .access_context import load_access_context
+        ctx = load_access_context()
+        if not _admin_override:
+            ok, err = ctx.require_admin()
+            if not ok:
+                return {"ok": False, "error": err}
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         binding = store.bind_agent(
@@ -1713,7 +3803,15 @@ class GovernanceApi:
                                     share_group_id: str = "",
                                     mcp_server_name: str = "memoryguard",
                                     native_memory_modes: dict[str, str] | None = None,
-                                    redirect_paths: dict[str, list[str]] | None = None) -> dict:
+                                    redirect_paths: dict[str, list[str]] | None = None,
+                                    *, _admin_override: bool = False) -> dict:
+        # A2: 与 bind_agent 对齐
+        from .access_context import load_access_context
+        ctx = load_access_context()
+        if not _admin_override:
+            ok, err = ctx.require_admin()
+            if not ok:
+                return {"ok": False, "error": err}
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         return store.bind_agents_to_group(
@@ -1724,13 +3822,385 @@ class GovernanceApi:
             redirect_paths=redirect_paths or {},
         )
 
-    def unbind_agent(self, binding_id: str) -> dict:
+    def install_shared_group_mcp_redirects(
+        self,
+        share_group_id: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """为指定记忆组（personal 或 shared）内已绑定 Agent 安装用户级 MCP 重定向。
+
+        配置写到各宿主的全局用户目录；MEMORYGUARD_WORKSPACE 固定指向
+        本控制目录，因此 Agent 从任意项目启动都访问同一份绑定与共享记忆。
+        """
+        if not confirmed:
+            return {"error": "需要确认才能安装 MCP 重定向"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .agent_binding import AgentBindingStore
+        from .agent_locator import AgentLocator
+        from .provider_adapters import get_provider_adapter_class
+
+        bindings = AgentBindingStore(self.workspace).find_by_group(share_group_id, include_inactive=False)
+        if not bindings:
+            return {"error": f"no active bindings for group: {share_group_id}"}
+        instances, _ = AgentLocator(self.workspace).detect_instances()
+        product_by_id = {i.instance_id: i.product for i in instances}
+        installed: list[dict] = []
+        for b in bindings:
+            product = product_by_id.get(b.agent_instance_id, "")
+            cls = get_provider_adapter_class(product)
+            if cls is None:
+                installed.append({
+                    "agent_instance_id": b.agent_instance_id,
+                    "product": product,
+                    "status": "skipped",
+                    "skipped": True,
+                    "reason": "automatic_install_adapter_not_implemented",
+                    "mcp_support": "unknown_or_manual",
+                })
+                continue
+            try:
+                result = cls(self.workspace).install(
+                    workspace=self.workspace,
+                    share_group_id=share_group_id,
+                    agent_instance_id=b.agent_instance_id,
+                    global_scope=True,
+                )
+                result["agent_instance_id"] = b.agent_instance_id
+                result["product"] = product
+                result["status"] = result.get("status", "configured")
+                installed.append(result)
+            except Exception as exc:
+                installed.append({
+                    "agent_instance_id": b.agent_instance_id,
+                    "product": product,
+                    "status": "error",
+                    "error": str(exc),
+                })
+        configured_count = sum(item["status"] == "configured" for item in installed)
+        skipped_count = sum(item["status"] == "skipped" for item in installed)
+        error_count = sum(item["status"] == "error" for item in installed)
+        hook_configured_count = sum(
+            bool(item.get("hook", {}).get("configured"))
+            for item in installed
+            if item["status"] == "configured"
+        )
+        hook_unsupported_count = sum(
+            item.get("hook", {}).get("supported") is False
+            for item in installed
+            if item["status"] == "configured"
+        )
+        hook_error_count = sum(
+            item.get("hook", {}).get("status") == "error"
+            for item in installed
+            if item["status"] == "configured"
+        )
+        warning_count = sum(
+            len(item.get("warnings", []))
+            for item in installed
+            if item["status"] == "configured"
+        )
+        if configured_count == len(installed):
+            status = (
+                "partial"
+                if hook_error_count or hook_unsupported_count
+                else "configured"
+            )
+        elif configured_count:
+            status = "partial"
+        else:
+            status = "failure"
+        return {
+            "ok": (
+                configured_count == len(installed)
+                and hook_error_count == 0
+            ),
+            "status": status,
+            "share_group_id": share_group_id,
+            "installed": installed,
+            "configured_count": configured_count,
+            # 兼容旧客户端；这里表示配置文件已写入，不代表运行时已连接。
+            "installed_count": configured_count,
+            "skipped_count": skipped_count,
+            "error_count": error_count,
+            "hook_configured_count": hook_configured_count,
+            "hook_unsupported_count": hook_unsupported_count,
+            "hook_error_count": hook_error_count,
+            "warning_count": warning_count,
+            "restart_required": configured_count > 0,
+            "runtime_verified": False,
+        }
+
+    def get_host_hook_status(
+        self,
+        provider: str = "",
+        agent_instance_id: str = "",
+    ) -> dict:
+        """Read-only user-level Hook status and last runtime receipt."""
+        from .host_hooks import HostHookManager
+
+        manager = HostHookManager(self.workspace)
+        if provider or agent_instance_id:
+            return manager.status(
+                provider,
+                agent_instance_id=agent_instance_id,
+            )
+        result = manager.status()
+        try:
+            from .agent_binding import AgentBindingStore
+            from .agent_locator import AgentLocator
+
+            instances, _ = AgentLocator(self.workspace).detect_instances()
+            product_by_id = {
+                item.instance_id: item.product.lower() for item in instances
+            }
+            aliases = {
+                "claude-code": "claude",
+                "claude": "claude",
+                "codex": "codex",
+                "cursor": "cursor",
+                "trae": "trae",
+            }
+            agent_statuses = []
+            for binding in AgentBindingStore(self.workspace).list_bindings(
+                include_inactive=False,
+            ):
+                product = product_by_id.get(binding.agent_instance_id, "")
+                hook_provider = aliases.get(product, "")
+                if not hook_provider:
+                    continue
+                item = manager.status(
+                    hook_provider,
+                    agent_instance_id=binding.agent_instance_id,
+                )
+                item["agent_instance_id"] = binding.agent_instance_id
+                item["product"] = product
+                agent_statuses.append(item)
+            result["agents"] = agent_statuses
+        except Exception as exc:
+            result["agent_status_error"] = str(exc)
+        return result
+
+    def set_host_hook_mode(
+        self,
+        provider: str,
+        agent_instance_id: str,
+        mode: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """Switch enforce/observe/paused without deleting host configuration."""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .host_hooks import set_hook_mode
+
+        return {
+            "ok": True,
+            **set_hook_mode(
+                self.workspace,
+                provider,
+                agent_instance_id,
+                mode,
+            ),
+        }
+
+    def uninstall_host_hook(
+        self,
+        provider: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """Remove only MemoryGuard-owned Hook handlers."""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .host_hooks import HostHookManager
+
+        return {
+            "ok": True,
+            **HostHookManager(self.workspace).uninstall(provider),
+        }
+
+    def import_native_memories_to_group(
+        self,
+        share_group_id: str = "",
+        agent_instance_ids: list[str] | None = None,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """从各 Agent 已授权原生记忆根导入共享组（正式接管的数据迁移）。"""
+        if not confirmed:
+            return {"error": "需要确认才能导入原生记忆"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        if not share_group_id:
+            return {"error": "share_group_id_required"}
+        from .agent_binding import AgentBindingStore
+        from .shared_memory_import import import_native_memories_to_group
+
+        store = AgentBindingStore(self.workspace)
+        bindings = store.find_by_group(share_group_id, include_inactive=False)
+        agent_ids = list(agent_instance_ids or [])
+        if not agent_ids:
+            agent_ids = [b.agent_instance_id for b in bindings]
+        if not agent_ids:
+            return {"error": "no_agents_in_group"}
+        result = import_native_memories_to_group(self.workspace, share_group_id, agent_ids)
+        # 重建共享组投影
+        self.build_projection(
+            confirmed=True,
+            scope={"mode": "share_group", "share_group_id": share_group_id},
+            share_group_id=share_group_id,
+        )
+        return result
+
+    def commit_shared_memory_governance(
+        self,
+        share_group_id: str = "",
+        reason: str = "",
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """共享组正式接管：对 SharedMemoryStore 打版本快照（面板重构/分类确认）。"""
+        if not confirmed:
+            return {"error": "需要确认才能提交共享记忆治理"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        if not share_group_id:
+            return {"error": "share_group_id_required"}
+        from .governance_engine import GovernanceEngine
+
+        engine = GovernanceEngine(self.workspace, share_group_id)
+        store = engine.store
+        records = store.list_records(status="active")
+        governance = engine.record_governance_decision(
+            actor="user",
+            action="commit_shared_governance",
+            target_ids=[r.memory_id for r in records[:200]],
+            reason=reason or "panel governance commit",
+        )
+        version_id = governance["version_id"]
+        projection_warning = ""
+        try:
+            projection_result = self.build_projection(
+                confirmed=True,
+                scope={"mode": "share_group", "share_group_id": share_group_id},
+                share_group_id=share_group_id,
+            )
+            if projection_result.get("error"):
+                projection_warning = str(projection_result["error"])
+        except Exception as exc:
+            # 快照和决策已持久化；投影只是可重建视图，不能反向误报接管失败。
+            projection_warning = str(exc)
+        return {
+            "ok": True,
+            "share_group_id": share_group_id,
+            "version_id": version_id,
+            "active_records": len(records),
+            "takeover_mode": "shared_mcp",
+            "projection_warning": projection_warning,
+        }
+
+    def unbind_agent(self, binding_id: str, *, _admin_override: bool = False) -> dict:
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         binding = store.unbind_agent(binding_id)
         if binding is None:
             return {"error": f"binding not found: {binding_id}"}
         return {"ok": True, "binding": binding.to_dict()}
+
+    def dissolve_shared_group(
+        self,
+        share_group_id: str,
+        confirmed: bool = False,
+        archive_data: bool = True,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """解散共享组：解绑全部 Agent，删投影，可选归档共享记忆目录。"""
+        if not confirmed:
+            return {"error": "需要确认才能解散共享组"}
+        if not share_group_id:
+            return {"error": "share_group_id_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+
+        from pathlib import Path
+        import shutil
+        from datetime import datetime, timezone
+
+        from .agent_binding import AgentBindingStore
+        from .governance_scope import (
+            GovernanceScope,
+            load_scope_preference,
+            preference_path,
+            share_group_projection_path,
+        )
+
+        bind_store = AgentBindingStore(self.workspace)
+        unbound = bind_store.dissolve_group(share_group_id)
+
+        proj_path = share_group_projection_path(
+            self.workspace,
+            GovernanceScope(mode="share_group", share_group_id=share_group_id),
+        )
+        projection_deleted = False
+        if proj_path.exists():
+            proj_path.unlink()
+            projection_deleted = True
+        tomb = proj_path.with_suffix(proj_path.suffix + ".deleted")
+        tomb.parent.mkdir(parents=True, exist_ok=True)
+        tomb.write_text("deleted", encoding="utf-8")
+
+        archived_to = ""
+        sm_dir = Path(self.workspace) / ".memoryguard" / "shared-memory" / share_group_id
+        if archive_data and sm_dir.is_dir():
+            archive_root = Path(self.workspace) / ".memoryguard" / "shared-memory-archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dest = archive_root / f"{share_group_id}-{stamp}"
+            shutil.move(str(sm_dir), str(dest))
+            archived_to = str(dest)
+
+        scope_cleared = False
+        pref = load_scope_preference(self.workspace)
+        if (
+            pref is not None
+            and pref.mode == "share_group"
+            and pref.share_group_id == share_group_id
+        ):
+            pref_file = preference_path(self.workspace)
+            if pref_file.exists():
+                pref_file.unlink()
+            scope_cleared = True
+
+        return {
+            "ok": True,
+            "share_group_id": share_group_id,
+            "unbound_count": unbound.get("unbound_count", 0),
+            "bindings": unbound.get("bindings", []),
+            "projection_deleted": projection_deleted,
+            "archived_to": archived_to,
+            "scope_cleared": scope_cleared,
+        }
 
     def check_binding_drift(self, binding_id: str) -> dict:
         from .agent_binding import AgentBindingStore
@@ -1778,11 +4248,532 @@ class GovernanceApi:
     # MemoryApi（v3.2 §8.2）：记忆治理
     # ------------------------------------------------------------------
 
+    def _require_admin_or_override(self, _admin_override: bool = False) -> dict | None:
+        """校验 admin 权限。返回 error dict 或 None(通过)。"""
+        from .access_context import load_access_context
+        ctx = load_access_context()
+        if not _admin_override:
+            ok, err = ctx.require_admin()
+            if not ok:
+                return {"ok": False, "error": err}
+        return None
+
+    def _open_store(
+        self,
+        share_group_id: str,
+        *,
+        read_only: bool = False,
+        must_exist: bool = False,
+    ):
+        """打开 SharedMemoryStore,处理 FileNotFoundError。返回 (store, error_dict)。"""
+        from .shared_memory_store import SharedMemoryStore
+        try:
+            store = SharedMemoryStore(
+                self.workspace,
+                share_group_id,
+                read_only=read_only,
+                must_exist=must_exist,
+            )
+            return (store, None)
+        except FileNotFoundError:
+            return (None, {"error": f"group not found: {share_group_id}"})
+        except ValueError as e:
+            return (None, {"error": str(e)})
+
+    def list_share_groups(self) -> dict:
+        """全局治理入口:列出所有 share_group 及其记忆统计。
+
+        扫描 .memoryguard/shared-memory/*/memory.db,
+        返回每个 group 的记录数、冲突数、隔离数、绑定 Agent 数。
+        """
+        from pathlib import Path
+        sm_root = Path(self.workspace) / ".memoryguard" / "shared-memory"
+        if not sm_root.is_dir():
+            return {"groups": [], "total": 0}
+        groups: list[dict] = []
+        for group_dir in sorted(sm_root.iterdir()):
+            if not group_dir.is_dir():
+                continue
+            group_id = group_dir.name
+            try:
+                from .shared_memory_store import SharedMemoryStore
+                store = SharedMemoryStore(self.workspace, group_id)
+                records = store.list_records()
+                active = [r for r in records if r.status.value == "active"]
+                conflicts = store.list_conflicts()
+                quarantine = store.list_quarantine()
+                from .agent_binding import AgentBindingStore, group_kind
+                bindings = AgentBindingStore(self.workspace).list_bindings()
+                agents = [b.agent_instance_id for b in bindings
+                          if b.share_group_id == group_id and b.status.value == "active"]
+                groups.append({
+                    "share_group_id": group_id,
+                    "group_kind": group_kind(group_id),
+                    "total_records": len(records),
+                    "active_records": len(active),
+                    "conflict_count": len(conflicts),
+                    "quarantine_count": len(quarantine),
+                    "bound_agents": agents,
+                    "agent_count": len(agents),
+                })
+            except Exception as e:
+                import logging
+                logging.warning(f"group {group_id} load failed: {e}")
+                continue
+        return {"groups": groups, "total": len(groups)}
+
+    def get_memory_source_map(self, share_group_id: str) -> dict:
+        """逐条记忆追溯到本地文件、MCP 事件或衍生记忆。
+
+        只返回定位元数据与短预览，不读取或改写来源文件。
+        """
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        from .memory_ir import MemoryNormalizer
+        from .source_registry import SourceRegistry
+
+        records = store.list_records()
+        record_by_id = {record.memory_id: record for record in records}
+        events = store.list_events()
+        event_by_id = {event.event_id: event for event in events}
+        events_by_relative_path: dict[str, list] = {}
+        for event in events:
+            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            relative = str(metadata.get("relative_path", "") or "").strip().replace("\\", "/")
+            if relative:
+                events_by_relative_path.setdefault(relative, []).append(event)
+        roots_by_id = {
+            root.root_id: root
+            for root in SourceRegistry(self.workspace).list_all_sources()
+        }
+        source_objects = {}
+        try:
+            ir = MemoryNormalizer(self.workspace).load()
+            if ir is not None:
+                ir_source_objects = list(getattr(ir, "source_objects", []) or [])
+                if not ir_source_objects and ir.snapshot_id:
+                    # MemoryIR 当前只持久化 records/决策；来源对象属于扫描快照。
+                    # 兼容旧实验对象上的 source_objects，同时优先从真实快照读取。
+                    import json
+                    from .schema_v3 import SourceObject
+                    snapshot_sources = (
+                        Path(self.workspace)
+                        / ".memoryguard" / "snapshots"
+                        / ir.snapshot_id / "sources.json"
+                    )
+                    if snapshot_sources.is_file():
+                        payload = json.loads(
+                            snapshot_sources.read_text(encoding="utf-8")
+                        )
+                        ir_source_objects = [
+                            SourceObject(**item)
+                            for item in payload
+                            if isinstance(item, dict)
+                        ]
+                source_objects = {
+                    obj.source_object_id: obj for obj in ir_source_objects
+                }
+        except (OSError, TypeError, ValueError):
+            source_objects = {}
+
+        def source_from_event(event, locator: str) -> dict:
+            metadata = event.metadata if isinstance(event.metadata, dict) else {}
+            root_id = str(metadata.get("source_root_id", "") or "")
+            relative = str(metadata.get("relative_path", "") or "").strip().replace("\\", "/")
+            root = roots_by_id.get(root_id)
+            absolute_path = ""
+            path_valid = False
+            exists = False
+            if root is not None:
+                try:
+                    root_path = Path(root.path).expanduser().resolve()
+                    if getattr(root.type, "value", str(root.type)) == "selected_file":
+                        candidate = root_path
+                    else:
+                        candidate = (root_path / relative).resolve()
+                    candidate.relative_to(
+                        root_path.parent if getattr(root.type, "value", str(root.type)) == "selected_file"
+                        else root_path
+                    )
+                    absolute_path = str(candidate)
+                    path_valid = True
+                    exists = candidate.exists()
+                except (OSError, ValueError):
+                    absolute_path = ""
+            if root is None and not root_id and not relative:
+                return {
+                    "origin_kind": "mcp_runtime",
+                    "display_name": f"MCP 对话写入 · {event.agent_instance_id or 'unknown'}",
+                    "event_id": event.event_id,
+                    "agent_instance_id": event.agent_instance_id,
+                    "locator": locator or "event",
+                    "source_root_id": "",
+                    "relative_path": "",
+                    "absolute_path": "",
+                    "path_valid": False,
+                    "exists": False,
+                    "scope": "memory_group",
+                    "project_ref": "",
+                    "authorized": True,
+                }
+            return {
+                "origin_kind": "local_file",
+                "display_name": (
+                    root.display_name if root is not None
+                    else relative or root_id or "历史文件来源"
+                ),
+                "event_id": event.event_id,
+                "agent_instance_id": event.agent_instance_id,
+                "locator": str(metadata.get("locator", "") or locator or "file"),
+                "source_root_id": root_id,
+                "relative_path": relative,
+                "absolute_path": absolute_path,
+                "path_valid": path_valid,
+                "exists": exists,
+                "scope": root.scope if root is not None else "unknown",
+                "project_ref": root.project_ref if root is not None else "",
+                "authorized": bool(root is not None and root.enabled),
+                "source_category": (
+                    root.source_category if root is not None
+                    else str(metadata.get("source_category", "") or "unknown")
+                ),
+            }
+
+        def resolve_provenance(source_id: str, locator: str, visited: set[str]) -> list[dict]:
+            if not source_id or source_id in visited:
+                return []
+            next_visited = set(visited)
+            next_visited.add(source_id)
+            event = event_by_id.get(source_id)
+            if event is not None:
+                return [source_from_event(event, locator)]
+            if source_id.startswith("share-file:"):
+                relative = source_id.split(":", 1)[1].strip().replace("\\", "/")
+                return [
+                    source_from_event(item, locator)
+                    for item in events_by_relative_path.get(relative, [])
+                ]
+            source_record = record_by_id.get(source_id)
+            if source_record is not None:
+                resolved: list[dict] = []
+                for provenance in source_record.provenance or []:
+                    resolved.extend(resolve_provenance(
+                        provenance.source_object_id,
+                        provenance.locator,
+                        next_visited,
+                    ))
+                return resolved
+            source_object = source_objects.get(source_id)
+            if source_object is not None:
+                root = roots_by_id.get(source_object.source_root_id)
+                synthetic_event = type("_SourceEvent", (), {
+                    "event_id": "",
+                    "agent_instance_id": root.agent_instance_id if root is not None else "",
+                    "metadata": {
+                        "source_root_id": source_object.source_root_id,
+                        "relative_path": source_object.relative_path,
+                    },
+                })()
+                return [source_from_event(synthetic_event, locator)]
+            return []
+
+        mappings: list[dict] = []
+        mapped_count = 0
+        file_count = 0
+        for record in records:
+            sources: list[dict] = []
+            seen: set[tuple] = set()
+            for provenance in record.provenance or []:
+                for source in resolve_provenance(
+                    provenance.source_object_id,
+                    provenance.locator,
+                    set(),
+                ):
+                    key = (
+                        source.get("origin_kind"),
+                        source.get("event_id"),
+                        source.get("source_root_id"),
+                        source.get("relative_path"),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        sources.append(source)
+            if not sources:
+                sources.append({
+                    "origin_kind": "mcp_runtime",
+                    "display_name": f"MCP/衍生写入 · {record.agent_instance_id or 'unknown'}",
+                    "event_id": "",
+                    "agent_instance_id": record.agent_instance_id,
+                    "locator": "memory",
+                    "source_root_id": "",
+                    "relative_path": "",
+                    "absolute_path": "",
+                    "path_valid": False,
+                    "exists": False,
+                    "scope": "memory_group",
+                    "project_ref": "",
+                    "authorized": True,
+                })
+            if sources:
+                mapped_count += 1
+            file_count += sum(source["origin_kind"] == "local_file" for source in sources)
+            mappings.append({
+                "memory_id": record.memory_id,
+                "body_preview": _mask_content(record.body, 120),
+                "kind": record.kind.value,
+                "status": record.status.value,
+                "agent_instance_id": record.agent_instance_id,
+                "sources": sources,
+            })
+        return {
+            "share_group_id": share_group_id,
+            "mappings": mappings,
+            "total_records": len(records),
+            "mapped_records": mapped_count,
+            "file_source_count": file_count,
+        }
+
+    def _export_memory_group_impl(self, share_group_id: str) -> dict:
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        import json
+        import zipfile
+        from datetime import datetime, timezone
+        from .agent_binding import AgentBindingStore, group_kind
+        from .schema_v3 import stable_hash, _now_iso
+
+        state = store.export_state()
+        records = state["records"]
+        events = state["events"]
+        decisions = state["decisions"]
+        conflicts = state["conflicts"]
+        quarantine = state["quarantine"]
+        versions = state["versions"]
+        bindings = [
+            binding.to_dict()
+            for binding in AgentBindingStore(self.workspace).find_by_group(
+                share_group_id, include_inactive=True,
+            )
+        ]
+        source_map = self.get_memory_source_map(share_group_id)
+        exported_at = _now_iso()
+        export_id = stable_hash("memory_group_export", share_group_id, exported_at)
+        manifest = {
+            "schema": "memoryguard.memory-group-export.v1",
+            "export_id": export_id,
+            "exported_at": exported_at,
+            "share_group_id": share_group_id,
+            "group_kind": group_kind(share_group_id),
+            "canonical_store_path": str(store.db_path),
+            "counts": {
+                "records": len(records),
+                "events": len(events),
+                "decisions": len(decisions),
+                "conflicts": len(conflicts),
+                "quarantine": len(quarantine),
+                "versions": len(versions),
+                "bindings": len(bindings),
+            },
+            "native_files_included": False,
+        }
+        export_root = Path(self.workspace) / ".memoryguard" / "exports"
+        export_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        export_path = export_root / f"{share_group_id}-{stamp}-{export_id[:8]}.zip"
+        temp_path = export_path.with_suffix(".zip.tmp")
+        payloads = {
+            "manifest.json": manifest,
+            "records.json": records,
+            "events.json": events,
+            "decisions.json": decisions,
+            "conflicts.json": conflicts,
+            "quarantine.json": quarantine,
+            "versions.json": versions,
+            "bindings.json": bindings,
+            "source-map.json": source_map,
+        }
+        try:
+            with zipfile.ZipFile(
+                temp_path, "w", compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                for name, payload in payloads.items():
+                    archive.writestr(
+                        name,
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                    )
+            temp_path.replace(export_path)
+        except Exception:
+            if temp_path.exists():
+                temp_path.unlink()
+            raise
+        return {
+            "ok": True,
+            "share_group_id": share_group_id,
+            "group_kind": manifest["group_kind"],
+            "export_id": export_id,
+            "export_path": str(export_path),
+            "counts": manifest["counts"],
+        }
+
+    def export_memory_group(
+        self,
+        share_group_id: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        store, open_err = self._open_store(
+            share_group_id, must_exist=True,
+        )
+        if open_err:
+            return open_err
+        with store.maintenance("export_memory_group"):
+            return self._export_memory_group_impl(share_group_id)
+
+    def clear_memory_group(
+        self,
+        share_group_id: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """先导出，再清空当前组；保留 binding、MCP 配置和空数据库。"""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        store, open_err = self._open_store(
+            share_group_id, must_exist=True,
+        )
+        if open_err:
+            return open_err
+        with store.maintenance("clear_memory_group"):
+            exported = self._export_memory_group_impl(share_group_id)
+            if not exported.get("ok"):
+                return exported
+            cleared = store.clear_all()
+        projection_warning = ""
+        try:
+            self.build_projection(
+                confirmed=True,
+                scope={"mode": "share_group", "share_group_id": share_group_id},
+                share_group_id=share_group_id,
+            )
+        except Exception as exc:
+            projection_warning = str(exc)
+        return {
+            "ok": True,
+            "share_group_id": share_group_id,
+            "export_path": exported["export_path"],
+            "before": cleared["before"],
+            "after": cleared["after"],
+            "cleanup_warnings": cleared["warnings"],
+            "projection_warning": projection_warning,
+            "binding_preserved": True,
+            "native_files_changed": False,
+        }
+
+    def archive_memory_group(
+        self,
+        share_group_id: str,
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """先导出，再解绑并归档整个个人/共享记忆层。"""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        store, open_err = self._open_store(
+            share_group_id, must_exist=True,
+        )
+        if open_err:
+            return open_err
+        with store.maintenance("archive_memory_group"):
+            exported = self._export_memory_group_impl(share_group_id)
+            if not exported.get("ok"):
+                return exported
+            archived = self.dissolve_shared_group(
+                share_group_id,
+                confirmed=True,
+                archive_data=True,
+                _admin_override=True,
+            )
+        archived_marker = Path(archived.get("archived_to", "")) / ".maintenance"
+        if archived.get("archived_to") and archived_marker.exists():
+            archived_marker.unlink()
+        archived["export_path"] = exported["export_path"]
+        archived["native_files_changed"] = False
+        return archived
+
+    def get_global_memory_status(self) -> dict:
+        """全局治理入口:跨所有 share_group 的记忆总览。
+
+        聚合所有 group 的记录数、冲突数、隔离数,
+        并检测跨 group 的重复记忆(相同 body hash)。
+        """
+        groups_data = self.list_share_groups()
+        all_records: list[dict] = []
+        for g in groups_data["groups"]:
+            gid = g["share_group_id"]
+            try:
+                from .shared_memory_store import SharedMemoryStore
+                store = SharedMemoryStore(self.workspace, gid)
+                for r in store.list_records():
+                    all_records.append({
+                        "memory_id": r.memory_id,
+                        "share_group_id": gid,
+                        "body": r.body[:200],
+                        "kind": r.kind.value,
+                        "status": r.status.value,
+                        "agent_instance_id": r.agent_instance_id,
+                    })
+            except Exception as e:
+                import logging
+                logging.warning(f"group {gid} load failed: {e}")
+                continue
+        # A1: 跨 group 重复检测改用 canonical_hash(全哈希,非 body[:100] 前缀)
+        from .shared_memory_store import SharedMemoryStore
+        hash_map: dict[str, list[dict]] = {}
+        for r in all_records:
+            c_hash = SharedMemoryStore._canonical_hash(r["body"])
+            hash_map.setdefault(c_hash, []).append(r)
+        cross_group_dups = [
+            {
+                "canonical_hash": k,
+                "body_preview": v[0]["body"][:80],
+                "memory_ids": [r["memory_id"] for r in v],
+                "share_group_ids": list(set(r["share_group_id"] for r in v)),
+                "count": len(v),
+            }
+            for k, v in hash_map.items() if len(v) > 1
+        ]
+        return {
+            "total_groups": groups_data["total"],
+            "total_records": len(all_records),
+            "active_records": sum(1 for r in all_records if r["status"] == "active"),
+            "conflict_total": sum(g["conflict_count"] for g in groups_data["groups"]),
+            "quarantine_total": sum(g["quarantine_count"] for g in groups_data["groups"]),
+            "cross_group_duplicates": cross_group_dups,
+            "groups": groups_data["groups"],
+        }
+
     def list_memory(self, status: str = "", kind: str = "",
                     share_group_id: str = "default") -> dict:
         """列出共享记忆，可按 status/kind 过滤。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         records = store.list_records(status=status or None, kind=kind or None)
         return {
             "records": [r.to_dict() for r in records],
@@ -1792,60 +4783,111 @@ class GovernanceApi:
 
     def get_memory(self, memory_id: str, share_group_id: str = "default") -> dict:
         """读取单条记忆。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         record = store.get_record(memory_id)
         if record is None:
             return {"error": f"memory not found: {memory_id}"}
         return record.to_dict()
 
-    def search_memory(self, query: str, share_group_id: str = "default") -> dict:
-        """搜索记忆。"""
+    def search_memory(self, query: str, share_group_id: str = "default",
+                      *, semantic: str = "off", limit: int = 20) -> dict:
+        """B1: FTS5 全文搜索 + BM25 排序 + 可选语义召回。
+
+        semantic: off(默认)/heuristic/model
+        """
         from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        records = store.list_records(status="active")
-        query_lower = query.lower()
-        matched = [r for r in records if query_lower in r.body.lower()]
-        return {"records": [r.to_dict() for r in matched], "total": len(matched)}
+        try:
+            store = SharedMemoryStore(self.workspace, share_group_id, read_only=True)
+        except FileNotFoundError:
+            return {"records": [], "total": 0, "error": "group not found"}
+        results = store.search_fts(query, status="active", limit=limit)
+        # 可选语义召回
+        if semantic in ("heuristic", "model") and query:
+            try:
+                from .semantic_dedup import SemanticDedup
+                dedup = SemanticDedup(self.workspace, share_group_id)
+                sem_dups = dedup.find_semantic_duplicates(query, threshold=0.60)
+                fts_ids = {r["record"]["memory_id"] for r in results}
+                for dup in sem_dups:
+                    if dup.memory_id not in fts_ids:
+                        rec = store.get_record(dup.memory_id)
+                        if rec:
+                            results.append({
+                                "record": rec.to_dict(),
+                                "bm25_score": 0.0,
+                                "semantic_score": dup.similarity,
+                                "share_group_id": share_group_id,
+                                "agent_instance_id": rec.agent_instance_id,
+                                "kind": rec.kind.value,
+                                "provenance": rec.provenance,
+                                "confidence": rec.confidence,
+                            })
+            except Exception:
+                pass
+        return {"records": results, "total": len(results)}
 
     def edit_memory(self, memory_id: str, body: str,
-                    share_group_id: str = "default") -> dict:
+                    share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """编辑记忆正文。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        store.edit(memory_id, body)
-        return {"ok": True, "memory_id": memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        from .mcp_server import _redact_secret
+        safe_body, secret_hit = _redact_secret(body)
+        if secret_hit:
+            body = safe_body
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).human_edit(memory_id, body)
 
-    def lock_memory(self, memory_id: str, share_group_id: str = "default") -> dict:
+    def lock_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """锁定记忆。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        store.lock(memory_id)
-        return {"ok": True, "memory_id": memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).human_lock(memory_id)
 
-    def unlock_memory(self, memory_id: str, share_group_id: str = "default") -> dict:
+    def unlock_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """解锁记忆。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        store.unlock(memory_id)
-        return {"ok": True, "memory_id": memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).human_unlock(memory_id)
 
-    def restore_memory(self, memory_id: str, share_group_id: str = "default") -> dict:
+    def restore_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """恢复 shadowed 记忆为 active。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        store.restore(memory_id)
-        return {"ok": True, "memory_id": memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).human_restore(memory_id)
 
-    def delete_memory(self, memory_id: str, share_group_id: str = "default") -> dict:
+    def delete_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """软删除记忆。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        store.delete(memory_id)
-        return {"ok": True, "memory_id": memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).human_delete(memory_id)
 
-    def rollback_memory(self, version_id: str, share_group_id: str = "default") -> dict:
+    def rollback_memory(self, version_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """回滚到指定版本。"""
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
         from .shared_memory_store import SharedMemoryStore
         store = SharedMemoryStore(self.workspace, share_group_id)
         store.rollback_to_version(version_id)
@@ -1853,8 +4895,9 @@ class GovernanceApi:
 
     def list_memory_versions(self, share_group_id: str = "default") -> dict:
         """列出所有版本。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         return {"versions": store.list_versions()}
 
     # ------------------------------------------------------------------
@@ -1863,8 +4906,9 @@ class GovernanceApi:
 
     def get_recent_events(self, share_group_id: str = "default") -> dict:
         """最近自动写入事件。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         events = store.list_events()
         # 最近 50 条
         recent = events[-50:] if len(events) > 50 else events
@@ -1872,8 +4916,9 @@ class GovernanceApi:
 
     def get_auto_actions(self, share_group_id: str = "default") -> dict:
         """自动整理记录（从 events 的 auto_actions 聚合）。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         events = store.list_events()
         actions = []
         for e in events:
@@ -1885,8 +4930,9 @@ class GovernanceApi:
     def get_supersede_chain(self, memory_id: str,
                             share_group_id: str = "default") -> dict:
         """获取覆盖链。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         record = store.get_record(memory_id)
         if record is None:
             return {"error": "memory not found"}
@@ -1900,18 +4946,25 @@ class GovernanceApi:
 
     def get_conflicts(self, share_group_id: str = "default") -> dict:
         """冲突队列。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        conflicts = store.list_conflicts()
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        conflicts = [
+            item for item in store.list_conflicts()
+            if item.status.value == "unresolved"
+        ]
         return {"conflicts": [c.to_dict() for c in conflicts], "total": len(conflicts)}
 
     def get_quarantine(self, share_group_id: str = "default") -> dict:
         """隔离队列（安全修复：后端返回 masked_preview，前端永远拿不到原文）。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         entries = store.list_quarantine()
         result = []
         for e in entries:
+            if e.released:
+                continue
             masked = _mask_preview(e.original_content or "")
             result.append({
                 "quarantine_id": e.quarantine_id,
@@ -1926,8 +4979,9 @@ class GovernanceApi:
 
     def get_governance_snapshot(self, share_group_id: str = "default") -> dict:
         """只读聚合：总览状态栏 + 概念图事件卡所需的所有数据，一次调用返回。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
 
         # 状态统计
         status = store.status()
@@ -2009,14 +5063,16 @@ class GovernanceApi:
 
     def get_memory_status(self, share_group_id: str = "default") -> dict:
         """共享组状态统计。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         return store.status()
 
     def get_supersede_decisions(self, share_group_id: str = "default") -> dict:
         """获取所有 auto_supersede 决策及关联记录内容预览。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
         decisions = store.list_decisions()
         records = {r.memory_id: r for r in store.list_records()}
         result = []
@@ -2040,43 +5096,37 @@ class GovernanceApi:
         return {"decisions": result, "total": len(result)}
 
     def resolve_conflict(self, group_id: str, keep_memory_id: str,
-                         share_group_id: str = "default") -> dict:
+                         share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """解决冲突：保留指定记忆，其他成员软删除。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        conflicts = store.list_conflicts()
-        group = next((c for c in conflicts if c.group_id == group_id), None)
-        if group is None:
-            return {"error": "conflict group not found"}
-        for mid in group.member_ids:
-            if mid != keep_memory_id:
-                store.delete(mid)
-        store.restore(keep_memory_id)
-        return {"ok": True, "kept": keep_memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).resolve_conflict(group_id, keep_memory_id)
 
     def release_quarantine(self, quarantine_id: str,
-                           share_group_id: str = "default") -> dict:
+                           share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """释放隔离：恢复记忆为 active。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        entries = store.list_quarantine()
-        entry = next((e for e in entries if e.quarantine_id == quarantine_id), None)
-        if entry is None:
-            return {"error": "quarantine entry not found"}
-        store.restore(entry.memory_id)
-        return {"ok": True, "memory_id": entry.memory_id}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).resolve_quarantine(quarantine_id, resolution="release")
 
     def delete_quarantine(self, quarantine_id: str,
-                          share_group_id: str = "default") -> dict:
-        """永久删除隔离记忆。"""
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        entries = store.list_quarantine()
-        entry = next((e for e in entries if e.quarantine_id == quarantine_id), None)
-        if entry is None:
-            return {"error": "quarantine entry not found"}
-        store.delete(entry.memory_id)
-        return {"ok": True, "memory_id": entry.memory_id}
+                          share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
+        """软删除隔离记忆；历史与版本保留，可恢复。"""
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        return GovernanceEngine(
+            self.workspace, share_group_id,
+        ).resolve_quarantine(quarantine_id, resolution="delete")
 
     def _preview_source_impl(self, path: str, source_type: str = "selected_directory") -> dict:
         """v3.1 §1.1 P0：添加来源前必须先 preview。type 别名映射防止 ValueError。"""
@@ -2250,13 +5300,11 @@ class GovernanceApi:
         file_result = self.get_source_file_content(root_id, relative_path)
         if "error" in file_result:
             return file_result
-        from .auto_organizer import AutoOrganizer
+        from .governance_engine import GovernanceEngine
         from .schema_v3 import MemoryEvent, stable_hash, _now_iso
-        from .shared_memory_store import SharedMemoryStore
         content = file_result.get("content", "")
         segments = self._extract_memory_segments(content, max_segments=max_segments)
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        organizer = AutoOrganizer(self.workspace, share_group_id)
+        engine = GovernanceEngine(self.workspace, share_group_id)
         extracted = []
         for idx, segment in enumerate(segments):
             event = MemoryEvent(
@@ -2272,16 +5320,22 @@ class GovernanceApi:
                 auto_actions=[],
                 created_at=_now_iso(),
             )
-            store.append_event(event)
-            record, actions = organizer.organize(event)
-            event.auto_actions = actions
-            store.update_event(event)
+            result = engine.auto_write(
+                event,
+                idempotency_key=stable_hash(
+                    "doc_extract",
+                    root_id,
+                    relative_path,
+                    str(idx),
+                    segment,
+                ),
+            )
             extracted.append({
-                "memory_id": record.memory_id,
-                "body": record.body,
-                "kind": record.kind.value,
-                "status": record.status.value,
-                "auto_actions": actions,
+                "memory_id": result["memory_id"],
+                "body": (result.get("after") or {}).get("body", segment),
+                "kind": result["kind"],
+                "status": result["status"],
+                "auto_actions": result["auto_actions"],
             })
         return {
             "ok": True,
@@ -2307,7 +5361,7 @@ class GovernanceApi:
         import json
         import time
         from pathlib import Path
-        from .auto_organizer import AutoOrganizer
+        from .governance_engine import GovernanceEngine
         from .schema_v3 import stable_hash, _now_iso
 
         file_result = self.get_source_file_content(root_id, relative_path)
@@ -2316,13 +5370,14 @@ class GovernanceApi:
         content = file_result.get("content", "")
         segments = self._extract_memory_segments(content, max_segments=max_segments)
 
-        # 用 AutoOrganizer 的只读方法做分类 + 风险扫描（不调 organize，避免写入）
-        organizer = AutoOrganizer(self.workspace, "default")
+        # 通过统一治理层做只读分类 + 风险扫描。
+        engine = GovernanceEngine(self.workspace, "default")
         candidates = []
         for idx, segment in enumerate(segments):
-            kind = organizer._classify(segment)
-            confidence = organizer._confidence(segment, kind)
-            secret = organizer._detect_secret(segment)
+            preview = engine.preview_content(segment)
+            kind = preview["kind"]
+            confidence = preview["confidence"]
+            secret = preview["secret_pattern"]
             if secret:
                 risk_level = "high"
             elif confidence < 0.45:
@@ -2334,7 +5389,7 @@ class GovernanceApi:
             candidates.append({
                 "candidate_id": candidate_id,
                 "body": segment,
-                "kind": kind.value,
+                "kind": kind,
                 "risk_level": risk_level,
                 "preview": segment[:200],
             })
@@ -2372,6 +5427,154 @@ class GovernanceApi:
             "total": len(candidates),
         }
 
+    def extract_preview_by_path(
+        self,
+        abs_path: str,
+        agent_instance_id: str = "",
+        max_segments: int = 20,
+    ) -> dict:
+        """对已发现但未授权勾选的会话/证据路径做萃取预览。
+
+        安全边界：路径必须落在当前探测到的 Agent 表面之下（或任意已发现表面），
+        且类别属于 conversation_history / runtime_evidence / knowledge_source /
+        native_memory / project_memory。禁止任意路径读取。
+        """
+        import json
+        import time
+        from pathlib import Path
+        from .agent_locator import (
+            AgentLocator,
+            EXTRACT_DISPLAY_CATEGORIES,
+            MEMORY_SELECTABLE_CATEGORIES,
+        )
+        from .governance_engine import GovernanceEngine
+        from .schema_v3 import stable_hash, _now_iso
+
+        target = Path(abs_path).expanduser()
+        try:
+            target = target.resolve()
+        except OSError as e:
+            return {"error": f"resolve failed: {e}"}
+        if not target.is_file():
+            return {"error": "file not found"}
+        try:
+            if target.stat().st_size > 5 * 1024 * 1024:
+                return {"error": "file too large (max 5MB)"}
+        except OSError as e:
+            return {"error": f"stat failed: {e}"}
+
+        locator = AgentLocator(self.workspace)
+        instances, _ = locator.detect_instances()
+        if agent_instance_id:
+            instances = [i for i in instances if i.instance_id == agent_instance_id]
+        allowed_cats = MEMORY_SELECTABLE_CATEGORIES | EXTRACT_DISPLAY_CATEGORIES
+        matched: dict | None = None
+        for inst in instances:
+            tree = locator.get_selection_tree(inst.instance_id)
+            for scope_obj in tree.get("scopes", []):
+                cats = list(scope_obj.get("categories") or [])
+                for proj in scope_obj.get("projects") or []:
+                    cats.extend(proj.get("categories") or [])
+                for cat in cats:
+                    category = cat.get("category", "")
+                    if category not in allowed_cats:
+                        continue
+                    for f in cat.get("files") or []:
+                        fpath = Path(f.get("path") or "")
+                        try:
+                            fpath = fpath.resolve()
+                        except OSError:
+                            continue
+                        if fpath == target:
+                            matched = {
+                                "instance_id": inst.instance_id,
+                                "category": category,
+                                "surface_id": f.get("surface_id", ""),
+                                "path": str(fpath),
+                            }
+                            break
+                        if fpath.is_dir():
+                            try:
+                                target.relative_to(fpath)
+                            except ValueError:
+                                continue
+                            matched = {
+                                "instance_id": inst.instance_id,
+                                "category": category,
+                                "surface_id": f.get("surface_id", ""),
+                                "path": str(fpath),
+                            }
+                            break
+                    if matched:
+                        break
+                if matched:
+                    break
+            if matched:
+                break
+        if not matched:
+            return {"error": "path_not_in_discovered_extractable_surfaces"}
+
+        try:
+            content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            return {"error": f"read failed: {e}"}
+
+        synthetic_root = stable_hash("discover_path", matched["instance_id"], str(target))
+        relative_path = target.name
+        segments = self._extract_memory_segments(content, max_segments=max_segments)
+        engine = GovernanceEngine(self.workspace, "default")
+        candidates = []
+        for idx, segment in enumerate(segments):
+            preview = engine.preview_content(segment)
+            kind = preview["kind"]
+            confidence = preview["confidence"]
+            secret = preview["secret_pattern"]
+            risk_level = "high" if secret else ("medium" if confidence < 0.45 else "low")
+            candidate_id = stable_hash(
+                "candidate", synthetic_root, relative_path, str(idx), segment,
+            )
+            candidates.append({
+                "candidate_id": candidate_id,
+                "body": segment,
+                "kind": kind,
+                "risk_level": risk_level,
+                "preview": segment[:200],
+            })
+
+        extract_id = stable_hash("extract_path", str(target), _now_iso())
+        staging_dir = Path(self.workspace) / ".memoryguard" / "staging"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        cutoff = time.time() - 24 * 3600
+        for f in staging_dir.glob("extract-*.json"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                continue
+        staging_file = staging_dir / f"extract-{extract_id}.json"
+        staging_data = {
+            "extract_id": extract_id,
+            "root_id": synthetic_root,
+            "relative_path": relative_path,
+            "abs_path": str(target),
+            "discovery": matched,
+            "created_at": _now_iso(),
+            "candidates": candidates,
+        }
+        staging_file.write_text(
+            json.dumps(staging_data, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        return {
+            "ok": True,
+            "extract_id": extract_id,
+            "root_id": synthetic_root,
+            "relative_path": relative_path,
+            "abs_path": str(target),
+            "discovery": matched,
+            "candidates": candidates,
+            "total": len(candidates),
+        }
+
     def accept_candidates(self, extract_id: str, candidate_ids: list[str],
                           share_group_id: str = "default",
                           agent_instance_id: str = "document-extractor") -> dict:
@@ -2381,9 +5584,8 @@ class GovernanceApi:
         """
         import json
         from pathlib import Path
-        from .auto_organizer import AutoOrganizer
-        from .schema_v3 import MemoryEvent, DecisionEvent, stable_hash, _now_iso
-        from .shared_memory_store import SharedMemoryStore
+        from .governance_engine import GovernanceEngine
+        from .schema_v3 import MemoryEvent, stable_hash, _now_iso
 
         staging_dir = Path(self.workspace) / ".memoryguard" / "staging"
         staging_file = staging_dir / f"extract-{extract_id}.json"
@@ -2400,8 +5602,7 @@ class GovernanceApi:
         root_id = staging_data.get("root_id", "")
         relative_path = staging_data.get("relative_path", "")
 
-        store = SharedMemoryStore(self.workspace, share_group_id)
-        organizer = AutoOrganizer(self.workspace, share_group_id)
+        engine = GovernanceEngine(self.workspace, share_group_id)
         results = []
         written_ids = []
         for candidate in accepted:
@@ -2421,28 +5622,30 @@ class GovernanceApi:
                 auto_actions=[],
                 created_at=_now_iso(),
             )
-            store.append_event(event)
-            record, actions = organizer.organize(event)
-            event.auto_actions = actions
-            store.update_event(event)
-            written_ids.append(record.memory_id)
+            result = engine.auto_write(
+                event,
+                idempotency_key=(
+                    f"accept_extract:{extract_id}:{candidate['candidate_id']}"
+                ),
+            )
+            if not result["ok"]:
+                return {"error": result["blocked_reason"]}
+            written_ids.append(result["memory_id"])
             results.append({
-                "memory_id": record.memory_id,
-                "status": record.status.value,
-                "kind": record.kind.value,
-                "auto_actions": actions,
+                "memory_id": result["memory_id"],
+                "status": result["status"],
+                "kind": result["kind"],
+                "auto_actions": result["auto_actions"],
             })
 
         # 记录 DecisionEvent
-        decision = DecisionEvent(
-            event_id=stable_hash("accept_extract", extract_id, _now_iso()),
+        engine.record_governance_decision(
             actor="user",
             action="accept_extract",
             target_ids=written_ids,
             reason="user confirmed",
-            created_at=_now_iso(),
+            idempotency_key=f"accept_extract:{extract_id}",
         )
-        store.append_decision(decision)
 
         # 写入完成后删除 staging 文件
         try:
@@ -2546,53 +5749,148 @@ class GovernanceApi:
             "record_count": len(ir.records),
         }
 
-    def create_build_plan(self, target_path: str = "") -> dict:
+    def create_build_plan(self, target_path: str = "",
+                          scope: dict | None = None,
+                          agent_instance_id: str = "",
+                          target_root_id: str = "") -> dict:
         from .adapters import GenericMarkdownTarget
         from .release_manager import ReleaseManager
-        from .source_registry import ScanBudget
+        from .source_registry import ScanBudget, SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, filter_ir_for_agent, resolve_scoped_roots,
+            derive_publish_target_file, root_authorizes_agent,
+        )
         from pathlib import Path
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
         rm = ReleaseManager(self.workspace)
         target = GenericMarkdownTarget()
-        tp = Path(target_path) if target_path else Path(self.workspace) / ".memoryguard" / "memory-target"
+        derived = derive_publish_target_file(root)
+        tp = derived.parent if derived.suffix else derived
+        if target_path:
+            # 仅当与派生路径一致时允许
+            try:
+                if Path(target_path).resolve() not in {tp.resolve(), derived.resolve()}:
+                    return {"error": "target_file_mismatch_root"}
+            except OSError:
+                return {"error": "target_file_mismatch_root"}
         snap, ir = rm.scan_and_normalize(ScanBudget())
-        plan = rm.create_build_plan(ir, target, tp)
+        roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
+        scoped_ir = filter_ir_for_agent(ir, {r.root_id for r in roots}, snap)
+        try:
+            plan = rm.create_build_plan(
+                scoped_ir, target, tp,
+                governance_scope=parsed, target_root_id=target_root_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         return plan.to_dict()
 
     def apply_build(self, plan_id: str, confirmed: bool = False,
-                    target_path: str = "") -> dict:
+                    target_path: str = "",
+                    scope: dict | None = None,
+                    agent_instance_id: str = "",
+                    target_root_id: str = "") -> dict:
         if not confirmed:
             return {"error": "需要确认才能应用构建"}
         from .adapters import GenericMarkdownTarget
         from .release_manager import ReleaseManager
+        from .source_registry import SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, derive_publish_target_file, root_authorizes_agent,
+        )
         from pathlib import Path
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
+        derived = derive_publish_target_file(root)
+        tp = derived.parent if derived.suffix else derived
+        if target_path:
+            try:
+                if Path(target_path).resolve() not in {tp.resolve(), derived.resolve()}:
+                    return {"error": "target_file_mismatch_root"}
+            except OSError:
+                return {"error": "target_file_mismatch_root"}
         rm = ReleaseManager(self.workspace)
         target = GenericMarkdownTarget()
-        tp = Path(target_path) if target_path else Path(self.workspace) / ".memoryguard" / "memory-target"
-        release = rm.apply_build(plan_id, target, tp, approval=True)
+        try:
+            release = rm.apply_build(
+                plan_id, target, tp, approval=True,
+                expected_scope=parsed, expected_target_root_id=target_root_id,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         return release.to_dict()
 
-    def verify_release(self, release_id: str, target_path: str = "") -> dict:
+    def verify_release(self, release_id: str, target_path: str = "",
+                       scope: dict | None = None,
+                       agent_instance_id: str = "",
+                       target_root_id: str = "") -> dict:
         from .adapters import GenericMarkdownTarget
         from .release_manager import ReleaseManager
+        from .source_registry import SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, derive_publish_target_file, root_authorizes_agent,
+        )
         from pathlib import Path
         import json
-        rm = ReleaseManager(self.workspace)
-        target = GenericMarkdownTarget()
-        tp = Path(target_path) if target_path else Path(self.workspace) / ".memoryguard" / "memory-target"
-        # 读 manifest
-        change_path = Path(self.workspace) / ".memoryguard" / "changes" / f"{release_id}.json"
-        if not change_path.exists():
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
+        derived = derive_publish_target_file(root)
+        tp = derived.parent if derived.suffix else derived
+        if target_path:
+            try:
+                if Path(target_path).resolve() not in {tp.resolve(), derived.resolve()}:
+                    return {"error": "target_file_mismatch_root"}
+            except OSError:
+                return {"error": "target_file_mismatch_root"}
+        release_path = Path(self.workspace) / ".memoryguard" / "releases" / f"{release_id}.json"
+        if not release_path.exists():
+            release_path = Path(self.workspace) / ".memoryguard" / "changes" / f"{release_id}.json"
+        if not release_path.exists():
             return {"error": "release not found"}
-        data = json.loads(change_path.read_text(encoding="utf-8"))
-        build_id = data.get("build_id", "")
-        # 找 plan
-        plans_dir = Path(self.workspace) / ".memoryguard" / "plans"
-        manifest = None
-        for pf in plans_dir.glob("*.json"):
-            pd = json.loads(pf.read_text(encoding="utf-8"))
-            if pd.get("manifest", {}).get("build_id") == build_id:
-                manifest = pd["manifest"]
-                break
+        data = json.loads(release_path.read_text(encoding="utf-8"))
+        try:
+            ReleaseManager.validate_release_binding(
+                data,
+                expected_scope=parsed,
+                expected_target_root_id=target_root_id,
+                expected_target_path=tp,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+        manifest = data.get("manifest")
+        if manifest is None:
+            build_id = data.get("build_id", "")
+            plans_dir = Path(self.workspace) / ".memoryguard" / "plans"
+            for pf in plans_dir.glob("*.json"):
+                pd = json.loads(pf.read_text(encoding="utf-8"))
+                if pd.get("manifest", {}).get("build_id") == build_id:
+                    manifest = pd["manifest"]
+                    break
         if manifest is None:
             return {"error": "manifest not found"}
         from .schema_v3 import BuildManifest
@@ -2600,25 +5898,134 @@ class GovernanceApi:
             build_id=manifest["build_id"], release_hash=manifest.get("release_hash", ""),
             target_profile=manifest.get("target_profile", ""),
         )
+        rm = ReleaseManager(self.workspace)
+        target = GenericMarkdownTarget()
         return rm.verify_release(release_id, target, tp, mm)
 
     def rollback_release(self, release_id: str, confirmed: bool = False,
-                         target_path: str = "") -> dict:
+                         target_path: str = "",
+                         scope: dict | None = None,
+                         agent_instance_id: str = "",
+                         target_root_id: str = "") -> dict:
         if not confirmed:
             return {"error": "需要确认才能回滚"}
         from .adapters import GenericMarkdownTarget
         from .release_manager import ReleaseManager
+        from .source_registry import SourceRegistry
+        from .governance_scope import (
+            GovernanceScope, derive_publish_target_file, root_authorizes_agent,
+        )
         from pathlib import Path
+        import json
+        parsed, err = self._parse_scope(scope, agent_instance_id=agent_instance_id, mode="agent")
+        if err or not parsed or parsed.get("mode") != "agent":
+            return {"error": err or "agent_scope_required"}
+        if not target_root_id:
+            return {"error": "target_root_id_required"}
+        gscope = GovernanceScope.from_dict(parsed)
+        reg = SourceRegistry(self.workspace)
+        root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
+        if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
+            return {"error": "target_root_not_authorized_for_agent"}
+        derived = derive_publish_target_file(root)
+        tp = derived.parent if derived.suffix else derived
+        if target_path:
+            try:
+                if Path(target_path).resolve() not in {tp.resolve(), derived.resolve()}:
+                    return {"error": "target_file_mismatch_root"}
+            except OSError:
+                return {"error": "target_file_mismatch_root"}
+        release_path = Path(self.workspace) / ".memoryguard" / "releases" / f"{release_id}.json"
+        if not release_path.exists():
+            return {"error": "release not found"}
+        data = json.loads(release_path.read_text(encoding="utf-8"))
+        try:
+            ReleaseManager.validate_release_binding(
+                data,
+                expected_scope=parsed,
+                expected_target_root_id=target_root_id,
+                expected_target_path=tp,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         rm = ReleaseManager(self.workspace)
         target = GenericMarkdownTarget()
-        tp = Path(target_path) if target_path else Path(self.workspace) / ".memoryguard" / "memory-target"
-        rb = rm.rollback_release(release_id, target, tp)
+        try:
+            rb = rm.rollback_release(
+                release_id, target, tp,
+                expected_scope=parsed,
+                expected_target_root_id=target_root_id,
+                expected_target_path=tp,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
         return rb.to_dict()
 
     def list_releases(self) -> dict:
         from .release_manager import ReleaseManager
         rm = ReleaseManager(self.workspace)
         return {"releases": rm.list_releases()}
+
+    def plan_memoryguard_gc(
+        self,
+        older_than_days: int = 30,
+        keep_releases: int = 20,
+        keep_snapshots: int = 3,
+    ) -> dict:
+        from .gc import MemoryGuardGc
+
+        gc = MemoryGuardGc(
+            self.workspace,
+            older_than_days=older_than_days,
+            keep_releases=keep_releases,
+            keep_snapshots=keep_snapshots,
+        )
+        return gc.plan(dry_run=True).to_dict()
+
+    def apply_memoryguard_gc(
+        self,
+        confirmed: bool = False,
+        older_than_days: int = 30,
+        keep_releases: int = 20,
+        keep_snapshots: int = 3,
+    ) -> dict:
+        if not confirmed:
+            return {"error": "需要确认才能执行 GC"}
+        from .gc import MemoryGuardGc
+
+        gc = MemoryGuardGc(
+            self.workspace,
+            older_than_days=older_than_days,
+            keep_releases=keep_releases,
+            keep_snapshots=keep_snapshots,
+        )
+        plan = gc.plan(dry_run=False)
+        result = gc.apply(plan, confirmed=True)
+        # P2.1: GC 后重扫,确保 IR 与清理后的状态一致
+        if result.get("ok"):
+            try:
+                from .memory_ir import MemoryNormalizer
+                from .source_registry import SourceRegistry, ScanBudget
+                reg = SourceRegistry(self.workspace)
+                snap = reg.scan(ScanBudget())
+                roots = reg.list_sources()
+                root_map = {r.root_id: r.path for r in roots}
+                root_policies = {r.root_id: {"source_category": r.source_category,
+                                             "ingestion_policy": r.ingestion_policy} for r in roots}
+                norm = MemoryNormalizer(self.workspace)
+                ir = norm.load()
+                if ir is None or ir.snapshot_id != snap.snapshot_id:
+                    ir = norm.normalize(snap, root_map=root_map, root_policies=root_policies)
+                    norm.save(ir)
+                result["rescan"] = {"ok": True, "snapshot_id": snap.snapshot_id}
+            except Exception as exc:
+                # P2.1: 重扫失败必须令顶层 ok 失败,不能只附加 rescan.ok=False
+                result["rescan"] = {"ok": False, "error": str(exc)}
+                result["ok"] = False
+                if not result.get("errors"):
+                    result["errors"] = []
+                result["errors"].append(f"post-GC rescan failed: {exc}")
+        return result
 
     def list_history(self) -> dict:
         """v3.1 §8.4：统一历史时间线（rule_change + memory_release + warnings）。
@@ -2628,6 +6035,36 @@ class GovernanceApi:
         from .change_history import list_change_history
         from pathlib import Path
         return list_change_history(Path(self.workspace))
+
+    def get_storage_overview(self) -> dict:
+        """P2.1: 存储概览,供 GUI 存储页展示 .memoryguard/ 各子目录大小。"""
+        from pathlib import Path
+        mg_dir = Path(self.workspace) / ".memoryguard"
+        if not mg_dir.is_dir():
+            return {"total_bytes": 0, "categories": {}, "has_prev_ir": False}
+        categories: dict[str, int] = {}
+        total = 0
+        for child in mg_dir.iterdir():
+            if not child.is_dir() and not child.is_file():
+                continue
+            name = child.name if child.is_dir() else child.stem
+            size = 0
+            if child.is_file():
+                try:
+                    size = child.stat().st_size
+                except OSError:
+                    pass
+            else:
+                for f in child.rglob("*"):
+                    if f.is_file():
+                        try:
+                            size += f.stat().st_size
+                        except OSError:
+                            pass
+            categories[name] = categories.get(name, 0) + size
+            total += size
+        has_prev = (mg_dir / "ir" / "current.prev.json").exists()
+        return {"total_bytes": total, "categories": categories, "has_prev_ir": has_prev}
 
     # ------------------------------------------------------------------
     # 规则级修复闭环（v2.1 保留）
@@ -2779,6 +6216,159 @@ class GovernanceApi:
         self._report = report.to_dict()
         return {"ok": True}
 
+    # -----------------------------------------------------------------------
+    # v3.3 Host AI Enrichment
+    # -----------------------------------------------------------------------
+
+    def list_pending_enrichments(
+        self,
+        limit: int = 50,
+        agent_instance_id: str = "",
+        share_group_id: str = "",
+        scope: dict | None = None,
+    ) -> dict:
+        """列出待宿主 AI 整理的记忆任务（与 MCP list 同一队列）。"""
+        from .host_enrichment import list_pending as _list
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, share_group_id=share_group_id,
+        ) if (scope or agent_instance_id or share_group_id) else (None, "")
+        if err:
+            return {"error": err}
+        aid = ""
+        gid = ""
+        if parsed:
+            if parsed.get("mode") == "share_group":
+                gid = parsed.get("share_group_id", "")
+            else:
+                aid = parsed.get("agent_instance_id", "")
+        else:
+            aid = agent_instance_id
+            gid = share_group_id
+        tasks = _list(
+            self.workspace, limit=limit,
+            agent_instance_id=aid, share_group_id=gid,
+        )
+        return {
+            "pending_count": len(tasks),
+            "tasks": tasks,
+            "mode": "build_integrated",
+            "hint": "primary: build_projection; residual: MCP list/apply",
+        }
+
+    def apply_enrichments(
+        self,
+        results: list,
+        agent_instance_id: str = "",
+        share_group_id: str = "",
+        scope: dict | None = None,
+    ) -> dict:
+        """宿主 AI 回写整理结果到 IR / SharedMemoryStore。默认不自动 rebuild。"""
+        from .host_enrichment import apply_results as _apply
+        if not results or not isinstance(results, list):
+            return {"error": "results must be a non-empty list"}
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, share_group_id=share_group_id,
+        ) if (scope or agent_instance_id or share_group_id) else (None, "")
+        if err:
+            return {"error": err}
+        aid = ""
+        gid = ""
+        if parsed:
+            if parsed.get("mode") == "share_group":
+                gid = parsed.get("share_group_id", "")
+            else:
+                aid = parsed.get("agent_instance_id", "")
+        else:
+            aid = agent_instance_id
+            gid = share_group_id
+        return _apply(
+            self.workspace, results,
+            agent_instance_id=aid, share_group_id=gid,
+        )
+
+    def list_host_llm_agents(self) -> dict:
+        """列出整理引擎：宿主 Skill（主路径）+ 本机 Agent CLI（可选加速）。
+
+        多 Agent / 共享组 GUI 必须弹窗选择；Skill/MCP 调用默认走 host。
+        """
+        from .host_agent_backend import detect_available_agents
+        agents = [{
+            "agent": "host",
+            "cli": "",
+            "label": "当前宿主 Skill（需在对话中继续整理）",
+        }]
+        agents.extend(detect_available_agents())
+        return {
+            "agents": agents,
+            "primary": "host",
+            "hint": "host=对话 Skill 自动环；GUI 无法唤起聊天。多 Agent 弹窗必选。Cursor Agent CLI 可本机同步调用。",
+        }
+
+    def get_host_enrichment_guide(
+        self,
+        agent_instance_id: str = "",
+        share_group_id: str = "",
+        scope: dict | None = None,
+    ) -> dict:
+        """残留 pending 的 MCP 补做提示（主路径已并入构建）。"""
+        status = self.get_enrichment_status(
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            scope=scope,
+        )
+        if status.get("error"):
+            return status
+        pending = status.get("pending", 0)
+        return {
+            "ok": True,
+            "mode": "host_skill_primary",
+            "pending_count": pending,
+            "applied_count": status.get("applied", 0),
+            "message": (
+                f"Skill/MCP 主路径：宿主对话模型整理。另有 {pending} 条 pending。"
+                if pending else "无残留待整理项；可直接构建/重建投影。"
+            ),
+            "steps": [
+                "GUI 多 Agent：弹窗选「宿主 Skill」或本机 CLI",
+                "Skill/MCP：memoryguard_build_and_enrich（默认 host）→ 你整理 → apply → 再 build",
+                "不要要求用户另开 AI 整理按钮",
+            ],
+            "mcp_tools": [
+                "memoryguard_build_and_enrich",
+                "memoryguard_list_pending_enrichments",
+                "memoryguard_apply_enrichments",
+                "memoryguard_enrichment_status",
+            ],
+            "hint": "primary: host Skill auto loop; GUI multi-agent: LLM pick modal",
+        }
+
+    def get_enrichment_status(
+        self,
+        agent_instance_id: str = "",
+        share_group_id: str = "",
+        scope: dict | None = None,
+    ) -> dict:
+        """返回整理队列状态摘要。"""
+        from .host_enrichment import get_status as _status
+        parsed, err = self._parse_scope(
+            scope, agent_instance_id=agent_instance_id, share_group_id=share_group_id,
+        ) if (scope or agent_instance_id or share_group_id) else (None, "")
+        if err:
+            return {"error": err}
+        aid = ""
+        gid = ""
+        if parsed:
+            if parsed.get("mode") == "share_group":
+                gid = parsed.get("share_group_id", "")
+            else:
+                aid = parsed.get("agent_instance_id", "")
+        else:
+            aid = agent_instance_id
+            gid = share_group_id
+        out = _status(self.workspace, agent_instance_id=aid, share_group_id=gid)
+        out["mode"] = "build_integrated"
+        return out
+
 
 class SafeBridgeApi:
     """受限桥接 API：pywebview js_api 的安全代理。
@@ -2790,9 +6380,11 @@ class SafeBridgeApi:
     前端统一通过这两个方法调用，不再直接访问 method 属性。
     """
 
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, *, direct_mutations: bool = False):
         self._inner = GovernanceApi(workspace)
         self._workspace = workspace
+        # 原生桌面窗口本身即执行端，变更应直接执行，不被 IDE 沙箱启发式推迟
+        self._direct_mutations = bool(direct_mutations)
 
     def _set_window(self, window) -> None:
         self._inner._set_window(window)
@@ -2820,7 +6412,7 @@ class SafeBridgeApi:
     def request_mutation(self, method: str, args: list | None = None) -> dict:
         """调用变更方法。
 
-        沙箱模式下走请求队列；非沙箱模式下注入 confirmed=True 后直接执行。
+        沙箱模式下走请求队列；非沙箱 / 原生 GUI 直接执行模式下注入 confirmed=True 后执行。
         """
         from .security import is_mutation_method, detect_sandbox_mode
 
@@ -2828,7 +6420,8 @@ class SafeBridgeApi:
             return {"error": f"not a mutation method: {method}"}
 
         # 沙箱模式：走请求队列，返回 deferred 标记
-        if detect_sandbox_mode():
+        # 原生桌面 GUI（direct_mutations）不推迟——窗口本身就是确认端
+        if detect_sandbox_mode() and not self._direct_mutations:
             result = self._inner.submit_request(method, args or [])
             return {
                 "ok": True,
@@ -2862,7 +6455,9 @@ class SafeBridgeApi:
         return self._inner.get_api_method_registry()
 
     def get_sandbox_status(self) -> dict:
-        """返回沙箱状态。"""
+        """返回沙箱状态。原生 GUI 直接执行时对外报告非沙箱。"""
+        if self._direct_mutations:
+            return {"sandbox": False, "direct_mutations": True}
         return self._inner.get_sandbox_status()
 
     def pick_path(self, for_files: bool = False) -> dict:
@@ -2881,12 +6476,23 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     """
     if not has_native_gui():
         return 3
+    import os
     import shutil
     import webview
     from .interactive import render_interactive_html
 
-    api = SafeBridgeApi(workspace)
+    _set_windows_app_user_model_id()
+    # 原生窗口即桌面执行端：显式关闭沙箱推迟，避免 Cursor/IDE 启发式导致构建只进队列不执行
+    os.environ["MEMORYGUARD_SANDBOX"] = "0"
+
+    api = SafeBridgeApi(workspace, direct_mutations=True)
     html = render_interactive_html()
+    if "</head>" in html:
+        html = html.replace(
+            "</head>",
+            '<script>window.__MG_SANDBOX__=false;</script></head>',
+            1,
+        )
 
     # 写 HTML + cytoscape.js 到 .memoryguard/ui/ 目录，用 url= 加载本地文件
     ui_dir = Path(workspace) / ".memoryguard" / "ui"
@@ -2895,6 +6501,9 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     static_src = Path(__file__).parent / "static" / "cytoscape.min.js"
     if static_src.exists():
         shutil.copy2(static_src, ui_dir / "cytoscape.min.js")
+    icon_src = Path(__file__).parent / "static" / "memoryguard-icon.png"
+    if icon_src.exists():
+        shutil.copy2(icon_src, ui_dir / "memoryguard-icon.png")
     # 写 HTML
     html_path = ui_dir / "index.html"
     html_path.write_text(html, encoding="utf-8")
@@ -2905,5 +6514,5 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     )
     # v3.1：注入 window 引用，使 pick_path 能调用 create_file_dialog
     api._set_window(window)
-    webview.start()
+    _start_webview(webview)
     return 0
