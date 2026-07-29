@@ -2,7 +2,7 @@
   <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.0</h1>
+<h1 align="center">MemoryGuard v0.3.1</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -183,6 +183,12 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Changelog
+
+### v0.3.1 (2026-07-29)
+
+- Migrate legacy unmarked Codex MCP sections before installing the managed
+  section, preventing duplicate TOML tables during upgrades
+- Make `memoryguard doctor` output safe on GBK Windows consoles
 
 ### v0.3.0 (2026-07-29)
 

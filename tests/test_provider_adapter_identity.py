@@ -180,6 +180,58 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     assert store.get_binding(binding.binding_id).status.value == "active"
 
 
+def test_codex_global_install_migrates_unmarked_legacy_section(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    _patch_home(monkeypatch, home)
+    AgentBindingStore(workspace).bind_agent("codex-legacy", "team-legacy")
+
+    config_path = home / ".codex" / "config.toml"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        '[mcp_servers.other]\ncommand = "keep-me"\n\n'
+        '[mcp_servers.memoryguard]\n'
+        'enabled = true\n'
+        'command = "python"\n'
+        'args = ["-m", "memoryguard.mcp_server"]\n'
+        'env = { MEMORYGUARD_AGENT_ID = "old-agent" }\n\n'
+        "# preserve this unrelated comment\n"
+        '[features]\nkeep = true\n',
+        encoding="utf-8",
+    )
+
+    adapter = CodexAdapter(workspace)
+    adapter.install(
+        workspace,
+        share_group_id="team-legacy",
+        agent_instance_id="codex-legacy",
+        global_scope=True,
+    )
+    first_text = config_path.read_text(encoding="utf-8")
+    adapter.install(
+        workspace,
+        share_group_id="team-legacy",
+        agent_instance_id="codex-legacy",
+        global_scope=True,
+    )
+
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    assert parsed["mcp_servers"]["memoryguard"]["env"] == {
+        "MEMORYGUARD_AGENT_ID": "codex-legacy",
+        "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
+    }
+    assert parsed["mcp_servers"]["other"]["command"] == "keep-me"
+    assert parsed["features"]["keep"] is True
+    assert "# preserve this unrelated comment" in first_text
+    assert first_text.count("[mcp_servers.memoryguard]") == 1
+    assert first_text.count("# BEGIN memoryguard:provider-redirect") == 1
+    assert config_path.read_text(encoding="utf-8") == first_text
+
+
 def test_governance_configures_trae_and_reports_other_adapter_errors(
     tmp_path, monkeypatch,
 ):

@@ -179,6 +179,48 @@ def _replace_section(text: str, begin_marker: str, end_marker: str,
     return f"{begin_marker}\n{section_content}\n{end_marker}\n"
 
 
+def _remove_unmanaged_toml_table(text: str, table_name: str) -> str:
+    """移除标记段外的旧 TOML table，保留其他 table 与独立注释。
+
+    0.3.0 之前的 Codex 配置直接写 ``[mcp_servers.memoryguard]``，没有
+    MemoryGuard 标记。升级时必须先迁移旧 table，否则追加新版标记段会形成
+    重复 table，导致整个 Codex config.toml 无法解析。
+    """
+    target_header = f"[{table_name}]"
+    result: list[str] = []
+    managed = False
+    removing = False
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == _TOML_BEGIN:
+            managed = True
+
+        header = stripped.split("#", 1)[0].strip()
+        is_table_header = (
+            header.startswith("[")
+            and header.endswith("]")
+            and len(header) >= 3
+        )
+        if is_table_header:
+            removing = False
+            if header == target_header and not managed:
+                removing = True
+                continue
+
+        if removing:
+            # 独立注释可能描述后续 table，保留；旧 table 的键值全部移除。
+            if not stripped or stripped.startswith("#"):
+                result.append(line)
+            continue
+
+        result.append(line)
+        if stripped == _TOML_END:
+            managed = False
+
+    return "".join(result)
+
+
 def _remove_section(text: str, begin_marker: str, end_marker: str) -> str:
     """移除标记之间的内容，返回剩余文本。"""
     begin_idx = text.find(begin_marker)
@@ -650,6 +692,10 @@ class CodexAdapter(ProviderAdapter):
 
         mcp_path = self._mcp_config_path()
         toml_content = _read_text_for_update(mcp_path)
+        toml_content = _remove_unmanaged_toml_table(
+            toml_content,
+            f"mcp_servers.{MCP_SERVER_NAME}",
+        )
         section = _mcp_toml_section(agent_instance_id, self.workspace)
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
         _validate_toml(new_toml, mcp_path)

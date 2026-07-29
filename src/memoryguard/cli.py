@@ -818,30 +818,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 1. Python 版本（>= 3.10）
     py_ok = sys.version_info >= (3, 10)
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    lines.append(f"Python: {py_ver} {'✓' if py_ok else '✗ (require >= 3.10)'}")
+    lines.append(
+        f"Python: {py_ver} {'[ok]' if py_ok else '[error] require >= 3.10'}"
+    )
     if not py_ok:
         issues += 1
 
     # 2. memoryguard 包可 import
     try:
         import memoryguard  # noqa: F401
-        lines.append("memoryguard package: ✓")
+        lines.append("memoryguard package: [ok]")
     except ImportError as e:
-        lines.append(f"memoryguard package: ✗ ({e})")
+        lines.append(f"memoryguard package: [error] ({e})")
         issues += 1
 
     # 3. MCP server 模块可 import
     try:
         from . import mcp_server  # noqa: F401
-        lines.append("MCP server module: ✓")
+        lines.append("MCP server module: [ok]")
     except ImportError as e:
-        lines.append(f"MCP server module: ✗ ({e})")
+        lines.append(f"MCP server module: [error] ({e})")
         issues += 1
 
     # 4. 工作区 .memoryguard/ 目录
     mg_dir = workspace / MG_DIR
     if mg_dir.is_dir():
-        lines.append(f"Workspace .memoryguard/: ✓ (found at {mg_dir})")
+        lines.append(f"Workspace .memoryguard/: [ok] (found at {mg_dir})")
     else:
         lines.append(f"Workspace .memoryguard/: not found (run `memoryguard audit` to initialize)")
 
@@ -880,7 +882,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             try:
                 st = cls(str(workspace)).status()
                 if st.get("installed"):
-                    lines.append(f"  {name}: installed ✓")
+                    lines.append(f"  {name}: installed [ok]")
                 else:
                     lines.append(f"  {name}: not installed")
             except Exception as e:
@@ -898,7 +900,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             if not item.get("supported"):
                 state = "unsupported"
             elif item.get("runtime_verified"):
-                state = "operational ✓"
+                state = "operational [ok]"
             elif item.get("configured"):
                 state = "configured, awaiting runtime receipt"
             else:
@@ -910,7 +912,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # 9. pywebview（可选）
     try:
         import webview  # type: ignore  # noqa: F401
-        lines.append("GUI (pywebview): available ✓")
+        lines.append("GUI (pywebview): available [ok]")
     except ImportError:
         lines.append("GUI (pywebview): not available (optional)")
 

@@ -2,7 +2,7 @@
   <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard 治理台：已整理的共享记忆、覆盖关系和版本回滚历史" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.0</h1>
+<h1 align="center">MemoryGuard v0.3.1</h1>
 
 <p align="center">
   <strong>多个编程 Agent 共享记忆，不共享混乱。</strong><br />
@@ -182,6 +182,11 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 - **之后：** 在需求被验证后探索团队与企业能力；不承诺具体日期。
 
 ## 更新日志
+
+### v0.3.1（2026-07-29）
+
+- 安装新版受管段前自动迁移 Codex 旧版无标记 MCP 段，避免升级时生成重复 TOML table
+- `memoryguard doctor` 改用 GBK Windows 控制台可安全输出的状态标记
 
 ### v0.3.0（2026-07-29）
 
