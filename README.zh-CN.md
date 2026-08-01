@@ -2,7 +2,7 @@
   <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard 桌面治理台：可导航的神经图、记忆分类、风险信号和治理入口" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.2</h1>
+<h1 align="center">MemoryGuard v0.4.0</h1>
 
 <p align="center">
   <strong>多个编程 Agent 共享记忆，不共享混乱。</strong><br />
@@ -208,6 +208,12 @@ procedure 自动升为强制。`memoryguard_memory_update` 可切换策略。boo
 - **之后：** 在需求被验证后探索团队与企业能力；不承诺具体日期。
 
 ## 更新日志
+
+### v0.4.0（2026-08-01）
+
+- 新增 scoped rules 与受治理的会话历史存储、导入。
+- 桌面 GUI 新增神经图治理控制。
+- 加固 Windows Host Hook 的 UTF-8 处理与写入回执。
 
 ### v0.3.2（2026-07-29）
 

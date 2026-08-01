@@ -1,7 +1,7 @@
 ---
 name: memoryguard
 description: Local-first MCP memory backend and governance console for coding agents. Auto-organize, quarantine, supersede, and rollback shared memories across multiple agents.
-version: 0.3.2
+version: 0.4.0
 author: irisxc4
 homepage: https://github.com/irisxc4/memoryguard
 repository: https://github.com/irisxc4/memoryguard

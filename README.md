@@ -2,7 +2,7 @@
   <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard desktop governance console with a navigable neuron graph, memory categories, risk signals, and governance controls" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.2</h1>
+<h1 align="center">MemoryGuard v0.4.0</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -224,6 +224,12 @@ packages. The GUI can return a rule to on-demand, delete, or restore it.
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Changelog
+
+### v0.4.0 (2026-08-01)
+
+- Add scoped rules and governed conversation-history storage and import.
+- Add neuron-graph governance controls in the desktop GUI.
+- Harden Hook UTF-8 handling and write receipts for Windows hosts.
 
 ### v0.3.2 (2026-07-29)
 
