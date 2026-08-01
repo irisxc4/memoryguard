@@ -6640,6 +6640,55 @@ class GovernanceApi:
             runtime_role=role,
         ), None
 
+    def _trusted_rule_bridge_context(self):
+        """Resolve rule-creation context from trusted runtime state only.
+
+        The rule page's diagnostic selectors are intentionally untrusted
+        preview state.  Auto-creation therefore cannot accept a context
+        payload from the browser; identity and project come from the local
+        host environment/current working directory (with the persisted
+        governance scope used only to choose the storage group).  Missing
+        Agent identity fails closed.
+        """
+        from .access_context import load_access_context
+        from .governance_scope import load_scope_preference
+        from .rule_scope import canonical_project_ref
+
+        access = load_access_context()
+        agent = str(access.trusted_agent_id or "").strip()
+        if not agent:
+            return None, {
+                "ok": False,
+                "error": "agent_context_required",
+                "reason": "rule creation requires trusted MEMORYGUARD_AGENT_ID",
+            }
+
+        preference = load_scope_preference(self.workspace)
+        env_group = str(os.environ.get("MEMORYGUARD_SHARE_GROUP_ID", "") or "").strip()
+        if env_group:
+            group = env_group
+        elif preference is not None and preference.mode == "share_group":
+            # Scope preference routes the local GUI to its selected store.  It
+            # does not supply Agent identity or project authorization.
+            group = preference.share_group_id
+        else:
+            group = "default"
+
+        project_raw = str(
+            os.environ.get("MEMORYGUARD_PROJECT_CWD") or os.getcwd()
+        ).strip()
+        project = canonical_project_ref(project_raw) if project_raw else ""
+        provider = str(os.environ.get("MEMORYGUARD_PROVIDER", "") or "").strip().lower()
+        runtime_role = str(os.environ.get("MEMORYGUARD_RUNTIME_ROLE", "") or "").strip()
+        return self._rule_bridge_context(
+            None,
+            agent_instance_id=agent,
+            share_group_id=group or "default",
+            project_ref=project,
+            provider=provider,
+            runtime_role=runtime_role,
+        )
+
     @staticmethod
     def _rule_bridge_call(service, names: tuple[str, ...], *args, **kwargs):
         """Invoke the first implemented service method.
@@ -6662,6 +6711,49 @@ class GovernanceApi:
                     continue
         return False, None
 
+    @staticmethod
+    def _trusted_gui_feedback_call(service, receipt_id: str, outcome: str,
+                                   evidence: str, confidence: float, context):
+        """Call feedback service only through trusted GUI producer boundary.
+
+        Do not retry without ``producer`` or ``effective_context``: that
+        compatibility path would downgrade GUI input to an agent event or skip
+        receipt ownership validation.
+        """
+        import inspect
+
+        for name in ("submit_feedback", "feedback", "submit_rule_feedback"):
+            fn = getattr(service, name, None)
+            if not callable(fn):
+                continue
+            try:
+                parameters = tuple(inspect.signature(fn).parameters.values())
+            except (TypeError, ValueError):
+                parameters = ()
+            accepts_kwargs = any(
+                item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters
+            )
+            names = {item.name for item in parameters}
+            if not accepts_kwargs and not {"producer", "effective_context"}.issubset(names):
+                # Older lifecycle services cannot prove this GUI boundary;
+                # caller may use the ownership-checked store fallback instead.
+                continue
+            call_kwargs = {
+                "evidence": evidence,
+                "confidence": confidence,
+                "effective_context": context,
+                "producer": "user",
+            }
+            if accepts_kwargs or "actor_id" in names:
+                call_kwargs["actor_id"] = "user"
+            return True, fn(
+                receipt_id,
+                outcome,
+                "user",
+                **call_kwargs,
+            )
+        return False, None
+
     def create_rule_from_text(
         self,
         text: str,
@@ -6677,24 +6769,20 @@ class GovernanceApi:
     ) -> dict:
         """Create one rule from a sentence using the optional lifecycle service.
 
-        Scope is always derived from the explicit current-agent context.  A
-        low-confidence service result is returned verbatim (including its
-        narrow candidates); this bridge never upgrades it to a group/system
-        audience.
+        Scope is always derived from trusted host context, never browser
+        preview selectors.  A low-confidence service result is returned
+        verbatim (including its narrow candidates); this bridge never upgrades
+        it to a group/system audience.
         """
         sentence = str(text or "").strip()
         if not sentence:
             return {"ok": False, "error": "rule_text_required"}
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        ctx, error = self._rule_bridge_context(
-            context,
-            agent_instance_id=agent_instance_id,
-            share_group_id=share_group_id,
-            project_ref=project_ref,
-            provider=provider,
-            runtime_role=runtime_role,
-        )
+        # Ignore all request-supplied context for automatic creation.  The
+        # browser may provide only sentence text; trusted Agent/project state
+        # is resolved from the host process above.
+        ctx, error = self._trusted_rule_bridge_context()
         if error:
             return error
         service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
@@ -6921,7 +7009,7 @@ class GovernanceApi:
         self,
         receipt_id: str,
         outcome: str,
-        actor: str,
+        actor: str = "",
         evidence: str = "",
         share_group_id: str = "default",
         confidence: float = 1.0,
@@ -6930,34 +7018,60 @@ class GovernanceApi:
     ) -> dict:
         if not str(receipt_id or "").strip():
             return {"ok": False, "error": "receipt_id_required"}
-        if not str(actor or "").strip():
-            return {"ok": False, "error": "actor_required"}
-        service = self._rule_bridge_service(share_group_id)
+        # ``actor`` is a legacy display argument.  GUI feedback is a trusted
+        # human boundary; never infer producer/authority from browser actor.
+        ctx, context_error = self._trusted_rule_bridge_context()
+        if context_error:
+            return context_error
+        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
         if service is not None:
-            called, raw = self._rule_bridge_call(
-                service,
-                ("submit_feedback", "feedback", "submit_rule_feedback"),
-                receipt_id, outcome, actor,
-                evidence=evidence, confidence=confidence,
+            called, raw = self._trusted_gui_feedback_call(
+                service, str(receipt_id), str(outcome), str(evidence or ""),
+                float(confidence), ctx,
             )
             if called:
                 payload = self._rule_bridge_payload(raw)
                 payload.setdefault("ok", True)
+                payload["producer"] = "user"
+                payload["source"] = "user"
+                payload["authority"] = 4
+                payload["actor"] = "user"
                 return payload
         # Stable fallback for stores that already implement explicit receipts.
         try:
             from .schema_v3 import RuleMatchFeedback
-            store, err = self._open_store(share_group_id, must_exist=True)
+            store, err = self._open_store(ctx.share_group_id, must_exist=True)
             if err:
                 return err
+            receipt_fn = getattr(store, "get_rule_match_receipt", None)
+            receipt = receipt_fn(str(receipt_id)) if callable(receipt_fn) else None
+            if receipt is None:
+                return {"ok": False, "error": "receipt_not_found"}
+            if str(receipt.share_group_id or ctx.share_group_id) != str(ctx.share_group_id):
+                return {"ok": False, "error": "feedback_share_group_mismatch"}
+            if str(receipt.agent_instance_id or "") != str(ctx.agent_instance_id):
+                return {"ok": False, "error": "feedback_agent_does_not_own_receipt"}
+            effective_fn = getattr(store, "get_effective_rule_match_feedback", None)
+            if not callable(effective_fn):
+                effective_fn = getattr(store, "get_rule_match_feedback_by_receipt", None)
+            prior = effective_fn(str(receipt_id)) if callable(effective_fn) else None
             feedback = RuleMatchFeedback(
                 feedback_id="", receipt_id=str(receipt_id), outcome=str(outcome),
-                actor=str(actor), evidence=str(evidence or ""), confidence=float(confidence),
+                actor="user", evidence=str(evidence or ""), confidence=float(confidence),
+                source="user", authority=4,
+                supersedes_feedback_id=str(getattr(prior, "feedback_id", "") or ""),
             )
             fn = getattr(store, "append_rule_match_feedback", None)
             if not callable(fn):
                 return {"ok": False, "error": "service_unavailable"}
-            return {"ok": True, "feedback": self._rule_bridge_payload(fn(feedback))}
+            saved = fn(feedback)
+            return {
+                "ok": True,
+                "producer": "user",
+                "source": "user",
+                "authority": 4,
+                "feedback": self._rule_bridge_payload(saved),
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

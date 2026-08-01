@@ -21,6 +21,7 @@ from .schema_v3 import (
     stable_hash,
 )
 from .rule_scope import effective_assignments, normalize_assignment
+from .rule_scope import canonical_project_ref
 from .shared_memory_store import (
     MANDATORY_MAX_CHARS,
     MANDATORY_MAX_ITEMS,
@@ -124,8 +125,21 @@ def build_context_packet(
             raise ValueError("effective agent context is required for mandatory rule bootstrap")
         if effective_context.share_group_id != store.group_id:
             raise ValueError("effective agent context share_group_id mismatch")
+    project_ref = canonical_project_ref(effective_context.project_ref)
+    session_id = str(effective_context.session_id or "").strip()
+    context_hash = str(effective_context.context_hash or "").strip() or stable_hash(
+        "rule-context",
+        effective_context.agent_instance_id,
+        effective_context.share_group_id,
+        project_ref,
+        effective_context.provider,
+        effective_context.runtime_role,
+        session_id,
+    )
     task_hash = stable_hash(
-        "rule-bootstrap", task, store.group_id, effective_context.agent_instance_id
+        "rule-bootstrap", task, store.group_id, effective_context.agent_instance_id,
+        project_ref, effective_context.provider, effective_context.runtime_role,
+        session_id, context_hash,
     )
     query_tokens = _tokens(f"{task} {project_hint}")
     all_records = store.list_records()
@@ -331,9 +345,11 @@ def build_context_packet(
             mandatory_match_receipts.append(
                 RuleMatchReceipt(
                     receipt_id=stable_hash(
-                        "rule-bootstrap-receipt",
+                        "rule-bootstrap-receipt-v2",
                         store.group_id,
                         effective_context.agent_instance_id,
+                        session_id,
+                        context_hash,
                         task_hash,
                         record.memory_id,
                     ),
@@ -347,6 +363,11 @@ def build_context_packet(
                     matcher_version="rule-bootstrap-v1",
                     confidence=float(record.confidence),
                     created_at=_now_iso(),
+                    project_ref=project_ref,
+                    provider=effective_context.provider,
+                    runtime_role=effective_context.runtime_role,
+                    session_id=session_id,
+                    context_hash=context_hash,
                 ).to_dict()
             )
 
@@ -486,6 +507,8 @@ def build_context_packet(
             "runtime_role": effective_context.runtime_role,
             "runtime_agent_id": effective_context.runtime_agent_id,
             "parent_agent_id": effective_context.parent_agent_id,
+            "session_id": session_id,
+            "context_hash": context_hash,
         },
         "assignment_receipt": assignment_receipt,
         "legacy_unscoped_rule_ids": legacy_unscoped,

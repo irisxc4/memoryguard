@@ -12,6 +12,8 @@ from memoryguard.cli import main as cli_main
 from memoryguard.host_hooks import (
     HostHookManager,
     _state_path,
+    _flush_pending_rule_feedback,
+    _save_state,
     run_hook,
     set_hook_mode,
 )
@@ -776,7 +778,10 @@ def test_stop_flushes_pending_mandatory_rule_feedback(tmp_path: Path):
     # observation may mean followed, violated, deferred, or simply not reached yet.
     events = store.list_rule_match_feedbacks(receipt_id=receipt_id)
     assert any(
-        item.outcome == "unobserved" and item.source == "hook" and item.confidence == 0.0
+        item.outcome == "unobserved"
+        and item.source == "hook"
+        and item.authority == 2
+        and item.confidence == 0.0
         for item in events
     ), "stop with no observation must record unobserved (never not_applicable)"
     # unobserved is not an *effective* feedback, so the receipt stays pending for a real answer.
@@ -874,6 +879,48 @@ def test_stop_skips_feedback_when_explicit_feedback_is_already_present(tmp_path:
     assert feedback is not None
     assert feedback.outcome == "followed"
     assert feedback.feedback_id == "manual-1"
+
+
+def test_internal_hook_feedback_cannot_infer_user_authority_from_actor_text(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    store = SharedMemoryStore(workspace, "group-a")
+    store.append_record(SharedMemoryRecord(
+        memory_id="always", body="始终先运行测试", kind=MemoryKind.PROCEDURE,
+        status=SharedMemoryStatus.ACTIVE, injection_policy="always",
+        agent_instance_id="codex-agent",
+    ))
+    store.set_rule_assignments("always", [{
+        "target_type": "agent", "target_id": "codex-agent",
+    }])
+    receipt = store.append_rule_match_receipt(RuleMatchReceipt(
+        receipt_id="hook-authority-receipt", memory_id="always",
+        share_group_id="group-a", agent_instance_id="codex-agent",
+        task_hash="task", task="task", session_id="hook-session",
+    ))
+    _save_state(workspace, "codex", "hook-session", {
+        "mandatory_match_receipts": [{
+            "receipt_id": receipt.receipt_id, "memory_id": receipt.memory_id,
+        }],
+    })
+
+    # Actor text is display metadata only; Hook producer remains hook/authority 2.
+    _flush_pending_rule_feedback(
+        workspace=workspace,
+        provider="codex",
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        session_id="hook-session",
+        actor="user",
+        trigger="stop",
+    )
+    event = store.list_rule_match_feedbacks(receipt_id=receipt.receipt_id)[0]
+    assert event.actor == "user"
+    assert event.source == "hook"
+    assert event.authority == 2
 @pytest.mark.parametrize("disable_mode", ["env", "config"])
 def test_history_capture_global_disable_is_visible_in_receipt(tmp_path: Path, monkeypatch, disable_mode: str):
     workspace = tmp_path / "control"

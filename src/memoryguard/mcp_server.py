@@ -275,7 +275,10 @@ TOOLS = [
                 },
                 "actor": {
                     "type": "string",
-                    "description": "who recorded feedback (agent|hook|user, etc.)",
+                    "description": (
+                        "deprecated display actor id; source/authority are fixed by MCP "
+                        "transport and never inferred from this value"
+                    ),
                 },
                 "evidence": {
                     "type": "string",
@@ -292,7 +295,10 @@ TOOLS = [
                     "description": "optional retry key bound to content and actor",
                 },
             },
-            "required": ["receipt_id", "outcome", "actor"],
+            # The caller cannot select the producer.  Older clients may still
+            # send a display actor; when omitted the handler derives one from
+            # the trusted transport identity.
+            "required": ["receipt_id", "outcome"],
             "additionalProperties": False,
         },
     },
@@ -1796,11 +1802,22 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
 
     receipt_id = str(args.get("receipt_id", "") or "").strip()
     outcome = str(args.get("outcome", "") or "").strip()
+    actor_supplied = "actor" in args
     actor = str(args.get("actor", "") or "").strip()
     evidence = str(args.get("evidence", "") or "")
     confidence = args.get("confidence")
     if confidence is None:
         confidence = 1.0
+    if not actor_supplied:
+        # MCP is an Agent producer.  Keep the actor as an audit/display ID,
+        # but derive it from the trusted transport context rather than from
+        # an optional client field.
+        try:
+            trusted_context = _effective_agent_context(args, group_id)
+            if trusted_context.agent_instance_id:
+                actor = f"agent:{trusted_context.agent_instance_id}"
+        except (TypeError, ValueError):
+            pass
     from .shared_memory_store import SharedMemoryStore
     try:
         store = SharedMemoryStore(workspace, group_id)
@@ -1814,6 +1831,8 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
             evidence=evidence, confidence=confidence,
             effective_context=_effective_agent_context(args, group_id),
             idempotency_key=str(args.get("idempotency_key", "") or ""),
+            producer="agent",
+            actor_id=actor,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         return _mcp_error(str(exc))

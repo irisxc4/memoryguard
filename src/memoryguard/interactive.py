@@ -3146,8 +3146,6 @@ let ruleScopeMetrics = {};
 let ruleReceiptRows = [];
 let ruleExceptionRows = [];
 let ruleCreateResult = null;
-let ruleContextGroupId = '';
-let ruleContextProjectRef = '';
 
 function ruleAudience(record) {
   const items = record.assignments || [];
@@ -3248,16 +3246,12 @@ function renderRuleAutoScopePanel() {
 function renderRuleCreatePanel(options) {
   const agents = options.agents || [];
   const groups = options.groups || [];
-  const projects = options.projects || [];
-  if (!ruleContextGroupId || !groups.some(item => item.id === ruleContextGroupId)) {
-    ruleContextGroupId = activeShareGroupId || groups[0]?.id || 'default';
-  }
-  if (!ruleContextProjectRef || !projects.some(item => item.id === ruleContextProjectRef)) {
-    ruleContextProjectRef = rulePreviewProjectRef || '';
-  }
-  const selectedAgent = rulePreviewAgentId || activeAgentInstanceId || agents[0]?.id || '';
+  // Preview controls are diagnostic-only.  Never copy preview Agent/project
+  // into the creation context or its read-only display.
+  const selectedAgent = activeAgentInstanceId || '';
   const selectedAgentLabel = agents.find(item => item.id === selectedAgent)?.label || agents.find(item => item.id === selectedAgent)?.name || selectedAgent || '当前 Agent';
-  const selectedGroupLabel = groups.find(item => item.id === ruleContextGroupId)?.label || groups.find(item => item.id === ruleContextGroupId)?.name || ruleContextGroupId || 'default';
+  const selectedGroupId = activeShareGroupId || 'default';
+  const selectedGroupLabel = groups.find(item => item.id === selectedGroupId)?.label || groups.find(item => item.id === selectedGroupId)?.name || selectedGroupId;
   const result = ruleCreateResult;
   const resultHtml = result ? `<div class="rule-create-result ${result.error ? 'error' : ''}">
     ${result.error ? `<strong>未创建：${escapeHtml(result.error)}</strong>` : `<strong>已创建规则 ${escapeHtml(result.rule_id || result.memory_id || '')}</strong>
@@ -3268,23 +3262,19 @@ function renderRuleCreatePanel(options) {
   // 不作为可选项暴露给用户；服务端只读取当前可信上下文自动定范围。
   return `<section class="card rule-create-panel"><div class="card-head"><div><h2>一句话新增规则</h2><p>规则范围由当前可信上下文自动判断，无需手动选择。系统范围与跨 Agent 范围不会由自动流程创建。</p></div></div>
     <textarea id="rule-create-text" rows="3" maxlength="12000" placeholder="例如：所有 Unity UI 修复先补 EditMode 回归测试"></textarea>
-    <div class="rule-context-readonly"><span class="chip chip-info">当前上下文：${escapeHtml(selectedAgentLabel)} · ${escapeHtml(selectedGroupLabel)}${ruleContextProjectRef ? ` · ${escapeHtml(ruleContextProjectRef)}` : ''}</span></div>
+    <div class="rule-context-readonly"><span class="chip chip-info">当前上下文：${escapeHtml(selectedAgentLabel)} · ${escapeHtml(selectedGroupLabel)}</span></div>
     <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="createRuleFromText()">分析并创建</button><span class="muted">系统只自动写入当前 Agent / 当前 Agent + 项目范围，绝不扩大。</span></div>${resultHtml}</section>`;
 }
 
 async function createRuleFromText() {
   const text = String(document.getElementById('rule-create-text')?.value || '').trim();
-  // v2: GUI 不再要求用户选择 Agent / 共享组 / 项目。  这些值全部来自
-  // 当前可信上下文（上一版已加载的治理范围），用户不可在选择框里改动。
-  const agent = String(rulePreviewAgentId || activeAgentInstanceId || '').trim();
-  const group = String(ruleContextGroupId || activeShareGroupId || 'default').trim();
-  const project = String(ruleContextProjectRef || rulePreviewProjectRef || '').trim();
   if (!text) return showToast('请输入规则正文。', 'error');
   ruleCreateResult = null;
   try {
-    const result = await callApi('create_rule_from_text', text, {
-      agent_instance_id: agent, share_group_id: group, project_ref: project,
-    }, '', '', '', '', '', true);
+    // Creation intentionally sends text only.  The backend derives Agent and
+    // project from its trusted runtime context; diagnostic preview state never
+    // crosses this boundary.
+    const result = await callApi('create_rule_from_text', text);
     ruleCreateResult = result || {error: 'empty_service_response'};
     if (result?.error || result?.ok === false) showToast(result.error || '规则未创建', 'error');
     else showToast('规则已创建，正在刷新范围与回执。', 'success');
@@ -3299,10 +3289,11 @@ async function createRuleFromText() {
 async function undoRuleDecision(decisionId) {
   if (!decisionId || !confirm('确认撤销这条自动范围决定？')) return;
   try {
-    const result = await callApi('undo_rule_decision', decisionId, activeShareGroupId || ruleContextGroupId || 'default', true, {
-      agent_instance_id: activeAgentInstanceId || rulePreviewAgentId || '',
-      share_group_id: activeShareGroupId || ruleContextGroupId || 'default',
-      project_ref: ruleContextProjectRef || rulePreviewProjectRef || '',
+    const result = await callApi('undo_rule_decision', decisionId, activeShareGroupId || 'default', true, {
+      // Preview selectors are diagnostic-only and cannot authorize undo.
+      agent_instance_id: activeAgentInstanceId || '',
+      share_group_id: activeShareGroupId || 'default',
+      project_ref: '',
     });
     if (result?.error || result?.ok === false) throw new Error(result.error || '撤销失败');
     showToast('自动范围决定已撤销。', 'success');
@@ -3312,12 +3303,13 @@ async function undoRuleDecision(decisionId) {
 
 async function submitRuleFeedback(receiptId, outcome) {
   if (!receiptId || !outcome) return;
-  const actor = activeAgentInstanceId || 'user';
   // Evidence is optional; keep the one-click feedback action free of native
   // prompt dialogs so the desktop and localhost surfaces behave identically.
   const evidence = '';
   try {
-    const result = await callApi('submit_rule_feedback', receiptId, outcome, actor, evidence, activeShareGroupId || ruleContextGroupId || 'default', 1.0);
+    // Backend fixes producer/source=user and actor=user; no Agent identity
+    // comes from diagnostic UI state.
+    const result = await callApi('submit_rule_feedback', receiptId, outcome, '', evidence, activeShareGroupId || 'default', 1.0);
     if (result?.error || result?.ok === false) throw new Error(result.error || '反馈提交失败');
     showToast('反馈已记录。', 'success');
     await renderRulesHabits();
@@ -3350,7 +3342,7 @@ async function submitChildException(parentRule) {
   if (!reason) return showToast('请填写例外原因。', 'error');
   document.getElementById('rule-exception-modal')?.remove();
   try {
-    const result = await callApi('create_child_exception', parentRule, child.trim(), priority, reason.trim(), activeShareGroupId || ruleContextGroupId || 'default', true);
+    const result = await callApi('create_child_exception', parentRule, child.trim(), priority, reason.trim(), activeShareGroupId || 'default', true);
     if (result?.error || result?.ok === false) throw new Error(result.error || '创建例外失败');
     showToast('子例外已创建。', 'success');
     await renderRulesHabits();
@@ -3360,7 +3352,7 @@ async function submitChildException(parentRule) {
 async function revokeRuleException(exceptionId) {
   if (!exceptionId || !confirm('确认撤销这条子例外？')) return;
   try {
-    const result = await callApi('revoke_rule_exception', exceptionId, activeShareGroupId || ruleContextGroupId || 'default', true);
+    const result = await callApi('revoke_rule_exception', exceptionId, activeShareGroupId || 'default', true);
     if (result?.error || result?.ok === false) throw new Error(result.error || '撤销例外失败');
     showToast('子例外已撤销。', 'success');
     await renderRulesHabits();
@@ -3592,7 +3584,7 @@ async function renderRulesHabits() {
     // v2: the six diagnostic filters are hidden behind a closed <details> so
     // they never enter the first-viewport tab order and never participate in
     // a routine "add rule" request.
-    const diagnosticFilters = `<section class="card"><details id="rule-diagnostics"${diagnosticsExpanded ? ' open' : ''}><summary class="card-head" style="cursor:pointer"><div><h2>诊断与高级筛选</h2><p>管理员或排查时才需要调整；日常使用保持默认值。</p></div></summary>
+    const diagnosticFilters = `<section class="card"><details id="rule-diagnostics"><summary class="card-head" style="cursor:pointer"><div><h2>诊断与高级筛选</h2><p>管理员或排查时才需要调整；日常使用保持默认值。</p></div></summary>
       <div class="page-actions"><label class="field"><span>预览 Agent</span><select onchange="setRulePreviewAgent(this.value)">${agentOptions}</select></label><label class="field"><span>项目</span><select onchange="setRulePreviewProject(this.value)">${projectOptions}</select></label><label class="field"><span>宿主</span><select onchange="setRulePreviewProvider(this.value)">${providerOptions}</select></label><label class="field"><span>运行角色</span><select onchange="setRulePreviewRuntimeRole(this.value)">${roleOptions}</select></label><label class="field"><span>显示</span><select onchange="setRuleVisibilityFilter(this.value)">${visibilityOptions}</select></label><label class="field"><span>范围</span><select onchange="setRuleRangeFilter(this.value)">${scopeOptions}</select></label></div><p class="muted">预览只使用已发现/可信上下文；未知项目、宿主或角色保持空值，不会猜测命中规则。</p></details></section>`;
     setContent(`<div class="page-head"><div><h1>规则与习惯</h1><p>规则受众独立于记忆来源。范围删除不会删除记忆；只有强制规则会按范围注入。</p></div></div>
       ${renderRuleCreatePanel(options)}${renderRuleAutoScopePanel()}

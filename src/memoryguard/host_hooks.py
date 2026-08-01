@@ -114,6 +114,14 @@ def _effective_agent_context(
     """Build scope from host event identity, never a prompt-supplied role."""
     from .schema_v3 import EffectiveAgentContext
     from .rule_scope import canonical_project_ref
+    session_id = str(
+        payload.get("session_id")
+        or payload.get("conversation_id")
+        or payload.get("conversationId")
+        or payload.get("sessionId")
+        or ""
+    ).strip()
+    context_hash = str(payload.get("context_hash") or "").strip()
     return EffectiveAgentContext(
         agent_instance_id=agent_instance_id,
         share_group_id=share_group_id,
@@ -129,6 +137,8 @@ def _effective_agent_context(
         parent_agent_id=(
             agent_instance_id if event == "subagent_start" else ""
         ),
+        session_id=session_id,
+        context_hash=context_hash,
     )
 
 
@@ -1609,10 +1619,25 @@ def _flush_pending_rule_feedback(
             evidence=f"no observation reported before stop: {trigger}",
             confidence=0.0,
             source="hook",
+            authority=2,
             created_at=_now_iso(),
         )
+        # Model normalizes ``unobserved`` to authority 1 for generic callers;
+        # Hook transport is trusted producer metadata and must remain explicit
+        # hook authority 2 even when actor text happens to be ``user``.
+        feedback.authority = 2
         try:
             store.append_rule_match_feedback(feedback)
+            # ``SharedMemoryStore`` reconstructs model objects on its public
+            # append path; older model semantics normalize unobserved events
+            # to authority 1.  Re-assert trusted Hook transport metadata at
+            # persistence boundary so actor text cannot alter producer rank.
+            with store._tx() as conn:
+                conn.execute(
+                    "UPDATE rule_match_feedbacks SET source='hook', authority=2 "
+                    "WHERE feedback_id=?",
+                    (feedback.feedback_id,),
+                )
         except Exception as exc:
             _emit_runtime_write_diagnostic(
                 "rule_feedback_fallback_write_failed",

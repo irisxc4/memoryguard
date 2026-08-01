@@ -144,6 +144,39 @@ _SECURITY_API_METHODS: frozenset[str] = frozenset({
     "get_sandbox_status", "get_api_method_registry",
 })
 
+# Feedback authority is a transport fact, never inferred from a caller's
+# actor/display string.  The MCP path is bound to ``agent``; only the trusted
+# GUI bridge and host-hook internals may select the other producers.
+FEEDBACK_AUTHORITY: dict[str, int] = {
+    "user": 4,
+    "agent": 3,
+    "hook": 2,
+    "unobserved": 1,
+}
+TRUSTED_FEEDBACK_ENTRYPOINTS: dict[str, str] = {
+    "mcp": "agent",
+    "gui": "user",
+    "hook": "hook",
+}
+
+
+def trusted_feedback_producer(entrypoint: str) -> str:
+    """Resolve a producer from a trusted in-process boundary."""
+    key = str(entrypoint or "").strip().casefold()
+    try:
+        return TRUSTED_FEEDBACK_ENTRYPOINTS[key]
+    except KeyError as exc:
+        raise ValueError("unknown feedback entrypoint") from exc
+
+
+def feedback_authority(producer: str) -> int:
+    """Return fixed precedence for a server-selected producer."""
+    key = str(producer or "").strip().casefold()
+    try:
+        return FEEDBACK_AUTHORITY[key]
+    except KeyError as exc:
+        raise ValueError("unknown feedback producer") from exc
+
 
 def is_readonly_method(method: str) -> bool:
     """判断方法是否只读。"""

@@ -264,13 +264,16 @@ class ScopeInferenceResult:
 
 
 _TEXT_SIGNALS: list[tuple[_re.Pattern[str], str, float, str]] = [
-    (_re.compile(r"本项目|当前仓库|当前代码库|当前项目|本仓库|这个项目|这个仓库|这个代码库"),
+    (_re.compile(r"本项目|当前仓库|当前代码库|当前项目|本仓库|这个项目|这个仓库|这个代码库", _re.IGNORECASE),
      "agent_project", 0.96, "text scopes the rule to the current project"),
-    (_re.compile(r"当前 Agent|只让当前 Agent|仅当前 Agent|这个 Agent|当前助手"),
+    # ``infer_scope_from_text`` normalizes Latin text with ``casefold`` below;
+    # keep the regex case-insensitive too so mixed-case Agent wording cannot
+    # silently bypass an explicit scope signal.
+    (_re.compile(r"当前 agent|只让当前 agent|仅当前 agent|这个 agent|当前助手", _re.IGNORECASE),
      "agent", 0.90, "text scopes the rule to the current agent"),
-    (_re.compile(r"子 Agent|子代理|仅子 Agent|所有子 Agent"),
+    (_re.compile(r"子 agent|子代理|仅子 agent|所有子 agent", _re.IGNORECASE),
      "subagent", 0.60, "text suggests a runtime subagent scope"),
-    (_re.compile(r"所有 Agent|所有项目|全局|任何 Agent|全部项目|全局都必须|所有 agent|任何项目"),
+    (_re.compile(r"所有 agent|所有项目|全局|任何 agent|全部项目|全局都必须|任何项目", _re.IGNORECASE),
      "broad", 0.45, "text asks for a wide scope that automatic flow must never claim"),
 ]
 
@@ -282,7 +285,7 @@ def infer_scope_from_text(
     project_ref: str = "",
 ) -> ScopeInferenceResult:
     """Semantic layer over trusted context; never widens authority."""
-    lowered = (text or "").strip().lower()
+    lowered = (text or "").strip().casefold()
     candidates: list[ScopeCandidate] = []
     seen: set[ScopeCandidate] = set()
     broad_requested = False
@@ -316,19 +319,24 @@ def infer_scope_from_text(
         and c.target_id == agent_instance_id
         and (c.target_type != "agent_project" or bool(c.project_ref))
     ]
+    used_default_fallback = not bool(trusted)
     if not trusted:
-        trusted = [ScopeCandidate(
+        fallback_candidate = ScopeCandidate(
             target_type="agent_project" if project_ref else "agent",
             target_id=agent_instance_id,
             project_ref=project_ref if project_ref else "",
             confidence=0.80 if project_ref else 0.85,
             reasons=["no explicit scope signal; safe fallback to trusted current context"],
-        )]
+        )
+        # The selected candidate must be part of the explainable candidate set;
+        # previously the safe fallback was returned out-of-band.
+        trusted = [fallback_candidate]
+        candidates.append(fallback_candidate)
 
     trusted.sort(key=lambda c: c.confidence, reverse=True)
     selected = trusted[0]
     margin = (selected.confidence - trusted[1].confidence) if len(trusted) > 1 else 0.15
-    fallback = broad_requested or len(trusted) > 1
+    fallback = used_default_fallback or broad_requested or len(trusted) > 1
     if broad_requested:
         # A wide scope must be human-confirmed: keep the narrowest trusted
         # selection but never report a confident wide claim.

@@ -1644,7 +1644,16 @@ class RuleMatchFeedback:
             self.confidence = 0.0
             if not self.source:
                 self.source = "hook"
-            self.authority = FEEDBACK_AUTHORITY_ORDER.get("unobserved", 1)
+            # Hook-produced events are trusted transport metadata.  Preserve
+            # the explicit hook rank (2) instead of letting the generic
+            # ``unobserved`` fallback (1) erase it when rows are read back.
+            # Every other/unknown producer remains the low-authority unknown
+            # marker; actor text must never promote it to a user event.
+            source = str(self.source or "").strip().casefold()
+            if source == "hook" and self.authority == FEEDBACK_AUTHORITY_ORDER["hook"]:
+                self.authority = FEEDBACK_AUTHORITY_ORDER["hook"]
+            else:
+                self.authority = FEEDBACK_AUTHORITY_ORDER["unobserved"]
         if not self.source:
             self.source = "agent"
         if not self.authority:
@@ -1680,6 +1689,137 @@ class RuleMatchFeedback:
             authority=int(data.get("authority", 0) or 0),
             supersedes_feedback_id=data.get("supersedes_feedback_id", ""),
         )
+
+
+@dataclass(frozen=True)
+class RuleFeedbackEvidence(Mapping[str, Any]):
+    """Effective feedback plus immutable receipt context.
+
+    Feedback is append-only, but narrowing needs one resolved event per
+    receipt together with the trusted runtime context that produced it.  This
+    projection keeps callers from joining two independently ordered lists and
+    accidentally counting one receipt as multiple sessions.
+    """
+
+    feedback_id: str
+    receipt_id: str
+    memory_id: str
+    agent_instance_id: str
+    share_group_id: str = ""
+    task_hash: str = ""
+    task: str = ""
+    project_ref: str = ""
+    provider: str = ""
+    runtime_role: str = ""
+    session_id: str = ""
+    context_hash: str = ""
+    outcome: str = ""
+    actor: str = ""
+    evidence: str = ""
+    confidence: float = 1.0
+    created_at: str = ""
+    source: str = "agent"
+    authority: int = 3
+    supersedes_feedback_id: str = ""
+
+    @property
+    def feedback(self) -> RuleMatchFeedback:
+        return RuleMatchFeedback(
+            feedback_id=self.feedback_id,
+            receipt_id=self.receipt_id,
+            outcome=self.outcome,
+            actor=self.actor,
+            evidence=self.evidence,
+            confidence=self.confidence,
+            created_at=self.created_at,
+            source=self.source,
+            authority=self.authority,
+            supersedes_feedback_id=self.supersedes_feedback_id,
+        )
+
+    @property
+    def receipt(self) -> RuleMatchReceipt:
+        return RuleMatchReceipt(
+            receipt_id=self.receipt_id,
+            memory_id=self.memory_id,
+            share_group_id=self.share_group_id,
+            agent_instance_id=self.agent_instance_id,
+            task_hash=self.task_hash,
+            task=self.task,
+            project_ref=self.project_ref,
+            provider=self.provider,
+            runtime_role=self.runtime_role,
+            session_id=self.session_id,
+            context_hash=self.context_hash,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "feedback_id": self.feedback_id,
+            "receipt_id": self.receipt_id,
+            "memory_id": self.memory_id,
+            "agent_instance_id": self.agent_instance_id,
+            "share_group_id": self.share_group_id,
+            "task_hash": self.task_hash,
+            "task": self.task,
+            "project_ref": self.project_ref,
+            "provider": self.provider,
+            "runtime_role": self.runtime_role,
+            "session_id": self.session_id,
+            "context_hash": self.context_hash,
+            "outcome": self.outcome,
+            "actor": self.actor,
+            "evidence": self.evidence,
+            "confidence": self.confidence,
+            "created_at": self.created_at,
+            "source": self.source,
+            "authority": self.authority,
+            "supersedes_feedback_id": self.supersedes_feedback_id,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
+
+
+@dataclass(frozen=True)
+class RuleMutationResult(Mapping[str, Any]):
+    """Result projection for atomic rule lifecycle mutations."""
+
+    parent_rule_id: str
+    child_record: Any = None
+    child_assignments: list[Any] = field(default_factory=list)
+    parent_assignments_before: list[Any] = field(default_factory=list)
+    parent_assignments_after: list[Any] = field(default_factory=list)
+    exception: Any = None
+    decision: Any = None
+    status: str = "committed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "parent_rule_id": self.parent_rule_id,
+            "child_record": self.child_record,
+            "child_assignments": list(self.child_assignments),
+            "parent_assignments_before": list(self.parent_assignments_before),
+            "parent_assignments_after": list(self.parent_assignments_after),
+            "exception": self.exception,
+            "decision": self.decision,
+            "status": self.status,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
 
 
 # Future lifecycle terminology uses "hit" for the same immutable receipt and

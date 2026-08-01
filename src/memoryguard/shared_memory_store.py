@@ -44,6 +44,8 @@ from .schema_v3 import (
     RuleException,
     RuleHitReceipt,
     RuleHitFeedback,
+    RuleFeedbackEvidence,
+    RuleMutationResult,
 )
 from .rule_scope import (
     effective_assignments,
@@ -254,6 +256,47 @@ CREATE TABLE IF NOT EXISTS rule_assignments (
     FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory ON rule_assignments(memory_id);
+"""
+
+# Kept separate from the large bootstrap schema so read-only consumers can
+# create/migrate receipt tables before opening immutable query connections.
+_RULE_MATCH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rule_match_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    share_group_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    task_hash TEXT NOT NULL,
+    task TEXT NOT NULL,
+    assignment_ids TEXT NOT NULL DEFAULT '[]',
+    selection_reason TEXT NOT NULL DEFAULT '',
+    matcher_version TEXT NOT NULL DEFAULT 'rule-bootstrap-v1',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    project_ref TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    runtime_role TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    context_hash TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_share_group ON rule_match_receipts(share_group_id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_agent ON rule_match_receipts(agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_task ON rule_match_receipts(task_hash);
+CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
+    feedback_id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'agent',
+    authority INTEGER NOT NULL DEFAULT 3,
+    supersedes_feedback_id TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (receipt_id) REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt_created ON rule_match_feedbacks(receipt_id, created_at);
 """
 
 _RULE_LIFECYCLE_SCHEMA = """
@@ -564,8 +607,8 @@ class SharedMemoryStore:
                 conn.execute("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
             # S3.2: schema version 标记(在事务内提交)
             conn.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3') "
-                "ON CONFLICT(key) DO UPDATE SET value='3'"
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4') "
+                "ON CONFLICT(key) DO UPDATE SET value='4'"
             )
             self._migrate_records_schema(conn)
 
@@ -585,8 +628,18 @@ class SharedMemoryStore:
                 self._migrate_records_schema(conn)
                 conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
                 self._migrate_rule_assignments(conn)
+                conn.executescript(_RULE_MATCH_SCHEMA)
+                self._migrate_rule_match_schema(conn)
                 conn.executescript(_RULE_LIFECYCLE_SCHEMA)
                 self._migrate_rule_lifecycle_schema(conn)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS schema_meta ("
+                    "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4') "
+                    "ON CONFLICT(key) DO UPDATE SET value='4'"
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -709,6 +762,10 @@ class SharedMemoryStore:
     @staticmethod
     def _migrate_rule_lifecycle_schema(conn: sqlite3.Connection) -> None:
         """Create lifecycle tables and repair columns from early prototypes."""
+        # ``_SCHEMA`` creates these on a new database.  Read-only upgrade paths
+        # call this method after the small receipt schema above, so both paths
+        # converge on the same lossless v2 event-stream migration.
+        SharedMemoryStore._migrate_rule_match_schema(conn)
         conn.executescript(_RULE_LIFECYCLE_SCHEMA)
         # The table definitions above are intentionally additive.  A few
         # development snapshots created the decision table before action and
@@ -724,6 +781,132 @@ class SharedMemoryStore:
             }
             if name not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql}")
+
+    @staticmethod
+    def _migrate_rule_match_schema(conn: sqlite3.Connection) -> None:
+        """Upgrade receipt/feedback tables without probing data rows.
+
+        The first feedback stream prototype used ``UNIQUE(receipt_id)`` and
+        omitted authority/source lineage.  ``CREATE TABLE IF NOT EXISTS``
+        cannot repair that table, so old installations are rebuilt in the
+        same transaction.  All source rows and primary keys are copied.
+        """
+        conn.executescript(_RULE_MATCH_SCHEMA)
+
+        receipt_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rule_match_receipts)"
+            ).fetchall()
+        }
+        # Receipt context was additive; ALTER preserves existing row IDs/data.
+        for name, sql in (
+            ("project_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("provider", "TEXT NOT NULL DEFAULT ''"),
+            ("runtime_role", "TEXT NOT NULL DEFAULT ''"),
+            ("session_id", "TEXT NOT NULL DEFAULT ''"),
+            ("context_hash", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in receipt_columns:
+                conn.execute(
+                    f"ALTER TABLE rule_match_receipts ADD COLUMN {name} {sql}"
+                )
+
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rule_match_feedbacks)"
+            ).fetchall()
+        }
+        # Detect a UNIQUE(receipt_id) constraint via schema indexes rather than
+        # data rows.  This catches empty old tables as well as populated ones.
+        unique_receipt = False
+        for index in conn.execute(
+            "PRAGMA index_list(rule_match_feedbacks)"
+        ).fetchall():
+            if not int(index[2]):
+                continue
+            index_columns = [
+                row[2]
+                for row in conn.execute(
+                    f"PRAGMA index_info([{str(index[1]).replace(']', ']]')}])"
+                ).fetchall()
+            ]
+            if index_columns == ["receipt_id"]:
+                unique_receipt = True
+                break
+        table_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='rule_match_feedbacks'"
+        ).fetchone()
+        table_sql = str(table_row[0] or "") if table_row else ""
+        compact_sql = "".join(table_sql.casefold().split())
+        unique_receipt = unique_receipt or "unique(receipt_id)" in compact_sql
+        needs_rebuild = (
+            not {"source", "authority", "supersedes_feedback_id"}.issubset(columns)
+            or unique_receipt
+        )
+        if not needs_rebuild:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt_created "
+                "ON rule_match_feedbacks(receipt_id, created_at)"
+            )
+            return
+
+        temp_name = "rule_match_feedbacks__v2_migration"
+        conn.execute(f"DROP TABLE IF EXISTS {temp_name}")
+        conn.execute(
+            f"""CREATE TABLE {temp_name} (
+                feedback_id TEXT PRIMARY KEY,
+                receipt_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                evidence TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                created_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'agent',
+                authority INTEGER NOT NULL DEFAULT 3,
+                supersedes_feedback_id TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (receipt_id)
+                    REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
+            )"""
+        )
+        old_columns = columns
+        def _old_or_literal(name: str, literal: str) -> str:
+            return name if name in old_columns else literal
+        actor_expr = _old_or_literal("actor", "''")
+        conn.execute(
+            f"""INSERT INTO {temp_name} (
+                feedback_id, receipt_id, outcome, actor, evidence, confidence,
+                created_at, source, authority, supersedes_feedback_id
+            )
+            SELECT feedback_id, receipt_id, outcome, {actor_expr},
+                {_old_or_literal('evidence', "''")},
+                {_old_or_literal('confidence', '1.0')},
+                {_old_or_literal('created_at', "''")},
+                CASE
+                    WHEN lower({actor_expr}) LIKE 'hook:%' THEN 'hook'
+                    WHEN lower({actor_expr}) LIKE 'user:%'
+                      OR lower({actor_expr}) = 'user' THEN 'user'
+                    ELSE 'agent'
+                END,
+                CASE
+                    WHEN lower({actor_expr}) LIKE 'hook:%' THEN 2
+                    WHEN lower({actor_expr}) LIKE 'user:%'
+                      OR lower({actor_expr}) = 'user' THEN 4
+                    ELSE 3
+                END,
+                ''
+            FROM rule_match_feedbacks"""
+        )
+        conn.execute("DROP TABLE rule_match_feedbacks")
+        conn.execute(
+            f"ALTER TABLE {temp_name} RENAME TO rule_match_feedbacks"
+        )
+        conn.execute(
+            "CREATE INDEX idx_rule_match_feedbacks_receipt_created "
+            "ON rule_match_feedbacks(receipt_id, created_at)"
+        )
 
     @staticmethod
     def _canonical_hash(body: str) -> str:
@@ -875,17 +1058,25 @@ class SharedMemoryStore:
         self, conn: sqlite3.Connection, receipt: RuleMatchReceipt,
     ) -> None:
         d = receipt.to_dict()
+        # Project refs are canonicalized at the persistence boundary so
+        # Windows case/separator variants aggregate into one scope.
+        d["project_ref"] = canonical_project_ref(d.get("project_ref", ""))
         try:
-            row = conn.execute(
-                "SELECT * FROM rule_match_receipts WHERE receipt_id=?",
-                (d["receipt_id"],),
-            ).fetchone()
-            has_new_columns = row is not None and "project_ref" in row.keys()
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(rule_match_receipts)"
+                ).fetchall()
+            }
+            has_new_columns = {
+                "project_ref", "provider", "runtime_role", "session_id",
+                "context_hash",
+            }.issubset(columns)
         except sqlite3.Error:
             has_new_columns = False
         if has_new_columns:
             conn.execute(
-                "INSERT OR REPLACE INTO rule_match_receipts "
+                "INSERT INTO rule_match_receipts "
                 "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
                 "assignment_ids,selection_reason,matcher_version,confidence,created_at,"
                 "project_ref,provider,runtime_role,session_id,context_hash)"
@@ -903,7 +1094,7 @@ class SharedMemoryStore:
             )
         else:
             conn.execute(
-                "INSERT OR REPLACE INTO rule_match_receipts "
+                "INSERT INTO rule_match_receipts "
                 "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
                 "assignment_ids,selection_reason,matcher_version,confidence,created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -1741,22 +1932,16 @@ class SharedMemoryStore:
     def undo_rule_decision(
         self, decision_id: str, actor: str = "user",
     ) -> RuleDecision:
-        """Append an explicit inverse decision and optionally restore its snapshot.
+        """Append an explicit inverse decision.
 
-        Undo is audit-first: an absent/non-version ``undo_id`` does not make
-        the decision disappear; the inverse record still explains what was
-        requested.  Snapshot restoration is attempted only when the token is
-        a known version in this share group.
+        Daily target undo never restores a whole-group snapshot.  Structured
+        lifecycle callers must apply their precise inverse mutation first and
+        then append the resulting audit decision; disaster recovery owns
+        :meth:`rollback_to_version` as a separate explicit API.
         """
         original = self.get_rule_decision(decision_id)
         if original is None:
             raise ValueError("rule_decision_not_found")
-        if original.undo_id:
-            try:
-                if any(item.get("version_id") == original.undo_id for item in self.list_version_snapshots()):
-                    self.rollback_to_version(original.undo_id)
-            except (FileNotFoundError, ValueError, RuntimeError):
-                pass
         now = _now_iso()
         inverse = RuleDecision(
             decision_id=stable_hash("rule-decision-undo", decision_id, actor, now),
@@ -2005,6 +2190,161 @@ class SharedMemoryStore:
 
     deactivate_rule_exception = rollback_rule_exception
 
+    def revert_rule_exception(
+        self,
+        exception_id: str,
+        expected_parent_assignment_hash: str = "",
+        decision: RuleDecision | None = None,
+    ) -> RuleException:
+        """Reverse exception behavior in one transaction.
+
+        Removes only the exclude generated by this exception, soft-deletes its
+        child rule, deactivates relation, and writes optional inverse decision.
+        If a later parent edit changed the recorded revision, fail closed.
+        """
+        now = _now_iso()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (exception_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("rule_exception_not_found")
+            current = self._row_to_rule_exception(row)
+            rollback = current.rollback if isinstance(current.rollback, dict) else {}
+            parent_rule_id = str(
+                rollback.get("parent_rule_id") or current.parent_rule
+            )
+            parent_row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (parent_rule_id,)
+            ).fetchone()
+            parent_assignments: list[RuleAssignment] = []
+            if parent_row is not None:
+                parent_assignments = self._list_rule_assignments_conn(
+                    conn, parent_rule_id,
+                )
+                current_hash = self._assignment_hash(parent_assignments)
+                expected_candidates = [
+                    str(expected_parent_assignment_hash or ""),
+                    str(rollback.get("parent_assignments_after_hash") or ""),
+                ]
+                checks = [candidate for candidate in expected_candidates if candidate]
+                if checks and not any(
+                    self._assignment_hash_matches(candidate, parent_assignments)
+                    for candidate in checks
+                ):
+                    raise ValueError("parent_assignment_revision_conflict")
+
+            generated = rollback.get("generated_parent_assignment")
+            generated_id = str(
+                rollback.get("generated_parent_assignment_id") or ""
+            )
+            if not isinstance(generated, dict):
+                generated = {}
+            # New exception records distinguish the assignment generated by
+            # this relation from a pre-existing/sibling exclude.  Legacy
+            # records have no explicit flag, so retain their old inference.
+            generated_added = rollback.get("generated_parent_assignment_added")
+            if generated_added is None:
+                generated_added = bool(
+                    generated
+                    or generated_id
+                    or rollback.get("agent_instance_id")
+                    or rollback.get("project_ref")
+                )
+            has_generated_metadata = bool(generated_added)
+            generated_key = (
+                str(generated.get("target_type") or "agent_project"),
+                str(generated.get("target_id") or rollback.get("agent_instance_id") or ""),
+                canonical_project_ref(
+                    str(generated.get("project_ref") or rollback.get("project_ref") or "")
+                ),
+                str(generated.get("effect") or "exclude"),
+            )
+            sibling_projects: set[tuple[str, str, str, str]] = set()
+            siblings = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE parent_rule=? "
+                "AND active=1 AND exception_id<>?",
+                (parent_rule_id, exception_id),
+            ).fetchall()
+            for sibling_row in siblings:
+                sibling = self._row_to_rule_exception(sibling_row)
+                sibling_rollback = sibling.rollback if isinstance(sibling.rollback, dict) else {}
+                sibling_generated = sibling_rollback.get("exception_scope_assignment")
+                if not isinstance(sibling_generated, dict) or not sibling_generated:
+                    sibling_generated = sibling_rollback.get("generated_parent_assignment")
+                if isinstance(sibling_generated, dict):
+                    sibling_projects.add((
+                        str(sibling_generated.get("target_type") or "agent_project"),
+                        str(sibling_generated.get("target_id") or ""),
+                        canonical_project_ref(str(sibling_generated.get("project_ref") or "")),
+                        str(sibling_generated.get("effect") or "exclude"),
+                    ))
+            if parent_assignments:
+                retained: list[RuleAssignment] = []
+                for assignment in parent_assignments:
+                    assignment_key = (
+                        assignment.target_type,
+                        assignment.target_id,
+                        canonical_project_ref(assignment.project_ref),
+                        assignment.effect,
+                    )
+                    is_generated = has_generated_metadata and (
+                        (
+                            generated_id
+                            and assignment.assignment_id == generated_id
+                        )
+                        or assignment_key == generated_key
+                    )
+                    if is_generated and assignment_key not in sibling_projects:
+                        continue
+                    retained.append(assignment)
+                conn.execute(
+                    "DELETE FROM rule_assignments WHERE memory_id=?",
+                    (parent_rule_id,),
+                )
+                self._insert_assignments(conn, parent_rule_id, retained)
+                parent_record = self._row_to_record(parent_row)
+                conn.execute(
+                    "UPDATE records SET dedup_domain=?,updated_at=? WHERE memory_id=?",
+                    (
+                        self._dedup_domain(
+                            "always", retained,
+                            writer_id=parent_record.agent_instance_id,
+                            memory_id=parent_rule_id,
+                        ),
+                        now,
+                        parent_rule_id,
+                    ),
+                )
+
+            child_rule_id = str(
+                rollback.get("child_rule_id") or current.child_exception
+            )
+            if child_rule_id:
+                conn.execute(
+                    "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                    (SharedMemoryStatus.DELETED.value, now, child_rule_id),
+                )
+            current.active = False
+            current.updated_at = now
+            self._insert_rule_exception(conn, current)
+            if decision is not None:
+                if not isinstance(decision, RuleDecision):
+                    decision = RuleDecision.from_dict(dict(decision))
+                self._insert_rule_decision(conn, decision)
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (exception_id,),
+            ).fetchone()
+        result = self._row_to_rule_exception(row)
+        self._append_jsonl(self.rule_exceptions_bak_path, result)
+        if decision is not None:
+            self._append_jsonl(self.rule_decisions_bak_path, decision)
+        return result
+
+    rollback_rule_exception_atomic = revert_rule_exception
+
     def list_conflicts(self) -> list[ConflictGroup]:
         """列出所有冲突组。"""
         with self._db() as conn:
@@ -2107,7 +2447,7 @@ class SharedMemoryStore:
             params.append(share_group_id)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at"
+        sql += " ORDER BY created_at, rowid"
         with self._db() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_rule_match_receipt(row) for row in rows]
@@ -2139,6 +2479,7 @@ class SharedMemoryStore:
             actor, payload["evidence"], payload["created_at"],
         )
         payload["feedback_id"] = feedback_id
+        persisted = RuleMatchFeedback(**{**payload, "feedback_id": feedback_id})
         with self._tx() as conn:
             row = conn.execute(
                 "SELECT 1 FROM rule_match_receipts WHERE receipt_id=?",
@@ -2147,18 +2488,23 @@ class SharedMemoryStore:
             if row is None:
                 raise ValueError("receipt_not_found")
             try:
-                self._insert_rule_match_feedback(
-                    conn, RuleMatchFeedback(**{**payload, "feedback_id": feedback_id}),
-                )
+                self._insert_rule_match_feedback(conn, persisted)
             except sqlite3.IntegrityError:
+                # Idempotency is keyed by feedback_id, not receipt_id.  A
+                # second event for one receipt is valid and must remain stored.
                 existing = conn.execute(
-                    "SELECT * FROM rule_match_feedbacks WHERE receipt_id=?",
-                    (feedback.receipt_id,),
+                    "SELECT * FROM rule_match_feedbacks WHERE feedback_id=?",
+                    (feedback_id,),
                 ).fetchone()
                 if existing is None:
                     raise
-                return self._row_to_rule_match_feedback(existing)
-        return self.get_rule_match_feedback_by_receipt(feedback.receipt_id)
+                if str(existing["receipt_id"]) != str(feedback.receipt_id):
+                    raise ValueError("feedback_id_collision")
+                persisted = self._row_to_rule_match_feedback(existing)
+        self._append_jsonl(self.rule_match_feedbacks_bak_path, persisted)
+        # Return event just persisted, not effective event.  Callers must
+        # resolve effective authority explicitly before triggering governance.
+        return persisted
 
     def list_rule_match_feedbacks(
         self,
@@ -2177,7 +2523,7 @@ class SharedMemoryStore:
             params.append(actor)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at"
+        sql += " ORDER BY created_at, rowid"
         with self._db() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_rule_match_feedback(row) for row in rows]
@@ -2204,8 +2550,10 @@ class SharedMemoryStore:
         ordered = [self._row_to_rule_match_feedback(row) for row in rows]
         ordered.sort(
             key=lambda item: (
+                int(item.authority or FEEDBACK_AUTHORITY_ORDER.get(item.source, 0)),
                 FEEDBACK_AUTHORITY_ORDER.get(item.source, 0),
                 item.created_at or "",
+                item.feedback_id,
             ),
             reverse=True,
         )
@@ -2213,6 +2561,88 @@ class SharedMemoryStore:
         if effective.outcome == "unobserved":
             return None
         return effective
+
+    get_effective_rule_match_feedback = get_rule_match_feedback_by_receipt
+    get_effective_rule_feedback = get_rule_match_feedback_by_receipt
+
+    def list_effective_rule_feedback_evidence(
+        self,
+        memory_id: str,
+        agent_instance_id: str,
+        project_ref: str = "",
+    ) -> list[RuleFeedbackEvidence]:
+        """Return one effective, observed feedback event per matching receipt.
+
+        Query is constrained by rule + runtime agent + canonical project.  A
+        receipt with several events contributes at most one event, resolved by
+        stored authority then timestamp.  ``unobserved`` is deliberately not
+        emitted as evidence: absence of observation cannot drive narrowing.
+        """
+        project_ref = canonical_project_ref(project_ref)
+        from .schema_v3 import FEEDBACK_AUTHORITY_ORDER
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT f.*, r.memory_id AS receipt_memory_id, "
+                "r.share_group_id AS receipt_share_group_id, r.task_hash AS receipt_task_hash, "
+                "r.task AS receipt_task, "
+                "r.agent_instance_id AS receipt_agent_instance_id, "
+                "r.project_ref AS receipt_project_ref, r.provider, "
+                "r.runtime_role, r.session_id, r.context_hash "
+                "FROM rule_match_feedbacks f "
+                "JOIN rule_match_receipts r ON r.receipt_id=f.receipt_id "
+                "WHERE r.memory_id=? AND r.agent_instance_id=? "
+                "ORDER BY f.receipt_id, f.created_at, f.rowid",
+                (memory_id, agent_instance_id),
+            ).fetchall()
+        by_receipt: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            if canonical_project_ref(str(row["receipt_project_ref"] or "")) != project_ref:
+                continue
+            by_receipt.setdefault(str(row["receipt_id"]), []).append(row)
+        result: list[RuleFeedbackEvidence] = []
+        for receipt_id, receipt_rows in by_receipt.items():
+            receipt_rows.sort(
+                key=lambda row: (
+                    int(row["authority"] or FEEDBACK_AUTHORITY_ORDER.get(
+                        str(row["source"] or "agent"), 0,
+                    )),
+                    FEEDBACK_AUTHORITY_ORDER.get(
+                        str(row["source"] or "agent"), 0,
+                    ),
+                    str(row["created_at"] or ""),
+                    str(row["feedback_id"] or ""),
+                ),
+                reverse=True,
+            )
+            row = receipt_rows[0]
+            if str(row["outcome"] or "") == "unobserved":
+                continue
+            result.append(RuleFeedbackEvidence(
+                feedback_id=str(row["feedback_id"]),
+                receipt_id=receipt_id,
+                memory_id=str(row["receipt_memory_id"]),
+                agent_instance_id=str(row["receipt_agent_instance_id"] or ""),
+                share_group_id=str(row["receipt_share_group_id"] or ""),
+                task_hash=str(row["receipt_task_hash"] or ""),
+                task=str(row["receipt_task"] or ""),
+                project_ref=canonical_project_ref(str(row["receipt_project_ref"] or "")),
+                provider=str(row["provider"] or ""),
+                runtime_role=str(row["runtime_role"] or ""),
+                session_id=str(row["session_id"] or ""),
+                context_hash=str(row["context_hash"] or ""),
+                outcome=str(row["outcome"] or ""),
+                actor=str(row["actor"] or ""),
+                evidence=str(row["evidence"] or ""),
+                confidence=float(row["confidence"] or 0.0),
+                created_at=str(row["created_at"] or ""),
+                source=str(row["source"] or "agent"),
+                authority=int(row["authority"] or 0),
+                supersedes_feedback_id=str(row["supersedes_feedback_id"] or ""),
+            ))
+        result.sort(key=lambda item: (item.created_at, item.receipt_id))
+        return result
+
+    list_effective_rule_feedback = list_effective_rule_feedback_evidence
 
     # Future narrowing logic can use hit terminology without creating a
     # second table or losing compatibility with existing match receipts.
@@ -2256,6 +2686,312 @@ class SharedMemoryStore:
                 ), now, memory_id),
             )
         return self.list_rule_assignments(memory_id)
+
+    @staticmethod
+    def _assignment_hash(items: list[RuleAssignment]) -> str:
+        material = [
+            {
+                "memory_id": item.memory_id,
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "project_ref": canonical_project_ref(item.project_ref),
+                "effect": item.effect,
+                "priority_override": item.priority_override,
+            }
+            for item in sorted(
+                items,
+                key=lambda value: (
+                    value.target_type, value.target_id,
+                    canonical_project_ref(value.project_ref), value.effect,
+                    value.priority_override if value.priority_override is not None else -10**9,
+                ),
+            )
+        ]
+        return stable_hash(
+            "rule-assignment-state",
+            json.dumps(material, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def rule_assignment_hash(self, memory_id: str) -> str:
+        """Stable revision token for one rule's complete assignment multiset."""
+        return self._assignment_hash(self.list_rule_assignments(memory_id))
+
+    @classmethod
+    def _assignment_hash_matches(
+        cls, expected: str, items: list[RuleAssignment],
+    ) -> bool:
+        """Accept current canonical token plus pre-v4 service token."""
+        if not expected:
+            return True
+        if expected == cls._assignment_hash(items):
+            return True
+        # Early lifecycle service used this token before the store exposed a
+        # stable revision API.  Keep compatibility for already persisted
+        # decisions while new callers use ``rule_assignment_hash``.
+        full = [item.to_dict() for item in items]
+        legacy = stable_hash(
+            "rule-assignments",
+            json.dumps(full, ensure_ascii=False, sort_keys=True),
+        )
+        if expected == legacy:
+            return True
+        semantic = [
+            {
+                "target_type": item.target_type,
+                "target_id": item.target_id,
+                "project_ref": canonical_project_ref(item.project_ref),
+                "effect": item.effect,
+                "priority_override": item.priority_override,
+            }
+            for item in items
+        ]
+        return expected == stable_hash(
+            "rule-assignments",
+            json.dumps(semantic, ensure_ascii=False, sort_keys=True),
+        )
+
+    def apply_rule_split(
+        self,
+        parent_rule_id: str,
+        expected_parent_assignment_hash: str,
+        child_record: SharedMemoryRecord,
+        child_assignments: list[dict | RuleAssignment] | None,
+        parent_assignments_after: list[dict | RuleAssignment] | None,
+        exception: RuleException | None = None,
+        decision: RuleDecision | None = None,
+        *,
+        automatic: bool = True,
+        actor_agent_id: str = "",
+    ) -> dict[str, Any]:
+        """Atomically create child, replace parent audience and audit.
+
+        All writes share one ``BEGIN`` from :meth:`_tx`; any validation,
+        insert, relation or decision failure rolls back every mutation.
+        ``expected_parent_assignment_hash`` is an optimistic concurrency guard.
+        """
+        if not isinstance(child_record, SharedMemoryRecord):
+            child_record = SharedMemoryRecord.from_dict(dict(child_record))
+        if child_record.memory_id == parent_rule_id:
+            raise ValueError("child_rule_must_differ_from_parent")
+        if exception is not None and not isinstance(exception, RuleException):
+            exception = RuleException.from_dict(dict(exception))
+        if decision is not None and not isinstance(decision, RuleDecision):
+            decision = RuleDecision.from_dict(dict(decision))
+        actor_agent_id = actor_agent_id or child_record.agent_instance_id
+        with self._tx() as conn:
+            parent_row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (parent_rule_id,)
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError("parent_rule_not_found")
+            parent_record = self._row_to_record(parent_row)
+            if parent_record.injection_policy != "always":
+                raise ValueError("parent_rule_assignments_require_always")
+            parent_before = self._list_rule_assignments_conn(conn, parent_rule_id)
+            current_hash = self._assignment_hash(parent_before)
+            if not self._assignment_hash_matches(
+                expected_parent_assignment_hash, parent_before,
+            ):
+                raise ValueError("parent_assignment_revision_conflict")
+            existing_child = conn.execute(
+                "SELECT 1 FROM records WHERE memory_id=?", (child_record.memory_id,)
+            ).fetchone()
+            if existing_child is not None:
+                raise ValueError("child_rule_exists")
+
+            normalized_child = self._normalize_assignments(
+                child_record.memory_id, child_assignments or [],
+                automatic=automatic, actor_agent_id=actor_agent_id,
+            )
+            if child_record.injection_policy == "always" and not normalized_child:
+                normalized_child = self._default_assignments(child_record)
+            if child_record.injection_policy != "always" and normalized_child:
+                raise ValueError("rule assignments require injection_policy=always")
+            normalized_parent = self._normalize_assignments(
+                parent_rule_id,
+                parent_assignments_after
+                if parent_assignments_after is not None else parent_before,
+                automatic=automatic, actor_agent_id=actor_agent_id,
+            )
+            self._validate_mandatory_budget(
+                child_record, assignments=normalized_child, conn=conn,
+            )
+            self._validate_mandatory_budget(
+                parent_record, assignments=normalized_parent, conn=conn,
+                replacing_id=parent_rule_id,
+            )
+            self._insert_record(
+                conn, child_record,
+                dedup_domain=self._dedup_domain(
+                    child_record.injection_policy, normalized_child,
+                    writer_id=child_record.agent_instance_id,
+                    memory_id=child_record.memory_id,
+                ),
+            )
+            self._insert_assignments(conn, child_record.memory_id, normalized_child)
+            conn.execute(
+                "DELETE FROM rule_assignments WHERE memory_id=?", (parent_rule_id,)
+            )
+            self._insert_assignments(conn, parent_rule_id, normalized_parent)
+            now = _now_iso()
+            conn.execute(
+                "UPDATE records SET dedup_domain=?,updated_at=? WHERE memory_id=?",
+                (
+                    self._dedup_domain(
+                        "always", normalized_parent,
+                        writer_id=parent_record.agent_instance_id,
+                        memory_id=parent_rule_id,
+                    ),
+                    now,
+                    parent_rule_id,
+                ),
+            )
+            persisted_exception = exception
+            if persisted_exception is not None:
+                rollback = persisted_exception.rollback
+                if not isinstance(rollback, dict):
+                    rollback = {"value": rollback}
+                rollback = dict(rollback)
+                rollback.setdefault("parent_rule_id", parent_rule_id)
+                rollback.setdefault(
+                    "parent_assignments_before_hash", current_hash,
+                )
+                rollback.setdefault(
+                    "parent_assignments_after_hash",
+                    self._assignment_hash(normalized_parent),
+                )
+                rollback.setdefault("child_rule_id", child_record.memory_id)
+                if not rollback.get("generated_parent_assignment"):
+                    generated = next(
+                        (
+                            item.to_dict() for item in normalized_parent
+                            if item.effect == "exclude"
+                            and item.target_type == "agent_project"
+                            and item.target_id == child_record.agent_instance_id
+                        ),
+                        None,
+                    )
+                    if generated is not None:
+                        rollback["generated_parent_assignment"] = generated
+                persisted_exception = RuleException.from_dict({
+                    **persisted_exception.to_dict(),
+                    "rollback": rollback,
+                    "created_at": persisted_exception.created_at or now,
+                    "updated_at": persisted_exception.updated_at or now,
+                })
+                self._insert_rule_exception(conn, persisted_exception)
+            if decision is not None:
+                self._insert_rule_decision(conn, decision)
+            result = RuleMutationResult(
+                parent_rule_id=parent_rule_id,
+                child_record=child_record,
+                child_assignments=normalized_child,
+                parent_assignments_before=parent_before,
+                parent_assignments_after=normalized_parent,
+                exception=persisted_exception,
+                decision=decision,
+            )
+        # Backups are deliberately outside the DB transaction; a sidecar
+        # failure cannot turn a committed atomic mutation into a partial DB.
+        self._append_jsonl(self.records_bak_path, child_record)
+        if persisted_exception is not None:
+            self._append_jsonl(self.rule_exceptions_bak_path, persisted_exception)
+        if decision is not None:
+            self._append_jsonl(self.rule_decisions_bak_path, decision)
+        return result
+
+    def apply_rule_exception_atomic(
+        self,
+        parent_rule_id: str,
+        parent_assignments_before: list[dict | RuleAssignment] | None,
+        parent_assignments_after: list[dict | RuleAssignment],
+        child_record: SharedMemoryRecord,
+        child_assignments: list[dict | RuleAssignment] | None,
+        exception_relation: RuleException,
+        decision: RuleDecision | None,
+        expected_parent_assignment_hash: str = "",
+        *,
+        automatic: bool = True,
+        actor_agent_id: str = "",
+    ) -> dict[str, Any]:
+        """Atomic exception mutation primitive (split + relation + decision)."""
+        expected = expected_parent_assignment_hash
+        if not expected and parent_assignments_before is not None:
+            before_items = self._normalize_assignments(
+                parent_rule_id, parent_assignments_before,
+                automatic=False,
+            )
+            expected = self._assignment_hash(before_items)
+        return self.apply_rule_split(
+            parent_rule_id,
+            expected,
+            child_record,
+            child_assignments,
+            parent_assignments_after,
+            exception=exception_relation,
+            decision=decision,
+            automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
+
+    def apply_rule_narrow_atomic(
+        self,
+        parent_rule_id: str,
+        parent_assignments_after: list[dict | RuleAssignment],
+        decision: RuleDecision | None = None,
+        expected_parent_assignment_hash: str = "",
+        *,
+        automatic: bool = True,
+        actor_agent_id: str = "",
+    ) -> list[RuleAssignment]:
+        """Atomically replace parent assignments and append narrowing decision."""
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (parent_rule_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("parent_rule_not_found")
+            record = self._row_to_record(row)
+            if record.injection_policy != "always":
+                raise ValueError("parent_rule_assignments_require_always")
+            current = self._list_rule_assignments_conn(conn, parent_rule_id)
+            current_hash = self._assignment_hash(current)
+            if not self._assignment_hash_matches(
+                expected_parent_assignment_hash, current,
+            ):
+                raise ValueError("parent_assignment_revision_conflict")
+            actor_agent_id = actor_agent_id or record.agent_instance_id
+            normalized = self._normalize_assignments(
+                parent_rule_id, parent_assignments_after,
+                automatic=automatic, actor_agent_id=actor_agent_id,
+            )
+            self._validate_mandatory_budget(
+                record, assignments=normalized, conn=conn,
+                replacing_id=parent_rule_id,
+            )
+            conn.execute(
+                "DELETE FROM rule_assignments WHERE memory_id=?", (parent_rule_id,)
+            )
+            self._insert_assignments(conn, parent_rule_id, normalized)
+            conn.execute(
+                "UPDATE records SET dedup_domain=?,updated_at=? WHERE memory_id=?",
+                (
+                    self._dedup_domain(
+                        "always", normalized,
+                        writer_id=record.agent_instance_id,
+                        memory_id=parent_rule_id,
+                    ),
+                    _now_iso(),
+                    parent_rule_id,
+                ),
+            )
+            if decision is not None:
+                if not isinstance(decision, RuleDecision):
+                    decision = RuleDecision.from_dict(dict(decision))
+                self._insert_rule_decision(conn, decision)
+        if decision is not None:
+            self._append_jsonl(self.rule_decisions_bak_path, decision)
+        return self.list_rule_assignments(parent_rule_id)
 
     def replace_actor_assignment(
         self, memory_id: str, actor_agent_id: str,

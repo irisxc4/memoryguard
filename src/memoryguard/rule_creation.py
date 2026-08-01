@@ -22,6 +22,7 @@ from typing import Any
 
 from .governance_engine import GovernanceEngine
 from .rule_scope import TARGET_TYPES, canonical_project_ref, normalize_assignment
+from .security import FEEDBACK_AUTHORITY
 try:  # rolling upgrades: the narrower validator may land after this module
     from .rule_scope import validate_automatic_assignment
 except ImportError:  # pragma: no cover - exercised only by pre-lifecycle stores
@@ -37,10 +38,13 @@ except ImportError:  # pragma: no cover - exercised only by pre-lifecycle stores
 from .schema_v3 import (
     DecisionEvent,
     EffectiveAgentContext,
+    MemoryKind,
     MemoryEvent,
+    Provenance,
     RuleMatchFeedback,
     RuleDecision,
     RuleException,
+    SharedMemoryRecord,
     SharedMemoryStatus,
     _now_iso,
     stable_hash,
@@ -63,7 +67,12 @@ FEEDBACK_OUTCOMES = frozenset({
 NARROWING_MIN_EVENTS = 3
 NARROWING_MIN_SESSIONS = 2
 # High-confidence ``followed`` evidence cancels narrowing evidence.
-NARROWING_OPPOSED_THRESHOLD = 2
+# One effective, high-confidence ``followed`` observation in the same
+# agent/project scope is enough to cancel automatic narrowing.  A single
+# positive observation is already evidence that the rule may be applicable;
+# requiring two would permit a false narrowing after one counterexample.
+NARROWING_OPPOSED_THRESHOLD = 1
+FEEDBACK_PRODUCER_AUTHORITY = FEEDBACK_AUTHORITY
 
 
 class RuleCreationService:
@@ -110,6 +119,8 @@ class RuleCreationService:
                 "runtime_role": str(context.runtime_role or "").strip(),
                 "runtime_agent_id": str(context.runtime_agent_id or "").strip(),
                 "parent_agent_id": str(context.parent_agent_id or "").strip(),
+                "session_id": str(context.session_id or "").strip(),
+                "context_hash": str(context.context_hash or "").strip(),
             }
         if isinstance(context, Mapping):
             return {
@@ -120,6 +131,8 @@ class RuleCreationService:
                 "runtime_role": str(context.get("runtime_role", "") or "").strip(),
                 "runtime_agent_id": str(context.get("runtime_agent_id", "") or "").strip(),
                 "parent_agent_id": str(context.get("parent_agent_id", "") or "").strip(),
+                "session_id": str(context.get("session_id", "") or "").strip(),
+                "context_hash": str(context.get("context_hash", "") or "").strip(),
             }
         raise ValueError("effective agent context is required")
 
@@ -314,6 +327,7 @@ class RuleCreationService:
         metadata: Mapping[str, Any] | None = None,
         actor: str = "agent:unknown",
         before: Any | None = None,
+        persist: bool = True,
     ) -> RuleDecision:
         result = result or {}
         record = result.get("record") or result.get("after") or {}
@@ -336,6 +350,7 @@ class RuleCreationService:
         target_type = str(target.get("target_type", "") or "")
         target_id = str(target.get("target_id", "") or "")
         project_ref = str(target.get("project_ref", "") or "")
+        decision_confidence = float(scope_confidence) if scope_confidence is not None else 1.0
         after = dict(record)
         after.update({
             "assignments": assignments_payload,
@@ -347,7 +362,7 @@ class RuleCreationService:
         })
         reason_payload = {
             "scope_reason": scope_reason,
-            "scope_confidence": float(scope_confidence),
+            "scope_confidence": decision_confidence,
             "assignment": target,
             "parent_rule_id": parent_rule_id,
             **dict(metadata or {}),
@@ -357,7 +372,7 @@ class RuleCreationService:
             actor=actor or "agent:unknown",
             before={} if before is None else before, after=after,
             reason=json.dumps(reason_payload, ensure_ascii=False, separators=(",", ":")),
-            confidence=max(0.0, min(1.0, float(scope_confidence or 1.0))),
+            confidence=max(0.0, min(1.0, decision_confidence)),
             undo_id=undo_id,
             created_at=_now_iso(),
             rule_id=memory_id,
@@ -370,11 +385,12 @@ class RuleCreationService:
             target_type=target_type,
             target_id=target_id,
             project_ref=project_ref,
-            scope_confidence=float(scope_confidence),
+            scope_confidence=decision_confidence,
             scope_reason=scope_reason,
             blocked_reason=blocked_reason or str(result.get("blocked_reason", "") or ""),
+            metadata=dict(metadata or {}),
         )
-        return self._persist_structured_decision(decision)
+        return self._persist_structured_decision(decision) if persist else decision
 
     # ------------------------------------------------------------------
     # Creation / undo / decision read
@@ -444,6 +460,16 @@ class RuleCreationService:
                             return previous
                 except Exception:
                     pass
+        # Keep the complete inference decision in the structured audit record;
+        # this is separate from the compact human-facing scope_reason.
+        inference_metadata: dict[str, Any] = {}
+        if requested is None:
+            from .rule_scope import infer_scope_from_text
+            inference_metadata["scope_inference"] = infer_scope_from_text(
+                body,
+                agent_instance_id=context["agent_instance_id"],
+                project_ref=context["project_ref"],
+            ).to_dict()
         try:
             assignment, confidence, scope_reason = self._scope_values(
                 context, requested, manual=bool(manual), is_admin=admin, text=body,
@@ -528,6 +554,7 @@ class RuleCreationService:
             "undo_id": undo_id,
             "parent_rule_id": parent_rule_id,
             "assignment": assignment,
+            **inference_metadata,
         }
         try:
             self.store.append_decision(DecisionEvent(
@@ -553,7 +580,11 @@ class RuleCreationService:
             parent_rule_id=parent_rule_id,
             actor=("admin" if manual and admin else f"agent:{context['agent_instance_id']}"),
             before={"undo_id": undo_id, "pre_rule_snapshot": True},
-            metadata={"manual": bool(manual), "is_admin": admin, "idempotency_key": idempotency_key},
+            metadata={
+                "manual": bool(manual), "is_admin": admin,
+                "idempotency_key": idempotency_key,
+                **inference_metadata,
+            },
         )
 
     create_rule = create_rule_from_text
@@ -565,74 +596,116 @@ class RuleCreationService:
         token: str,
         actor: str,
     ) -> RuleDecision | None:
-        """Target-level inverse operation for one rule decision.
-
-        v2: restores only the record + assignments touched by this decision,
-        never the whole shared-memory group.  Returns None when the decision
-        does not name a rule or the rule no longer exists.
-        """
-        if not decision.memory_id and not decision.rule_id:
-            return None
-        memory_id = decision.memory_id or decision.rule_id
-        before = decision.before if isinstance(decision.before, dict) else {}
-        before_record = before.get("record") if isinstance(before.get("record"), dict) else before.get("after")
-        before_assignments = before.get("assignments")
-        get_record = getattr(self.store, "get_record", None)
-        if callable(get_record):
-            try:
-                existing = get_record(memory_id)
-            except Exception:
-                existing = None
-        else:
-            existing = None
-        if existing is not None:
-            # Soft-delete/shadow the rule; preserve history.
-            delete = getattr(self.store, "delete", None)
-            if callable(delete):
-                try:
-                    delete(memory_id, actor=actor, manual_override=True)
-                except (TypeError, ValueError, RuntimeError):
-                    pass
-            elif hasattr(self.store, "update_record"):
-                from .schema_v3 import SharedMemoryStatus
-                try:
-                    existing.status = SharedMemoryStatus.DELETED
-                    self.store.update_record(existing)
-                except (TypeError, ValueError, RuntimeError):
-                    pass
-        # Restore the exact assignments this decision created (if any).
-        if isinstance(before_assignments, list) and before_assignments:
-            set_assignments = getattr(self.store, "set_rule_assignments", None)
-            if callable(set_assignments):
-                try:
-                    set_assignments(
-                        memory_id, [dict(item) for item in before_assignments],
-                        automatic=True, actor_agent_id=str(decision.actor or "").replace("agent:", ""),
-                    )
-                except (TypeError, ValueError, RuntimeError):
-                    pass
+        """Apply one structured inverse; never restore a group snapshot."""
+        action = str(getattr(decision, "action", "") or "")
+        memory_id = str(decision.memory_id or decision.rule_id or "")
+        if not memory_id:
+            raise ValueError("structured_decision_required")
+        metadata = decision.after.get("metadata", {}) if isinstance(decision.after, dict) else {}
+        metadata = metadata if isinstance(metadata, dict) else {}
         now = _now_iso()
-        inverse = RuleDecision(
-            decision_id=stable_hash("rule-decision-undo", decision.decision_id, actor, now),
-            actor=actor,
-            before=decision.after,
-            after=decision.before,
-            reason=f"target-level undo of {decision.decision_id}",
-            confidence=decision.confidence,
-            undo_id=decision.decision_id,
-            created_at=now,
-            rule_id=memory_id,
-            action="rule_undo",
-            target_ids=[memory_id],
-            status="undone",
-            memory_id=memory_id,
-            parent_rule_id=decision.parent_rule_id,
-            scope_confidence=decision.scope_confidence,
-            scope_reason="explicit target-level undo",
-            blocked_reason="",
-            metadata={"target_undo": True, "supersedes_token": token},
-        )
-        return self._persist_structured_decision(inverse)
+
+        def _inverse(status: str = "undone", *, reason: str = "") -> RuleDecision:
+            return RuleDecision(
+                decision_id=stable_hash("rule-decision-undo", decision.decision_id, actor, now),
+                actor=actor,
+                before=decision.after,
+                after=decision.before,
+                reason=reason or f"target-level undo of {decision.decision_id}",
+                confidence=decision.confidence,
+                undo_id=decision.decision_id,
+                created_at=now,
+                rule_id=memory_id,
+                action="rule_undo",
+                target_ids=list(decision.target_ids) or [memory_id],
+                status=status,
+                memory_id=memory_id,
+                parent_rule_id=decision.parent_rule_id,
+                scope_confidence=decision.scope_confidence,
+                scope_reason="explicit structured inverse",
+                blocked_reason="" if status == "undone" else reason,
+                metadata={"target_undo": True, "supersedes_token": token, "original_action": action},
+            )
+
+        if action in {"rule_create_auto", "rule_create_manual"}:
+            existing = self.store.get_record(memory_id)
+            if existing is None:
+                raise ValueError("target_rule_not_found")
+            delete = getattr(self.store, "delete", None)
+            if not callable(delete):
+                raise ValueError("structured_rule_delete_unavailable")
+            delete(memory_id, actor=actor, manual_override=True)
+            before_assignments = decision.before.get("assignments") if isinstance(decision.before, dict) else None
+            if isinstance(before_assignments, list) and before_assignments:
+                setter = getattr(self.store, "set_rule_assignments", None)
+                if not callable(setter):
+                    raise ValueError("structured_assignment_restore_unavailable")
+                setter(
+                    memory_id, [dict(item) for item in before_assignments],
+                    automatic=True, actor_agent_id=str(decision.actor or "").replace("agent:", ""),
+                )
+            inverse = _inverse()
+        elif action == "rule_narrow":
+            parent_id = str(decision.parent_rule_id or memory_id)
+            before_assignments = metadata.get("parent_assignments_before")
+            after_assignments = metadata.get("parent_assignments_after")
+            if not isinstance(before_assignments, list) or not isinstance(after_assignments, list):
+                raise ValueError("structured_narrow_inverse_missing")
+            hash_fn = getattr(self.store, "rule_assignment_hash", None)
+            current_hash = (
+                str(hash_fn(parent_id) or "")
+                if callable(hash_fn)
+                else stable_hash(
+                    "rule-assignments", json.dumps(after_assignments, ensure_ascii=False, sort_keys=True),
+                )
+            )
+            inverse = _inverse()
+            apply_narrow = getattr(self.store, "apply_rule_narrow_atomic", None)
+            if not callable(apply_narrow):
+                raise ValueError("atomic_rule_narrow_revert_unavailable")
+            apply_narrow(
+                parent_rule_id=parent_id,
+                parent_assignments_after=[dict(item) for item in before_assignments],
+                expected_parent_assignment_hash=current_hash,
+                automatic=True,
+                actor_agent_id=str(decision.actor or "").replace("agent:", ""),
+                decision=inverse,
+            )
+            return inverse
+        elif action == "rule_exception":
+            exception_id = str(metadata.get("exception_id", "") or "")
+            if not exception_id:
+                child_rule_id = str(decision.child_rule_id or metadata.get("child_rule_id", "") or "")
+                if child_rule_id:
+                    exception_id = stable_hash("rule-exception", str(decision.parent_rule_id), child_rule_id)
+            if not exception_id:
+                raise ValueError("structured_exception_inverse_missing")
+            after_assignments = metadata.get("parent_assignments_after")
+            if not isinstance(after_assignments, list):
+                raise ValueError("structured_exception_assignment_delta_missing")
+            parent_id = str(decision.parent_rule_id or "")
+            hash_fn = getattr(self.store, "rule_assignment_hash", None)
+            current_hash = (
+                str(hash_fn(parent_id) or "")
+                if callable(hash_fn) and parent_id
+                else stable_hash(
+                    "rule-assignments", json.dumps(after_assignments, ensure_ascii=False, sort_keys=True),
+                )
+            )
+            inverse = _inverse()
+            revert = getattr(self.store, "revert_rule_exception", None)
+            if not callable(revert):
+                raise ValueError("atomic_rule_exception_revert_unavailable")
+            revert(exception_id, expected_parent_assignment_hash=current_hash, decision=inverse)
+            return inverse
+        else:
+            raise ValueError(f"structured_inverse_unsupported:{action or 'unknown'}")
+
+        append = getattr(self.store, "append_rule_decision", None)
+        if not callable(append):
+            raise ValueError("structured_inverse_persistence_unavailable")
+        persisted = append(inverse)
+        return persisted if persisted is not None else inverse
 
     def undo_rule(
         self,
@@ -641,21 +714,11 @@ class RuleCreationService:
         *,
         is_admin: bool | None = None,
     ) -> RuleDecision:
-        """Rollback the snapshot represented by ``undo_id``."""
+        """Undo one structured lifecycle decision; never restore a group snapshot."""
         context = self._context_dict(effective_context)
         token = str(undo_id or "").strip()
         if not token:
             return self._blocked(action="rule_undo", reason="undo_id is required", context=context)
-        snapshots = []
-        try:
-            snapshots = self.store.list_version_snapshots()
-        except Exception:
-            snapshots = []
-        snapshot = next((item for item in snapshots if item.get("version_id") == token), None)
-        if snapshot is None:
-            return self._blocked(action="rule_undo", reason="undo_id not found", context=context, undo_id=token)
-        if snapshot.get("share_group_id", self.group_id) != self.group_id:
-            return self._blocked(action="rule_undo", reason="undo_id belongs to another share group", context=context, undo_id=token)
         admin = self.is_admin if is_admin is None else bool(is_admin)
         if not admin and not context["agent_instance_id"]:
             return self._blocked(
@@ -664,27 +727,6 @@ class RuleCreationService:
                 context=context,
                 undo_id=token,
             )
-        # The snapshot reason is the only persisted owner hint available in
-        # legacy stores.  Admins may undo any rule; agents may undo a decision
-        # whose rule record or reason names the current agent.
-        if not admin:
-            reason = str(snapshot.get("reason", ""))
-            owner_match = context["agent_instance_id"] and context["agent_instance_id"] in reason
-            structured_list = getattr(self.store, "list_rule_decisions", None)
-            if callable(structured_list):
-                try:
-                    owner_match = owner_match or any(
-                        context["agent_instance_id"] in str(item.actor or "")
-                        for item in structured_list(undo_id=token)
-                    )
-                except Exception:
-                    pass
-            if context["agent_instance_id"] and not owner_match:
-                return self._blocked(action="rule_undo", reason="undo permission denied", context=context, undo_id=token)
-        # v2: daily undo must be a target-level inverse operation, never a
-        # whole-share-group rollback.  A shared group can contain rules
-        # written by other Agents after this rule was created; rolling back
-        # the pre-create snapshot would erase their writes.
         structured_original = None
         structured_list = getattr(self.store, "list_rule_decisions", None)
         if callable(structured_list):
@@ -693,38 +735,25 @@ class RuleCreationService:
                 structured_original = candidates[0] if candidates else None
             except Exception:
                 structured_original = None
-        if structured_original is not None:
-            try:
-                inverse = self._target_undo(
-                    structured_original, token=token,
-                    actor=("admin" if admin else f"agent:{context['agent_instance_id']}"),
-                )
-                if inverse is not None:
-                    return inverse
-            except (TypeError, ValueError, RuntimeError):
-                pass
-        # No structured decision points to a specific rule: fall back to the
-        # versioned snapshot only as a compatibility path for legacy tokens.
+        if structured_original is None:
+            return self._blocked(
+                action="rule_undo", reason="structured_decision_required",
+                context=context, undo_id=token,
+            )
+        if not admin and context["agent_instance_id"] not in str(structured_original.actor or ""):
+            return self._blocked(action="rule_undo", reason="undo permission denied", context=context, undo_id=token)
         try:
-            self.store.rollback_to_version(token)
-        except (FileNotFoundError, ValueError, RuntimeError) as exc:
-            return self._blocked(action="rule_undo", reason=str(exc), context=context, undo_id=token)
-        decision_id = stable_hash("rule-undo-decision", self.group_id, token, context["agent_instance_id"], _now_iso())
-        try:
-            self.store.append_decision(DecisionEvent(
-                event_id=decision_id,
+            return self._target_undo(
+                structured_original, token=token,
                 actor=("admin" if admin else f"agent:{context['agent_instance_id']}"),
-                action="rule_undo", target_ids=[token],
-                reason=f"rollback to pre-rule snapshot {token}", created_at=_now_iso(),
-            ))
-        except Exception:
-            pass
-        return self._decision(
-            action="rule_undo", status="undone", result={
-                "decision_id": decision_id, "version_id": token,
-            }, undo_id=token, scope_reason="explicit undo of persisted pre-rule snapshot",
-            actor=("admin" if admin else f"agent:{context['agent_instance_id']}"),
-        )
+            ) or self._blocked(
+                action="rule_undo", reason="target_undo_noop", context=context, undo_id=token,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(
+                action="rule_undo", reason=f"target_undo_partial_failure:{exc}",
+                context=context, undo_id=token,
+            )
 
     def undo_rule_decision(
         self,
@@ -735,7 +764,6 @@ class RuleCreationService:
     ) -> RuleDecision:
         """Undo by lifecycle decision id (UI/API friendly alias)."""
         decision = self.read_decision(decision_id)
-        token = decision.undo_id if decision is not None and decision.undo_id else str(decision_id or "")
         if effective_context is None:
             effective_context = EffectiveAgentContext(
                 agent_instance_id=os.environ.get("MEMORYGUARD_AGENT_ID", "").strip(),
@@ -746,7 +774,32 @@ class RuleCreationService:
                 provider=os.environ.get("MEMORYGUARD_PROVIDER", "").strip(),
                 runtime_role=os.environ.get("MEMORYGUARD_RUNTIME_ROLE", "").strip(),
             )
-        return self.undo_rule(token, effective_context, is_admin=is_admin)
+        context = self._context_dict(effective_context)
+        if decision is None:
+            return self._blocked(
+                action="rule_undo", reason="structured_decision_required",
+                context=context, undo_id=str(decision_id or ""),
+            )
+        admin = self.is_admin if is_admin is None else bool(is_admin)
+        if not admin and context["agent_instance_id"] not in str(decision.actor or ""):
+            return self._blocked(
+                action="rule_undo", reason="undo permission denied",
+                context=context, undo_id=str(decision_id or ""),
+            )
+        try:
+            return self._target_undo(
+                decision,
+                token=str(decision_id or ""),
+                actor=("admin" if admin else f"agent:{context['agent_instance_id']}"),
+            ) or self._blocked(
+                action="rule_undo", reason="target_undo_noop",
+                context=context, undo_id=str(decision_id or ""),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(
+                action="rule_undo", reason=f"target_undo_partial_failure:{exc}",
+                context=context, undo_id=str(decision_id or ""),
+            )
 
     def read_decision(self, decision_id: str) -> RuleDecision | None:
         target = str(decision_id or "").strip()
@@ -847,11 +900,13 @@ class RuleCreationService:
             "inference_policy": "agent_project when trusted cwd project exists, else agent",
         }
         list_scope_stats = getattr(self.store, "list_rule_scope_stats", None)
+        scope_stats_rows: list[Any] = []
         if callable(list_scope_stats):
             try:
+                scope_stats_rows = list(list_scope_stats() or [])
                 payload["scope_stats"] = [
                     item.to_dict() if hasattr(item, "to_dict") else dict(item)
-                    for item in list_scope_stats()
+                    for item in scope_stats_rows
                 ]
             except Exception:
                 payload["scope_stats"] = []
@@ -865,19 +920,92 @@ class RuleCreationService:
                 decisions = list_decisions()
             except Exception:
                 decisions = []
-        auto_created = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_auto"]
-        manual_created = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_manual"]
-        total_created = len(auto_created) + len(manual_created)
+        auto_attempts = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_auto"]
+        manual_attempts = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_manual"]
+        total_attempts = len(auto_attempts) + len(manual_attempts)
+        auto_created = [
+            d for d in auto_attempts
+            if str(getattr(d, "status", "") or "") == "created"
+        ]
+        manual_created = [
+            d for d in manual_attempts
+            if str(getattr(d, "status", "") or "") == "created"
+        ]
+        created_decisions = auto_created + manual_created
+        blocked_decisions = [
+            d for d in (auto_attempts + manual_attempts)
+            if str(getattr(d, "status", "") or "") == "blocked"
+        ]
         fallback_auto = [
             d for d in auto_created
             if "fallback" in str(getattr(d, "scope_reason", "") or getattr(d, "reason", "") or "")
         ]
+        corrected_count = 0
+        wrong_scope_count = 0
+        def _stat_value(stat: Any, key: str) -> int:
+            if isinstance(stat, Mapping):
+                return int(stat.get(key, 0) or 0)
+            return int(getattr(stat, key, 0) or 0)
+        if callable(list_scope_stats):
+            try:
+                for stat in scope_stats_rows:
+                    corrected_count += _stat_value(stat, "corrected")
+                    wrong_scope_count += _stat_value(stat, "wrong_scope")
+            except Exception:
+                pass
+        reviewed = corrected_count + wrong_scope_count
+        accepted_without_correction = max(0, sum(
+            _stat_value(stat, "accepted")
+            for stat in scope_stats_rows
+        ) - corrected_count)
+        fallback_count = len(fallback_auto)
+        auto_created_count = len(auto_created)
+        successful_scope_decisions = len(auto_created) + len(manual_created)
+        metrics = {
+            "attempts": total_attempts,
+            "created": len(created_decisions),
+            "blocked": len(blocked_decisions),
+            "manual": len(manual_created),
+            "auto_scope_attempts": len(auto_attempts),
+            "auto_scope_created": len(auto_created),
+            "auto_scope_blocked": sum(
+                1 for item in auto_attempts
+                if str(getattr(item, "status", "") or "") == "blocked"
+            ),
+            "manual_scope_attempts": len(manual_attempts),
+            "manual_scope_created": len(manual_created),
+            "manual_scope_blocked": sum(
+                1 for item in manual_attempts
+                if str(getattr(item, "status", "") or "") == "blocked"
+            ),
+            "fallback": fallback_count,
+            "corrected": corrected_count,
+            "wrong": wrong_scope_count,
+            "auto_scope_coverage": (
+                len(auto_created) / successful_scope_decisions
+                if successful_scope_decisions else 0.0
+            ),
+            "auto_scope_accuracy": (
+                accepted_without_correction / reviewed if reviewed else None
+            ),
+            "fallback_rate": fallback_count / auto_created_count if auto_created_count else 0.0,
+            "under_scoped_rate": corrected_count / reviewed if reviewed else 0.0,
+            "over_scoped_rate": wrong_scope_count / reviewed if reviewed else 0.0,
+            "manual_correction_rate": corrected_count / reviewed if reviewed else 0.0,
+        }
+        payload["metrics"] = metrics
+        payload["scope_metrics"] = dict(metrics)
         payload["auto_scope"] = {
             "auto_created": len(auto_created),
             "manual_created": len(manual_created),
-            "auto_scope_coverage": (len(auto_created) / total_created) if total_created else 0.0,
-            "auto_fallback_count": len(fallback_auto),
-            "accuracy_note": "accuracy requires a human-labeled golden set; assignment count is not accuracy",
+            "auto_scope_coverage": metrics["auto_scope_coverage"],
+            "auto_scope_accuracy": metrics["auto_scope_accuracy"],
+            "auto_fallback_count": fallback_count,
+            "fallback_rate": metrics["fallback_rate"],
+            "under_scoped_rate": metrics["under_scoped_rate"],
+            "over_scoped_rate": metrics["over_scoped_rate"],
+            "manual_correction_rate": metrics["manual_correction_rate"],
+            "accuracy_note": "accuracy uses reviewed scope outcomes; unreviewed creations are not counted as correct",
         }
         if context is not None:
             payload["effective_context"] = context
@@ -899,13 +1027,14 @@ class RuleCreationService:
         self,
         receipt_id: str,
         outcome: str,
-        actor: str,
+        actor: str = "",
         evidence: str = "",
         *,
-        
         confidence: float = 1.0,
         effective_context: EffectiveAgentContext | Mapping[str, Any] | None = None,
         idempotency_key: str = "",
+        producer: str = "agent",
+        actor_id: str | None = None,
     ) -> RuleDecision:
         outcome = str(outcome or "").strip()
         if outcome not in FEEDBACK_OUTCOMES:
@@ -916,22 +1045,64 @@ class RuleCreationService:
             return self._blocked(action="rule_feedback", reason="confidence must be numeric between 0 and 1", receipt_id=receipt_id)
         if not 0 <= confidence_value <= 1:
             return self._blocked(action="rule_feedback", reason="confidence must be between 0 and 1", receipt_id=receipt_id)
-        if not str(actor or "").strip():
+        actor_value = str(actor_id if actor_id is not None else actor or "").strip()
+        if not actor_value:
             return self._blocked(action="rule_feedback", reason="actor is required", receipt_id=receipt_id)
-        feedback_id = str(idempotency_key or "").strip() or stable_hash(
-            "rule-feedback", receipt_id, outcome, actor, evidence,
-        )
-        # v2: feedback is an append-only event stream.  Derive ``source`` from
-        # the actor prefix so the effective-feedback resolver can order
-        # user > agent > hook > unobserved correctly.
-        actor_value = str(actor).strip()
-        actor_lower = actor_value.casefold()
-        if actor_lower.startswith("user") or actor_lower == "user":
-            feedback_source = "user"
-        elif actor_lower.startswith("hook"):
-            feedback_source = "hook"
+        feedback_source = str(producer or "agent").strip().casefold()
+        if feedback_source not in FEEDBACK_PRODUCER_AUTHORITY:
+            return self._blocked(
+                action="rule_feedback",
+                reason="feedback producer must be one of user|agent|hook",
+                receipt_id=receipt_id,
+            )
+
+        receipt = self.store.get_rule_match_receipt(str(receipt_id))
+        if receipt is None:
+            return self._blocked(
+                action="rule_feedback", reason="receipt_not_found", receipt_id=receipt_id,
+            )
+        # A feedback event is owned by the Agent that produced the receipt.
+        # MCP/host callers cannot use an actor string to switch that owner.
+        if effective_context is not None:
+            try:
+                context = self._context_dict(effective_context)
+            except (TypeError, ValueError) as exc:
+                return self._blocked(action="rule_feedback", reason=str(exc), receipt_id=receipt_id)
+            if context["share_group_id"] and context["share_group_id"] != self.group_id:
+                return self._blocked(
+                    action="rule_feedback", reason="feedback share group mismatch",
+                    receipt_id=receipt_id,
+                )
+            if context["agent_instance_id"] != str(receipt.agent_instance_id or ""):
+                return self._blocked(
+                    action="rule_feedback", reason="feedback agent does not match receipt owner",
+                    receipt_id=receipt_id,
+                )
         else:
-            feedback_source = "agent"
+            context = {
+                "agent_instance_id": str(receipt.agent_instance_id or ""),
+                "share_group_id": self.group_id,
+                "provider": str(receipt.provider or ""),
+                "project_ref": canonical_project_ref(receipt.project_ref),
+                "runtime_role": str(receipt.runtime_role or ""),
+                "runtime_agent_id": "", "parent_agent_id": "",
+                "session_id": str(receipt.session_id or ""),
+                "context_hash": str(receipt.context_hash or ""),
+            }
+
+        get_effective = getattr(self.store, "get_effective_rule_match_feedback", None)
+        if not callable(get_effective):
+            get_effective = getattr(self.store, "get_rule_match_feedback_by_receipt", None)
+        prior_effective = None
+        if callable(get_effective):
+            try:
+                prior_effective = get_effective(str(receipt_id))
+            except (TypeError, ValueError, RuntimeError):
+                prior_effective = None
+        prior_feedback_id = str(getattr(prior_effective, "feedback_id", "") or "")
+        feedback_id = str(idempotency_key or "").strip() or stable_hash(
+            "rule-feedback", receipt_id, outcome, feedback_source, actor_value, evidence,
+        )
         # An ``unobserved`` feedback event must never be recorded with a
         # positive confidence; the model enforces this in __post_init__.
         feedback = RuleMatchFeedback(
@@ -939,21 +1110,47 @@ class RuleCreationService:
             actor=actor_value, evidence=str(evidence or ""),
             confidence=confidence_value, created_at=_now_iso(),
             source=feedback_source,
+            authority=FEEDBACK_PRODUCER_AUTHORITY[feedback_source],
+            supersedes_feedback_id=prior_feedback_id,
         )
-        # Determine the current effective feedback before appending so we can
-        # tell whether this new event actually changes the observable outcome.
-        lookup_feedback = getattr(self.store, "get_rule_match_feedback_by_receipt", None)
-        prior_effective = None
-        if callable(lookup_feedback):
-            try:
-                prior_effective = lookup_feedback(str(receipt_id))
-            except Exception:
-                prior_effective = None
         try:
             saved = self.store.append_rule_match_feedback(feedback)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             return self._blocked(action="rule_feedback", reason=str(exc), receipt_id=receipt_id)
-        receipt = self.store.get_rule_match_receipt(str(receipt_id))
+        saved_feedback_id = str(getattr(saved, "feedback_id", "") or feedback_id)
+        new_effective = None
+        if callable(get_effective):
+            try:
+                new_effective = get_effective(str(receipt_id))
+            except (TypeError, ValueError, RuntimeError):
+                new_effective = None
+        new_effective_id = str(getattr(new_effective, "feedback_id", "") or "")
+        became_effective = bool(
+            new_effective is not None
+            and new_effective_id == saved_feedback_id
+            and prior_feedback_id != saved_feedback_id
+        )
+
+        # Lower-authority events remain in the append-only stream, but cannot
+        # alter counters, narrowing, or exception behavior.
+        if not became_effective:
+            return self._decision(
+                action="rule_feedback", status="recorded", result={
+                    "decision_id": stable_hash("rule-feedback-decision", feedback_id),
+                    "feedback_id": saved_feedback_id,
+                    "receipt_id": receipt_id,
+                }, feedback_id=saved_feedback_id, receipt_id=receipt_id,
+                scope_confidence=confidence_value,
+                metadata={
+                    "outcome": outcome, "evidence": evidence,
+                    "confidence": confidence_value, "source": feedback_source,
+                    "authority": FEEDBACK_PRODUCER_AUTHORITY[feedback_source],
+                    "effective": False,
+                    "supersedes_feedback_id": prior_feedback_id,
+                },
+                actor=actor_value,
+            )
+
         # Counters must never count ``unobserved`` as a scope outcome.  Only
         # explicit outcomes update the accuracy ledger.
         if (
@@ -967,7 +1164,7 @@ class RuleCreationService:
         ):
             record_scope = getattr(self.store, "record_rule_scope", None)
             if callable(record_scope):
-                context_for_stats = self._context_dict(effective_context) if effective_context is not None else {}
+                context_for_stats = context
                 scope_outcome = {
                     "followed": "accepted",
                     "corrected": "corrected",
@@ -998,6 +1195,9 @@ class RuleCreationService:
             metadata={
                 "outcome": outcome, "evidence": evidence,
                 "confidence": confidence_value, "source": feedback_source,
+                "authority": FEEDBACK_PRODUCER_AUTHORITY[feedback_source],
+                "effective": True,
+                "supersedes_feedback_id": prior_feedback_id,
             },
             actor=actor_value,
         )
@@ -1033,11 +1233,105 @@ class RuleCreationService:
                 pass
         return []
 
+    @staticmethod
+    def _evidence_field(item: Any, name: str, default: Any = "") -> Any:
+        """Read a store evidence row across rolling API representations."""
+        if isinstance(item, Mapping):
+            if name in item:
+                return item.get(name, default)
+            feedback = item.get("feedback")
+            receipt = item.get("receipt")
+            for nested in (feedback, receipt):
+                if isinstance(nested, Mapping) and name in nested:
+                    return nested.get(name, default)
+        value = getattr(item, name, None)
+        if value is not None:
+            return value
+        for nested_name in ("feedback", "receipt"):
+            nested = getattr(item, nested_name, None)
+            value = getattr(nested, name, None) if nested is not None else None
+            if value is not None:
+                return value
+        return default
+
+    def _collect_effective_scope_evidence(
+        self, *, memory_id: str, agent_instance_id: str, project_ref: str,
+    ) -> list[Any]:
+        """Collect one effective feedback row per receipt for one scope."""
+        listing = getattr(self.store, "list_effective_rule_feedback_evidence", None)
+        if callable(listing):
+            try:
+                rows = list(listing(
+                    memory_id=memory_id,
+                    agent_instance_id=agent_instance_id,
+                    project_ref=canonical_project_ref(project_ref),
+                ) or [])
+                if rows:
+                    return rows
+            except (TypeError, ValueError, RuntimeError):
+                # Fall through to the compatibility resolver below.
+                pass
+        rows: list[dict[str, Any]] = []
+        try:
+            receipts = self.store.list_rule_match_receipts(
+                memory_id=memory_id, agent_instance_id=agent_instance_id,
+            )
+        except (TypeError, ValueError, RuntimeError):
+            receipts = []
+        get_effective = getattr(self.store, "get_effective_rule_match_feedback", None)
+        if not callable(get_effective):
+            get_effective = getattr(self.store, "get_rule_match_feedback_by_receipt", None)
+        for receipt in receipts:
+            if canonical_project_ref(getattr(receipt, "project_ref", "") or "") != canonical_project_ref(project_ref):
+                continue
+            if not callable(get_effective):
+                continue
+            try:
+                feedback = get_effective(receipt.receipt_id)
+            except (TypeError, ValueError, RuntimeError):
+                feedback = None
+            if feedback is not None:
+                rows.append({"feedback": feedback, "receipt": receipt})
+        return rows
+
     def _narrow_evidence_ready(
         self, receipt_id: str,
     ) -> tuple[bool, str, int, int, int]:
-        """Check the v2 narrowing threshold on the argument-supplied list."""
-        return False, "not_applicable_not_enough_evidence", 0, 0, 0
+        """Check the v2 threshold over all receipts in one rule scope."""
+        receipt, parent = self._receipt_record(receipt_id)
+        if receipt is None or parent is None:
+            return False, "receipt_or_parent_rule_not_found", 0, 0, 0
+        project_ref = canonical_project_ref(getattr(receipt, "project_ref", "") or "")
+        if not project_ref:
+            return False, "no_trusted_project_context", 0, 0, 0
+        rows = self._collect_effective_scope_evidence(
+            memory_id=parent.memory_id,
+            agent_instance_id=str(receipt.agent_instance_id or ""),
+            project_ref=project_ref,
+        )
+        scope_errors = [
+            row for row in rows
+            if self._evidence_field(row, "outcome") == "not_applicable"
+            and float(self._evidence_field(row, "confidence", 0.0) or 0.0) >= 0.7
+            and str(self._evidence_field(row, "session_id", "") or "")
+        ]
+        followed = [
+            row for row in rows
+            if self._evidence_field(row, "outcome") == "followed"
+            and float(self._evidence_field(row, "confidence", 0.0) or 0.0) >= 0.7
+        ]
+        sessions = {
+            str(self._evidence_field(row, "session_id", "") or "")
+            for row in scope_errors
+            if str(self._evidence_field(row, "session_id", "") or "")
+        }
+        if len(scope_errors) < NARROWING_MIN_EVENTS:
+            return False, "not_applicable_not_enough_evidence", len(scope_errors), len(sessions), len(followed)
+        if len(sessions) < NARROWING_MIN_SESSIONS:
+            return False, "not_applicable_not_enough_sessions", len(scope_errors), len(sessions), len(followed)
+        if len(followed) >= NARROWING_OPPOSED_THRESHOLD:
+            return False, "followed_evidence_cancels_narrowing", len(scope_errors), len(sessions), len(followed)
+        return True, "ready", len(scope_errors), len(sessions), len(followed)
 
     def _narrow_from_feedback(
         self,
@@ -1058,6 +1352,7 @@ class RuleCreationService:
             "provider": receipt.provider or "", "project_ref": receipt.project_ref or "",
             "runtime_role": receipt.runtime_role or "",
             "runtime_agent_id": "", "parent_agent_id": "",
+            "session_id": receipt.session_id or "", "context_hash": receipt.context_hash or "",
         }
         if context["agent_instance_id"] != receipt.agent_instance_id:
             return self._blocked(action="rule_narrow", reason="feedback agent does not match receipt agent", receipt_id=receipt_id, feedback_id=feedback_id)
@@ -1067,31 +1362,23 @@ class RuleCreationService:
         project_ref = context["project_ref"] or receipt.project_ref
         if not project_ref:
             return self._blocked(action="rule_narrow", reason="no trusted project context for narrowing", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        # v2: a single feedback event must never change scope.  Require at
-        # least 3 explicit ``not_applicable`` events from at least 2 distinct
-        # sessions for the same agent/project, with no strong ``followed``
-        # evidence cancelling them.
-        events = self._collect_receipt_feedbacks(receipt_id)
-        scope_error_events = [
-            item for item in events
-            if item.outcome == "not_applicable" and item.source != "unobserved"
-        ]
-        followed_events = [
-            item for item in events
-            if item.outcome == "followed" and item.confidence >= 0.7
-        ]
-        sessions = {item.actor for item in scope_error_events}
-        # Include the current event's session in the count.
-        current_session = str(context.get("session_id", "") or receipt.session_id or "")
-        sessions.add(
-            current_session or f"session:{receipt.agent_instance_id}:{receipt.session_id}"
-        )
-        if len(scope_error_events) < NARROWING_MIN_EVENTS:
-            return self._blocked(action="rule_narrow", reason="not_applicable_not_enough_evidence", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id, scope_reason=f"needed {NARROWING_MIN_EVENTS}, have {len(scope_error_events)}")
-        if len(sessions) < NARROWING_MIN_SESSIONS:
-            return self._blocked(action="rule_narrow", reason="not_applicable_not_enough_sessions", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id, scope_reason=f"needed {NARROWING_MIN_SESSIONS} sessions, have {len(sessions)}")
-        if len(followed_events) >= NARROWING_OPPOSED_THRESHOLD:
-            return self._blocked(action="rule_narrow", reason="followed_evidence_cancels_narrowing", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
+        ready, reason, error_count, session_count, followed_count = self._narrow_evidence_ready(receipt_id)
+        if not ready:
+            return self._decision(
+                action="rule_narrow", status="pending",
+                result={"memory_id": parent.memory_id, "decision_id": stable_hash(
+                    "rule-narrow-pending", parent.memory_id, feedback_id, reason,
+                )},
+                parent_rule_id=parent.memory_id, feedback_id=feedback_id,
+                receipt_id=receipt_id, scope_confidence=0.0,
+                scope_reason=reason,
+                metadata={
+                    "evidence_count": error_count,
+                    "session_count": session_count,
+                    "opposed_followed_count": followed_count,
+                    "pending": True,
+                },
+            )
         # Narrowing is monotone: agent -> agent include + agent_project exclude
         # for the offending project.  Never convert a project-specific
         # assignment back to agent, group, system, provider, or runtime role.
@@ -1100,79 +1387,115 @@ class RuleCreationService:
             # If nobody on the parent matches this agent at agent level, it
             # may already be narrowed; a no-op is preferable to widening.
             return self._blocked(action="rule_narrow", reason="no strictly narrower trusted agent_project scope available", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        # Create the child narrower rule (agent_project include).
-        child = self.create_rule_from_text(
-            evidence.strip() or parent.body,
-            EffectiveAgentContext(
-                agent_instance_id=context["agent_instance_id"], share_group_id=self.group_id,
-                provider=context.get("provider", ""), project_ref=project_ref,
-                runtime_role=context.get("runtime_role", ""),
-                runtime_agent_id=context.get("runtime_agent_id", ""),
-                parent_agent_id=context.get("parent_agent_id", ""),
-            ),
-            requested_scope={
-                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
-                "project_ref": project_ref, "effect": "include",
-            },
-            manual=False,
-            priority=parent.priority + 1,
-            parent_rule_id=parent.memory_id,
+        # Narrowing only adds the precise parent exclude.  It never creates a
+        # child rule: the parent remains the single governed definition.
+        before_assignments = [
+            item.to_dict() if hasattr(item, "to_dict") else dict(item)
+            for item in assignments
+        ]
+        updated_assignments = list(before_assignments)
+        existing_keys = {
+            (
+                str(item.get("target_type", "")),
+                str(item.get("target_id", "")),
+                canonical_project_ref(item.get("project_ref", "")),
+                str(item.get("effect", "include")),
+            )
+            for item in updated_assignments
+        }
+        exclude_key = (
+            "agent_project", str(receipt.agent_instance_id),
+            canonical_project_ref(project_ref), "exclude",
         )
-        child.action = "rule_narrow"
-        child.parent_rule_id = parent.memory_id
-        # The parent rule must stop applying to the offending project while
-        # continuing to apply everywhere else.  Replace the agent-include with
-        # agent-include + agent_project-exclude for that project.
-        updated_assignments = []
-        seen_project_exclude = False
-        for item in assignments:
-            if (
-                item.target_type == "agent"
-                and item.target_id == receipt.agent_instance_id
-                and item.effect == "include"
-            ):
-                updated_assignments.append({
-                    "target_type": "agent", "target_id": receipt.agent_instance_id,
-                    "project_ref": "", "effect": "include",
-                    "priority_override": item.priority_override,
-                })
-            elif (
-                item.effect == "exclude"
-                and item.target_type == "agent_project"
-                and item.target_id == receipt.agent_instance_id
-                and item.project_ref == project_ref
-            ):
-                seen_project_exclude = True
-            else:
-                updated_assignments.append({
-                    "target_type": item.target_type, "target_id": item.target_id,
-                    "project_ref": item.project_ref, "effect": item.effect,
-                    "priority_override": item.priority_override,
-                })
-        if not seen_project_exclude:
+        if exclude_key not in existing_keys:
             updated_assignments.append({
                 "target_type": "agent_project", "target_id": receipt.agent_instance_id,
                 "project_ref": project_ref, "effect": "exclude",
             })
+        after_assignments = [dict(item) for item in updated_assignments]
+        decision = self._decision(
+            action="rule_narrow", status="created",
+            result={
+                "memory_id": parent.memory_id,
+                "assignments": after_assignments,
+                "decision_id": stable_hash("rule-narrow", parent.memory_id, feedback_id, project_ref),
+            },
+            parent_rule_id=parent.memory_id, feedback_id=feedback_id,
+            receipt_id=receipt_id, scope_confidence=1.0,
+            scope_reason="cross-session not_applicable evidence reached narrowing threshold",
+            before={"assignments": before_assignments},
+            metadata={
+                "narrowed_parent_rule": parent.memory_id,
+                "parent_assignments_before": before_assignments,
+                "parent_assignments_after": after_assignments,
+                "excluded_project": project_ref,
+                "generated_parent_assignment": {
+                    "target_type": "agent_project",
+                    "target_id": receipt.agent_instance_id,
+                    "project_ref": project_ref,
+                    "effect": "exclude",
+                },
+                "evidence_count": error_count,
+                "session_count": session_count,
+            },
+            actor=f"agent:{receipt.agent_instance_id}", persist=False,
+        )
+        hash_fn = getattr(self.store, "rule_assignment_hash", None)
+        expected_hash = (
+            str(hash_fn(parent.memory_id) or "")
+            if callable(hash_fn)
+            else stable_hash(
+                "rule-assignments", json.dumps(before_assignments, ensure_ascii=False, sort_keys=True),
+            )
+        )
+        apply_narrow = getattr(self.store, "apply_rule_narrow_atomic", None)
+        apply_split = getattr(self.store, "apply_rule_split", None)
         try:
+            if callable(apply_narrow):
+                applied = apply_narrow(
+                    parent_rule_id=parent.memory_id,
+                    parent_assignments_after=after_assignments,
+                    expected_parent_assignment_hash=expected_hash,
+                    automatic=True,
+                    actor_agent_id=receipt.agent_instance_id,
+                    decision=decision,
+                )
+                if isinstance(applied, Mapping):
+                    persisted = applied.get("decision")
+                    if persisted is not None:
+                        return persisted
+                return decision
+            if callable(apply_split):
+                applied = apply_split(
+                    parent_rule_id=parent.memory_id,
+                    expected_parent_assignment_hash=expected_hash,
+                    child_record=None,
+                    child_assignments=[],
+                    parent_assignments_after=after_assignments,
+                    exception=None,
+                    decision=decision,
+                )
+                if isinstance(applied, Mapping):
+                    persisted = applied.get("decision")
+                    if persisted is not None:
+                        return persisted
+                return decision
+            # Compatibility stores without the mutation bundle are allowed to
+            # perform this single parent mutation, but never create a child.
             final_assignments = self.store.set_rule_assignments(
-                parent.memory_id, updated_assignments,
+                parent.memory_id, after_assignments,
                 automatic=True, actor_agent_id=receipt.agent_instance_id,
             )
-        except (TypeError, ValueError, RuntimeError) as exc:
-            return self._blocked(action="rule_narrow", reason=f"parent_exclude_update_failed:{exc}", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        after = dict(child.after or {})
-        after.update({
-            "narrowed_parent_rule": parent.memory_id,
-            "parent_assignments_after": [
+            decision.after["assignments"] = [
                 item.to_dict() if hasattr(item, "to_dict") else dict(item)
                 for item in final_assignments
-            ],
-            "excluded_project": project_ref,
-        })
-        child.after = after
-        child_decision = self._persist_structured_decision(child)
-        return child_decision
+            ]
+            return self._persist_structured_decision(decision)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(
+                action="rule_narrow", reason=f"parent_exclude_update_failed:{exc}",
+                memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id,
+            )
 
     def create_child_exception(
         self,
@@ -1186,16 +1509,23 @@ class RuleCreationService:
         receipt, parent = self._receipt_record(receipt_id)
         if receipt is None or parent is None:
             return self._blocked(action="rule_exception", reason="receipt_or_parent_rule_not_found", receipt_id=receipt_id, feedback_id=feedback_id)
+        override_body = str(evidence or "").strip()
+        if not override_body:
+            return self._blocked(
+                action="rule_exception", reason="exception_override_body_required",
+                memory_id=getattr(parent, "memory_id", ""), receipt_id=receipt_id,
+                feedback_id=feedback_id,
+            )
         context = self._context_dict(effective_context) if effective_context is not None else {
             "agent_instance_id": str(receipt.agent_instance_id or ""), "share_group_id": self.group_id,
-            "provider": "", "project_ref": "", "runtime_role": "", "runtime_agent_id": "", "parent_agent_id": "",
+            "provider": receipt.provider or "", "project_ref": receipt.project_ref or "",
+            "runtime_role": receipt.runtime_role or "", "runtime_agent_id": "", "parent_agent_id": "",
+            "session_id": receipt.session_id or "", "context_hash": receipt.context_hash or "",
         }
         if context["agent_instance_id"] != receipt.agent_instance_id:
             return self._blocked(action="rule_exception", reason="feedback agent does not match receipt agent", receipt_id=receipt_id, feedback_id=feedback_id)
-        # v2: an exception must *actually* narrow the parent.  We create a
-        # child rule tailored to the exception context and give the parent an
-        # exclude assignment for that same context, so the existing
-        # include/exclude matcher naturally suppresses the parent there.
+        # An exception must *actually* narrow the parent.  The child and the
+        # parent exclude are persisted by one mutation bundle below.
         project_ref = context["project_ref"] or receipt.project_ref
         parent_assignments = self.store.list_rule_assignments(parent.memory_id)
         for parent_assignment in parent_assignments:
@@ -1227,95 +1557,186 @@ class RuleCreationService:
                 memory_id=parent.memory_id, receipt_id=receipt_id,
                 feedback_id=feedback_id,
             )
-        child = self.create_rule_from_text(
-            evidence.strip() or f"Exception to rule: {parent.body}",
-            EffectiveAgentContext(
-                agent_instance_id=context["agent_instance_id"], share_group_id=self.group_id,
-                provider=context.get("provider", ""), project_ref=project_ref,
-                runtime_role=context.get("runtime_role", ""),
-                runtime_agent_id=context.get("runtime_agent_id", ""),
-                parent_agent_id=context.get("parent_agent_id", ""),
-            ),
-            requested_scope=assignment,
-            manual=False,
-            priority=parent.priority + 1,
-            parent_rule_id=parent.memory_id,
-        )
-        child.action = "rule_exception"
-        child.parent_rule_id = parent.memory_id
-        child.after = dict(child.after or {})
-        child.after.update({
-            "exception": True,
-            "parent_rule_id": parent.memory_id,
-            "feedback_id": feedback_id,
-            "receipt_id": receipt_id,
-        })
-        child.reason = json.dumps({
-            "exception": True,
-            "parent_rule_id": parent.memory_id,
-            "feedback_id": feedback_id,
-            "receipt_id": receipt_id,
-        }, ensure_ascii=False, separators=(",", ":"))
         # Add the parent exclude for the exception project so the original
         # rule stops applying there.  The child with higher priority then
         # covers the exception context alone.
-        updated_assignments = []
-        seen_exclude = False
-        for item in parent_assignments:
-            if item.effect == "exclude":
-                if (
-                    item.target_type == "agent_project"
-                    and item.target_id == receipt.agent_instance_id
-                    and item.project_ref == project_ref
-                ):
-                    seen_exclude = True
-                    updated_assignments.append({
-                        "target_type": item.target_type, "target_id": item.target_id,
-                        "project_ref": item.project_ref, "effect": item.effect,
-                        "priority_override": item.priority_override,
-                    })
-                    continue
-            else:
-                updated_assignments.append({
-                    "target_type": item.target_type, "target_id": item.target_id,
-                    "project_ref": item.project_ref, "effect": item.effect,
-                    "priority_override": item.priority_override,
-                })
-        if not seen_exclude:
+        before_assignments = [
+            item.to_dict() if hasattr(item, "to_dict") else dict(item)
+            for item in parent_assignments
+        ]
+        updated_assignments = list(before_assignments)
+        existing_keys = {
+            (
+                str(item.get("target_type", "")),
+                str(item.get("target_id", "")),
+                canonical_project_ref(item.get("project_ref", "")),
+                str(item.get("effect", "include")),
+            )
+            for item in updated_assignments
+        }
+        exclude_key = (
+            "agent_project", str(receipt.agent_instance_id),
+            canonical_project_ref(project_ref), "exclude",
+        )
+        exclude_added = exclude_key not in existing_keys
+        if exclude_added:
             updated_assignments.append({
                 "target_type": "agent_project", "target_id": receipt.agent_instance_id,
                 "project_ref": project_ref, "effect": "exclude",
             })
-        try:
-            final_assignments = self.store.set_rule_assignments(
-                parent.memory_id, updated_assignments,
-                automatic=True, actor_agent_id=receipt.agent_instance_id,
-            )
-        except (TypeError, ValueError, RuntimeError) as exc:
-            return self._blocked(action="rule_exception", reason=f"parent_exclude_update_failed:{exc}", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        child.after.update({
-            "parent_assignments_after": [
-                item.to_dict() if hasattr(item, "to_dict") else dict(item)
-                for item in final_assignments
-            ],
-            "excluded_project": project_ref,
-        })
-        append_exception = getattr(self.store, "append_rule_exception", None)
-        if callable(append_exception) and child.memory_id:
+        after_assignments = [dict(item) for item in updated_assignments]
+        generated_parent_assignment = {
+            "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+            "project_ref": project_ref, "effect": "exclude",
+        } if exclude_added else {}
+        generated_parent_assignment_id = (
+            stable_hash(
+                "rule-assignment", parent.memory_id, "agent_project",
+                receipt.agent_instance_id, canonical_project_ref(project_ref),
+                "exclude",
+            ) if exclude_added else ""
+        )
+        child_id = stable_hash(
+            "rule-exception-child", self.group_id, parent.memory_id,
+            receipt_id, feedback_id, context["agent_instance_id"], project_ref,
+        )
+        now = _now_iso()
+        parent_kind = parent.kind if isinstance(parent.kind, MemoryKind) else MemoryKind.PROCEDURE
+        child_record = SharedMemoryRecord(
+            memory_id=child_id,
+            body=override_body,
+            kind=parent_kind,
+            status=SharedMemoryStatus.ACTIVE,
+            confidence=max(0.8, float(getattr(parent, "confidence", 0.8) or 0.8)),
+            provenance=[Provenance(
+                source_object_id=f"rule-exception:{receipt_id}",
+                locator=f"rule:{parent.memory_id}",
+                excerpt_hash=stable_hash(override_body),
+                source_revision=now,
+            )],
+            injection_policy="always",
+            priority=int(parent.priority) + 1,
+            created_at=now,
+            updated_at=now,
+            agent_instance_id=context["agent_instance_id"],
+        )
+        child_assignments = [{"memory_id": child_id, **assignment}]
+        normalized_after_hash = ""
+        normalize_store = getattr(self.store, "_normalize_assignments", None)
+        hash_store = getattr(self.store, "_assignment_hash", None)
+        if callable(normalize_store) and callable(hash_store):
             try:
-                append_exception(RuleException(
-                    parent_rule=parent.memory_id,
-                    child_exception=child.memory_id,
-                    priority=parent.priority + 1,
-                    reason=evidence or "explicit exception feedback",
-                    rollback={"undo_id": child.undo_id},
-                    created_at=_now_iso(),
-                    updated_at=_now_iso(),
-                ))
+                normalized_after_hash = str(hash_store(
+                    normalize_store(parent.memory_id, after_assignments, automatic=False),
+                ) or "")
             except (TypeError, ValueError, RuntimeError):
-                pass
-        self._persist_structured_decision(child)
-        return child
+                normalized_after_hash = ""
+        hash_fn = getattr(self.store, "rule_assignment_hash", None)
+        expected_hash = (
+            str(hash_fn(parent.memory_id) or "")
+            if callable(hash_fn)
+            else stable_hash(
+                "rule-assignments", json.dumps(before_assignments, ensure_ascii=False, sort_keys=True),
+            )
+        )
+        decision = self._decision(
+            action="rule_exception", status="created",
+            result={
+                "memory_id": child_id,
+                "record": child_record.to_dict(),
+                "assignments": child_assignments,
+                "decision_id": stable_hash("rule-exception", parent.memory_id, child_id, feedback_id),
+            },
+            parent_rule_id=parent.memory_id, child_rule_id=child_id,
+            feedback_id=feedback_id, receipt_id=receipt_id,
+            scope=assignment, scope_confidence=1.0,
+            scope_reason="explicit exception override for trusted project",
+            before={"parent_assignments": before_assignments, "child_status": "absent"},
+            metadata={
+                "exception": True, "parent_rule_id": parent.memory_id,
+                "feedback_id": feedback_id, "receipt_id": receipt_id,
+                "parent_assignments_before": before_assignments,
+                "parent_assignments_after": after_assignments,
+                "excluded_project": project_ref,
+                "exception_scope_assignment": {
+                    "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                    "project_ref": project_ref, "effect": "exclude",
+                },
+                "generated_parent_assignment": generated_parent_assignment,
+                "generated_parent_assignment_id": generated_parent_assignment_id,
+                "generated_parent_assignment_added": exclude_added,
+            },
+            actor=f"agent:{receipt.agent_instance_id}", persist=False,
+        )
+        exception_relation = RuleException(
+            parent_rule=parent.memory_id,
+            child_exception=child_id,
+            priority=int(parent.priority) + 1,
+            reason=override_body,
+            rollback={
+                "parent_assignments_before": before_assignments,
+                "parent_assignments_after": after_assignments,
+                "parent_assignments_after_hash": normalized_after_hash or stable_hash(
+                    "rule-assignments", json.dumps(after_assignments, ensure_ascii=False, sort_keys=True),
+                ),
+                "exception_scope_assignment": {
+                    "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                    "project_ref": project_ref, "effect": "exclude",
+                },
+                "generated_parent_assignment": generated_parent_assignment,
+                "generated_parent_assignment_id": generated_parent_assignment_id,
+                "generated_parent_assignment_added": exclude_added,
+                "child_rule_id": child_id,
+                "child_status_before": "absent",
+                "decision_id": decision.decision_id,
+            },
+            created_at=now, updated_at=now,
+        )
+        # Persist the relation identifier in the structured decision so an
+        # undo-by-decision call can target the exact exception without
+        # reconstructing it from parent/child IDs.
+        decision.metadata["exception_id"] = exception_relation.exception_id
+        if isinstance(decision.after, dict):
+            decision.after.setdefault("metadata", {})["exception_id"] = exception_relation.exception_id
+        apply_exception = getattr(self.store, "apply_rule_exception_atomic", None)
+        apply_split = getattr(self.store, "apply_rule_split", None)
+        try:
+            if callable(apply_exception):
+                applied = apply_exception(
+                    parent_rule_id=parent.memory_id,
+                    parent_assignments_before=before_assignments,
+                    parent_assignments_after=after_assignments,
+                    child_record=child_record,
+                    child_assignments=child_assignments,
+                    exception_relation=exception_relation,
+                    decision=decision,
+                    expected_parent_assignment_hash=expected_hash,
+                )
+            elif callable(apply_split):
+                applied = apply_split(
+                    parent_rule_id=parent.memory_id,
+                    expected_parent_assignment_hash=expected_hash,
+                    child_record=child_record,
+                    child_assignments=child_assignments,
+                    parent_assignments_after=after_assignments,
+                    exception=exception_relation,
+                    decision=decision,
+                )
+            else:
+                return self._blocked(
+                    action="rule_exception", reason="atomic_rule_exception_store_unavailable",
+                    memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id,
+                )
+            if isinstance(applied, Mapping):
+                persisted = applied.get("decision")
+                if persisted is not None:
+                    return persisted
+            return decision
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(
+                action="rule_exception", reason=f"atomic_rule_exception_failed:{exc}",
+                memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id,
+            )
 
     def create_exception(
         self,
@@ -1378,11 +1799,36 @@ class RuleCreationService:
         return {"exceptions": payload, "total": len(payload)}
 
     def revoke_exception(self, exception_id: str) -> dict[str, Any]:
-        rollback = getattr(self.store, "rollback_rule_exception", None)
+        # Revoke is a behavioral inverse (restore parent coverage + deactivate
+        # child + relation), not a flag-only update.  New stores expose the
+        # atomic inverse; legacy stores fail closed instead of claiming success.
+        rollback = getattr(self.store, "revert_rule_exception", None)
         if not callable(rollback):
-            return {"ok": False, "error": "rule_exception_store_unavailable"}
+            return {"ok": False, "error": "atomic_rule_exception_revert_unavailable"}
         try:
-            exception = rollback(exception_id)
+            getter = getattr(self.store, "get_rule_exception", None)
+            current = getter(exception_id) if callable(getter) else None
+            if current is None:
+                return {"ok": False, "error": "rule_exception_not_found"}
+            now = _now_iso()
+            inverse = RuleDecision(
+                decision_id=stable_hash("rule-exception-revoke", exception_id, now),
+                actor="admin" if self.is_admin else "agent:unknown",
+                before=current.to_dict(),
+                after={**current.to_dict(), "active": False},
+                reason=f"revoke rule exception {exception_id}",
+                confidence=1.0,
+                created_at=now,
+                rule_id=current.child_exception,
+                action="rule_exception_revoke",
+                target_ids=[current.parent_rule, current.child_exception],
+                status="undone",
+                memory_id=current.child_exception,
+                parent_rule_id=current.parent_rule,
+                child_rule_id=current.child_exception,
+                metadata={"exception_id": exception_id, "target_undo": True},
+            )
+            exception = rollback(exception_id, decision=inverse)
         except (TypeError, ValueError, RuntimeError) as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, **exception.to_dict()}
