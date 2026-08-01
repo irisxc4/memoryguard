@@ -6640,72 +6640,93 @@ class GovernanceApi:
             runtime_role=role,
         ), None
 
+    @staticmethod
+    def _resolve_current_group_scope(preference, env_group: str) -> str:
+        """Resolve an explicit group from env or persisted scope preference."""
+        if env_group:
+            return env_group
+        if preference is not None and preference.mode == "share_group":
+            return str(preference.share_group_id or "").strip()
+        return ""
+
     def _resolve_current_rule_agent(self, preference) -> tuple[str, str, str | None]:
         """Resolve a trusted current agent from runtime state, falling back to
         persisted governance scope and finally to a unique active binding.
 
-        Returns ``(agent_id, group_id, error_payload)``.  The agent must
-        belong to the resolved group via an ``active`` binding; a system-wide
-        listing is never treated as membership.
+        Returns ``(agent_id, group_id, error_payload)``.  The Agent is always
+        resolved *before* the group: when a personal ``GovernanceScope`` stores
+        ``mode="agent"`` without a ``share_group_id``, the group must be
+        re-derived from the Agent's active binding ledger (``personal-<hash>``),
+        never defaulted to ``"default"``.
         """
         from .access_context import load_access_context
         from .agent_binding import AgentBindingStore
         from .schema_v3 import BindingStatus
 
         access = load_access_context()
-        agent = str(access.trusted_agent_id or "").strip()
-
+        env_agent = str(access.trusted_agent_id or "").strip()
         env_group = str(os.environ.get("MEMORYGUARD_SHARE_GROUP_ID", "") or "").strip()
-        if env_group:
-            group = env_group
-        elif preference is not None and preference.mode == "share_group":
-            group = preference.share_group_id
-        else:
-            group = "default"
 
-        # Candidate 1: env-injected agent identity is the trusted root anchor.
-        # ``MEMORYGUARD_AGENT_ID`` is set by the host process after OAuth
-        # verification ("current connection's trusted agent identity"); the
-        # binding ledger is only an authorization claim for *shared-group
-        # storage*, not a prerequisite for the anchor itself.  Requiring a
-        # binding here would break first-run creation in a fresh workspace
-        # (no binding files exist yet), a chicken-and-egg deadlock.
-        if agent:
-            return agent, group, None
-
-        # Candidate 2: persisted governance scope selecting one agent.
+        scoped_agent = ""
         if preference is not None and preference.mode == "agent":
             scoped_agent = str(preference.agent_instance_id or "").strip()
-            if scoped_agent:
-                store = AgentBindingStore(self.workspace)
-                matches = [
-                    b for b in store.find_by_agent(scoped_agent, include_inactive=False)
-                    if b.share_group_id == group
-                    and getattr(b, "status", BindingStatus.ACTIVE) == BindingStatus.ACTIVE
-                ]
-                if matches:
-                    return scoped_agent, group, None
-                return None, group, {
+        explicit_group = self._resolve_current_group_scope(preference, env_group)
+
+        agent = env_agent or scoped_agent
+        store = AgentBindingStore(self.workspace)
+
+        def _active(binding) -> bool:
+            status = getattr(binding, "status", BindingStatus.ACTIVE)
+            return status == BindingStatus.ACTIVE
+
+        if agent:
+            active = [
+                b for b in store.find_by_agent(agent, include_inactive=False)
+                if _active(b)
+            ]
+            if explicit_group:
+                matches = [b for b in active if str(b.share_group_id or "") == explicit_group]
+                if len(matches) == 1:
+                    return agent, explicit_group, None
+                return None, explicit_group, {
                     "ok": False,
                     "error": "agent_not_bound_to_group",
-                    "reason": f"governed agent {scoped_agent!r} has no active binding in group {group!r}",
+                    "reason": f"governed agent {agent!r} has no active binding in group {explicit_group!r}",
                 }
+            if len(active) == 1:
+                return agent, str(active[0].share_group_id or "default"), None
+            if len(active) > 1:
+                return None, "", {
+                    "ok": False,
+                    "error": "multiple_active_bindings",
+                    "reason": f"agent {agent!r} has multiple active bindings; set MEMORYGUARD_SHARE_GROUP_ID or governance scope",
+                }
+            # First-run trusted-agent path: no binding files exist yet, so we
+            # safely establish a personal memory group before creating rules.
+            ensure = getattr(store, "ensure_personal_memory_group", None)
+            if callable(ensure):
+                try:
+                    created = ensure(agent)
+                except Exception:
+                    created = None
+                if created and created.get("share_group_id"):
+                    return agent, str(created["share_group_id"]), None
+            return agent, explicit_group or "default", None
 
-        # Candidate 3: the current group has exactly one active agent.
-        store = AgentBindingStore(self.workspace)
-        bound = [
-            b for b in store.find_by_group(group, include_inactive=False)
-            if getattr(b, "status", BindingStatus.ACTIVE) == BindingStatus.ACTIVE
-        ]
-        if len(bound) == 1:
-            return str(bound[0].agent_instance_id or "").strip(), group, None
-        if len(bound) > 1:
-            return None, group, {
-                "ok": False,
-                "error": "ambiguous_agent_context",
-                "reason": "multiple active agents in group; set governance scope once",
-            }
-        return None, group, {
+        if explicit_group:
+            members = [
+                b for b in store.find_by_group(explicit_group, include_inactive=False)
+                if _active(b)
+            ]
+            if len(members) == 1:
+                return str(members[0].agent_instance_id or "").strip(), explicit_group, None
+            if len(members) > 1:
+                return None, explicit_group, {
+                    "ok": False,
+                    "error": "ambiguous_agent_context",
+                    "reason": "multiple active agents in group; set governance scope once",
+                }
+        return None, explicit_group or "", {
             "ok": False,
             "error": "agent_context_required",
             "reason": "rule creation requires a trusted current agent "
@@ -6950,35 +6971,40 @@ class GovernanceApi:
             return {"ok": False, "error": "confirmation_required"}
         if not str(decision_id or "").strip():
             return {"ok": False, "error": "decision_id_required"}
-        service = self._rule_bridge_service(share_group_id, is_admin=_admin_override)
-        if service is None:
-            return {"ok": False, "error": "service_unavailable"}
-        ctx, error = self._rule_bridge_context(
-            context,
-            agent_instance_id=agent_instance_id,
-            share_group_id=share_group_id,
-            project_ref=project_ref,
-            provider=provider,
-            runtime_role=runtime_role,
-        )
+        # Ignore request-supplied context for undo authorization.  Undo of a
+        # governed decision is authorized by the trusted host context, not by
+        # browser-supplied agent/project claims.
+        ctx, error = self._trusted_rule_bridge_context()
         if error:
             return error
-        token = str(decision_id)
-        # The public UI uses decision_id; the service rolls back the persisted
-        # pre-rule snapshot identified by undo_id.  Resolve that link before
-        # invoking the service, while retaining decision_id in the response.
-        read_called, read_raw = self._rule_bridge_call(
-            service, ("read_decision", "get_decision"), decision_id,
-        )
-        if read_called:
-            read_payload = self._rule_bridge_payload(read_raw)
-            token = str(read_payload.get("undo_id") or token)
-        called, raw = self._rule_bridge_call(
-            service, ("undo_rule_decision", "undo_decision", "undo_rule"), token,
-            ctx,
-        )
-        if not called:
-            return {"ok": False, "error": "service_method_unavailable"}
+        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
+        if service is None:
+            return {"ok": False, "error": "service_unavailable"}
+        # The real service contract is ``undo_rule_decision(decision_id,
+        # context)``: it loads the structured decision by ID and computes the
+        # inverse atomically.  Resolving decision_id -> undo_id here would hand
+        # the service a legacy snapshot token that read_decision cannot find.
+        undo_by_decision = getattr(service, "undo_rule_decision", None)
+        if callable(undo_by_decision):
+            raw = undo_by_decision(
+                str(decision_id),
+                ctx,
+                is_admin=_admin_override,
+            )
+        else:
+            # Compatibility path: only callers without the new contract may use
+            # the legacy ``undo_rule`` with a resolved undo_id.
+            legacy_undo = getattr(service, "undo_rule", None)
+            if not callable(legacy_undo):
+                return {"ok": False, "error": "service_method_unavailable"}
+            decision = service.read_decision(str(decision_id))
+            if decision is None or not getattr(decision, "undo_id", ""):
+                return {"ok": False, "error": "structured_decision_required"}
+            raw = legacy_undo(
+                str(getattr(decision, "undo_id", "")),
+                ctx,
+                is_admin=_admin_override,
+            )
         payload = self._rule_bridge_payload(raw)
         if payload.get("status") == "blocked" or payload.get("blocked_reason"):
             payload.setdefault("ok", False)
@@ -6986,7 +7012,53 @@ class GovernanceApi:
         else:
             payload.setdefault("ok", True)
         payload.setdefault("decision_id", decision_id)
-        payload.setdefault("undo_id", token)
+        return payload
+
+    def revoke_rule_exception(
+        self,
+        exception_id: str,
+        share_group_id: str = "default",
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        if not str(exception_id or "").strip():
+            return {"ok": False, "error": "exception_id_required"}
+        # Exception revocation mutates shared rules.  Authorization comes from
+        # the trusted host context, never browser-supplied group claims.
+        # Admins may proceed without a trusted Agent identity; everyone else
+        # must resolve one or fail closed.
+        ctx, error = self._trusted_rule_bridge_context()
+        if error and not _admin_override:
+            return error
+        service = self._rule_bridge_service(
+            ctx.share_group_id if ctx is not None else share_group_id,
+            is_admin=_admin_override,
+        )
+        if service is None:
+            return {"ok": False, "error": "atomic_rule_exception_service_required"}
+        revoke = getattr(service, "revoke_exception", None)
+        if not callable(revoke):
+            # The product path must never fall back to the legacy
+            # ``rollback_rule_exception`` store helper: that path only flips a
+            # relation's active flag without restoring the parent exclude or
+            # deleting the child rule.  When the atomic revert is unavailable
+            # we report failure honestly instead of pretending success.
+            return {"ok": False, "error": "atomic_rule_exception_revert_unavailable"}
+        raw = revoke(
+            str(exception_id),
+            effective_context=ctx,
+            is_admin=_admin_override,
+        )
+        payload = self._rule_bridge_payload(raw)
+        if payload.get("status") == "blocked" or payload.get("blocked_reason"):
+            payload.setdefault("ok", False)
+            payload.setdefault("error", payload.get("blocked_reason") or payload.get("reason") or "rule_exception_revoke_blocked")
+        else:
+            payload.setdefault("ok", True)
+        payload.setdefault("exception_id", exception_id)
         return payload
 
     def get_rule_auto_scope_metrics(self, share_group_id: str = "default") -> dict:
@@ -7093,6 +7165,12 @@ class GovernanceApi:
                 payload["authority"] = 4
                 payload["actor"] = "user"
                 return payload
+        # Lifecycle feedback (narrowing / exception split) cannot be satisfied
+        # by the plain append-only store fallback: it would record the event
+        # without applying the narrowing or exception behavior.  Fail closed
+        # instead of silently degrading a behavioral decision.
+        if str(outcome) in {"not_applicable", "exception"}:
+            return {"ok": False, "error": "lifecycle_feedback_requires_rule_service"}
         # Stable fallback for stores that already implement explicit receipts.
         try:
             from .schema_v3 import RuleMatchFeedback
@@ -7207,40 +7285,6 @@ class GovernanceApi:
             saved = fn(relation)
             return {"ok": True, **self._rule_bridge_payload(saved), "parent_rule": parent_rule,
                     "child_exception": child_exception, "priority": int(priority), "reason": reason}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    def revoke_rule_exception(
-        self,
-        exception_id: str,
-        share_group_id: str = "default",
-        confirmed: bool = False,
-        *,
-        _admin_override: bool = False,
-    ) -> dict:
-        if not confirmed:
-            return {"ok": False, "error": "confirmation_required"}
-        if not str(exception_id or "").strip():
-            return {"ok": False, "error": "exception_id_required"}
-        service = self._rule_bridge_service(share_group_id)
-        if service is not None:
-            called, raw = self._rule_bridge_call(
-                service, ("revoke_exception", "undo_exception", "delete_exception"), exception_id,
-            )
-            if called:
-                payload = self._rule_bridge_payload(raw)
-                payload.setdefault("ok", True)
-                payload.setdefault("exception_id", exception_id)
-                return payload
-        try:
-            store, err = self._open_store(share_group_id, must_exist=True)
-            if err:
-                return err
-            fn = getattr(store, "rollback_rule_exception", None)
-            if not callable(fn):
-                return {"ok": False, "error": "service_unavailable"}
-            saved = fn(str(exception_id))
-            return {"ok": True, **self._rule_bridge_payload(saved), "exception_id": exception_id}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

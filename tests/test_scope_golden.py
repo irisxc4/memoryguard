@@ -39,6 +39,20 @@ def test_scope_golden_has_two_hundred_unique_manual_cases(cases):
         assert "target_type" in case["expected"] or case["expected"].get("blocked")
 
 
+def _expected_identity(expected, context):
+    """Derive the full labelled identity (type + agent id + project)."""
+    target_type = expected.get("target_type", "")
+    target_id = ""
+    project_ref = ""
+    if target_type in {"agent", "agent_project"}:
+        target_id = context["agent_instance_id"]
+    if target_type in {"agent_project", "project"}:
+        project_ref = str(context.get("project_ref", "") or "")
+    if target_type == "provider":
+        target_id = str(context.get("provider", "") or "")
+    return target_type, target_id, project_ref
+
+
 def test_scope_golden_accuracy_and_no_system_promotion(cases):
     exact = 0
     for case in cases:
@@ -51,8 +65,13 @@ def test_scope_golden_accuracy_and_no_system_promotion(cases):
         )
         selected = result.selected
         assert selected.target_type != "system", case["case_id"]
+        # Compare the FULL identity, not just the target type: resolving to the
+        # wrong agent or the wrong project must not count as correct.
+        exp_type, exp_target_id, exp_project_ref = _expected_identity(expected, context)
         if (
-            selected.target_type == expected.get("target_type")
+            selected.target_type == exp_type
+            and (selected.target_id or "") == exp_target_id
+            and (selected.project_ref or "") == exp_project_ref
             and "include" == expected.get("effect", "include")
             and bool(result.fallback_used) == bool(expected.get("fallback", False))
         ):

@@ -151,6 +151,7 @@ FEEDBACK_AUTHORITY: dict[str, int] = {
     "user": 4,
     "agent": 3,
     "hook": 2,
+    "legacy": 1,
     "unobserved": 1,
 }
 TRUSTED_FEEDBACK_ENTRYPOINTS: dict[str, str] = {

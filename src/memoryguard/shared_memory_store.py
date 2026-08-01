@@ -24,6 +24,7 @@ import contextlib
 import json
 import shutil
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ from .schema_v3 import (
     RuleMatchReceipt,
     RuleDecision,
     RuleScopeStats,
+    RuleScopeEvaluation,
     RuleException,
     RuleHitReceipt,
     RuleHitFeedback,
@@ -164,6 +166,21 @@ CREATE TABLE IF NOT EXISTS rule_scope_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_agent ON rule_scope_stats(agent_instance_id);
 CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_project ON rule_scope_stats(project_ref);
+-- Per-receipt *current* effective scope conclusion.  The append-only feedback
+-- table is the historical audit trail; this table is the accuracy ledger:
+-- each receipt contributes exactly one row holding its current effective
+-- outcome, UPSERTed whenever the effective feedback changes.
+CREATE TABLE IF NOT EXISTS rule_scope_evaluations (
+    receipt_id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    effective_feedback_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_evaluations_scope
+    ON rule_scope_evaluations(rule_id, agent_instance_id, project_ref);
 CREATE TABLE IF NOT EXISTS rule_exceptions (
     exception_id TEXT PRIMARY KEY,
     parent_rule TEXT NOT NULL,
@@ -332,6 +349,21 @@ CREATE TABLE IF NOT EXISTS rule_scope_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_agent ON rule_scope_stats(agent_instance_id);
 CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_project ON rule_scope_stats(project_ref);
+-- Per-receipt *current* effective scope conclusion.  The append-only feedback
+-- table is the historical audit trail; this table is the accuracy ledger:
+-- each receipt contributes exactly one row holding its current effective
+-- outcome, UPSERTed whenever the effective feedback changes.
+CREATE TABLE IF NOT EXISTS rule_scope_evaluations (
+    receipt_id TEXT PRIMARY KEY,
+    rule_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    effective_feedback_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_evaluations_scope
+    ON rule_scope_evaluations(rule_id, agent_instance_id, project_ref);
 CREATE TABLE IF NOT EXISTS rule_exceptions (
     exception_id TEXT PRIMARY KEY,
     parent_rule TEXT NOT NULL,
@@ -950,15 +982,11 @@ class SharedMemoryStore:
                 {_old_or_literal('created_at', "''")},
                 CASE
                     WHEN lower({actor_expr}) LIKE 'hook:%' THEN 'hook'
-                    WHEN lower({actor_expr}) LIKE 'user:%'
-                      OR lower({actor_expr}) = 'user' THEN 'user'
-                    ELSE 'agent'
+                    ELSE 'legacy'
                 END,
                 CASE
                     WHEN lower({actor_expr}) LIKE 'hook:%' THEN 2
-                    WHEN lower({actor_expr}) LIKE 'user:%'
-                      OR lower({actor_expr}) = 'user' THEN 4
-                    ELSE 3
+                    ELSE 1
                 END,
                 ''
             FROM rule_match_feedbacks"""
@@ -982,6 +1010,61 @@ class SharedMemoryStore:
         import hashlib
         normalized = " ".join(body.split()).lower()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+    def rule_behavior_hash(
+        self,
+        record: SharedMemoryRecord | Mapping[str, Any],
+        assignments: list[RuleAssignment] | list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Hash the full observable behavior of one governed rule.
+
+        The create/undo revision guard must compare the *behavior* of the rule
+        (body, kind, status, confidence, locked, injection policy, priority,
+        supersedes, provenance and audience assignments), not just the body.
+        Otherwise a user who edits priority, assignments, lock status or
+        provenance after creation could still have the stale create decision
+        delete the now-governed rule.
+        """
+        if isinstance(record, Mapping):
+            record = SharedMemoryRecord.from_dict(dict(record))
+        normalized_assignments = (
+            self._normalize_assignments(record.memory_id, assignments)
+            if assignments else []
+        )
+        provenance = [
+            item.to_dict() if isinstance(item, Provenance) else dict(item)
+            for item in (getattr(record, "provenance", None) or [])
+        ]
+        payload = {
+            "body": record.body,
+            "kind": (
+                record.kind.value
+                if hasattr(record.kind, "value") else str(record.kind)
+            ),
+            "status": (
+                record.status.value
+                if hasattr(record.status, "value") else str(record.status)
+            ),
+            "confidence": float(record.confidence),
+            "locked": bool(record.locked),
+            "injection_policy": str(record.injection_policy),
+            "priority": int(record.priority),
+            "supersedes": sorted(str(item) for item in (record.supersedes or [])),
+            "provenance": sorted(
+                provenance,
+                key=lambda item: json.dumps(
+                    item, ensure_ascii=False, sort_keys=True,
+                ),
+            ),
+            "assignments": [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in normalized_assignments
+            ],
+        }
+        return stable_hash(
+            "rule-behavior-v1",
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        )
 
     @staticmethod
     def _assignment_key(item: RuleAssignment) -> tuple[Any, ...]:
@@ -1039,6 +1122,16 @@ class SharedMemoryStore:
         )
         return f"always:{stable_hash(material)}"
 
+    @staticmethod
+    def _rule_assignment_from_row(row: sqlite3.Row) -> RuleAssignment:
+        return RuleAssignment(
+            memory_id=row["memory_id"], target_type=row["target_type"],
+            target_id=row["target_id"] or "", project_ref=row["project_ref"] or "",
+            effect=row["effect"] or "include",
+            priority_override=row["priority_override"],
+            created_at=row["created_at"] or "", updated_at=row["updated_at"] or "",
+        )
+
     def _list_rule_assignments_conn(
         self, conn: sqlite3.Connection, memory_id: str,
     ) -> list[RuleAssignment]:
@@ -1047,13 +1140,7 @@ class SharedMemoryStore:
             "ORDER BY target_type,target_id,project_ref,effect",
             (memory_id,),
         ).fetchall()
-        return [RuleAssignment(
-            memory_id=row["memory_id"], target_type=row["target_type"],
-            target_id=row["target_id"] or "", project_ref=row["project_ref"] or "",
-            effect=row["effect"] or "include",
-            priority_override=row["priority_override"],
-            created_at=row["created_at"] or "", updated_at=row["updated_at"] or "",
-        ) for row in rows]
+        return [self._rule_assignment_from_row(row) for row in rows]
 
     def _insert_assignments(
         self, conn: sqlite3.Connection, memory_id: str,
@@ -1610,6 +1697,58 @@ class SharedMemoryStore:
             updated_at=row["updated_at"] or "",
         )
 
+    def _insert_rule_scope_evaluation(
+        self, conn: sqlite3.Connection, evaluation: RuleScopeEvaluation,
+    ) -> None:
+        d = evaluation.to_dict()
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_scope_evaluations "
+            "(receipt_id,rule_id,agent_instance_id,project_ref,effective_feedback_id,outcome,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                d["receipt_id"], d["rule_id"], d.get("agent_instance_id", ""),
+                canonical_project_ref(d.get("project_ref", "")),
+                d.get("effective_feedback_id", ""),
+                d.get("outcome", "accepted"), d.get("updated_at", ""),
+            ),
+        )
+
+    @staticmethod
+    def _row_to_rule_scope_evaluation(row: sqlite3.Row) -> RuleScopeEvaluation:
+        return RuleScopeEvaluation(
+            receipt_id=row["receipt_id"],
+            rule_id=row["rule_id"],
+            agent_instance_id=row["agent_instance_id"] or "",
+            project_ref=row["project_ref"] or "",
+            effective_feedback_id=row["effective_feedback_id"] or "",
+            outcome=row["outcome"] or "accepted",
+            updated_at=row["updated_at"] or "",
+        )
+
+    def _aggregate_rule_scope_evaluations(
+        self, conn: sqlite3.Connection,
+        rule_id: str, agent_instance_id: str, project_ref: str,
+    ) -> dict[str, int]:
+        """Aggregate the *current* effective conclusions for one scope."""
+        row = conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN outcome='accepted' THEN 1 ELSE 0 END) AS accepted, "
+            "SUM(CASE WHEN outcome='corrected' THEN 1 ELSE 0 END) AS corrected, "
+            "SUM(CASE WHEN outcome='wrong_scope' THEN 1 ELSE 0 END) AS wrong_scope "
+            "FROM rule_scope_evaluations "
+            "WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+            (
+                rule_id, agent_instance_id,
+                canonical_project_ref(project_ref),
+            ),
+        ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "accepted": int(row["accepted"] or 0),
+            "corrected": int(row["corrected"] or 0),
+            "wrong_scope": int(row["wrong_scope"] or 0),
+        }
+
     def _insert_rule_exception(self, conn: sqlite3.Connection, exception: RuleException) -> None:
         d = exception.to_dict()
         conn.execute(
@@ -1902,7 +2041,9 @@ class SharedMemoryStore:
                 decision.metadata = {
                     **dict(decision.metadata or {}),
                     "mutation_kind": mutation_kind,
-                    "record_revision_hash": self._canonical_hash(target_record.body),
+                    "record_revision_hash": self.rule_behavior_hash(
+                        target_record, target_assignments,
+                    ),
                     "memory_id": target_record.memory_id,
                     "event_id": event.event_id,
                     "added_provenance": list(added_provenance),
@@ -1968,7 +2109,10 @@ class SharedMemoryStore:
             if row is None:
                 raise ValueError("target_rule_not_found")
             current = self._row_to_record(row)
-            current_hash = str(row["canonical_hash"] or self._canonical_hash(current.body))
+            current_assignments = self._list_rule_assignments_conn(conn, rule_id)
+            current_hash = self.rule_behavior_hash(
+                current, current_assignments,
+            )
             if current_hash != str(expected_record_hash):
                 raise ValueError("record_revision_conflict")
             metadata = dict(decision.metadata or {}) if decision is not None else {}
@@ -2711,11 +2855,20 @@ class SharedMemoryStore:
         project: str | None = None,
         outcome: str = "accepted",
         count: int = 1,
+        receipt_id: str = "",
+        effective_feedback_id: str = "",
     ) -> RuleScopeStats:
-        """Increment feedback counters for a precise runtime scope.
+        """Record the *current* effective scope conclusion for a receipt.
 
-        This method never infers sibling agents, group membership, provider or
-        runtime-role dimensions; callers must pass the exact observed scope.
+        Accuracy-ledger semantics: one row per receipt in
+        ``rule_scope_evaluations``, UPSERTed whenever the effective feedback
+        changes, so counters describe *current* reality (a later
+        higher-authority event replaces the earlier conclusion) instead of
+        summing every historical event (which double-counts superseded
+        opinions).  ``rule_scope_stats`` is then recomputed from that ledger.
+
+        Legacy callers that do not pass a ``receipt_id`` keep the previous
+        cumulative behavior; receipt-aware callers get the current-fact ledger.
         """
         if isinstance(rule_id, RuleScopeStats):
             return self.append_rule_scope_stats(rule_id)
@@ -2732,41 +2885,99 @@ class SharedMemoryStore:
         if outcome not in allowed:
             raise ValueError("invalid scope outcome")
         project_ref = canonical_project_ref(project_ref)
+        ledger_outcome = (
+            outcome if outcome in {"accepted", "corrected", "wrong_scope"}
+            else "ignored"
+        )
         now = _now_iso()
         with self._tx() as conn:
-            row = conn.execute(
-                "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
-                (rule_id, agent_instance_id, project_ref),
-            ).fetchone()
-            if row is None:
-                values = {
-                    "rule_id": rule_id, "agent_instance_id": agent_instance_id,
-                    "project_ref": project_ref, "total": count,
-                    "accepted": count if outcome == "accepted" else 0,
-                    "corrected": count if outcome == "corrected" else 0,
-                    "wrong_scope": count if outcome == "wrong_scope" else 0,
-                    "created_at": now, "updated_at": now,
-                }
-                stats = RuleScopeStats(**values)
+            if str(receipt_id or "").strip():
+                # v2 accuracy ledger: one current conclusion per receipt.
+                self._insert_rule_scope_evaluation(
+                    conn,
+                    RuleScopeEvaluation(
+                        receipt_id=str(receipt_id),
+                        rule_id=str(rule_id),
+                        agent_instance_id=str(agent_instance_id),
+                        project_ref=project_ref,
+                        effective_feedback_id=str(effective_feedback_id or ""),
+                        outcome=ledger_outcome,
+                        updated_at=now,
+                    ),
+                )
+                counts = self._aggregate_rule_scope_evaluations(
+                    conn, str(rule_id), str(agent_instance_id), project_ref,
+                )
+                stats = RuleScopeStats(
+                    rule_id=str(rule_id),
+                    agent_instance_id=str(agent_instance_id),
+                    project_ref=project_ref,
+                    total=counts["total"],
+                    accepted=counts["accepted"],
+                    corrected=counts["corrected"],
+                    wrong_scope=counts["wrong_scope"],
+                    created_at=now, updated_at=now,
+                )
                 self._insert_rule_scope_stats(conn, stats)
             else:
-                stats = self._row_to_rule_scope_stats(row)
-                stats.total += count
-                if outcome == "accepted":
-                    stats.accepted += count
-                elif outcome == "corrected":
-                    stats.corrected += count
-                elif outcome == "wrong_scope":
-                    stats.wrong_scope += count
-                stats.updated_at = now
-                self._insert_rule_scope_stats(conn, stats)
+                # Legacy cumulative behavior (no receipt identity available).
+                row = conn.execute(
+                    "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+                    (rule_id, agent_instance_id, project_ref),
+                ).fetchone()
+                if row is None:
+                    stats = RuleScopeStats(
+                        rule_id=rule_id, agent_instance_id=agent_instance_id,
+                        project_ref=project_ref, total=count,
+                        accepted=count if outcome == "accepted" else 0,
+                        corrected=count if outcome == "corrected" else 0,
+                        wrong_scope=count if outcome == "wrong_scope" else 0,
+                        created_at=now, updated_at=now,
+                    )
+                    self._insert_rule_scope_stats(conn, stats)
+                else:
+                    stats = self._row_to_rule_scope_stats(row)
+                    stats.total += count
+                    if outcome == "accepted":
+                        stats.accepted += count
+                    elif outcome == "corrected":
+                        stats.corrected += count
+                    elif outcome == "wrong_scope":
+                        stats.wrong_scope += count
+                    stats.updated_at = now
+                    self._insert_rule_scope_stats(conn, stats)
             row = conn.execute(
                 "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
-                (rule_id, agent_instance_id, project_ref),
+                (str(rule_id), agent_instance_id, project_ref),
             ).fetchone()
         result = self._row_to_rule_scope_stats(row)
         self._append_jsonl(self.rule_scope_stats_bak_path, result)
         return result
+
+    upsert_rule_scope_evaluation = record_rule_scope
+
+    def list_rule_scope_evaluations(
+        self, *, rule_id: str | None = None, memory_id: str | None = None,
+        agent_instance_id: str | None = None, project_ref: str | None = None,
+    ) -> list[RuleScopeEvaluation]:
+        sql = "SELECT * FROM rule_scope_evaluations"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if rule_id or memory_id:
+            clauses.append("rule_id=?")
+            params.append(rule_id or memory_id)
+        if agent_instance_id:
+            clauses.append("agent_instance_id=?")
+            params.append(agent_instance_id)
+        if project_ref:
+            clauses.append("project_ref=?")
+            params.append(canonical_project_ref(project_ref))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY rule_id, agent_instance_id, project_ref, receipt_id"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_scope_evaluation(row) for row in rows]
 
     record_scope_stat = record_rule_scope
 
@@ -2916,11 +3127,6 @@ class SharedMemoryStore:
         child rule, deactivates relation, and writes optional inverse decision.
         If a later parent edit changed the recorded revision, fail closed.
         """
-        # The inverse must carry the revision captured when the exception was
-        # created.  Reading the current hash here would make the optimistic
-        # guard tautological and silently overwrite a later human edit.
-        if not str(expected_parent_assignment_hash or "").strip():
-            raise ValueError("parent_assignments_after_hash_required")
         now = _now_iso()
         transferred_sibling: RuleException | None = None
         with self._tx() as conn:
@@ -2938,28 +3144,114 @@ class SharedMemoryStore:
             parent_row = conn.execute(
                 "SELECT * FROM records WHERE memory_id=?", (parent_rule_id,)
             ).fetchone()
-            parent_assignments: list[RuleAssignment] = []
             if parent_row is None:
                 raise ValueError("parent_rule_not_found")
             parent_assignments = self._list_rule_assignments_conn(
                 conn, parent_rule_id,
             )
-            if not self._assignment_hash_matches(
-                str(expected_parent_assignment_hash), parent_assignments,
-            ):
-                raise ValueError("parent_assignment_revision_conflict")
-
             generated = rollback.get("generated_parent_assignment")
             generated_id = str(
                 rollback.get("generated_parent_assignment_id") or ""
             )
             if not isinstance(generated, dict):
                 generated = {}
-            # New exception records distinguish the assignment generated by
-            # this relation from a pre-existing/sibling exclude.  Legacy
-            # records have no explicit flag, so retain their old inference.
             generated_added = rollback.get("generated_parent_assignment_added")
-            if generated_added is None:
+            has_local_guard = (
+                generated_added is not None
+                or bool(generated_id)
+                or bool(rollback.get("generated_assignment_hash"))
+                or bool(rollback.get("child_rule_behavior_hash"))
+                or bool(rollback.get("relation_revision"))
+            )
+            if has_local_guard:
+                # Local-delta revocation guard.  Never lock the parent's whole
+                # assignment multiset: a sibling exception on a different
+                # project changes that multiset, so whole-set hashing would
+                # force LIFO-only undo.  Validate only this relation's own
+                # footprint: the relation must still be active, the assignment
+                # it generated must still exist unchanged, and the child rule
+                # must be untouched since creation.
+                if not current.active:
+                    raise ValueError("rule_exception_not_active")
+                if generated_added is None:
+                    generated_added = bool(
+                        generated
+                        or generated_id
+                        or rollback.get("agent_instance_id")
+                        or rollback.get("project_ref")
+                    )
+                if generated_added:
+                    gen_hash = str(
+                        rollback.get("generated_assignment_hash") or ""
+                    ).strip()
+                    gen_row = None
+                    candidate_rows = conn.execute(
+                        "SELECT * FROM rule_assignments WHERE memory_id=? AND effect='exclude'",
+                        (parent_rule_id,),
+                    ).fetchall()
+                    if generated_id:
+                        for candidate_row in candidate_rows:
+                            item = self._rule_assignment_from_row(candidate_row)
+                            if item.assignment_id == generated_id:
+                                gen_row = candidate_row
+                                break
+                    if gen_row is None:
+                        for candidate_row in candidate_rows:
+                            item = self._rule_assignment_from_row(candidate_row)
+                            if (
+                                item.target_type,
+                                item.target_id,
+                                canonical_project_ref(item.project_ref),
+                            ) == (
+                                str(generated.get("target_type") or "agent_project"),
+                                str(generated.get("target_id") or ""),
+                                canonical_project_ref(str(generated.get("project_ref") or "")),
+                            ):
+                                gen_row = candidate_row
+                                generated_id = item.assignment_id
+                                break
+                    if gen_row is None:
+                        raise ValueError("generated_assignment_missing")
+                    if gen_hash:
+                        current_gen_hash = self._assignment_hash([
+                            self._rule_assignment_from_row(gen_row),
+                        ])
+                        if current_gen_hash != gen_hash:
+                            raise ValueError("generated_assignment_revision_conflict")
+                child_behavior = str(
+                    rollback.get("child_rule_behavior_hash") or ""
+                ).strip()
+                child_rule_id = str(
+                    rollback.get("child_rule_id") or current.child_exception
+                )
+                if child_behavior and child_rule_id:
+                    child_row = conn.execute(
+                        "SELECT * FROM records WHERE memory_id=?", (child_rule_id,),
+                    ).fetchone()
+                    if child_row is not None:
+                        child_current = self._row_to_record(child_row)
+                        child_assignments_current = self._list_rule_assignments_conn(
+                            conn, child_rule_id,
+                        )
+                        if self.rule_behavior_hash(
+                            child_current, child_assignments_current,
+                        ) != child_behavior:
+                            raise ValueError("child_rule_revision_conflict")
+                # ``relation_revision`` is recorded for audit only.  It is NOT
+                # compared against ``updated_at`` here: a sibling revoke may
+                # legitimately transfer generated-ownership metadata onto this
+                # relation (bumping ``updated_at``) without ever editing the
+                # exception itself, so a timestamp comparison would block valid
+                # sibling revokes with a false conflict.
+            else:
+                # Legacy records without local-delta metadata keep the
+                # whole-multiset optimistic guard as a conservative fallback.
+                if not str(expected_parent_assignment_hash or "").strip():
+                    raise ValueError("parent_assignments_after_hash_required")
+                if not self._assignment_hash_matches(
+                    str(expected_parent_assignment_hash), parent_assignments,
+                ):
+                    raise ValueError("parent_assignment_revision_conflict")
                 generated_added = bool(
                     generated
                     or generated_id
@@ -4728,12 +5020,28 @@ class SharedMemoryStore:
                     continue
 
     def _migrate_rule_match_feedbacks_jsonl(self, path: Path) -> None:
+        """Conservatively migrate legacy JSONL feedback authority.
+
+        Older feedback rows derived ``source``/``authority`` from a
+        client-writable ``actor`` string, so a historical ``"user"`` actor does
+        not prove the event really came from the GUI.  Only the trusted
+        ``hook:*`` marker survives verbatim; every other legacy row is
+        downgraded to ``legacy/1`` so stale claims can never out-rank a later,
+        genuinely sourced event.  The real user re-confirms to mint a new
+        ``source=user`` event.
+        """
+        from .schema_v3 import FEEDBACK_AUTHORITY_ORDER
         with self._tx() as conn:
             for d in self._read_jsonl(path):
                 try:
-                    self._insert_rule_match_feedback(
-                        conn, RuleMatchFeedback.from_dict(d),
-                    )
+                    item = RuleMatchFeedback.from_dict(d)
+                    source = str(d.get("source", "") or "").strip().casefold()
+                    if source != "hook":
+                        item.source = "legacy"
+                        item.authority = FEEDBACK_AUTHORITY_ORDER.get(
+                            "legacy", 1
+                        )
+                    self._insert_rule_match_feedback(conn, item)
                 except (ValueError, KeyError, sqlite3.IntegrityError):
                     continue
 

@@ -63,7 +63,8 @@ def test_exception_feedback_excludes_parent_and_corrected_is_only_recorded(tmp_p
     store.append_rule_match_receipt(RuleMatchReceipt(
         receipt_id=receipt_id, memory_id=parent.memory_id,
         share_group_id="team", agent_instance_id="a", task_hash="t",
-        task="x", assignment_ids=[item.assignment_id for item in parent_before],
+        task="x", project_ref=str(tmp_path / "project"),
+        assignment_ids=[item.assignment_id for item in parent_before],
         created_at=_now_iso(),
     ))
     corrected = service.submit_feedback(
@@ -82,7 +83,8 @@ def test_exception_feedback_excludes_parent_and_corrected_is_only_recorded(tmp_p
     store.append_rule_match_receipt(RuleMatchReceipt(
         receipt_id=exception_receipt_id, memory_id=parent.memory_id,
         share_group_id="team", agent_instance_id="a", task_hash="t2",
-        task="x", assignment_ids=[item.assignment_id for item in store.list_rule_assignments(parent.memory_id)],
+        task="x", project_ref=str(tmp_path / "project"),
+        assignment_ids=[item.assignment_id for item in store.list_rule_assignments(parent.memory_id)],
         created_at=_now_iso(),
     ))
     exception = service.submit_feedback(

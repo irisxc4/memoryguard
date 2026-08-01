@@ -472,8 +472,15 @@ class AutoOrganizer:
                     "old_ids": [item.memory_id for item in duplicates],
                 })
                 return record, actions, "conflicted"
-            # Only exact canonical duplicates may use the atomic dedup path;
-            # near/semantic duplicates remain on the existing organizer path.
+            # Only exact canonical duplicates may use the atomic dedup path.
+            # Near/semantic duplicates must NEVER fall back to the legacy
+            # organizer merge: that path appends the event, mutates the
+            # record/provenance, then writes a separate decision, so the
+            # semantic merge is not a transaction, its mutation kind is
+            # incomplete, and the decision carries no fixed revision hash
+            # (undo then fails with ``structured_inverse_revision_missing``).
+            # The duplicate is surfaced as a low-confidence proposal with an
+            # independent decision; a human confirms before merging.
             canonical = getattr(self.store, "_canonical_hash", None)
             if callable(canonical) and all(
                 canonical(event.raw_content) == canonical(item.body)
@@ -486,10 +493,16 @@ class AutoOrganizer:
                                 "duplicate_ids": [duplicates[0].memory_id],
                                 "target_id": duplicates[0].memory_id})
                 return record, actions, "deduplicated"
-            # Let legacy organize handle semantic merge/provenance details.
-            return self._create_record(
-                event, kind, SharedMemoryStatus.ACTIVE, confidence=confidence,
-            ), actions, "legacy"
+            record = self._create_record(
+                event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
+                confidence=min(confidence, 0.44),
+            )
+            actions.append({
+                "action": "semantic_duplicate_proposal",
+                "target_id": duplicates[0].memory_id,
+                "old_ids": [item.memory_id for item in duplicates],
+            })
+            return record, actions, "proposed"
 
         status = SharedMemoryStatus.LOW_CONFIDENCE if confidence < 0.45 else SharedMemoryStatus.ACTIVE
         record = self._create_record(event, kind, status, confidence=confidence)

@@ -41,6 +41,7 @@ from .schema_v3 import (
     MemoryKind,
     MemoryEvent,
     Provenance,
+    RuleAssignment,
     RuleMatchFeedback,
     RuleDecision,
     RuleException,
@@ -690,6 +691,7 @@ class RuleCreationService:
 
         if action in {
             "rule_create_auto", "rule_create_manual",
+            "rule_propose_auto", "rule_propose_manual",
             "rule_superseded", "rule_conflicted", "rule_quarantined",
         }:
             existing = self.store.get_record(memory_id)
@@ -1245,8 +1247,40 @@ class RuleCreationService:
             return self._blocked(
                 action="rule_feedback", reason="receipt_not_found", receipt_id=receipt_id,
             )
-        # A feedback event is owned by the Agent that produced the receipt.
-        # MCP/host callers cannot use an actor string to switch that owner.
+        # An exception with an empty override body must be rejected before any
+        # event is written: otherwise the append-only feedback stream and the
+        # scope counters are polluted, then ``create_child_exception`` fails and
+        # a nonexistent child rule is reported.  The front-end already guards
+        # this, but MCP/other API callers must hit the same fail-closed edge.
+        if outcome == "exception" and not str(evidence or "").strip():
+            return self._blocked(
+                action="rule_feedback",
+                reason="exception_override_body_required",
+                receipt_id=receipt_id,
+            )
+        # A feedback event is owned by the Agent that produced the receipt, and
+        # its evidence is bound to the exact runtime context where that receipt
+        # was created.  MCP/host callers cannot use an actor string or a later
+        # project switch to move a receipt's evidence to another scope: doing so
+        # would let Project B's "not_applicable" mutate Project A's rule.
+        #
+        # ``receipt_context`` is immutable for every downstream consumer (scope
+        # evaluation, auto narrowing, exception split, decision explanation).
+        # The caller's ``effective_context`` may only prove *who* submits the
+        # feedback; it can never rewrite *where* the receipt was produced.
+        receipt_project = canonical_project_ref(
+            getattr(receipt, "project_ref", "") or ""
+        )
+        receipt_context = {
+            "agent_instance_id": str(receipt.agent_instance_id or ""),
+            "share_group_id": self.group_id,
+            "provider": str(receipt.provider or ""),
+            "project_ref": receipt_project,
+            "runtime_role": str(receipt.runtime_role or ""),
+            "runtime_agent_id": "", "parent_agent_id": "",
+            "session_id": str(receipt.session_id or ""),
+            "context_hash": str(receipt.context_hash or ""),
+        }
         if effective_context is not None:
             try:
                 context = self._context_dict(effective_context)
@@ -1262,17 +1296,48 @@ class RuleCreationService:
                     action="rule_feedback", reason="feedback agent does not match receipt owner",
                     receipt_id=receipt_id,
                 )
+            if (
+                context["project_ref"]
+                and receipt_project
+                and context["project_ref"] != receipt_project
+            ):
+                return self._blocked(
+                    action="rule_feedback",
+                    reason="feedback_context_project_mismatch",
+                    receipt_id=receipt_id,
+                )
+            if (
+                context["provider"]
+                and getattr(receipt, "provider", "")
+                and context["provider"] != str(receipt.provider or "")
+            ):
+                return self._blocked(
+                    action="rule_feedback",
+                    reason="feedback_context_provider_mismatch",
+                    receipt_id=receipt_id,
+                )
+            if (
+                context["runtime_role"]
+                and getattr(receipt, "runtime_role", "")
+                and context["runtime_role"] != str(receipt.runtime_role or "")
+            ):
+                return self._blocked(
+                    action="rule_feedback",
+                    reason="feedback_context_runtime_role_mismatch",
+                    receipt_id=receipt_id,
+                )
+            if (
+                context["context_hash"]
+                and getattr(receipt, "context_hash", "")
+                and context["context_hash"] != str(receipt.context_hash or "")
+            ):
+                return self._blocked(
+                    action="rule_feedback",
+                    reason="feedback_context_hash_mismatch",
+                    receipt_id=receipt_id,
+                )
         else:
-            context = {
-                "agent_instance_id": str(receipt.agent_instance_id or ""),
-                "share_group_id": self.group_id,
-                "provider": str(receipt.provider or ""),
-                "project_ref": canonical_project_ref(receipt.project_ref),
-                "runtime_role": str(receipt.runtime_role or ""),
-                "runtime_agent_id": "", "parent_agent_id": "",
-                "session_id": str(receipt.session_id or ""),
-                "context_hash": str(receipt.context_hash or ""),
-            }
+            context = dict(receipt_context)
 
         get_effective = getattr(self.store, "get_effective_rule_match_feedback", None)
         if not callable(get_effective):
@@ -1348,7 +1413,9 @@ class RuleCreationService:
         ):
             record_scope = getattr(self.store, "record_rule_scope", None)
             if callable(record_scope):
-                context_for_stats = context
+                # Scope accounting must use the receipt's original context, not
+                # the submitter's current project/provider/role.
+                context_for_stats = receipt_context
                 scope_outcome = {
                     "followed": "accepted",
                     "corrected": "corrected",
@@ -1366,6 +1433,8 @@ class RuleCreationService:
                             or ""
                         ),
                         outcome=scope_outcome,
+                        receipt_id=str(receipt_id),
+                        effective_feedback_id=str(saved_feedback_id),
                     )
                 except (TypeError, ValueError, RuntimeError):
                     pass
@@ -1387,12 +1456,12 @@ class RuleCreationService:
         )
         if outcome in NARROWING_OUTCOMES:
             return self._narrow_from_feedback(
-                receipt_id, feedback_id, effective_context, outcome=outcome,
+                receipt_id, feedback_id, receipt_context, outcome=outcome,
                 evidence=evidence, base=base,
             )
         if outcome == "exception":
             return self.create_child_exception(
-                receipt_id, effective_context, evidence=evidence,
+                receipt_id, receipt_context, evidence=evidence,
                 feedback_id=feedback_id, base=base,
             )
         return base
@@ -1860,6 +1929,36 @@ class RuleCreationService:
             },
             actor=f"agent:{receipt.agent_instance_id}", persist=False,
         )
+        # Local-delta inverse metadata.  Revocation must validate *this*
+        # relation's own footprint (the exclude it generated, the child rule it
+        # created, and its relation revision), never the parent's whole
+        # assignment multiset -- otherwise a sibling exception on another
+        # project would block this one (LIFO-only undo).
+        generated_hash = ""
+        if exclude_added and generated_parent_assignment_id:
+            assignment_store = getattr(self.store, "_assignment_hash", None)
+            if callable(assignment_store):
+                try:
+                    generated_hash = str(assignment_store([
+                        RuleAssignment(
+                            memory_id=parent.memory_id,
+                            target_type=generated_parent_assignment.get("target_type", "agent_project"),
+                            target_id=generated_parent_assignment.get("target_id", receipt.agent_instance_id),
+                            project_ref=generated_parent_assignment.get("project_ref", project_ref),
+                            effect=generated_parent_assignment.get("effect", "exclude"),
+                        ),
+                    ]) or "")
+                except (TypeError, ValueError, RuntimeError):
+                    generated_hash = ""
+        behavior_hash = getattr(self.store, "rule_behavior_hash", None)
+        child_behavior_hash = ""
+        if callable(behavior_hash):
+            try:
+                child_behavior_hash = str(behavior_hash(
+                    child_record, child_assignments,
+                ) or "")
+            except (TypeError, ValueError, RuntimeError):
+                child_behavior_hash = ""
         exception_relation = RuleException(
             parent_rule=parent.memory_id,
             child_exception=child_id,
@@ -1878,8 +1977,11 @@ class RuleCreationService:
                 "generated_parent_assignment": generated_parent_assignment,
                 "generated_parent_assignment_id": generated_parent_assignment_id,
                 "generated_parent_assignment_added": exclude_added,
+                "generated_assignment_hash": generated_hash,
                 "child_rule_id": child_id,
+                "child_rule_behavior_hash": child_behavior_hash,
                 "child_status_before": "absent",
+                "relation_revision": now,
                 "decision_id": decision.decision_id,
             },
             created_at=now, updated_at=now,

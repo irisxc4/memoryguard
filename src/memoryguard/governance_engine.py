@@ -318,12 +318,19 @@ class GovernanceEngine:
                 if rule_assignments and hasattr(rule_assignments[0], "to_dict")
                 else dict(rule_assignments[0]) if rule_assignments else {}
             )
-            if mutation_kind in {"created", "deduplicated"}:
-                lifecycle_action = (
-                    "rule_create_manual"
-                    if metadata.get("rule_creation") == "manual"
-                    else "rule_create_auto"
-                )
+            if mutation_kind in {"created", "deduplicated", "proposed"}:
+                if mutation_kind == "proposed":
+                    lifecycle_action = (
+                        "rule_propose_manual"
+                        if metadata.get("rule_creation") == "manual"
+                        else "rule_propose_auto"
+                    )
+                else:
+                    lifecycle_action = (
+                        "rule_create_manual"
+                        if metadata.get("rule_creation") == "manual"
+                        else "rule_create_auto"
+                    )
                 decision = RuleDecision(
                     decision_id=self._decision_id("auto_write", idempotency_key)
                     if idempotency_key else stable_hash(
@@ -340,7 +347,7 @@ class GovernanceEngine:
                     rule_id=planned_record.memory_id,
                     action=lifecycle_action,
                     target_ids=[item for item in (event.agent_instance_id, planned_record.memory_id) if item],
-                    status="created",
+                    status=("proposed" if mutation_kind == "proposed" else "created"),
                     memory_id=planned_record.memory_id,
                     kind=planned_record.kind.value,
                     assignments=[target_assignment],
@@ -388,7 +395,11 @@ class GovernanceEngine:
                     "auto_actions": planned_actions,
                     "record": atomic.get("record", planned_record.to_dict()),
                     "assignments": atomic.get("assignments", []),
-                    "mutation_kind": atomic.get("mutation_kind", mutation_kind),
+                    "mutation_kind": (
+                        mutation_kind
+                        if mutation_kind == "proposed"
+                        else atomic.get("mutation_kind", mutation_kind)
+                    ),
                     "decision": persisted_decision,
                     "event_id": atomic.get("event_id", event.event_id),
                 }

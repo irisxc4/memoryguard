@@ -19,6 +19,10 @@ def _setup(tmp_path, monkeypatch, agent="a"):
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent)
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    # MCP feedback scope is the trusted host project.  It must match the
+    # receipt's original project or the feedback is rejected (cross-project
+    # evidence must never mutate another project's rule).
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
     store = SharedMemoryStore(tmp_path, "team")
     store.append_record(SharedMemoryRecord(
         memory_id="rule-1", body="始终先运行测试", kind=MemoryKind.PROCEDURE,

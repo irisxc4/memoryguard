@@ -78,7 +78,11 @@ def test_rule_create_undo_decision_failure_rolls_back_delete(tmp_path, monkeypat
         assignments=[{"target_type": "agent", "target_id": "agent-a"}],
         decision=_decision("r"),
     )
-    expected_hash = store._canonical_hash("body-r")
+    # Revision is the full rule behavior hash (body + kind + priority + locked
+    # + provenance + audience), captured at creation time -- never a body-only
+    # canonical hash, which would let an edit of priority/assignments still be
+    # undone by the stale create decision.
+    expected_hash = result["decision"]["metadata"]["record_revision_hash"]
     original = store._insert_rule_decision
 
     def fail(*args, **kwargs):

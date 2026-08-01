@@ -1,12 +1,16 @@
-"""Rule cockpit bridge lifecycle tests.
+"""Rule cockpit bridge lifecycle tests (real service + binding fallback chain).
 
-These tests exercise the GUI boundary with a tiny fake lifecycle service.  The
-real service is optional during rolling upgrades; the bridge must fail closed
-and must never infer a system/cross-Agent audience from a sentence.
+These tests exercise the GUI boundary against the real ``RuleCreationService``
+and the real ``AgentBindingStore``.  The old fake-service tests only proved the
+bridge "calls something"; the real service enforces the decision-ID undo
+contract, immutable receipt context and atomic exception revocation that the
+GUI must speak.  Agent/group resolution is tested as its own fallback chain:
+the group is always derived from the Agent's active binding, never defaulted.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import types
@@ -17,185 +21,322 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from memoryguard.agent_binding import AgentBindingStore  # noqa: E402
+from memoryguard.governance_scope import GovernanceScope  # noqa: E402
+from memoryguard.rule_scope import canonical_project_ref  # noqa: E402
+from memoryguard.schema_v3 import (  # noqa: E402
+    EffectiveAgentContext, RuleMatchReceipt, _now_iso,
+)
 
-class _FakeRuleCreationService:
-    def __init__(self, workspace, share_group_id="default"):
-        self.workspace = workspace
-        self.share_group_id = share_group_id
-        self.calls = []
 
-    def create_rule_from_text(self, text, context):
-        self.calls.append(("create", text, context))
-        return {
-            "ok": True,
-            "rule_id": "rule-1",
-            "memory_id": "rule-1",
-            "kind": "procedure",
-            "assignments": [{
-                "target_type": "agent_project",
-                "target_id": context.agent_instance_id,
-                "project_ref": context.project_ref,
-                "effect": "include",
-            }],
-            "scope_confidence": 0.42,
-            "scope_reason": "当前 Agent + 项目候选；未扩大到共享组",
-            "decision_id": "decision-1",
-            "undo_id": "undo-1",
-        }
+def _make_api(workspace):
+    from memoryguard.gui import GovernanceApi
 
-    def list_decisions(self, limit=50):
-        return {"decisions": [{
-            "decision_id": "decision-1", "rule_id": "rule-1",
-            "scope_confidence": 0.42, "scope_reason": "narrow candidate",
-            "undo_id": "undo-1", "status": "active",
-        }], "total": 1}
+    api = GovernanceApi(workspace)
+    project = canonical_project_ref(str(Path(workspace) / "project"))
+    api._rule_scope_options = lambda _group: {
+        "agents": [{"id": "agent-a", "label": "agent-a"}, {"id": "agent-b", "label": "agent-b"}],
+        "groups": [{"id": _group, "label": _group}],
+        "projects": [{"id": project, "label": "project"}],
+        "providers": [], "runtime_roles": [],
+    }
+    return api
 
-    def undo_rule_decision(self, decision_id, context=None):
-        return {"ok": True, "decision_id": decision_id, "status": "undone"}
 
-    def scope_stats(self):
-        return {"stats": [{"rule_id": "rule-1", "total": 2, "accepted": 1,
-                            "corrected": 1, "wrong_scope": 0}],
-                "auto_scope": {"total": 1, "low_confidence": 1}}
-
-    def submit_feedback(self, receipt_id, outcome, actor, evidence="", **kwargs):
-        return {"ok": True, "receipt_id": receipt_id, "outcome": outcome,
-                "actor": actor, "evidence": evidence,
-                "producer": kwargs.get("producer"),
-                "source": kwargs.get("producer"),
-                "authority": 4 if kwargs.get("producer") == "user" else 3,
-                "context": kwargs.get("effective_context")}
-
-    def list_exceptions(self, parent_rule=""):
-        return {"exceptions": [{"exception_id": "ex-1", "parent_rule": parent_rule or "rule-1",
-                                "child_exception": "rule-child", "priority": 10,
-                                "reason": "explicit exception", "active": True}], "total": 1}
-
-    def create_rule_exception(self, parent_rule, child_exception, priority=0, reason=""):
-        return {"ok": True, "exception_id": "ex-1", "parent_rule": parent_rule,
-                "child_exception": child_exception, "priority": priority, "reason": reason}
-
-    def revoke_exception(self, exception_id):
-        return {"ok": True, "exception_id": exception_id, "active": False}
+def _personal_group(store: AgentBindingStore, agent: str) -> str:
+    return str(store.ensure_personal_memory_group(agent)["share_group_id"])
 
 
 @pytest.fixture()
-def fake_service(monkeypatch):
-    module = types.ModuleType("memoryguard.rule_creation")
-    module.RuleCreationService = _FakeRuleCreationService
-    monkeypatch.setitem(sys.modules, "memoryguard.rule_creation", module)
-    return module
+def env(monkeypatch):
+    monkeypatch.delenv("MEMORYGUARD_AGENT_ID", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_SHARE_GROUP_ID", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_PROJECT_CWD", raising=False)
+    return monkeypatch
 
 
-def test_rule_cockpit_create_requires_trusted_context_and_preserves_narrow_scope(fake_service, monkeypatch):
+def test_rule_agent_resolution_env_agent_uses_personal_binding(tmp_path, env):
+    store = AgentBindingStore(tmp_path)
+    personal = _personal_group(store, "agent-a")
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    api = _make_api(tmp_path)
+    agent, group, error = api._resolve_current_rule_agent(None)
+    assert error is None
+    assert agent == "agent-a"
+    assert group == personal
+
+
+def test_rule_agent_resolution_agent_scope_uses_personal_binding(tmp_path, env):
+    store = AgentBindingStore(tmp_path)
+    personal = _personal_group(store, "agent-a")
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    api = _make_api(tmp_path)
+    preference = GovernanceScope(mode="agent", agent_instance_id="agent-a")
+    agent, group, error = api._resolve_current_rule_agent(preference)
+    assert error is None
+    assert group == personal
+
+
+def test_rule_agent_resolution_unique_binding_no_preference(tmp_path, env):
+    store = AgentBindingStore(tmp_path)
+    personal = _personal_group(store, "agent-a")
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    api = _make_api(tmp_path)
+    agent, group, error = api._resolve_current_rule_agent(None)
+    assert error is None
+    assert agent == "agent-a"
+    assert group == personal
+
+
+def test_rule_agent_resolution_env_group_binding_mismatch_rejected(tmp_path, env):
+    store = AgentBindingStore(tmp_path)
+    _personal_group(store, "agent-a")  # bound to personal-<hash>, not "g1"
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    env.setenv("MEMORYGUARD_SHARE_GROUP_ID", "g1")
+    api = _make_api(tmp_path)
+    agent, group, error = api._resolve_current_rule_agent(None)
+    assert error is not None
+    assert error["error"] == "agent_not_bound_to_group"
+    assert agent is None
+    assert group == "g1"
+
+
+def test_rule_agent_resolution_ambiguous_group_members_rejected(tmp_path, env):
+    store = AgentBindingStore(tmp_path)
+    store.bind_agent("agent-a", "g1")
+    store.bind_agent("agent-b", "g1")
+    env.setenv("MEMORYGUARD_SHARE_GROUP_ID", "g1")
+    env.delenv("MEMORYGUARD_AGENT_ID", raising=False)
+    api = _make_api(tmp_path)
+    agent, group, error = api._resolve_current_rule_agent(None)
+    assert error is not None
+    assert error["error"] == "ambiguous_agent_context"
+    assert agent is None
+
+
+def test_rule_agent_resolution_first_run_creates_personal_group(tmp_path, env):
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    api = _make_api(tmp_path)
+    agent, group, error = api._resolve_current_rule_agent(None)
+    assert error is None
+    assert agent == "agent-a"
+    assert group.startswith("personal-")
+    assert AgentBindingStore(tmp_path).find_by_agent("agent-a", include_inactive=False)
+
+
+def test_gui_real_service_create_then_undo(tmp_path, env):
     from memoryguard.gui import GovernanceApi
 
-    with tempfile.TemporaryDirectory() as workspace:
-        api = GovernanceApi(workspace)
-        api._rule_scope_options = lambda _group: {
-            "agents": [{"id": "agent-a", "label": "agent-a"}],
-            "groups": [{"id": "default", "label": "default"}],
-            "projects": [{"id": "project-a", "label": "project-a"}],
-            "providers": [], "runtime_roles": [],
-        }
-        monkeypatch.delenv("MEMORYGUARD_AGENT_ID", raising=False)
-        missing = api.create_rule_from_text("一句话规则", share_group_id="g1", confirmed=True)
-        assert missing["error"] == "agent_context_required"
+    store = AgentBindingStore(tmp_path)
+    _personal_group(store, "agent-a")
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    env.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
+    api = _make_api(tmp_path)
+    decision = api.create_rule_from_text("所有任务默认使用 UTF-8。", confirmed=True)
+    assert decision["ok"] is True
+    assert decision["decision_id"]
 
-        monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
-        monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", "project-a")
-        created = api.create_rule_from_text(
-            "一句话规则",
-            context={
-                "agent_instance_id": "attacker-agent",
-                "share_group_id": "attacker-group",
-                "project_ref": "attacker-project",
-            },
-            agent_instance_id="attacker-agent",
-            share_group_id="attacker-group",
-            project_ref="attacker-project",
-            confirmed=True,
+    undone = api.undo_rule_decision(decision["decision_id"], confirmed=True)
+    assert undone["status"] == "undone"
+
+
+def test_gui_real_service_exception_revoke_uses_trusted_context(tmp_path, env):
+    from memoryguard.gui import GovernanceApi
+    from memoryguard.rule_creation import RuleCreationService
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    group = "g1"
+    store = SharedMemoryStore(tmp_path, group)
+    AgentBindingStore(tmp_path).bind_agent("agent-a", group)
+    env.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    env.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
+    env.setenv("MEMORYGUARD_SHARE_GROUP_ID", group)
+    store.append_record(
+        _record(store, "parent"), assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    service = RuleCreationService(tmp_path, group, store=store)
+    context = EffectiveAgentContext(
+        agent_instance_id="agent-a", share_group_id=group,
+        project_ref=str(tmp_path / "project"), session_id="s1",
+    )
+    store.append_rule_match_receipt(RuleMatchReceipt(
+        receipt_id="receipt-1", memory_id="parent", share_group_id=group,
+        agent_instance_id="agent-a", task_hash="t", task="task",
+        project_ref=str(tmp_path / "project"), session_id="s1",
+        created_at=_now_iso(),
+    ))
+    created = service.submit_feedback(
+        "receipt-1", "exception", "agent-a",
+        evidence="override body", effective_context=context,
+    )
+    assert created.status == "created"
+    exception_id = created.metadata["exception_id"]
+
+    api = _make_api(tmp_path)
+    revoked = api.revoke_rule_exception(exception_id, confirmed=True)
+    assert revoked["ok"] is True
+    assert revoked["active"] is False
+
+
+def test_feedback_project_mismatch_is_blocked(tmp_path):
+    from memoryguard.rule_creation import RuleCreationService
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    group = "g1"
+    store = SharedMemoryStore(tmp_path, group)
+    store.append_record(
+        _record(store, "parent"), assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    store.append_rule_match_receipt(RuleMatchReceipt(
+        receipt_id="receipt-pa", memory_id="parent", share_group_id=group,
+        agent_instance_id="agent-a", task_hash="t", task="task",
+        project_ref=str(tmp_path / "projectA"), session_id="s1",
+        created_at=_now_iso(),
+    ))
+    service = RuleCreationService(tmp_path, group, store=store)
+    # Submitter switches to project B: evidence from receipt-A must not be
+    # allowed to mutate Project B's rule.
+    context = EffectiveAgentContext(
+        agent_instance_id="agent-a", share_group_id=group,
+        project_ref=str(tmp_path / "projectB"), session_id="s1",
+    )
+    result = service.submit_feedback(
+        "receipt-pa", "not_applicable", "agent-a",
+        evidence="not applicable", effective_context=context,
+    )
+    assert result.status == "blocked"
+    assert result.blocked_reason == "feedback_context_project_mismatch"
+
+
+def test_feedback_empty_exception_body_rejected_before_write(tmp_path):
+    from memoryguard.rule_creation import RuleCreationService
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    group = "g1"
+    store = SharedMemoryStore(tmp_path, group)
+    store.append_record(
+        _record(store, "parent"), assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    store.append_rule_match_receipt(RuleMatchReceipt(
+        receipt_id="receipt-1", memory_id="parent", share_group_id=group,
+        agent_instance_id="agent-a", task_hash="t", task="task",
+        project_ref=str(tmp_path / "projectA"), session_id="s1",
+        created_at=_now_iso(),
+    ))
+    service = RuleCreationService(tmp_path, group, store=store)
+    before = len(store.list_rule_match_feedbacks())
+    context = EffectiveAgentContext(
+        agent_instance_id="agent-a", share_group_id=group,
+        project_ref=str(tmp_path / "projectA"), session_id="s1",
+    )
+    result = service.submit_feedback(
+        "receipt-1", "exception", "agent-a",
+        evidence="   ", effective_context=context,
+    )
+    assert result.status == "blocked"
+    assert result.blocked_reason == "exception_override_body_required"
+    assert len(store.list_rule_match_feedbacks()) == before
+    assert not store.list_rule_exceptions(parent_rule="parent")
+
+
+def test_scope_evaluation_ledger_tracks_current_outcome(tmp_path):
+    from memoryguard.rule_creation import RuleCreationService
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    group = "g1"
+    store = SharedMemoryStore(tmp_path, group)
+    store.append_record(
+        _record(store, "parent"), assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    for idx in (1, 2, 3):
+        store.append_rule_match_receipt(RuleMatchReceipt(
+            receipt_id=f"receipt-{idx}", memory_id="parent", share_group_id=group,
+            agent_instance_id="agent-a", task_hash=f"t{idx}", task="task",
+            project_ref=str(tmp_path / "projectA"), session_id=f"s{idx}",
+            created_at=_now_iso(),
+        ))
+    service = RuleCreationService(tmp_path, group, store=store)
+    context = EffectiveAgentContext(
+        agent_instance_id="agent-a", share_group_id=group,
+        project_ref=str(tmp_path / "projectA"), session_id="s1",
+    )
+    # Three independent not_applicable receipts -> 3 wrong_scope conclusions.
+    for idx in (1, 2, 3):
+        result = service.submit_feedback(
+            f"receipt-{idx}", "not_applicable", "agent-a",
+            evidence="na", effective_context=context,
         )
-        assert created["ok"] is True
-        assert created["rule_id"] == "rule-1"
-        assert created["scope_confidence"] == pytest.approx(0.42)
-        assert created["decision_id"] == "decision-1"
-        assert created["undo_id"] == "undo-1"
-        assert created["assignments"][0]["target_type"] == "agent_project"
-        assert created["context"] == {
-            "agent_instance_id": "agent-a",
-            "share_group_id": "default",
-            "project_ref": "project-a",
-            "provider": "",
-            "runtime_role": "",
-        }
-        assert all(item.get("target_type") != "system" for item in created["assignments"])
+        assert result.status != "blocked"
+    stats = store.get_rule_scope_stats(
+        "parent", agent_instance_id="agent-a", project_ref=str(tmp_path / "projectA"),
+    )
+    assert stats.wrong_scope == 3
+    assert stats.accepted == 0
+    # A later higher-authority followed event on receipt-1 replaces the
+    # earlier not_applicable conclusion: current ledger = 2 wrong + 1 accepted.
+    result = service.submit_feedback(
+        "receipt-1", "followed", "agent-a",
+        evidence="followed", effective_context=context,
+    )
+    assert result.status == "recorded"
+    stats = store.get_rule_scope_stats(
+        "parent", agent_instance_id="agent-a", project_ref=str(tmp_path / "projectA"),
+    )
+    assert stats.wrong_scope == 2
+    assert stats.accepted == 1
 
 
-def test_rule_cockpit_decision_undo_feedback_exception_lifecycle(fake_service, monkeypatch):
+def test_mandatory_semantic_duplicate_proposes_low_confidence(tmp_path):
+    from memoryguard.governance_engine import GovernanceEngine
+    from memoryguard.schema_v3 import MemoryEvent
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    from memoryguard.schema_v3 import MemoryKind
+
+    store = SharedMemoryStore(tmp_path, "g1")
+    store.append_record(
+        _record(store, "existing", body="所有 agent 默认启用 rtk 输出。",
+                kind=MemoryKind.FACT),
+        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    engine = GovernanceEngine(tmp_path, "g1", store=store)
+    event = MemoryEvent(
+        event_id="event-sem", agent_instance_id="agent-a", share_group_id="g1",
+        raw_content="所有 agent 默认采用 rtk 输出。",
+        created_at=_now_iso(),
+    )
+    result = engine.auto_write(
+        event,
+        injection_policy="always",
+        rule_assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    # A near/semantic duplicate of an existing mandatory rule must never fall
+    # back to the legacy non-atomic organizer merge; it is surfaced as a
+    # low-confidence proposal with its own decision, and the original rule is
+    # left untouched until a human confirms the merge.
+    assert result["mutation_kind"] == "proposed"
+    assert result["record"]["status"] == "low_confidence"
+    assert store.get_record("existing").status.value == "active"
+
+
+def test_rule_cockpit_service_unavailable_is_fail_closed(tmp_path, monkeypatch):
     from memoryguard.gui import GovernanceApi
+    from memoryguard.agent_binding import AgentBindingStore
 
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
-    monkeypatch.setenv("MEMORYGUARD_SHARE_GROUP_ID", "g1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", "project-a")
-    with tempfile.TemporaryDirectory() as workspace:
-        api = GovernanceApi(workspace)
-        api._rule_scope_options = lambda _group: {
-            "agents": [{"id": "agent-a", "label": "agent-a"}],
-            "groups": [{"id": "g1", "label": "g1"}],
-            "projects": [{"id": "project-a", "label": "project-a"}],
-            "providers": [], "runtime_roles": [],
-        }
-        decisions = api.list_rule_decisions("g1")
-        assert decisions["decisions"][0]["decision_id"] == "decision-1"
-        metrics = api.get_rule_auto_scope_metrics("g1")
-        assert metrics["auto_scope"]["low_confidence"] == 1
-
-        assert api.undo_rule_decision("decision-1", "g1", confirmed=False)["error"] == "confirmation_required"
-        undone = api.undo_rule_decision(
-            "decision-1", "g1", confirmed=True,
-            context={"agent_instance_id": "agent-a", "share_group_id": "g1", "project_ref": "project-a"},
-        )
-        assert undone["status"] == "undone"
-
-        feedback = api.submit_rule_feedback("receipt-1", "followed", "agent-a", "evidence", "g1")
-        assert feedback["outcome"] == "followed"
-        assert feedback["producer"] == "user"
-        assert feedback["source"] == "user"
-        assert feedback["authority"] == 4
-        assert feedback["actor"] == "user"
-
-        invalid = api.create_child_exception("rule-1", "rule-1", confirmed=True)
-        assert invalid["error"] == "rule_exception_cannot_reference_itself"
-        created = api.create_child_exception("rule-1", "rule-child", 10, "explicit exception", "g1", True)
-        assert created["parent_rule"] == "rule-1"
-        assert created["child_exception"] == "rule-child"
-        listed = api.list_rule_exceptions("g1", "rule-1")
-        assert listed["exceptions"][0]["parent_rule"] == "rule-1"
-        revoked = api.revoke_rule_exception("ex-1", "g1", confirmed=True)
-        assert revoked["active"] is False
-
-
-def test_rule_cockpit_service_unavailable_is_fail_closed(monkeypatch):
-    from memoryguard.gui import GovernanceApi
-
+    AgentBindingStore(tmp_path).bind_agent("agent-a", "g1")
     monkeypatch.setitem(sys.modules, "memoryguard.rule_creation", None)
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
     monkeypatch.setenv("MEMORYGUARD_SHARE_GROUP_ID", "g1")
-    with tempfile.TemporaryDirectory() as workspace:
-        api = GovernanceApi(workspace)
-        api._rule_scope_options = lambda _group: {
-            "agents": [], "groups": [{"id": "g1", "label": "g1"}],
-            "projects": [], "providers": [], "runtime_roles": [],
-        }
-        result = api.create_rule_from_text(
-            "一句话规则",
-            context={"agent_instance_id": "agent-a", "share_group_id": "g1"},
-            confirmed=True,
-        )
-        assert result["error"] in {"service_unavailable", "service_method_unavailable"}
-        undo = api.undo_rule_decision("decision-1", "g1", confirmed=True)
-        assert undo["error"] == "service_unavailable"
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
+    api = _make_api(tmp_path)
+    result = api.create_rule_from_text(
+        "一句话规则",
+        context={"agent_instance_id": "agent-a", "share_group_id": "g1"},
+        confirmed=True,
+    )
+    assert result["error"] in {"service_unavailable", "service_method_unavailable"}
+    undo = api.undo_rule_decision("decision-1", "g1", confirmed=True)
+    assert undo["error"] == "service_unavailable"
 
 
 def test_gui_feedback_fallback_is_user_authority_and_checks_receipt_owner(monkeypatch):
@@ -206,6 +347,8 @@ def test_gui_feedback_fallback_is_user_authority_and_checks_receipt_owner(monkey
     monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", "project-a")
     receipt = types.SimpleNamespace(
         receipt_id="receipt-1", share_group_id="g1", agent_instance_id="agent-a",
+        project_ref="project-a", provider="", runtime_role="", context_hash="",
+        session_id="s1",
     )
 
     class _FallbackStore:
@@ -231,6 +374,12 @@ def test_gui_feedback_fallback_is_user_authority_and_checks_receipt_owner(monkey
     }
     api._rule_bridge_service = lambda *args, **kwargs: None
     api._open_store = lambda _group, must_exist=False: (store, "")
+    api._trusted_rule_bridge_context = lambda: (
+        EffectiveAgentContext(
+            agent_instance_id="agent-a", share_group_id="g1", project_ref="project-a",
+        ),
+        None,
+    )
 
     result = api.submit_rule_feedback("receipt-1", "followed", "attacker", "evidence", "g1")
     assert result["ok"] is True
@@ -245,6 +394,46 @@ def test_gui_feedback_fallback_is_user_authority_and_checks_receipt_owner(monkey
     assert denied["error"] == "feedback_agent_does_not_own_receipt"
 
 
+def test_gui_lifecycle_feedback_never_falls_back_to_plain_store(monkeypatch):
+    from memoryguard.gui import GovernanceApi
+
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_SHARE_GROUP_ID", "g1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", "project-a")
+
+    class _Store:
+        group_id = "g1"
+
+        def get_rule_match_receipt(self, receipt_id):
+            return types.SimpleNamespace(
+                receipt_id=receipt_id, share_group_id="g1",
+                agent_instance_id="agent-a", project_ref="project-a",
+                provider="", runtime_role="", context_hash="", session_id="s1",
+            )
+
+        def get_effective_rule_match_feedback(self, receipt_id):
+            return None
+
+        def append_rule_match_feedback(self, feedback):
+            raise AssertionError("lifecycle feedback must not hit plain-store fallback")
+
+    store = _Store()
+    api = GovernanceApi("unused")
+    api._rule_bridge_service = lambda *args, **kwargs: None
+    api._open_store = lambda _group, must_exist=False: (store, "")
+    api._trusted_rule_bridge_context = lambda: (
+        EffectiveAgentContext(
+            agent_instance_id="agent-a", share_group_id="g1", project_ref="project-a",
+        ),
+        None,
+    )
+    for lifecycle_outcome in ("not_applicable", "exception"):
+        result = api.submit_rule_feedback(
+            "receipt-1", lifecycle_outcome, "agent-a", "evidence", "g1",
+        )
+        assert result["error"] == "lifecycle_feedback_requires_rule_service"
+
+
 def test_interactive_rule_cockpit_surface_is_present():
     from memoryguard.interactive import render_interactive_html
 
@@ -254,3 +443,18 @@ def test_interactive_rule_cockpit_surface_is_present():
         "命中回执与反馈", "新增子例外", "submitRuleFeedback",
     ):
         assert marker in html
+
+
+def _record(store, mid: str, body: str = "所有 agent 都采用同一套格式。",
+            kind=None):
+    from memoryguard.schema_v3 import (
+        MemoryKind, SharedMemoryRecord, SharedMemoryStatus,
+    )
+
+    return SharedMemoryRecord(
+        memory_id=mid, body=body,
+        kind=kind or MemoryKind.PROCEDURE,
+        status=SharedMemoryStatus.ACTIVE, agent_instance_id="agent-a",
+        injection_policy="always", priority=10,
+        created_at=_now_iso(), updated_at=_now_iso(),
+    )

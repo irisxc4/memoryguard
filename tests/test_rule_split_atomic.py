@@ -2,6 +2,7 @@ from pathlib import Path
 
 from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.rule_creation import RuleCreationService
+from memoryguard.rule_scope import canonical_project_ref
 from memoryguard.schema_v3 import (
     EffectiveAgentContext,
     MemoryKind,
@@ -173,11 +174,28 @@ def test_exception_undo_rejects_later_parent_edit(tmp_path):
     after_edit = [item.to_dict() for item in store.list_rule_assignments("parent")]
     child_id = store.list_rule_exceptions(parent_rule="parent")[0].child_exception
 
+    # Revocation is guarded by a LOCAL delta (this relation's generated
+    # exclude, its child rule, and the relation's active flag), never by the
+    # parent's whole assignment multiset.  An unrelated later parent edit on
+    # another project must not block this exception's undo.
     undone = service.undo_rule_decision(decision.decision_id, context)
-    assert undone.status == "blocked"
-    assert "parent_assignment_revision_conflict" in undone.blocked_reason
-    assert [item.to_dict() for item in store.list_rule_assignments("parent")] == after_edit
-    assert store.get_record(child_id).status == SharedMemoryStatus.ACTIVE
+    assert undone.status == "undone"
+    parent_after_undo = store.list_rule_assignments("parent")
+    # The later include edit is preserved.
+    assert any(
+        item.target_type == "agent_project"
+        and item.project_ref == canonical_project_ref(str(tmp_path / "later-exception-edit"))
+        and item.effect == "include"
+        for item in parent_after_undo
+    )
+    # This exception's generated exclude is removed and the child soft-deleted.
+    assert not any(
+        item.effect == "exclude"
+        and item.target_id == "a"
+        and item.project_ref == canonical_project_ref(str(tmp_path / "project"))
+        for item in parent_after_undo
+    )
+    assert store.get_record(child_id).status == SharedMemoryStatus.DELETED
 
 
 def test_exception_revoke_keeps_preexisting_target_exclude(tmp_path):

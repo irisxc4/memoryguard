@@ -1457,6 +1457,55 @@ class RuleScopeStats:
 
 
 @dataclass
+class RuleScopeEvaluation:
+    """Current effective scope conclusion for one receipt.
+
+    The append-only ``rule_match_feedbacks`` stream is the historical audit
+    trail; this row is the accuracy ledger.  One row per receipt, UPSERTed
+    whenever the effective feedback changes, so aggregated counters always
+    describe *current* reality instead of summing every historical event
+    (which double-counts superseded opinions).
+    """
+
+    receipt_id: str
+    rule_id: str
+    agent_instance_id: str = ""
+    project_ref: str = ""
+    effective_feedback_id: str = ""
+    outcome: str = "accepted"
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not str(self.receipt_id or "").strip() or not str(self.rule_id or "").strip():
+            raise ValueError("receipt_id and rule_id are required")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "rule_id": self.rule_id,
+            "agent_instance_id": self.agent_instance_id,
+            "project_ref": self.project_ref,
+            "effective_feedback_id": self.effective_feedback_id,
+            "outcome": self.outcome,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleScopeEvaluation":
+        if not isinstance(data, dict):
+            raise ValueError("rule scope evaluation must be an object")
+        return cls(
+            receipt_id=str(data.get("receipt_id", "")),
+            rule_id=str(data.get("rule_id", "")),
+            agent_instance_id=str(data.get("agent_instance_id", "")),
+            project_ref=str(data.get("project_ref", "")),
+            effective_feedback_id=str(data.get("effective_feedback_id", "")),
+            outcome=str(data.get("outcome", "accepted")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+
+@dataclass
 class RuleException:
     """A child exception relation attached to a parent rule."""
 
@@ -1622,6 +1671,7 @@ FEEDBACK_AUTHORITY_ORDER = {
     "user": 4,
     "agent": 3,
     "hook": 2,
+    "legacy": 1,
     "unobserved": 1,
 }
 
