@@ -126,3 +126,74 @@ def build_evidence(
         confidence=confidence,
         observed_at=observed_at or _now_iso(),
     )
+
+
+@dataclass(frozen=True)
+class NegativeEvidence:
+    """Empirical contradiction: a project/agent where the rule did not hold.
+
+    This is the P3-001 counterweight to positive evidence.  One observation
+    never rejects a merge; a weighted fraction above the threshold does.
+    The identity is the same (session+project+content) dedup discipline as
+    positive evidence so one repeated report never inflates the score.
+    """
+
+    evidence_id: str
+    definition_id: str = ""
+    source_rule_id: str = ""
+    agent_instance_id: str = ""
+    project_ref: str = ""
+    content_hash: str = ""
+    confidence: float = 1.0
+    observed_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "definition_id": self.definition_id,
+            "source_rule_id": self.source_rule_id,
+            "agent_instance_id": self.agent_instance_id,
+            "project_ref": self.project_ref,
+            "content_hash": self.content_hash,
+            "confidence": self.confidence,
+            "observed_at": self.observed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "NegativeEvidence":
+        return cls(
+            evidence_id=data["evidence_id"],
+            definition_id=data.get("definition_id", ""),
+            source_rule_id=data.get("source_rule_id", ""),
+            agent_instance_id=data.get("agent_instance_id", ""),
+            project_ref=data.get("project_ref", ""),
+            content_hash=data.get("content_hash", ""),
+            confidence=float(data.get("confidence", 1.0)),
+            observed_at=data.get("observed_at", ""),
+        )
+
+
+def build_negative_evidence(
+    *,
+    source_rule_id: str = "",
+    agent_instance_id: str = "",
+    project_ref: str = "",
+    content: str = "",
+    confidence: float = 1.0,
+    definition_id: str = "",
+    observed_at: str = "",
+) -> NegativeEvidence:
+    content_hash = stable_hash("rule-content", str(content or "").strip())
+    return NegativeEvidence(
+        evidence_id=stable_hash(
+            "rule-negative-evidence", source_rule_id, agent_instance_id,
+            canonical_project_ref(project_ref), content_hash,
+        ),
+        definition_id=definition_id,
+        source_rule_id=source_rule_id,
+        agent_instance_id=agent_instance_id,
+        project_ref=canonical_project_ref(project_ref),
+        content_hash=content_hash,
+        confidence=confidence,
+        observed_at=observed_at or _now_iso(),
+    )

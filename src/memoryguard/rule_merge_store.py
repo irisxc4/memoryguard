@@ -33,6 +33,7 @@ from .rule_definition import (
     RuleDefinition,
 )
 from .rule_evidence import RuleEvidence, dedupe_evidence
+from .rule_merge_policy import MAX_SINGLE_SOURCE_RATIO, largest_source_ratio
 from .rule_scope import assignment_matches, canonical_project_ref
 from .schema_v3 import (
     EffectiveAgentContext,
@@ -55,6 +56,8 @@ CREATE TABLE IF NOT EXISTS rule_definitions (
     status TEXT NOT NULL DEFAULT 'active',
     confidence REAL NOT NULL DEFAULT 1.0,
     revision INTEGER NOT NULL DEFAULT 1,
+    rule_strength TEXT NOT NULL DEFAULT 'observation',
+    maturity_state TEXT NOT NULL DEFAULT 'observing',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     superseded_by TEXT NOT NULL DEFAULT ''
@@ -119,6 +122,12 @@ CREATE TABLE IF NOT EXISTS rule_merge_proposals (
     agent_count INTEGER NOT NULL DEFAULT 0,
     project_count INTEGER NOT NULL DEFAULT 0,
     contradiction_score REAL NOT NULL DEFAULT 0.0,
+    readiness_score REAL NOT NULL DEFAULT 0.0,
+    governance_reasons TEXT NOT NULL DEFAULT '',
+    cooldown_until TEXT NOT NULL DEFAULT '',
+    first_merge_acknowledged INTEGER NOT NULL DEFAULT 0,
+    negative_score REAL NOT NULL DEFAULT 0.0,
+    conflict_type TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'candidate',
     explanation TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -132,12 +141,61 @@ CREATE TABLE IF NOT EXISTS rule_merge_decisions (
     after_bindings TEXT NOT NULL DEFAULT '[]',
     migration TEXT NOT NULL DEFAULT '{}',
     actor TEXT NOT NULL DEFAULT 'auto',
+    readiness_at_merge REAL NOT NULL DEFAULT 0.0,
+    strength_ok INTEGER NOT NULL DEFAULT 1,
+    negative_ok INTEGER NOT NULL DEFAULT 1,
+    first_merge_acknowledged INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'merged',
     created_at TEXT NOT NULL,
     undone_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_rule_merge_decisions_proposal
     ON rule_merge_decisions(proposal_id);
+CREATE TABLE IF NOT EXISTS rule_negative_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL DEFAULT '',
+    source_rule_id TEXT NOT NULL DEFAULT '',
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (definition_id) REFERENCES rule_definitions(definition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_negative_evidence_definition
+    ON rule_negative_evidence(definition_id);
+CREATE TABLE IF NOT EXISTS agent_reputation (
+    agent_id TEXT PRIMARY KEY,
+    success_rate REAL NOT NULL DEFAULT 0.0,
+    rule_accuracy REAL NOT NULL DEFAULT 0.0,
+    violation_rate REAL NOT NULL DEFAULT 0.0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    feedback_quality REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_profile (
+    project_ref TEXT PRIMARY KEY,
+    production_level REAL NOT NULL DEFAULT 0.0,
+    criticality REAL NOT NULL DEFAULT 0.0,
+    owner_verified INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_definition_versions (
+    version_id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL,
+    superseded_by TEXT NOT NULL DEFAULT '',
+    old_strength TEXT NOT NULL DEFAULT '',
+    new_strength TEXT NOT NULL DEFAULT '',
+    change_reason TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (definition_id) REFERENCES rule_definitions(definition_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_definition_versions_definition
+    ON rule_definition_versions(definition_id);
 """
 
 
@@ -169,6 +227,46 @@ class RuleMergeStore:
     def _init_db(self) -> None:
         with self._db() as conn:
             conn.executescript(_SCHEMA)
+            self._apply_upgrade(conn)
+            conn.commit()
+
+    # ------------------------------------------------------------------
+    # in-place upgrade for databases created before the governance layer
+    # ------------------------------------------------------------------
+
+    _UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("rule_definitions", "rule_strength", "TEXT NOT NULL DEFAULT 'observation'"),
+        ("rule_definitions", "maturity_state", "TEXT NOT NULL DEFAULT 'observing'"),
+        ("rule_merge_proposals", "readiness_score", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_proposals", "governance_reasons", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "cooldown_until", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
+        ("rule_merge_proposals", "negative_score", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_proposals", "conflict_type", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_decisions", "readiness_at_merge", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_decisions", "strength_ok", "INTEGER NOT NULL DEFAULT 1"),
+        ("rule_merge_decisions", "negative_ok", "INTEGER NOT NULL DEFAULT 1"),
+        ("rule_merge_decisions", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 1"),
+    )
+
+    @staticmethod
+    def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _apply_upgrade(self, conn: sqlite3.Connection) -> None:
+        """Add governance columns to tables created before the upgrade.
+
+        ``CREATE TABLE IF NOT EXISTS`` never touches an existing table, so a
+        store built before the governance layer keeps its old columns until
+        this routine adds them.  Fresh databases already have every column and
+        every check becomes a no-op.
+        """
+        for table, column, ddl in self._UPGRADE_COLUMNS:
+            if column not in self._existing_columns(conn, table):
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                )
 
     # ------------------------------------------------------------------
     # Definitions
@@ -182,8 +280,9 @@ class RuleMergeStore:
                 INSERT INTO rule_definitions (
                     definition_id, canonical_text, normalized_intent, rule_kind,
                     polarity, semantic_hash, parameter_schema, status, confidence,
-                    revision, created_at, updated_at, superseded_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    revision, rule_strength, maturity_state,
+                    created_at, updated_at, superseded_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(definition_id) DO UPDATE SET
                     canonical_text=excluded.canonical_text,
                     normalized_intent=excluded.normalized_intent,
@@ -194,6 +293,8 @@ class RuleMergeStore:
                     status=excluded.status,
                     confidence=excluded.confidence,
                     revision=excluded.revision,
+                    rule_strength=excluded.rule_strength,
+                    maturity_state=excluded.maturity_state,
                     updated_at=excluded.updated_at,
                     superseded_by=excluded.superseded_by
                 """,
@@ -203,6 +304,7 @@ class RuleMergeStore:
                     payload["polarity"], payload["semantic_hash"],
                     payload["parameter_schema"], payload["status"],
                     payload["confidence"], payload["revision"],
+                    payload["rule_strength"], payload["maturity_state"],
                     payload["created_at"], payload["updated_at"],
                     payload["superseded_by"],
                 ),
@@ -256,6 +358,8 @@ class RuleMergeStore:
             status=row["status"] or "active",
             confidence=float(row["confidence"] or 1.0),
             revision=int(row["revision"] or 1),
+            rule_strength=row["rule_strength"] or "observation",
+            maturity_state=row["maturity_state"] or "observing",
             created_at=row["created_at"] or "",
             updated_at=row["updated_at"] or "",
             superseded_by=row["superseded_by"] or "",
@@ -267,6 +371,26 @@ class RuleMergeStore:
                 "SELECT COUNT(*) AS c FROM rule_definitions WHERE status IN ('active','alias')"
             ).fetchone()
         return int(row["c"])
+
+    def set_definition_status(
+        self, definition_id: str, status: str, *, superseded_by: str = "",
+    ) -> None:
+        """Change a definition's lifecycle status (active|superseded|merged…)."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE rule_definitions SET status=?, superseded_by=?, updated_at=? "
+                "WHERE definition_id=?",
+                (status, superseded_by, _now(), definition_id),
+            )
+
+    def set_definition_maturity(self, definition_id: str, state: str) -> None:
+        """Persist the recomputed maturity stage of one definition."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE rule_definitions SET maturity_state=?, updated_at=? "
+                "WHERE definition_id=?",
+                (state, _now(), definition_id),
+            )
 
     # ------------------------------------------------------------------
     # Bindings
@@ -431,6 +555,270 @@ class RuleMergeStore:
         return int(row["c"])
 
     # ------------------------------------------------------------------
+    # Negative evidence (P3-001 §5)
+    # ------------------------------------------------------------------
+
+    def upsert_negative_evidence(
+        self, evidence: Any,
+    ) -> Any:
+        payload = evidence.to_dict()
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO rule_negative_evidence (
+                    evidence_id, definition_id, source_rule_id,
+                    agent_instance_id, project_ref, content_hash, confidence,
+                    observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(evidence_id) DO UPDATE SET
+                    definition_id=excluded.definition_id,
+                    confidence=excluded.confidence,
+                    observed_at=excluded.observed_at
+                """,
+                (
+                    payload["evidence_id"], payload["definition_id"],
+                    payload["source_rule_id"], payload["agent_instance_id"],
+                    payload["project_ref"], payload["content_hash"],
+                    payload["confidence"], payload["observed_at"],
+                ),
+            )
+        return evidence
+
+    def list_negative_evidence(
+        self, definition_id: str | None = None,
+    ) -> list[Any]:
+        from .rule_evidence import NegativeEvidence
+
+        sql = "SELECT * FROM rule_negative_evidence"
+        params: list[Any] = []
+        if definition_id:
+            sql += " WHERE definition_id=?"
+            params.append(definition_id)
+        sql += " ORDER BY observed_at"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            NegativeEvidence(
+                evidence_id=row["evidence_id"],
+                definition_id=row["definition_id"] or "",
+                source_rule_id=row["source_rule_id"] or "",
+                agent_instance_id=row["agent_instance_id"] or "",
+                project_ref=row["project_ref"] or "",
+                content_hash=row["content_hash"] or "",
+                confidence=float(row["confidence"] or 1.0),
+                observed_at=row["observed_at"] or "",
+            )
+            for row in rows
+        ]
+
+    def count_negative_evidence(self) -> int:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM rule_negative_evidence"
+            ).fetchone()
+        return int(row["c"])
+
+    # ------------------------------------------------------------------
+    # Agent reputation / project profile (P3-003 §2)
+    # ------------------------------------------------------------------
+
+    def upsert_agent_reputation(
+        self,
+        *,
+        agent_id: str,
+        success_rate: float = 0.0,
+        rule_accuracy: float = 0.0,
+        violation_rate: float = 0.0,
+        sample_count: int = 0,
+        feedback_quality: float = 0.0,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_reputation (
+                    agent_id, success_rate, rule_accuracy, violation_rate,
+                    sample_count, feedback_quality, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    success_rate=excluded.success_rate,
+                    rule_accuracy=excluded.rule_accuracy,
+                    violation_rate=excluded.violation_rate,
+                    sample_count=excluded.sample_count,
+                    feedback_quality=excluded.feedback_quality,
+                    updated_at=excluded.updated_at
+                """,
+                (agent_id, float(success_rate), float(rule_accuracy),
+                 float(violation_rate), int(sample_count),
+                 float(feedback_quality), now, now),
+            )
+        return {
+            "agent_id": agent_id, "success_rate": float(success_rate),
+            "rule_accuracy": float(rule_accuracy),
+            "violation_rate": float(violation_rate),
+            "sample_count": int(sample_count),
+            "feedback_quality": float(feedback_quality),
+        }
+
+    def get_agent_reputation(self, agent_id: str) -> dict[str, Any] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_reputation WHERE agent_id=?", (agent_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "agent_id": row["agent_id"],
+            "success_rate": float(row["success_rate"] or 0.0),
+            "rule_accuracy": float(row["rule_accuracy"] or 0.0),
+            "violation_rate": float(row["violation_rate"] or 0.0),
+            "sample_count": int(row["sample_count"] or 0),
+            "feedback_quality": float(row["feedback_quality"] or 0.0),
+        }
+
+    def list_agent_reputations(self) -> list[dict[str, Any]]:
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM agent_reputation ORDER BY agent_id"
+            ).fetchall()
+        return [{
+            "agent_id": row["agent_id"],
+            "success_rate": float(row["success_rate"] or 0.0),
+            "rule_accuracy": float(row["rule_accuracy"] or 0.0),
+            "violation_rate": float(row["violation_rate"] or 0.0),
+            "sample_count": int(row["sample_count"] or 0),
+            "feedback_quality": float(row["feedback_quality"] or 0.0),
+        } for row in rows]
+
+    def upsert_project_profile(
+        self,
+        *,
+        project_ref: str,
+        production_level: float = 0.0,
+        criticality: float = 0.0,
+        owner_verified: bool = False,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO project_profile (
+                    project_ref, production_level, criticality,
+                    owner_verified, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_ref) DO UPDATE SET
+                    production_level=excluded.production_level,
+                    criticality=excluded.criticality,
+                    owner_verified=excluded.owner_verified,
+                    updated_at=excluded.updated_at
+                """,
+                (project_ref, float(production_level), float(criticality),
+                 1 if owner_verified else 0, now, now),
+            )
+        return {
+            "project_ref": project_ref,
+            "production_level": float(production_level),
+            "criticality": float(criticality),
+            "owner_verified": bool(owner_verified),
+        }
+
+    def get_project_profile(self, project_ref: str) -> dict[str, Any] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_profile WHERE project_ref=?", (project_ref,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "project_ref": row["project_ref"],
+            "production_level": float(row["production_level"] or 0.0),
+            "criticality": float(row["criticality"] or 0.0),
+            "owner_verified": bool(row["owner_verified"]),
+        }
+
+    def list_project_profiles(self) -> list[dict[str, Any]]:
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM project_profile ORDER BY project_ref"
+            ).fetchall()
+        return [{
+            "project_ref": row["project_ref"],
+            "production_level": float(row["production_level"] or 0.0),
+            "criticality": float(row["criticality"] or 0.0),
+            "owner_verified": bool(row["owner_verified"]),
+        } for row in rows]
+
+    # ------------------------------------------------------------------
+    # Definition versions / strength evolution (P3-002 §5)
+    # ------------------------------------------------------------------
+
+    def record_definition_version(
+        self,
+        *,
+        definition_id: str,
+        superseded_by: str,
+        old_strength: str,
+        new_strength: str,
+        change_reason: str = "",
+        actor: str = "auto",
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        version_id = stable_hash(
+            "rule-definition-version", definition_id, superseded_by, old_strength,
+            new_strength, _now(),
+        )
+        now = _now()
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO rule_definition_versions (
+                    version_id, definition_id, superseded_by, old_strength,
+                    new_strength, change_reason, actor, evidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (version_id, definition_id, superseded_by, old_strength,
+                 new_strength, change_reason, actor,
+                 json.dumps(evidence or {}, ensure_ascii=False, sort_keys=True),
+                 now),
+            )
+        return {
+            "version_id": version_id, "definition_id": definition_id,
+            "superseded_by": superseded_by, "old_strength": old_strength,
+            "new_strength": new_strength, "change_reason": change_reason,
+            "actor": actor, "evidence": evidence or {}, "created_at": now,
+        }
+
+    def list_definition_versions(
+        self, definition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM rule_definition_versions"
+        params: list[Any] = []
+        if definition_id:
+            sql += " WHERE definition_id=?"
+            params.append(definition_id)
+        sql += " ORDER BY created_at"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [{
+            "version_id": row["version_id"],
+            "definition_id": row["definition_id"],
+            "superseded_by": row["superseded_by"] or "",
+            "old_strength": row["old_strength"] or "",
+            "new_strength": row["new_strength"] or "",
+            "change_reason": row["change_reason"] or "",
+            "actor": row["actor"] or "",
+            "evidence": json.loads(row["evidence"] or "{}"),
+            "created_at": row["created_at"] or "",
+        } for row in rows]
+
+    def count_definition_versions(self) -> int:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM rule_definition_versions"
+            ).fetchone()
+        return int(row["c"])
+
+    # ------------------------------------------------------------------
     # Merge proposals
     # ------------------------------------------------------------------
 
@@ -442,6 +830,11 @@ class RuleMergeStore:
         evidence: list[RuleEvidence] | tuple[RuleEvidence, ...] | None = None,
         contradiction_score: float = 0.0,
         explanation: str = "",
+        readiness_score: float = 0.0,
+        governance_reasons: str = "",
+        cooldown_until: str = "",
+        negative_score: float = 0.0,
+        conflict_type: str = "",
     ) -> dict[str, Any]:
         evidence_list = dedupe_evidence(list(evidence or []))
         agents = {ev.agent_instance_id for ev in evidence_list if ev.agent_instance_id}
@@ -469,22 +862,23 @@ class RuleMergeStore:
                 INSERT OR REPLACE INTO rule_merge_proposals (
                     proposal_id, definition_ids, similarity_score,
                     evidence_count, agent_count, project_count,
-                    contradiction_score, status, explanation, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    contradiction_score, readiness_score, governance_reasons,
+                    cooldown_until, first_merge_acknowledged, negative_score,
+                    conflict_type, status, explanation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     proposal_id,
                     json.dumps(sorted(definition_ids), ensure_ascii=False),
                     float(similarity_score), len(evidence_list),
                     len(agents), len(projects),
-                    float(contradiction_score), "candidate",
-                    explanation, now,
+                    float(contradiction_score), float(readiness_score),
+                    governance_reasons or "", cooldown_until or "",
+                    0, float(negative_score), conflict_type or "",
+                    "candidate", explanation, now,
                 ),
             )
-        row = conn.execute(
-            "SELECT * FROM rule_merge_proposals WHERE proposal_id=?", (proposal_id,),
-        ).fetchone()
-        return self._row_to_proposal(row)
+        return self.get_proposal(proposal_id)
 
     def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         with self._db() as conn:
@@ -517,6 +911,92 @@ class RuleMergeStore:
             )
         return self.get_proposal(proposal_id)
 
+    def update_proposal_governance(
+        self,
+        proposal_id: str,
+        *,
+        readiness_score: float = 0.0,
+        governance_reasons: str = "",
+        cooldown_until: str = "",
+        negative_score: float = 0.0,
+        conflict_type: str = "",
+    ) -> dict[str, Any] | None:
+        """Persist the governance snapshot of one merge proposal."""
+        with self._db() as conn:
+            conn.execute(
+                """
+                UPDATE rule_merge_proposals SET
+                    readiness_score=?, governance_reasons=?, cooldown_until=?,
+                    negative_score=?, conflict_type=?
+                WHERE proposal_id=?
+                """,
+                (float(readiness_score), governance_reasons or "",
+                 cooldown_until or "", float(negative_score), conflict_type or "",
+                 proposal_id),
+            )
+        return self.get_proposal(proposal_id)
+
+    def acknowledge_first_merge(
+        self, proposal_id: str, actor: str = "human",
+    ) -> dict[str, Any] | None:
+        """Record explicit human acknowledgment of the first-merge risk.
+
+        The very first merge involving a pair of definitions is the highest-risk
+        operation in the layer (no rollback history, no error pattern).  It must
+        not happen on an Agent's say-so alone: ``merge_proposal(actor='auto')``
+        refuses until this acknowledgment exists.
+        """
+        with self._db() as conn:
+            conn.execute(
+                """
+                UPDATE rule_merge_proposals SET
+                    first_merge_acknowledged=1,
+                    governance_reasons=COALESCE(
+                        NULLIF(governance_reasons, ''),
+                        'first_merge_acknowledged_by=' || ?
+                    )
+                WHERE proposal_id=?
+                """,
+                (actor, proposal_id),
+            )
+        return self.get_proposal(proposal_id)
+
+    def clear_proposal_cooldown(self, proposal_id: str) -> dict[str, Any] | None:
+        """Clear the 72h cooldown after human review of a merge proposal."""
+        with self._db() as conn:
+            conn.execute(
+                "UPDATE rule_merge_proposals SET cooldown_until='' WHERE proposal_id=?",
+                (proposal_id,),
+            )
+        return self.get_proposal(proposal_id)
+
+    def count_merge_decisions_for_definitions(
+        self, definition_ids: Iterable[str],
+    ) -> int:
+        """Count *successful* merge decisions touching any of these definitions.
+
+        ``merge_count == 0`` marks a first merge.  Undone decisions no longer
+        count: once a pair has been merged and rolled back, its rollback
+        experience exists, so the first-merge gate no longer applies.
+        """
+        wanted = set(definition_ids)
+        if not wanted:
+            return 0
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT canonical_definition_id, merged_definition_ids, status "
+                "FROM rule_merge_decisions"
+            ).fetchall()
+        count = 0
+        for row in rows:
+            if row["status"] == "undone":
+                continue
+            canonical = row["canonical_definition_id"]
+            merged = set(json.loads(row["merged_definition_ids"] or "[]"))
+            if canonical in wanted or (wanted & merged):
+                count += 1
+        return count
+
     @staticmethod
     def _row_to_proposal(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -527,6 +1007,12 @@ class RuleMergeStore:
             "agent_count": int(row["agent_count"] or 0),
             "project_count": int(row["project_count"] or 0),
             "contradiction_score": float(row["contradiction_score"] or 0.0),
+            "readiness_score": float(row["readiness_score"] or 0.0),
+            "governance_reasons": row["governance_reasons"] or "",
+            "cooldown_until": row["cooldown_until"] or "",
+            "first_merge_acknowledged": int(row["first_merge_acknowledged"] or 0),
+            "negative_score": float(row["negative_score"] or 0.0),
+            "conflict_type": row["conflict_type"] or "",
             "status": row["status"] or "candidate",
             "explanation": row["explanation"] or "",
             "created_at": row["created_at"] or "",
@@ -546,49 +1032,39 @@ class RuleMergeStore:
         after_bindings: list[dict[str, Any]],
         migration: dict[str, Any],
         actor: str = "auto",
+        readiness_at_merge: float = 0.0,
+        strength_ok: bool = True,
+        negative_ok: bool = True,
+        first_merge_acknowledged: bool = True,
         conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         decision_id = stable_hash(
             "rule-merge-decision", proposal_id, canonical_definition_id, _now(),
         )
         now = _now()
+        sql = """
+            INSERT INTO rule_merge_decisions (
+                decision_id, proposal_id, canonical_definition_id,
+                merged_definition_ids, before_bindings, after_bindings,
+                migration, actor, readiness_at_merge, strength_ok, negative_ok,
+                first_merge_acknowledged, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?)
+        """
+        values = (
+            decision_id, proposal_id, canonical_definition_id,
+            json.dumps(sorted(merged_definition_ids), ensure_ascii=False),
+            json.dumps(before_bindings, ensure_ascii=False),
+            json.dumps(after_bindings, ensure_ascii=False),
+            json.dumps(migration, ensure_ascii=False, sort_keys=True),
+            actor, float(readiness_at_merge),
+            1 if strength_ok else 0, 1 if negative_ok else 0,
+            1 if first_merge_acknowledged else 0, now,
+        )
         if conn is not None:
-            conn.execute(
-                """
-                INSERT INTO rule_merge_decisions (
-                    decision_id, proposal_id, canonical_definition_id,
-                    merged_definition_ids, before_bindings, after_bindings,
-                    migration, actor, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?)
-                """,
-                (
-                    decision_id, proposal_id, canonical_definition_id,
-                    json.dumps(sorted(merged_definition_ids), ensure_ascii=False),
-                    json.dumps(before_bindings, ensure_ascii=False),
-                    json.dumps(after_bindings, ensure_ascii=False),
-                    json.dumps(migration, ensure_ascii=False, sort_keys=True),
-                    actor, now,
-                ),
-            )
+            conn.execute(sql, values)
         else:
             with self._db() as connection:
-                connection.execute(
-                    """
-                    INSERT INTO rule_merge_decisions (
-                        decision_id, proposal_id, canonical_definition_id,
-                        merged_definition_ids, before_bindings, after_bindings,
-                        migration, actor, status, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?)
-                    """,
-                    (
-                        decision_id, proposal_id, canonical_definition_id,
-                        json.dumps(sorted(merged_definition_ids), ensure_ascii=False),
-                        json.dumps(before_bindings, ensure_ascii=False),
-                        json.dumps(after_bindings, ensure_ascii=False),
-                        json.dumps(migration, ensure_ascii=False, sort_keys=True),
-                        actor, now,
-                    ),
-                )
+                connection.execute(sql, values)
         return {
             "decision_id": decision_id,
             "proposal_id": proposal_id,
@@ -598,6 +1074,10 @@ class RuleMergeStore:
             "after_bindings": after_bindings,
             "migration": migration,
             "actor": actor,
+            "readiness_at_merge": float(readiness_at_merge),
+            "strength_ok": bool(strength_ok),
+            "negative_ok": bool(negative_ok),
+            "first_merge_acknowledged": bool(first_merge_acknowledged),
             "status": "merged",
             "created_at": now,
             "undone_at": "",
@@ -620,6 +1100,10 @@ class RuleMergeStore:
             "after_bindings": json.loads(row["after_bindings"] or "[]"),
             "migration": json.loads(row["migration"] or "{}"),
             "actor": row["actor"] or "auto",
+            "readiness_at_merge": float(row["readiness_at_merge"] or 0.0),
+            "strength_ok": bool(row["strength_ok"]),
+            "negative_ok": bool(row["negative_ok"]),
+            "first_merge_acknowledged": bool(row["first_merge_acknowledged"]),
             "status": row["status"] or "merged",
             "created_at": row["created_at"] or "",
             "undone_at": row["undone_at"] or "",
@@ -643,6 +1127,10 @@ class RuleMergeStore:
             "proposal_id": r["proposal_id"],
             "canonical_definition_id": r["canonical_definition_id"],
             "merged_definition_ids": json.loads(r["merged_definition_ids"] or "[]"),
+            "readiness_at_merge": float(r["readiness_at_merge"] or 0.0),
+            "strength_ok": bool(r["strength_ok"]),
+            "negative_ok": bool(r["negative_ok"]),
+            "first_merge_acknowledged": bool(r["first_merge_acknowledged"]),
             "status": r["status"] or "merged",
             "created_at": r["created_at"] or "",
             "undone_at": r["undone_at"] or "",
@@ -659,6 +1147,10 @@ class RuleMergeStore:
         canonical_definition_id: str,
         merged_definition_ids: list[str],
         actor: str = "auto",
+        readiness_at_merge: float = 0.0,
+        strength_ok: bool = True,
+        negative_ok: bool = True,
+        first_merge_acknowledged: bool = True,
     ) -> dict[str, Any]:
         """Atomically merge definitions into a canonical one.
 
@@ -703,7 +1195,10 @@ class RuleMergeStore:
                     ).fetchone()
                     if row is None:
                         raise ValueError("rule_definition_not_found")
-                    if row["status"] in {"merged", "alias"} and definition_id != canonical_definition_id:
+                    if (
+                        row["status"] in {"merged", "alias", "superseded"}
+                        and definition_id != canonical_definition_id
+                    ):
                         raise ValueError("rule_definition_already_merged")
                     binding_rows = conn.execute(
                         "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
@@ -766,6 +1261,10 @@ class RuleMergeStore:
                     after_bindings=after_bindings,
                     migration=migration,
                     actor=actor,
+                    readiness_at_merge=readiness_at_merge,
+                    strength_ok=strength_ok,
+                    negative_ok=negative_ok,
+                    first_merge_acknowledged=first_merge_acknowledged,
                     conn=conn,
                 )
                 conn.execute(
@@ -946,6 +1445,47 @@ class RuleMergeStore:
         canonical_unique = len(
             {binding_identity_key(b) for b in bindings if b.status == "active"}
         )
+
+        # P3-001/002/003 acceptance family.  Every value is designed to be 0
+        # (or 1 for the success booleans) when the governance gates hold.
+        decisions = self.list_merge_decisions()
+        mergeable_decision_count = len(decisions)
+        if mergeable_decision_count:
+            strength_conflict_merge = sum(
+                1 for d in decisions if not d.get("strength_ok", True)
+            )
+            negative_leak = sum(
+                1 for d in decisions if not d.get("negative_ok", True)
+            )
+            unack_first_auto = sum(
+                1 for d in decisions
+                if d.get("actor") == "auto"
+                and not d.get("first_merge_acknowledged", True)
+            )
+            auto_merge_precision = 1.0 - (
+                (strength_conflict_merge + negative_leak)
+                / max(1, mergeable_decision_count)
+            )
+        else:
+            strength_conflict_merge = 0
+            negative_leak = 0
+            unack_first_auto = 0
+            auto_merge_precision = 1.0
+
+        single_agent_dominance = 0
+        for proposal in self.list_proposals():
+            if proposal["status"] != "candidate":
+                continue
+            evidence_list = self._evidence_for_proposal(proposal)
+            weights = self._weights_for(evidence_list)
+            per_agent: dict[str, float] = {}
+            for ev, w in zip(evidence_list, weights):
+                per_agent[ev.agent_instance_id or ""] = (
+                    per_agent.get(ev.agent_instance_id or "", 0.0) + w
+                )
+            if largest_source_ratio(per_agent) >= MAX_SINGLE_SOURCE_RATIO:
+                single_agent_dominance += 1
+
         return {
             "definition_count": len(definitions),
             "active_definition_count": len(active_definitions),
@@ -960,7 +1500,62 @@ class RuleMergeStore:
             "auto_broad_binding": len(auto_broad),
             "merge_undo_success": 1,
             "migration_loss": 0,
+            "auto_merge_precision": round(auto_merge_precision, 4),
+            "strength_conflict_merge": strength_conflict_merge,
+            "negative_evidence_leak": negative_leak,
+            "first_merge_human_approval": unack_first_auto,
+            "single_agent_dominance": single_agent_dominance,
+            "negative_evidence_count": self.count_negative_evidence(),
+            "agent_reputation_count": len(self.list_agent_reputations()),
+            "project_profile_count": len(self.list_project_profiles()),
+            "definition_version_count": self.count_definition_versions(),
         }
+
+    # ------------------------------------------------------------------
+    # metrics helpers (evidence weighting for candidate proposals)
+    # ------------------------------------------------------------------
+
+    def _evidence_for_proposal(
+        self, proposal: dict[str, Any],
+    ) -> list[Any]:
+        definition_ids = proposal["definition_ids"]
+        return [
+            ev
+            for definition_id in definition_ids
+            for ev in self.list_evidence(definition_id)
+        ]
+
+    def _weights_for(self, evidence_list: list[Any]) -> list[float]:
+        """Weight each evidence by agent reputation + project profile (P3-003)."""
+        reps = {r["agent_id"]: r for r in self.list_agent_reputations()}
+        profiles = {p["project_ref"]: p for p in self.list_project_profiles()}
+        from .rule_merge_policy import (
+            days_between,
+            evidence_weight,
+            recency_factor,
+        )
+
+        weights: list[float] = []
+        for ev in evidence_list:
+            rep = reps.get(ev.agent_instance_id or "")
+            profile = profiles.get(ev.project_ref or "")
+            agent_reputation = (
+                (rep["success_rate"] + rep["rule_accuracy"]) / 2.0
+                if rep else 1.0
+            )
+            historical_success = (
+                rep["success_rate"] if rep and rep["sample_count"] > 0 else 1.0
+            )
+            weights.append(evidence_weight(
+                agent_reputation=agent_reputation,
+                project_importance=(
+                    profile["production_level"] if profile else 1.0
+                ),
+                historical_success=historical_success,
+                feedback_quality=rep["feedback_quality"] if rep else 1.0,
+                recency=recency_factor(days_between(ev.observed_at)),
+            ))
+        return weights
 
 
 def iter_legacy_groups(workspace: str | Path) -> Iterable[tuple[str, Path]]:

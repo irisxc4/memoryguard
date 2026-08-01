@@ -15,12 +15,46 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Any
 
 from .schema_v3 import MemoryKind, _now_iso, stable_hash
 
 POLARITY_POSITIVE = "positive"
 POLARITY_NEGATIVE = "negative"
+
+
+class RuleStrength(str, Enum):
+    """Governance weight of a rule (P3-002).  Strength is a hard merge gate.
+
+    ``must > should > recommended > suggestion > observation``.  Merging two
+    Definitions with different strengths is a governance conflict, never a
+    duplicate — "提交必须测试" (MUST) and "提交建议测试" (SUGGESTION) are
+    the same intent but materially different obligations.
+    """
+
+    MUST = "must"
+    SHOULD = "should"
+    RECOMMENDED = "recommended"
+    SUGGESTION = "suggestion"
+    OBSERVATION = "observation"
+
+
+# Keyword -> strength.  Priority order matters: MUST markers are matched first
+# so "不得使用 npm" reads MUST(+negative polarity) instead of SUGGESTION.
+_STRENGTH_MARKERS: tuple[tuple[RuleStrength, tuple[str, ...]], ...] = (
+    (RuleStrength.MUST, (
+        "必须", "禁止", "不得", "严禁", "不许", "不要", "绝不",
+        "must", "required", "mandatory", "always",
+    )),
+    (RuleStrength.SHOULD, (
+        "应该", "应当", "建议", "最好", "should", "prefer",
+    )),
+    (RuleStrength.RECOMMENDED, ("推荐", "recommended")),
+    (RuleStrength.SUGGESTION, (
+        "可以", "考虑", "可选", "maybe", "optional", "could",
+    )),
+)
 
 # Negative-intent markers: "提交前必须运行测试" is positive; "不要提交未测试代码"
 # is negative.  The list is deliberately conservative so positive text is never
@@ -128,6 +162,21 @@ def detect_polarity(text: str) -> str:
     return POLARITY_POSITIVE
 
 
+def detect_strength(text: str) -> RuleStrength:
+    """Extract rule strength from the *raw* surface wording.
+
+    Reads the original text (before ``normalize_rule_text`` strips weightless
+    tokens) so ``必须`` / ``建议`` are still visible.  No marker means the
+    sentence is an observation, the most conservative default for merging.
+    """
+    lowered = str(text or "").casefold()
+    for strength, markers in _STRENGTH_MARKERS:
+        for marker in markers:
+            if marker.casefold() in lowered:
+                return strength
+    return RuleStrength.OBSERVATION
+
+
 def normalize_rule_text(text: str) -> str:
     """Strip weightless tokens and punctuation for canonical comparison."""
     value = str(text or "").strip()
@@ -230,12 +279,14 @@ class RuleDefinition:
     polarity: str = POLARITY_POSITIVE
     semantic_hash: str = ""
     parameter_schema: str = "{}"
-    status: str = "active"  # active | merged | alias
+    status: str = "active"  # active | merged | alias | superseded
     confidence: float = 1.0
     revision: int = 1
+    rule_strength: str = RuleStrength.OBSERVATION.value  # must..observation
+    maturity_state: str = "observing"  # observing|candidate|validated|trusted
     created_at: str = ""
     updated_at: str = ""
-    superseded_by: str = ""  # definition_id this alias/merged definition points at
+    superseded_by: str = ""  # definition_id this alias/merged/superseded definition points at
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +300,8 @@ class RuleDefinition:
             "status": self.status,
             "confidence": self.confidence,
             "revision": self.revision,
+            "rule_strength": self.rule_strength,
+            "maturity_state": self.maturity_state,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "superseded_by": self.superseded_by,
@@ -267,6 +320,8 @@ class RuleDefinition:
             status=data.get("status", "active"),
             confidence=float(data.get("confidence", 1.0)),
             revision=int(data.get("revision", 1)),
+            rule_strength=data.get("rule_strength", RuleStrength.OBSERVATION.value),
+            maturity_state=data.get("maturity_state", "observing"),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             superseded_by=data.get("superseded_by", ""),
@@ -287,6 +342,7 @@ def build_definition(
     kind: MemoryKind | str = "workflow",
     confidence: float = 1.0,
     created_at: str = "",
+    rule_strength: str = "",
 ) -> RuleDefinition:
     """Build a Definition from raw rule text (used by backfill and dual-write).
 
@@ -299,6 +355,7 @@ def build_definition(
     text = str(body or "").strip()
     intent = extract_intent(text, kind=kind)
     polarity = detect_polarity(text)
+    strength = rule_strength or detect_strength(text).value
     parameters = sorted(intent.parameters)
     kind_value = kind.value if isinstance(kind, MemoryKind) else str(kind)
     normalized_intent = intent.canonical()
@@ -317,6 +374,7 @@ def build_definition(
             {"parameters": parameters}, ensure_ascii=False, sort_keys=True,
         ),
         confidence=confidence,
+        rule_strength=strength,
         created_at=created_at,
         updated_at=created_at,
     )

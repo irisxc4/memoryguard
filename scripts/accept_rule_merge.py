@@ -1,18 +1,23 @@
 """Deterministic acceptance check for the Rule Intelligence merge layer (P3).
 
-The script drives the real ``RuleMergeService`` against a synthetic workspace:
-it backfills legacy groups, scans for candidates, merges a safe pair, and then
-verifies the P3 CI metric family:
+Drives the real ``RuleMergeService`` against a synthetic workspace and verifies
+the full governance metric family (P3-001/002/003):
 
-* ``definition_merge_precision``  -- how often a candidate we auto-merge is a
-  true duplicate (never a conflict / parameter clash);
-* ``binding_expansion``           -- count of merges that changed the binding
-  audience identity set (must be 0);
-* ``system_auto_binding``         -- auto/backfill system bindings (must be 0);
-* ``unauthorized_visibility``     -- a definition that leaked across groups it
-  has no binding in (must be 0);
-* ``merge_undo_success``          -- undo restored the exact pre-merge state;
-* ``migration_loss``              -- backfill count drift (must be 0).
+* ``auto_merge_precision``       -- merged pairs are never a strength/polarity/
+                                    parameter/negative conflict (>= 0.995);
+* ``binding_expansion``          -- merges never change the binding audience
+                                    identity set (must be 0);
+* ``system_auto_binding``        -- auto/backfill system bindings (must be 0);
+* ``first_merge_human_approval`` -- an auto merge happened on a pair with no
+                                    human acknowledgment of the first-merge
+                                    risk (must be 0);
+* ``strength_conflict_merge``    -- MUST+SHOULD pair got merged (must be 0);
+* ``negative_evidence_leak``     -- a pair with weighted negative evidence got
+                                    merged (must be 0);
+* ``single_agent_dominance``     -- one Agent held >=60% of evidence weight on
+                                    a candidate (must be 0);
+* ``merge_rollback_success``     -- undo restored the exact pre-merge state;
+* ``migration_loss``             -- backfill count drift (must be 0).
 
 Exits non-zero when any gate fails, mirroring ``accept_rule_lifecycle.py``.
 """
@@ -22,6 +27,7 @@ import argparse
 import json
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,11 +35,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from memoryguard.agent_binding import AgentBindingStore  # noqa: E402
 from memoryguard.rule_binding import build_binding  # noqa: E402
-from memoryguard.rule_definition import build_definition  # noqa: E402
-from memoryguard.rule_evidence import build_evidence  # noqa: E402
+from memoryguard.rule_evidence import build_evidence, build_negative_evidence  # noqa: E402
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore  # noqa: E402
 from memoryguard.schema_v3 import (  # noqa: E402
-    EffectiveAgentContext,
     MemoryKind,
     SharedMemoryRecord,
     SharedMemoryStatus,
@@ -42,22 +46,30 @@ from memoryguard.schema_v3 import (  # noqa: E402
 from memoryguard.shared_memory_store import SharedMemoryStore  # noqa: E402
 
 
+def _aged(days: int) -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(days=days)
+    ).isoformat()
+
+
 def _seed_legacy(workspace: Path, group_id: str, bodies: list[str]) -> None:
     AgentBindingStore(workspace).bind_agent(f"agent-{group_id}", group_id)
     store = SharedMemoryStore(workspace, group_id)
     for i, body in enumerate(bodies):
-        memory_id = f"{group_id}-{i}"
         store.append_record(SharedMemoryRecord(
-            memory_id=memory_id, body=body, kind=MemoryKind.PROCEDURE,
+            memory_id=f"{group_id}-{i}", body=body, kind=MemoryKind.PROCEDURE,
             status=SharedMemoryStatus.ACTIVE, injection_policy="always",
             priority=10, agent_instance_id=f"agent-{group_id}",
-            created_at=_now_iso(), updated_at=_now_iso(),
+            created_at=_aged(90), updated_at=_aged(90),
         ), assignments=[
             {"target_type": "agent", "target_id": f"agent-{group_id}"},
         ])
 
 
-def _seed_evidence(store: RuleMergeStore, definition_id: str, text: str) -> None:
+def _seed_evidence(
+    store: RuleMergeStore, definition_id: str, text: str,
+    *, observed_at: str = "",
+) -> None:
     for i in range(3):
         store.upsert_evidence(build_evidence(
             definition_id=definition_id,
@@ -66,15 +78,30 @@ def _seed_evidence(store: RuleMergeStore, definition_id: str, text: str) -> None
             project_ref=f"project-{i}",
             session_id=f"session-{i}",
             content=text,
+            observed_at=observed_at or _aged(60),
         ))
+
+
+def _seed_reputations(store: RuleMergeStore) -> None:
+    for i in range(3):
+        store.upsert_agent_reputation(
+            agent_id=f"agent-{i}", success_rate=0.98, rule_accuracy=0.98,
+            violation_rate=0.02, sample_count=200, feedback_quality=0.95,
+        )
+        store.upsert_project_profile(
+            project_ref=f"project-{i}", production_level=1.0,
+            criticality=0.8, owner_verified=True,
+        )
 
 
 def evaluate() -> dict[str, object]:
     workspace = Path(tempfile.mkdtemp())
-    # Two legacy groups, each with a mandatory rule.  Group A and B both use the
-    # same wording in one rule ("提交代码前必须运行测试") so backfill should produce
-    # exactly one canonical Definition across groups, and a synonym rephrase in
-    # group A should surface as a merge candidate.
+    # Three legacy groups:
+    #   team-a/team-b share the exact wording "提交代码前必须运行测试" -> one
+    #     canonical Definition across groups; team-a's synonym rephrase
+    #     "提交前必须执行测试" is the merge candidate we auto-merge.
+    #   team-c holds a MUST/SUGGESTION pair on pnpm -> a strength conflict that
+    #     must never merge, plus negative evidence to exercise that gate.
     _seed_legacy(workspace, "team-a", [
         "提交代码前必须运行测试",   # exact duplicate with team-b
         "提交前必须执行测试",       # synonym of the above
@@ -82,46 +109,81 @@ def evaluate() -> dict[str, object]:
     _seed_legacy(workspace, "team-b", [
         "提交代码前必须运行测试",   # exact duplicate with team-a
     ])
+    _seed_legacy(workspace, "team-c", [
+        "必须使用pnpm安装依赖",     # MUST
+        "建议使用pnpm安装依赖",     # SUGGESTION -> strength conflict
+    ])
 
     service = RuleMergeService(RuleMergeStore(workspace))
     backfill = service.backfill_legacy(workspace)
 
-    # Seed independent evidence on the two distinct-canonical definitions so the
-    # synonym pair becomes an auto-merge candidate.
+    # Seed independent evidence on every definition so synonym pairs become
+    # auto-merge candidates, plus reputation so the evidence is weighted.
     intel = RuleMergeStore(workspace)
     for definition in intel.list_definitions():
         _seed_evidence(intel, definition.definition_id, definition.canonical_text)
+    _seed_reputations(intel)
+
+    # Negative evidence on the weaker (SHOULD) pnpm definition: a real project
+    # contradicts the rule, so neither it nor its MUST twin may merge.
+    weaker = next(
+        d for d in intel.list_definitions()
+        if d.rule_strength != "must"
+    )
+    intel.upsert_negative_evidence(build_negative_evidence(
+        definition_id=weaker.definition_id,
+        source_rule_id="neg-1",
+        agent_instance_id="agent-0",
+        project_ref="project-0",
+        content="项目使用npm且运行正常，不遵循pnpm规则",
+        observed_at=_aged(45),
+    ))
 
     proposals = service.scan_and_propose()
     candidates = [p for p in proposals if p["status"] == "candidate"]
+    conflicted = [p for p in proposals if p["status"] == "conflicted"]
 
+    # The pnpm MUST/SHOULD pair must surface as a strength conflict.
+    strength_conflict_found = any(
+        p["conflict_type"] == "strength" for p in conflicted
+    )
+    # And the negative-evidence definition must not be a candidate.
+    weaker_id = weaker.definition_id
+    suggestion_never_candidate = all(
+        weaker_id not in p["definition_ids"] for p in candidates
+    )
+
+    # Cold-start protection: a fresh candidate (even a highly-similar, highly-
+    # evidenced one) must NOT auto-merge on the first attempt — cooldown and
+    # first-merge acknowledgment both block it.
     merge_ok = False
+    auto_blocked_first = False
     canonical_before = intel.count_definitions()
     binding_before = {b.audience_identity() for b in intel.list_bindings()}
     decision_id = ""
     for proposal in candidates:
-        result = service.merge_proposal(proposal["proposal_id"])
-        if result.get("ok"):
-            merge_ok = True
-            decision_id = result["decision"]["decision_id"]
+        blocked = service.merge_proposal(proposal["proposal_id"])
+        auto_blocked_first = (
+            not blocked.get("ok")
+            and blocked.get("blocked_reason") == "auto_merge_not_ready"
+        )
+        if auto_blocked_first:
+            intel.acknowledge_first_merge(proposal["proposal_id"], actor="human")
+            intel.clear_proposal_cooldown(proposal["proposal_id"])
+            result = service.merge_proposal(proposal["proposal_id"])
+            if result.get("ok"):
+                merge_ok = True
+                decision_id = result["decision"]["decision_id"]
+        if merge_ok:
             break
 
     binding_after = {b.audience_identity() for b in intel.list_bindings()}
     binding_expansion = 0 if binding_before == binding_after else 1
 
-    # Merge precision: for every *merged* proposal, the pair must not have been
-    # a polarity/parameter conflict.  We record that by scanning all pairs.
-    conflict_merged = 0
-    for proposal in proposals:
-        if proposal["status"] != "merged":
-            continue
-        ids = proposal["definition_ids"]
-        a = intel.get_definition(ids[0])
-        b = intel.get_definition(ids[1])
-        if a is None or b is None:
-            continue
-        if a.polarity != b.polarity or _params(a) != _params(b):
-            conflict_merged += 1
+    # Merge precision: every *merged* proposal must have recorded strength_ok
+    # and negative_ok in its decision (a merged conflict would flip them).
+    metrics = intel.metrics()
+    auto_merge_precision = metrics["auto_merge_precision"]
 
     # Undo and restore check.
     undo_ok = False
@@ -129,45 +191,43 @@ def evaluate() -> dict[str, object]:
         undo = service.undo_decision(decision_id)
         undo_ok = bool(undo.get("status") == "undone")
 
-    metrics = intel.metrics()
-    # unauthorized_visibility: a definition whose bindings reference a group it
-    # has no binding row for is impossible by construction (FK); instead verify
-    # no definition spans a group it was never bound to via shadow permission.
-    unauthorized_visibility = 0
-
     report = {
-        "definition_merge_precision": 1.0 if conflict_merged == 0 else 0.0,
-        "conflict_merged": conflict_merged,
+        "auto_merge_precision": auto_merge_precision,
+        "strength_conflict_merge": metrics["strength_conflict_merge"],
+        "negative_evidence_leak": metrics["negative_evidence_leak"],
+        "first_merge_human_approval": metrics["first_merge_human_approval"],
+        "single_agent_dominance": metrics["single_agent_dominance"],
         "binding_expansion": binding_expansion,
         "system_auto_binding": metrics["system_auto_binding"],
         "auto_broad_binding": metrics["auto_broad_binding"],
-        "unauthorized_visibility": unauthorized_visibility,
-        "merge_undo_success": 1 if undo_ok else 0,
+        "merge_rollback_success": 1 if undo_ok else 0,
         "migration_loss": backfill["migration_loss"],
         "candidate_count": len(candidates),
+        "conflicted_count": len(conflicted),
+        "strength_conflict_found": bool(strength_conflict_found),
+        "negative_blocked_candidate": bool(suggestion_never_candidate),
+        "auto_blocked_on_first_attempt": bool(auto_blocked_first),
         "merged_count": int(merge_ok),
         "definitions_before": canonical_before,
         "binding_count": metrics["binding_count"],
         "passed": bool(
-            conflict_merged == 0
+            auto_merge_precision >= 0.995
+            and metrics["strength_conflict_merge"] == 0
+            and metrics["negative_evidence_leak"] == 0
+            and metrics["first_merge_human_approval"] == 0
+            and metrics["single_agent_dominance"] == 0
             and binding_expansion == 0
             and metrics["system_auto_binding"] == 0
             and metrics["auto_broad_binding"] == 0
-            and unauthorized_visibility == 0
             and undo_ok
             and backfill["migration_loss"] == 0
+            and strength_conflict_found
+            and suggestion_never_candidate
+            and auto_blocked_first
+            and merge_ok
         ),
     }
     return report
-
-
-def _params(definition) -> set[str]:
-    import json as _json
-    try:
-        schema = _json.loads(definition.parameter_schema or "{}")
-    except (ValueError, TypeError):
-        schema = {}
-    return set(schema.get("parameters", []))
 
 
 def main(argv: list[str] | None = None) -> int:
