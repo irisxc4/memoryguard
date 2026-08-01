@@ -136,6 +136,23 @@ class RuleCreationService:
             }
         raise ValueError("effective agent context is required")
 
+    def _assignment_hash_for(
+        self, memory_id: str, assignments: list[Mapping[str, Any]],
+    ) -> str:
+        """Hash a proposed assignment revision using Store canonicalization."""
+        normalize = getattr(self.store, "_normalize_assignments", None)
+        hash_fn = getattr(self.store, "_assignment_hash", None)
+        if callable(normalize) and callable(hash_fn):
+            try:
+                normalized = normalize(memory_id, list(assignments), automatic=False)
+                return str(hash_fn(normalized) or "")
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        return stable_hash(
+            "rule-assignments",
+            json.dumps(list(assignments), ensure_ascii=False, sort_keys=True),
+        )
+
     def _blocked(
         self,
         *,
@@ -194,6 +211,7 @@ class RuleCreationService:
             scope_confidence=float(extra.get("scope_confidence", 0.0) or 0.0),
             scope_reason=reason,
             blocked_reason=reason,
+            owner_agent_id=str((context or {}).get("agent_instance_id", "") or ""),
         )
         self._persist_structured_decision(decision)
         return decision
@@ -202,10 +220,10 @@ class RuleCreationService:
         """Use the lifecycle store model when available; stay compatible with v3.2."""
         append = getattr(self.store, "append_rule_decision", None)
         if callable(append):
-            try:
-                return append(decision)
-            except (TypeError, ValueError, RuntimeError):
-                pass
+            # A successful lifecycle mutation must have a durable structured
+            # decision.  Do not swallow persistence failures: callers must
+            # fail closed (and atomic store APIs will roll back the mutation).
+            return append(decision)
         return decision
 
     @staticmethod
@@ -326,6 +344,7 @@ class RuleCreationService:
         blocked_reason: str = "",
         metadata: Mapping[str, Any] | None = None,
         actor: str = "agent:unknown",
+        owner_agent_id: str = "",
         before: Any | None = None,
         persist: bool = True,
     ) -> RuleDecision:
@@ -389,6 +408,10 @@ class RuleCreationService:
             scope_reason=scope_reason,
             blocked_reason=blocked_reason or str(result.get("blocked_reason", "") or ""),
             metadata=dict(metadata or {}),
+            owner_agent_id=(
+                str(owner_agent_id or "").strip()
+                or (str(actor).removeprefix("agent:") if str(actor).startswith("agent:") else "")
+            ),
         )
         return self._persist_structured_decision(decision) if persist else decision
 
@@ -501,6 +524,8 @@ class RuleCreationService:
                 "scope_reason": scope_reason,
                 "scope_confidence": confidence,
                 "parent_rule_id": parent_rule_id,
+                "undo_id": undo_id,
+                **inference_metadata,
             },
             auto_actions=[],
             created_at=now,
@@ -536,6 +561,29 @@ class RuleCreationService:
                 target_id=assignment.get("target_id", ""),
                 project_ref=assignment.get("project_ref", ""),
             )
+
+        # The atomic Store seam persists the complete lifecycle decision in
+        # the same transaction as record/event/assignments.  Return that
+        # decision directly; do not append a second decision or risk claiming
+        # success after a post-commit write failure.
+        persisted_atomic = result.get("decision")
+        if persisted_atomic:
+            try:
+                return RuleDecision.from_dict(
+                    persisted_atomic.to_dict()
+                    if hasattr(persisted_atomic, "to_dict")
+                    else dict(persisted_atomic)
+                )
+            except (TypeError, ValueError):
+                return self._blocked(
+                    action="rule_create_auto" if not manual else "rule_create_manual",
+                    reason="atomic_rule_decision_decode_failed", context=context,
+                    scope_confidence=confidence, scope_reason=scope_reason,
+                    undo_id=undo_id,
+                    target_type=assignment.get("target_type", ""),
+                    target_id=assignment.get("target_id", ""),
+                    project_ref=assignment.get("project_ref", ""),
+                )
 
         memory_id = str(result.get("memory_id", "") or (result.get("after") or {}).get("memory_id", ""))
         assignments: list[dict[str, Any]] = []
@@ -601,8 +649,17 @@ class RuleCreationService:
         memory_id = str(decision.memory_id or decision.rule_id or "")
         if not memory_id:
             raise ValueError("structured_decision_required")
-        metadata = decision.after.get("metadata", {}) if isinstance(decision.after, dict) else {}
-        metadata = metadata if isinstance(metadata, dict) else {}
+        # New atomic writers persist lifecycle metadata on the structured
+        # decision itself; older writers nested it under ``after.metadata``.
+        # Read both shapes (top-level wins) so revision hashes/provenance are
+        # never lost when an inverse is applied.
+        nested_metadata = (
+            decision.after.get("metadata", {})
+            if isinstance(decision.after, dict) else {}
+        )
+        metadata = dict(nested_metadata) if isinstance(nested_metadata, dict) else {}
+        if isinstance(getattr(decision, "metadata", None), dict):
+            metadata.update(decision.metadata)
         now = _now_iso()
 
         def _inverse(status: str = "undone", *, reason: str = "") -> RuleDecision:
@@ -625,40 +682,89 @@ class RuleCreationService:
                 scope_reason="explicit structured inverse",
                 blocked_reason="" if status == "undone" else reason,
                 metadata={"target_undo": True, "supersedes_token": token, "original_action": action},
+                owner_agent_id=(
+                    str(actor).removeprefix("agent:")
+                    if str(actor).startswith("agent:") else ""
+                ),
             )
 
-        if action in {"rule_create_auto", "rule_create_manual"}:
+        if action in {
+            "rule_create_auto", "rule_create_manual",
+            "rule_superseded", "rule_conflicted", "rule_quarantined",
+        }:
             existing = self.store.get_record(memory_id)
             if existing is None:
                 raise ValueError("target_rule_not_found")
-            delete = getattr(self.store, "delete", None)
-            if not callable(delete):
-                raise ValueError("structured_rule_delete_unavailable")
-            delete(memory_id, actor=actor, manual_override=True)
-            before_assignments = decision.before.get("assignments") if isinstance(decision.before, dict) else None
-            if isinstance(before_assignments, list) and before_assignments:
-                setter = getattr(self.store, "set_rule_assignments", None)
-                if not callable(setter):
-                    raise ValueError("structured_assignment_restore_unavailable")
-                setter(
-                    memory_id, [dict(item) for item in before_assignments],
-                    automatic=True, actor_agent_id=str(decision.actor or "").replace("agent:", ""),
-                )
             inverse = _inverse()
+            metadata = dict(metadata)
+            expected_record_hash = str(
+                metadata.get("record_revision_hash", "") or ""
+            ).strip()
+            if not expected_record_hash:
+                raise ValueError("structured_inverse_revision_missing")
+            mutation_kind = str(metadata.get("mutation_kind", "created") or "created")
+            if mutation_kind in {"superseded", "conflicted", "quarantined"}:
+                revert_lifecycle = getattr(
+                    self.store, "revert_rule_lifecycle_atomic", None,
+                )
+                if not callable(revert_lifecycle):
+                    raise ValueError("atomic_rule_lifecycle_revert_unavailable")
+                inverse.metadata.update({
+                    "mutation_kind": mutation_kind,
+                    "record_revision_hash": expected_record_hash,
+                    "old_record_ids": metadata.get("old_record_ids", []),
+                    "old_record_hashes": metadata.get("old_record_hashes", {}),
+                    "conflict_group_id": metadata.get("conflict_group_id", ""),
+                    "quarantine_id": metadata.get("quarantine_id", ""),
+                })
+                result = revert_lifecycle(
+                    decision,
+                    expected_record_hash=expected_record_hash,
+                    inverse_decision=inverse,
+                )
+                if isinstance(result, Mapping) and result.get("decision"):
+                    persisted = result["decision"]
+                    return RuleDecision.from_dict(
+                        persisted.to_dict()
+                        if hasattr(persisted, "to_dict") else dict(persisted)
+                    )
+                return inverse
+            revert_create = getattr(self.store, "revert_rule_create_atomic", None)
+            if not callable(revert_create):
+                raise ValueError("atomic_rule_create_revert_unavailable")
+            inverse.metadata.update({
+                "mutation_kind": mutation_kind,
+                "record_revision_hash": expected_record_hash,
+                "event_id": str(metadata.get("event_id", "") or ""),
+                "added_provenance": metadata.get("added_provenance", []),
+            })
+            owner = str(
+                getattr(decision, "owner_agent_id", "")
+                or str(decision.actor or "").removeprefix("agent:")
+            )
+            result = revert_create(
+                memory_id,
+                expected_record_hash=expected_record_hash,
+                decision=inverse,
+                actor_agent_id=owner,
+            )
+            if isinstance(result, Mapping) and result.get("decision"):
+                persisted = result["decision"]
+                return RuleDecision.from_dict(
+                    persisted.to_dict() if hasattr(persisted, "to_dict") else dict(persisted)
+                )
+            return inverse
         elif action == "rule_narrow":
             parent_id = str(decision.parent_rule_id or memory_id)
             before_assignments = metadata.get("parent_assignments_before")
             after_assignments = metadata.get("parent_assignments_after")
             if not isinstance(before_assignments, list) or not isinstance(after_assignments, list):
                 raise ValueError("structured_narrow_inverse_missing")
-            hash_fn = getattr(self.store, "rule_assignment_hash", None)
-            current_hash = (
-                str(hash_fn(parent_id) or "")
-                if callable(hash_fn)
-                else stable_hash(
-                    "rule-assignments", json.dumps(after_assignments, ensure_ascii=False, sort_keys=True),
-                )
-            )
+            expected_after_hash = str(
+                metadata.get("parent_assignments_after_hash", "") or ""
+            ).strip()
+            if not expected_after_hash:
+                raise ValueError("structured_inverse_revision_missing")
             inverse = _inverse()
             apply_narrow = getattr(self.store, "apply_rule_narrow_atomic", None)
             if not callable(apply_narrow):
@@ -666,7 +772,7 @@ class RuleCreationService:
             apply_narrow(
                 parent_rule_id=parent_id,
                 parent_assignments_after=[dict(item) for item in before_assignments],
-                expected_parent_assignment_hash=current_hash,
+                expected_parent_assignment_hash=expected_after_hash,
                 automatic=True,
                 actor_agent_id=str(decision.actor or "").replace("agent:", ""),
                 decision=inverse,
@@ -684,19 +790,20 @@ class RuleCreationService:
             if not isinstance(after_assignments, list):
                 raise ValueError("structured_exception_assignment_delta_missing")
             parent_id = str(decision.parent_rule_id or "")
-            hash_fn = getattr(self.store, "rule_assignment_hash", None)
-            current_hash = (
-                str(hash_fn(parent_id) or "")
-                if callable(hash_fn) and parent_id
-                else stable_hash(
-                    "rule-assignments", json.dumps(after_assignments, ensure_ascii=False, sort_keys=True),
-                )
-            )
+            expected_after_hash = str(
+                metadata.get("parent_assignments_after_hash", "") or ""
+            ).strip()
+            if not expected_after_hash:
+                raise ValueError("structured_inverse_revision_missing")
             inverse = _inverse()
             revert = getattr(self.store, "revert_rule_exception", None)
             if not callable(revert):
                 raise ValueError("atomic_rule_exception_revert_unavailable")
-            revert(exception_id, expected_parent_assignment_hash=current_hash, decision=inverse)
+            revert(
+                exception_id,
+                expected_parent_assignment_hash=expected_after_hash,
+                decision=inverse,
+            )
             return inverse
         else:
             raise ValueError(f"structured_inverse_unsupported:{action or 'unknown'}")
@@ -706,6 +813,18 @@ class RuleCreationService:
             raise ValueError("structured_inverse_persistence_unavailable")
         persisted = append(inverse)
         return persisted if persisted is not None else inverse
+
+    @staticmethod
+    def _decision_owned_by(decision: RuleDecision, agent_instance_id: str) -> bool:
+        """Exact target ownership check; never use substring/prefix matching."""
+        agent_id = str(agent_instance_id or "").strip()
+        if not agent_id:
+            return False
+        owner = str(getattr(decision, "owner_agent_id", "") or "").strip()
+        if owner:
+            return owner == agent_id
+        actor = str(getattr(decision, "actor", "") or "").strip()
+        return actor in {agent_id, f"agent:{agent_id}"}
 
     def undo_rule(
         self,
@@ -740,7 +859,9 @@ class RuleCreationService:
                 action="rule_undo", reason="structured_decision_required",
                 context=context, undo_id=token,
             )
-        if not admin and context["agent_instance_id"] not in str(structured_original.actor or ""):
+        if not admin and not self._decision_owned_by(
+            structured_original, context["agent_instance_id"]
+        ):
             return self._blocked(action="rule_undo", reason="undo permission denied", context=context, undo_id=token)
         try:
             return self._target_undo(
@@ -750,8 +871,14 @@ class RuleCreationService:
                 action="rule_undo", reason="target_undo_noop", context=context, undo_id=token,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
+            reason = str(exc)
+            if reason == "structured_inverse_revision_missing":
+                return self._blocked(
+                    action="rule_undo", reason=reason,
+                    context=context, undo_id=token,
+                )
             return self._blocked(
-                action="rule_undo", reason=f"target_undo_partial_failure:{exc}",
+                action="rule_undo", reason=f"target_undo_partial_failure:{reason}",
                 context=context, undo_id=token,
             )
 
@@ -781,7 +908,9 @@ class RuleCreationService:
                 context=context, undo_id=str(decision_id or ""),
             )
         admin = self.is_admin if is_admin is None else bool(is_admin)
-        if not admin and context["agent_instance_id"] not in str(decision.actor or ""):
+        if not admin and not self._decision_owned_by(
+            decision, context["agent_instance_id"]
+        ):
             return self._blocked(
                 action="rule_undo", reason="undo permission denied",
                 context=context, undo_id=str(decision_id or ""),
@@ -796,8 +925,14 @@ class RuleCreationService:
                 context=context, undo_id=str(decision_id or ""),
             )
         except (TypeError, ValueError, RuntimeError) as exc:
+            reason = str(exc)
+            if reason == "structured_inverse_revision_missing":
+                return self._blocked(
+                    action="rule_undo", reason=reason,
+                    context=context, undo_id=str(decision_id or ""),
+                )
             return self._blocked(
-                action="rule_undo", reason=f"target_undo_partial_failure:{exc}",
+                action="rule_undo", reason=f"target_undo_partial_failure:{reason}",
                 context=context, undo_id=str(decision_id or ""),
             )
 
@@ -942,25 +1077,69 @@ class RuleCreationService:
         ]
         corrected_count = 0
         wrong_scope_count = 0
+        accepted_count = 0
         def _stat_value(stat: Any, key: str) -> int:
             if isinstance(stat, Mapping):
                 return int(stat.get(key, 0) or 0)
             return int(getattr(stat, key, 0) or 0)
+        # Runtime scope feedback is meaningful only for rules created by the
+        # automatic path.  Blocked decisions never create a rule and
+        # unobserved events are excluded by the Store evidence ledger.
+        auto_rule_ids = {
+            str(getattr(item, "memory_id", "") or getattr(item, "rule_id", ""))
+            for item in auto_created
+            if str(getattr(item, "memory_id", "") or getattr(item, "rule_id", ""))
+        }
         if callable(list_scope_stats):
             try:
                 for stat in scope_stats_rows:
+                    stat_rule_id = str(
+                        stat.get("rule_id", "") if isinstance(stat, Mapping)
+                        else getattr(stat, "rule_id", "")
+                    )
+                    if stat_rule_id not in auto_rule_ids:
+                        continue
                     corrected_count += _stat_value(stat, "corrected")
                     wrong_scope_count += _stat_value(stat, "wrong_scope")
-            except Exception:
+                    accepted_count += _stat_value(stat, "accepted")
+            except (TypeError, ValueError):
                 pass
-        reviewed = corrected_count + wrong_scope_count
-        accepted_without_correction = max(0, sum(
-            _stat_value(stat, "accepted")
-            for stat in scope_stats_rows
-        ) - corrected_count)
+        observed_total = accepted_count + corrected_count + wrong_scope_count
         fallback_count = len(fallback_auto)
         auto_created_count = len(auto_created)
         successful_scope_decisions = len(auto_created) + len(manual_created)
+        def _rate(numerator: int, denominator: int) -> float:
+            if denominator <= 0:
+                return 0.0
+            return max(0.0, min(1.0, float(numerator) / float(denominator)))
+
+        # Optional, explicitly labeled golden-set annotations.  Runtime
+        # feedback is never used as a substitute for human-labeled accuracy.
+        golden_total = 0
+        golden_correct = 0
+        for item in auto_created:
+            metadata = getattr(item, "metadata", {})
+            if not isinstance(metadata, Mapping):
+                continue
+            expected = metadata.get("golden_expected_scope")
+            if expected is None:
+                expected = metadata.get("golden_scope")
+            if not isinstance(expected, Mapping):
+                continue
+            actual = metadata.get("assignment")
+            if not isinstance(actual, Mapping):
+                actual = (getattr(item, "after", {}) or {}).get("assignments", [])
+                actual = actual[0] if isinstance(actual, list) and actual else {}
+            golden_total += 1
+            if (
+                str(actual.get("target_type", "")) == str(expected.get("target_type", ""))
+                and str(actual.get("target_id", "")) == str(expected.get("target_id", ""))
+                and canonical_project_ref(actual.get("project_ref", ""))
+                == canonical_project_ref(expected.get("project_ref", ""))
+            ):
+                golden_correct += 1
+        golden_accuracy = _rate(golden_correct, golden_total) if golden_total else None
+
         metrics = {
             "attempts": total_attempts,
             "created": len(created_decisions),
@@ -981,17 +1160,19 @@ class RuleCreationService:
             "fallback": fallback_count,
             "corrected": corrected_count,
             "wrong": wrong_scope_count,
-            "auto_scope_coverage": (
-                len(auto_created) / successful_scope_decisions
-                if successful_scope_decisions else 0.0
-            ),
-            "auto_scope_accuracy": (
-                accepted_without_correction / reviewed if reviewed else None
-            ),
-            "fallback_rate": fallback_count / auto_created_count if auto_created_count else 0.0,
-            "under_scoped_rate": corrected_count / reviewed if reviewed else 0.0,
-            "over_scoped_rate": wrong_scope_count / reviewed if reviewed else 0.0,
-            "manual_correction_rate": corrected_count / reviewed if reviewed else 0.0,
+            "auto_scope_coverage": _rate(len(auto_created), successful_scope_decisions),
+            "auto_scope_accuracy": _rate(accepted_count, observed_total),
+            "observed_accuracy": _rate(accepted_count, observed_total),
+            "observed_feedback_total": observed_total,
+            "accepted": accepted_count,
+            "corrected": corrected_count,
+            "wrong_scope": wrong_scope_count,
+            "fallback_rate": _rate(fallback_count, auto_created_count),
+            "under_scoped_rate": _rate(corrected_count, observed_total),
+            "over_scoped_rate": _rate(wrong_scope_count, observed_total),
+            "manual_correction_rate": _rate(corrected_count, observed_total),
+            "golden_scope_accuracy": golden_accuracy,
+            "golden_scope_evaluated": golden_total,
         }
         payload["metrics"] = metrics
         payload["scope_metrics"] = dict(metrics)
@@ -1000,11 +1181,14 @@ class RuleCreationService:
             "manual_created": len(manual_created),
             "auto_scope_coverage": metrics["auto_scope_coverage"],
             "auto_scope_accuracy": metrics["auto_scope_accuracy"],
+            "observed_accuracy": metrics["observed_accuracy"],
             "auto_fallback_count": fallback_count,
             "fallback_rate": metrics["fallback_rate"],
             "under_scoped_rate": metrics["under_scoped_rate"],
             "over_scoped_rate": metrics["over_scoped_rate"],
             "manual_correction_rate": metrics["manual_correction_rate"],
+            "golden_scope_accuracy": golden_accuracy,
+            "golden_scope_evaluated": golden_total,
             "accuracy_note": "accuracy uses reviewed scope outcomes; unreviewed creations are not counted as correct",
         }
         if context is not None:
@@ -1413,6 +1597,9 @@ class RuleCreationService:
                 "project_ref": project_ref, "effect": "exclude",
             })
         after_assignments = [dict(item) for item in updated_assignments]
+        parent_assignments_after_hash = self._assignment_hash_for(
+            parent.memory_id, after_assignments,
+        )
         decision = self._decision(
             action="rule_narrow", status="created",
             result={
@@ -1428,6 +1615,7 @@ class RuleCreationService:
                 "narrowed_parent_rule": parent.memory_id,
                 "parent_assignments_before": before_assignments,
                 "parent_assignments_after": after_assignments,
+                "parent_assignments_after_hash": parent_assignments_after_hash,
                 "excluded_project": project_ref,
                 "generated_parent_assignment": {
                     "target_type": "agent_project",
@@ -1631,6 +1819,9 @@ class RuleCreationService:
                 ) or "")
             except (TypeError, ValueError, RuntimeError):
                 normalized_after_hash = ""
+        parent_assignments_after_hash = normalized_after_hash or self._assignment_hash_for(
+            parent.memory_id, after_assignments,
+        )
         hash_fn = getattr(self.store, "rule_assignment_hash", None)
         expected_hash = (
             str(hash_fn(parent.memory_id) or "")
@@ -1657,6 +1848,7 @@ class RuleCreationService:
                 "feedback_id": feedback_id, "receipt_id": receipt_id,
                 "parent_assignments_before": before_assignments,
                 "parent_assignments_after": after_assignments,
+                "parent_assignments_after_hash": parent_assignments_after_hash,
                 "excluded_project": project_ref,
                 "exception_scope_assignment": {
                     "target_type": "agent_project", "target_id": receipt.agent_instance_id,
@@ -1766,10 +1958,55 @@ class RuleCreationService:
         priority: int = 0,
         reason: str = "",
     ) -> dict[str, Any]:
+        # This low-level relation API is intentionally admin-only.  Normal
+        # callers must use receipt-driven ``create_child_exception`` so the
+        # parent exclude, child rule, evidence and decision are one atomic
+        # mutation.  Relation-only writes are retained for migration/admin
+        # tooling but fail closed unless both records and scopes validate.
+        if not self.is_admin:
+            return {"ok": False, "error": "admin capability required for relation-only exception"}
         if not parent_rule or not child_exception:
             return {"ok": False, "error": "rule_exception_requires_parent_and_child"}
         if parent_rule == child_exception:
             return {"ok": False, "error": "rule_exception_cannot_reference_itself"}
+        parent = self.store.get_record(parent_rule)
+        child = self.store.get_record(child_exception)
+        if parent is None or child is None:
+            return {"ok": False, "error": "rule_exception_parent_or_child_not_found"}
+        if parent.status != SharedMemoryStatus.ACTIVE or child.status != SharedMemoryStatus.ACTIVE:
+            return {"ok": False, "error": "rule_exception_parent_and_child_must_be_active"}
+        parent_assignments = self.store.list_rule_assignments(parent_rule)
+        child_assignments = self.store.list_rule_assignments(child_exception)
+        if not parent_assignments or not child_assignments:
+            return {"ok": False, "error": "rule_exception_scope_assignments_required"}
+
+        def _compatible(parent_item: Any, child_item: Any) -> bool:
+            if getattr(parent_item, "effect", "include") != "include":
+                return False
+            if getattr(child_item, "effect", "include") != "include":
+                return True
+            pt = str(getattr(parent_item, "target_type", ""))
+            ct = str(getattr(child_item, "target_type", ""))
+            pid = str(getattr(parent_item, "target_id", ""))
+            cid = str(getattr(child_item, "target_id", ""))
+            pp = canonical_project_ref(getattr(parent_item, "project_ref", ""))
+            cp = canonical_project_ref(getattr(child_item, "project_ref", ""))
+            if pt == ct:
+                return pid == cid and pp == cp
+            if pt == "agent" and ct == "agent_project":
+                return pid == cid
+            if pt == "project" and ct == "agent_project":
+                return pp == cp
+            if pt in {"group", "system"}:
+                return True
+            return False
+
+        if any(
+            not any(_compatible(parent_item, child_item) for parent_item in parent_assignments)
+            for child_item in child_assignments
+            if getattr(child_item, "effect", "include") == "include"
+        ):
+            return {"ok": False, "error": "rule_exception_child_scope_outside_parent"}
         append_exception = getattr(self.store, "append_rule_exception", None)
         if not callable(append_exception):
             return {"ok": False, "error": "rule_exception_store_unavailable"}
@@ -1798,7 +2035,13 @@ class RuleCreationService:
         payload = [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in values]
         return {"exceptions": payload, "total": len(payload)}
 
-    def revoke_exception(self, exception_id: str) -> dict[str, Any]:
+    def revoke_exception(
+        self,
+        exception_id: str,
+        effective_context: EffectiveAgentContext | Mapping[str, Any] | None = None,
+        *,
+        is_admin: bool | None = None,
+    ) -> dict[str, Any]:
         # Revoke is a behavioral inverse (restore parent coverage + deactivate
         # child + relation), not a flag-only update.  New stores expose the
         # atomic inverse; legacy stores fail closed instead of claiming success.
@@ -1810,10 +2053,37 @@ class RuleCreationService:
             current = getter(exception_id) if callable(getter) else None
             if current is None:
                 return {"ok": False, "error": "rule_exception_not_found"}
+            admin = self.is_admin if is_admin is None else bool(is_admin)
+            parent = self.store.get_record(current.parent_rule)
+            child = self.store.get_record(current.child_exception)
+            if parent is None or child is None:
+                return {"ok": False, "error": "rule_exception_parent_or_child_not_found"}
+            if not admin:
+                if effective_context is None:
+                    return {"ok": False, "error": "trusted effective agent context required"}
+                context = self._context_dict(effective_context)
+                owner = str(child.agent_instance_id or parent.agent_instance_id or "").strip()
+                if context["agent_instance_id"] != owner:
+                    return {"ok": False, "error": "rule exception revoke permission denied"}
+                if context["project_ref"]:
+                    child_scopes = self.store.list_rule_assignments(child.memory_id)
+                    if child_scopes and not any(
+                        canonical_project_ref(item.project_ref) == context["project_ref"]
+                        for item in child_scopes
+                        if item.effect == "include"
+                    ):
+                        return {"ok": False, "error": "rule exception revoke scope mismatch"}
+            rollback_data = current.rollback if isinstance(current.rollback, Mapping) else {}
+            expected_hash = str(
+                rollback_data.get("parent_assignments_after_hash", "") or ""
+            ).strip()
+            if not expected_hash:
+                return {"ok": False, "error": "structured_inverse_revision_missing"}
             now = _now_iso()
+            owner_agent_id = str(child.agent_instance_id or parent.agent_instance_id or "").strip()
             inverse = RuleDecision(
                 decision_id=stable_hash("rule-exception-revoke", exception_id, now),
-                actor="admin" if self.is_admin else "agent:unknown",
+                actor="admin" if admin else f"agent:{owner_agent_id}",
                 before=current.to_dict(),
                 after={**current.to_dict(), "active": False},
                 reason=f"revoke rule exception {exception_id}",
@@ -1826,9 +2096,18 @@ class RuleCreationService:
                 memory_id=current.child_exception,
                 parent_rule_id=current.parent_rule,
                 child_rule_id=current.child_exception,
-                metadata={"exception_id": exception_id, "target_undo": True},
+                metadata={
+                    "exception_id": exception_id,
+                    "target_undo": True,
+                    "parent_assignments_after_hash": expected_hash,
+                },
+                owner_agent_id=owner_agent_id,
             )
-            exception = rollback(exception_id, decision=inverse)
+            exception = rollback(
+                exception_id,
+                expected_parent_assignment_hash=expected_hash,
+                decision=inverse,
+            )
         except (TypeError, ValueError, RuntimeError) as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, **exception.to_dict()}

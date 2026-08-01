@@ -13,11 +13,15 @@ import time
 import tempfile
 import os
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-os.environ["MEMORYGUARD_ADMIN"] = "1"
-os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
-os.environ["MEMORYGUARD_STRICT_BINDING"] = "0"
+
+@pytest.fixture(autouse=True)
+def _isolated_test_env(monkeypatch):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
 
 
 def make_test_workspace(record_count: int = 50, dup_ratio: float = 0.2) -> Path:

@@ -193,3 +193,51 @@ def test_rule_feedback_idempotent_by_receipt(tmp_path, monkeypatch):
 
     feedbacks = store.list_rule_match_feedbacks(receipt_id=receipt_id)
     assert len(feedbacks) == 1
+
+
+def test_mcp_receipt_without_session_cannot_drive_narrowing(tmp_path, monkeypatch):
+    """MCP feedback must not narrow a rule when receipts lack host sessions.
+
+    Session identity is a trusted host fact.  Three otherwise-valid
+    ``not_applicable`` events with an empty session must remain pending and
+    leave the parent assignment unchanged; an actor cannot manufacture the
+    cross-session evidence required for automatic narrowing.
+    """
+    store = _bind(tmp_path, monkeypatch)
+    project_ref = str(tmp_path / "project")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", project_ref)
+    monkeypatch.delenv("MEMORYGUARD_SESSION_ID", raising=False)
+    store.append_record(_rule("parent", "a"), assignments=[{
+        "target_type": "agent", "target_id": "a",
+    }])
+    before = [item.to_dict() for item in store.list_rule_assignments("parent")]
+
+    for index in range(3):
+        receipt_id = f"no-session-{index}"
+        store.append_rule_match_receipt(RuleMatchReceipt(
+            receipt_id=receipt_id,
+            memory_id="parent",
+            share_group_id="team",
+            agent_instance_id="a",
+            task_hash=receipt_id,
+            task="task without host session",
+            project_ref=project_ref,
+            session_id="",
+            created_at=_now_iso(),
+        ))
+        response = execute_tool("memoryguard_rule_feedback", {
+            "receipt_id": receipt_id,
+            "outcome": "not_applicable",
+            "actor": "hook:codex:a",
+            "confidence": 1.0,
+        })
+        assert response.get("isError") is not True, response
+        payload = json.loads(response["content"][0]["text"])
+        assert payload["status"] == "pending"
+        assert payload["scope_reason"] in {
+            "not_applicable_not_enough_evidence",
+            "not_applicable_not_enough_sessions",
+        }
+
+    after = [item.to_dict() for item in store.list_rule_assignments("parent")]
+    assert after == before

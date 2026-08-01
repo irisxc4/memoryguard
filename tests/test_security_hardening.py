@@ -18,58 +18,56 @@ import sqlite3
 import tempfile
 import threading
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
-def _setup_ws_with_binding(agent_id: str, group_id: str = "test-group"):
+def _setup_ws_with_binding(
+    agent_id: str, group_id: str = "test-group", *, monkeypatch,
+):
     """创建工作区并绑定 agent(用 admin 权限)。"""
     from memoryguard.gui import GovernanceApi
     ws = Path(tempfile.mkdtemp())
-    os.environ["MEMORYGUARD_ADMIN"] = "1"
-    os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
     api = GovernanceApi(str(ws))
     api.bind_agent(agent_id, group_id)
     return ws
 
 
-def test_cross_group_access_denied():
+def test_cross_group_access_denied(monkeypatch):
     """硬断言1: Agent B 无法读写 Agent A 的 group。"""
     from memoryguard.mcp_server import _handle_memory_read, _handle_memory_search, _handle_memory_write
 
-    old_env = dict(os.environ)
-    try:
-        ws = _setup_ws_with_binding("agent-a", "group-a")
-        # Agent A 写入一条记忆
-        os.environ["MEMORYGUARD_AGENT_ID"] = "agent-a"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
-        write_result = _handle_memory_write({
-            "workspace": str(ws),
-            "body": "agent-a 的私有记忆",
-            "agent_instance_id": "agent-a",
-        })
-        assert not write_result.get("isError"), f"agent-a write failed: {write_result}"
+    ws = _setup_ws_with_binding("agent-a", "group-a", monkeypatch=monkeypatch)
+    # Agent A 写入一条记忆
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    write_result = _handle_memory_write({
+        "workspace": str(ws),
+        "body": "agent-a 的私有记忆",
+        "agent_instance_id": "agent-a",
+    })
+    assert not write_result.get("isError"), f"agent-a write failed: {write_result}"
 
-        # Agent B 冒充 agent-a 身份 -> 被 AccessContext 拒绝
-        os.environ["MEMORYGUARD_AGENT_ID"] = "agent-b"
-        read_result = _handle_memory_read({
-            "workspace": str(ws),
-            "memory_id": "any-id",
-            "agent_instance_id": "agent-a",  # 冒充 agent-a
-        })
-        assert read_result.get("isError"), "Agent B impersonating agent-a should be denied"
-        assert "mismatch" in read_result["content"][0]["text"] or "denied" in read_result["content"][0]["text"]
+    # Agent B 冒充 agent-a 身份 -> 被 AccessContext 拒绝
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-b")
+    read_result = _handle_memory_read({
+        "workspace": str(ws),
+        "memory_id": "any-id",
+        "agent_instance_id": "agent-a",  # 冒充 agent-a
+    })
+    assert read_result.get("isError"), "Agent B impersonating agent-a should be denied"
+    assert "mismatch" in read_result["content"][0]["text"] or "denied" in read_result["content"][0]["text"]
 
-        # Agent B 无 binding -> 被 strict binding 拒绝
-        search_result = _handle_memory_search({
-            "workspace": str(ws),
-            "query": "私有",
-            "agent_instance_id": "agent-b",
-        })
-        assert search_result.get("isError"), "unbound agent-b should be denied in strict mode"
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    # Agent B 无 binding -> 被 strict binding 拒绝
+    search_result = _handle_memory_search({
+        "workspace": str(ws),
+        "query": "私有",
+        "agent_instance_id": "agent-b",
+    })
+    assert search_result.get("isError"), "unbound agent-b should be denied in strict mode"
 
 
 def test_readonly_no_side_effects():
@@ -126,57 +124,54 @@ def test_readonly_no_side_effects():
             f"filesystem changed! before={before} after={after}"
 
 
-def test_update_secret_redacted():
+def test_update_secret_redacted(monkeypatch):
     """硬断言3: update 路径也脱敏,原文不入持久层。"""
     from memoryguard.mcp_server import _handle_memory_write, _handle_memory_update
     from memoryguard.gui import GovernanceApi
 
-    old_env = dict(os.environ)
-    try:
-        ws = _setup_ws_with_binding("agent-a", "upd-secret-group")
-        os.environ["MEMORYGUARD_AGENT_ID"] = "agent-a"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
+    ws = _setup_ws_with_binding(
+        "agent-a", "upd-secret-group", monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
-        # 先写入一条正常记忆
-        write_result = _handle_memory_write({
+    # 先写入一条正常记忆
+    write_result = _handle_memory_write({
             "workspace": str(ws),
             "body": "正常记忆内容用于测试更新",
             "agent_instance_id": "agent-a",
         })
-        assert not write_result.get("isError")
-        mem_id = json.loads(write_result["content"][0]["text"])["memory_id"]
+    assert not write_result.get("isError")
+    mem_id = json.loads(write_result["content"][0]["text"])["memory_id"]
 
-        # 用 update 更新 body 为含 secret 的内容
-        secret_body = "api_key=sk-update123def456ghi789jkl012mno345pqr789"
-        update_result = _handle_memory_update({
+    # 用 update 更新 body 为含 secret 的内容
+    secret_body = "api_key=sk-update123def456ghi789jkl012mno345pqr789"
+    update_result = _handle_memory_update({
             "workspace": str(ws),
             "memory_id": mem_id,
             "body": secret_body,
             "agent_instance_id": "agent-a",
         })
-        # 不应有 isError(secret 被脱敏了,但 update 本身成功)
-        assert not update_result.get("isError"), f"update failed: {update_result}"
+    # 不应有 isError(secret 被脱敏了,但 update 本身成功)
+    assert not update_result.get("isError"), f"update failed: {update_result}"
 
-        # 硬断言:SQLite 中不含原始 secret
-        db_path = Path(ws) / ".memoryguard" / "shared-memory" / "upd-secret-group" / "memory.db"
-        conn = sqlite3.connect(str(db_path))
-        for table in ["records", "events", "quarantine"]:
-            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
-            for row in rows:
-                row_str = str(row)
-                assert "sk-update123" not in row_str, \
-                    f"secret found in {table} after update: {row_str}"
-        conn.close()
+    # 硬断言:SQLite 中不含原始 secret
+    db_path = Path(ws) / ".memoryguard" / "shared-memory" / "upd-secret-group" / "memory.db"
+    conn = sqlite3.connect(str(db_path))
+    for table in ["records", "events", "quarantine"]:
+        rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+        for row in rows:
+            row_str = str(row)
+            assert "sk-update123" not in row_str, \
+                f"secret found in {table} after update: {row_str}"
+    conn.close()
 
-        # JSONL 也不含
-        for jsonl in ["records.jsonl", "events.jsonl", "quarantine.jsonl"]:
-            path = Path(ws) / ".memoryguard" / "shared-memory" / "upd-secret-group" / jsonl
-            if path.exists():
-                content = path.read_text(encoding="utf-8")
-                assert "sk-update123" not in content, f"secret in {jsonl}"
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    # JSONL 也不含
+    for jsonl in ["records.jsonl", "events.jsonl", "quarantine.jsonl"]:
+        path = Path(ws) / ".memoryguard" / "shared-memory" / "upd-secret-group" / jsonl
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+            assert "sk-update123" not in content, f"secret in {jsonl}"
 
 
 def test_concurrent_same_body_one_record():
@@ -252,41 +247,31 @@ def test_path_traversal_blocked():
                 assert "\\" not in child.name
 
 
-def test_access_context_impersonation_blocked():
+def test_access_context_impersonation_blocked(monkeypatch):
     """AccessContext 拒绝冒充。"""
     from memoryguard.access_context import load_access_context
 
-    old_env = dict(os.environ)
-    try:
-        os.environ["MEMORYGUARD_AGENT_ID"] = "trusted-agent"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
-        ctx = load_access_context()
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    ctx = load_access_context()
 
-        # 正确身份 -> 通过
-        ok, err = ctx.check_agent("trusted-agent")
-        assert ok
+    # 正确身份 -> 通过
+    ok, err = ctx.check_agent("trusted-agent")
+    assert ok
 
-        # 冒充 -> 拒绝
-        ok, err = ctx.check_agent("impostor")
-        assert not ok
-        assert "mismatch" in err
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    # 冒充 -> 拒绝
+    ok, err = ctx.check_agent("impostor")
+    assert not ok
+    assert "mismatch" in err
 
 
-def test_strict_binding_default_on():
+def test_strict_binding_default_on(monkeypatch):
     """STRICT_BINDING 默认开启。"""
     from memoryguard.access_context import load_access_context
 
-    old_env = dict(os.environ)
-    try:
-        os.environ.pop("MEMORYGUARD_STRICT_BINDING", None)
-        ctx = load_access_context()
-        assert ctx.strict_binding, "STRICT_BINDING should default to True"
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    monkeypatch.delenv("MEMORYGUARD_STRICT_BINDING", raising=False)
+    ctx = load_access_context()
+    assert ctx.strict_binding, "STRICT_BINDING should default to True"
 
 
 if __name__ == "__main__":

@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import os
 from unittest.mock import patch
+import pytest
 
-os.environ.setdefault("MEMORYGUARD_ADMIN", "1")
-os.environ.setdefault("MEMORYGUARD_ALLOW_ANON", "1")
+
+@pytest.fixture(autouse=True)
+def _isolated_test_env(monkeypatch):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
 
 def test_share_group_build_enriches_then_graphs(tmp_path):

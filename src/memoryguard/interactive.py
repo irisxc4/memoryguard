@@ -682,6 +682,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .rule-decision-link, .rule-receipts, .rule-exceptions { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
 .rule-feedback-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .rule-feedback-actions .btn { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+.rule-advanced { margin-top: 10px; border: 1px solid rgba(233,187,100,.24); border-radius: 9px; background: rgba(233,187,100,.035); }
+.rule-advanced > summary { padding: 8px 10px; color: var(--orange); cursor: pointer; font-size: 11px; list-style-position: inside; }
+.rule-advanced-body { padding: 0 10px 10px; }
+.rule-advanced-body .muted { font-size: 11px; }
+.feedback-error { margin-top: 8px; color: var(--red); font-size: 12px; min-height: 1.4em; }
 @media (max-width: 720px) { .rule-context-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -3303,6 +3308,7 @@ async function undoRuleDecision(decisionId) {
 
 async function submitRuleFeedback(receiptId, outcome) {
   if (!receiptId || !outcome) return;
+  if (outcome === 'exception') return openRuleExceptionFeedbackModal(receiptId);
   // Evidence is optional; keep the one-click feedback action free of native
   // prompt dialogs so the desktop and localhost surfaces behave identically.
   const evidence = '';
@@ -3314,6 +3320,47 @@ async function submitRuleFeedback(receiptId, outcome) {
     showToast('反馈已记录。', 'success');
     await renderRulesHabits();
   } catch (error) { showToast(`反馈提交失败：${error.message || error}`, 'error'); }
+}
+
+function openRuleExceptionFeedbackModal(receiptId) {
+  if (!receiptId) return;
+  document.getElementById('rule-exception-feedback-modal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'rule-exception-feedback-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="提交规则例外">
+    <div class="modal-head"><h3>记录规则例外</h3><p>当前项目应遵循什么替代规则？只填写替代规则正文，提交后由治理层创建可撤销例外。</p></div>
+    <div class="modal-body"><label class="field"><span>替代规则正文</span><textarea id="rule-exception-override" rows="5" maxlength="6000" placeholder="例如：仅在本项目的测试目录中允许……"></textarea></label><div id="rule-exception-feedback-error" class="feedback-error" role="alert" aria-live="polite"></div></div>
+    <div class="modal-actions"><button class="btn" type="button" onclick="document.getElementById('rule-exception-feedback-modal')?.remove()">取消</button><button class="btn btn-primary" type="button" onclick="submitRuleExceptionFeedback('${escapeHtml(receiptId)}')">提交例外</button></div>
+  </div>`;
+  modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+  document.body.appendChild(modal);
+  document.getElementById('rule-exception-override')?.focus?.();
+}
+
+async function submitRuleExceptionFeedback(receiptId) {
+  const input = document.getElementById('rule-exception-override');
+  const errorNode = document.getElementById('rule-exception-feedback-error');
+  const override = String(input?.value || '').trim();
+  if (!override) {
+    if (errorNode) errorNode.textContent = '请填写替代规则正文。';
+    showToast('替代规则正文不能为空。', 'error');
+    return;
+  }
+  try {
+    // The GUI bridge fixes producer=user and validates receipt ownership.  The
+    // override is passed as evidence because the service treats it as the
+    // atomic child-rule body for an exception outcome.
+    const result = await callApi('submit_rule_feedback', receiptId, 'exception', '', override, activeShareGroupId || 'default', 1.0);
+    if (result?.error || result?.ok === false) throw new Error(result.error || '例外提交被治理层阻断');
+    document.getElementById('rule-exception-feedback-modal')?.remove();
+    showToast('例外已记录并创建替代规则。', 'success');
+    await renderRulesHabits();
+  } catch (error) {
+    const message = error.message || String(error);
+    if (errorNode) errorNode.textContent = `治理层阻断：${message}`;
+    showToast(`例外提交失败：${message}`, 'error');
+  }
 }
 
 async function createChildException(parentRule) {
@@ -3378,6 +3425,10 @@ function ruleCard(record) {
   const confidence = decision?.scope_confidence ?? record.scope_confidence ?? record.auto_scope_confidence ?? record.confidence;
   const decisionId = decision?.decision_id || record.decision_id || '';
   const exceptionHtml = exceptions.length ? `<div class="rule-exceptions"><div class="muted">子例外（父规则：${escapeHtml(record.memory_id)}）</div>${exceptions.map(item => `<div class="rule-exception-row"><code>${escapeHtml(item.child_exception || item.child_rule_id || '')}</code><span class="chip chip-info">priority ${Number(item.priority || 0)}</span><span class="muted">${escapeHtml(item.reason || '')}</span>${item.active === false ? '<span class="chip chip-medium">已撤销</span>' : `<button class="btn btn-danger btn-icon" type="button" onclick="revokeRuleException('${escapeHtml(item.exception_id || '')}')">撤销</button>`}</div>`).join('')}</div>` : '';
+  // Pure parent/child relation editing is an administrator diagnostic path.
+  // Daily governance uses the receipt-level “例外” action above, which carries
+  // the actual project override and enters the atomic service path.
+  const advancedHtml = `<details class="rule-advanced"><summary>诊断与高级治理（管理员）</summary><div class="rule-advanced-body"><p class="muted">仅用于排查已有关系；日常例外请从命中回执提交替代规则。</p><div class="finding-actions"><button class="btn" type="button" onclick="createChildException('${escapeHtml(record.memory_id)}')">新增子例外关系</button></div>${exceptionHtml}</div></details>`;
   const receiptHtml = receipts.slice(-3).map(renderRuleReceiptActions).join('');
   return `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(displayTitle(record))}</strong>
     <span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : ''}">${record.injection_policy === 'always' ? '强制' : '按需'}</span>
@@ -3389,8 +3440,8 @@ function ruleCard(record) {
     ${stats ? `<div class="muted">范围命中：${Number(stats.total || 0)} · 遵循 ${Number(stats.accepted || 0)} · 纠正 ${Number(stats.corrected || 0)} · 作用域错误 ${Number(stats.wrong_scope || 0)}</div>` : ''}
     ${decisionId ? `<div class="rule-decision-link"><code>decision ${escapeHtml(decisionId)}</code>${decision?.undo_id || decision?.status !== 'undone' ? `<button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecision('${escapeHtml(decisionId)}')">撤销自动决定</button>` : '<span class="chip chip-medium">已撤销</span>'}</div>` : ''}
     ${receiptHtml ? `<div class="rule-receipts"><div class="muted">命中回执与反馈</div>${receiptHtml}</div>` : ''}
-    <div class="finding-actions">${editable ? `<button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button>` : ''}<button class="btn" type="button" onclick="createChildException('${escapeHtml(record.memory_id)}')">新增子例外</button></div>
-    ${exceptionHtml}
+    <div class="finding-actions">${editable ? `<button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button>` : ''}</div>
+    ${advancedHtml}
   </article>`;
 }
 

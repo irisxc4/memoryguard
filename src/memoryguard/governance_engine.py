@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import Any
 
 from .schema_v3 import (
+    ConflictGroup,
     ConflictResolution,
     DecisionEvent,
     Provenance,
     QuarantineEntry,
     SharedMemoryRecord,
     SharedMemoryStatus,
+    RuleDecision,
     _now_iso,
     stable_hash,
 )
@@ -288,6 +290,275 @@ class GovernanceEngine:
         event.injection_policy = injection_policy
         event.priority = priority
         event.rule_assignments = list(rule_assignments or [])
+
+        # Mandatory rules use the planner/atomic store seam.  This preserves
+        # the existing enricher + duplicate semantics while ensuring record,
+        # event, assignments and structured decision commit together.
+        if injection_policy == "always" and rule_assignments:
+            from .auto_organizer import AutoOrganizer
+            organizer = AutoOrganizer(
+                self.store.workspace,
+                self.group_id,
+                enricher_mode=enricher_mode,
+                store=self.store,
+                engine=self,
+            )
+            try:
+                planned_record, planned_actions, mutation_kind = organizer.plan_rule_create(
+                    event, kind_override=kind_override, write_policy=write_policy,
+                )
+            except (TypeError, ValueError, RuntimeError) as exc:
+                return self._blocked(
+                    action="auto_write", actor=actor, record=None,
+                    reason=str(exc), idempotency_key=idempotency_key,
+                )
+            metadata = dict(event.metadata or {})
+            target_assignment = (
+                rule_assignments[0].to_dict()
+                if rule_assignments and hasattr(rule_assignments[0], "to_dict")
+                else dict(rule_assignments[0]) if rule_assignments else {}
+            )
+            if mutation_kind in {"created", "deduplicated"}:
+                lifecycle_action = (
+                    "rule_create_manual"
+                    if metadata.get("rule_creation") == "manual"
+                    else "rule_create_auto"
+                )
+                decision = RuleDecision(
+                    decision_id=self._decision_id("auto_write", idempotency_key)
+                    if idempotency_key else stable_hash(
+                        "rule-create-decision", self.group_id, event.event_id,
+                    ),
+                    actor=("admin" if lifecycle_action == "rule_create_manual" else actor),
+                    owner_agent_id=event.agent_instance_id or "",
+                    before={"assignments": []},
+                    after={"record": planned_record.to_dict()},
+                    reason=str(metadata.get("scope_reason") or "automatic governed memory write"),
+                    confidence=float(metadata.get("scope_confidence", planned_record.confidence) or planned_record.confidence),
+                    undo_id=str(metadata.get("undo_id", "") or ""),
+                    created_at=_now_iso(),
+                    rule_id=planned_record.memory_id,
+                    action=lifecycle_action,
+                    target_ids=[item for item in (event.agent_instance_id, planned_record.memory_id) if item],
+                    status="created",
+                    memory_id=planned_record.memory_id,
+                    kind=planned_record.kind.value,
+                    assignments=[target_assignment],
+                    target_type=str(target_assignment.get("target_type", "")),
+                    target_id=str(target_assignment.get("target_id", "")),
+                    project_ref=str(target_assignment.get("project_ref", "")),
+                    scope_confidence=float(metadata.get("scope_confidence", planned_record.confidence) or planned_record.confidence),
+                    scope_reason=str(metadata.get("scope_reason", "") or ""),
+                    body=planned_record.body,
+                    metadata=metadata,
+                )
+                try:
+                    atomic = self.store.apply_rule_create_atomic(
+                        planned_record,
+                        event=event,
+                        assignments=list(rule_assignments),
+                        decision=decision,
+                        automatic=metadata.get("rule_creation") != "manual",
+                        actor_agent_id=event.agent_instance_id or "",
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    return self._blocked(
+                        action="auto_write", actor=actor, record=None,
+                        reason=str(exc), idempotency_key=idempotency_key,
+                    )
+                persisted_decision = atomic.get("decision") if isinstance(atomic, dict) else None
+                result = {
+                    "ok": True,
+                    "action": "auto_write",
+                    "actor": actor,
+                    "before": None,
+                    "after": atomic.get("record") if isinstance(atomic, dict) else planned_record.to_dict(),
+                    "decision_id": (
+                        persisted_decision.get("decision_id", "")
+                        if isinstance(persisted_decision, dict)
+                        else getattr(persisted_decision, "decision_id", decision.decision_id)
+                    ),
+                    "version_id": self.store.get_active_version_id(),
+                    "blocked_reason": "",
+                    "idempotency_key": idempotency_key,
+                    "idempotent_replay": False,
+                    "memory_id": atomic.get("memory_id", planned_record.memory_id),
+                    "status": (atomic.get("record") or {}).get("status", planned_record.status.value),
+                    "kind": (atomic.get("record") or {}).get("kind", planned_record.kind.value),
+                    "auto_actions": planned_actions,
+                    "record": atomic.get("record", planned_record.to_dict()),
+                    "assignments": atomic.get("assignments", []),
+                    "mutation_kind": atomic.get("mutation_kind", mutation_kind),
+                    "decision": persisted_decision,
+                    "event_id": atomic.get("event_id", event.event_id),
+                }
+                return result
+            # Supersede/conflict/quarantine are also planned without writes.
+            # Commit the candidate, old-record status/group/quarantine entry,
+            # event and structured decision in one Store transaction; never
+            # fall back to organizer.organize() after a lifecycle plan.
+            if mutation_kind in {"superseded", "conflicted", "quarantined"}:
+                action = next(
+                    (
+                        item for item in planned_actions
+                        if isinstance(item, dict)
+                        and str(item.get("action", "")) in {
+                            "supersede", "conflict", "quarantine",
+                        }
+                    ),
+                    {},
+                )
+                old_ids = [
+                    str(item) for item in (
+                        action.get("old_ids")
+                        or ([action.get("old_id")] if action.get("old_id") else [])
+                        or list(getattr(planned_record, "supersedes", []) or [])
+                    ) if str(item)
+                ]
+                before_records: dict[str, Any] = {}
+                for old_id in old_ids:
+                    previous = self.store.get_record(old_id)
+                    if previous is not None:
+                        before_records[old_id] = previous.to_dict()
+                conflict_group = None
+                if mutation_kind == "conflicted":
+                    conflict_group = ConflictGroup(
+                        group_id=stable_hash(
+                            "auto-conflict", self.group_id,
+                            planned_record.memory_id, event.event_id,
+                        ),
+                        member_ids=[*old_ids, planned_record.memory_id],
+                        reason=str(action.get("reason") or "automatic conflict"),
+                        created_at=event.created_at or _now_iso(),
+                    )
+                quarantine_entry = None
+                if mutation_kind == "quarantined":
+                    pattern = str(
+                        action.get("detected_pattern")
+                        or action.get("reason")
+                        or "sensitive content"
+                    )
+                    quarantine_entry = QuarantineEntry(
+                        quarantine_id=stable_hash(
+                            "quarantine", planned_record.memory_id,
+                            event.event_id, event.created_at or _now_iso(),
+                        ),
+                        memory_id=planned_record.memory_id,
+                        reason=f"检测到敏感信息: {pattern}",
+                        detected_pattern=pattern,
+                        original_content=event.raw_content,
+                        quarantined_at=event.created_at or _now_iso(),
+                    )
+                lifecycle_action = f"rule_{mutation_kind}"
+                decision = RuleDecision(
+                    decision_id=self._decision_id("auto_write", idempotency_key)
+                    if idempotency_key else stable_hash(
+                        "rule-lifecycle-decision", self.group_id,
+                        mutation_kind, event.event_id,
+                    ),
+                    actor=(
+                        "admin"
+                        if metadata.get("rule_creation") == "manual"
+                        else actor
+                    ),
+                    owner_agent_id=event.agent_instance_id or "",
+                    before={"records": before_records},
+                    after={"record": planned_record.to_dict()},
+                    reason=str(
+                        metadata.get("scope_reason")
+                        or action.get("reason")
+                        or f"automatic {mutation_kind} lifecycle"
+                    ),
+                    confidence=float(
+                        metadata.get("scope_confidence", planned_record.confidence)
+                        or planned_record.confidence
+                    ),
+                    undo_id=str(metadata.get("undo_id", "") or ""),
+                    created_at=_now_iso(),
+                    rule_id=planned_record.memory_id,
+                    action=lifecycle_action,
+                    target_ids=[planned_record.memory_id, *old_ids],
+                    status="created",
+                    memory_id=planned_record.memory_id,
+                    kind=planned_record.kind.value,
+                    assignments=[target_assignment],
+                    target_type=str(target_assignment.get("target_type", "")),
+                    target_id=str(target_assignment.get("target_id", "")),
+                    project_ref=str(target_assignment.get("project_ref", "")),
+                    scope_confidence=float(
+                        metadata.get("scope_confidence", planned_record.confidence)
+                        or planned_record.confidence
+                    ),
+                    scope_reason=str(metadata.get("scope_reason", "") or ""),
+                    body=planned_record.body,
+                    metadata={
+                        **metadata,
+                        "mutation_kind": mutation_kind,
+                        "old_record_ids": old_ids,
+                        "conflict_reason": action.get("reason", ""),
+                        "quarantine_reason": action.get("reason", ""),
+                    },
+                )
+                try:
+                    atomic = self.store.apply_rule_lifecycle_atomic(
+                        planned_record,
+                        event,
+                        decision=decision,
+                        mutation_kind=mutation_kind,
+                        assignments=list(rule_assignments),
+                        old_record_ids=old_ids,
+                        conflict_group=conflict_group,
+                        quarantine_entry=quarantine_entry,
+                        actor_agent_id=event.agent_instance_id or "",
+                        automatic=metadata.get("rule_creation") != "manual",
+                    )
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    return self._blocked(
+                        action="auto_write", actor=actor, record=None,
+                        reason=str(exc), idempotency_key=idempotency_key,
+                    )
+                persisted_decision = (
+                    atomic.get("decision")
+                    if isinstance(atomic, dict) else None
+                )
+                persisted_dict = (
+                    persisted_decision.to_dict()
+                    if hasattr(persisted_decision, "to_dict")
+                    else persisted_decision
+                )
+                return {
+                    "ok": True,
+                    "action": "auto_write",
+                    "actor": actor,
+                    "before": {"records": before_records},
+                    "after": atomic.get("record", planned_record.to_dict()),
+                    "decision_id": (
+                        persisted_dict.get("decision_id", "")
+                        if isinstance(persisted_dict, dict)
+                        else decision.decision_id
+                    ),
+                    "version_id": self.store.get_active_version_id(),
+                    "blocked_reason": "",
+                    "idempotency_key": idempotency_key,
+                    "idempotent_replay": False,
+                    "memory_id": atomic.get("memory_id", planned_record.memory_id),
+                    "status": atomic.get(
+                        "record", planned_record.to_dict()
+                    ).get("status", planned_record.status.value),
+                    "kind": atomic.get(
+                        "record", planned_record.to_dict()
+                    ).get("kind", planned_record.kind.value),
+                    "auto_actions": planned_actions,
+                    "record": atomic.get("record", planned_record.to_dict()),
+                    "assignments": atomic.get("assignments", []),
+                    "mutation_kind": atomic.get("mutation_kind", mutation_kind),
+                    "decision": persisted_dict,
+                    "event_id": atomic.get("event_id", event.event_id),
+                    "target_ids": atomic.get(
+                        "target_ids", [planned_record.memory_id, *old_ids]
+                    ),
+                    "undo_metadata": atomic.get("undo_metadata", {}),
+                }
         self.store.append_event(event)
         from .auto_organizer import AutoOrganizer
         organizer = AutoOrganizer(
@@ -327,8 +598,25 @@ class GovernanceEngine:
             "kind": record.kind.value,
             "auto_actions": actions,
             "record": record.to_dict(),
+            "mutation_kind": self._mutation_kind_from_actions(actions, record),
         })
         return result
+
+    @staticmethod
+    def _mutation_kind_from_actions(
+        actions: list[dict[str, Any]], record: SharedMemoryRecord | None = None,
+    ) -> str:
+        """Map legacy organizer actions to the explicit lifecycle kind."""
+        names = {str(item.get("action", "")) for item in actions if isinstance(item, dict)}
+        if "quarantine" in names:
+            return "quarantined"
+        if "conflict" in names:
+            return "conflicted"
+        if "supersede" in names:
+            return "superseded"
+        if "merge_provenance" in names or "semantic_match" in names:
+            return "deduplicated"
+        return "created"
 
     def preview_content(
         self,

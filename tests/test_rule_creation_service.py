@@ -39,6 +39,26 @@ def test_auto_create_infers_trusted_agent_project_and_exposes_undo(tmp_path):
     assert store.get_record(result.memory_id).status == SharedMemoryStatus.DELETED
 
 
+def test_agent_prefix_cannot_bypass_undo_owner(tmp_path):
+    """Undo ownership is exact: ``codex`` cannot undo ``codex-main``."""
+    store, owner_context = _setup(tmp_path, agent="codex-main")
+    service = RuleCreationService(tmp_path, "team", store=store)
+    created = service.create_rule_from_text(
+        "仅 codex-main 应遵循的规则", owner_context,
+    )
+    assert created.status == "created"
+
+    prefix_context = EffectiveAgentContext(
+        agent_instance_id="codex",
+        share_group_id="team",
+        project_ref=owner_context.project_ref,
+    )
+    denied = service.undo_rule(created.undo_id, prefix_context)
+    assert denied.status == "blocked"
+    assert denied.blocked_reason == "undo permission denied"
+    assert store.get_record(created.memory_id).status == SharedMemoryStatus.ACTIVE
+
+
 def test_auto_scope_rejects_broad_or_other_agent_target(tmp_path):
     store, context = _setup(tmp_path)
     service = RuleCreationService(tmp_path, "team", store=store)

@@ -1269,6 +1269,10 @@ class RuleDecision(Mapping[str, Any]):
     receipt_id: str = ""
     child_rule_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Trusted ownership identity for target-level undo.  ``actor`` remains an
+    # audit/display value and is never parsed with substring matching.
+    # Additive default keeps pre-v4 JSON/SQLite rows readable.
+    owner_agent_id: str = ""
 
     def __post_init__(self) -> None:
         if not self.decision_id or not isinstance(self.decision_id, str):
@@ -1301,6 +1305,7 @@ class RuleDecision(Mapping[str, Any]):
         return {
             "decision_id": self.decision_id,
             "actor": self.actor,
+            "owner_agent_id": self.owner_agent_id,
             "before": self.before,
             "after": self.after,
             "reason": self.reason,
@@ -1350,6 +1355,7 @@ class RuleDecision(Mapping[str, Any]):
         return cls(
             decision_id=str(data.get("decision_id", data.get("event_id", ""))),
             actor=str(data.get("actor", "")),
+            owner_agent_id=str(data.get("owner_agent_id", "")),
             before=data.get("before", {}),
             after=data.get("after", {}),
             reason=str(data.get("reason", "")),
@@ -1463,6 +1469,11 @@ class RuleException:
     created_at: str = ""
     updated_at: str = ""
     exception_id: str = ""
+    # Persistence mutation status is additive metadata returned by the store
+    # when the SQLite transaction committed but JSONL backup degraded.
+    committed: bool = True
+    backup_status: str = "ok"
+    backup_errors: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.parent_rule or not isinstance(self.parent_rule, str):
@@ -1497,6 +1508,9 @@ class RuleException:
             "active": bool(self.active),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "committed": bool(self.committed),
+            "backup_status": self.backup_status,
+            "backup_errors": list(self.backup_errors),
         }
 
     @classmethod
@@ -1513,6 +1527,9 @@ class RuleException:
             active=bool(data.get("active", True)),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
+            committed=bool(data.get("committed", True)),
+            backup_status=str(data.get("backup_status", "ok")),
+            backup_errors=[str(item) for item in (data.get("backup_errors", []) or [])],
         )
 
 
@@ -1799,6 +1816,9 @@ class RuleMutationResult(Mapping[str, Any]):
     exception: Any = None
     decision: Any = None
     status: str = "committed"
+    committed: bool = True
+    backup_status: str = "ok"
+    backup_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1810,6 +1830,13 @@ class RuleMutationResult(Mapping[str, Any]):
             "exception": self.exception,
             "decision": self.decision,
             "status": self.status,
+            "committed": bool(self.committed),
+            "backup_status": self.backup_status,
+            "backup_errors": list(self.backup_errors),
+            # Narrowing callers historically received the final assignment
+            # list directly.  Keep a named projection for the atomic result
+            # while retaining the old parent_assignments_after field.
+            "assignments": list(self.parent_assignments_after),
         }
 
     def __getitem__(self, key: str) -> Any:

@@ -136,6 +136,7 @@ CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt_created ON rule_matc
 CREATE TABLE IF NOT EXISTS rule_decisions (
     decision_id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
+    owner_agent_id TEXT NOT NULL DEFAULT '',
     before_state TEXT NOT NULL DEFAULT '{}',
     after_state TEXT NOT NULL DEFAULT '{}',
     reason TEXT NOT NULL DEFAULT '',
@@ -303,6 +304,7 @@ _RULE_LIFECYCLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rule_decisions (
     decision_id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
+    owner_agent_id TEXT NOT NULL DEFAULT '',
     before_state TEXT NOT NULL DEFAULT '{}',
     after_state TEXT NOT NULL DEFAULT '{}',
     reason TEXT NOT NULL DEFAULT '',
@@ -345,6 +347,31 @@ CREATE TABLE IF NOT EXISTS rule_exceptions (
 CREATE INDEX IF NOT EXISTS idx_rule_exceptions_parent ON rule_exceptions(parent_rule);
 CREATE INDEX IF NOT EXISTS idx_rule_exceptions_child ON rule_exceptions(child_exception);
 """
+
+
+def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
+    """Execute a schema script without ``executescript`` transaction breaks.
+
+    ``sqlite3.Connection.executescript`` implicitly commits any pending
+    transaction before executing its input.  Schema upgrades call this helper
+    while holding ``BEGIN IMMEDIATE``; each complete statement therefore stays
+    inside the caller's transaction and a later failure rolls the whole
+    migration back.  ``sqlite3.complete_statement`` understands trigger
+    bodies, unlike a naïve semicolon split.
+    """
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            conn.execute(statement)
+    if buffer.strip():
+        # A malformed/incomplete schema script must abort the outer
+        # transaction rather than silently leaving a partial migration.
+        raise sqlite3.OperationalError("incomplete SQL schema statement")
 
 # 允许通过 _update_record_field 更新的列（白名单，防 SQL 注入）
 _RECORD_COLUMNS = {
@@ -432,6 +459,10 @@ class SharedMemoryStore:
         self.db_path = self.root / "memory.db"
         self.maintenance_marker = self.root / ".maintenance"
         self._maintenance_override = False
+        # Optional test-only migration checkpoint.  Production leaves this
+        # unset; tests may assign ``lambda name: ...`` to inject a failure at
+        # a named boundary and assert the outer transaction rolls back.
+        self._migration_fault_hook = None
         self.read_only = read_only
         self.must_exist = must_exist
         # JSONL 备份路径
@@ -477,6 +508,24 @@ class SharedMemoryStore:
                           ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+    def _append_jsonl_degraded(
+        self, items: list[tuple[Path, Any]],
+    ) -> tuple[str, list[str]]:
+        """Best-effort sidecar writes after a committed SQLite mutation.
+
+        JSONL is a backup projection, not the transaction's source of truth.
+        A locked/read-only disk must therefore produce a degraded result while
+        preserving the committed database state; every target is attempted so
+        one failed sidecar does not hide later successful backups.
+        """
+        errors: list[str] = []
+        for path, obj in items:
+            try:
+                self._append_jsonl(path, obj)
+            except Exception as exc:  # OSError + test fault injection
+                errors.append(f"{path}: {exc}")
+        return ("ok" if not errors else "degraded"), errors
 
     def export_jsonl_backup(self) -> None:
         """全量导出所有 JSONL 备份（可从 memory.db 重建）。"""
@@ -559,6 +608,11 @@ class SharedMemoryStore:
                 f"memory group is in maintenance: {self.group_id}"
             )
 
+    def _migration_checkpoint(self, name: str) -> None:
+        hook = getattr(self, "_migration_fault_hook", None)
+        if callable(hook):
+            hook(str(name))
+
     @contextlib.contextmanager
     def maintenance(self, reason: str):
         """阻止新写事务，用于导出后清空/归档的一致性窗口。"""
@@ -597,7 +651,7 @@ class SharedMemoryStore:
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='records_fts'"
             ).fetchone() is not None
             self._migrate_records_schema(conn)
-            conn.executescript(_SCHEMA)
+            _execute_sql_script_atomic(conn, _SCHEMA)
             self._migrate_rule_assignments(conn)
             self._migrate_rule_lifecycle_schema(conn)
             if had_records and not had_records_fts:
@@ -606,10 +660,12 @@ class SharedMemoryStore:
                 # its UPDATE trigger can report a malformed index.
                 conn.execute("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
             # S3.2: schema version 标记(在事务内提交)
+            self._migration_checkpoint("schema_version_before")
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4') "
                 "ON CONFLICT(key) DO UPDATE SET value='4'"
             )
+            self._migration_checkpoint("schema_version")
             self._migrate_records_schema(conn)
 
     def _migrate_existing_records_schema(self) -> None:
@@ -626,16 +682,19 @@ class SharedMemoryStore:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 self._migrate_records_schema(conn)
-                conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
+                _execute_sql_script_atomic(conn, _RULE_ASSIGNMENT_SCHEMA)
                 self._migrate_rule_assignments(conn)
-                conn.executescript(_RULE_MATCH_SCHEMA)
+                _execute_sql_script_atomic(conn, _RULE_MATCH_SCHEMA)
                 self._migrate_rule_match_schema(conn)
-                conn.executescript(_RULE_LIFECYCLE_SCHEMA)
+                _execute_sql_script_atomic(conn, _RULE_LIFECYCLE_SCHEMA)
                 self._migrate_rule_lifecycle_schema(conn)
                 conn.execute(
+                    # Upgrade marker is written last; a fault here must
+                    # leave the pre-upgrade schema/version intact.
                     "CREATE TABLE IF NOT EXISTS schema_meta ("
                     "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
                 )
+                self._migration_checkpoint("schema_version_before")
                 conn.execute(
                     "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '4') "
                     "ON CONFLICT(key) DO UPDATE SET value='4'"
@@ -684,7 +743,7 @@ class SharedMemoryStore:
         has_fk = bool(conn.execute("PRAGMA foreign_key_list(rule_assignments)").fetchall())
         if not has_fk:
             conn.execute("ALTER TABLE rule_assignments RENAME TO rule_assignments_legacy")
-            conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
+            _execute_sql_script_atomic(conn, _RULE_ASSIGNMENT_SCHEMA)
             conn.execute(
                 "INSERT OR IGNORE INTO rule_assignments "
                 "(memory_id,target_type,target_id,project_ref,effect,priority_override,created_at,updated_at) "
@@ -759,18 +818,18 @@ class SharedMemoryStore:
                     "INSERT INTO records_fts(records_fts) VALUES ('rebuild')"
                 )
 
-    @staticmethod
-    def _migrate_rule_lifecycle_schema(conn: sqlite3.Connection) -> None:
+    def _migrate_rule_lifecycle_schema(self, conn: sqlite3.Connection) -> None:
         """Create lifecycle tables and repair columns from early prototypes."""
         # ``_SCHEMA`` creates these on a new database.  Read-only upgrade paths
         # call this method after the small receipt schema above, so both paths
         # converge on the same lossless v2 event-stream migration.
-        SharedMemoryStore._migrate_rule_match_schema(conn)
-        conn.executescript(_RULE_LIFECYCLE_SCHEMA)
+        self._migrate_rule_match_schema(conn)
+        _execute_sql_script_atomic(conn, _RULE_LIFECYCLE_SCHEMA)
         # The table definitions above are intentionally additive.  A few
         # development snapshots created the decision table before action and
         # target metadata existed; add those columns without rewriting rows.
         for table, name, sql in (
+            ("rule_decisions", "owner_agent_id", "TEXT NOT NULL DEFAULT ''"),
             ("rule_decisions", "rule_id", "TEXT NOT NULL DEFAULT ''"),
             ("rule_decisions", "action", "TEXT NOT NULL DEFAULT ''"),
             ("rule_decisions", "target_ids", "TEXT NOT NULL DEFAULT '[]'"),
@@ -781,9 +840,12 @@ class SharedMemoryStore:
             }
             if name not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql}")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_decisions_owner "
+            "ON rule_decisions(owner_agent_id)"
+        )
 
-    @staticmethod
-    def _migrate_rule_match_schema(conn: sqlite3.Connection) -> None:
+    def _migrate_rule_match_schema(self, conn: sqlite3.Connection) -> None:
         """Upgrade receipt/feedback tables without probing data rows.
 
         The first feedback stream prototype used ``UNIQUE(receipt_id)`` and
@@ -791,7 +853,7 @@ class SharedMemoryStore:
         cannot repair that table, so old installations are rebuilt in the
         same transaction.  All source rows and primary keys are copied.
         """
-        conn.executescript(_RULE_MATCH_SCHEMA)
+        _execute_sql_script_atomic(conn, _RULE_MATCH_SCHEMA)
 
         receipt_columns = {
             row[1]
@@ -855,6 +917,7 @@ class SharedMemoryStore:
 
         temp_name = "rule_match_feedbacks__v2_migration"
         conn.execute(f"DROP TABLE IF EXISTS {temp_name}")
+        self._migration_checkpoint("feedback_before_new_table")
         conn.execute(
             f"""CREATE TABLE {temp_name} (
                 feedback_id TEXT PRIMARY KEY,
@@ -871,6 +934,7 @@ class SharedMemoryStore:
                     REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
             )"""
         )
+        self._migration_checkpoint("feedback_new_table")
         old_columns = columns
         def _old_or_literal(name: str, literal: str) -> str:
             return name if name in old_columns else literal
@@ -899,10 +963,14 @@ class SharedMemoryStore:
                 ''
             FROM rule_match_feedbacks"""
         )
+        self._migration_checkpoint("feedback_copy")
+        self._migration_checkpoint("feedback_before_drop")
         conn.execute("DROP TABLE rule_match_feedbacks")
+        self._migration_checkpoint("feedback_after_drop")
         conn.execute(
             f"ALTER TABLE {temp_name} RENAME TO rule_match_feedbacks"
         )
+        self._migration_checkpoint("feedback_after_rename")
         conn.execute(
             "CREATE INDEX idx_rule_match_feedbacks_receipt_created "
             "ON rule_match_feedbacks(receipt_id, created_at)"
@@ -1452,10 +1520,11 @@ class SharedMemoryStore:
         d = decision.to_dict()
         conn.execute(
             "INSERT OR REPLACE INTO rule_decisions "
-            "(decision_id,actor,before_state,after_state,reason,confidence,undo_id,"
-            "created_at,rule_id,action,target_ids,metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(decision_id,actor,owner_agent_id,before_state,after_state,reason,confidence,undo_id,"
+            "created_at,rule_id,action,target_ids,metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 d["decision_id"], d["actor"],
+                d.get("owner_agent_id", ""),
                 json.dumps(d.get("before", {}), ensure_ascii=False),
                 json.dumps(d.get("after", {}), ensure_ascii=False),
                 d.get("reason", ""), d.get("confidence", 1.0),
@@ -1492,6 +1561,7 @@ class SharedMemoryStore:
         return RuleDecision(
             decision_id=row["decision_id"],
             actor=row["actor"],
+            owner_agent_id=row["owner_agent_id"] if "owner_agent_id" in columns else "",
             before=self._decode_json_value(row["before_state"], {}),
             after=self._decode_json_value(row["after_state"], {}),
             reason=row["reason"] or "",
@@ -1698,6 +1768,650 @@ class SharedMemoryStore:
             raise
         finally:
             conn.close()
+
+    def apply_rule_create_atomic(
+        self,
+        record: SharedMemoryRecord,
+        event: MemoryEvent | None = None,
+        assignments: list[dict | RuleAssignment] | None = None,
+        decision: RuleDecision | None = None,
+        *,
+        dedup_domain: str = "",
+        automatic: bool = True,
+        actor_agent_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist one rule creation bundle in a single SQLite transaction.
+
+        The bundle contains record, audience assignments, source event and
+        structured decision.  Deduplicated input never replaces/deletes the
+        existing rule: it only merges provenance and records a
+        ``mutation_kind=deduplicated`` decision, allowing an undo to preserve
+        the original rule.
+        """
+        if not isinstance(record, SharedMemoryRecord):
+            record = SharedMemoryRecord.from_dict(dict(record))
+        if event is None:
+            event = MemoryEvent(
+                event_id=stable_hash(
+                    "rule-create-event", self.group_id, record.memory_id,
+                    record.body, record.created_at or _now_iso(),
+                ),
+                agent_instance_id=record.agent_instance_id,
+                share_group_id=self.group_id,
+                raw_content=record.body,
+                created_at=record.created_at or _now_iso(),
+            )
+        elif not isinstance(event, MemoryEvent):
+            event = MemoryEvent.from_dict(dict(event))
+        if event.share_group_id != self.group_id:
+            raise ValueError("event share group mismatch")
+        if decision is not None and not isinstance(decision, RuleDecision):
+            decision = RuleDecision.from_dict(dict(decision))
+        actor_agent_id = actor_agent_id or record.agent_instance_id
+        normalized = self._normalize_assignments(
+            record.memory_id, assignments or [], automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
+        if record.injection_policy == "always" and not normalized:
+            normalized = self._default_assignments(record)
+        if record.injection_policy != "always" and normalized:
+            raise ValueError("rule assignments require injection_policy=always")
+        domain = dedup_domain or self._dedup_domain(
+            record.injection_policy, normalized,
+            writer_id=record.agent_instance_id, memory_id=record.memory_id,
+        )
+        now = _now_iso()
+        if not event.created_at:
+            event = MemoryEvent.from_dict({**event.to_dict(), "created_at": now})
+        persisted_decision: RuleDecision | None = None
+        target_record = record
+        target_assignments = normalized
+        mutation_kind = "created"
+        added_provenance: list[Any] = []
+        with self._tx() as conn:
+            existing_by_id = conn.execute(
+                "SELECT memory_id,status FROM records WHERE memory_id=?",
+                (record.memory_id,),
+            ).fetchone()
+            if existing_by_id is not None and str(existing_by_id["status"]) == SharedMemoryStatus.ACTIVE.value:
+                # A caller retrying the exact ID is idempotent only when its
+                # canonical/domain identity matches the existing row below.
+                pass
+            elif existing_by_id is not None:
+                raise ValueError("record_id_conflict")
+            c_hash = self._canonical_hash(record.body)
+            duplicate = conn.execute(
+                "SELECT * FROM records WHERE canonical_hash=? AND dedup_domain=? "
+                "AND status=? ORDER BY rowid LIMIT 1",
+                (c_hash, domain, SharedMemoryStatus.ACTIVE.value),
+            ).fetchone()
+            if duplicate is not None:
+                mutation_kind = "deduplicated"
+                target_record = self._row_to_record(duplicate)
+                old_provenance = self._safe_json_list(duplicate["provenance"])
+                incoming_provenance = record.to_dict().get("provenance", [])
+                added_provenance = [
+                    item for item in incoming_provenance if item not in old_provenance
+                ]
+                merged = old_provenance + added_provenance
+                if merged != old_provenance:
+                    conn.execute(
+                        "UPDATE records SET provenance=?,updated_at=? WHERE memory_id=?",
+                        (json.dumps(merged, ensure_ascii=False), now, target_record.memory_id),
+                    )
+                    target_record = self._row_to_record(
+                        conn.execute(
+                            "SELECT * FROM records WHERE memory_id=?",
+                            (target_record.memory_id,),
+                        ).fetchone()
+                    )
+                target_assignments = self._list_rule_assignments_conn(
+                    conn, target_record.memory_id,
+                )
+            else:
+                self._validate_mandatory_budget(
+                    record, assignments=normalized, conn=conn,
+                )
+                self._insert_record(conn, record, dedup_domain=domain)
+                self._insert_assignments(conn, record.memory_id, normalized)
+            event_payload = event.to_dict()
+            event_metadata = dict(event_payload.get("metadata", {}))
+            event_metadata.update({
+                "memory_id": target_record.memory_id,
+                "mutation_kind": mutation_kind,
+            })
+            event_payload["metadata"] = event_metadata
+            event = MemoryEvent.from_dict(event_payload)
+            self._insert_event(conn, event)
+            if decision is not None:
+                if not decision.owner_agent_id:
+                    decision.owner_agent_id = actor_agent_id
+                # The planner may pre-fill the candidate ID.  Deduplication
+                # changes the target to the existing active record, so these
+                # identities must always be rewritten to the committed target
+                # (never retain the uncommitted candidate ID).
+                decision.memory_id = target_record.memory_id
+                decision.rule_id = target_record.memory_id
+                if isinstance(decision.after, dict):
+                    after_payload = dict(decision.after)
+                    if isinstance(after_payload.get("record"), dict):
+                        after_payload["record"] = target_record.to_dict()
+                    else:
+                        after_payload.setdefault("memory_id", target_record.memory_id)
+                    decision.after = after_payload
+                decision.metadata = {
+                    **dict(decision.metadata or {}),
+                    "mutation_kind": mutation_kind,
+                    "record_revision_hash": self._canonical_hash(target_record.body),
+                    "memory_id": target_record.memory_id,
+                    "event_id": event.event_id,
+                    "added_provenance": list(added_provenance),
+                }
+                persisted_decision = decision
+                self._insert_rule_decision(conn, persisted_decision)
+            target_record = self._row_to_record(
+                conn.execute(
+                    "SELECT * FROM records WHERE memory_id=?",
+                    (target_record.memory_id,),
+                ).fetchone()
+            )
+            target_assignments = self._list_rule_assignments_conn(
+                conn, target_record.memory_id,
+            )
+        backup_items: list[tuple[Path, Any]] = [(self.events_bak_path, event)]
+        if mutation_kind == "created":
+            backup_items.insert(0, (self.records_bak_path, target_record))
+        if persisted_decision is not None:
+            backup_items.append((self.rule_decisions_bak_path, persisted_decision))
+        backup_status, backup_errors = self._append_jsonl_degraded(backup_items)
+        return {
+            "ok": True,
+            "committed": True,
+            "backup_status": backup_status,
+            "backup_errors": backup_errors,
+            "mutation_kind": mutation_kind,
+            "created": mutation_kind == "created",
+            "memory_id": target_record.memory_id,
+            "record": target_record.to_dict(),
+            "assignments": [item.to_dict() for item in target_assignments],
+            "event": event.to_dict(),
+            "event_id": event.event_id,
+            "decision": persisted_decision.to_dict() if persisted_decision else None,
+        }
+
+    def revert_rule_create_atomic(
+        self,
+        rule_id: str,
+        expected_record_hash: str,
+        decision: RuleDecision | None = None,
+        *,
+        actor_agent_id: str = "",
+    ) -> dict[str, Any]:
+        """Soft-delete one created rule + inverse decision atomically.
+
+        ``expected_record_hash`` is captured at creation time and is required;
+        the store never substitutes a hash read from the current row.  A
+        deduplicated creation is a no-op for the original record and only
+        records the inverse decision.
+        """
+        if not str(expected_record_hash or "").strip():
+            raise ValueError("record_revision_hash_required")
+        if decision is not None and not isinstance(decision, RuleDecision):
+            decision = RuleDecision.from_dict(dict(decision))
+        now = _now_iso()
+        result_record: SharedMemoryRecord | None = None
+        mutation_kind = "created"
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (rule_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("target_rule_not_found")
+            current = self._row_to_record(row)
+            current_hash = str(row["canonical_hash"] or self._canonical_hash(current.body))
+            if current_hash != str(expected_record_hash):
+                raise ValueError("record_revision_conflict")
+            metadata = dict(decision.metadata or {}) if decision is not None else {}
+            mutation_kind = str(metadata.get("mutation_kind") or "created")
+            if mutation_kind == "created":
+                conn.execute(
+                    "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                    (SharedMemoryStatus.DELETED.value, now, rule_id),
+                )
+            elif mutation_kind == "deduplicated":
+                # Undo only this invocation's contribution.  The original
+                # deduplicated rule remains active; append-only JSONL cannot
+                # remove its historical line, so the inverse decision carries
+                # an explicit event/provenance tombstone.
+                added = metadata.get("added_provenance", [])
+                if not isinstance(added, list):
+                    added = []
+                old_provenance = self._safe_json_list(row["provenance"])
+                retained_provenance = [item for item in old_provenance if item not in added]
+                if retained_provenance != old_provenance:
+                    conn.execute(
+                        "UPDATE records SET provenance=?,updated_at=? WHERE memory_id=?",
+                        (json.dumps(retained_provenance, ensure_ascii=False), now, rule_id),
+                    )
+                event_id = str(metadata.get("event_id") or "")
+                if event_id:
+                    conn.execute("DELETE FROM events WHERE event_id=?", (event_id,))
+            else:
+                raise ValueError("unsupported_rule_create_mutation")
+            if decision is None:
+                owner = actor_agent_id or current.agent_instance_id
+                decision = RuleDecision(
+                    decision_id=stable_hash("rule-create-undo", rule_id, now),
+                    actor=f"agent:{owner}" if owner else "user",
+                    owner_agent_id=owner,
+                    before={"memory_id": rule_id, "status": current.status.value},
+                    after={"memory_id": rule_id, "status": SharedMemoryStatus.DELETED.value},
+                    reason="target-level undo of rule create",
+                    confidence=1.0,
+                    created_at=now,
+                    rule_id=rule_id,
+                    action="rule_create_undo",
+                    memory_id=rule_id,
+                    status="undone",
+                    metadata={"mutation_kind": mutation_kind},
+                )
+            elif not decision.owner_agent_id:
+                decision.owner_agent_id = actor_agent_id or current.agent_instance_id
+            decision.metadata = {
+                **dict(decision.metadata or {}),
+                "mutation_kind": mutation_kind,
+                "record_revision_hash": str(expected_record_hash),
+                "inverse_event_id": str(metadata.get("event_id") or ""),
+                "inverse_provenance": metadata.get("added_provenance", []),
+            }
+            self._insert_rule_decision(conn, decision)
+            result_record = self._row_to_record(
+                conn.execute(
+                    "SELECT * FROM records WHERE memory_id=?", (rule_id,),
+                ).fetchone()
+            )
+        backup_status, backup_errors = self._append_jsonl_degraded([
+            (self.records_bak_path, result_record),
+            (self.rule_decisions_bak_path, decision),
+        ])
+        return {
+            "ok": True,
+            "committed": True,
+            "backup_status": backup_status,
+            "backup_errors": backup_errors,
+            "mutation_kind": mutation_kind,
+            "undone": mutation_kind == "created",
+            "memory_id": rule_id,
+            "record": result_record.to_dict() if result_record else None,
+            "decision": decision.to_dict() if decision else None,
+        }
+
+    def apply_rule_lifecycle_atomic(
+        self,
+        record: SharedMemoryRecord,
+        event: MemoryEvent,
+        decision: RuleDecision | None = None,
+        *,
+        mutation_kind: str,
+        assignments: list[dict | RuleAssignment] | None = None,
+        old_record_ids: list[str] | None = None,
+        conflict_group: ConflictGroup | None = None,
+        quarantine_entry: QuarantineEntry | None = None,
+        actor_agent_id: str = "",
+        automatic: bool = True,
+    ) -> dict[str, Any]:
+        """Atomically persist supersede/conflict/quarantine lifecycle writes.
+
+        ``organize()`` historically wrote the candidate, then changed old
+        records/groups in separate calls.  This seam accepts the already
+        planned objects and commits every fact plus event/decision together.
+        No planner or model inference runs inside the transaction.
+        """
+        allowed = {"superseded", "conflicted", "quarantined"}
+        mutation_kind = str(mutation_kind or "").strip().lower()
+        if mutation_kind not in allowed:
+            raise ValueError("unsupported_rule_lifecycle_mutation")
+        if not isinstance(record, SharedMemoryRecord):
+            record = SharedMemoryRecord.from_dict(dict(record))
+        if not isinstance(event, MemoryEvent):
+            event = MemoryEvent.from_dict(dict(event))
+        if event.share_group_id != self.group_id:
+            raise ValueError("event share group mismatch")
+        if decision is not None and not isinstance(decision, RuleDecision):
+            decision = RuleDecision.from_dict(dict(decision))
+        if conflict_group is not None and not isinstance(conflict_group, ConflictGroup):
+            conflict_group = ConflictGroup.from_dict(dict(conflict_group))
+        if quarantine_entry is not None and not isinstance(quarantine_entry, QuarantineEntry):
+            quarantine_entry = QuarantineEntry.from_dict(dict(quarantine_entry))
+        actor_agent_id = actor_agent_id or record.agent_instance_id
+        old_ids = [str(item) for item in (old_record_ids or []) if str(item)]
+        if mutation_kind == "superseded" and not old_ids:
+            old_ids = [str(item) for item in record.supersedes if str(item)]
+        if mutation_kind == "conflicted" and conflict_group is None:
+            conflict_group = ConflictGroup(
+                group_id=stable_hash(
+                    "auto-conflict", self.group_id, record.memory_id,
+                    event.event_id,
+                ),
+                member_ids=[*old_ids, record.memory_id],
+                reason="automatic conflict",
+                created_at=event.created_at or _now_iso(),
+            )
+        if mutation_kind == "conflicted":
+            conflict_group.member_ids = list(dict.fromkeys(
+                [*conflict_group.member_ids, *old_ids, record.memory_id]
+            ))
+            record.conflict_group_id = conflict_group.group_id
+            record.status = SharedMemoryStatus.CONFLICTED
+        if mutation_kind == "quarantined":
+            if quarantine_entry is None:
+                quarantine_entry = QuarantineEntry(
+                    quarantine_id=stable_hash(
+                        "quarantine", record.memory_id,
+                        event.event_id, event.created_at or _now_iso(),
+                    ),
+                    memory_id=record.memory_id,
+                    reason="automatic quarantine",
+                    detected_pattern="",
+                    original_content=event.raw_content,
+                    quarantined_at=event.created_at or _now_iso(),
+                )
+            if quarantine_entry.memory_id != record.memory_id:
+                raise ValueError("quarantine_memory_mismatch")
+            record.status = SharedMemoryStatus.QUARANTINED
+
+        normalized = self._normalize_assignments(
+            record.memory_id, assignments or [], automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
+        if record.injection_policy == "always" and not normalized:
+            normalized = self._default_assignments(record)
+        now = _now_iso()
+        before_records: dict[str, dict[str, Any]] = {}
+        after_hash = self._canonical_hash(record.body)
+        with self._tx() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM records WHERE memory_id=?", (record.memory_id,)
+            ).fetchone()
+            if existing is not None:
+                raise ValueError("lifecycle_record_exists")
+            for old_id in old_ids:
+                row = conn.execute(
+                    "SELECT * FROM records WHERE memory_id=?", (old_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError("lifecycle_old_record_not_found")
+                old = self._row_to_record(row)
+                before_records[old_id] = {
+                    "status": old.status.value,
+                    "hash": self._canonical_hash(old.body),
+                    "conflict_group_id": old.conflict_group_id,
+                }
+            self._validate_mandatory_budget(
+                record, assignments=normalized, conn=conn,
+            )
+            self._insert_record(
+                conn, record,
+                dedup_domain=self._dedup_domain(
+                    record.injection_policy, normalized,
+                    writer_id=record.agent_instance_id,
+                    memory_id=record.memory_id,
+                ),
+            )
+            self._insert_assignments(conn, record.memory_id, normalized)
+            if mutation_kind == "superseded":
+                for old_id in old_ids:
+                    conn.execute(
+                        "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                        (SharedMemoryStatus.SHADOWED.value, now, old_id),
+                    )
+            elif mutation_kind == "conflicted":
+                for old_id in old_ids:
+                    conn.execute(
+                        "UPDATE records SET status=?,conflict_group_id=?,updated_at=? "
+                        "WHERE memory_id=?",
+                        (SharedMemoryStatus.CONFLICTED.value, conflict_group.group_id, now, old_id),
+                    )
+                self._insert_conflict(conn, conflict_group)
+            elif mutation_kind == "quarantined":
+                self._insert_quarantine(conn, quarantine_entry)
+
+            event_payload = event.to_dict()
+            event_meta = dict(event_payload.get("metadata", {}))
+            event_meta.update({
+                "memory_id": record.memory_id,
+                "mutation_kind": mutation_kind,
+            })
+            event = MemoryEvent.from_dict({**event_payload, "metadata": event_meta})
+            self._insert_event(conn, event)
+            if decision is None:
+                decision = RuleDecision(
+                    decision_id=stable_hash(
+                        "lifecycle-decision", self.group_id,
+                        mutation_kind, record.memory_id, event.event_id,
+                    ),
+                    actor=f"agent:{actor_agent_id}" if actor_agent_id else "auto",
+                    owner_agent_id=actor_agent_id,
+                    before={"records": before_records},
+                    after={"record": record.to_dict()},
+                    reason=mutation_kind,
+                    confidence=float(record.confidence),
+                    created_at=now,
+                    rule_id=record.memory_id,
+                    action=f"rule_{mutation_kind}",
+                )
+            decision.memory_id = record.memory_id
+            decision.rule_id = record.memory_id
+            if not decision.owner_agent_id:
+                decision.owner_agent_id = actor_agent_id
+            decision.metadata = {
+                **dict(decision.metadata or {}),
+                "mutation_kind": mutation_kind,
+                "record_revision_hash": after_hash,
+                "event_id": event.event_id,
+                "old_record_ids": list(old_ids),
+                "old_record_hashes": {
+                    key: value["hash"] for key, value in before_records.items()
+                },
+                "old_record_statuses": {
+                    key: value["status"] for key, value in before_records.items()
+                },
+                "old_record_post_statuses": {
+                    key: (
+                        SharedMemoryStatus.SHADOWED.value
+                        if mutation_kind == "superseded"
+                        else SharedMemoryStatus.CONFLICTED.value
+                    )
+                    for key in before_records
+                },
+                "conflict_group_id": conflict_group.group_id if conflict_group else "",
+                "quarantine_id": quarantine_entry.quarantine_id if quarantine_entry else "",
+            }
+            if isinstance(decision.after, dict):
+                after_payload = dict(decision.after)
+                after_payload["record"] = record.to_dict()
+                decision.after = after_payload
+            self._insert_rule_decision(conn, decision)
+        backup_items: list[tuple[Path, Any]] = [
+            (self.records_bak_path, record),
+            (self.events_bak_path, event),
+            (self.rule_decisions_bak_path, decision),
+        ]
+        if conflict_group is not None:
+            backup_items.append((self.conflicts_bak_path, conflict_group))
+        if quarantine_entry is not None:
+            backup_items.append((self.quarantine_bak_path, quarantine_entry))
+        backup_status, backup_errors = self._append_jsonl_degraded(backup_items)
+        return {
+            "ok": True,
+            "committed": True,
+            "backup_status": backup_status,
+            "backup_errors": backup_errors,
+            "mutation_kind": mutation_kind,
+            "memory_id": record.memory_id,
+            "target_ids": [record.memory_id, *old_ids],
+            "record": record.to_dict(),
+            "assignments": [item.to_dict() for item in normalized],
+            "record_hashes": {
+                record.memory_id: after_hash,
+                **{key: value["hash"] for key, value in before_records.items()},
+            },
+            "event_id": event.event_id,
+            "decision": decision.to_dict(),
+            "undo_metadata": dict(decision.metadata),
+            "conflict_group": conflict_group.to_dict() if conflict_group else None,
+            "quarantine": quarantine_entry.to_dict() if quarantine_entry else None,
+        }
+
+    def revert_rule_lifecycle_atomic(
+        self,
+        decision: RuleDecision | dict[str, Any],
+        expected_record_hash: str = "",
+        *,
+        inverse_decision: RuleDecision | None = None,
+    ) -> dict[str, Any]:
+        """Undo one supersede/conflict/quarantine mutation with fixed hashes."""
+        if not isinstance(decision, RuleDecision):
+            decision = RuleDecision.from_dict(dict(decision))
+        metadata = dict(decision.metadata or {})
+        mutation_kind = str(metadata.get("mutation_kind") or "").strip().lower()
+        if mutation_kind not in {"superseded", "conflicted", "quarantined"}:
+            raise ValueError("unsupported_rule_lifecycle_mutation")
+        expected = str(expected_record_hash or metadata.get("record_revision_hash") or "").strip()
+        if not expected:
+            raise ValueError("structured_inverse_revision_missing")
+        memory_id = str(decision.memory_id or decision.rule_id or "")
+        if not memory_id:
+            raise ValueError("structured_lifecycle_target_missing")
+        old_ids = [str(item) for item in metadata.get("old_record_ids", []) if str(item)]
+        old_hashes = dict(metadata.get("old_record_hashes", {}) or {})
+        now = _now_iso()
+        tombstone: QuarantineEntry | None = None
+        group_after: ConflictGroup | None = None
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("lifecycle_target_not_found")
+            current = self._row_to_record(row)
+            if self._canonical_hash(current.body) != expected:
+                raise ValueError("lifecycle_record_revision_conflict")
+            expected_target_status = {
+                "superseded": SharedMemoryStatus.ACTIVE,
+                "conflicted": SharedMemoryStatus.CONFLICTED,
+                "quarantined": SharedMemoryStatus.QUARANTINED,
+            }[mutation_kind]
+            if current.status != expected_target_status:
+                raise ValueError("lifecycle_target_state_conflict")
+            old_statuses = dict(metadata.get("old_record_statuses", {}) or {})
+            old_post_statuses = dict(
+                metadata.get("old_record_post_statuses", {})
+                or old_statuses
+            )
+            for old_id in old_ids:
+                old_row = conn.execute(
+                    "SELECT * FROM records WHERE memory_id=?", (old_id,)
+                ).fetchone()
+                if old_row is None:
+                    raise ValueError("lifecycle_old_record_not_found")
+                old = self._row_to_record(old_row)
+                expected_old = str(old_hashes.get(old_id) or "")
+                if expected_old and self._canonical_hash(old.body) != expected_old:
+                    raise ValueError("lifecycle_old_record_revision_conflict")
+                expected_old_status = str(old_post_statuses.get(old_id) or "")
+                if expected_old_status and old.status.value != expected_old_status:
+                    raise ValueError("lifecycle_old_record_state_conflict")
+            if mutation_kind == "superseded":
+                conn.execute(
+                    "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                    (SharedMemoryStatus.DELETED.value, now, memory_id),
+                )
+                for old_id in old_ids:
+                    conn.execute(
+                        "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                        (str(old_statuses.get(old_id) or SharedMemoryStatus.ACTIVE.value), now, old_id),
+                    )
+            elif mutation_kind == "conflicted":
+                conn.execute(
+                    "UPDATE records SET status=?,conflict_group_id='',updated_at=? WHERE memory_id=?",
+                    (SharedMemoryStatus.DELETED.value, now, memory_id),
+                )
+                group_id = str(metadata.get("conflict_group_id") or "")
+                if group_id:
+                    group_row = conn.execute(
+                        "SELECT * FROM conflicts WHERE group_id=?", (group_id,)
+                    ).fetchone()
+                    if group_row is not None:
+                        group_after = self._row_to_conflict(group_row)
+                        group_after.member_ids = [
+                            item for item in group_after.member_ids if item != memory_id
+                        ]
+                        if group_after.member_ids:
+                            self._insert_conflict(conn, group_after)
+                        else:
+                            conn.execute("DELETE FROM conflicts WHERE group_id=?", (group_id,))
+            else:
+                conn.execute(
+                    "UPDATE records SET status=?,updated_at=? WHERE memory_id=?",
+                    (SharedMemoryStatus.DELETED.value, now, memory_id),
+                )
+                tombstone = QuarantineEntry(
+                    quarantine_id=stable_hash("quarantine-undo", memory_id, decision.decision_id),
+                    memory_id=memory_id,
+                    reason=f"undo quarantine {decision.decision_id}",
+                    detected_pattern="undo_tombstone",
+                    original_content=current.body,
+                    quarantined_at=now,
+                    released=True,
+                )
+                self._insert_quarantine(conn, tombstone)
+            if inverse_decision is None:
+                inverse_decision = RuleDecision(
+                    decision_id=stable_hash("lifecycle-undo", decision.decision_id, now),
+                    actor="user",
+                    owner_agent_id=decision.owner_agent_id,
+                    before=decision.after,
+                    after={"memory_id": memory_id, "status": SharedMemoryStatus.DELETED.value},
+                    reason=f"undo {decision.decision_id}",
+                    confidence=decision.confidence,
+                    undo_id=decision.decision_id,
+                    created_at=now,
+                    rule_id=memory_id,
+                    action=f"rule_{mutation_kind}_undo",
+                    memory_id=memory_id,
+                    status="undone",
+                )
+            inverse_decision.metadata = {
+                **dict(inverse_decision.metadata or {}),
+                "target_undo": True,
+                "mutation_kind": mutation_kind,
+                "record_revision_hash": expected,
+                "undo_of": decision.decision_id,
+            }
+            self._insert_rule_decision(conn, inverse_decision)
+        backup_items: list[tuple[Path, Any]] = [
+            (self.records_bak_path, current),
+            (self.rule_decisions_bak_path, inverse_decision),
+        ]
+        if tombstone is not None:
+            backup_items.append((self.quarantine_bak_path, tombstone))
+        if group_after is not None:
+            backup_items.append((self.conflicts_bak_path, group_after))
+        backup_status, backup_errors = self._append_jsonl_degraded(backup_items)
+        return {
+            "ok": True,
+            "committed": True,
+            "backup_status": backup_status,
+            "backup_errors": backup_errors,
+            "mutation_kind": mutation_kind,
+            "undone": True,
+            "memory_id": memory_id,
+            "target_ids": [memory_id, *old_ids],
+            "decision": inverse_decision.to_dict(),
+            "tombstone": tombstone.to_dict() if tombstone else None,
+            "conflict_group": group_after.to_dict() if group_after else None,
+        }
 
     def append_record(
         self, record: SharedMemoryRecord, *,
@@ -2202,7 +2916,13 @@ class SharedMemoryStore:
         child rule, deactivates relation, and writes optional inverse decision.
         If a later parent edit changed the recorded revision, fail closed.
         """
+        # The inverse must carry the revision captured when the exception was
+        # created.  Reading the current hash here would make the optimistic
+        # guard tautological and silently overwrite a later human edit.
+        if not str(expected_parent_assignment_hash or "").strip():
+            raise ValueError("parent_assignments_after_hash_required")
         now = _now_iso()
+        transferred_sibling: RuleException | None = None
         with self._tx() as conn:
             row = conn.execute(
                 "SELECT * FROM rule_exceptions WHERE exception_id=?",
@@ -2219,21 +2939,15 @@ class SharedMemoryStore:
                 "SELECT * FROM records WHERE memory_id=?", (parent_rule_id,)
             ).fetchone()
             parent_assignments: list[RuleAssignment] = []
-            if parent_row is not None:
-                parent_assignments = self._list_rule_assignments_conn(
-                    conn, parent_rule_id,
-                )
-                current_hash = self._assignment_hash(parent_assignments)
-                expected_candidates = [
-                    str(expected_parent_assignment_hash or ""),
-                    str(rollback.get("parent_assignments_after_hash") or ""),
-                ]
-                checks = [candidate for candidate in expected_candidates if candidate]
-                if checks and not any(
-                    self._assignment_hash_matches(candidate, parent_assignments)
-                    for candidate in checks
-                ):
-                    raise ValueError("parent_assignment_revision_conflict")
+            if parent_row is None:
+                raise ValueError("parent_rule_not_found")
+            parent_assignments = self._list_rule_assignments_conn(
+                conn, parent_rule_id,
+            )
+            if not self._assignment_hash_matches(
+                str(expected_parent_assignment_hash), parent_assignments,
+            ):
+                raise ValueError("parent_assignment_revision_conflict")
 
             generated = rollback.get("generated_parent_assignment")
             generated_id = str(
@@ -2262,6 +2976,7 @@ class SharedMemoryStore:
                 str(generated.get("effect") or "exclude"),
             )
             sibling_projects: set[tuple[str, str, str, str]] = set()
+            sibling_relations: list[tuple[RuleException, dict[str, Any], bool]] = []
             siblings = conn.execute(
                 "SELECT * FROM rule_exceptions WHERE parent_rule=? "
                 "AND active=1 AND exception_id<>?",
@@ -2274,6 +2989,13 @@ class SharedMemoryStore:
                 if not isinstance(sibling_generated, dict) or not sibling_generated:
                     sibling_generated = sibling_rollback.get("generated_parent_assignment")
                 if isinstance(sibling_generated, dict):
+                    sibling_added = sibling_rollback.get("generated_parent_assignment_added")
+                    if sibling_added is None:
+                        sibling_added = bool(
+                            sibling_rollback.get("generated_parent_assignment_id")
+                            or sibling_generated
+                        )
+                    sibling_relations.append((sibling, dict(sibling_generated), bool(sibling_added)))
                     sibling_projects.add((
                         str(sibling_generated.get("target_type") or "agent_project"),
                         str(sibling_generated.get("target_id") or ""),
@@ -2318,6 +3040,39 @@ class SharedMemoryStore:
                     ),
                 )
 
+            # If this relation was the first creator of a shared exclude but a
+            # sibling exception is still active, transfer ownership metadata to
+            # that sibling.  The last sibling can then remove the generated
+            # exclude; a pre-existing exclude (no owner ever recorded) remains.
+            if has_generated_metadata and sibling_relations:
+                transfer = next(
+                    (
+                        (sibling, scope)
+                        for sibling, scope, _added in sibling_relations
+                        if (
+                            str(scope.get("target_type") or "agent_project"),
+                            str(scope.get("target_id") or ""),
+                            canonical_project_ref(str(scope.get("project_ref") or "")),
+                            str(scope.get("effect") or "exclude"),
+                        ) == generated_key
+                    ),
+                    None,
+                )
+                if transfer is not None:
+                    sibling, _scope = transfer
+                    sibling_rollback = (
+                        dict(sibling.rollback)
+                        if isinstance(sibling.rollback, dict) else {}
+                    )
+                    sibling_rollback["generated_parent_assignment_added"] = True
+                    sibling_rollback["generated_parent_assignment"] = dict(generated)
+                    if generated_id:
+                        sibling_rollback["generated_parent_assignment_id"] = generated_id
+                    sibling.rollback = sibling_rollback
+                    sibling.updated_at = now
+                    self._insert_rule_exception(conn, sibling)
+                    transferred_sibling = sibling
+
             child_rule_id = str(
                 rollback.get("child_rule_id") or current.child_exception
             )
@@ -2338,9 +3093,17 @@ class SharedMemoryStore:
                 (exception_id,),
             ).fetchone()
         result = self._row_to_rule_exception(row)
-        self._append_jsonl(self.rule_exceptions_bak_path, result)
+        backup_items: list[tuple[Path, Any]] = [
+            (self.rule_exceptions_bak_path, result),
+        ]
+        if transferred_sibling is not None:
+            backup_items.append((self.rule_exceptions_bak_path, transferred_sibling))
         if decision is not None:
-            self._append_jsonl(self.rule_decisions_bak_path, decision)
+            backup_items.append((self.rule_decisions_bak_path, decision))
+        backup_status, backup_errors = self._append_jsonl_degraded(backup_items)
+        result.committed = True
+        result.backup_status = backup_status
+        result.backup_errors = backup_errors
         return result
 
     rollback_rule_exception_atomic = revert_rule_exception
@@ -2893,12 +3656,25 @@ class SharedMemoryStore:
             )
         # Backups are deliberately outside the DB transaction; a sidecar
         # failure cannot turn a committed atomic mutation into a partial DB.
-        self._append_jsonl(self.records_bak_path, child_record)
+        backup_items: list[tuple[Path, Any]] = [(self.records_bak_path, child_record)]
         if persisted_exception is not None:
-            self._append_jsonl(self.rule_exceptions_bak_path, persisted_exception)
+            backup_items.append((self.rule_exceptions_bak_path, persisted_exception))
         if decision is not None:
-            self._append_jsonl(self.rule_decisions_bak_path, decision)
-        return result
+            backup_items.append((self.rule_decisions_bak_path, decision))
+        backup_status, backup_errors = self._append_jsonl_degraded(backup_items)
+        return RuleMutationResult(
+            parent_rule_id=result.parent_rule_id,
+            child_record=result.child_record,
+            child_assignments=result.child_assignments,
+            parent_assignments_before=result.parent_assignments_before,
+            parent_assignments_after=result.parent_assignments_after,
+            exception=result.exception,
+            decision=result.decision,
+            status="committed",
+            committed=True,
+            backup_status=backup_status,
+            backup_errors=backup_errors,
+        )
 
     def apply_rule_exception_atomic(
         self,
@@ -2989,9 +3765,21 @@ class SharedMemoryStore:
                 if not isinstance(decision, RuleDecision):
                     decision = RuleDecision.from_dict(dict(decision))
                 self._insert_rule_decision(conn, decision)
+        backup_status, backup_errors = ("ok", [])
         if decision is not None:
-            self._append_jsonl(self.rule_decisions_bak_path, decision)
-        return self.list_rule_assignments(parent_rule_id)
+            backup_status, backup_errors = self._append_jsonl_degraded([
+                (self.rule_decisions_bak_path, decision),
+            ])
+        return RuleMutationResult(
+            parent_rule_id=parent_rule_id,
+            parent_assignments_before=current,
+            parent_assignments_after=normalized,
+            decision=decision,
+            status="committed",
+            committed=True,
+            backup_status=backup_status,
+            backup_errors=backup_errors,
+        )
 
     def replace_actor_assignment(
         self, memory_id: str, actor_agent_id: str,

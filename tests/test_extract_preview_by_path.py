@@ -4,9 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 import os
 import tempfile
+import pytest
 
-os.environ.setdefault("MEMORYGUARD_ADMIN", "1")
-os.environ.setdefault("MEMORYGUARD_ALLOW_ANON", "1")
+
+@pytest.fixture(autouse=True)
+def _isolated_test_env(monkeypatch):
+    """Keep admin/anonymous test capabilities scoped to each test."""
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
 
 def test_extract_preview_by_path_allows_discovered_session(tmp_path, monkeypatch):

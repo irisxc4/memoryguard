@@ -14,173 +14,144 @@ import json
 import tempfile
 import sqlite3
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
-def test_cross_group_dup_canonical_hash():
+def test_cross_group_dup_canonical_hash(monkeypatch):
     """A1: 跨组重复检测用 canonical_hash,前 100 字相同但后文不同不误报。"""
     from memoryguard.gui import GovernanceApi
     from memoryguard.schema_v3 import MemoryEvent
     from memoryguard.auto_organizer import AutoOrganizer
 
-    old_env = dict(os.environ)
-    try:
-        os.environ["MEMORYGUARD_ADMIN"] = "1"
-        os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "0"
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
 
-        with tempfile.TemporaryDirectory() as ws:
-            api = GovernanceApi(ws)
-            api.bind_agent("agent-a", "g1", _admin_override=True)
-            api.bind_agent("agent-b", "g2", _admin_override=True)
+    with tempfile.TemporaryDirectory() as ws:
+        api = GovernanceApi(ws)
+        api.bind_agent("agent-a", "g1", _admin_override=True)
+        api.bind_agent("agent-b", "g2", _admin_override=True)
 
-            # 前 100 字相同,后文不同(前缀法会误报)
-            prefix = "A" * 100
-            org1 = AutoOrganizer(ws, "g1")
-            org1.organize(MemoryEvent(
-                event_id="e1", agent_instance_id="agent-a", share_group_id="g1",
-                raw_content=prefix + " 后续内容A完全不同", metadata={},
-            ))
-            org2 = AutoOrganizer(ws, "g2")
-            org2.organize(MemoryEvent(
-                event_id="e2", agent_instance_id="agent-b", share_group_id="g2",
-                raw_content=prefix + " 后续内容B完全不同", metadata={},
-            ))
+        # 前 100 字相同,后文不同(前缀法会误报)
+        prefix = "A" * 100
+        org1 = AutoOrganizer(ws, "g1")
+        org1.organize(MemoryEvent(
+            event_id="e1", agent_instance_id="agent-a", share_group_id="g1",
+            raw_content=prefix + " 后续内容A完全不同", metadata={},
+        ))
+        org2 = AutoOrganizer(ws, "g2")
+        org2.organize(MemoryEvent(
+            event_id="e2", agent_instance_id="agent-b", share_group_id="g2",
+            raw_content=prefix + " 后续内容B完全不同", metadata={},
+        ))
 
-            result = api.get_global_memory_status()
-            dups = result["cross_group_duplicates"]
-            # canonical_hash 不同 -> 不应判为重复
-            assert len(dups) == 0, f"should not detect dups for different content: {dups}"
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+        result = api.get_global_memory_status()
+        dups = result["cross_group_duplicates"]
+        # canonical_hash 不同 -> 不应判为重复
+        assert len(dups) == 0, f"should not detect dups for different content: {dups}"
 
 
-def test_cross_group_dup_same_content_detected():
+def test_cross_group_dup_same_content_detected(monkeypatch):
     """A1: 真正相同内容(不同 group)被检测为重复。"""
     from memoryguard.gui import GovernanceApi
     from memoryguard.schema_v3 import MemoryEvent
     from memoryguard.auto_organizer import AutoOrganizer
 
-    old_env = dict(os.environ)
-    try:
-        os.environ["MEMORYGUARD_ADMIN"] = "1"
-        os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "0"
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
 
-        with tempfile.TemporaryDirectory() as ws:
-            api = GovernanceApi(ws)
-            api.bind_agent("agent-a", "g1", _admin_override=True)
-            api.bind_agent("agent-b", "g2", _admin_override=True)
+    with tempfile.TemporaryDirectory() as ws:
+        api = GovernanceApi(ws)
+        api.bind_agent("agent-a", "g1", _admin_override=True)
+        api.bind_agent("agent-b", "g2", _admin_override=True)
 
-            same = "完全相同的跨组内容用于测试"
-            org1 = AutoOrganizer(ws, "g1")
-            org1.organize(MemoryEvent(
-                event_id="e1", agent_instance_id="agent-a", share_group_id="g1",
-                raw_content=same, metadata={},
-            ))
-            org2 = AutoOrganizer(ws, "g2")
-            org2.organize(MemoryEvent(
-                event_id="e2", agent_instance_id="agent-b", share_group_id="g2",
-                raw_content=same, metadata={},
-            ))
+        same = "完全相同的跨组内容用于测试"
+        org1 = AutoOrganizer(ws, "g1")
+        org1.organize(MemoryEvent(
+            event_id="e1", agent_instance_id="agent-a", share_group_id="g1",
+            raw_content=same, metadata={},
+        ))
+        org2 = AutoOrganizer(ws, "g2")
+        org2.organize(MemoryEvent(
+            event_id="e2", agent_instance_id="agent-b", share_group_id="g2",
+            raw_content=same, metadata={},
+        ))
 
-            result = api.get_global_memory_status()
-            dups = result["cross_group_duplicates"]
-            assert len(dups) >= 1, "should detect same content as dup"
-            assert "canonical_hash" in dups[0]
-            assert len(dups[0]["share_group_ids"]) >= 2
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+        result = api.get_global_memory_status()
+        dups = result["cross_group_duplicates"]
+        assert len(dups) >= 1, "should detect same content as dup"
+        assert "canonical_hash" in dups[0]
+        assert len(dups[0]["share_group_ids"]) >= 2
 
 
-def test_gui_bind_agent_non_admin_denied():
+def test_gui_bind_agent_non_admin_denied(monkeypatch):
     """A2: GUI bind_agent 非 admin 被拒。"""
     from memoryguard.gui import GovernanceApi
 
-    old_env = dict(os.environ)
-    try:
-        os.environ.pop("MEMORYGUARD_ADMIN", None)
-        os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
+    monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
-        with tempfile.TemporaryDirectory() as ws:
-            api = GovernanceApi(ws)
-            result = api.bind_agent("agent-a", "g1")
-            assert not result.get("ok"), "non-admin bind should fail"
-            assert "admin" in result.get("error", "")
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    with tempfile.TemporaryDirectory() as ws:
+        api = GovernanceApi(ws)
+        result = api.bind_agent("agent-a", "g1")
+        assert not result.get("ok"), "non-admin bind should fail"
+        assert "admin" in result.get("error", "")
 
 
-def test_gui_bind_agent_admin_override():
+def test_gui_bind_agent_admin_override(monkeypatch):
     """A2: admin 或 _admin_override 可绑定。"""
     from memoryguard.gui import GovernanceApi
 
-    old_env = dict(os.environ)
-    try:
-        os.environ.pop("MEMORYGUARD_ADMIN", None)
-        os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
+    monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
-        with tempfile.TemporaryDirectory() as ws:
-            api = GovernanceApi(ws)
-            # _admin_override=True 绕过(本地 GUI 场景)
-            result = api.bind_agent("agent-a", "g1", _admin_override=True)
-            assert result.get("ok"), f"admin_override should work: {result}"
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    with tempfile.TemporaryDirectory() as ws:
+        api = GovernanceApi(ws)
+        # _admin_override=True 绕过(本地 GUI 场景)
+        result = api.bind_agent("agent-a", "g1", _admin_override=True)
+        assert result.get("ok"), f"admin_override should work: {result}"
 
 
-def test_preflight_check_prints_status():
+def test_preflight_check_prints_status(monkeypatch):
     """A3: preflight_check 打印身份权限态。"""
     from memoryguard.access_context import load_access_context, preflight_check
 
-    old_env = dict(os.environ)
-    try:
-        os.environ["MEMORYGUARD_AGENT_ID"] = "test-agent"
-        os.environ["MEMORYGUARD_ADMIN"] = "1"
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
-        os.environ.pop("MEMORYGUARD_ALLOW_ANON", None)
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "test-agent")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.delenv("MEMORYGUARD_ALLOW_ANON", raising=False)
 
-        buf = io.StringIO()
-        ctx = load_access_context()
-        warnings = preflight_check(ctx, stream=buf)
-        output = buf.getvalue()
+    buf = io.StringIO()
+    ctx = load_access_context()
+    warnings = preflight_check(ctx, stream=buf)
+    output = buf.getvalue()
 
-        assert "agent_id=test-agent" in output
-        assert "admin=ON" in output
-        assert "strict_binding=ON" in output
-        assert len(warnings) == 0, f"should have no warnings: {warnings}"
-        assert "preflight OK" in output
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    assert "agent_id=test-agent" in output
+    assert "admin=ON" in output
+    assert "strict_binding=ON" in output
+    assert len(warnings) == 0, f"should have no warnings: {warnings}"
+    assert "preflight OK" in output
 
 
-def test_preflight_check_warns_missing_agent():
+def test_preflight_check_warns_missing_agent(monkeypatch):
     """A3: 缺身份时预检告警。"""
     from memoryguard.access_context import load_access_context, preflight_check
 
-    old_env = dict(os.environ)
-    try:
-        for k in ["MEMORYGUARD_AGENT_ID", "MEMORYGUARD_ADMIN", "MEMORYGUARD_ALLOW_ANON"]:
-            os.environ.pop(k, None)
-        os.environ["MEMORYGUARD_STRICT_BINDING"] = "1"
+    for k in ["MEMORYGUARD_AGENT_ID", "MEMORYGUARD_ADMIN", "MEMORYGUARD_ALLOW_ANON"]:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
-        buf = io.StringIO()
-        ctx = load_access_context()
-        warnings = preflight_check(ctx, stream=buf)
-        output = buf.getvalue()
+    buf = io.StringIO()
+    ctx = load_access_context()
+    warnings = preflight_check(ctx, stream=buf)
+    output = buf.getvalue()
 
-        assert any("AGENT_ID not set" in w for w in warnings)
-        assert any("ADMIN not set" in w for w in warnings)
-        assert "WARNING" in output
-    finally:
-        os.environ.clear()
-        os.environ.update(old_env)
+    assert any("AGENT_ID not set" in w for w in warnings)
+    assert any("ADMIN not set" in w for w in warnings)
+    assert "WARNING" in output
 
 
 def test_fts5_search_recall():

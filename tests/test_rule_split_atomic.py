@@ -65,6 +65,41 @@ def test_narrowing_aggregates_receipts_sessions_and_preserves_excludes(tmp_path)
     assert any(item.effect == "exclude" and Path(item.project_ref).name == "other" for item in assignments)
 
 
+def test_narrow_undo_rejects_later_parent_edit(tmp_path):
+    """A parent assignment edit invalidates a previously captured narrow inverse."""
+    store = _parent(tmp_path)
+    service = RuleCreationService(tmp_path, "team", store=store)
+    decision = None
+    for index, session in enumerate(("narrow-s1", "narrow-s2", "narrow-s3"), start=1):
+        receipt_id = f"narrow-undo-{index}"
+        _receipt(store, tmp_path, receipt_id, session)
+        decision = service.submit_feedback(
+            receipt_id, "not_applicable", "agent-a",
+            effective_context=_context(tmp_path, session),
+        )
+    assert decision is not None and decision.status == "created"
+    assert decision.action == "rule_narrow"
+
+    # Simulate a later human/agent edit after the narrowing decision.  The
+    # inverse must not restore the stale before-snapshot over this assignment.
+    edited = [item.to_dict() for item in store.list_rule_assignments("parent")]
+    edited.append({
+        "target_type": "agent_project", "target_id": "a",
+        "project_ref": str(tmp_path / "later-edit"), "effect": "include",
+    })
+    store.set_rule_assignments(
+        "parent", edited, automatic=True, actor_agent_id="a",
+    )
+    after_edit = [item.to_dict() for item in store.list_rule_assignments("parent")]
+
+    undone = service.undo_rule_decision(
+        decision.decision_id, _context(tmp_path, "narrow-s3"),
+    )
+    assert undone.status == "blocked"
+    assert "parent_assignment_revision_conflict" in undone.blocked_reason
+    assert [item.to_dict() for item in store.list_rule_assignments("parent")] == after_edit
+
+
 def test_followed_evidence_blocks_narrowing(tmp_path):
     store = _parent(tmp_path)
     service = RuleCreationService(tmp_path, "team", store=store)
@@ -102,7 +137,7 @@ def test_exception_revoke_restores_parent_and_child_behavior(tmp_path):
     )
     assert decision.status == "created"
     relation = store.list_rule_exceptions(parent_rule="parent")[0]
-    result = service.revoke_exception(relation.exception_id)
+    result = service.revoke_exception(relation.exception_id, context)
     assert result["ok"] is True
     assert result["active"] is False
     assert store.get_record(relation.child_exception).status == SharedMemoryStatus.DELETED
@@ -110,6 +145,39 @@ def test_exception_revoke_restores_parent_and_child_behavior(tmp_path):
     assignments = store.list_rule_assignments("parent")
     assert not any(item.effect == "exclude" and Path(item.project_ref).name == "project" for item in assignments)
     assert any(item.effect == "exclude" and Path(item.project_ref).name == "other" for item in assignments)
+
+
+def test_exception_undo_rejects_later_parent_edit(tmp_path):
+    """An exception inverse must fail closed after a parent assignment edit."""
+    store = _parent(tmp_path)
+    _receipt(store, tmp_path, "exception-undo", "exception-undo-session")
+    service = RuleCreationService(tmp_path, "team", store=store)
+    context = _context(tmp_path, "exception-undo-session")
+    decision = service.submit_feedback(
+        "exception-undo", "exception", "agent-a",
+        evidence="temporary project-specific procedure", effective_context=context,
+    )
+    assert decision.status == "created"
+    assert decision.action == "rule_exception"
+
+    # A subsequent parent edit changes the assignment revision captured by
+    # the exception decision.  Undo must preserve this edit and the child.
+    edited = [item.to_dict() for item in store.list_rule_assignments("parent")]
+    edited.append({
+        "target_type": "agent_project", "target_id": "a",
+        "project_ref": str(tmp_path / "later-exception-edit"), "effect": "include",
+    })
+    store.set_rule_assignments(
+        "parent", edited, automatic=True, actor_agent_id="a",
+    )
+    after_edit = [item.to_dict() for item in store.list_rule_assignments("parent")]
+    child_id = store.list_rule_exceptions(parent_rule="parent")[0].child_exception
+
+    undone = service.undo_rule_decision(decision.decision_id, context)
+    assert undone.status == "blocked"
+    assert "parent_assignment_revision_conflict" in undone.blocked_reason
+    assert [item.to_dict() for item in store.list_rule_assignments("parent")] == after_edit
+    assert store.get_record(child_id).status == SharedMemoryStatus.ACTIVE
 
 
 def test_exception_revoke_keeps_preexisting_target_exclude(tmp_path):
@@ -129,7 +197,10 @@ def test_exception_revoke_keeps_preexisting_target_exclude(tmp_path):
     )
     assert decision.status == "created"
     relation = store.list_rule_exceptions(parent_rule="parent")[0]
-    assert service.revoke_exception(relation.exception_id)["ok"] is True
+    assert service.revoke_exception(
+        relation.exception_id,
+        _context(tmp_path, "preexisting-session"),
+    )["ok"] is True
     assignments = store.list_rule_assignments("parent")
     assert any(
         item.effect == "exclude" and item.target_type == "agent_project"
@@ -151,7 +222,10 @@ def test_exception_revoke_keeps_exclude_while_sibling_active(tmp_path):
         assert decision.status == "created"
     relations = store.list_rule_exceptions(parent_rule="parent")
     assert len(relations) == 2
-    assert service.revoke_exception(relations[0].exception_id)["ok"] is True
+    assert service.revoke_exception(
+        relations[0].exception_id,
+        _context(tmp_path, "s1"),
+    )["ok"] is True
     assert any(
         item.effect == "exclude" and Path(item.project_ref).name == "project"
         for item in store.list_rule_assignments("parent")

@@ -14,13 +14,17 @@ import json
 import subprocess
 import tempfile
 from pathlib import Path
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-# A2: bind_agent 需要 admin 权限,测试环境显式设置
-os.environ["MEMORYGUARD_ADMIN"] = "1"
-os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
-os.environ["MEMORYGUARD_STRICT_BINDING"] = "0"
+# A2: bind_agent 需要 admin 权限。保持测试能力隔离，避免模块导入时
+# 污染后续跨 Agent 权限测试的进程环境。
+@pytest.fixture(autouse=True)
+def _isolated_test_env(monkeypatch):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
 
 
 def test_stdio_protocol_forces_utf8_on_windows_locale(tmp_path: Path):

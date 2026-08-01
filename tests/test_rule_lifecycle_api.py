@@ -101,3 +101,80 @@ def test_exception_feedback_excludes_parent_and_corrected_is_only_recorded(tmp_p
         and _norm_project(item.project_ref) == _norm_project(context.project_ref)
         for item in parent_after
     ), "exception must exclude the parent rule from the offending project (P0-5)"
+
+
+def test_atomic_rule_create_dedup_undo_preserves_original_rule(tmp_path, monkeypatch):
+    store = _bind(tmp_path, monkeypatch)
+    context = EffectiveAgentContext(
+        agent_instance_id="a", share_group_id="team",
+        project_ref=str(tmp_path / "project"), session_id="s-1",
+    )
+    service = RuleCreationService(tmp_path, "team", store=store)
+    first = service.create_rule_from_text("始终先运行定向测试", context)
+    second = service.create_rule_from_text("始终先运行定向测试", context)
+
+    assert first.status == "created"
+    assert second.status == "created"
+    assert second.memory_id == first.memory_id
+    assert second.metadata["mutation_kind"] == "deduplicated"
+    undone = service.undo_rule_decision(second.decision_id, context)
+    assert undone.status == "undone"
+    original = store.get_record(first.memory_id)
+    assert original is not None
+    assert original.status.value == "active"
+
+
+def test_non_created_lifecycle_decisions_are_atomic_and_reversible(
+    tmp_path, monkeypatch,
+):
+    store = _bind(tmp_path, monkeypatch)
+    context = EffectiveAgentContext(
+        agent_instance_id="a", share_group_id="team",
+        project_ref=str(tmp_path / "project"), session_id="lifecycle-session",
+    )
+    service = RuleCreationService(tmp_path, "team", store=store)
+
+    # A correction supersedes the old record in the same mutation bundle.
+    original = service.create_rule_from_text("始终先运行定向测试", context)
+    superseded = service.create_rule_from_text("纠正：始终先运行定向测试", context)
+    assert superseded.action == "rule_superseded"
+    assert superseded.metadata["mutation_kind"] == "superseded"
+    assert store.get_record(original.memory_id).status.value == "shadowed"
+    undone = service.undo_rule_decision(superseded.decision_id, context)
+    assert undone.status == "undone"
+    assert store.get_record(superseded.memory_id).status.value == "deleted"
+    assert store.get_record(original.memory_id).status.value == "active"
+
+    # A conflict records the group and can be undone without touching unrelated
+    # records; the structured decision carries the fixed revision hash.
+    first_preference = service.create_rule_from_text(
+        "偏好：项目统一使用 pnpm 进行依赖安装", context,
+    )
+    conflict = service.create_rule_from_text(
+        "偏好：项目统一使用 npm 进行依赖安装", context,
+    )
+    assert conflict.action == "rule_conflicted"
+    assert conflict.metadata["mutation_kind"] == "conflicted"
+    assert store.get_record(conflict.memory_id).status.value == "conflicted"
+    conflict_undo = service.undo_rule_decision(conflict.decision_id, context)
+    assert conflict_undo.status == "undone"
+    assert store.get_record(conflict.memory_id).status.value == "deleted"
+    assert store.get_record(first_preference.memory_id).status.value in {
+        "active", "shadowed", "conflicted",
+    }
+
+    # A secret is quarantined without sending raw content through enrichment;
+    # undo creates a released tombstone rather than reactivating the secret.
+    quarantined = service.create_rule_from_text(
+        "临时 api_key=do-not-leak", context,
+    )
+    assert quarantined.action == "rule_quarantined"
+    assert quarantined.metadata["mutation_kind"] == "quarantined"
+    assert store.get_record(quarantined.memory_id).status.value == "quarantined"
+    quarantine_undo = service.undo_rule_decision(quarantined.decision_id, context)
+    assert quarantine_undo.status == "undone"
+    assert store.get_record(quarantined.memory_id).status.value == "deleted"
+    assert any(
+        item.memory_id == quarantined.memory_id and item.released
+        for item in store.list_quarantine()
+    )

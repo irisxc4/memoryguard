@@ -20,6 +20,7 @@ def _record(
     *,
     confidence: float = 0.8,
     locked: bool = False,
+    agent_instance_id: str = "agent-a",
 ) -> SharedMemoryRecord:
     return SharedMemoryRecord(
         memory_id=memory_id,
@@ -30,7 +31,7 @@ def _record(
         locked=locked,
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
-        agent_instance_id="agent-a",
+        agent_instance_id=agent_instance_id,
     )
 
 
@@ -231,6 +232,79 @@ def test_mcp_schema_and_dispatch_use_trusted_binding(tmp_path, monkeypatch):
     assert ids == ["trusted-memory"]
 
 
+def test_mcp_bootstrap_persists_mandatory_receipt_with_trusted_runtime_context(
+    tmp_path, monkeypatch,
+):
+    """A bootstrap receipt must be durable before MCP returns it."""
+    agent_id, group_id = "trusted-agent", "trusted-group"
+    AgentBindingStore(tmp_path).bind_agent(agent_id, group_id)
+    store = SharedMemoryStore(tmp_path, group_id)
+    mandatory = _record(
+        "mandatory", "始终先运行定向测试", MemoryKind.PROCEDURE,
+        agent_instance_id=agent_id,
+    )
+    mandatory.injection_policy = "always"
+    project_ref = tmp_path / "project"
+    store.append_record(mandatory, assignments=[{
+        "target_type": "agent", "target_id": agent_id,
+    }])
+
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent_id)
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(project_ref))
+    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
+    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
+    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
+
+    result = execute_tool("memoryguard_context_bootstrap", {
+        "task": "修复定向测试流程",
+    })
+    assert result.get("isError") is not True, result
+    packet = json.loads(result["content"][0]["text"])
+    assert packet["receipt_persistence"] == {"status": "persisted", "count": 1}
+    receipt = packet["mandatory_match_receipts"][0]
+    assert receipt["agent_instance_id"] == agent_id
+    assert receipt["session_id"] == "session-1"
+    assert receipt["context_hash"] == "ctx-1"
+    assert receipt["provider"] == "codex"
+    persisted = SharedMemoryStore(tmp_path, group_id, read_only=True).get_rule_match_receipt(
+        receipt["receipt_id"]
+    )
+    assert persisted is not None
+    assert persisted.to_dict() == receipt
+
+
+def test_mcp_bootstrap_fails_closed_when_receipt_persistence_fails(
+    tmp_path, monkeypatch,
+):
+    agent_id, group_id = "trusted-agent", "trusted-group"
+    AgentBindingStore(tmp_path).bind_agent(agent_id, group_id)
+    store = SharedMemoryStore(tmp_path, group_id)
+    mandatory = _record(
+        "mandatory", "始终先运行定向测试", MemoryKind.PROCEDURE,
+        agent_instance_id=agent_id,
+    )
+    mandatory.injection_policy = "always"
+    store.append_record(mandatory, assignments=[{
+        "target_type": "agent", "target_id": agent_id,
+    }])
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent_id)
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
+
+    def fail_append(self, receipt):
+        raise RuntimeError("receipt writer unavailable")
+
+    monkeypatch.setattr(SharedMemoryStore, "append_rule_match_receipt", fail_append)
+    result = execute_tool("memoryguard_context_bootstrap", {"task": "测试"})
+    assert result.get("isError") is True
+    assert "receipt persistence failed" in result["content"][0]["text"]
+    assert "mandatory_match_receipts" not in result["content"][0]["text"]
+
+
 def test_update_delete_preflight_and_handlers_use_same_trusted_group(
     tmp_path: Path,
     monkeypatch,
@@ -239,9 +313,11 @@ def test_update_delete_preflight_and_handlers_use_same_trusted_group(
     trusted = SharedMemoryStore(tmp_path, "trusted-group")
     trusted.append_record(_record(
         "update-me", "旧正文", MemoryKind.FACT,
+        agent_instance_id="trusted-agent",
     ))
     trusted.append_record(_record(
         "delete-me", "待删除", MemoryKind.FACT,
+        agent_instance_id="trusted-agent",
     ))
     SharedMemoryStore(tmp_path, "attacker-group")
 
@@ -276,6 +352,27 @@ def test_update_delete_preflight_and_handlers_use_same_trusted_group(
         for item in decisions
     )
     assert not read_store.get_record("delete-me").locked
+
+
+def test_memory_mutation_rejects_cross_agent_record_owner(
+    tmp_path: Path,
+    monkeypatch,
+):
+    AgentBindingStore(tmp_path).bind_agent("trusted-agent", "trusted-group")
+    trusted = SharedMemoryStore(tmp_path, "trusted-group")
+    trusted.append_record(_record(
+        "owned-by-a", "仅 agent-a 可改", MemoryKind.FACT,
+        agent_instance_id="agent-a",
+    ))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+
+    denied = execute_tool("memoryguard_memory_update", {
+        "memory_id": "owned-by-a", "body": "越权修改",
+    })
+    assert denied.get("isError") is True
+    assert "another agent" in denied["content"][0]["text"]
 
 
 def test_active_binding_allows_write_inactive_or_unbound_denies(

@@ -264,7 +264,10 @@ def test_rule_split_is_atomic_and_revert_restores_behavior(tmp_path):
     assert store.get_record("child-1").status == SharedMemoryStatus.ACTIVE
     assert store.get_rule_exception(exception.exception_id).active is True
     assert any(item.effect == "exclude" for item in store.list_rule_assignments("rule-1"))
-    store.revert_rule_exception(exception.exception_id)
+    store.revert_rule_exception(
+        exception.exception_id,
+        expected_parent_assignment_hash=store.rule_assignment_hash("rule-1"),
+    )
     assert store.get_record("child-1").status == SharedMemoryStatus.DELETED
     assert store.get_rule_exception(exception.exception_id).active is False
     assert [item.assignment_id for item in store.list_rule_assignments("rule-1")] == [

@@ -1340,6 +1340,11 @@ def _effective_agent_context(args: dict[str, Any], group_id: str):
         runtime_role=os.environ.get("MEMORYGUARD_RUNTIME_ROLE", "").strip(),
         runtime_agent_id=os.environ.get("MEMORYGUARD_RUNTIME_AGENT_ID", "").strip(),
         parent_agent_id=os.environ.get("MEMORYGUARD_PARENT_AGENT_ID", "").strip(),
+        # Session/context identity is a trusted host launch fact.  Never read
+        # these from the MCP request body: feedback/narrowing must not be able
+        # to manufacture a second session by changing ordinary tool args.
+        session_id=os.environ.get("MEMORYGUARD_SESSION_ID", "").strip(),
+        context_hash=os.environ.get("MEMORYGUARD_CONTEXT_HASH", "").strip(),
     )
 
 
@@ -1761,6 +1766,7 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
         build_context_packet,
     )
     from .shared_memory_store import SharedMemoryStore
+    from .schema_v3 import RuleMatchReceipt
 
     task = str(args.get("task", "") or "").strip()
     if not task:
@@ -1784,6 +1790,33 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
         )
     except (TypeError, ValueError) as exc:
         return _mcp_error(str(exc))
+    # A feedback receipt is only useful when it is durable.  The selector
+    # intentionally runs against a read-only store; persist generated
+    # mandatory receipts through a separate trusted writer *before* the
+    # packet is returned. Any write failure is fail-closed so callers can
+    # never receive a pseudo-receipt that cannot later be referenced.
+    raw_receipts = packet.get("mandatory_match_receipts") or []
+    try:
+        if raw_receipts:
+            writer = SharedMemoryStore(workspace, group_id)
+            persisted_receipts: list[dict[str, Any]] = []
+            for raw_receipt in raw_receipts:
+                receipt = RuleMatchReceipt.from_dict(dict(raw_receipt))
+                saved = writer.append_rule_match_receipt(receipt)
+                persisted_receipts.append(
+                    saved.to_dict() if hasattr(saved, "to_dict") else receipt.to_dict()
+                )
+            packet["mandatory_match_receipts"] = persisted_receipts
+            packet["receipt_persistence"] = {
+                "status": "persisted",
+                "count": len(persisted_receipts),
+            }
+        else:
+            packet["receipt_persistence"] = {"status": "none", "count": 0}
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        return _mcp_error(f"context bootstrap receipt persistence failed: {exc}")
+    except Exception as exc:  # sqlite/driver errors must not leak fake receipts
+        return _mcp_error(f"context bootstrap receipt persistence failed: {exc}")
     return {
         "content": [{
             "type": "text",

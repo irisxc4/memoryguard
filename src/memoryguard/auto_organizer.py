@@ -156,7 +156,11 @@ class AutoOrganizer:
                 actor="auto",
                 manual_override=False,
             )
-            actions.append({"action": "quarantine", "reason": secret_match})
+            actions.append({
+                "action": "quarantine",
+                "reason": secret_match,
+                "detected_pattern": secret_match,
+            })
             return record, actions
 
         # P1.2/P1.5: 非隔离内容先脱敏再送 enricher(防止残留 secret 进入模型)
@@ -382,6 +386,115 @@ class AutoOrganizer:
             actions.append(derive_action)
 
         return record, actions
+
+    def plan_rule_create(
+        self,
+        event: MemoryEvent,
+        kind_override: str = "",
+        write_policy: str = "auto_accept",
+    ) -> tuple[SharedMemoryRecord, list[dict[str, Any]], str]:
+        """Pure planning seam for mandatory-rule atomic persistence.
+
+        Reuses the same secret guard, enricher and duplicate matcher as
+        ``organize`` but never writes records/events/decisions.  The caller
+        must commit the returned plan through the appropriate atomic Store
+        lifecycle API.  The mutation kind identifies whether the plan is a
+        create/dedup or a multi-record supersede/conflict/quarantine bundle.
+        """
+        actions: list[dict[str, Any]] = []
+        incoming_policy = getattr(event, "injection_policy", "relevant")
+        raw_assignments = list(getattr(event, "rule_assignments", []) or [])
+        incoming_assignments = self.store._normalize_assignments("pending", raw_assignments)
+        if incoming_policy == "always" and not incoming_assignments and event.agent_instance_id:
+            from .schema_v3 import RuleAssignment
+            incoming_assignments = [RuleAssignment(
+                memory_id="pending", target_type="agent", target_id=event.agent_instance_id,
+            )]
+        event.rule_assignments = incoming_assignments
+        self._active_rule_assignments = incoming_assignments
+        secret_match = self._detect_secret(event.raw_content)
+        metadata = event.metadata if isinstance(event.metadata, dict) else {}
+        if not secret_match and metadata.get("_secret_detected"):
+            secret_match = str(metadata.get("_secret_detected") or "")
+        if secret_match:
+            from .policies import classify_kind
+            kind = MemoryKind(kind_override or classify_kind(event.raw_content))
+            confidence = self._confidence(event.raw_content, kind)
+            actions.append({"action": "classify", "kind": kind.value,
+                            "confidence": confidence,
+                            "enrichment_mode": "heuristic_secret_safe"})
+            record = self._create_record(
+                event, kind, SharedMemoryStatus.QUARANTINED, confidence=confidence,
+            )
+            actions.append({
+                "action": "quarantine",
+                "reason": secret_match,
+                "detected_pattern": secret_match,
+            })
+            return record, actions, "quarantined"
+
+        safe_content = self._redact_for_enricher(event.raw_content)
+        enriched = self._get_enricher().enrich(
+            title="", body=safe_content, kind_hint=kind_override,
+            metadata=metadata,
+        )
+        kind = self._safe_kind(enriched.kind, event.raw_content)
+        confidence = self._safe_confidence(enriched.confidence)
+        if kind_override:
+            kind = MemoryKind(kind_override)
+        actions.append({"action": "classify", "kind": kind.value,
+                        "confidence": confidence,
+                        "enrichment_mode": enriched.enrichment_mode})
+        duplicates = self._find_duplicates(
+            event.raw_content, threshold=0.80,
+            injection_policy=incoming_policy,
+            assignments=incoming_assignments,
+        )
+        if duplicates:
+            if self._is_correction(event, duplicates):
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.ACTIVE,
+                    supersedes=[duplicates[0].memory_id], confidence=confidence,
+                )
+                actions.append({
+                    "action": "supersede",
+                    "old_id": duplicates[0].memory_id,
+                    "old_ids": [item.memory_id for item in duplicates],
+                })
+                return record, actions, "superseded"
+            if self._is_conflict(event, duplicates) or self._has_kind_conflict(duplicates, kind):
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.CONFLICTED, confidence=confidence,
+                )
+                actions.append({
+                    "action": "conflict",
+                    "reason": self._explain_conflict(event.raw_content, duplicates),
+                    "old_ids": [item.memory_id for item in duplicates],
+                })
+                return record, actions, "conflicted"
+            # Only exact canonical duplicates may use the atomic dedup path;
+            # near/semantic duplicates remain on the existing organizer path.
+            canonical = getattr(self.store, "_canonical_hash", None)
+            if callable(canonical) and all(
+                canonical(event.raw_content) == canonical(item.body)
+                for item in duplicates[:1]
+            ):
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.ACTIVE, confidence=confidence,
+                )
+                actions.append({"action": "merge_provenance",
+                                "duplicate_ids": [duplicates[0].memory_id],
+                                "target_id": duplicates[0].memory_id})
+                return record, actions, "deduplicated"
+            # Let legacy organize handle semantic merge/provenance details.
+            return self._create_record(
+                event, kind, SharedMemoryStatus.ACTIVE, confidence=confidence,
+            ), actions, "legacy"
+
+        status = SharedMemoryStatus.LOW_CONFIDENCE if confidence < 0.45 else SharedMemoryStatus.ACTIVE
+        record = self._create_record(event, kind, status, confidence=confidence)
+        actions.append({"action": "create_low_confidence" if status == SharedMemoryStatus.LOW_CONFIDENCE else "create_active"})
+        return record, actions, "created"
 
     def _append_record(self, record: SharedMemoryRecord) -> None:
         self.store.append_record(
