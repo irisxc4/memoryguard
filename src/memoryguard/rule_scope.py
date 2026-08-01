@@ -20,6 +20,34 @@ TARGET_TYPES = {
 EFFECTS = {"include", "exclude"}
 
 
+def validate_automatic_assignment(
+    value: dict | RuleAssignment,
+    *,
+    actor_agent_id: str = "",
+) -> RuleAssignment:
+    """Validate an assignment emitted by automation.
+
+    Manual governance may still use ``system`` and broad dimensions.  An
+    automatic lifecycle update is deliberately narrower: it may only retain
+    the current Agent (optionally paired with its project), never manufacture
+    a system/group/provider/runtime-role/project broadcast or target another
+    Agent.  This is a mutation boundary, not a matcher restriction.
+    """
+    assignment = normalize_assignment(value)
+    if assignment.target_type not in {"agent", "agent_project"}:
+        raise ValueError(
+            "automatic assignment cannot broaden target_type; "
+            "allowed target types are agent and agent_project"
+        )
+    if actor_agent_id and assignment.target_id != actor_agent_id:
+        raise ValueError("automatic assignment cannot target another agent")
+    if not actor_agent_id:
+        # Without a trusted runtime identity an automatic write cannot prove
+        # ownership of an Agent audience, so fail closed.
+        raise ValueError("automatic assignment requires actor_agent_id")
+    return assignment
+
+
 def canonical_project_ref(value: str | os.PathLike[str] | None) -> str:
     """Canonical project identity shared by rules and raw history.
 
@@ -48,7 +76,10 @@ def canonical_project_ref(value: str | os.PathLike[str] | None) -> str:
     return normalized.rstrip("/")
 
 
-def normalize_assignment(value: dict | RuleAssignment) -> RuleAssignment:
+def normalize_assignment(
+    value: dict | RuleAssignment, *, automatic: bool = False,
+    actor_agent_id: str = "",
+) -> RuleAssignment:
     if isinstance(value, RuleAssignment):
         assignment = value
     elif isinstance(value, dict):
@@ -102,6 +133,18 @@ def normalize_assignment(value: dict | RuleAssignment) -> RuleAssignment:
         or not -100 <= assignment.priority_override <= 100
     ):
         raise ValueError("audience priority_override must be an integer between -100 and 100")
+    if automatic:
+        # Keep manual ``system`` matching compatible while making the
+        # opt-in automatic boundary explicit for callers outside Store.
+        if assignment.target_type not in {"agent", "agent_project"}:
+            raise ValueError(
+                "automatic assignment cannot broaden target_type; "
+                "allowed target types are agent and agent_project"
+            )
+        if not actor_agent_id:
+            raise ValueError("automatic assignment requires actor_agent_id")
+        if assignment.target_id != actor_agent_id:
+            raise ValueError("automatic assignment cannot target another agent")
     return assignment
 
 

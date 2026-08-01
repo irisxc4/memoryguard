@@ -72,6 +72,10 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     # Mandatory-rule audience governance.  Options and previews are read-only;
     # edits must take the normal mutation/confirmation path below.
     "get_rule_scope_options", "preview_effective_rules",
+    # Rule lifecycle cockpit: reads are safe previews; mutations still pass
+    # the normal localhost confirmation/admin capability path.
+    "list_rule_cockpit", "list_rule_decisions", "read_rule_decision",
+    "get_rule_auto_scope_metrics", "list_rule_match_receipts", "list_rule_exceptions",
 })
 
 # 变更 API：修改文件、删除目录、归档、绑定、记忆治理等
@@ -120,6 +124,8 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     # Changes audience assignments or performs an atomic relevant<->always
     # transition.  Never expose this as a read-only browser call.
     "update_rule_audience",
+    "create_rule_from_text", "undo_rule_decision", "create_child_exception",
+    "create_rule_exception", "submit_rule_feedback", "revoke_rule_exception",
 })
 
 # 所有允许的 API 方法

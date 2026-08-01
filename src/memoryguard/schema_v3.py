@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 
@@ -1224,6 +1225,296 @@ class RuleAssignment:
 
 
 @dataclass
+class RuleDecision(Mapping[str, Any]):
+    """Structured, auditable decision emitted by rule lifecycle automation.
+
+    ``DecisionEvent`` is the historical governance log and remains unchanged
+    for callers which only need an action/target list.  Rule automation needs
+    a lossless before/after payload and an explicit confidence/undo link, so
+    it is persisted separately.  ``before``/``after`` deliberately accept any
+    JSON-compatible value: older integrations sometimes used a canonical
+    string while newer ones use a state mapping.
+    """
+
+    decision_id: str
+    actor: str
+    before: Any = field(default_factory=dict)
+    after: Any = field(default_factory=dict)
+    reason: str = ""
+    confidence: float = 1.0
+    undo_id: str = ""
+    created_at: str = ""
+    rule_id: str = ""
+    action: str = ""
+    target_ids: list[str] = field(default_factory=list)
+    # Optional lifecycle projection fields.  They keep GUI/API consumers from
+    # reverse-engineering ``before``/``after`` while remaining additive for
+    # old producers.
+    status: str = ""
+    memory_id: str = ""
+    parent_rule_id: str = ""
+    kind: str = ""
+    assignments: list[dict[str, Any]] = field(default_factory=list)
+    target_type: str = ""
+    target_id: str = ""
+    project_ref: str = ""
+    scope_confidence: float | None = None
+    scope_reason: str = ""
+    blocked_reason: str = ""
+    body: str = ""
+    version_id: str = ""
+    feedback_id: str = ""
+    receipt_id: str = ""
+    child_rule_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.decision_id or not isinstance(self.decision_id, str):
+            raise ValueError("decision_id is required")
+        if not self.actor or not isinstance(self.actor, str):
+            raise ValueError("actor is required")
+        if isinstance(self.confidence, bool):
+            raise ValueError("confidence must be between 0 and 1")
+        try:
+            confidence = float(self.confidence)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("confidence must be between 0 and 1") from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+        self.confidence = confidence
+        self.target_ids = [str(item) for item in self.target_ids]
+        self.assignments = [dict(item) for item in self.assignments]
+        if not self.memory_id and self.rule_id:
+            self.memory_id = self.rule_id
+        if not self.rule_id and self.memory_id:
+            self.rule_id = self.memory_id
+        if self.scope_confidence is not None:
+            if isinstance(self.scope_confidence, bool):
+                raise ValueError("scope_confidence must be between 0 and 1")
+            self.scope_confidence = float(self.scope_confidence)
+            if not 0.0 <= self.scope_confidence <= 1.0:
+                raise ValueError("scope_confidence must be between 0 and 1")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "actor": self.actor,
+            "before": self.before,
+            "after": self.after,
+            "reason": self.reason,
+            "confidence": self.confidence,
+            "undo_id": self.undo_id,
+            "created_at": self.created_at,
+            "rule_id": self.rule_id,
+            "action": self.action,
+            "target_ids": list(self.target_ids),
+            "status": self.status,
+            "memory_id": self.memory_id,
+            "parent_rule_id": self.parent_rule_id,
+            "kind": self.kind,
+            "assignments": [dict(item) for item in self.assignments],
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "project_ref": self.project_ref,
+            "scope_confidence": self.scope_confidence,
+            "scope_reason": self.scope_reason,
+            "blocked_reason": self.blocked_reason,
+            "body": self.body,
+            "version_id": self.version_id,
+            "feedback_id": self.feedback_id,
+            "receipt_id": self.receipt_id,
+            "child_rule_id": self.child_rule_id,
+            "metadata": dict(self.metadata),
+        }
+
+    # Mapping compatibility keeps the model usable by MCP/GUI adapters that
+    # historically received dictionary-shaped lifecycle results.
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleDecision":
+        if not isinstance(data, dict):
+            raise ValueError("rule decision must be an object")
+        return cls(
+            decision_id=str(data.get("decision_id", data.get("event_id", ""))),
+            actor=str(data.get("actor", "")),
+            before=data.get("before", {}),
+            after=data.get("after", {}),
+            reason=str(data.get("reason", "")),
+            confidence=float(data.get("confidence", 1.0)),
+            undo_id=str(data.get("undo_id", "")),
+            created_at=str(data.get("created_at", "")),
+            rule_id=str(data.get("rule_id", data.get("memory_id", ""))),
+            action=str(data.get("action", "")),
+            target_ids=list(data.get("target_ids", [])),
+            status=str(data.get("status", "")),
+            memory_id=str(data.get("memory_id", data.get("rule_id", ""))),
+            parent_rule_id=str(data.get("parent_rule_id", "")),
+            kind=str(data.get("kind", "")),
+            assignments=list(data.get("assignments", [])),
+            target_type=str(data.get("target_type", "")),
+            target_id=str(data.get("target_id", "")),
+            project_ref=str(data.get("project_ref", "")),
+            scope_confidence=(
+                None if data.get("scope_confidence") is None
+                else float(data.get("scope_confidence"))
+            ),
+            scope_reason=str(data.get("scope_reason", "")),
+            blocked_reason=str(data.get("blocked_reason", "")),
+            body=str(data.get("body", "")),
+            version_id=str(data.get("version_id", "")),
+            feedback_id=str(data.get("feedback_id", "")),
+            receipt_id=str(data.get("receipt_id", "")),
+            child_rule_id=str(data.get("child_rule_id", "")),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class RuleScopeStats:
+    """Cumulative feedback counters for one rule and runtime scope."""
+
+    rule_id: str
+    agent_instance_id: str = ""
+    project_ref: str = ""
+    total: int = 0
+    accepted: int = 0
+    corrected: int = 0
+    wrong_scope: int = 0
+    created_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def memory_id(self) -> str:
+        """Compatibility alias: persisted rules are memory records."""
+        return self.rule_id
+
+    @property
+    def scope_id(self) -> str:
+        return stable_hash(
+            "rule-scope-stats", self.rule_id,
+            self.agent_instance_id, self.project_ref,
+        )
+
+    def __post_init__(self) -> None:
+        if not self.rule_id or not isinstance(self.rule_id, str):
+            raise ValueError("rule_id is required")
+        for name in ("total", "accepted", "corrected", "wrong_scope"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if any(value > self.total for value in (self.accepted, self.corrected, self.wrong_scope)):
+            raise ValueError("scope counters cannot exceed total")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "scope_id": self.scope_id,
+            "rule_id": self.rule_id,
+            "memory_id": self.rule_id,
+            "agent_instance_id": self.agent_instance_id,
+            "project_ref": self.project_ref,
+            "total": self.total,
+            "accepted": self.accepted,
+            "corrected": self.corrected,
+            "wrong_scope": self.wrong_scope,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleScopeStats":
+        if not isinstance(data, dict):
+            raise ValueError("rule scope stats must be an object")
+        return cls(
+            rule_id=str(data.get("rule_id", data.get("memory_id", ""))),
+            agent_instance_id=str(data.get("agent_instance_id", "")),
+            project_ref=str(data.get("project_ref", "")),
+            total=int(data.get("total", 0)),
+            accepted=int(data.get("accepted", 0)),
+            corrected=int(data.get("corrected", 0)),
+            wrong_scope=int(data.get("wrong_scope", 0)),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+
+@dataclass
+class RuleException:
+    """A child exception relation attached to a parent rule."""
+
+    parent_rule: str
+    child_exception: str
+    priority: int = 0
+    reason: str = ""
+    rollback: Any = field(default_factory=dict)
+    active: bool = True
+    created_at: str = ""
+    updated_at: str = ""
+    exception_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.parent_rule or not isinstance(self.parent_rule, str):
+            raise ValueError("parent_rule is required")
+        if not self.child_exception or not isinstance(self.child_exception, str):
+            raise ValueError("child_exception is required")
+        if self.parent_rule == self.child_exception:
+            raise ValueError("rule exception cannot reference itself")
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int):
+            raise ValueError("exception priority must be an integer")
+        if not -100 <= self.priority <= 100:
+            raise ValueError("exception priority must be between -100 and 100")
+        if not self.exception_id:
+            self.exception_id = stable_hash(
+                "rule-exception", self.parent_rule, self.child_exception,
+            )
+
+    @property
+    def rollback_info(self) -> Any:
+        """Compatibility alias used by early lifecycle prototypes."""
+        return self.rollback
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exception_id": self.exception_id,
+            "parent_rule": self.parent_rule,
+            "child_exception": self.child_exception,
+            "priority": self.priority,
+            "reason": self.reason,
+            "rollback": self.rollback,
+            "rollback_info": self.rollback,
+            "active": bool(self.active),
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleException":
+        if not isinstance(data, dict):
+            raise ValueError("rule exception must be an object")
+        return cls(
+            exception_id=str(data.get("exception_id", "")),
+            parent_rule=str(data.get("parent_rule", "")),
+            child_exception=str(data.get("child_exception", "")),
+            priority=int(data.get("priority", 0)),
+            reason=str(data.get("reason", "")),
+            rollback=data.get("rollback", data.get("rollback_info", {})),
+            active=bool(data.get("active", True)),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+
+@dataclass
 class RuleMatchReceipt:
     """A per-bootstrap match record for an injected rule.
 
@@ -1311,6 +1602,14 @@ class RuleMatchFeedback:
             confidence=float(data.get("confidence", 1.0)),
             created_at=data.get("created_at", ""),
         )
+
+
+# Future lifecycle terminology uses "hit" for the same immutable receipt and
+# explicit feedback pair.  Keep aliases (rather than duplicate wire models)
+# so old MCP clients and new narrowing code share one persistence contract.
+RuleHitReceipt = RuleMatchReceipt
+RuleHitFeedback = RuleMatchFeedback
+RuleFeedback = RuleMatchFeedback
 
 
 @dataclass

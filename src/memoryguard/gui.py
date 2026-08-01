@@ -6520,6 +6520,567 @@ class GovernanceApi:
         return {"buckets": buckets, "total": sum(map(len, buckets.values()))}
 
     # ------------------------------------------------------------------
+    # Rule cockpit bridge (lazy, feature-detected)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rule_bridge_payload(value) -> dict:
+        """Best-effort conversion for service dataclasses/mappings.
+
+        The rule lifecycle service is intentionally optional for older
+        installations.  Keeping conversion here lets the GUI bridge accept
+        both the dataclass objects used by the service and the JSON mappings
+        returned by a remote/compatibility implementation.
+        """
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                result = to_dict()
+                if isinstance(result, dict):
+                    return dict(result)
+            except Exception:
+                pass
+        try:
+            result = dict(value)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+        try:
+            return dict(vars(value))
+        except Exception:
+            return {"value": value}
+
+    def _rule_bridge_service(self, share_group_id: str = "default", *, is_admin: bool = False):
+        """Return an optional RuleCreationService without importing at module load.
+
+        Constructor signatures changed during the v3.2 rollout.  Try the
+        supported forms in order and return ``None`` when the service is not
+        installed; callers then expose a stable ``service_unavailable``
+        response instead of breaking the existing GUI.
+        """
+        try:
+            from .rule_creation import RuleCreationService
+        except (ImportError, ModuleNotFoundError):
+            return None
+        attempts = (
+            ((self.workspace, share_group_id), {"is_admin": bool(is_admin)}),
+            ((self.workspace,), {"share_group_id": share_group_id, "is_admin": bool(is_admin)}),
+            ((), {"workspace": self.workspace, "share_group_id": share_group_id, "is_admin": bool(is_admin)}),
+            ((self.workspace,), {}),
+            ((), {"workspace": self.workspace}),
+            ((), {}),
+        )
+        last_type_error = None
+        for args, kwargs in attempts:
+            try:
+                return RuleCreationService(*args, **kwargs)
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+            except Exception:
+                # A present service which cannot initialise should be reported
+                # as unavailable by the bridge, not retried with a different
+                # scope (which could accidentally broaden writes).
+                return None
+        _ = last_type_error
+        return None
+
+    def _rule_bridge_context(
+        self,
+        context: dict | None = None,
+        *,
+        agent_instance_id: str = "",
+        share_group_id: str = "default",
+        project_ref: str = "",
+        provider: str = "",
+        runtime_role: str = "",
+    ):
+        """Validate a concrete current-agent context for rule creation.
+
+        UI values must originate from ``get_rule_scope_options``.  In
+        particular, this bridge never accepts ``system`` or a guessed
+        cross-Agent identifier for an automatic decision.
+        """
+        from .schema_v3 import EffectiveAgentContext
+
+        raw = dict(context or {}) if isinstance(context, dict) else {}
+        agent = str(raw.get("agent_instance_id") or agent_instance_id or "").strip()
+        group = str(raw.get("share_group_id") or share_group_id or "default").strip()
+        project = str(raw.get("project_ref") or project_ref or "").strip()
+        provider_value = str(raw.get("provider") or provider or "").strip()
+        role = str(raw.get("runtime_role") or runtime_role or "").strip()
+        if not agent:
+            return None, {"ok": False, "error": "agent_context_required"}
+        options = self._rule_scope_options(group)
+        known_agents = {str(item.get("id") or "") for item in options.get("agents", [])}
+        if known_agents and agent not in known_agents:
+            return None, {"ok": False, "error": "unknown_agent_target"}
+        known_groups = {str(item.get("id") or "") for item in options.get("groups", [])}
+        if known_groups and group not in known_groups:
+            return None, {"ok": False, "error": "unknown_group_target"}
+        known_projects = {str(item.get("id") or "") for item in options.get("projects", [])}
+        if project and known_projects and project not in known_projects:
+            return None, {"ok": False, "error": "unknown_project_target"}
+        known_providers = {str(item.get("id") or "").casefold() for item in options.get("providers", [])}
+        if provider_value and known_providers and provider_value.casefold() not in known_providers:
+            return None, {"ok": False, "error": "unknown_provider_target"}
+        known_roles = {str(item.get("id") or "").casefold() for item in options.get("runtime_roles", [])}
+        if role and known_roles and role.casefold() not in known_roles:
+            return None, {"ok": False, "error": "unknown_runtime_role_target"}
+        return EffectiveAgentContext(
+            agent_instance_id=agent,
+            share_group_id=group,
+            provider=provider_value,
+            project_ref=project,
+            runtime_role=role,
+        ), None
+
+    @staticmethod
+    def _rule_bridge_call(service, names: tuple[str, ...], *args, **kwargs):
+        """Invoke the first implemented service method.
+
+        ``None`` means no compatible method was found; exceptions are left to
+        the caller so an implementation error is visible in the UI response.
+        """
+        for name in names:
+            fn = getattr(service, name, None)
+            if not callable(fn):
+                continue
+            try:
+                return True, fn(*args, **kwargs)
+            except TypeError:
+                # Compatibility implementations may use keyword-only context
+                # or omit optional arguments.  Retry conservative forms only.
+                try:
+                    return True, fn(*args)
+                except TypeError:
+                    continue
+        return False, None
+
+    def create_rule_from_text(
+        self,
+        text: str,
+        context: dict | None = None,
+        agent_instance_id: str = "",
+        share_group_id: str = "default",
+        project_ref: str = "",
+        provider: str = "",
+        runtime_role: str = "",
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """Create one rule from a sentence using the optional lifecycle service.
+
+        Scope is always derived from the explicit current-agent context.  A
+        low-confidence service result is returned verbatim (including its
+        narrow candidates); this bridge never upgrades it to a group/system
+        audience.
+        """
+        sentence = str(text or "").strip()
+        if not sentence:
+            return {"ok": False, "error": "rule_text_required"}
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        ctx, error = self._rule_bridge_context(
+            context,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            project_ref=project_ref,
+            provider=provider,
+            runtime_role=runtime_role,
+        )
+        if error:
+            return error
+        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
+        if service is None:
+            return {"ok": False, "error": "service_unavailable"}
+        called, raw = self._rule_bridge_call(
+            service, ("create_rule_from_text", "create_rule"), sentence, ctx,
+        )
+        if not called:
+            return {"ok": False, "error": "service_method_unavailable"}
+        payload = self._rule_bridge_payload(raw)
+        if payload.get("status") == "blocked" or payload.get("blocked_reason"):
+            payload.setdefault("ok", False)
+            payload.setdefault("error", payload.get("blocked_reason") or payload.get("scope_reason") or "rule_creation_blocked")
+        else:
+            payload.setdefault("ok", True)
+        payload.setdefault("rule_id", payload.get("memory_id", ""))
+        payload.setdefault("memory_id", payload.get("rule_id", ""))
+        payload.setdefault("assignments", payload.get("assignment", []))
+        payload.setdefault("scope_confidence", payload.get("confidence", None))
+        payload.setdefault("scope_reason", payload.get("reason", ""))
+        payload.setdefault("decision_id", payload.get("event_id", ""))
+        payload.setdefault("undo_id", "")
+        payload["context"] = {
+            "agent_instance_id": ctx.agent_instance_id,
+            "share_group_id": ctx.share_group_id,
+            "project_ref": ctx.project_ref,
+            "provider": ctx.provider,
+            "runtime_role": ctx.runtime_role,
+        }
+        return payload
+
+    def list_rule_decisions(self, share_group_id: str = "default", limit: int = 50) -> dict:
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(service, ("list_decisions", "list_rule_decisions"), limit=limit)
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                if isinstance(raw, (list, tuple)):
+                    payload = {"decisions": [self._rule_bridge_payload(item) for item in raw]}
+                payload.setdefault("decisions", payload.get("items", []))
+                payload.setdefault("total", len(payload.get("decisions", [])))
+                return payload
+        # Older stores may expose persistence helpers without the service.
+        try:
+            store, err = self._open_store(share_group_id, read_only=True)
+            if err:
+                return err
+            fn = getattr(store, "list_rule_decisions", None)
+            if callable(fn):
+                rows = fn()
+                rows = list(rows)[-max(1, int(limit or 50)):]
+                return {"decisions": [self._rule_bridge_payload(item) for item in rows], "total": len(rows)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"decisions": [], "total": 0, "service_unavailable": True}
+
+    def list_rule_cockpit(
+        self,
+        share_group_id: str = "default",
+        agent_instance_id: str = "",
+        limit: int = 50,
+    ) -> dict:
+        """Single read-only snapshot for desktop/localhost cockpit clients."""
+        rules = self.list_rules_habits(share_group_id)
+        options = self.get_rule_scope_options(share_group_id)
+        decisions = self.list_rule_decisions(share_group_id, limit=limit)
+        metrics = self.get_rule_auto_scope_metrics(share_group_id)
+        receipts = self.list_rule_match_receipts(
+            share_group_id, agent_instance_id=agent_instance_id, limit=limit,
+        )
+        exceptions = self.list_rule_exceptions(share_group_id)
+        return {
+            "ok": True,
+            "share_group_id": share_group_id,
+            "rules": rules,
+            "scope_options": options,
+            "decisions": decisions,
+            "metrics": metrics,
+            "receipts": receipts,
+            "exceptions": exceptions,
+        }
+
+    def read_rule_decision(self, decision_id: str, share_group_id: str = "default") -> dict:
+        if not str(decision_id or "").strip():
+            return {"ok": False, "error": "decision_id_required"}
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(service, ("read_decision", "get_decision"), decision_id)
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                return payload or {"ok": False, "error": "decision_not_found"}
+        return {"ok": False, "error": "service_unavailable"}
+
+    def undo_rule_decision(
+        self,
+        decision_id: str,
+        share_group_id: str = "default",
+        confirmed: bool = False,
+        context: dict | None = None,
+        agent_instance_id: str = "",
+        project_ref: str = "",
+        provider: str = "",
+        runtime_role: str = "",
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        if not str(decision_id or "").strip():
+            return {"ok": False, "error": "decision_id_required"}
+        service = self._rule_bridge_service(share_group_id, is_admin=_admin_override)
+        if service is None:
+            return {"ok": False, "error": "service_unavailable"}
+        ctx, error = self._rule_bridge_context(
+            context,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            project_ref=project_ref,
+            provider=provider,
+            runtime_role=runtime_role,
+        )
+        if error:
+            return error
+        token = str(decision_id)
+        # The public UI uses decision_id; the service rolls back the persisted
+        # pre-rule snapshot identified by undo_id.  Resolve that link before
+        # invoking the service, while retaining decision_id in the response.
+        read_called, read_raw = self._rule_bridge_call(
+            service, ("read_decision", "get_decision"), decision_id,
+        )
+        if read_called:
+            read_payload = self._rule_bridge_payload(read_raw)
+            token = str(read_payload.get("undo_id") or token)
+        called, raw = self._rule_bridge_call(
+            service, ("undo_rule_decision", "undo_decision", "undo_rule"), token,
+            ctx,
+        )
+        if not called:
+            return {"ok": False, "error": "service_method_unavailable"}
+        payload = self._rule_bridge_payload(raw)
+        if payload.get("status") == "blocked" or payload.get("blocked_reason"):
+            payload.setdefault("ok", False)
+            payload.setdefault("error", payload.get("blocked_reason") or payload.get("reason") or "rule_undo_blocked")
+        else:
+            payload.setdefault("ok", True)
+        payload.setdefault("decision_id", decision_id)
+        payload.setdefault("undo_id", token)
+        return payload
+
+    def get_rule_auto_scope_metrics(self, share_group_id: str = "default") -> dict:
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(service, ("scope_stats", "get_scope_stats", "get_rule_scope_stats"))
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                if isinstance(raw, (list, tuple)):
+                    payload = {"stats": [self._rule_bridge_payload(item) for item in raw]}
+                payload.setdefault("stats", payload.get("items", []))
+                if not payload.get("auto_scope"):
+                    payload["auto_scope"] = payload.get("metrics") or {
+                        "assignment_count": payload.get("assignment_count", 0),
+                        "by_target_type": payload.get("by_target_type", {}),
+                        "active_by_target_type": payload.get("active_by_target_type", {}),
+                        "inference_policy": payload.get("inference_policy", ""),
+                    }
+                # RuleCreationService exposes aggregate assignment counts;
+                # enrich the cockpit with persisted per-rule counters when
+                # the store supports the v3.2 stats table.
+                if not payload.get("stats"):
+                    try:
+                        store, store_err = self._open_store(share_group_id, read_only=True)
+                        stats_fn = getattr(store, "list_rule_scope_stats", None) if not store_err else None
+                        if callable(stats_fn):
+                            payload["stats"] = [self._rule_bridge_payload(item) for item in stats_fn()]
+                    except Exception:
+                        pass
+                return payload
+        try:
+            store, err = self._open_store(share_group_id, read_only=True)
+            if err:
+                return err
+            fn = getattr(store, "list_rule_scope_stats", None)
+            if callable(fn):
+                rows = list(fn())
+                stats = [self._rule_bridge_payload(item) for item in rows]
+                return {"stats": stats, "auto_scope": {"total": sum(int(x.get("total", 0) or 0) for x in stats)}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"stats": [], "auto_scope": {}, "service_unavailable": True}
+
+    def list_rule_match_receipts(
+        self,
+        share_group_id: str = "default",
+        memory_id: str = "",
+        agent_instance_id: str = "",
+        limit: int = 50,
+    ) -> dict:
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        fn = getattr(store, "list_rule_match_receipts", None)
+        if not callable(fn):
+            return {"receipts": [], "total": 0, "service_unavailable": True}
+        rows = fn(
+            memory_id=memory_id or None,
+            agent_instance_id=agent_instance_id or None,
+            share_group_id=share_group_id,
+        )
+        rows = list(rows)[-max(1, int(limit or 50)):]
+        receipts = []
+        for row in rows:
+            item = self._rule_bridge_payload(row)
+            receipt_id = str(item.get("receipt_id") or "")
+            feedback_fn = getattr(store, "get_rule_match_feedback_by_receipt", None)
+            if callable(feedback_fn) and receipt_id:
+                feedback = feedback_fn(receipt_id)
+                if feedback is not None:
+                    item["feedback"] = self._rule_bridge_payload(feedback)
+            receipts.append(item)
+        return {"receipts": receipts, "total": len(receipts)}
+
+    def submit_rule_feedback(
+        self,
+        receipt_id: str,
+        outcome: str,
+        actor: str,
+        evidence: str = "",
+        share_group_id: str = "default",
+        confidence: float = 1.0,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not str(receipt_id or "").strip():
+            return {"ok": False, "error": "receipt_id_required"}
+        if not str(actor or "").strip():
+            return {"ok": False, "error": "actor_required"}
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(
+                service,
+                ("submit_feedback", "feedback", "submit_rule_feedback"),
+                receipt_id, outcome, actor,
+                evidence=evidence, confidence=confidence,
+            )
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                payload.setdefault("ok", True)
+                return payload
+        # Stable fallback for stores that already implement explicit receipts.
+        try:
+            from .schema_v3 import RuleMatchFeedback
+            store, err = self._open_store(share_group_id, must_exist=True)
+            if err:
+                return err
+            feedback = RuleMatchFeedback(
+                feedback_id="", receipt_id=str(receipt_id), outcome=str(outcome),
+                actor=str(actor), evidence=str(evidence or ""), confidence=float(confidence),
+            )
+            fn = getattr(store, "append_rule_match_feedback", None)
+            if not callable(fn):
+                return {"ok": False, "error": "service_unavailable"}
+            return {"ok": True, "feedback": self._rule_bridge_payload(fn(feedback))}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def list_rule_exceptions(self, share_group_id: str = "default", parent_rule: str = "") -> dict:
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(service, ("list_exceptions", "list_rule_exceptions"), parent_rule)
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                if isinstance(raw, (list, tuple)):
+                    payload = {"exceptions": [self._rule_bridge_payload(item) for item in raw]}
+                payload.setdefault("exceptions", payload.get("items", []))
+                payload.setdefault("total", len(payload.get("exceptions", [])))
+                return payload
+        try:
+            store, err = self._open_store(share_group_id, read_only=True)
+            if err:
+                return err
+            fn = getattr(store, "list_rule_exceptions", None)
+            if callable(fn):
+                rows = fn(parent_rule=parent_rule or None)
+                rows = list(rows)
+                return {"exceptions": [self._rule_bridge_payload(item) for item in rows], "total": len(rows)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"exceptions": [], "total": 0, "service_unavailable": True}
+
+    def create_child_exception(
+        self,
+        parent_rule: str,
+        child_exception: str,
+        priority: int = 0,
+        reason: str = "",
+        share_group_id: str = "default",
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        if not str(parent_rule or "").strip() or not str(child_exception or "").strip():
+            return {"ok": False, "error": "parent_and_child_required"}
+        if str(parent_rule).strip() == str(child_exception).strip():
+            return {"ok": False, "error": "rule_exception_cannot_reference_itself"}
+        service = self._rule_bridge_service(share_group_id)
+        # The service's ``create_child_exception`` is receipt-driven (it
+        # creates a narrower rule after an ``exception`` feedback).  This GUI
+        # action is the explicit parent/child relation editor, so prefer a
+        # dedicated service method when available and otherwise use the stable
+        # v3.2 store bridge.
+        if service is not None:
+            called, raw = self._rule_bridge_call(
+                service,
+                ("create_rule_exception", "add_rule_exception"),
+                parent_rule, child_exception, priority, reason,
+            )
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                payload.setdefault("ok", True)
+                payload.setdefault("parent_rule", parent_rule)
+                payload.setdefault("child_exception", child_exception)
+                payload.setdefault("priority", int(priority))
+                payload.setdefault("reason", reason)
+                return payload
+        try:
+            from .schema_v3 import RuleException
+            store, err = self._open_store(share_group_id, must_exist=True)
+            if err:
+                return err
+            fn = getattr(store, "append_rule_exception", None)
+            if not callable(fn):
+                return {"ok": False, "error": "service_unavailable"}
+            relation = RuleException(
+                parent_rule=str(parent_rule), child_exception=str(child_exception),
+                priority=int(priority), reason=str(reason),
+            )
+            saved = fn(relation)
+            return {"ok": True, **self._rule_bridge_payload(saved), "parent_rule": parent_rule,
+                    "child_exception": child_exception, "priority": int(priority), "reason": reason}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def revoke_rule_exception(
+        self,
+        exception_id: str,
+        share_group_id: str = "default",
+        confirmed: bool = False,
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        if not str(exception_id or "").strip():
+            return {"ok": False, "error": "exception_id_required"}
+        service = self._rule_bridge_service(share_group_id)
+        if service is not None:
+            called, raw = self._rule_bridge_call(
+                service, ("revoke_exception", "undo_exception", "delete_exception"), exception_id,
+            )
+            if called:
+                payload = self._rule_bridge_payload(raw)
+                payload.setdefault("ok", True)
+                payload.setdefault("exception_id", exception_id)
+                return payload
+        try:
+            store, err = self._open_store(share_group_id, must_exist=True)
+            if err:
+                return err
+            fn = getattr(store, "rollback_rule_exception", None)
+            if not callable(fn):
+                return {"ok": False, "error": "service_unavailable"}
+            saved = fn(str(exception_id))
+            return {"ok": True, **self._rule_bridge_payload(saved), "exception_id": exception_id}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # Compatibility alias used by the security registry and early cockpit
+    # clients.  Keep one implementation so parent/child validation cannot
+    # drift between endpoint names.
+    def create_rule_exception(self, *args, **kwargs) -> dict:
+        return self.create_child_exception(*args, **kwargs)
+
+    # ------------------------------------------------------------------
     # MemoryApi（spec §7.2）
     # ------------------------------------------------------------------
 

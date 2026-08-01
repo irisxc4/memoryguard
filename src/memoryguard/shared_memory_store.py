@@ -39,8 +39,18 @@ from .schema_v3 import (
     RuleAssignment,
     RuleMatchFeedback,
     RuleMatchReceipt,
+    RuleDecision,
+    RuleScopeStats,
+    RuleException,
+    RuleHitReceipt,
+    RuleHitFeedback,
 )
-from .rule_scope import effective_assignments, normalize_assignment
+from .rule_scope import (
+    effective_assignments,
+    normalize_assignment,
+    canonical_project_ref,
+    validate_automatic_assignment,
+)
 
 
 _SCHEMA = """
@@ -110,6 +120,50 @@ CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
     FOREIGN KEY (receipt_id) REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt ON rule_match_feedbacks(receipt_id);
+CREATE TABLE IF NOT EXISTS rule_decisions (
+    decision_id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    before_state TEXT NOT NULL DEFAULT '{}',
+    after_state TEXT NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    undo_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    rule_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    target_ids TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_rule_decisions_rule ON rule_decisions(rule_id);
+CREATE INDEX IF NOT EXISTS idx_rule_decisions_actor ON rule_decisions(actor);
+CREATE TABLE IF NOT EXISTS rule_scope_stats (
+    rule_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    total INTEGER NOT NULL DEFAULT 0,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    corrected INTEGER NOT NULL DEFAULT 0,
+    wrong_scope INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, agent_instance_id, project_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_agent ON rule_scope_stats(agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_project ON rule_scope_stats(project_ref);
+CREATE TABLE IF NOT EXISTS rule_exceptions (
+    exception_id TEXT PRIMARY KEY,
+    parent_rule TEXT NOT NULL,
+    child_exception TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    rollback TEXT NOT NULL DEFAULT '{}',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(parent_rule, child_exception)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_exceptions_parent ON rule_exceptions(parent_rule);
+CREATE INDEX IF NOT EXISTS idx_rule_exceptions_child ON rule_exceptions(child_exception);
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     agent_instance_id TEXT NOT NULL,
@@ -189,6 +243,53 @@ CREATE TABLE IF NOT EXISTS rule_assignments (
     FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory ON rule_assignments(memory_id);
+"""
+
+_RULE_LIFECYCLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rule_decisions (
+    decision_id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    before_state TEXT NOT NULL DEFAULT '{}',
+    after_state TEXT NOT NULL DEFAULT '{}',
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    undo_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    rule_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    target_ids TEXT NOT NULL DEFAULT '[]',
+    metadata TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_rule_decisions_rule ON rule_decisions(rule_id);
+CREATE INDEX IF NOT EXISTS idx_rule_decisions_actor ON rule_decisions(actor);
+CREATE TABLE IF NOT EXISTS rule_scope_stats (
+    rule_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    total INTEGER NOT NULL DEFAULT 0,
+    accepted INTEGER NOT NULL DEFAULT 0,
+    corrected INTEGER NOT NULL DEFAULT 0,
+    wrong_scope INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (rule_id, agent_instance_id, project_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_agent ON rule_scope_stats(agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_rule_scope_stats_project ON rule_scope_stats(project_ref);
+CREATE TABLE IF NOT EXISTS rule_exceptions (
+    exception_id TEXT PRIMARY KEY,
+    parent_rule TEXT NOT NULL,
+    child_exception TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    rollback TEXT NOT NULL DEFAULT '{}',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(parent_rule, child_exception)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_exceptions_parent ON rule_exceptions(parent_rule);
+CREATE INDEX IF NOT EXISTS idx_rule_exceptions_child ON rule_exceptions(child_exception);
 """
 
 # 允许通过 _update_record_field 更新的列（白名单，防 SQL 注入）
@@ -284,6 +385,9 @@ class SharedMemoryStore:
         self.rule_assignments_bak_path = self.root / "rule_assignments.jsonl"
         self.rule_match_receipts_bak_path = self.root / "rule_match_receipts.jsonl"
         self.rule_match_feedbacks_bak_path = self.root / "rule_match_feedbacks.jsonl"
+        self.rule_decisions_bak_path = self.root / "rule_decisions.jsonl"
+        self.rule_scope_stats_bak_path = self.root / "rule_scope_stats.jsonl"
+        self.rule_exceptions_bak_path = self.root / "rule_exceptions.jsonl"
         self.events_bak_path = self.root / "events.jsonl"
         self.decisions_bak_path = self.root / "decisions.jsonl"
         self.conflicts_bak_path = self.root / "conflicts.jsonl"
@@ -327,6 +431,9 @@ class SharedMemoryStore:
             (self.rule_assignments_bak_path, self.list_rule_assignments()),
             (self.rule_match_receipts_bak_path, self.list_rule_match_receipts()),
             (self.rule_match_feedbacks_bak_path, self.list_rule_match_feedbacks()),
+            (self.rule_decisions_bak_path, self.list_rule_decisions()),
+            (self.rule_scope_stats_bak_path, self.list_rule_scope_stats()),
+            (self.rule_exceptions_bak_path, self.list_rule_exceptions()),
             (self.events_bak_path, self.list_events()),
             (self.decisions_bak_path, self.list_decisions()),
             (self.conflicts_bak_path, self.list_conflicts()),
@@ -438,6 +545,7 @@ class SharedMemoryStore:
             self._migrate_records_schema(conn)
             conn.executescript(_SCHEMA)
             self._migrate_rule_assignments(conn)
+            self._migrate_rule_lifecycle_schema(conn)
             if had_records and not had_records_fts:
                 # External-content FTS needs an explicit rebuild after it is
                 # first attached to a pre-existing records table; otherwise
@@ -445,7 +553,8 @@ class SharedMemoryStore:
                 conn.execute("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
             # S3.2: schema version 标记(在事务内提交)
             conn.execute(
-                "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', '2')"
+                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '3') "
+                "ON CONFLICT(key) DO UPDATE SET value='3'"
             )
             self._migrate_records_schema(conn)
 
@@ -465,6 +574,8 @@ class SharedMemoryStore:
                 self._migrate_records_schema(conn)
                 conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
                 self._migrate_rule_assignments(conn)
+                conn.executescript(_RULE_LIFECYCLE_SCHEMA)
+                self._migrate_rule_lifecycle_schema(conn)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -585,6 +696,25 @@ class SharedMemoryStore:
                 )
 
     @staticmethod
+    def _migrate_rule_lifecycle_schema(conn: sqlite3.Connection) -> None:
+        """Create lifecycle tables and repair columns from early prototypes."""
+        conn.executescript(_RULE_LIFECYCLE_SCHEMA)
+        # The table definitions above are intentionally additive.  A few
+        # development snapshots created the decision table before action and
+        # target metadata existed; add those columns without rewriting rows.
+        for table, name, sql in (
+            ("rule_decisions", "rule_id", "TEXT NOT NULL DEFAULT ''"),
+            ("rule_decisions", "action", "TEXT NOT NULL DEFAULT ''"),
+            ("rule_decisions", "target_ids", "TEXT NOT NULL DEFAULT '[]'"),
+            ("rule_decisions", "metadata", "TEXT NOT NULL DEFAULT '{}'"),
+        ):
+            columns = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if name not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql}")
+
+    @staticmethod
     def _canonical_hash(body: str) -> str:
         """S2.2: 正文规范哈希,用于并发去重唯一索引。"""
         import hashlib
@@ -600,12 +730,16 @@ class SharedMemoryStore:
 
     def _normalize_assignments(
         self, memory_id: str, assignments: list[dict | RuleAssignment],
+        *, automatic: bool = False, actor_agent_id: str = "",
     ) -> list[RuleAssignment]:
         normalized: dict[tuple[Any, ...], RuleAssignment] = {}
         for raw in assignments:
             value = raw.to_dict() if isinstance(raw, RuleAssignment) else dict(raw)
             value["memory_id"] = memory_id
-            item = normalize_assignment(value)
+            item = (
+                validate_automatic_assignment(value, actor_agent_id=actor_agent_id)
+                if automatic else normalize_assignment(value)
+            )
             if item.target_type == "group":
                 if item.target_id and item.target_id != self.group_id:
                     raise ValueError("group audience must target the current shared-memory group")
@@ -1045,6 +1179,126 @@ class SharedMemoryStore:
             created_at=row["created_at"],
         )
 
+    def _insert_rule_decision(self, conn: sqlite3.Connection, decision: RuleDecision) -> None:
+        d = decision.to_dict()
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_decisions "
+            "(decision_id,actor,before_state,after_state,reason,confidence,undo_id,"
+            "created_at,rule_id,action,target_ids,metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                d["decision_id"], d["actor"],
+                json.dumps(d.get("before", {}), ensure_ascii=False),
+                json.dumps(d.get("after", {}), ensure_ascii=False),
+                d.get("reason", ""), d.get("confidence", 1.0),
+                d.get("undo_id", ""), d.get("created_at", ""),
+                d.get("rule_id", ""), d.get("action", ""),
+                json.dumps(d.get("target_ids", []), ensure_ascii=False),
+                json.dumps({
+                    key: d.get(key)
+                    for key in (
+                        "status", "memory_id", "parent_rule_id", "kind",
+                        "assignments", "target_type", "target_id", "project_ref",
+                        "scope_confidence", "scope_reason", "blocked_reason",
+                        "body", "version_id", "feedback_id", "receipt_id",
+                        "child_rule_id", "metadata",
+                    )
+                    if d.get(key) not in (None, "", [], {})
+                }, ensure_ascii=False),
+            ),
+        )
+
+    @staticmethod
+    def _decode_json_value(value: Any, default: Any) -> Any:
+        if value is None or value == "":
+            return default
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            # Preserve historical opaque before/after strings rather than
+            # failing the entire group's audit history.
+            return value
+
+    def _row_to_rule_decision(self, row: sqlite3.Row) -> RuleDecision:
+        columns = set(row.keys())
+        return RuleDecision(
+            decision_id=row["decision_id"],
+            actor=row["actor"],
+            before=self._decode_json_value(row["before_state"], {}),
+            after=self._decode_json_value(row["after_state"], {}),
+            reason=row["reason"] or "",
+            confidence=float(row["confidence"]),
+            undo_id=row["undo_id"] or "",
+            created_at=row["created_at"] or "",
+            rule_id=row["rule_id"] if "rule_id" in columns else "",
+            action=row["action"] if "action" in columns else "",
+            target_ids=self._safe_json_str_list(
+                row["target_ids"] if "target_ids" in columns else "[]"
+            ),
+            **self._decode_json_value(
+                row["metadata"] if "metadata" in columns else "{}", {}
+            ) if isinstance(
+                self._decode_json_value(
+                    row["metadata"] if "metadata" in columns else "{}", {}
+                ), dict
+            ) else {},
+        )
+
+    def _insert_rule_scope_stats(self, conn: sqlite3.Connection, stats: RuleScopeStats) -> None:
+        d = stats.to_dict()
+        project_ref = canonical_project_ref(d.get("project_ref", ""))
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_scope_stats "
+            "(rule_id,agent_instance_id,project_ref,total,accepted,corrected,wrong_scope,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                d["rule_id"], d.get("agent_instance_id", ""), project_ref,
+                d["total"], d["accepted"], d["corrected"], d["wrong_scope"],
+                d.get("created_at", ""), d.get("updated_at", ""),
+            ),
+        )
+
+    @staticmethod
+    def _row_to_rule_scope_stats(row: sqlite3.Row) -> RuleScopeStats:
+        return RuleScopeStats(
+            rule_id=row["rule_id"],
+            agent_instance_id=row["agent_instance_id"] or "",
+            project_ref=row["project_ref"] or "",
+            total=int(row["total"] or 0),
+            accepted=int(row["accepted"] or 0),
+            corrected=int(row["corrected"] or 0),
+            wrong_scope=int(row["wrong_scope"] or 0),
+            created_at=row["created_at"] or "",
+            updated_at=row["updated_at"] or "",
+        )
+
+    def _insert_rule_exception(self, conn: sqlite3.Connection, exception: RuleException) -> None:
+        d = exception.to_dict()
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_exceptions "
+            "(exception_id,parent_rule,child_exception,priority,reason,rollback,active,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                d["exception_id"], d["parent_rule"], d["child_exception"],
+                d["priority"], d.get("reason", ""),
+                json.dumps(d.get("rollback", {}), ensure_ascii=False),
+                1 if d.get("active", True) else 0,
+                d.get("created_at", ""), d.get("updated_at", ""),
+            ),
+        )
+
+    def _row_to_rule_exception(self, row: sqlite3.Row) -> RuleException:
+        return RuleException(
+            exception_id=row["exception_id"],
+            parent_rule=row["parent_rule"],
+            child_exception=row["child_exception"],
+            priority=int(row["priority"] or 0),
+            reason=row["reason"] or "",
+            rollback=self._decode_json_value(row["rollback"], {}),
+            active=bool(row["active"]),
+            created_at=row["created_at"] or "",
+            updated_at=row["updated_at"] or "",
+        )
+
     def _insert_conflict(self, conn: sqlite3.Connection, group: ConflictGroup) -> None:
         d = group.to_dict()
         conn.execute(
@@ -1115,12 +1369,20 @@ class SharedMemoryStore:
     def write_rule_with_assignments(
         self, record: SharedMemoryRecord, *,
         assignments: list[dict | RuleAssignment] | None = None,
-        decision: DecisionEvent | None = None,
+        decision: DecisionEvent | RuleDecision | None = None,
         dedup_domain: str = "",
+        automatic: bool = False,
+        actor_agent_id: str = "",
     ) -> SharedMemoryRecord:
         """Atomically persist record, audience and optional audit decision."""
         validate_injection_settings(record.injection_policy, record.priority)
-        normalized = self._normalize_assignments(record.memory_id, assignments or [])
+        decision_actor = getattr(decision, "actor", "") if decision is not None else ""
+        automatic = automatic or isinstance(decision, RuleDecision) or str(decision_actor).casefold().startswith("auto")
+        actor_agent_id = actor_agent_id or record.agent_instance_id
+        normalized = self._normalize_assignments(
+            record.memory_id, assignments or [], automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
         if record.injection_policy == "always" and not normalized:
             normalized = self._default_assignments(record)
         if record.injection_policy != "always" and normalized:
@@ -1156,7 +1418,10 @@ class SharedMemoryStore:
                 self._insert_record(conn, record, dedup_domain=domain)
                 self._insert_assignments(conn, record.memory_id, normalized)
             if decision is not None:
-                self._insert_decision(conn, decision)
+                if isinstance(decision, RuleDecision):
+                    self._insert_rule_decision(conn, decision)
+                else:
+                    self._insert_decision(conn, decision)
             conn.commit()
             return record
         except Exception:
@@ -1175,8 +1440,11 @@ class SharedMemoryStore:
         )
         self._append_jsonl(self.records_bak_path, record)
 
-    def append_decision(self, decision: DecisionEvent) -> None:
+    def append_decision(self, decision: DecisionEvent | RuleDecision) -> None:
         """追加决策事件。"""
+        if isinstance(decision, RuleDecision):
+            self.append_rule_decision(decision)
+            return
         with self._tx() as conn:
             self._insert_decision(conn, decision)
         self._append_jsonl(self.decisions_bak_path, decision)
@@ -1315,6 +1583,349 @@ class SharedMemoryStore:
         with self._db() as conn:
             rows = conn.execute("SELECT * FROM decisions ORDER BY rowid").fetchall()
         return [self._row_to_decision(r) for r in rows]
+
+    def append_rule_decision(self, decision: RuleDecision) -> RuleDecision:
+        """Persist one structured lifecycle decision idempotently."""
+        caller_decision = decision
+        if not isinstance(decision, RuleDecision):
+            raw = (
+                decision.to_dict() if hasattr(decision, "to_dict")
+                else dict(decision)
+            )
+            # ``rule_creation.RuleDecision`` is a mapping used by the
+            # rolling service layer and predates this persistence model.  It
+            # has no actor/before/after fields; keep it auditable by treating
+            # the service result as an automatic decision and preserving its
+            # full payload in the structured after state.
+            raw.setdefault("actor", "auto")
+            raw.setdefault("before", {})
+            raw.setdefault("after", dict(raw))
+            decision = RuleDecision.from_dict(raw)
+        payload = decision.to_dict()
+        if not payload["created_at"]:
+            payload["created_at"] = _now_iso()
+        persisted = RuleDecision.from_dict(payload)
+        with self._tx() as conn:
+            self._insert_rule_decision(conn, persisted)
+            row = conn.execute(
+                "SELECT * FROM rule_decisions WHERE decision_id=?",
+                (persisted.decision_id,),
+            ).fetchone()
+        # The optional rule_creation service exposes its own Mapping-shaped
+        # RuleDecision.  Return that object to preserve its mapping contract;
+        # native schema callers receive the canonical persisted model.
+        result = (
+            caller_decision if not isinstance(caller_decision, RuleDecision)
+            else (self._row_to_rule_decision(row) if row else persisted)
+        )
+        self._append_jsonl(self.rule_decisions_bak_path, result)
+        return result
+
+    append_auto_decision = append_rule_decision
+
+    def get_rule_decision(self, decision_id: str) -> RuleDecision | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_decisions WHERE decision_id=?",
+                (decision_id,),
+            ).fetchone()
+        return self._row_to_rule_decision(row) if row else None
+
+    def list_rule_decisions(
+        self, *, decision_id: str | None = None,
+        actor: str | None = None, rule_id: str | None = None,
+        memory_id: str | None = None, undo_id: str | None = None,
+    ) -> list[RuleDecision]:
+        sql = "SELECT * FROM rule_decisions"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if decision_id:
+            clauses.append("decision_id=?")
+            params.append(decision_id)
+        if actor:
+            clauses.append("actor=?")
+            params.append(actor)
+        if rule_id or memory_id:
+            clauses.append("rule_id=?")
+            params.append(rule_id or memory_id)
+        if undo_id:
+            clauses.append("undo_id=?")
+            params.append(undo_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at, rowid"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_decision(row) for row in rows]
+
+    list_auto_decisions = list_rule_decisions
+
+    def undo_rule_decision(
+        self, decision_id: str, actor: str = "user",
+    ) -> RuleDecision:
+        """Append an explicit inverse decision and optionally restore its snapshot.
+
+        Undo is audit-first: an absent/non-version ``undo_id`` does not make
+        the decision disappear; the inverse record still explains what was
+        requested.  Snapshot restoration is attempted only when the token is
+        a known version in this share group.
+        """
+        original = self.get_rule_decision(decision_id)
+        if original is None:
+            raise ValueError("rule_decision_not_found")
+        if original.undo_id:
+            try:
+                if any(item.get("version_id") == original.undo_id for item in self.list_version_snapshots()):
+                    self.rollback_to_version(original.undo_id)
+            except (FileNotFoundError, ValueError, RuntimeError):
+                pass
+        now = _now_iso()
+        inverse = RuleDecision(
+            decision_id=stable_hash("rule-decision-undo", decision_id, actor, now),
+            actor=actor,
+            before=original.after,
+            after=original.before,
+            reason=f"undo {decision_id}",
+            confidence=original.confidence,
+            undo_id=decision_id,
+            created_at=now,
+            rule_id=original.rule_id,
+            action="undo",
+            target_ids=list(original.target_ids),
+            parent_rule_id=original.parent_rule_id,
+            memory_id=original.memory_id,
+        )
+        return self.append_rule_decision(inverse)
+
+    rollback_rule_decision = undo_rule_decision
+
+    def append_rule_scope_stats(self, stats: RuleScopeStats) -> RuleScopeStats:
+        """Upsert cumulative counters for one (rule, Agent, project) scope."""
+        if not isinstance(stats, RuleScopeStats):
+            stats = RuleScopeStats.from_dict(dict(stats))
+        now = _now_iso()
+        payload = stats.to_dict()
+        if not payload["created_at"]:
+            payload["created_at"] = now
+        if not payload["updated_at"]:
+            payload["updated_at"] = now
+        persisted = RuleScopeStats.from_dict(payload)
+        with self._tx() as conn:
+            self._insert_rule_scope_stats(conn, persisted)
+            row = conn.execute(
+                "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+                (persisted.rule_id, persisted.agent_instance_id,
+                 canonical_project_ref(persisted.project_ref)),
+            ).fetchone()
+        result = self._row_to_rule_scope_stats(row) if row else persisted
+        self._append_jsonl(self.rule_scope_stats_bak_path, result)
+        return result
+
+    upsert_rule_scope_stats = append_rule_scope_stats
+    update_rule_scope_stats = append_rule_scope_stats
+
+    def record_rule_scope(
+        self,
+        rule_id: str | RuleScopeStats,
+        *,
+        agent_instance_id: str = "",
+        project_ref: str = "",
+        agent: str | None = None,
+        project: str | None = None,
+        outcome: str = "accepted",
+        count: int = 1,
+    ) -> RuleScopeStats:
+        """Increment feedback counters for a precise runtime scope.
+
+        This method never infers sibling agents, group membership, provider or
+        runtime-role dimensions; callers must pass the exact observed scope.
+        """
+        if isinstance(rule_id, RuleScopeStats):
+            return self.append_rule_scope_stats(rule_id)
+        if not rule_id:
+            raise ValueError("rule_id is required")
+        if agent is not None:
+            agent_instance_id = agent
+        if project is not None:
+            project_ref = project
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("count must be a positive integer")
+        outcome = str(outcome or "").strip().casefold()
+        allowed = {"accepted", "corrected", "wrong_scope", "total", "ignored", "not_applicable"}
+        if outcome not in allowed:
+            raise ValueError("invalid scope outcome")
+        project_ref = canonical_project_ref(project_ref)
+        now = _now_iso()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+                (rule_id, agent_instance_id, project_ref),
+            ).fetchone()
+            if row is None:
+                values = {
+                    "rule_id": rule_id, "agent_instance_id": agent_instance_id,
+                    "project_ref": project_ref, "total": count,
+                    "accepted": count if outcome == "accepted" else 0,
+                    "corrected": count if outcome == "corrected" else 0,
+                    "wrong_scope": count if outcome == "wrong_scope" else 0,
+                    "created_at": now, "updated_at": now,
+                }
+                stats = RuleScopeStats(**values)
+                self._insert_rule_scope_stats(conn, stats)
+            else:
+                stats = self._row_to_rule_scope_stats(row)
+                stats.total += count
+                if outcome == "accepted":
+                    stats.accepted += count
+                elif outcome == "corrected":
+                    stats.corrected += count
+                elif outcome == "wrong_scope":
+                    stats.wrong_scope += count
+                stats.updated_at = now
+                self._insert_rule_scope_stats(conn, stats)
+            row = conn.execute(
+                "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+                (rule_id, agent_instance_id, project_ref),
+            ).fetchone()
+        result = self._row_to_rule_scope_stats(row)
+        self._append_jsonl(self.rule_scope_stats_bak_path, result)
+        return result
+
+    record_scope_stat = record_rule_scope
+
+    def list_rule_scope_stats(
+        self, *, rule_id: str | None = None, memory_id: str | None = None,
+        agent_instance_id: str | None = None, project_ref: str | None = None,
+        agent: str | None = None, project: str | None = None,
+    ) -> list[RuleScopeStats]:
+        sql = "SELECT * FROM rule_scope_stats"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if rule_id or memory_id:
+            clauses.append("rule_id=?")
+            params.append(rule_id or memory_id)
+        if agent_instance_id is None and agent is not None:
+            agent_instance_id = agent
+        if project_ref is None and project is not None:
+            project_ref = project
+        if agent_instance_id is not None:
+            clauses.append("agent_instance_id=?")
+            params.append(agent_instance_id)
+        if project_ref is not None:
+            clauses.append("project_ref=?")
+            params.append(canonical_project_ref(project_ref))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY rule_id, agent_instance_id, project_ref"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_scope_stats(row) for row in rows]
+
+    list_scope_stats = list_rule_scope_stats
+    query_rule_scope_stats = list_rule_scope_stats
+
+    def get_rule_scope_stats(
+        self, rule_id: str, *, agent_instance_id: str = "",
+        project_ref: str = "", agent: str | None = None,
+        project: str | None = None,
+    ) -> RuleScopeStats | None:
+        if agent is not None:
+            agent_instance_id = agent
+        if project is not None:
+            project_ref = project
+        project_ref = canonical_project_ref(project_ref)
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_scope_stats WHERE rule_id=? AND agent_instance_id=? AND project_ref=?",
+                (rule_id, agent_instance_id, project_ref),
+            ).fetchone()
+        return self._row_to_rule_scope_stats(row) if row else None
+
+    def append_rule_exception(self, exception: RuleException) -> RuleException:
+        """Persist a parent→child exception relation, idempotently."""
+        if not isinstance(exception, RuleException):
+            exception = RuleException.from_dict(dict(exception))
+        now = _now_iso()
+        payload = exception.to_dict()
+        if not payload["created_at"]:
+            payload["created_at"] = now
+        if not payload["updated_at"]:
+            payload["updated_at"] = now
+        persisted = RuleException.from_dict(payload)
+        with self._tx() as conn:
+            self._insert_rule_exception(conn, persisted)
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (persisted.exception_id,),
+            ).fetchone()
+        result = self._row_to_rule_exception(row) if row else persisted
+        self._append_jsonl(self.rule_exceptions_bak_path, result)
+        return result
+
+    add_rule_exception = append_rule_exception
+
+    def get_rule_exception(self, exception_id: str) -> RuleException | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (exception_id,),
+            ).fetchone()
+        return self._row_to_rule_exception(row) if row else None
+
+    def list_rule_exceptions(
+        self, *, parent_rule: str | None = None,
+        child_exception: str | None = None,
+        active: bool | None = None,
+    ) -> list[RuleException]:
+        sql = "SELECT * FROM rule_exceptions"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_rule is not None:
+            clauses.append("parent_rule=?")
+            params.append(parent_rule)
+        if child_exception is not None:
+            clauses.append("child_exception=?")
+            params.append(child_exception)
+        if active is not None:
+            clauses.append("active=?")
+            params.append(1 if active else 0)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY priority DESC, created_at, exception_id"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_exception(row) for row in rows]
+
+    def rollback_rule_exception(
+        self, exception_id: str, *, rollback: Any = None,
+        decision: RuleDecision | None = None,
+    ) -> RuleException:
+        """Deactivate an exception while retaining reversible rollback data."""
+        now = _now_iso()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (exception_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("rule_exception_not_found")
+            current = self._row_to_rule_exception(row)
+            current.active = False
+            current.updated_at = now
+            if rollback is not None:
+                current.rollback = rollback
+            self._insert_rule_exception(conn, current)
+            if decision is not None:
+                self._insert_rule_decision(conn, decision)
+            row = conn.execute(
+                "SELECT * FROM rule_exceptions WHERE exception_id=?",
+                (exception_id,),
+            ).fetchone()
+        result = self._row_to_rule_exception(row)
+        self._append_jsonl(self.rule_exceptions_bak_path, result)
+        return result
+
+    deactivate_rule_exception = rollback_rule_exception
 
     def list_conflicts(self) -> list[ConflictGroup]:
         """列出所有冲突组。"""
@@ -1505,9 +2116,24 @@ class SharedMemoryStore:
             return None
         return self._row_to_rule_match_feedback(row)
 
-    def set_rule_assignments(self, memory_id: str, assignments: list[dict | RuleAssignment]) -> list[RuleAssignment]:
+    # Future narrowing logic can use hit terminology without creating a
+    # second table or losing compatibility with existing match receipts.
+    append_rule_hit_receipt = append_rule_match_receipt
+    get_rule_hit_receipt = get_rule_match_receipt
+    list_rule_hit_receipts = list_rule_match_receipts
+    append_rule_hit_feedback = append_rule_match_feedback
+    list_rule_hit_feedbacks = list_rule_match_feedbacks
+    get_rule_hit_feedback_by_receipt = get_rule_match_feedback_by_receipt
+
+    def set_rule_assignments(
+        self, memory_id: str, assignments: list[dict | RuleAssignment], *,
+        automatic: bool = False, actor_agent_id: str = "",
+    ) -> list[RuleAssignment]:
         """Replace audience relations atomically; record deletion is separate."""
-        normalized = self._normalize_assignments(memory_id, assignments)
+        normalized = self._normalize_assignments(
+            memory_id, assignments, automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
         now = _now_iso()
         with self._tx() as conn:
             row = conn.execute(
@@ -1535,10 +2161,13 @@ class SharedMemoryStore:
 
     def replace_actor_assignment(
         self, memory_id: str, actor_agent_id: str,
-        assignments: list[dict | RuleAssignment],
+        assignments: list[dict | RuleAssignment], *, automatic: bool = False,
     ) -> list[RuleAssignment]:
         """Atomically replace only one actor's agent-scoped relations."""
-        incoming = self._normalize_assignments(memory_id, assignments)
+        incoming = self._normalize_assignments(
+            memory_id, assignments, automatic=automatic,
+            actor_agent_id=actor_agent_id,
+        )
         if any(
             item.target_type != "agent" or item.target_id != actor_agent_id
             for item in incoming
@@ -1557,7 +2186,10 @@ class SharedMemoryStore:
                 item for item in self._list_rule_assignments_conn(conn, memory_id)
                 if not (item.target_type == "agent" and item.target_id == actor_agent_id)
             ]
-            final = self._normalize_assignments(memory_id, retained + incoming)
+            final = self._normalize_assignments(
+                memory_id, retained + incoming, automatic=automatic,
+                actor_agent_id=actor_agent_id,
+            )
             self._validate_mandatory_budget(
                 record, assignments=final, conn=conn, replacing_id=memory_id,
             )
@@ -1583,8 +2215,10 @@ class SharedMemoryStore:
     def transition_injection_policy(
         self, memory_id: str, injection_policy: str, priority: int, *,
         assignments: list[dict | RuleAssignment] | None = None,
-        decision: DecisionEvent | None = None,
+        decision: DecisionEvent | RuleDecision | None = None,
         provenance: list[Provenance] | None = None,
+        automatic: bool = False,
+        actor_agent_id: str = "",
     ) -> tuple[SharedMemoryRecord, list[RuleAssignment]]:
         """Atomically change policy and its audience lifecycle."""
         injection_policy, priority = validate_injection_settings(
@@ -1599,8 +2233,15 @@ class SharedMemoryStore:
             record = self._row_to_record(row)
             if record.status != SharedMemoryStatus.ACTIVE:
                 raise ValueError("injection_policy_transition_requires_active_record")
+            decision_actor = getattr(decision, "actor", "") if decision is not None else ""
+            transition_automatic = (
+                automatic or isinstance(decision, RuleDecision)
+                or str(decision_actor).casefold().startswith("auto")
+            )
+            actor_id = actor_agent_id or record.agent_instance_id
             normalized = self._normalize_assignments(
-                memory_id, assignments or [],
+                memory_id, assignments or [], automatic=transition_automatic,
+                actor_agent_id=actor_id,
             )
             if injection_policy == "always":
                 if not any(item.effect == "include" for item in normalized):
@@ -1640,7 +2281,10 @@ class SharedMemoryStore:
                 ),
             )
             if decision is not None:
-                self._insert_decision(conn, decision)
+                if isinstance(decision, RuleDecision):
+                    self._insert_rule_decision(conn, decision)
+                else:
+                    self._insert_decision(conn, decision)
         updated = self.get_record(memory_id)
         if updated is None:
             raise RuntimeError("policy transition lost record")
@@ -1863,6 +2507,9 @@ class SharedMemoryStore:
             "rule_match_feedbacks": [
                 item.to_dict() for item in self.list_rule_match_feedbacks()
             ],
+            "rule_decisions": [item.to_dict() for item in self.list_rule_decisions()],
+            "rule_scope_stats": [item.to_dict() for item in self.list_rule_scope_stats()],
+            "rule_exceptions": [item.to_dict() for item in self.list_rule_exceptions()],
             "events": [e.to_dict() for e in self.list_events()],
             "decisions": [d.to_dict() for d in self.list_decisions()],
             "conflicts": [c.to_dict() for c in self.list_conflicts()],
@@ -1931,7 +2578,8 @@ class SharedMemoryStore:
             raise ValueError("invalid_snapshot_structure")
         names = (
             "records", "rule_assignments", "rule_match_receipts",
-            "rule_match_feedbacks", "events", "decisions",
+            "rule_match_feedbacks", "rule_decisions", "rule_scope_stats",
+            "rule_exceptions", "events", "decisions",
             "conflicts", "quarantine",
         )
         if any(name in snapshot and not isinstance(snapshot[name], list) for name in names):
@@ -1964,6 +2612,21 @@ class SharedMemoryStore:
                 if not isinstance(value, dict):
                     raise ValueError("invalid_snapshot_rule_match_feedback")
                 rule_match_feedbacks.append(RuleMatchFeedback.from_dict(value))
+            rule_decisions = []
+            for value in snapshot.get("rule_decisions", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_rule_decision")
+                rule_decisions.append(RuleDecision.from_dict(value))
+            rule_scope_stats = []
+            for value in snapshot.get("rule_scope_stats", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_rule_scope_stats")
+                rule_scope_stats.append(RuleScopeStats.from_dict(value))
+            rule_exceptions = []
+            for value in snapshot.get("rule_exceptions", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_rule_exception")
+                rule_exceptions.append(RuleException.from_dict(value))
             receipt_ids = {item.receipt_id for item in rule_match_receipts}
             for feedback in rule_match_feedbacks:
                 if feedback.receipt_id not in receipt_ids:
@@ -1983,6 +2646,9 @@ class SharedMemoryStore:
             "records": records, "rule_assignments": assignments,
             "rule_match_receipts": rule_match_receipts,
             "rule_match_feedbacks": rule_match_feedbacks,
+            "rule_decisions": rule_decisions,
+            "rule_scope_stats": rule_scope_stats,
+            "rule_exceptions": rule_exceptions,
             "events": events, "decisions": decisions,
             "conflicts": conflicts, "quarantine": quarantine,
         }
@@ -1992,6 +2658,7 @@ class SharedMemoryStore:
         with self._tx() as conn:
             for table in (
                 "rule_match_feedbacks", "rule_match_receipts",
+                "rule_decisions", "rule_scope_stats", "rule_exceptions",
                 "rule_assignments", "records", "events", "decisions",
                 "conflicts", "quarantine",
             ):
@@ -2025,6 +2692,12 @@ class SharedMemoryStore:
                 )
             for event in snapshot["events"]:
                 self._insert_event(conn, event)
+            for decision in snapshot["rule_decisions"]:
+                self._insert_rule_decision(conn, decision)
+            for stats in snapshot["rule_scope_stats"]:
+                self._insert_rule_scope_stats(conn, stats)
+            for exception in snapshot["rule_exceptions"]:
+                self._insert_rule_exception(conn, exception)
             for decision in snapshot["decisions"]:
                 self._insert_decision(conn, decision)
             for conflict in snapshot["conflicts"]:
@@ -2102,6 +2775,18 @@ class SharedMemoryStore:
                     conn, row["memory_id"],
                 )
             ]
+            rule_match_receipts = [
+                self._row_to_rule_match_receipt(row).to_dict()
+                for row in conn.execute(
+                    "SELECT * FROM rule_match_receipts ORDER BY rowid"
+                )
+            ]
+            rule_match_feedbacks = [
+                self._row_to_rule_match_feedback(row).to_dict()
+                for row in conn.execute(
+                    "SELECT * FROM rule_match_feedbacks ORDER BY rowid"
+                )
+            ]
             events = [
                 self._row_to_event(row).to_dict()
                 for row in conn.execute("SELECT * FROM events ORDER BY rowid")
@@ -2109,6 +2794,18 @@ class SharedMemoryStore:
             decisions = [
                 self._row_to_decision(row).to_dict()
                 for row in conn.execute("SELECT * FROM decisions ORDER BY rowid")
+            ]
+            rule_decisions = [
+                self._row_to_rule_decision(row).to_dict()
+                for row in conn.execute("SELECT * FROM rule_decisions ORDER BY rowid")
+            ]
+            rule_scope_stats = [
+                self._row_to_rule_scope_stats(row).to_dict()
+                for row in conn.execute("SELECT * FROM rule_scope_stats ORDER BY rowid")
+            ]
+            rule_exceptions = [
+                self._row_to_rule_exception(row).to_dict()
+                for row in conn.execute("SELECT * FROM rule_exceptions ORDER BY rowid")
             ]
             conflicts = [
                 self._row_to_conflict(row).to_dict()
@@ -2138,8 +2835,13 @@ class SharedMemoryStore:
         return {
             "records": records,
             "rule_assignments": rule_assignments,
+            "rule_match_receipts": rule_match_receipts,
+            "rule_match_feedbacks": rule_match_feedbacks,
             "events": events,
             "decisions": decisions,
+            "rule_decisions": rule_decisions,
+            "rule_scope_stats": rule_scope_stats,
+            "rule_exceptions": rule_exceptions,
             "conflicts": conflicts,
             "quarantine": quarantine,
             "versions": versions,
@@ -2154,6 +2856,8 @@ class SharedMemoryStore:
         records = self.list_records()
         events = self.list_events()
         decisions = self.list_decisions()
+        rule_decisions = self.list_rule_decisions()
+        rule_exceptions = self.list_rule_exceptions()
         conflicts = self.list_conflicts()
         quarantine = self.list_quarantine()
         return {
@@ -2171,6 +2875,9 @@ class SharedMemoryStore:
             "deleted": sum(1 for r in records if r.status == SharedMemoryStatus.DELETED),
             "total_events": len(events),
             "total_decisions": len(decisions),
+            "total_rule_decisions": len(rule_decisions),
+            "total_rule_exceptions": len(rule_exceptions),
+            "total_rule_scope_stats": len(self.list_rule_scope_stats()),
             "total_conflicts": len(conflicts),
             "total_quarantine": len(quarantine),
             "active_version": self.get_active_version_id(),
@@ -2191,6 +2898,9 @@ class SharedMemoryStore:
             self.rule_assignments_bak_path,
             self.rule_match_receipts_bak_path,
             self.rule_match_feedbacks_bak_path,
+            self.rule_decisions_bak_path,
+            self.rule_scope_stats_bak_path,
+            self.rule_exceptions_bak_path,
             self.events_bak_path,
             self.decisions_bak_path,
             self.conflicts_bak_path,
@@ -2208,6 +2918,8 @@ class SharedMemoryStore:
             with self._tx() as conn:
                 for table in (
                     "quarantine", "conflicts", "decisions", "events",
+                    "rule_match_feedbacks", "rule_match_receipts",
+                    "rule_decisions", "rule_scope_stats", "rule_exceptions",
                     "rule_assignments", "records", "active_version", "versions",
                 ):
                     conn.execute(f"DELETE FROM {table}")
@@ -2258,6 +2970,9 @@ class SharedMemoryStore:
             ("rule_assignments.jsonl", self._migrate_rule_assignments_jsonl),
             ("rule_match_receipts.jsonl", self._migrate_rule_match_receipts_jsonl),
             ("rule_match_feedbacks.jsonl", self._migrate_rule_match_feedbacks_jsonl),
+            ("rule_decisions.jsonl", self._migrate_rule_decisions_jsonl),
+            ("rule_scope_stats.jsonl", self._migrate_rule_scope_stats_jsonl),
+            ("rule_exceptions.jsonl", self._migrate_rule_exceptions_jsonl),
             ("events.jsonl", self._migrate_events_jsonl),
             ("decisions.jsonl", self._migrate_decisions_jsonl),
             ("conflicts.jsonl", self._migrate_conflicts_jsonl),
@@ -2400,6 +3115,30 @@ class SharedMemoryStore:
                 except (ValueError, KeyError, sqlite3.IntegrityError):
                     continue
 
+    def _migrate_rule_decisions_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for d in self._read_jsonl(path):
+                try:
+                    self._insert_rule_decision(conn, RuleDecision.from_dict(d))
+                except (ValueError, KeyError, TypeError, sqlite3.IntegrityError):
+                    continue
+
+    def _migrate_rule_scope_stats_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for d in self._read_jsonl(path):
+                try:
+                    self._insert_rule_scope_stats(conn, RuleScopeStats.from_dict(d))
+                except (ValueError, KeyError, TypeError, sqlite3.IntegrityError):
+                    continue
+
+    def _migrate_rule_exceptions_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for d in self._read_jsonl(path):
+                try:
+                    self._insert_rule_exception(conn, RuleException.from_dict(d))
+                except (ValueError, KeyError, TypeError, sqlite3.IntegrityError):
+                    continue
+
     def _migrate_versions_dir(self) -> None:
         if not self.versions_dir.exists():
             return
@@ -2418,12 +3157,16 @@ class SharedMemoryStore:
             created_at = manifest.get("created_at", "")
             snapshot = {
                 "records": self._read_jsonl(vdir / "records.jsonl"),
+                "rule_assignments": self._read_jsonl(vdir / "rule_assignments.jsonl"),
                 "rule_match_receipts": self._read_jsonl(
                     vdir / "rule_match_receipts.jsonl",
                 ),
                 "rule_match_feedbacks": self._read_jsonl(
                     vdir / "rule_match_feedbacks.jsonl",
                 ),
+                "rule_decisions": self._read_jsonl(vdir / "rule_decisions.jsonl"),
+                "rule_scope_stats": self._read_jsonl(vdir / "rule_scope_stats.jsonl"),
+                "rule_exceptions": self._read_jsonl(vdir / "rule_exceptions.jsonl"),
                 "events": [],
                 "decisions": self._read_jsonl(vdir / "decisions.jsonl"),
                 "conflicts": [],

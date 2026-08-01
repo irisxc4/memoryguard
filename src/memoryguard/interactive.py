@@ -671,6 +671,18 @@ tbody tr:last-child td { border-bottom: 0; }
 .source-map-table tr:last-child td { border-bottom: 0; }
 .path-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .muted-row { opacity: .58; }
+.rule-cockpit-panel { border-color: rgba(110,231,196,.28); }
+.rule-create-panel textarea { width: 100%; min-height: 82px; resize: vertical; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(4,13,10,.78); color: var(--fg); }
+.rule-context-grid { display: grid; grid-template-columns: repeat(3, minmax(160px, 1fr)); gap: 10px; margin-top: 12px; }
+.rule-create-result { margin-top: 12px; padding: 10px 12px; border: 1px solid rgba(110,231,196,.34); border-radius: 9px; background: rgba(110,231,196,.06); }
+.rule-create-result.error { border-color: rgba(255,125,136,.48); background: rgba(255,125,136,.06); }
+.rule-decision-row, .rule-exception-row, .rule-receipt { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 9px 0; border-top: 1px solid var(--line); }
+.rule-decision-row:first-of-type { border-top: 0; }
+.rule-decision-row > .muted { flex: 1 1 100%; }
+.rule-decision-link, .rule-receipts, .rule-exceptions { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+.rule-feedback-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.rule-feedback-actions .btn { min-height: 26px; padding: 3px 7px; font-size: 10px; }
+@media (max-width: 720px) { .rule-context-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -849,6 +861,15 @@ async function callApi(method, ...args) {
     showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
   }
   return result;
+}
+
+// Optional lifecycle endpoints are intentionally feature-detected so an older
+// GUI can still browse the existing rules page while the rule cockpit service
+// is being rolled out.  Mutations still go through callApi (and therefore the
+// normal pywebview/request-queue bridge) when the endpoint is present.
+async function callApiOptional(method, fallback, ...args) {
+  try { return await callApi(method, ...args); }
+  catch (_) { return fallback; }
 }
 
 function waitForPywebview(timeoutMs) {
@@ -3120,6 +3141,13 @@ let ruleRangeFilter = 'all';
 let ruleVisibilityFilter = 'effective';
 let ruleRecordsById = new Map();
 let rulePreviewById = new Map();
+let ruleDecisionRows = [];
+let ruleScopeMetrics = {};
+let ruleReceiptRows = [];
+let ruleExceptionRows = [];
+let ruleCreateResult = null;
+let ruleContextGroupId = '';
+let ruleContextProjectRef = '';
 
 function ruleAudience(record) {
   const items = record.assignments || [];
@@ -3144,6 +3172,198 @@ function rulePreviewState(record) {
   return rulePreviewById.get(record.memory_id) || 'unavailable';
 }
 
+function ruleDecisionFor(record) {
+  const id = record?.memory_id || record?.rule_id || '';
+  return ruleDecisionRows.find(item =>
+    String(item.rule_id || item.memory_id || item.target_rule_id || '') === String(id)
+  ) || null;
+}
+
+function ruleStatsFor(record) {
+  const id = record?.memory_id || record?.rule_id || '';
+  return (ruleScopeMetrics.stats || []).find(item =>
+    String(item.rule_id || item.memory_id || '') === String(id)
+  ) || null;
+}
+
+function ruleReceiptsFor(record) {
+  const id = record?.memory_id || record?.rule_id || '';
+  return ruleReceiptRows.filter(item => String(item.memory_id || '') === String(id));
+}
+
+function ruleExceptionsFor(record) {
+  const id = record?.memory_id || record?.rule_id || '';
+  return ruleExceptionRows.filter(item =>
+    String(item.parent_rule || item.parent_rule_id || '') === String(id)
+  );
+}
+
+function ruleConfidenceLabel(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '';
+  const pct = Math.round(Math.max(0, Math.min(1, n)) * 100);
+  const cls = pct >= 80 ? 'chip-confirmed' : pct >= 50 ? 'chip-medium' : 'chip-high';
+  return `<span class="chip ${cls}" title="自动范围置信度">范围置信度 ${pct}%</span>`;
+}
+
+function renderRuleReceiptActions(receipt) {
+  const receiptId = receipt?.receipt_id || '';
+  if (!receiptId) return '';
+  const feedback = receipt.feedback || {};
+  const outcome = feedback.outcome || '';
+  const outcomes = [
+    ['followed', '已遵循'], ['violated', '已违反'], ['not_applicable', '不适用'],
+    ['corrected', '纠正'], ['exception', '例外'],
+  ];
+  return `<div class="rule-receipt"><span class="chip chip-info">命中回执 ${escapeHtml(receiptId.slice(0, 12))}</span>
+    ${outcome ? `<span class="chip chip-confirmed">反馈：${escapeHtml(outcome)}</span>` : '<span class="muted">尚无反馈</span>'}
+    <div class="rule-feedback-actions">${outcomes.map(([value, label]) =>
+      `<button class="btn btn-icon" type="button" title="${label}" onclick="submitRuleFeedback('${escapeHtml(receiptId)}','${value}')">${label}</button>`
+    ).join('')}</div></div>`;
+}
+
+function renderRuleAutoScopePanel() {
+  const metrics = ruleScopeMetrics.auto_scope || ruleScopeMetrics.metrics || {};
+  const decisions = ruleDecisionRows || [];
+  const total = Number(metrics.total ?? metrics.decisions ?? metrics.assignment_count ?? decisions.length ?? 0);
+  const low = Number(metrics.low_confidence ?? metrics.low_confidence_count ?? decisions.filter(d => Number(d.scope_confidence ?? d.confidence) < .5).length ?? 0);
+  const narrowed = Number(metrics.narrowed ?? metrics.narrowed_count ?? 0);
+  const undone = Number(metrics.undone ?? metrics.undone_count ?? decisions.filter(d => d.status === 'undone' || d.undone).length ?? 0);
+  const rows = decisions.slice(-20).reverse().map(item => {
+    const id = item.decision_id || item.event_id || '';
+    const confidence = item.scope_confidence ?? item.confidence;
+    const canUndo = !!(item.undo_id || id) && item.status !== 'undone' && !item.undone;
+    return `<div class="rule-decision-row"><div><strong>${escapeHtml(item.action || 'auto_scope')}</strong>
+      <span class="chip chip-info">${escapeHtml((item.rule_id || item.memory_id || '').slice(0, 14))}</span>
+      ${ruleConfidenceLabel(confidence)}</div>
+      <div class="muted">${escapeHtml(item.scope_reason || item.reason || '未提供原因')} · ${escapeHtml(item.created_at || '')}</div>
+      <div class="finding-actions"><code>${escapeHtml(id)}</code>${canUndo ? `<button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecision('${escapeHtml(id)}')">撤销自动决定</button>` : '<span class="chip chip-medium">已撤销</span>'}</div></div>`;
+  }).join('');
+  return `<section class="card rule-cockpit-panel"><div class="card-head"><div><h2>自动范围决策</h2><p>范围只从当前 Agent / 项目上下文推导；低置信度不会扩大到共享组或系统。</p></div>
+    <div class="chips"><span class="chip chip-info">自动决定 ${total}</span><span class="chip ${low ? 'chip-high' : 'chip-confirmed'}">低置信度 ${low}</span><span class="chip chip-info">已收窄 ${narrowed}</span><span class="chip chip-info">已撤销 ${undone}</span></div></div>
+    ${rows || '<p class="muted">暂无自动范围决定。</p>'}</section>`;
+}
+
+function renderRuleCreatePanel(options) {
+  const agents = options.agents || [];
+  const groups = options.groups || [];
+  const projects = options.projects || [];
+  if (!ruleContextGroupId || !groups.some(item => item.id === ruleContextGroupId)) {
+    ruleContextGroupId = activeShareGroupId || groups[0]?.id || 'default';
+  }
+  if (!ruleContextProjectRef || !projects.some(item => item.id === ruleContextProjectRef)) {
+    ruleContextProjectRef = rulePreviewProjectRef || '';
+  }
+  const selectedAgent = rulePreviewAgentId || activeAgentInstanceId || agents[0]?.id || '';
+  const result = ruleCreateResult;
+  const resultHtml = result ? `<div class="rule-create-result ${result.error ? 'error' : ''}">
+    ${result.error ? `<strong>未创建：${escapeHtml(result.error)}</strong>` : `<strong>已创建规则 ${escapeHtml(result.rule_id || result.memory_id || '')}</strong>
+      <div class="chips">${result.kind ? `<span class="chip chip-info">分类 ${escapeHtml(result.kind)}</span>` : ''}${ruleConfidenceLabel(result.scope_confidence)}${result.decision_id ? `<span class="chip chip-info">决定 ${escapeHtml(result.decision_id.slice(0, 14))}</span>` : ''}</div>
+      <p>${escapeHtml(result.scope_reason || result.blocked_reason || '范围由当前上下文确定')}</p>`}
+  </div>` : '';
+  return `<section class="card rule-create-panel"><div class="card-head"><div><h2>一句话新增规则</h2><p>明确当前 Agent、共享组与项目后再保存。系统范围与跨 Agent 范围不会由自动流程创建。</p></div></div>
+    <textarea id="rule-create-text" rows="3" maxlength="12000" placeholder="例如：所有 Unity UI 修复先补 EditMode 回归测试"></textarea>
+    <div class="page-actions rule-context-grid"><label class="field"><span>当前 Agent</span><select id="rule-create-agent">${ruleSelectOptions(agents, selectedAgent)}</select></label>
+      <label class="field"><span>共享组</span><select id="rule-create-group" onchange="ruleContextGroupId=this.value">${ruleSelectOptions(groups, ruleContextGroupId)}${groups.length ? '' : '<option value="default">default</option>'}</select></label>
+      <label class="field"><span>项目（可选）</span><select id="rule-create-project" onchange="ruleContextProjectRef=this.value"><option value="">当前上下文未指定项目</option>${ruleSelectOptions(projects, ruleContextProjectRef)}</select></label></div>
+    <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="createRuleFromText()">分析并创建</button><span class="muted">低置信度只会返回当前 Agent / 项目候选，需人工确认。</span></div>${resultHtml}</section>`;
+}
+
+async function createRuleFromText() {
+  const text = String(document.getElementById('rule-create-text')?.value || '').trim();
+  const agent = String(document.getElementById('rule-create-agent')?.value || rulePreviewAgentId || activeAgentInstanceId || '').trim();
+  const group = String(document.getElementById('rule-create-group')?.value || ruleContextGroupId || activeShareGroupId || 'default').trim();
+  const project = String(document.getElementById('rule-create-project')?.value || ruleContextProjectRef || '').trim();
+  if (!text) return showToast('请输入规则正文。', 'error');
+  if (!agent) return showToast('请明确当前 Agent。', 'error');
+  ruleCreateResult = null;
+  try {
+    const result = await callApi('create_rule_from_text', text, {
+      agent_instance_id: agent, share_group_id: group, project_ref: project,
+    }, '', '', '', '', '', true);
+    ruleCreateResult = result || {error: 'empty_service_response'};
+    if (result?.error || result?.ok === false) showToast(result.error || '规则未创建', 'error');
+    else showToast('规则已创建，正在刷新范围与回执。', 'success');
+    await renderRulesHabits();
+  } catch (error) {
+    ruleCreateResult = {error: error.message || String(error)};
+    showToast(`规则创建失败：${error.message || error}`, 'error');
+    await renderRulesHabits();
+  }
+}
+
+async function undoRuleDecision(decisionId) {
+  if (!decisionId || !confirm('确认撤销这条自动范围决定？')) return;
+  try {
+    const result = await callApi('undo_rule_decision', decisionId, activeShareGroupId || ruleContextGroupId || 'default', true, {
+      agent_instance_id: activeAgentInstanceId || rulePreviewAgentId || '',
+      share_group_id: activeShareGroupId || ruleContextGroupId || 'default',
+      project_ref: ruleContextProjectRef || rulePreviewProjectRef || '',
+    });
+    if (result?.error || result?.ok === false) throw new Error(result.error || '撤销失败');
+    showToast('自动范围决定已撤销。', 'success');
+    await renderRulesHabits();
+  } catch (error) { showToast(`撤销失败：${error.message || error}`, 'error'); }
+}
+
+async function submitRuleFeedback(receiptId, outcome) {
+  if (!receiptId || !outcome) return;
+  const actor = activeAgentInstanceId || 'user';
+  // Evidence is optional; keep the one-click feedback action free of native
+  // prompt dialogs so the desktop and localhost surfaces behave identically.
+  const evidence = '';
+  try {
+    const result = await callApi('submit_rule_feedback', receiptId, outcome, actor, evidence, activeShareGroupId || ruleContextGroupId || 'default', 1.0);
+    if (result?.error || result?.ok === false) throw new Error(result.error || '反馈提交失败');
+    showToast('反馈已记录。', 'success');
+    await renderRulesHabits();
+  } catch (error) { showToast(`反馈提交失败：${error.message || error}`, 'error'); }
+}
+
+async function createChildException(parentRule) {
+  if (!parentRule) return;
+  document.getElementById('rule-exception-modal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'rule-exception-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="新增子例外">
+    <div class="modal-head"><h3>新增子例外</h3><p>父规则：<code>${escapeHtml(parentRule)}</code>。子规则必须不同，且原因必填。</p></div>
+    <div class="modal-body"><label class="field"><span>子例外规则 ID</span><input id="rule-exception-child" maxlength="160" /></label>
+      <label class="field"><span>优先级（-100 到 100）</span><input id="rule-exception-priority" type="number" min="-100" max="100" value="0" /></label>
+      <label class="field"><span>例外原因</span><textarea id="rule-exception-reason" rows="3" maxlength="2000"></textarea></label></div>
+    <div class="modal-actions"><button class="btn" type="button" onclick="document.getElementById('rule-exception-modal')?.remove()">取消</button><button class="btn btn-primary" type="button" onclick="submitChildException('${escapeHtml(parentRule)}')">创建</button></div>
+  </div>`;
+  modal.addEventListener('click', event => { if (event.target === modal) modal.remove(); });
+  document.body.appendChild(modal);
+}
+
+async function submitChildException(parentRule) {
+  const child = String(document.getElementById('rule-exception-child')?.value || '').trim();
+  const priorityRaw = String(document.getElementById('rule-exception-priority')?.value || '0');
+  const priority = Number.isFinite(Number(priorityRaw)) ? Number(priorityRaw) : 0;
+  const reason = String(document.getElementById('rule-exception-reason')?.value || '').trim();
+  if (!child) return showToast('请填写子例外规则 ID。', 'error');
+  if (!reason) return showToast('请填写例外原因。', 'error');
+  document.getElementById('rule-exception-modal')?.remove();
+  try {
+    const result = await callApi('create_child_exception', parentRule, child.trim(), priority, reason.trim(), activeShareGroupId || ruleContextGroupId || 'default', true);
+    if (result?.error || result?.ok === false) throw new Error(result.error || '创建例外失败');
+    showToast('子例外已创建。', 'success');
+    await renderRulesHabits();
+  } catch (error) { showToast(`创建子例外失败：${error.message || error}`, 'error'); }
+}
+
+async function revokeRuleException(exceptionId) {
+  if (!exceptionId || !confirm('确认撤销这条子例外？')) return;
+  try {
+    const result = await callApi('revoke_rule_exception', exceptionId, activeShareGroupId || ruleContextGroupId || 'default', true);
+    if (result?.error || result?.ok === false) throw new Error(result.error || '撤销例外失败');
+    showToast('子例外已撤销。', 'success');
+    await renderRulesHabits();
+  } catch (error) { showToast(`撤销例外失败：${error.message || error}`, 'error'); }
+}
+
 function ruleCard(record) {
   const state = rulePreviewState(record);
   const range = (record.assignments || []).map(a => a.target_type);
@@ -3156,13 +3376,26 @@ function ruleCard(record) {
   const sources = state === 'effective' ? `来源：${(preview.matched_sources || []).join('；')}`
     : state === 'excluded' ? `排除原因：${(preview.excluded_sources || []).join('；')}` : '';
   const editable = record.injection_policy === 'always' || record.status === 'active';
+  const decision = ruleDecisionFor(record);
+  const stats = ruleStatsFor(record);
+  const receipts = ruleReceiptsFor(record);
+  const exceptions = ruleExceptionsFor(record);
+  const confidence = decision?.scope_confidence ?? record.scope_confidence ?? record.auto_scope_confidence ?? record.confidence;
+  const decisionId = decision?.decision_id || record.decision_id || '';
+  const exceptionHtml = exceptions.length ? `<div class="rule-exceptions"><div class="muted">子例外（父规则：${escapeHtml(record.memory_id)}）</div>${exceptions.map(item => `<div class="rule-exception-row"><code>${escapeHtml(item.child_exception || item.child_rule_id || '')}</code><span class="chip chip-info">priority ${Number(item.priority || 0)}</span><span class="muted">${escapeHtml(item.reason || '')}</span>${item.active === false ? '<span class="chip chip-medium">已撤销</span>' : `<button class="btn btn-danger btn-icon" type="button" onclick="revokeRuleException('${escapeHtml(item.exception_id || '')}')">撤销</button>`}</div>`).join('')}</div>` : '';
+  const receiptHtml = receipts.slice(-3).map(renderRuleReceiptActions).join('');
   return `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(displayTitle(record))}</strong>
     <span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : ''}">${record.injection_policy === 'always' ? '强制' : '按需'}</span>
     ${stateLabel ? `<span class="chip ${stateChip}">${escapeHtml(stateLabel)}</span>` : ''}</div>
     <p>${escapeHtml(displayBody(record)).slice(0, 300)}</p>
     <div class="muted">适用范围：${escapeHtml(ruleAudience(record))}</div>
     ${record.injection_policy === 'always' ? `<div class="muted">基础优先级：${Number(record.priority || 0)}${sources ? ` · ${escapeHtml(sources)}` : ''}</div>` : ''}
-    ${editable ? `<div class="finding-actions"><button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button></div>` : ''}
+    ${confidence !== undefined ? `<div class="chips">${ruleConfidenceLabel(confidence)}${decision?.scope_reason || record.scope_reason ? `<span class="muted">${escapeHtml(decision?.scope_reason || record.scope_reason)}</span>` : ''}</div>` : ''}
+    ${stats ? `<div class="muted">范围命中：${Number(stats.total || 0)} · 遵循 ${Number(stats.accepted || 0)} · 纠正 ${Number(stats.corrected || 0)} · 作用域错误 ${Number(stats.wrong_scope || 0)}</div>` : ''}
+    ${decisionId ? `<div class="rule-decision-link"><code>decision ${escapeHtml(decisionId)}</code>${decision?.undo_id || decision?.status !== 'undone' ? `<button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecision('${escapeHtml(decisionId)}')">撤销自动决定</button>` : '<span class="chip chip-medium">已撤销</span>'}</div>` : ''}
+    ${receiptHtml ? `<div class="rule-receipts"><div class="muted">命中回执与反馈</div>${receiptHtml}</div>` : ''}
+    <div class="finding-actions">${editable ? `<button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button>` : ''}<button class="btn" type="button" onclick="createChildException('${escapeHtml(record.memory_id)}')">新增子例外</button></div>
+    ${exceptionHtml}
   </article>`;
 }
 
@@ -3304,11 +3537,19 @@ async function renderRulesHabits() {
   setContent('<div class="loading">正在读取规则与习惯…</div>');
   try {
     const groupId = activeShareGroupId || 'default';
-    const [data, options] = await Promise.all([
+    const [data, options, decisions, metrics, receipts, exceptions] = await Promise.all([
       callApi('list_rules_habits', groupId), callApi('get_rule_scope_options', groupId),
+      callApiOptional('list_rule_decisions', {decisions: [], total: 0}, groupId, 50),
+      callApiOptional('get_rule_auto_scope_metrics', {stats: [], auto_scope: {}}, groupId),
+      callApiOptional('list_rule_match_receipts', {receipts: [], total: 0}, groupId, '', activeAgentInstanceId, 50),
+      callApiOptional('list_rule_exceptions', {exceptions: [], total: 0}, groupId, ''),
     ]);
     if (data.error) throw new Error(data.error);
     if (options.error) throw new Error(options.error);
+    ruleDecisionRows = Array.isArray(decisions) ? decisions : (decisions.decisions || decisions.items || []);
+    ruleScopeMetrics = metrics || {};
+    ruleReceiptRows = Array.isArray(receipts) ? receipts : (receipts.receipts || receipts.items || []);
+    ruleExceptionRows = Array.isArray(exceptions) ? exceptions : (exceptions.exceptions || exceptions.items || []);
     ruleScopeOptions = options;
     const agents = options.agents || [];
     const projects = options.projects || [];
@@ -3346,6 +3587,7 @@ async function renderRulesHabits() {
     const scopeOptions = `<option value="all">全部范围类型</option>${['agent','group','project','agent_project','provider','runtime_role','system'].map(type => `<option value="${type}" ${ruleRangeFilter === type ? 'selected' : ''}>${escapeHtml({agent:'Agent',group:'共享组',project:'项目',agent_project:'Agent + 项目',provider:'宿主',runtime_role:'运行角色',system:'系统'}[type])}</option>`).join('')}`;
     const visibilityOptions = `<option value="effective" ${ruleVisibilityFilter === 'effective' ? 'selected' : ''}>仅当前 Agent 生效</option><option value="excluded" ${ruleVisibilityFilter === 'excluded' ? 'selected' : ''}>仅当前 Agent 被排除</option><option value="all" ${ruleVisibilityFilter === 'all' ? 'selected' : ''}>不按当前 Agent 过滤</option>`;
     setContent(`<div class="page-head"><div><h1>规则与习惯</h1><p>规则受众独立于记忆来源。范围删除不会删除记忆；只有强制规则会按范围注入。</p></div></div>
+      ${renderRuleCreatePanel(options)}${renderRuleAutoScopePanel()}
       <section class="card"><div class="page-actions"><label class="field"><span>预览 Agent</span><select onchange="setRulePreviewAgent(this.value)">${agentOptions}</select></label><label class="field"><span>项目</span><select onchange="setRulePreviewProject(this.value)">${projectOptions}</select></label><label class="field"><span>宿主</span><select onchange="setRulePreviewProvider(this.value)">${providerOptions}</select></label><label class="field"><span>运行角色</span><select onchange="setRulePreviewRuntimeRole(this.value)">${roleOptions}</select></label><label class="field"><span>显示</span><select onchange="setRuleVisibilityFilter(this.value)">${visibilityOptions}</select></label><label class="field"><span>范围</span><select onchange="setRuleRangeFilter(this.value)">${scopeOptions}</select></label></div><p class="muted">预览只使用已发现/可信上下文；未知项目、宿主或角色保持空值，不会猜测命中规则。</p></section>${blocks || '<div class="card empty-state"><p>当前筛选范围没有规则或习惯。</p></div>'}`);
   } catch (e) { setContent(`<div class="card empty-state"><p>规则加载失败：${escapeHtml(e)}</p></div>`); }
 }

@@ -38,6 +38,8 @@ _MUTATING_TOOLS = {
     "memoryguard_apply_enrichments",
     "memoryguard_history_delete",
     "memoryguard_rule_feedback",
+    "memoryguard_rule_create_auto",
+    "memoryguard_rule_undo",
 }
 
 
@@ -294,6 +296,64 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "memoryguard_rule_create_auto",
+        "description": (
+            "Create one mandatory rule from text. Automatic scope inference is fail-closed: "
+            "only the trusted current agent or that agent plus the trusted project cwd are allowed. "
+            "Broader scope requires explicit manual=true, an explicit scope object, and admin capability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "minLength": 1, "description": "rule text"},
+                "kind": {"type": "string", "description": "optional preference|fact|project|procedure|episode|correction"},
+                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0},
+                "scope": {"type": "object", "description": "optional explicit audience assignment; auto mode still rejects broad targets"},
+                "manual": {"type": "boolean", "default": False, "description": "explicit human/admin declaration for broad scope"},
+                "idempotency_key": {"type": "string"},
+                "workspace": {"type": "string", "description": "workspace path (default: configured MemoryGuard workspace)"},
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_decision_read",
+        "description": "Read one explainable rule lifecycle decision by decision_id. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "decision_id": {"type": "string"},
+                "workspace": {"type": "string"},
+            },
+            "required": ["decision_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_undo",
+        "description": "Undo a rule lifecycle mutation using its persisted pre-rule undo_id. Requires the trusted actor or admin capability.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "undo_id": {"type": "string"},
+                "decision_id": {"type": "string", "description": "optional decision id alias; resolved to its undo_id"},
+                "workspace": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_scope_stats",
+        "description": "Read rule audience statistics and the automatic scope policy. Read-only.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"workspace": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
     # --- v3.2 agent binding tools ---
     {
         "name": "memoryguard_binding_create",
@@ -535,6 +595,20 @@ def _mcp_error(message: str) -> dict[str, Any]:
 
 def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
     """Validate mutating requests before writing local state."""
+    if name == "memoryguard_rule_create_auto":
+        if not str(args.get("text", "") or "").strip():
+            return _mcp_error("text is required")
+        if args.get("scope") is not None and not isinstance(args.get("scope"), dict):
+            return _mcp_error("scope must be an object")
+        if args.get("manual") and args.get("scope") is None:
+            return _mcp_error("manual rule creation requires an explicit scope")
+        return None
+
+    if name == "memoryguard_rule_undo":
+        if not str(args.get("undo_id", "") or "").strip() and not str(args.get("decision_id", "") or "").strip():
+            return _mcp_error("undo_id or decision_id is required")
+        return None
+
     if name == "memoryguard_history_delete":
         session_ids = args.get("session_ids")
         if not isinstance(session_ids, list) or not any(str(item).strip() for item in session_ids):
@@ -676,6 +750,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             or name.startswith("memoryguard_history_")
             or name == "memoryguard_context_bootstrap"
             or name == "memoryguard_rule_feedback"
+            or name.startswith("memoryguard_rule_")
         )
         else _resolve_workspace(args)
     )
@@ -833,6 +908,14 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _handle_context_bootstrap(args)
     if name == "memoryguard_rule_feedback":
         return _handle_rule_feedback(args)
+    if name == "memoryguard_rule_create_auto":
+        return _handle_rule_create_auto(args)
+    if name == "memoryguard_rule_decision_read":
+        return _handle_rule_decision_read(args)
+    if name == "memoryguard_rule_undo":
+        return _handle_rule_undo(args)
+    if name == "memoryguard_rule_scope_stats":
+        return _handle_rule_scope_stats(args)
     if name.startswith("memoryguard_history_"):
         return _handle_history(args, name)
 
@@ -1705,9 +1788,9 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
     """Record mandatory-rule bootstrap feedback for one match receipt."""
-    from .schema_v3 import RuleMatchFeedback, stable_hash, _now_iso
+    from .rule_creation import RuleCreationService
     workspace = _resolve_memory_workspace(args)
-    group_id, err, _ = _resolve_access(args, workspace)
+    group_id, err, access_ctx = _resolve_access(args, workspace)
     if err:
         return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
 
@@ -1718,38 +1801,128 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
     confidence = args.get("confidence")
     if confidence is None:
         confidence = 1.0
-    try:
-        confidence_value = float(confidence)
-    except (TypeError, ValueError):
-        return _mcp_error("confidence must be numeric between 0 and 1")
-    if not 0 <= confidence_value <= 1:
-        return _mcp_error("confidence must be between 0 and 1")
-
-    explicit_feedback_id = str(args.get("idempotency_key", "") or "").strip()
-    feedback_id = explicit_feedback_id or stable_hash(
-        "rule-feedback", receipt_id, outcome, actor, evidence,
-    )
-    feedback = RuleMatchFeedback(
-        feedback_id=feedback_id,
-        receipt_id=receipt_id,
-        outcome=outcome,
-        actor=actor,
-        evidence=evidence,
-        confidence=confidence_value,
-        created_at=_now_iso(),
-    )
     from .shared_memory_store import SharedMemoryStore
     try:
         store = SharedMemoryStore(workspace, group_id)
-        result = store.append_rule_match_feedback(feedback)
+        from .rule_creation import RuleCreationService
+        service = RuleCreationService(
+            workspace, group_id, store=store,
+            is_admin=bool(access_ctx and access_ctx.is_admin),
+        )
+        result = service.submit_feedback(
+            receipt_id, outcome, actor,
+            evidence=evidence, confidence=confidence,
+            effective_context=_effective_agent_context(args, group_id),
+            idempotency_key=str(args.get("idempotency_key", "") or ""),
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         return _mcp_error(str(exc))
+    payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    # Keep the original feedback fields at the top-level for existing MCP
+    # clients while exposing the lifecycle decision/narrowing result.
+    feedback_after = getattr(result, "after", {}) or {}
+    payload.setdefault(
+        "feedback_id",
+        str(
+            feedback_after.get("feedback_id", "")
+            if isinstance(feedback_after, dict) else ""
+        )
+        or str(args.get("idempotency_key", "") or ""),
+    )
+    payload["receipt_id"] = receipt_id
+    payload["outcome"] = outcome
+    payload["actor"] = actor
+    payload["evidence"] = evidence
+    if getattr(result, "status", None) == "blocked" or (
+        isinstance(result, dict) and result.get("status") == "blocked"
+    ):
+        return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}], "isError": True}
     return {
         "content": [{
             "type": "text",
-            "text": json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+            "text": json.dumps(payload, ensure_ascii=False, indent=2),
         }],
     }
+
+
+def _rule_lifecycle_response(result: Any) -> dict[str, Any]:
+    """Serialize a RuleDecision while preserving hard-reject semantics."""
+    payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
+    payload.setdefault("ok", payload.get("status") != "blocked")
+    response: dict[str, Any] = {
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+    }
+    if payload.get("status") == "blocked":
+        response["isError"] = True
+    return response
+
+
+def _rule_service_for_args(args: dict[str, Any], workspace: Path):
+    from .rule_creation import RuleCreationService
+    group_id, err, access_ctx = _resolve_access(args, workspace)
+    if err:
+        return None, None, None, _mcp_error(err)
+    from .shared_memory_store import SharedMemoryStore
+    try:
+        store = SharedMemoryStore(workspace, group_id)
+    except FileNotFoundError:
+        return None, None, None, _mcp_error(f"group not found: {group_id}")
+    service = RuleCreationService(
+        workspace, group_id, store=store,
+        is_admin=bool(access_ctx and access_ctx.is_admin),
+    )
+    return service, group_id, access_ctx, None
+
+
+def _handle_rule_create_auto(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    service, group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    if error:
+        return error
+    context = _effective_agent_context(args, group_id)
+    result = service.create_rule_from_text(
+        str(args.get("text", "") or ""),
+        context,
+        requested_scope=args.get("scope"),
+        manual=bool(args.get("manual", False)),
+        kind=str(args.get("kind", "") or ""),
+        priority=int(args.get("priority", 0) or 0),
+        idempotency_key=str(args.get("idempotency_key", "") or ""),
+    )
+    return _rule_lifecycle_response(result)
+
+
+def _handle_rule_decision_read(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    service, _group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    if error:
+        return error
+    result = service.read_decision(str(args.get("decision_id", "") or ""))
+    if result is None:
+        return _mcp_error("decision not found")
+    return _rule_lifecycle_response(result)
+
+
+def _handle_rule_undo(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    service, group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    if error:
+        return error
+    result = service.undo_rule(
+        str(args.get("undo_id", "") or ""), _effective_agent_context(args, group_id),
+    ) if str(args.get("undo_id", "") or "").strip() else service.undo_rule_decision(
+        str(args.get("decision_id", "") or ""), _effective_agent_context(args, group_id),
+    )
+    return _rule_lifecycle_response(result)
+
+
+def _handle_rule_scope_stats(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    service, group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    if error:
+        return error
+    result = service.scope_stats(_effective_agent_context(args, group_id))
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_history(args: dict[str, Any], name: str) -> dict[str, Any]:
