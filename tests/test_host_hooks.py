@@ -1,5 +1,9 @@
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -7,6 +11,7 @@ from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.cli import main as cli_main
 from memoryguard.host_hooks import (
     HostHookManager,
+    _state_path,
     run_hook,
     set_hook_mode,
 )
@@ -15,6 +20,9 @@ from memoryguard.schema_v3 import (
     MemoryKind,
     SharedMemoryRecord,
     SharedMemoryStatus,
+    RuleMatchFeedback,
+    RuleMatchReceipt,
+    _now_iso,
 )
 from memoryguard.shared_memory_store import SharedMemoryStore
 
@@ -98,7 +106,22 @@ def test_hook_install_is_idempotent_and_preserves_other_hooks(
     serialized = json.dumps(data)
     assert first["configured"] and second["configured"]
     expected_handlers = 6 if provider == "cursor" else 7
-    assert serialized.count("memoryguard.host_hooks") == expected_handlers
+    if provider == "cursor":
+        owned_handlers = [
+            entry
+            for entries in data["hooks"].values()
+            for entry in entries
+            if "memoryguard.host_hooks" in entry.get("command", "")
+        ]
+    else:
+        owned_handlers = [
+            handler
+            for groups in data["hooks"].values()
+            for group in groups
+            for handler in group.get("hooks", [])
+            if "memoryguard.host_hooks" in handler.get("command", "")
+        ]
+    assert len(owned_handlers) == expected_handlers
     assert serialized.count("python user-stop.py") == 1
     assert event_name in data["hooks"]
 
@@ -108,6 +131,153 @@ def test_hook_install_is_idempotent_and_preserves_other_hooks(
     assert removed["configured"] is False
     assert "memoryguard.host_hooks" not in remaining_text
     assert remaining_text.count("python user-stop.py") == 1
+
+
+def test_codex_hook_config_uses_utf8_commands_for_each_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "control"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _bind(workspace, "codex-agent", "group-a")
+
+    HostHookManager(workspace).install(
+        "codex",
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+    )
+
+    data = json.loads(
+        (home / ".codex" / "hooks.json").read_text(encoding="utf-8")
+    )
+    limited_events = set()
+    for event_name, groups in data["hooks"].items():
+        handler = groups[0]["hooks"][0]
+        assert "-X utf8" in handler["command"]
+        assert "-X utf8" in handler["commandWindows"]
+        if "additionalContextLimit" in handler:
+            limited_events.add(event_name)
+    assert limited_events == {
+        "SessionStart",
+        "SubagentStart",
+        "UserPromptSubmit",
+    }
+
+
+def test_hook_cli_forces_utf8_stdio_when_windows_defaults_to_gbk(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    preference = "\u7528\u6237\u957f\u671f\u504f\u597d\uff1a\u56de\u7b54\u4fdd\u6301\u7b80\u6d01"
+    prompt = "\u8bf7\u8bfb\u53d6\u4e2d\u6587\u957f\u671f\u504f\u597d"
+    SharedMemoryStore(workspace, "group-a").append_record(_record(
+        "pref",
+        preference,
+        MemoryKind.PREFERENCE,
+    ))
+    payload = {
+        "session_id": "session-utf8",
+        "turn_id": "turn-utf8",
+        "prompt": prompt,
+        "cwd": str(workspace),
+    }
+    env = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(source_root), env.get("PYTHONPATH", "")) if part
+    )
+    env["PYTHONIOENCODING"] = "gbk"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "memoryguard.host_hooks",
+            "run",
+            "--provider",
+            "codex",
+            "--event",
+            "user_prompt",
+            "--workspace",
+            str(workspace),
+            "--agent-id",
+            "codex-agent",
+            "--share-group-id",
+            "group-a",
+        ],
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode(
+        "utf-8",
+        errors="replace",
+    )
+    result = json.loads(completed.stdout.decode("utf-8"))
+    context = result["hookSpecificOutput"]["additionalContext"]
+    assert prompt not in context
+    assert "\u56de\u7b54\u4fdd\u6301\u7b80\u6d01" in context
+
+
+def test_runtime_receipt_is_bound_to_exact_hook_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "control"
+    home.mkdir()
+    workspace.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _bind(workspace, "codex-agent", "group-a")
+    manager = HostHookManager(workspace)
+    manager.install(
+        "codex",
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+    )
+
+    run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": "session-1",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(workspace / "README.md")},
+        },
+    )
+    verified = manager.status("codex", agent_instance_id="codex-agent")
+    assert verified["status"] == "operational"
+    assert verified["runtime_verified"] is True
+    inferred = manager.status("codex")
+    assert inferred["status"] == "operational"
+    assert inferred["agent_instance_id"] == "codex-agent"
+
+    config_path = home / ".codex" / "hooks.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    handler = data["hooks"]["PreToolUse"][0]["hooks"][0]
+    handler["commandWindows"] += " --changed"
+    config_path.write_text(
+        json.dumps(data, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    stale = manager.status("codex", agent_instance_id="codex-agent")
+    assert stale["configured"] is True
+    assert stale["status"] == "configured_pending_runtime"
+    assert stale["runtime_verified"] is False
 
 
 def test_trae_reports_verified_fallback_instead_of_writing_fake_hook(
@@ -166,6 +336,55 @@ def test_user_prompt_injects_bounded_context_and_receipt_has_no_raw_prompt(
     )
     assert state_files
     assert prompt not in state_files[0].read_text(encoding="utf-8")
+
+
+def test_codex_defers_precompact_reminder_to_compact_session_start(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    SharedMemoryStore(workspace, "group-a").append_record(_record(
+        "pref",
+        "用户长期偏好：回答保持简洁",
+        MemoryKind.PREFERENCE,
+    ))
+    session_id = "session-compact"
+
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "turn_id": "turn-1",
+            "prompt": "以后默认使用结构化输出",
+            "cwd": str(workspace),
+        },
+    )
+    before = run_hook(
+        provider="codex",
+        event="pre_compact",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "trigger": "auto"},
+    )
+    resumed = run_hook(
+        provider="codex",
+        event="session_start",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "source": "compact"},
+    )
+
+    assert before == {}
+    context = resumed["hookSpecificOutput"]["additionalContext"]
+    assert "memoryguard_memory_write" in context
+    assert "压缩前" in context
 
 
 def test_pre_tool_blocks_native_memory_write_but_allows_project_file(
@@ -334,10 +553,19 @@ def test_global_provider_install_includes_hook_without_duplicate_handlers(
         global_scope=True,
     )
 
-    hooks_text = (home / ".codex" / "hooks.json").read_text(encoding="utf-8")
+    hooks = json.loads(
+        (home / ".codex" / "hooks.json").read_text(encoding="utf-8")
+    )["hooks"]
     assert first["hook_configured"] is True
     assert second["hook_configured"] is True
-    assert hooks_text.count("memoryguard.host_hooks") == 7
+    owned_handlers = [
+        handler
+        for groups in hooks.values()
+        for group in groups
+        for handler in group.get("hooks", [])
+        if "memoryguard.host_hooks" in handler.get("command", "")
+    ]
+    assert len(owned_handlers) == 7
 
 
 def test_paused_mode_is_emergency_bypass_for_tool_guard(
@@ -365,6 +593,398 @@ def test_paused_mode_is_emergency_bypass_for_tool_guard(
         },
     )
     assert result == {}
+
+
+def test_history_without_stable_event_id_preserves_legitimate_repeats_and_marks_degraded(tmp_path: Path):
+    from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    payload = {"session_id": "repeat-session", "prompt": "same legitimate prompt", "cwd": str(workspace)}
+    for _ in range(2):
+        run_hook(provider="codex", event="user_prompt", workspace=workspace,
+                 agent_instance_id="codex-agent", share_group_id="group-a", payload=payload)
+    scope = HistoryScope(agent_instance_id="codex-agent", project_ref=str(workspace),
+                         provider="codex", share_group_id="group-a")
+    session = ConversationHistoryStore(workspace).list_sessions(scope)["sessions"][0]
+    raw = ConversationHistoryStore(workspace).read(scope, session_id=session["session_id"])
+    assert [turn["content"] for turn in raw["turns"]] == ["same legitimate prompt"] * 2
+    receipt = next((workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json"))
+    history = json.loads(receipt.read_text(encoding="utf-8"))["history_archive"]
+    assert history["coverage_degraded"] is True
+    assert history["idempotency"] == "degraded"
+
+
+def test_post_tool_memory_write_success_marks_write_seen(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    session_id = "post-tool-success"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "turn_id": "turn-1", "prompt": "测试", "cwd": str(workspace)},
+    )
+
+    run_hook(
+        provider="codex",
+        event="post_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "memoryguard_memory_write",
+            "tool_input": {},
+            "tool_result": {"isError": False, "ok": True, "memory_id": "m-1"},
+        },
+    )
+
+    state = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert state["write_seen"] is True
+    assert state.get("write_failed") is None
+
+
+def test_post_tool_memory_write_failure_keeps_write_seen_false(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    session_id = "post-tool-fail"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "turn_id": "turn-1", "prompt": "测试", "cwd": str(workspace)},
+    )
+
+    run_hook(
+        provider="codex",
+        event="post_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "memoryguard_memory_write",
+            "tool_input": {},
+            "tool_result": {"isError": True, "error": "write failed"},
+        },
+    )
+
+    state = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert state["write_seen"] is False
+    assert state["write_failed"] is True
+    assert state["write_error"]
+
+
+def test_post_tool_memory_write_without_tool_result_does_not_auto_mark_success(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    session_id = "post-tool-unknown"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "turn_id": "turn-1", "prompt": "测试", "cwd": str(workspace)},
+    )
+
+    run_hook(
+        provider="codex",
+        event="post_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "memoryguard_memory_write",
+            "tool_input": {},
+        },
+    )
+
+    state = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert state["write_seen"] is False
+    assert state.get("write_failed") is None
+
+
+def test_stop_flushes_pending_mandatory_rule_feedback(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    store = SharedMemoryStore(workspace, "group-a")
+    store.append_record(
+        SharedMemoryRecord(
+            memory_id="always",
+            body="记住：测试项目下禁止持久记录未脱敏内容。",
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            agent_instance_id="codex-agent",
+        )
+    )
+    store.set_rule_assignments("always", [{
+        "target_type": "agent",
+        "target_id": "codex-agent",
+    }])
+    session_id = "feedback-session"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "turn_id": "turn-1",
+            "prompt": "请检查项目代码。",
+            "cwd": str(workspace),
+        },
+    )
+
+    state_path = _state_path(workspace, "codex", session_id)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    receipts = state.get("mandatory_match_receipts", [])
+    assert len(receipts) == 1
+    receipt_id = str(receipts[0].get("receipt_id"))
+    assert store.get_rule_match_feedback_by_receipt(receipt_id) is None
+
+    stop_result = run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "loop_count": 0},
+    )
+    assert "memoryguard_memory_write" not in stop_result
+
+    feedback = store.get_rule_match_feedback_by_receipt(receipt_id)
+    assert feedback is not None
+    assert feedback.outcome == "not_applicable"
+    assert feedback.actor == "hook:codex:codex-agent"
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state.get("mandatory_match_receipts") == []
+
+    second_stop = run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "loop_count": 1},
+    )
+    assert second_stop == {}
+    assert store.get_rule_match_feedback_by_receipt(receipt_id).feedback_id == feedback.feedback_id
+
+
+def test_stop_skips_feedback_when_explicit_feedback_is_already_present(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    store = SharedMemoryStore(workspace, "group-a")
+    store.append_record(
+        SharedMemoryRecord(
+            memory_id="always",
+            body="以后默认走 RTK 进行测试验证。",
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            agent_instance_id="codex-agent",
+        )
+    )
+    store.set_rule_assignments("always", [{
+        "target_type": "agent",
+        "target_id": "codex-agent",
+    }])
+    session_id = "feedback-explicit-session"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "turn_id": "turn-1",
+            "prompt": "请继续任务。",
+            "cwd": str(workspace),
+        },
+    )
+
+    state_path = _state_path(workspace, "codex", session_id)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    receipts = state.get("mandatory_match_receipts", [])
+    assert receipts
+    receipt_id = str(receipts[0].get("receipt_id"))
+    store.append_rule_match_receipt(RuleMatchReceipt(
+        receipt_id=receipt_id,
+        memory_id="always",
+        share_group_id="group-a",
+        agent_instance_id="codex-agent",
+        task_hash="explicit",
+        task="explicit session",
+        assignment_ids=[],
+        created_at=_now_iso(),
+    ))
+
+    preexisting = RuleMatchFeedback(
+        feedback_id="manual-1",
+        receipt_id=receipt_id,
+        outcome="followed",
+        actor="agent:codex-agent",
+        evidence="显式记忆反馈",
+        confidence=1.0,
+    )
+    store.append_rule_match_feedback(preexisting)
+
+    run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "loop_count": 0},
+    )
+
+    feedback = store.get_rule_match_feedback_by_receipt(receipt_id)
+    assert feedback is not None
+    assert feedback.outcome == "followed"
+    assert feedback.feedback_id == "manual-1"
+@pytest.mark.parametrize("disable_mode", ["env", "config"])
+def test_history_capture_global_disable_is_visible_in_receipt(tmp_path: Path, monkeypatch, disable_mode: str):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    if disable_mode == "env":
+        monkeypatch.setenv("MEMORYGUARD_HISTORY_ENABLED", "0")
+        expected = "disabled_by_env"
+    else:
+        path = workspace / ".memoryguard" / "history" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"enabled": false}', encoding="utf-8")
+        expected = "disabled_by_config"
+    run_hook(provider="codex", event="user_prompt", workspace=workspace,
+             agent_instance_id="codex-agent", share_group_id="group-a", payload={
+                 "session_id": "disabled-session", "turn_id": "turn-1", "prompt": "not archived",
+             })
+    receipt = next((workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json"))
+    history = json.loads(receipt.read_text(encoding="utf-8"))["history_archive"]
+    assert history == {"attempted": False, "reason": expected, "capture_enabled": False}
+
+
+def test_history_capture_blocks_obvious_secret_without_persisting_raw(tmp_path: Path):
+    from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    secret = "api_key=super-secret-value"
+    run_hook(provider="codex", event="user_prompt", workspace=workspace,
+             agent_instance_id="codex-agent", share_group_id="group-a", payload={
+                 "session_id": "secret-session", "turn_id": "secret-turn", "prompt": secret,
+             })
+    assert ConversationHistoryStore(workspace).list_sessions(
+        HistoryScope(agent_instance_id="codex-agent")
+    )["sessions"] == []
+    receipt = next((workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json"))
+    receipt_text = receipt.read_text(encoding="utf-8")
+    assert secret not in receipt_text
+    history = json.loads(receipt_text)["history_archive"]
+    assert history["reason"] == "secret_detected_blocked"
+    assert history["secret_blocked"] is True
+
+
+def test_concurrent_runtime_receipt_writes_remain_valid_json(tmp_path: Path):
+    from memoryguard.host_hooks import _write_json_config
+
+    path = tmp_path / ".memoryguard" / "hook-runtime" / "heartbeat" / "agent.json"
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(lambda index: _write_json_config(path, {"index": index}), range(80)))
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["index"] in range(80)
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_atomic_runtime_replace_retries_windows_access_denied(tmp_path: Path, monkeypatch):
+    import memoryguard.host_hooks as hooks
+
+    path = tmp_path / "heartbeat.json"
+    real_replace = hooks.os.replace
+    attempts = 0
+
+    def flaky_replace(source, target):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = PermissionError("temporarily locked")
+            error.winerror = 5
+            raise error
+        return real_replace(source, target)
+
+    monkeypatch.setattr(hooks.os, "replace", flaky_replace)
+    hooks._atomic_write_text(path, '{"ok": true}')
+    assert attempts == 3
+    assert json.loads(path.read_text(encoding="utf-8")) == {"ok": True}
+
+
+def test_heartbeat_write_failure_never_blocks_pretool_hook(tmp_path: Path, monkeypatch):
+    import memoryguard.host_hooks as hooks
+
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+
+    def fail_write(*_args, **_kwargs):
+        raise PermissionError("simulated heartbeat lock")
+
+    monkeypatch.setattr(hooks, "_write_json_config", fail_write)
+    result = run_hook(provider="codex", event="pre_tool", workspace=workspace,
+                      agent_instance_id="codex-agent", share_group_id="group-a", payload={
+                          "session_id": "session-1", "tool_name": "Read",
+                          "tool_input": {"file_path": str(workspace / "README.md")},
+                      })
+    assert result == {}
+
+
+def test_mandatory_state_write_failure_is_fail_closed_and_diagnosed(tmp_path: Path, monkeypatch, capsys):
+    import memoryguard.host_hooks as hooks
+
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    SharedMemoryStore(workspace, "group-a")
+    real_write = hooks._write_json_config
+
+    def fail_state_only(path, data):
+        if "state" in path.parts:
+            raise PermissionError("simulated mandatory state lock")
+        return real_write(path, data)
+
+    monkeypatch.setattr(hooks, "_write_json_config", fail_state_only)
+    with pytest.raises(PermissionError, match="mandatory state lock"):
+        run_hook(provider="codex", event="user_prompt", workspace=workspace,
+                 agent_instance_id="codex-agent", share_group_id="group-a", payload={
+                     "session_id": "session-1", "turn_id": "turn-1",
+                     "prompt": "regular prompt", "cwd": str(workspace),
+                 })
+    diagnostic = capsys.readouterr().err
+    assert "mandatory_state_write_failed" in diagnostic
+    assert "regular prompt" not in diagnostic
 
 
 def test_invalid_existing_hook_config_is_not_overwritten(

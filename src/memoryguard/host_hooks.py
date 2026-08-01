@@ -16,6 +16,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,10 @@ HOOK_MARKER = "memoryguard.host_hooks"
 HOOK_MODES = {"enforce", "observe", "paused"}
 _RUNTIME_DIR = "hook-runtime"
 _MAX_RECEIPT_AGE_DAYS = 30
+_COMPACT_REMINDER = (
+    "压缩前发现尚未沉淀的长期记忆候选；继续工作前用 "
+    "memoryguard_memory_write 萃取保存，不得保存整段对话。"
+)
 
 _EVENT_NAMES = {
     "session_start": "SessionStart",
@@ -81,34 +87,136 @@ _SHELL_WRITE_PATTERN = re.compile(
 )
 
 
+
+def read_hook_stdin_json(stdin_buffer=None):
+    """Decode hook stdin JSON. utf-8-sig strips BOM (Cursor) and accepts plain UTF-8 (Codex)."""
+    import json
+    import sys
+    buf = sys.stdin.buffer if stdin_buffer is None else stdin_buffer
+    raw = buf.read()
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8-sig"))
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _effective_agent_context(
+    provider: str,
+    agent_instance_id: str,
+    share_group_id: str,
+    payload: dict[str, Any],
+    *,
+    event: str,
+):
+    """Build scope from host event identity, never a prompt-supplied role."""
+    from .schema_v3 import EffectiveAgentContext
+    from .rule_scope import canonical_project_ref
+    return EffectiveAgentContext(
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+        provider=provider,
+        project_ref=canonical_project_ref(
+            payload.get("project_ref") or payload.get("cwd")
+        ),
+        runtime_role="subagent" if event == "subagent_start" else "root",
+        runtime_agent_id=(
+            str(payload.get("subagent_id") or "")
+            if event == "subagent_start" else ""
+        ),
+        parent_agent_id=(
+            agent_instance_id if event == "subagent_start" else ""
+        ),
+    )
 
 
 def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+@contextmanager
+def _cross_process_path_lock(path: Path, timeout_seconds: float = 3.0):
+    """Serialize atomic replacements across Hook processes.
+
+    Windows denies replacing a destination while another process still has a
+    transient handle.  A sidecar byte lock prevents our own writers racing;
+    bounded replace retries cover short-lived antivirus/indexer handles.
+    """
+    lock_path = path.with_name(f".{path.name}.memoryguard.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd: int | None = None
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while lock_fd is None:
+            try:
+                lock_fd = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                os.write(lock_fd, f"{os.getpid()} {_now_iso()}".encode("ascii"))
+            except (FileExistsError, PermissionError):
+                # Recover only genuinely stale crash remnants.  Normal
+                # writers hold the lock for milliseconds and are never
+                # unlinked by a waiter.
+                try:
+                    stale = time.time() - lock_path.stat().st_mtime > 30.0
+                    if stale:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"timed out acquiring hook runtime lock: {path}")
+                time.sleep(0.01)
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            for attempt in range(5):
+                try:
+                    lock_path.unlink(missing_ok=True)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        break
+                    time.sleep(0.01 * (attempt + 1))
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.memoryguard-",
-        suffix=".tmp",
-        dir=str(path.parent),
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-    except Exception:
+    with _cross_process_path_lock(path):
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.memoryguard-",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp = Path(tmp_name)
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            for attempt in range(7):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except OSError as exc:
+                    retryable = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32}
+                    if not retryable or attempt == 6:
+                        raise
+                    time.sleep(0.01 * (2 ** attempt))
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def _load_json_config(path: Path, *, strict: bool) -> dict[str, Any]:
@@ -127,6 +235,65 @@ def _load_json_config(path: Path, *, strict: bool) -> dict[str, Any]:
     return data
 
 
+def _coerce_tool_result_status(payload: Any) -> tuple[bool | None, str | None]:
+    """Return ``(ok, reason)`` for tool execution feedback.
+
+    ``ok`` is ``True``/``False`` for explicit success/failure; ``None`` means
+    cannot determine from current payload.
+    """
+    if payload is None:
+        return None, None
+
+    if isinstance(payload, dict):
+        if "isError" in payload:
+            is_error = payload.get("isError")
+            if isinstance(is_error, bool):
+                return (False, "isError=true") if is_error else (True, None)
+        for key in ("error", "error_code", "message"):
+            if payload.get(key):
+                if key == "error":
+                    if isinstance(payload[key], (dict, list, str)):
+                        return False, "error present"
+                else:
+                    return False, f"{key}={payload[key]!r}"
+        ok_value = payload.get("ok")
+        if isinstance(ok_value, bool):
+            return (True, None) if ok_value else (False, "ok=false")
+        if payload.get("status") in {"error", "failed", "failure"}:
+            return False, f"status={payload.get('status')}"
+        positive_signals = ("memory_id", "decision_id", "version_id", "record")
+        if any(sig in payload for sig in positive_signals):
+            return True, None
+        content = payload.get("content")
+        if isinstance(content, list) and content:
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str):
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    continue
+                status, reason = _coerce_tool_result_status(parsed)
+                if status is not None:
+                    return status, reason
+        return None, None
+
+    if isinstance(payload, list):
+        unknown_count = 0
+        for item in payload:
+            status, reason = _coerce_tool_result_status(item)
+            if status is not None:
+                return status, reason
+            unknown_count += 1
+        if unknown_count:
+            return None, None
+
+    return None, None
+
+
 def _write_json_config(path: Path, data: dict[str, Any]) -> None:
     if not data:
         path.unlink(missing_ok=True)
@@ -140,9 +307,13 @@ def _command(
     workspace: Path,
     agent_instance_id: str,
     share_group_id: str,
+    *,
+    windows: bool | None = None,
 ) -> str:
     argv = [
         "python",
+        "-X",
+        "utf8",
         "-m",
         HOOK_MARKER,
         "run",
@@ -159,7 +330,9 @@ def _command(
         "--managed-by",
         "memoryguard",
     ]
-    if os.name == "nt":
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
         return subprocess.list2cmdline(argv)
     import shlex
 
@@ -171,6 +344,81 @@ def _is_our_handler(handler: Any) -> bool:
         return False
     command = str(handler.get("command", "") or "")
     return HOOK_MARKER in command and "--managed-by" in command
+
+
+def _owned_hook_hash(data: dict[str, Any]) -> str:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return ""
+    owned: list[dict[str, Any]] = []
+    for event_name in sorted(hooks):
+        entries = hooks.get(event_name)
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if _is_our_handler(entry):
+                owned.append({"event": event_name, "handler": entry})
+                continue
+            if not isinstance(entry, dict):
+                continue
+            handlers = entry.get("hooks")
+            if not isinstance(handlers, list):
+                continue
+            owned_handlers = [
+                handler for handler in handlers if _is_our_handler(handler)
+            ]
+            if owned_handlers:
+                owned.append({
+                    "event": event_name,
+                    "group": {
+                        key: value
+                        for key, value in entry.items()
+                        if key != "hooks"
+                    },
+                    "handlers": owned_handlers,
+                })
+    if not owned:
+        return ""
+    serialized = json.dumps(
+        owned,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _owned_agent_ids(data: dict[str, Any]) -> set[str]:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return set()
+    handlers: list[dict[str, Any]] = []
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if _is_our_handler(entry):
+                handlers.append(entry)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("hooks")
+            if isinstance(nested, list):
+                handlers.extend(
+                    handler for handler in nested if _is_our_handler(handler)
+                )
+    result: set[str] = set()
+    pattern = re.compile(
+        r"""--agent-id(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s]+))"""
+    )
+    for handler in handlers:
+        command = str(handler.get("commandWindows", "") or "")
+        if not command:
+            command = str(handler.get("command", "") or "")
+        match = pattern.search(command)
+        if match:
+            result.add(next(value for value in match.groups() if value))
+    return result
 
 
 def _validate_binding(
@@ -319,10 +567,18 @@ class HostHookAdapter:
             owned_events
         )
         partial = bool(owned_events) and not configured
+        resolved_agent_id = agent_instance_id
+        if not resolved_agent_id:
+            configured_agent_ids = _owned_agent_ids(data)
+            if len(configured_agent_ids) == 1:
+                resolved_agent_id = next(iter(configured_agent_ids))
         heartbeat = _read_heartbeat(
-            self.workspace, self.provider, agent_instance_id,
-        ) if agent_instance_id else {}
-        runtime_verified = configured and _heartbeat_is_current(heartbeat)
+            self.workspace, self.provider, resolved_agent_id,
+        ) if resolved_agent_id else {}
+        runtime_verified = configured and _heartbeat_is_current(
+            heartbeat,
+            _owned_hook_hash(data),
+        )
         if runtime_verified:
             status = "operational"
         elif configured:
@@ -343,9 +599,10 @@ class HostHookAdapter:
             "last_seen_at": heartbeat.get("at"),
             "last_event": heartbeat.get("event"),
             "last_error": heartbeat.get("error"),
+            "agent_instance_id": resolved_agent_id,
             "mode": (
-                get_hook_mode(self.workspace, self.provider, agent_instance_id)
-                if agent_instance_id else "unknown"
+                get_hook_mode(self.workspace, self.provider, resolved_agent_id)
+                if resolved_agent_id else "unknown"
             ),
             "capability": capability.to_dict(),
         }
@@ -429,21 +686,34 @@ class _NestedJsonHookAdapter(HostHookAdapter):
             "pre_compact",
             "stop",
         ):
-            command = _command(
-                self.provider,
-                event,
-                self.workspace,
-                agent_instance_id,
-                share_group_id,
-            )
             handler: dict[str, Any] = {
                 "type": "command",
-                "command": command,
+                "command": _command(
+                    self.provider,
+                    event,
+                    self.workspace,
+                    agent_instance_id,
+                    share_group_id,
+                    windows=False,
+                ),
                 "timeout": 15,
             }
+            if self.provider == "codex":
+                handler["commandWindows"] = _command(
+                    self.provider,
+                    event,
+                    self.workspace,
+                    agent_instance_id,
+                    share_group_id,
+                    windows=True,
+                )
             if (
                 self.provider == "codex"
-                and event in {"session_start", "user_prompt", "pre_compact"}
+                and event in {
+                    "session_start",
+                    "subagent_start",
+                    "user_prompt",
+                }
             ):
                 handler["additionalContextLimit"] = 1800
             hooks.setdefault(self._event_name(event), []).append({
@@ -615,6 +885,15 @@ HOOK_ADAPTERS: dict[str, type[HostHookAdapter]] = {
 }
 
 
+def _current_hook_hash(workspace: Path, provider: str) -> str:
+    adapter_cls = HOOK_ADAPTERS.get(provider)
+    if adapter_cls is None:
+        return ""
+    adapter = adapter_cls(workspace)
+    data = _load_json_config(adapter.config_path(), strict=False)
+    return _owned_hook_hash(data)
+
+
 class HostHookManager:
     """Deep module: install, remove, inspect, and execute every host hook."""
 
@@ -765,7 +1044,11 @@ def _save_state(
         return
     state = dict(state)
     state["updated_at"] = _now_iso()
-    _write_json_config(_state_path(workspace, provider, session_id), state)
+    try:
+        _write_json_config(_state_path(workspace, provider, session_id), state)
+    except Exception as exc:
+        _emit_runtime_write_diagnostic("mandatory_state_write_failed", provider, "state", exc)
+        raise
 
 
 def _record_heartbeat(
@@ -775,19 +1058,63 @@ def _record_heartbeat(
     *,
     event: str,
     error: str = "",
-) -> None:
-    payload = {
+    mandatory_rule_ids: list[str] | None = None,
+    mandatory_overflow: bool = False,
+) -> bool:
+    path = _heartbeat_path(workspace, provider, agent_instance_id)
+    try:
+        previous = _load_json_config(path, strict=False)
+        payload = {
+            "provider": provider,
+            "agent_hash": _short_hash(agent_instance_id),
+            "hook_version": HOOK_VERSION,
+            "hook_hash": _current_hook_hash(workspace, provider),
+            "event": event,
+            "at": _now_iso(),
+            "error": (error or "")[:500],
+            "mandatory_rule_ids": list(mandatory_rule_ids or []),
+            "mandatory_overflow": bool(mandatory_overflow),
+        }
+        if isinstance(previous.get("history_archive"), dict):
+            payload["history_archive"] = previous["history_archive"]
+        _write_json_config(path, payload)
+        return True
+    except Exception as exc:
+        _emit_runtime_write_diagnostic("heartbeat_write_failed", provider, event, exc)
+        return False
+
+
+def _emit_runtime_write_diagnostic(kind: str, provider: str, event: str, exc: Exception) -> None:
+    print(json.dumps({
+        "memoryguard_hook_diagnostic": kind,
         "provider": provider,
-        "agent_hash": _short_hash(agent_instance_id),
-        "hook_version": HOOK_VERSION,
         "event": event,
-        "at": _now_iso(),
-        "error": (error or "")[:500],
-    }
-    _write_json_config(
-        _heartbeat_path(workspace, provider, agent_instance_id),
-        payload,
-    )
+        "error_type": type(exc).__name__,
+    }, ensure_ascii=True), file=sys.stderr)
+
+
+def _record_history_diagnostic(
+    workspace: Path,
+    provider: str,
+    agent_instance_id: str,
+    diagnostic: dict[str, Any],
+) -> bool:
+    """Attach non-content history coverage data to the hook receipt.
+
+    Runtime receipts are intentionally safe to inspect.  They contain IDs,
+    hashes, limits and failure categories only -- never the prompt or model
+    response that was archived in the separate history SQLite database.
+    """
+    path = _heartbeat_path(workspace, provider, agent_instance_id)
+    try:
+        receipt = _load_json_config(path, strict=False)
+        receipt["history_archive"] = dict(diagnostic)
+        receipt["at"] = _now_iso()
+        _write_json_config(path, receipt)
+        return True
+    except Exception as exc:
+        _emit_runtime_write_diagnostic("history_receipt_write_failed", provider, "history", exc)
+        return False
 
 
 def _read_heartbeat(
@@ -803,10 +1130,15 @@ def _read_heartbeat(
     )
 
 
-def _heartbeat_is_current(heartbeat: dict[str, Any]) -> bool:
+def _heartbeat_is_current(
+    heartbeat: dict[str, Any],
+    hook_hash: str,
+) -> bool:
     if not heartbeat or heartbeat.get("error"):
         return False
     if str(heartbeat.get("hook_version", "")) != HOOK_VERSION:
+        return False
+    if not hook_hash or str(heartbeat.get("hook_hash", "")) != hook_hash:
         return False
     try:
         timestamp = datetime.fromisoformat(str(heartbeat["at"]))
@@ -837,6 +1169,164 @@ def _prompt(payload: dict[str, Any]) -> str:
         or payload.get("initial_prompt")
         or ""
     )
+
+
+_HISTORY_PRIVATE_KEYS = (
+    "private", "sensitive", "do_not_archive", "history_disabled",
+    "memoryguard_history_disabled", "incognito",
+)
+
+
+def _history_opted_out(payload: dict[str, Any]) -> bool:
+    """Honor only explicit host-supplied privacy/disable indicators."""
+    containers = [payload]
+    for key in ("metadata", "context", "conversation"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            containers.append(value)
+    for container in containers:
+        for key in _HISTORY_PRIVATE_KEYS:
+            value = container.get(key)
+            if value is True or str(value).strip().casefold() in {"1", "true", "yes", "on"}:
+                return True
+    return False
+
+
+def _history_capture_enabled(workspace: Path) -> tuple[bool, str]:
+    env_value = os.environ.get("MEMORYGUARD_HISTORY_ENABLED", "").strip().casefold()
+    if env_value in {"0", "false", "no", "off"}:
+        return False, "disabled_by_env"
+    config = _load_json_config(
+        workspace / ".memoryguard" / "history" / "config.json",
+        strict=False,
+    )
+    if config.get("enabled") is False:
+        return False, "disabled_by_config"
+    return True, "enabled"
+
+
+def _stable_history_event_id(payload: dict[str, Any], event: str) -> tuple[str, bool, str]:
+    for key in ("turn_id", "message_id", "generation_id", "event_id"):
+        value = payload.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return f"{event}:id:{key}:{str(value).strip()}", True, key
+    # Some verified seams expose a monotonic sequence/offset but no opaque ID.
+    for key in ("sequence", "sequence_id", "turn_index", "message_index", "offset"):
+        value = payload.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return f"{event}:sequence:{key}:{str(value).strip()}", True, key
+    return "", False, "unavailable"
+
+
+def _contains_obvious_secret(content: str) -> bool:
+    from .auto_organizer import SECRET_PATTERNS
+    return any(pattern.search(content) for pattern in SECRET_PATTERNS)
+
+
+def _hook_history_session_id(payload: dict[str, Any]) -> str:
+    """Use a verified host session identity; never coalesce unknown chats."""
+    base = str(payload.get("session_id") or payload.get("conversation_id") or "").strip()
+    if not base:
+        return ""
+    subagent = str(payload.get("subagent_id") or payload.get("agent_id") or "").strip()
+    return f"{base}:subagent:{subagent}" if subagent else base
+
+
+def _archive_history_event(
+    *,
+    workspace: Path,
+    provider: str,
+    event: str,
+    agent_instance_id: str,
+    share_group_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort raw turn archive for verified lifecycle seams.
+
+    This never calls the long-term-memory store or bootstrap. Strict replay
+    idempotency is promised only when the host supplies a stable event ID or
+    sequence. Otherwise each observed call is preserved and coverage is marked
+    degraded. Failures never affect the host's normal conversation flow.
+    """
+    if event not in {"user_prompt", "stop"}:
+        return {"attempted": False, "reason": "event_not_archived"}
+    enabled, enabled_reason = _history_capture_enabled(workspace)
+    if not enabled:
+        return {"attempted": False, "reason": enabled_reason, "capture_enabled": False}
+    if _history_opted_out(payload):
+        return {"attempted": False, "reason": "private_or_disabled"}
+    external_session_id = _hook_history_session_id(payload)
+    if not external_session_id:
+        return {"attempted": False, "reason": "session_identity_missing"}
+    if event == "user_prompt":
+        role, content = "user", _prompt(payload)
+    else:
+        role = "assistant"
+        # A Stop event does not universally expose model text.  Do not invent
+        # it, scrape state, or claim full host coverage when it is absent.
+        content = str(
+            payload.get("last_assistant_message")
+            or payload.get("assistant_message")
+            or payload.get("final_response")
+            or ""
+        )
+    if not content.strip():
+        return {
+            "attempted": False,
+            "reason": "assistant_content_unavailable" if event == "stop" else "prompt_content_unavailable",
+            "session_hash": _short_hash(external_session_id),
+        }
+    if _contains_obvious_secret(content):
+        return {
+            "attempted": False, "archived": False,
+            "reason": "secret_detected_blocked", "secret_blocked": True,
+            "session_hash": _short_hash(external_session_id),
+        }
+    try:
+        from .conversation_history import ConversationHistoryStore, HistoryScope, MAX_TURN_CHARS
+
+        truncated = len(content) > MAX_TURN_CHARS
+        if truncated:
+            content = content[:MAX_TURN_CHARS]
+        host_event_id, event_stable, event_source = _stable_history_event_id(payload, event)
+        result = ConversationHistoryStore(workspace).append_turn(
+            HistoryScope(
+                agent_instance_id=agent_instance_id,
+                project_ref=str(payload.get("project_ref") or payload.get("cwd") or ""),
+                provider=provider,
+                share_group_id=share_group_id,
+            ),
+            external_session_id=external_session_id,
+            provider=provider,
+            role=role,
+            content=content,
+            event_id=host_event_id,
+            event_stable=event_stable,
+            title=str(payload.get("title") or payload.get("conversation_title") or ""),
+            created_at=str(payload.get("timestamp") or payload.get("created_at") or ""),
+        )
+        return {
+            "attempted": True,
+            "archived": bool(result.get("inserted")),
+            "replayed": bool(result.get("replayed")),
+            "event_conflict": bool(result.get("event_conflict")),
+            "event": event,
+            "role": role,
+            "session_hash": _short_hash(external_session_id),
+            "truncated": truncated,
+            "capture_enabled": True,
+            "idempotency": result.get("idempotency", "degraded"),
+            "coverage_degraded": not event_stable,
+            "event_identity_source": event_source,
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "archived": False,
+            "event": event,
+            "reason": f"history_archive_failed:{type(exc).__name__}",
+            "session_hash": _short_hash(external_session_id),
+        }
 
 
 def _durable_candidate(text: str) -> bool:
@@ -892,12 +1382,30 @@ def _is_memoryguard_tool(tool_name: str, operation: str = "") -> bool:
     return "memoryguard" in value and operation.casefold() in value
 
 
-def _is_memoryguard_bootstrap(tool_name: str) -> bool:
-    return _is_memoryguard_tool(tool_name, "context_bootstrap")
+def _cursor_mcp_inner_tool_name(tool_name: str, tool_input: Any = None) -> str:
+    """Cursor agents wrap MCP as CallMcpTool; real MCP tool name is in tool_input."""
+    raw = (tool_name or "").casefold()
+    compact = raw.replace("_", "")
+    if compact != "callmcptool" and "callmcptool" not in compact:
+        return ""
+    if not isinstance(tool_input, dict):
+        return ""
+    inner = tool_input.get("toolName") or tool_input.get("tool_name") or ""
+    return str(inner)
 
 
-def _is_memoryguard_write(tool_name: str) -> bool:
-    return _is_memoryguard_tool(tool_name, "memory_write")
+def _is_memoryguard_bootstrap(tool_name: str, tool_input: Any = None) -> bool:
+    if _is_memoryguard_tool(tool_name, "context_bootstrap"):
+        return True
+    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
+    return bool(inner) and _is_memoryguard_tool(inner, "context_bootstrap")
+
+
+def _is_memoryguard_write(tool_name: str, tool_input: Any = None) -> bool:
+    if _is_memoryguard_tool(tool_name, "memory_write"):
+        return True
+    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
+    return bool(inner) and _is_memoryguard_tool(inner, "memory_write")
 
 
 def _is_other_memory_write(tool_name: str) -> bool:
@@ -926,10 +1434,26 @@ def _load_store(
 def _render_context(packet: dict[str, Any]) -> str:
     context_packet = packet.get("context_packet", {})
     items = context_packet.get("items", [])
+    mandatory_items = context_packet.get("mandatory_items", [])
+    if packet.get("mandatory_overflow"):
+        return (
+            "MemoryGuard 强制规则包异常，停止继续执行。"
+            f"原因：{packet.get('error') or 'mandatory_rule_package_invalid'}"
+        )
     lines = [
-        "[MemoryGuard 长期记忆上下文]",
-        "仅用于补充长期规则/偏好/项目决策；当前宿主对话保持原样。",
+        "[MemoryGuard 强制规则（必须遵循）]",
     ]
+    if mandatory_items:
+        for item in mandatory_items:
+            body = " ".join(str(item.get("body", "")).split())
+            if body:
+                lines.append(f"- {item.get('kind', 'fact')}: {body}")
+    else:
+        lines.append("- 本轮没有生效的强制规则。")
+    lines.extend([
+        "[MemoryGuard 相关长期记忆]",
+        "仅用于补充长期规则/偏好/项目决策；当前宿主对话保持原样。",
+    ])
     for item in items:
         body = " ".join(str(item.get("body", "")).split())
         if not body:
@@ -973,6 +1497,117 @@ def _context_output(provider: str, event: str, text: str) -> dict[str, Any]:
             "additionalContext": text,
         }
     }
+
+
+def _normalize_feedback_receipts(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    items: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        receipt_id = str(item.get("receipt_id", "")).strip()
+        if not receipt_id:
+            continue
+        normalized = {
+            "receipt_id": receipt_id,
+            "memory_id": str(item.get("memory_id", "") or "").strip(),
+        }
+        items.append(normalized)
+    return items
+
+
+def _persist_mandatory_match_receipts(
+    *,
+    store: "SharedMemoryStore",
+    receipts: list[dict[str, Any]],
+    provider: str,
+    event: str,
+) -> None:
+    if not receipts:
+        return
+    from .schema_v3 import RuleMatchReceipt
+
+    for raw in receipts:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            store.append_rule_match_receipt(RuleMatchReceipt.from_dict(raw))
+        except Exception as exc:
+            _emit_runtime_write_diagnostic(
+                "mandatory_receipt_write_failed",
+                provider,
+                event,
+                exc,
+            )
+
+
+def _flush_pending_rule_feedback(
+    *,
+    workspace: Path,
+    provider: str,
+    agent_instance_id: str,
+    share_group_id: str,
+    session_id: str,
+    actor: str,
+    trigger: str,
+) -> None:
+    state = _load_state(workspace, provider, session_id)
+    receipts = _normalize_feedback_receipts(state.get("mandatory_match_receipts", []))
+    if not receipts:
+        return
+
+    try:
+        store = _load_store(workspace, agent_instance_id, share_group_id)
+    except Exception as exc:
+        _emit_runtime_write_diagnostic(
+            "rule_feedback_fallback_store_open_failed",
+            provider,
+            "stop",
+            exc,
+        )
+        return
+
+    from .schema_v3 import RuleMatchFeedback, stable_hash
+
+    for raw in receipts:
+        receipt_id = raw["receipt_id"]
+        try:
+            existing = store.get_rule_match_feedback_by_receipt(receipt_id)
+        except Exception as exc:
+            _emit_runtime_write_diagnostic(
+                "rule_feedback_fallback_lookup_failed",
+                provider,
+                "stop",
+                exc,
+            )
+            continue
+        if existing is not None:
+            continue
+        feedback = RuleMatchFeedback(
+            feedback_id=stable_hash(
+                "rule-feedback", "not_applicable", receipt_id, actor, trigger,
+            ),
+            receipt_id=receipt_id,
+            outcome="not_applicable",
+            actor=actor,
+            evidence=f"auto fallback from stop: {trigger}",
+            confidence=1.0,
+            created_at=_now_iso(),
+        )
+        try:
+            store.append_rule_match_feedback(feedback)
+        except Exception as exc:
+            _emit_runtime_write_diagnostic(
+                "rule_feedback_fallback_write_failed",
+                provider,
+                "stop",
+                exc,
+            )
+            continue
+
+    state["mandatory_match_receipts"] = []
+    _save_state(workspace, provider, session_id, state)
 
 
 def _deny_output(provider: str, reason: str) -> dict[str, Any]:
@@ -1033,6 +1668,24 @@ def run_hook(
     if mode == "paused":
         return _allow_output(normalized_provider, event)
 
+    # The three installed adapters all use these verified lifecycle seams.
+    # Archive only event payload supplied by that host; this is best-effort and
+    # deliberately independent from long-term memory/bootstrapping.
+    if event in {"user_prompt", "stop"}:
+        _record_history_diagnostic(
+            root,
+            normalized_provider,
+            agent_instance_id,
+            _archive_history_event(
+                workspace=root,
+                provider=normalized_provider,
+                event=event,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+                payload=payload,
+            ),
+        )
+
     if event == "session_start":
         text = _static_session_context(normalized_provider)
         if normalized_provider == "cursor":
@@ -1045,9 +1698,40 @@ def run_hook(
                     task="MemoryGuard session preferences",
                     max_items=5,
                     max_chars=2400,
+                    effective_context=_effective_agent_context(
+                        normalized_provider, agent_instance_id,
+                        share_group_id, payload, event=event,
+                    ),
+                )
+                _record_heartbeat(
+                    root, normalized_provider, agent_instance_id, event=event,
+                    error=str(packet.get("error", "")),
+                    mandatory_rule_ids=packet.get("mandatory_rule_ids", []),
+                    mandatory_overflow=bool(packet.get("mandatory_overflow")),
+                )
+                _save_state(root, normalized_provider, session_id, {
+                    "mandatory_rule_ids": packet.get("mandatory_rule_ids", []),
+                    "mandatory_overflow": bool(packet.get("mandatory_overflow")),
+                    "mandatory_invalid_reason": packet.get("mandatory_invalid_reason", ""),
+                    "mandatory_match_receipts": packet.get(
+                        "mandatory_match_receipts", [],
+                    ),
+                    "bootstrap_ok": not bool(packet.get("mandatory_overflow")),
+                })
+                _persist_mandatory_match_receipts(
+                    store=store,
+                    receipts=packet.get("mandatory_match_receipts", []),
+                    provider=normalized_provider,
+                    event="session_start",
                 )
                 text = text + "\n" + _render_context(packet)
             except Exception as exc:
+                _save_state(root, normalized_provider, session_id, {
+                    "mandatory_overflow": True,
+                    "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
+                    "mandatory_match_receipts": [],
+                    "bootstrap_ok": False,
+                })
                 _record_heartbeat(
                     root,
                     normalized_provider,
@@ -1055,6 +1739,13 @@ def run_hook(
                     event=event,
                     error=f"context bootstrap failed: {exc}",
                 )
+        elif (
+            normalized_provider == "codex"
+            and str(payload.get("source", "") or "").casefold() == "compact"
+        ):
+            state = _load_state(root, normalized_provider, session_id)
+            if state.get("durable_candidate") and not state.get("write_seen"):
+                text = text + "\n" + _COMPACT_REMINDER
         return _context_output(normalized_provider, event, text)
 
     if event == "subagent_start":
@@ -1074,6 +1765,37 @@ def run_hook(
                 project_hint=str(payload.get("cwd", "") or ""),
                 max_items=6,
                 max_chars=3000,
+                effective_context=_effective_agent_context(
+                    normalized_provider, agent_instance_id,
+                    share_group_id, payload, event=event,
+                ),
+            )
+            effective = packet.get("effective_agent", {})
+            receipt = packet.get("assignment_receipt", {})
+            _save_state(root, normalized_provider, session_id, {
+                "bootstrap_ok": not bool(packet.get("mandatory_overflow")),
+                "mandatory_overflow": bool(packet.get("mandatory_overflow")),
+                "mandatory_invalid_reason": packet.get(
+                    "mandatory_invalid_reason", ""
+                ),
+                "mandatory_rule_ids": packet.get("mandatory_rule_ids", []),
+                "mandatory_match_receipts": packet.get(
+                    "mandatory_match_receipts", [],
+                ),
+                "effective_agent": effective,
+                "assignment_receipt": receipt,
+            })
+            _persist_mandatory_match_receipts(
+                store=store,
+                receipts=packet.get("mandatory_match_receipts", []),
+                provider=normalized_provider,
+                event="subagent_start",
+            )
+            _record_heartbeat(
+                root, normalized_provider, agent_instance_id, event=event,
+                error=str(packet.get("error", "")),
+                mandatory_rule_ids=packet.get("mandatory_rule_ids", []),
+                mandatory_overflow=bool(packet.get("mandatory_overflow")),
             )
             return _context_output(
                 normalized_provider,
@@ -1083,6 +1805,14 @@ def run_hook(
                 + _render_context(packet),
             )
         except Exception as exc:
+            state = _load_state(root, normalized_provider, session_id)
+            state.update({
+                "mandatory_overflow": True,
+                "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
+                "mandatory_match_receipts": [],
+                "bootstrap_ok": False,
+            })
+            _save_state(root, normalized_provider, session_id, state)
             _record_heartbeat(
                 root,
                 normalized_provider,
@@ -1098,6 +1828,7 @@ def run_hook(
 
     if event == "user_prompt":
         prompt = _prompt(payload)
+        previous_state = _load_state(root, normalized_provider, session_id)
         state = {
             "prompt_hash": _short_hash(prompt),
             "durable_candidate": _durable_candidate(prompt),
@@ -1106,6 +1837,37 @@ def run_hook(
             "stop_continued": False,
         }
         if normalized_provider == "cursor":
+            try:
+                store = _load_store(root, agent_instance_id, share_group_id)
+                from .context_bootstrap import build_context_packet
+                packet = build_context_packet(
+                    store, task="MemoryGuard session mandatory verification",
+                    max_items=5, max_chars=2400,
+                    effective_context=_effective_agent_context(
+                        normalized_provider, agent_instance_id,
+                        share_group_id, payload, event=event,
+                    ),
+                )
+                state.update({
+                    "mandatory_rule_ids": packet.get("mandatory_rule_ids", previous_state.get("mandatory_rule_ids", [])),
+                    "mandatory_overflow": bool(packet.get("mandatory_overflow")),
+                    "mandatory_invalid_reason": packet.get("mandatory_invalid_reason", ""),
+                    "mandatory_match_receipts": packet.get(
+                        "mandatory_match_receipts", [],
+                    ),
+                })
+                _persist_mandatory_match_receipts(
+                    store=store,
+                    receipts=packet.get("mandatory_match_receipts", []),
+                    provider=normalized_provider,
+                    event="user_prompt",
+                )
+            except Exception as exc:
+                state.update({
+                    "mandatory_overflow": True,
+                    "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
+                    "mandatory_match_receipts": [],
+                })
             _save_state(root, normalized_provider, session_id, state)
             return {"continue": True}
         try:
@@ -1118,12 +1880,33 @@ def run_hook(
                 project_hint=str(payload.get("cwd", "") or ""),
                 max_items=8,
                 max_chars=4000,
+                effective_context=_effective_agent_context(
+                    normalized_provider, agent_instance_id,
+                    share_group_id, payload, event=event,
+                ),
             )
-            state["bootstrap_ok"] = True
+            state["mandatory_rule_ids"] = packet.get("mandatory_rule_ids", [])
+            state["mandatory_overflow"] = bool(packet.get("mandatory_overflow"))
+            state["mandatory_match_receipts"] = packet.get(
+                "mandatory_match_receipts", [],
+            )
+            state["bootstrap_ok"] = not state["mandatory_overflow"]
             state["selected_count"] = int(
                 packet.get("selection", {}).get("selected_count", 0)
             )
+            _persist_mandatory_match_receipts(
+                store=store,
+                receipts=packet.get("mandatory_match_receipts", []),
+                provider=normalized_provider,
+                event="user_prompt",
+            )
             _save_state(root, normalized_provider, session_id, state)
+            _record_heartbeat(
+                root, normalized_provider, agent_instance_id, event=event,
+                error=str(packet.get("error", "")),
+                mandatory_rule_ids=state["mandatory_rule_ids"],
+                mandatory_overflow=state["mandatory_overflow"],
+            )
             return _context_output(
                 normalized_provider,
                 event,
@@ -1131,6 +1914,9 @@ def run_hook(
             )
         except Exception as exc:
             state["bootstrap_error"] = str(exc)[:500]
+            state["mandatory_overflow"] = True
+            state["mandatory_invalid_reason"] = state["bootstrap_error"]
+            state["mandatory_match_receipts"] = []
             _save_state(root, normalized_provider, session_id, state)
             _record_heartbeat(
                 root,
@@ -1149,6 +1935,12 @@ def run_hook(
     if event == "pre_tool":
         tool_name = str(payload.get("tool_name", "") or "")
         tool_input = payload.get("tool_input", {})
+        state = _load_state(root, normalized_provider, session_id)
+        if (state.get("mandatory_overflow") or state.get("bootstrap_error")) and mode == "enforce":
+            return _deny_output(
+                normalized_provider,
+                "MemoryGuard 强制规则包异常，停止继续执行。请先修复共享记忆中的强制规则。",
+            )
         if _targets_native_memory(tool_name, tool_input):
             reason = (
                 "MemoryGuard 已接管长期记忆：禁止 Agent 写入宿主原生记忆路径。"
@@ -1178,10 +1970,18 @@ def run_hook(
                     "stop_continued": False,
                 }
                 _save_state(root, normalized_provider, session_id, state)
+            # Cursor: mark bootstrap on pre_tool; do not rely on postToolUse for MCP.
+            if _is_memoryguard_bootstrap(tool_name, tool_input):
+                if not isinstance(state, dict):
+                    state = {}
+                if not state.get("mandatory_overflow"):
+                    state["bootstrap_ok"] = True
+                    _save_state(root, normalized_provider, session_id, state)
+                return {}
             if (
-                state
+                isinstance(state, dict)
+                and state
                 and not state.get("bootstrap_ok")
-                and not _is_memoryguard_bootstrap(tool_name)
                 and mode == "enforce"
             ):
                 return _deny_output(
@@ -1193,14 +1993,35 @@ def run_hook(
 
     if event == "post_tool":
         tool_name = str(payload.get("tool_name", "") or "")
+        tool_input = payload.get("tool_input", {})
+        tool_result = payload.get("tool_result")
+        if tool_result is None:
+            tool_result = payload.get("result")
         state = _load_state(root, normalized_provider, session_id)
         changed = False
-        if _is_memoryguard_bootstrap(tool_name):
-            state["bootstrap_ok"] = True
-            changed = True
-        if _is_memoryguard_write(tool_name):
-            state["write_seen"] = True
-            changed = True
+        if _is_memoryguard_bootstrap(tool_name, tool_input):
+            if not state.get("mandatory_overflow"):
+                state["bootstrap_ok"] = True
+                changed = True
+        if _is_memoryguard_write(tool_name, tool_input):
+            success, reason = _coerce_tool_result_status(tool_result)
+            if success is True:
+                state["write_seen"] = True
+                state.pop("write_failed", None)
+                state.pop("write_error", None)
+                changed = True
+            elif success is False:
+                if not state.get("write_seen"):
+                    state["write_seen"] = False
+                state["write_failed"] = True
+                state["write_error"] = reason or "memoryguard write tool reported failure"
+                changed = True
+            else:
+                state.pop("write_failed", None)
+                state.pop("write_error", None)
+                if not state.get("write_seen"):
+                    # Unknown result; do not mark as success.
+                    pass
         if changed:
             _save_state(root, normalized_provider, session_id, state)
         return {}
@@ -1208,15 +2029,25 @@ def run_hook(
     if event == "pre_compact":
         state = _load_state(root, normalized_provider, session_id)
         if state.get("durable_candidate") and not state.get("write_seen"):
+            if normalized_provider == "codex":
+                return {}
             return _context_output(
                 normalized_provider,
                 event,
-                "压缩前发现尚未沉淀的长期记忆候选；继续工作前用 "
-                "memoryguard_memory_write 萃取保存，不得保存整段对话。",
+                _COMPACT_REMINDER,
             )
         return {}
 
     state = _load_state(root, normalized_provider, session_id)
+    _flush_pending_rule_feedback(
+        workspace=root,
+        provider=normalized_provider,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+        session_id=session_id,
+        actor=f"hook:{normalized_provider}:{agent_instance_id}",
+        trigger="stop_event",
+    )
     last_message = str(payload.get("last_assistant_message", "") or "")
     candidate = bool(state.get("durable_candidate")) or _durable_candidate(
         last_message
@@ -1253,7 +2084,18 @@ def _read_stdin_json() -> dict[str, Any]:
     return data
 
 
+def _configure_utf8_stdio() -> None:
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        errors = "backslashreplace" if name == "stderr" else "strict"
+        reconfigure(encoding="utf-8", errors=errors)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    _configure_utf8_stdio()
     try:
         payload = _read_stdin_json()
         result = run_hook(

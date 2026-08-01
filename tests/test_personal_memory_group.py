@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import sqlite3
+import threading
 import zipfile
 
 import pytest
@@ -134,6 +135,58 @@ def test_read_only_store_reads_live_wal_without_forcing_clean_db_sidecars(
         }
     finally:
         pin.close()
+
+
+def test_read_only_store_tolerates_wal_disappearing_during_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A checkpoint may unlink -wal after the reader has started probing it."""
+    store = SharedMemoryStore(tmp_path, "wal-disappears")
+    store.append_record(SharedMemoryRecord(
+        memory_id="stable-main-db", body="checkpoint-safe", kind=MemoryKind.FACT,
+        status=SharedMemoryStatus.ACTIVE,
+    ))
+    wal_path = Path(f"{store.db_path}-wal")
+    original_stat = Path.stat
+
+    def disappear_once(path: Path, *args, **kwargs):
+        if path == wal_path:
+            raise FileNotFoundError(2, "sidecar checkpointed", str(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", disappear_once)
+    records = SharedMemoryStore(tmp_path, "wal-disappears", read_only=True).list_records()
+    assert [record.memory_id for record in records] == ["stable-main-db"]
+
+
+def test_read_only_store_survives_concurrent_wal_checkpoints(tmp_path: Path):
+    """Stress the real read/write seam without asserting timing-sensitive WAL state."""
+    store = SharedMemoryStore(tmp_path, "wal-concurrency")
+    started = threading.Event()
+    failures: list[BaseException] = []
+
+    def writer() -> None:
+        try:
+            for index in range(40):
+                store.append_record(SharedMemoryRecord(
+                    memory_id=f"concurrent-{index}", body=f"record {index}",
+                    kind=MemoryKind.FACT, status=SharedMemoryStatus.ACTIVE,
+                ))
+                started.set()
+        except BaseException as exc:  # test must surface any worker failure
+            failures.append(exc)
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    started.wait(timeout=5)
+    try:
+        while thread.is_alive():
+            SharedMemoryStore(tmp_path, "wal-concurrency", read_only=True).list_records()
+    finally:
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not failures
+    assert len(SharedMemoryStore(tmp_path, "wal-concurrency", read_only=True).list_records()) == 40
 
 
 def test_group_listing_exposes_personal_or_shared_kind(tmp_path: Path):

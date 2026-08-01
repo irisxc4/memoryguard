@@ -319,14 +319,17 @@ def record_belongs_to_roots(
     allowed_root_ids: set[str],
     obj_to_root: dict[str, str],
 ) -> bool:
-    """无法从 provenance 推导归属 → False（fail closed）。"""
+    """无法从 provenance 推导归属 → False（fail closed）。
+
+    必须满足所有可解析 provenance 都在允许根内；任一 provenance 未解析/越界则拒绝。
+    """
     if not rec.provenance:
         return False
     for prov in rec.provenance:
         root_id = obj_to_root.get(prov.source_object_id, "")
-        if root_id and root_id in allowed_root_ids:
-            return True
-    return False
+        if not root_id or root_id not in allowed_root_ids:
+            return False
+    return True
 
 
 def filter_ir_for_agent(
@@ -484,14 +487,35 @@ def share_group_status_meta(workspace: str | Path, share_group_id: str) -> dict[
 def share_file_source_key(meta: dict[str, Any] | None) -> str:
     """从导入事件 metadata 生成文件级同源键（同文件多段 → 同一 source_hub）。
 
-    只用 relative_path：共享组内多 Agent 导入同一相对路径时应聚成同一突触。
+    只用 relative_path + source_root_id，避免不同根目录同名文件混淆。
     """
     if not isinstance(meta, dict):
         return ""
     rel = str(meta.get("relative_path") or "").strip().replace("\\", "/")
+    root_id = str(meta.get("source_root_id") or "").strip()
+    if rel and root_id:
+        return f"share-file:{stable_hash(root_id, rel)}:{rel}"
     if rel:
         return f"share-file:{rel}"
     return ""
+
+
+def parse_share_file_source_key(source_object_id: str) -> tuple[str, str]:
+    """解析 share-file 同源键。
+
+    返回 (root_hash_hint, relative_path)。"""
+    if not isinstance(source_object_id, str):
+        return "", ""
+    if not source_object_id.startswith("share-file:"):
+        return "", ""
+    rest = source_object_id[len("share-file:"):]
+    if not rest:
+        return "", ""
+    root_hint, sep, rel = rest.partition(":")
+    rel = rel.strip().replace("\\", "/")
+    if sep and rel and all(ch in "0123456789abcdef" for ch in root_hint.lower()):
+        return root_hint, rel
+    return "", rest.replace("\\", "/")
 
 
 def _rewrite_share_provenance_for_hubs(

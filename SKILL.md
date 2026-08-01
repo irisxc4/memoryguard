@@ -1,7 +1,7 @@
 ---
 name: memoryguard
 description: Local-first MCP memory backend and governance console for coding agents. Auto-organize, quarantine, supersede, and rollback shared memories across multiple agents.
-version: 0.3.1
+version: 0.3.2
 author: irisxc4
 homepage: https://github.com/irisxc4/memoryguard
 repository: https://github.com/irisxc4/memoryguard
@@ -68,6 +68,17 @@ Do not claim that Skill installation alone created a permanent Hook. The Hook
 is active only after the user-level host configuration is written and a runtime
 receipt is observed.
 
+## Mandatory rules
+
+- Use `memoryguard_memory_write(injection_policy="always", priority=...)` only
+  when the user explicitly asks for a long-term mandatory rule (for example,
+  “must”, “always”, or a default rule). Facts, preferences, and ordinary
+  procedures remain `relevant`; never promote every procedure to mandatory.
+- `memoryguard_memory_update` can switch `injection_policy`/`priority`. The
+  GUI can switch a rule back to on-demand or delete/restore it.
+- Bootstrap injects mandatory rules in an independent budget before relevant
+  recall. Sensitive or over-limit mandatory packages fail closed.
+
 ## Hook runtime contract
 
 - Claude and Codex: `UserPromptSubmit` injects one bounded, relevant,
@@ -84,6 +95,25 @@ receipt is observed.
 - `Stop` continues at most once when an explicit durable preference/correction
   has no MemoryGuard write receipt. Never save the whole conversation.
 - Hook modes are `enforce` (default), `observe`, and `paused`.
+
+## History is evidence, not long-term memory
+
+- **Rules & habits** govern long-term records. Mandatory rules must be scoped
+  to their intended Agent, project, provider, or runtime role; never treat a
+  shared group as permission to force every member.
+- **Conversation history** is a separate, local raw-evidence archive. It is
+  isolated per Agent by default and is never injected by
+  `memoryguard_context_bootstrap` or added to the neuron graph automatically.
+- Retrieve history progressively: `memoryguard_history_search` (IDs and
+  summaries only), then `memoryguard_history_timeline`, then
+  `memoryguard_history_read` for an authorized raw turn/session.
+- `memoryguard_history_extract_preview` is read-only. It may suggest
+  evidence-backed candidates but must not write long-term memory; use the
+  normal governed memory write path only after explicit selection.
+- Verified Hook seams may archive bounded user prompts and exposed assistant
+  finals directly into the history database. They honor privacy/disable flags,
+  never infer missing content, and cannot block the host conversation when
+  archival fails.
 
 ## MCP Configuration
 
@@ -119,6 +149,11 @@ Add to your agent's MCP config:
 - `memoryguard_list_pending_enrichments` - List pending classify/translate tasks
 - `memoryguard_apply_enrichments` - Apply host enrichment results (then rebuild)
 - `memoryguard_enrichment_status` - Pending/applied queue counts
+- `memoryguard_history_search` - Search scoped local history without raw text
+- `memoryguard_history_timeline` - Read a bounded preview around a result
+- `memoryguard_history_read` - Read an explicitly selected raw turn/session
+- `memoryguard_history_extract_preview` - Preview candidates; never writes memory
+- `memoryguard_history_list_sessions` / `memoryguard_history_export` / `memoryguard_history_delete` - Manage the trusted Agent's archive (`delete` requires `confirmed=true` and preserves evidence tombstones)
 
 ## Host AI enrichment (Skill interface — automatic)
 

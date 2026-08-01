@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -235,6 +236,9 @@ class GovernanceEngine:
         kind_override: str = "",
         write_policy: str = "auto_accept",
         enricher_mode: str | None = None,
+        injection_policy: str = "relevant",
+        priority: int = 0,
+        rule_assignments: list[dict[str, Any]] | None = None,
         idempotency_key: str = "",
     ) -> dict[str, Any]:
         """Only production entry for automatic shared-memory writes."""
@@ -246,6 +250,9 @@ class GovernanceEngine:
             "kind_override": kind_override,
             "write_policy": write_policy,
             "enricher_mode": enricher_mode or "",
+            "injection_policy": injection_policy,
+            "priority": priority,
+            "rule_assignments": rule_assignments or [],
         }
         replay = self._replay(
             "auto_write",
@@ -272,6 +279,15 @@ class GovernanceEngine:
             )
             event.metadata = dict(event.metadata or {})
             event.metadata["idempotency_key"] = idempotency_key
+        from .schema_v3 import validate_injection_settings
+        injection_policy, priority = validate_injection_settings(
+            injection_policy, priority,
+        )
+        # Runtime-only organizer input.  The resulting record persists these
+        # fields itself; event metadata is intentionally not used as storage.
+        event.injection_policy = injection_policy
+        event.priority = priority
+        event.rule_assignments = list(rule_assignments or [])
         self.store.append_event(event)
         from .auto_organizer import AutoOrganizer
         organizer = AutoOrganizer(
@@ -281,11 +297,17 @@ class GovernanceEngine:
             store=self.store,
             engine=self,
         )
-        record, actions = organizer.organize(
-            event,
-            kind_override=kind_override,
-            write_policy=write_policy,
-        )
+        try:
+            record, actions = organizer.organize(
+                event,
+                kind_override=kind_override,
+                write_policy=write_policy,
+            )
+        except ValueError as exc:
+            return self._blocked(
+                action="auto_write", actor=actor, record=None,
+                reason=str(exc), idempotency_key=idempotency_key,
+            )
         event.auto_actions = actions
         self.store.update_event(event)
         result = self._finish(
@@ -304,6 +326,7 @@ class GovernanceEngine:
             "status": record.status.value,
             "kind": record.kind.value,
             "auto_actions": actions,
+            "record": record.to_dict(),
         })
         return result
 
@@ -366,9 +389,14 @@ class GovernanceEngine:
         body: str | None = None,
         kind: str | None = None,
         status: str | None = None,
+        injection_policy: str | None = None,
+        priority: int | None = None,
         idempotency_key: str = "",
     ) -> dict[str, Any]:
-        payload = {"body": body, "kind": kind, "status": status}
+        payload = {
+            "body": body, "kind": kind, "status": status,
+            "injection_policy": injection_policy, "priority": priority,
+        }
         replay = self._replay(
             "agent_update", actor, [memory_id], idempotency_key, payload,
         )
@@ -388,7 +416,38 @@ class GovernanceEngine:
             )
         before = self._state(record)
         now = _now_iso()
+        prospective = replace(
+            record,
+            body=body if body is not None else record.body,
+            kind=MemoryKind(kind) if kind is not None else record.kind,
+            status=SharedMemoryStatus(status) if status is not None else record.status,
+            injection_policy=(
+                injection_policy if injection_policy is not None
+                else record.injection_policy
+            ),
+            priority=priority if priority is not None else record.priority,
+            updated_at=now,
+        )
+        from .schema_v3 import validate_injection_settings
+        try:
+            validate_injection_settings(
+                prospective.injection_policy, prospective.priority,
+            )
+        except ValueError as exc:
+            return self._blocked(
+                action="agent_update", actor=actor, record=record,
+                reason=str(exc), idempotency_key=idempotency_key,
+            )
         with self.store._tx() as conn:
+            try:
+                self.store._validate_mandatory_budget(
+                    prospective, conn=conn, replacing_id=memory_id,
+                )
+            except ValueError as exc:
+                return self._blocked(
+                    action="agent_update", actor=actor, record=record,
+                    reason=str(exc), idempotency_key=idempotency_key,
+                )
             if body is not None:
                 conn.execute(
                     "UPDATE records SET body=?, canonical_hash=?, updated_at=? "
@@ -410,8 +469,18 @@ class GovernanceEngine:
                     "UPDATE records SET status=?, updated_at=? WHERE memory_id=?",
                     (status, now, memory_id),
                 )
+            if injection_policy is not None:
+                conn.execute(
+                    "UPDATE records SET injection_policy=?, updated_at=? WHERE memory_id=?",
+                    (injection_policy, now, memory_id),
+                )
+            if priority is not None:
+                conn.execute(
+                    "UPDATE records SET priority=?, updated_at=? WHERE memory_id=?",
+                    (priority, now, memory_id),
+                )
         after = self._state(self.store.get_record(memory_id))
-        return self._finish(
+        result = self._finish(
             action="agent_update",
             actor=actor,
             target_ids=[memory_id],
@@ -421,6 +490,7 @@ class GovernanceEngine:
             idempotency_key=idempotency_key,
             payload=payload,
         )
+        return result
 
     def agent_delete(
         self,
@@ -490,7 +560,26 @@ class GovernanceEngine:
             )
         before = self._state(record)
         provenance, now = self._manual_provenance(record, action)
+        prospective = replace(
+            record,
+            body=body if body is not None else record.body,
+            status=status if status is not None else record.status,
+            updated_at=now,
+        )
         with self.store._tx() as conn:
+            if (
+                prospective.status == SharedMemoryStatus.ACTIVE
+                and prospective.injection_policy == "always"
+            ):
+                try:
+                    self.store._validate_mandatory_budget(
+                        prospective, conn=conn, replacing_id=memory_id,
+                    )
+                except ValueError as exc:
+                    return self._blocked(
+                        action=action, actor="user", record=record,
+                        reason=str(exc), idempotency_key=idempotency_key,
+                    )
             if body is not None:
                 conn.execute(
                     "UPDATE records SET body=?, canonical_hash=? "
@@ -563,6 +652,99 @@ class GovernanceEngine:
             idempotency_key=idempotency_key,
         )
 
+    def human_set_injection_policy(
+        self,
+        memory_id: str,
+        injection_policy: str,
+        priority: int = 0,
+        *,
+        assignments: list[dict[str, Any]] | None = None,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        """Manual policy toggle; unlike agent updates it preserves locked records."""
+        from .schema_v3 import validate_injection_settings
+        try:
+            injection_policy, priority = validate_injection_settings(
+                injection_policy, priority,
+            )
+        except ValueError as exc:
+            return self._blocked(
+                action="set_injection_policy", actor="user", record=None,
+                reason=str(exc), idempotency_key=idempotency_key,
+            )
+        record = self.store.get_record(memory_id)
+        if record is None:
+            return self._blocked(
+                action="set_injection_policy", actor="user", record=None,
+                reason="memory_not_found", idempotency_key=idempotency_key,
+            )
+        before = self._state(record)
+        before_assignments = self.store.list_rule_assignments(memory_id)
+        provenance, now = self._manual_provenance(record, "set_injection_policy")
+        requested_assignments = assignments or []
+        assignment_keys = sorted(
+            stable_hash(
+                item.get("target_type", ""), item.get("target_id", ""),
+                item.get("project_ref", ""), item.get("effect", "include"),
+            )
+            for item in requested_assignments
+        )
+        audit_summary = json.dumps({
+            "before": {
+                "policy": record.injection_policy,
+                "priority": record.priority,
+                "assignment_keys": sorted(
+                    item.assignment_id for item in before_assignments
+                ),
+            },
+            "after": {
+                "policy": injection_policy,
+                "priority": priority,
+                "assignment_keys": assignment_keys,
+                "scope_count": len(requested_assignments),
+            },
+        }, ensure_ascii=False, separators=(",", ":"))[:1200]
+        atomic_decision = DecisionEvent(
+            event_id=stable_hash(
+                "atomic-rule-transition", memory_id, injection_policy,
+                str(priority), now,
+            ),
+            actor="local-admin/gui",
+            action="atomic_rule_transition",
+            target_ids=[memory_id],
+            reason=audit_summary,
+            created_at=now,
+        )
+        try:
+            updated, final_assignments = self.store.transition_injection_policy(
+                memory_id, injection_policy, priority,
+                assignments=assignments or [],
+                decision=atomic_decision,
+                provenance=provenance,
+            )
+        except ValueError as exc:
+            return self._blocked(
+                action="set_injection_policy", actor="user", record=record,
+                reason=str(exc), idempotency_key=idempotency_key,
+            )
+        result = self._finish(
+            action="set_injection_policy", actor="user",
+            target_ids=[memory_id], before=before,
+            after=self._state(updated),
+            reason="manual injection policy and audience transition",
+            idempotency_key=idempotency_key,
+            payload={
+                "injection_policy": injection_policy, "priority": priority,
+                "assignments": [
+                    item.to_dict() for item in final_assignments
+                ],
+            },
+        )
+        result["assignments"] = [
+            item.to_dict() for item in final_assignments
+        ]
+        return result
+
     def human_delete(
         self,
         memory_id: str,
@@ -615,6 +797,26 @@ class GovernanceEngine:
         )
         provenance, now = self._manual_provenance(record, "restore")
         with self.store._tx() as conn:
+            # Validate before shadowing descendants. Returning after a failed
+            # check must leave the lineage untouched.
+            try:
+                self.store._validate_mandatory_budget(
+                    replace(
+                        record,
+                        status=SharedMemoryStatus.ACTIVE,
+                        updated_at=now,
+                    ),
+                    assignments=self.store._list_rule_assignments_conn(
+                        conn, memory_id,
+                    ),
+                    conn=conn,
+                    replacing_id=memory_id,
+                )
+            except ValueError as exc:
+                return self._blocked(
+                    action="restore", actor="user", record=record,
+                    reason=str(exc), idempotency_key=idempotency_key,
+                )
             if descendants:
                 placeholders = ",".join("?" for _ in descendants)
                 conn.execute(
@@ -625,6 +827,21 @@ class GovernanceEngine:
                         now,
                         *descendants,
                     ),
+                )
+            try:
+                self.store._validate_mandatory_budget(
+                    replace(
+                        record,
+                        status=SharedMemoryStatus.ACTIVE,
+                        updated_at=now,
+                    ),
+                    conn=conn,
+                    replacing_id=memory_id,
+                )
+            except ValueError as exc:
+                return self._blocked(
+                    action="restore", actor="user", record=record,
+                    reason=str(exc), idempotency_key=idempotency_key,
                 )
             conn.execute(
                 "UPDATE records SET status=?, locked=1, provenance=?, "
@@ -767,6 +984,17 @@ class GovernanceEngine:
             item for item in group.member_ids if item != keep_memory_id
         ]
         with self.store._tx() as conn:
+            try:
+                self.store._validate_mandatory_budget(
+                    replace(keep, status=SharedMemoryStatus.ACTIVE, updated_at=now),
+                    conn=conn,
+                    replacing_id=keep_memory_id,
+                )
+            except ValueError as exc:
+                return self._blocked(
+                    action="resolve_conflict", actor="user", record=keep,
+                    reason=str(exc), idempotency_key=idempotency_key,
+                )
             for memory_id in rejected:
                 other = self.store.get_record(memory_id)
                 if other is None:
@@ -876,6 +1104,18 @@ class GovernanceEngine:
             else SharedMemoryStatus.DELETED
         )
         with self.store._tx() as conn:
+            if new_status == SharedMemoryStatus.ACTIVE:
+                try:
+                    self.store._validate_mandatory_budget(
+                        replace(record, status=SharedMemoryStatus.ACTIVE, updated_at=now),
+                        conn=conn,
+                        replacing_id=entry.memory_id,
+                    )
+                except ValueError as exc:
+                    return self._blocked(
+                        action=action, actor="user", record=record,
+                        reason=str(exc), idempotency_key=idempotency_key,
+                    )
             conn.execute(
                 "UPDATE records SET status=?, locked=1, provenance=?, "
                 "updated_at=? WHERE memory_id=?",
@@ -917,8 +1157,12 @@ class GovernanceEngine:
         content: str,
         *,
         threshold: float,
+        injection_policy: str = "relevant",
+        assignments: list[Any] | None = None,
     ) -> dict[str, Any]:
         """Evaluate durable manual overrides before automatic mutation."""
+        if assignments is None and hasattr(self, "_incoming_rule_scope"):
+            injection_policy, assignments = self._incoming_rule_scope
         incoming = self._tokens(content)
         if not incoming:
             return self._blocked(
@@ -928,6 +1172,10 @@ class GovernanceEngine:
         matches: list[tuple[float, SharedMemoryRecord]] = []
         for record in self.store.list_records():
             if not record.locked:
+                continue
+            if not self.store.record_domain_overlaps(
+                record, injection_policy, assignments or [],
+            ):
                 continue
             existing = self._tokens(record.body)
             if not existing:

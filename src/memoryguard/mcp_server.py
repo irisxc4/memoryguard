@@ -20,6 +20,8 @@ from typing import Any
 from .cli import run_audit, _load_report
 from .report import render_html_report
 from .schema import Report
+from .history_api import TOOL_DEFINITIONS as HISTORY_TOOL_DEFINITIONS
+from .history_api import handle_history_tool
 
 
 # 写操作工具列表：执行前做本地参数预检，避免无效请求写入状态。
@@ -34,6 +36,8 @@ _MUTATING_TOOLS = {
     "memoryguard_accept_candidates",
     "memoryguard_provider_install",
     "memoryguard_apply_enrichments",
+    "memoryguard_history_delete",
+    "memoryguard_rule_feedback",
 }
 
 
@@ -149,6 +153,9 @@ TOOLS = [
             "properties": {
                 "body": {"type": "string", "description": "memory content"},
                 "kind": {"type": "string", "description": "override kind (default: auto-classify). Valid: preference|fact|project|procedure|episode|correction"},
+                "injection_policy": {"type": "string", "enum": ["relevant", "always"], "default": "relevant", "description": "relevant participates in task recall; always is a mandatory rule"},
+                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0, "description": "stable ordering within the mandatory rule package"},
+                "audience": {"type": "array", "description": "mandatory-rule assignments; omitted always defaults to the trusted current agent", "items": {"type": "object"}},
                 "write_policy": {"type": "string", "description": "write policy: auto_accept (default) | auto_quarantine_on_risk | propose_only. propose_only creates a low_confidence candidate without modifying existing memories"},
                 "metadata": {"type": "object", "description": "optional metadata from agent"},
                 "idempotency_key": {"type": "string", "description": "optional retry key bound to content, metadata, kind and policy"},
@@ -167,6 +174,9 @@ TOOLS = [
                 "body": {"type": "string", "description": "new body"},
                 "kind": {"type": "string", "description": "new kind"},
                 "status": {"type": "string", "description": "new status"},
+                "injection_policy": {"type": "string", "enum": ["relevant", "always"], "description": "new injection policy"},
+                "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "new priority"},
+                "audience": {"type": "array", "description": "replace mandatory-rule assignments; only allowed for always records", "items": {"type": "object"}},
                 "idempotency_key": {"type": "string", "description": "optional retry key bound to this target and payload"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
@@ -230,6 +240,57 @@ TOOLS = [
                 },
             },
             "required": ["task"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_feedback",
+        "description": (
+            "Record explicit evidence for a mandatory-rule bootstrap match. "
+            "This closes the loop for follow/violate/not_applicable/corrected decisions. "
+            "One feedback is bound to one receipt_id."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "agent_instance_id": {"type": "string", "description": "trusted identity check"},
+                "receipt_id": {
+                    "type": "string",
+                    "description": "receipt_id returned by memoryguard_context_bootstrap",
+                },
+                "outcome": {
+                    "type": "string",
+                    "enum": [
+                        "followed",
+                        "violated",
+                        "not_applicable",
+                        "corrected",
+                        "exception",
+                        "ignored",
+                    ],
+                    "description": "observed outcome after bootstrap packet is shown",
+                },
+                "actor": {
+                    "type": "string",
+                    "description": "who recorded feedback (agent|hook|user, etc.)",
+                },
+                "evidence": {
+                    "type": "string",
+                    "description": "optional evidence/notes",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                    "description": "confidence score 0-1",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "optional retry key bound to content and actor",
+                },
+            },
+            "required": ["receipt_id", "outcome", "actor"],
             "additionalProperties": False,
         },
     },
@@ -429,6 +490,39 @@ TOOLS = [
     },
 ]
 
+# Raw history uses a physically separate SQLite archive.  Keep its MCP
+# surface out of the long-term-memory tool family so it cannot accidentally
+# participate in bootstrap or a SharedMemoryRecord write path.
+TOOLS.extend(HISTORY_TOOL_DEFINITIONS)
+TOOLS.extend([
+    {
+        "name": "memoryguard_history_list_sessions",
+        "description": "List the trusted Agent's local conversation-history sessions. Read-only; raw text is not returned.",
+        "inputSchema": {"type": "object", "properties": {
+            "scope": {"type": "object"}, "limit": {"type": "integer"},
+            "offset": {"type": "integer"}, "extracted": {"type": "boolean"},
+            "date_from": {"type": "string"}, "date_to": {"type": "string"},
+        }},
+    },
+    {
+        "name": "memoryguard_history_export",
+        "description": "Export explicitly selected sessions owned by the trusted Agent. This is raw-history evidence, not long-term memory.",
+        "inputSchema": {"type": "object", "properties": {
+            "session_ids": {"type": "array", "items": {"type": "string"}},
+            "scope": {"type": "object"},
+        }, "required": ["session_ids"]},
+    },
+    {
+        "name": "memoryguard_history_delete",
+        "description": "Permanently delete explicitly selected raw-history sessions for the trusted Agent. Requires confirmed=true; never deletes long-term memories.",
+        "inputSchema": {"type": "object", "properties": {
+            "session_ids": {"type": "array", "items": {"type": "string"}},
+            "scope": {"type": "object"}, "invalidate_evidence": {"type": "boolean"},
+            "confirmed": {"type": "boolean"},
+        }, "required": ["session_ids", "confirmed"]},
+    },
+])
+
 
 # ---------------------------------------------------------------------------
 # 工具执行
@@ -441,6 +535,14 @@ def _mcp_error(message: str) -> dict[str, Any]:
 
 def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
     """Validate mutating requests before writing local state."""
+    if name == "memoryguard_history_delete":
+        session_ids = args.get("session_ids")
+        if not isinstance(session_ids, list) or not any(str(item).strip() for item in session_ids):
+            return _mcp_error("session_ids must be a non-empty list")
+        if args.get("confirmed") is not True:
+            return _mcp_error("history deletion requires confirmed=true")
+        return None
+
     if name == "memoryguard_memory_write":
         if not str(args.get("body", "")).strip():
             return _mcp_error("body is required")
@@ -450,8 +552,12 @@ def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -
         memory_id = str(args.get("memory_id", "")).strip()
         if not memory_id:
             return _mcp_error("memory_id is required")
-        if name == "memoryguard_memory_update" and not any(args.get(k) for k in ("body", "kind", "status")):
-            return _mcp_error("at least one update field is required: body, kind, or status")
+        if name == "memoryguard_memory_update" and not any(
+            key in args for key in ("body", "kind", "status", "injection_policy", "priority", "audience")
+        ):
+            return _mcp_error(
+                "at least one update field is required: body, kind, status, injection_policy, priority, or audience"
+            )
         # 枚举校验在 preflight 做，非法值不落盘
         if name == "memoryguard_memory_update":
             from .schema_v3 import SharedMemoryStatus, MemoryKind
@@ -512,6 +618,33 @@ def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -
             return _mcp_error(f"unknown provider '{provider}'. Supported: claude|codex|cursor|trae")
         return None
 
+    if name == "memoryguard_rule_feedback":
+        receipt_id = str(args.get("receipt_id", "") or "").strip()
+        if not receipt_id:
+            return _mcp_error("receipt_id is required")
+        outcome = str(args.get("outcome", "") or "").strip()
+        if outcome not in {
+            "followed", "violated", "not_applicable", "corrected",
+            "exception", "ignored",
+        }:
+            return _mcp_error(
+                "outcome must be one of: "
+                "followed|violated|not_applicable|corrected|exception|ignored"
+            )
+        actor = str(args.get("actor", "") or "").strip()
+        if not actor:
+            return _mcp_error("actor is required")
+        confidence = args.get("confidence")
+        if confidence is None:
+            return None
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            return _mcp_error("confidence must be numeric between 0 and 1")
+        if not 0 <= confidence_value <= 1:
+            return _mcp_error("confidence must be between 0 and 1")
+        return None
+
     return None
 
 
@@ -540,7 +673,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         _resolve_memory_workspace(args)
         if (
             name.startswith("memoryguard_memory_")
+            or name.startswith("memoryguard_history_")
             or name == "memoryguard_context_bootstrap"
+            or name == "memoryguard_rule_feedback"
         )
         else _resolve_workspace(args)
     )
@@ -696,6 +831,10 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _handle_memory_status(args)
     if name == "memoryguard_context_bootstrap":
         return _handle_context_bootstrap(args)
+    if name == "memoryguard_rule_feedback":
+        return _handle_rule_feedback(args)
+    if name.startswith("memoryguard_history_"):
+        return _handle_history(args, name)
 
     # --- v3.2 agent binding tools ---
     if name == "memoryguard_binding_create":
@@ -1093,6 +1232,73 @@ def _resolve_access(
     return (group_id, None, ctx)
 
 
+def _effective_agent_context(args: dict[str, Any], group_id: str):
+    """Build scope only from trusted connection/runtime environment.
+
+    Clients cannot claim a provider or a sub-agent role in a tool call.  Hosts
+    set these fields when launching their MCP process; absent role stays empty
+    and therefore cannot match role-scoped mandatory rules.
+    """
+    from .schema_v3 import EffectiveAgentContext
+    from .rule_scope import canonical_project_ref
+    return EffectiveAgentContext(
+        agent_instance_id=str(args.get("agent_instance_id", "") or ""),
+        share_group_id=group_id,
+        provider=os.environ.get("MEMORYGUARD_PROVIDER", "").strip().lower(),
+        project_ref=canonical_project_ref(
+            os.environ.get("MEMORYGUARD_PROJECT_CWD") or os.getcwd()
+        ),
+        runtime_role=os.environ.get("MEMORYGUARD_RUNTIME_ROLE", "").strip(),
+        runtime_agent_id=os.environ.get("MEMORYGUARD_RUNTIME_AGENT_ID", "").strip(),
+        parent_agent_id=os.environ.get("MEMORYGUARD_PARENT_AGENT_ID", "").strip(),
+    )
+
+
+def _authorized_audience(raw: Any, *, memory_id: str, actor_agent_id: str, is_admin: bool) -> list[dict[str, Any]]:
+    from .rule_scope import can_manage_assignment, normalize_assignment
+    if not isinstance(raw, list):
+        raise ValueError("audience must be an array")
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("audience entries must be objects")
+        assignment = normalize_assignment({**item, "memory_id": memory_id})
+        if not can_manage_assignment(assignment, actor_agent_id=actor_agent_id, is_admin=is_admin):
+            raise ValueError("admin capability required for non-self rule audience")
+        result.append(assignment.to_dict())
+    return result
+
+
+def _authorize_rule_mutation(
+    store: Any, memory_id: str, *, actor_agent_id: str, is_admin: bool,
+) -> tuple[Any | None, str]:
+    """Authorize mutation from persisted ownership/audience, never request claims."""
+    from .rule_scope import can_manage_assignment
+
+    record = store.get_record(memory_id)
+    if record is None:
+        return None, "memory_not_found"
+    if is_admin:
+        return record, ""
+    assignments = store.list_rule_assignments(memory_id)
+    if record.injection_policy == "always":
+        includes = [item for item in assignments if item.effect == "include"]
+        if (
+            len(assignments) != 1
+            or len(includes) != 1
+            or not can_manage_assignment(
+                includes[0],
+                actor_agent_id=actor_agent_id,
+                is_admin=False,
+            )
+        ):
+            return record, "admin capability required for non-self rule mutation"
+        return record, ""
+    if record.agent_instance_id != actor_agent_id:
+        return record, "memory mutation denied: record is owned by another agent"
+    return record, ""
+
+
 # ---------------------------------------------------------------------------
 # Memory handlers(P0-A/B/D 全部加固)
 # ---------------------------------------------------------------------------
@@ -1112,7 +1318,9 @@ def _handle_memory_read(args: dict[str, Any]) -> dict[str, Any]:
     record = store.get_record(args["memory_id"])
     if record is None:
         return {"content": [{"type": "text", "text": f"error: memory not found: {args['memory_id']}"}], "isError": True}
-    return {"content": [{"type": "text", "text": json.dumps(record.to_dict(), ensure_ascii=False, indent=2)}]}
+    payload = record.to_dict()
+    payload["assignments"] = [item.to_dict() for item in store.list_rule_assignments(record.memory_id)]
+    return {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_search(args: dict[str, Any]) -> dict[str, Any]:
@@ -1139,6 +1347,11 @@ def _handle_memory_search(args: dict[str, Any]) -> dict[str, Any]:
 
     # B1: FTS5 全文搜索(主路径)
     fts_results = store.search_fts(query, status=status, kind=kind, limit=limit)
+    for item in fts_results:
+        item["record"]["assignments"] = [
+            assignment.to_dict()
+            for assignment in store.list_rule_assignments(item["record"]["memory_id"])
+        ]
 
     # B1: 可选语义召回(heuristic 用 HashBackend,model 用 provider embedding)
     semantic_results: list[dict] = []
@@ -1189,9 +1402,9 @@ def _handle_memory_search(args: dict[str, Any]) -> dict[str, Any]:
 def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
     """P0-A/D: 身份校验 + secret 脱敏。"""
     from .governance_engine import GovernanceEngine
-    from .schema_v3 import MemoryEvent, stable_hash, _now_iso, MemoryKind, MemoryWritePolicy
+    from .schema_v3 import MemoryEvent, stable_hash, _now_iso, MemoryKind, MemoryWritePolicy, validate_injection_settings
     workspace = _resolve_memory_workspace(args)
-    group_id, err, _ = _resolve_access(args, workspace)
+    group_id, err, access_ctx = _resolve_access(args, workspace)
     if err:
         return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
     body = args["body"]
@@ -1199,6 +1412,9 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
     metadata = args.get("metadata", {})
     kind_override = args.get("kind", "")
     write_policy = args.get("write_policy", "auto_accept")
+    injection_policy = args.get("injection_policy", "relevant")
+    priority = args.get("priority", 0)
+    audience = args.get("audience")
 
     # 写入前校验枚举值
     _VALID_POLICIES = {p.value for p in MemoryWritePolicy}
@@ -1208,6 +1424,16 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
         _VALID_KINDS = {k.value for k in MemoryKind}
         if kind_override not in _VALID_KINDS:
             return {"content": [{"type": "text", "text": f"error: invalid kind '{kind_override}'. Valid: {sorted(_VALID_KINDS)}"}], "isError": True}
+    try:
+        injection_policy, priority = validate_injection_settings(injection_policy, priority)
+        if audience is not None and injection_policy != "always":
+            raise ValueError("audience is only valid for injection_policy=always")
+        requested_audience = (
+            _authorized_audience(audience, memory_id="pending", actor_agent_id=args["agent_instance_id"], is_admin=bool(access_ctx and access_ctx.is_admin))
+            if audience is not None else []
+        )
+    except ValueError as exc:
+        return _mcp_error(str(exc))
 
     # P0-D: 统一 secret 脱敏
     safe_body, secret_hit = _redact_secret(body)
@@ -1229,26 +1455,62 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
         event,
         kind_override=kind_override,
         write_policy=write_policy,
+        injection_policy=injection_policy,
+        priority=priority,
+        rule_assignments=(
+            requested_audience or ([{
+                "target_type": "agent",
+                "target_id": args["agent_instance_id"],
+                "effect": "include",
+            }] if injection_policy == "always" else [])
+        ),
         idempotency_key=str(args.get("idempotency_key", "") or ""),
     )
     if not result["ok"]:
         return _mcp_error(result["blocked_reason"])
+    if injection_policy == "always":
+        from .shared_memory_store import SharedMemoryStore
+        memory_id = result.get("memory_id", "")
+        assignments = SharedMemoryStore(
+            workspace, group_id, read_only=True,
+        ).list_rule_assignments(memory_id)
+        result["assignments"] = [item.to_dict() for item in assignments]
+    result["record"] = result.get("after")
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
     """Agent governance update; it is not a human/manual override."""
     from .governance_engine import GovernanceEngine
-    from .schema_v3 import SharedMemoryStatus, MemoryKind
+    from .schema_v3 import (
+        DecisionEvent,
+        MemoryKind,
+        SharedMemoryStatus,
+        _now_iso,
+        stable_hash,
+        validate_injection_settings,
+    )
     workspace = _resolve_memory_workspace(args)
-    group_id, err, _ = _resolve_access(args, workspace)
+    group_id, err, access_ctx = _resolve_access(args, workspace)
     if err:
         return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
     memory_id = args["memory_id"]
     body = args.get("body")
     kind = args.get("kind")
     status = args.get("status")
+    injection_policy = args.get("injection_policy")
+    priority = args.get("priority")
+    audience = args.get("audience")
     decision_actor = f"agent:{args.get('agent_instance_id', '') or 'unknown'}"
+    prepared_audience: list[dict[str, Any]] | None = None
+    engine = GovernanceEngine(workspace, group_id)
+    current, mutation_error = _authorize_rule_mutation(
+        engine.store, memory_id,
+        actor_agent_id=args["agent_instance_id"],
+        is_admin=bool(access_ctx and access_ctx.is_admin),
+    )
+    if mutation_error:
+        return _mcp_error(mutation_error)
 
     # 写入前校验枚举值
     _VALID_STATUSES = {s.value for s in SharedMemoryStatus}
@@ -1257,31 +1519,127 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
         return {"content": [{"type": "text", "text": f"error: invalid status '{status}'. Valid: {sorted(_VALID_STATUSES)}"}], "isError": True}
     if kind is not None and kind not in _VALID_KINDS:
         return {"content": [{"type": "text", "text": f"error: invalid kind '{kind}'. Valid: {sorted(_VALID_KINDS)}"}], "isError": True}
+    if injection_policy is not None or priority is not None:
+        try:
+            injection_policy, priority = validate_injection_settings(
+                injection_policy if injection_policy is not None else current.injection_policy,
+                priority if priority is not None else current.priority,
+            )
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+    if audience is not None:
+        intended_policy = injection_policy if injection_policy is not None else current.injection_policy
+        if intended_policy != "always":
+            return _mcp_error("audience is only valid for injection_policy=always")
+        try:
+            prepared_audience = _authorized_audience(
+                audience, memory_id=memory_id,
+                actor_agent_id=args["agent_instance_id"],
+                is_admin=bool(access_ctx and access_ctx.is_admin),
+            )
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+
+    if any(value is not None for value in (injection_policy, priority, audience)):
+        if any(value is not None for value in (body, kind, status)):
+            return _mcp_error(
+                "policy/audience transition cannot be combined with body, kind, or status"
+            )
+        target_policy = injection_policy or current.injection_policy
+        target_priority = (
+            priority if priority is not None else current.priority
+        )
+        target_audience = prepared_audience
+        if target_policy == "always" and target_audience is None:
+            existing = engine.store.list_rule_assignments(memory_id)
+            target_audience = [item.to_dict() for item in existing] or [{
+                "target_type": "agent",
+                "target_id": args["agent_instance_id"],
+                "effect": "include",
+            }]
+        transition_at = _now_iso()
+        audience_summary = sorted(
+            (
+                str(item.get("target_type", "")),
+                str(item.get("target_id", "")),
+                str(item.get("effect", "include")),
+                str(item.get("project_ref", "")),
+            )
+            for item in (target_audience or [])
+        )
+        transition_decision = DecisionEvent(
+            event_id=stable_hash(
+                "mcp-rule-transition", memory_id,
+                args["agent_instance_id"], target_policy,
+                str(target_priority), transition_at,
+            ),
+            actor=decision_actor,
+            action="agent_rule_transition",
+            target_ids=[memory_id],
+            reason=json.dumps({
+                "before_policy": current.injection_policy,
+                "after_policy": target_policy,
+                "before_priority": current.priority,
+                "after_priority": target_priority,
+                "audience": audience_summary,
+            }, ensure_ascii=False, separators=(",", ":"))[:1200],
+            created_at=transition_at,
+        )
+        try:
+            updated_record, updated_assignments = (
+                engine.store.transition_injection_policy(
+                    memory_id, target_policy, target_priority,
+                    assignments=target_audience or [],
+                    decision=transition_decision,
+                )
+            )
+        except ValueError as exc:
+            return _mcp_error(str(exc))
+        payload = {
+            "ok": True, "record": updated_record.to_dict(),
+            "assignments": [
+                item.to_dict() for item in updated_assignments
+            ],
+        }
+        return {"content": [{"type": "text", "text": json.dumps(
+            payload, ensure_ascii=False, indent=2,
+        )}]}
 
     # P0-D: body 更新前做 secret 脱敏
     if body is not None:
         safe_body, secret_hit = _redact_secret(body)
         body = safe_body
-    result = GovernanceEngine(workspace, group_id).agent_update(
+    result = engine.agent_update(
         memory_id,
         actor=decision_actor,
         body=body,
         kind=kind,
         status=status,
+        injection_policy=injection_policy,
+        priority=priority,
         idempotency_key=str(args.get("idempotency_key", "") or ""),
     )
     if not result["ok"]:
         return _mcp_error(result["blocked_reason"])
+    result["record"] = result.get("after")
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 def _handle_memory_delete(args: dict[str, Any]) -> dict[str, Any]:
     from .governance_engine import GovernanceEngine
     workspace = _resolve_memory_workspace(args)
-    group_id, err, _ = _resolve_access(args, workspace)
+    group_id, err, access_ctx = _resolve_access(args, workspace)
     if err:
         return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
-    result = GovernanceEngine(workspace, group_id).agent_delete(
+    engine = GovernanceEngine(workspace, group_id)
+    _, mutation_error = _authorize_rule_mutation(
+        engine.store, args["memory_id"],
+        actor_agent_id=args["agent_instance_id"],
+        is_admin=bool(access_ctx and access_ctx.is_admin),
+    )
+    if mutation_error:
+        return _mcp_error(mutation_error)
+    result = engine.agent_delete(
         args["memory_id"],
         actor=f"agent:{args.get('agent_instance_id', '') or 'unknown'}",
         idempotency_key=str(args.get("idempotency_key", "") or ""),
@@ -1333,6 +1691,7 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
             project_hint=str(args.get("project_hint", "") or ""),
             max_items=int(args.get("max_items", DEFAULT_MAX_ITEMS)),
             max_chars=int(args.get("max_chars", DEFAULT_MAX_CHARS)),
+            effective_context=_effective_agent_context(args, group_id),
         )
     except (TypeError, ValueError) as exc:
         return _mcp_error(str(exc))
@@ -1342,6 +1701,105 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
             "text": json.dumps(packet, ensure_ascii=False, indent=2),
         }],
     }
+
+
+def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
+    """Record mandatory-rule bootstrap feedback for one match receipt."""
+    from .schema_v3 import RuleMatchFeedback, stable_hash, _now_iso
+    workspace = _resolve_memory_workspace(args)
+    group_id, err, _ = _resolve_access(args, workspace)
+    if err:
+        return {"content": [{"type": "text", "text": f"error: {err}"}], "isError": True}
+
+    receipt_id = str(args.get("receipt_id", "") or "").strip()
+    outcome = str(args.get("outcome", "") or "").strip()
+    actor = str(args.get("actor", "") or "").strip()
+    evidence = str(args.get("evidence", "") or "")
+    confidence = args.get("confidence")
+    if confidence is None:
+        confidence = 1.0
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        return _mcp_error("confidence must be numeric between 0 and 1")
+    if not 0 <= confidence_value <= 1:
+        return _mcp_error("confidence must be between 0 and 1")
+
+    explicit_feedback_id = str(args.get("idempotency_key", "") or "").strip()
+    feedback_id = explicit_feedback_id or stable_hash(
+        "rule-feedback", receipt_id, outcome, actor, evidence,
+    )
+    feedback = RuleMatchFeedback(
+        feedback_id=feedback_id,
+        receipt_id=receipt_id,
+        outcome=outcome,
+        actor=actor,
+        evidence=evidence,
+        confidence=confidence_value,
+        created_at=_now_iso(),
+    )
+    from .shared_memory_store import SharedMemoryStore
+    try:
+        store = SharedMemoryStore(workspace, group_id)
+        result = store.append_rule_match_feedback(feedback)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return _mcp_error(str(exc))
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+        }],
+    }
+
+
+def _handle_history(args: dict[str, Any], name: str) -> dict[str, Any]:
+    """Serve raw-history evidence through the same trusted binding boundary.
+
+    History is a raw-evidence surface separate from shared long-term memory.
+    The binding establishes the caller identity; an active shared binding
+    dynamically authorizes current group members for reads, while mutations
+    stay owner-only. ``scope.agent_instance_id`` can never impersonate another
+    Agent, even for an administrator.
+    """
+    from .conversation_history import ConversationHistoryStore, HistoryAccessResolver
+
+    workspace = _resolve_memory_workspace(args)
+    _group_id, err, access_ctx = _resolve_access(args, workspace)
+    if err:
+        return _mcp_error(err)
+    trusted_agent_id = str(args.get("agent_instance_id") or "")
+    try:
+        if name in {item["name"] for item in HISTORY_TOOL_DEFINITIONS}:
+            result = handle_history_tool(
+                name, args, workspace=str(workspace),
+                trusted_agent_id=trusted_agent_id,
+            )
+        else:
+            scope = HistoryAccessResolver(workspace).resolve(trusted_agent_id, args.get("scope"))
+            history_store = ConversationHistoryStore(workspace)
+            if name == "memoryguard_history_list_sessions":
+                result = history_store.list_sessions(
+                    scope, limit=args.get("limit", 50), offset=args.get("offset", 0),
+                    extracted=args.get("extracted"),
+                    date_from=str(args.get("date_from") or ""),
+                    date_to=str(args.get("date_to") or ""),
+                )
+            elif name == "memoryguard_history_export":
+                result = history_store.export(scope, session_ids=list(args.get("session_ids") or []))
+            elif name == "memoryguard_history_delete":
+                if args.get("confirmed") is not True:
+                    return _mcp_error("history deletion requires confirmed=true")
+                result = ConversationHistoryStore.delete(
+                    history_store, scope, session_ids=list(args.get("session_ids") or []),
+                    # A valid provenance link must never outlive its source.
+                    # The history archive atomically tombstones it before removal.
+                    invalidate_evidence=True,
+                )
+            else:
+                return _mcp_error(f"unknown tool {name}")
+    except (LookupError, PermissionError, TypeError, ValueError) as exc:
+        return _mcp_error(str(exc))
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,8 @@ def _instruction_body(share_group_id: str = "default") -> str:
 调用 `memoryguard_memory_write` 工具：
 - `body`（必填）：记忆内容
 - `kind`（可选）：preference|fact|project|procedure|episode|correction，留空则自动分类
+- `injection_policy`（可选）：默认 `relevant`。仅当用户明确要求“规则/必须/默认长期遵循/强制”时写 `always`；普通事实、偏好和 procedure 仍写 `relevant`，不得把所有 procedure 自动设为强制。
+- `priority`（可选）：`always` 规则的有界排序整数，默认 0。
 - 不要传 `agent_instance_id` 或覆盖 `share_group_id`；MCP 连接已可信绑定到当前 Agent 和共享组
 
 ### 搜索 / 读取
@@ -69,14 +71,15 @@ def _instruction_body(share_group_id: str = "default") -> str:
 - 每个新任务优先调用一次 `memoryguard_context_bootstrap`，传入当前 `task`；同一任务不得重复调用
 - Claude/Codex Hook 已提供本轮 bootstrap 上下文时不要重复调用；Cursor 以 Hook 的首次工具门控为准
 - bootstrap 只补充长期记忆/长期规则；宿主当前对话上下文保持原样，不替换、不重复注入
-- bootstrap 已负责 active-only、敏感省略、相关性、去重和预算；不要再用多个散乱 search 重建启动上下文
+- bootstrap 先注入独立预算的强制规则包，再召回相关记忆；强制包敏感或超限会失败封闭，停止继续执行。
 - 仅在 bootstrap 后仍需精确治理查询时调用 `memoryguard_memory_search`
 - 历史对话文件只是可选来源，必须先萃取为长期记忆；禁止把历史对话全文注入当前任务
 - 需要精确原文时再用 `memoryguard_memory_read` 读取命中的单条记录
 
 ### 更新 / 删除
-- `memoryguard_memory_update`：更新 body / kind / status
+- `memoryguard_memory_update`：更新 body / kind / status，也可在 `injection_policy` 与 `priority` 间切换策略
 - `memoryguard_memory_delete`：软删除
+- GUI 可将强制规则改回按需，或删除/恢复；不要绕过治理路径。
 
 ### 规则
 - 不要为了"记住"而编辑 CLAUDE.md / AGENTS.md / .cursorrules 等指令文件
@@ -105,6 +108,7 @@ def _mcp_command() -> list[str]:
 def _mcp_server_config(
     agent_instance_id: str = "",
     memoryguard_workspace: str | Path = "",
+    provider: str = "",
 ) -> dict[str, Any]:
     """返回 MemoryGuard MCP server 的配置片段（JSON 格式，Claude/Cursor 通用）。"""
     cmd = _mcp_command()
@@ -115,6 +119,8 @@ def _mcp_server_config(
     env: dict[str, str] = {}
     if agent_instance_id:
         env["MEMORYGUARD_AGENT_ID"] = agent_instance_id
+    if provider:
+        env["MEMORYGUARD_PROVIDER"] = provider
     if memoryguard_workspace:
         env["MEMORYGUARD_WORKSPACE"] = str(
             Path(memoryguard_workspace).expanduser().resolve()
@@ -127,6 +133,7 @@ def _mcp_server_config(
 def _mcp_toml_section(
     agent_instance_id: str = "",
     memoryguard_workspace: str | Path = "",
+    provider: str = "codex",
 ) -> str:
     """返回 MemoryGuard MCP server 的 TOML 配置段落（Codex 用）。
 
@@ -144,6 +151,10 @@ def _mcp_toml_section(
     if agent_instance_id:
         env_items.append(
             f"MEMORYGUARD_AGENT_ID = {json.dumps(agent_instance_id)}"
+        )
+    if provider:
+        env_items.append(
+            f"MEMORYGUARD_PROVIDER = {json.dumps(provider)}"
         )
     if memoryguard_workspace:
         resolved = str(Path(memoryguard_workspace).expanduser().resolve())
@@ -218,6 +229,54 @@ def _remove_unmanaged_toml_table(text: str, table_name: str) -> str:
         if stripped == _TOML_END:
             managed = False
 
+    return "".join(result)
+
+
+def _reconcile_memoryguard_toml_tables(text: str) -> str:
+    """Remove every safely-identifiable legacy/owned MemoryGuard table.
+
+    TOML parsers reject duplicate table declarations before normal upsert can
+    run.  Only exact `mcp_servers.memoryguard` sections that identify this
+    module (or live in our marked block) are removed; an unknown same-named
+    section fails closed instead of silently deleting user configuration.
+    """
+    target = f"[mcp_servers.{MCP_SERVER_NAME}]"
+    # Markers are exclusively ours.  Strip every orphan/duplicate marker first
+    # and append one canonical block later via _replace_section; this prevents
+    # BEGIN/END accumulation when a previously interrupted install left only
+    # one side behind.
+    lines = [
+        line for line in text.splitlines(keepends=True)
+        if line.strip() not in {_TOML_BEGIN, _TOML_END}
+    ]
+    result: list[str] = []
+    index = 0
+    while index < len(lines):
+        header = lines[index].strip().split("#", 1)[0].strip()
+        if header != target:
+            result.append(lines[index])
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end].strip().split("#", 1)[0].strip()
+            if candidate.startswith("[") and candidate.endswith("]"):
+                break
+            end += 1
+        section = lines[index:end]
+        section_text = "".join(section)
+        if MCP_MODULE not in section_text:
+            raise ValueError(
+                "cannot safely reconcile duplicate "
+                "[mcp_servers.memoryguard]: section is not MemoryGuard-owned"
+            )
+        # Keep comments/blank lines: they can belong to the next user table;
+        # remove only the owned table header and its TOML assignments.
+        for line in section:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                result.append(line)
+        index = end
     return "".join(result)
 
 
@@ -562,7 +621,7 @@ class ClaudeAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace),
+            _mcp_server_config(agent_instance_id, self.workspace, "claude"),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([
@@ -692,10 +751,7 @@ class CodexAdapter(ProviderAdapter):
 
         mcp_path = self._mcp_config_path()
         toml_content = _read_text_for_update(mcp_path)
-        toml_content = _remove_unmanaged_toml_table(
-            toml_content,
-            f"mcp_servers.{MCP_SERVER_NAME}",
-        )
+        toml_content = _reconcile_memoryguard_toml_tables(toml_content)
         section = _mcp_toml_section(agent_instance_id, self.workspace)
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
         _validate_toml(new_toml, mcp_path)
@@ -871,7 +927,7 @@ class CursorAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace),
+            _mcp_server_config(agent_instance_id, self.workspace, "cursor"),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([
@@ -1026,7 +1082,7 @@ class TraeAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace),
+            _mcp_server_config(agent_instance_id, self.workspace, "trae"),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([

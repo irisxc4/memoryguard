@@ -61,6 +61,17 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     "list_pending_enrichments", "get_enrichment_status",
     "get_host_enrichment_guide",
     "get_build_progress", "list_host_llm_agents",
+    # Conversation history is raw evidence in its own local store.  These
+    # operations only browse/search/export the caller's scoped archive.
+    "list_history_sessions", "search_history", "history_timeline",
+    "history_read", "history_extract_preview", "export_history",
+    # Installed-before-MemoryGuard local transcript inventory.  Discovery
+    # touches metadata only and never creates an archive or state receipt.
+    "discover_local_history_sources",
+    "list_rules_habits",
+    # Mandatory-rule audience governance.  Options and previews are read-only;
+    # edits must take the normal mutation/confirmation path below.
+    "get_rule_scope_options", "preview_effective_rules",
 })
 
 # 变更 API：修改文件、删除目录、归档、绑定、记忆治理等
@@ -89,6 +100,7 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     "import_external_mcp_entries",
     # 记忆治理（变更）
     "edit_memory", "lock_memory", "unlock_memory",
+    "set_memory_injection_policy",
     "restore_memory", "delete_memory", "rollback_memory",
     "resolve_conflict", "release_quarantine", "delete_quarantine",
     # 萃取 / 导入（变更）
@@ -99,6 +111,15 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     "apply_plan", "undo_change",
     # Host AI 整理（变更:写回 IR；主路径已并入 build）
     "apply_enrichments",
+    # Raw-history deletion is deliberate and confirmation-gated by the API.
+    # It never deletes the governed long-term-memory record.
+    "delete_history",
+    # Imports raw transcript evidence into history.sqlite and updates the
+    # resumable receipt; this must use the existing confirmation path.
+    "backfill_local_history",
+    # Changes audience assignments or performs an atomic relevant<->always
+    # transition.  Never expose this as a read-only browser call.
+    "update_rule_audience",
 })
 
 # 所有允许的 API 方法

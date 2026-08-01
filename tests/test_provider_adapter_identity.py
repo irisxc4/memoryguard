@@ -55,6 +55,7 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "claude-real-7",
+        "MEMORYGUARD_PROVIDER": "claude",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert config["mcpServers"]["other"] == {"command": "other-server"}
@@ -68,6 +69,9 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     assert "同一任务不得重复调用" in instruction_text
     assert "宿主当前对话上下文保持原样，不替换、不重复注入" in instruction_text
     assert "历史对话文件只是可选来源，必须先萃取为长期记忆" in instruction_text
+    assert "injection_policy" in instruction_text
+    assert "不得把所有 procedure 自动设为强制" in instruction_text
+    assert "强制包敏感或超限会失败封闭" in instruction_text
     assert 'query="用户 长期 偏好"' not in instruction_text
     assert first["binding_id"] == binding.binding_id
     assert second["binding_id"] == binding.binding_id
@@ -106,6 +110,7 @@ def test_claude_global_scope_uses_user_config_and_stable_workspace(
     config = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
     assert config["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "claude-global",
+        "MEMORYGUARD_PROVIDER": "claude",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert result["mcp_config_file"] == str(home / ".claude.json")
@@ -157,6 +162,7 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-real-9",
+        "MEMORYGUARD_PROVIDER": "codex",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcp_servers"]["other"]["command"] == "other-server"
@@ -222,6 +228,7 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
     parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-legacy",
+        "MEMORYGUARD_PROVIDER": "codex",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcp_servers"]["other"]["command"] == "keep-me"
@@ -288,6 +295,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
         trae_global_config.read_text(encoding="utf-8")
     )["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "trae-real",
+        "MEMORYGUARD_PROVIDER": "trae",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
 
@@ -296,6 +304,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     )
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-real",
+        "MEMORYGUARD_PROVIDER": "codex",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert {
@@ -341,6 +350,7 @@ def test_cursor_workspace_install_uses_project_config(tmp_path, monkeypatch):
     parsed = json.loads(project_config.read_text(encoding="utf-8"))
     assert parsed["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "cursor-real",
+        "MEMORYGUARD_PROVIDER": "cursor",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert json.loads(global_config.read_text(encoding="utf-8")) == {
@@ -397,6 +407,7 @@ def test_trae_workspace_install_uses_project_config_and_preserves_servers(
     parsed = json.loads(project_config.read_text(encoding="utf-8"))
     assert parsed["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "trae-real",
+        "MEMORYGUARD_PROVIDER": "trae",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcpServers"]["existing"] == {"command": "existing-server"}

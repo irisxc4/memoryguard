@@ -355,6 +355,34 @@ tbody tr:last-child td { border-bottom: 0; }
    font-size: 9px; margin-top: 4px;
  }
  .agent-card.add-card { border-style: dashed; color: var(--muted); }
+.knowledge-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px;
+}
+.memory-card { margin: 10px 0; padding: 13px 14px; border: 1px solid rgba(110,231,196,.16); border-radius: 10px; background: rgba(3,20,15,.46); }
+.memory-card-top { display:flex; justify-content:space-between; gap:10px; align-items:center; }
+.memory-card p { margin:8px 0; color:var(--muted); white-space:pre-wrap; }
+.muted { color:var(--faint); font-size:11px; }
+.raw-content { max-height:420px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--fg); font:12px/1.6 var(--mono, monospace); }
+.knowledge-card {
+  position: relative; min-width: 0; padding: 15px; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 12px;
+  background: radial-gradient(circle at 16px 16px, rgba(110,231,196,.12), transparent 46px), rgba(10,26,21,.52);
+}
+.knowledge-card::before {
+  content: ""; position: absolute; top: 15px; left: 14px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--accent); box-shadow: 0 0 11px var(--accent);
+}
+.knowledge-card.missing::before { background: var(--red); box-shadow: 0 0 11px var(--red); }
+.knowledge-title { padding-left: 17px; font-size: 13px; font-weight: 650; color: var(--fg); }
+.knowledge-path {
+  margin: 10px 0; padding: 8px 10px; overflow: hidden; text-overflow: ellipsis;
+  border: 1px solid rgba(110,231,196,.10); border-radius: 8px;
+  background: rgba(3,10,8,.46); color: var(--muted); white-space: nowrap;
+}
+.knowledge-path code { font-size: 10px; }
+.knowledge-files { margin-top: 10px; }
+.knowledge-files summary { cursor: pointer; color: var(--muted); font-size: 11px; }
+.knowledge-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .plan-item { cursor: default; }
 .plan-item.verified::before, .plan-item.applied::before { background: var(--accent); }
 
@@ -364,15 +392,67 @@ tbody tr:last-child td { border-bottom: 0; }
   border: 1px solid var(--line); border-radius: 18px;
   background: radial-gradient(circle at 50% 48%, rgba(37, 104, 83, .14), transparent 38%), rgba(3, 10, 8, .74);
   box-shadow: var(--shadow), inset 0 0 80px rgba(0, 0, 0, .30);
+  animation: neuron-shell-breath 8s ease-in-out infinite;
+  isolation: isolate;
+  overflow: hidden;
 }
 .neuron-shell::before {
   content: ""; position: absolute; inset: 0; pointer-events: none; opacity: .28;
   background-image: radial-gradient(circle, rgba(110,231,196,.28) 1px, transparent 1.4px);
   background-size: 24px 24px; mask-image: radial-gradient(circle at center, black, transparent 82%);
+  animation: neuron-grid-drift 18s linear infinite;
+}
+.neuron-shell::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent 0%, rgba(110,231,196,.14) 48%, transparent 100%);
+  mix-blend-mode: screen; opacity: .24;
+  transform: skewX(-28deg) translateX(-62%);
+  animation: neuron-scanline 7.8s linear infinite;
+}
+.neuron-stage {
+  position: relative; width: 100%; height: calc(100vh - 120px); min-height: 610px;
+  overflow: hidden;
+}
+.neuron-stage::before {
+  content: ""; position: absolute; inset: -20%; pointer-events: none; z-index: 1;
+  border-radius: 50%;
+  border: 1px solid rgba(188, 255, 235, .12);
+  background:
+    radial-gradient(circle at 28% 22%, rgba(110,231,196,.19), transparent 33%),
+    radial-gradient(circle at 72% 74%, rgba(125,211,252,.11), transparent 38%);
+  opacity: .52;
+  mix-blend-mode: screen;
+  animation: neuron-orbit-spin 20s linear infinite;
+}
+.neuron-stage::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
+  background-image:
+    radial-gradient(circle at 60% 32%, rgba(110,231,196,.06) 0 0.7px, transparent 1.2px),
+    radial-gradient(circle at 28% 78%, rgba(129,237,215,.05) 0 0.7px, transparent 1.2px);
+  background-size: 24px 24px, 18px 18px;
+  opacity: .25;
+  animation: neuron-noise-shimmer 4.7s ease-in-out infinite;
+  mix-blend-mode: soft-light;
 }
 .neuron-toolbar {
   position: absolute; z-index: 12; top: 16px; left: 18px; right: 18px;
   display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; pointer-events: none;
+}
+.neuron-canvas-haze {
+  position: absolute; inset: -10%; pointer-events: none; z-index: 2;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(110,231,196,.08), transparent 22%),
+    radial-gradient(circle at 82% 72%, rgba(124,211,255,.06), transparent 26%),
+    radial-gradient(circle at 58% 58%, rgba(255,255,255,.02), transparent 32%);
+  filter: blur(4px);
+  animation: neuron-shell-ripple 16s ease-in-out infinite;
+}
+.neuron-noise-layer {
+  position: absolute; inset: 0; pointer-events: none; z-index: 8;
+  background-image: repeating-radial-gradient(circle at 20% 80%, rgba(255,255,255,.05), rgba(255,255,255,.05) 1.2px, transparent 1.2px, transparent 2.4px);
+  mix-blend-mode: multiply;
+  opacity: .09;
+  animation: neuron-noise-flicker 3.2s linear infinite;
 }
 .neuron-title, .canvas-actions, .neuron-legend, .neuron-stats, .merge-dock { pointer-events: auto; }
 .neuron-title { max-width: 390px; }
@@ -380,8 +460,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .neuron-title h2 { font-size: 18px; font-weight: 560; }
 .neuron-title p { margin-top: 4px; color: var(--muted); font-size: 11px; }
 .canvas-actions { display: flex; gap: 8px; }
-.neuron-stage { position: relative; width: 100%; height: calc(100vh - 120px); min-height: 610px; }
-.neuron-canvas { position: absolute; inset: 0; }
+.neuron-canvas { position: absolute; inset: 0; z-index: 5; }
 .neuron-stats {
   position: absolute; z-index: 11; left: 18px; bottom: 18px; max-width: calc(100% - 390px);
   display: flex; flex-wrap: wrap; gap: 8px; padding: 8px;
@@ -426,9 +505,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .neuron-popover {
   position: absolute; z-index: 30; width: min(360px, calc(100% - 28px)); max-height: min(470px, calc(100% - 32px));
   overflow: auto; padding: 16px; border: 1px solid rgba(110,231,196,.42); border-radius: 14px;
-  background: rgba(7, 22, 17, .94); backdrop-filter: blur(22px); box-shadow: 0 24px 64px rgba(0,0,0,.46), 0 0 30px rgba(110,231,196,.09);
+  background: radial-gradient(circle at 20% 16%, rgba(110,231,196,.08), transparent 45%), rgba(7, 22, 17, .94);
+  backdrop-filter: blur(22px); box-shadow: 0 24px 74px rgba(0,0,0,.52), 0 0 38px rgba(110,231,196,.20);
   opacity: 0; visibility: hidden; transform: translate(-50%, calc(-100% - 42px)) scale(.96);
-  transform-origin: bottom center; transition: opacity .16s ease, transform .16s ease, visibility .16s;
+  transform-origin: bottom center; transition: opacity .22s ease, transform .22s ease, visibility .22s;
+  animation: neuron-popover-glow 2.6s ease-in-out infinite;
 }
 .neuron-popover.show { opacity: 1; visibility: visible; transform: translate(-50%, calc(-100% - 42px)) scale(1); }
 .neuron-popover.below { transform-origin: top center; transform: translate(-50%, 42px) scale(.96); }
@@ -450,6 +531,41 @@ tbody tr:last-child td { border-bottom: 0; }
 
 .loading { min-height: 320px; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .loading::before { content: ""; width: 34px; height: 34px; margin-right: 12px; border: 1px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: pulse-spin 1.2s linear infinite; }
+@keyframes neuron-shell-breath {
+  0%, 100% { box-shadow: var(--shadow), inset 0 0 80px rgba(0,0,0,.30); }
+  50% { box-shadow: 0 24px 86px rgba(0,0,0,.34), inset 0 0 98px rgba(110,231,196,.14); }
+}
+@keyframes neuron-shell-ripple {
+  0%, 100% { transform: scale(0.98); opacity: .26; }
+  50% { transform: scale(1.03); opacity: .48; }
+}
+@keyframes neuron-orbit-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes neuron-grid-drift {
+  0% { background-position: 0 0; }
+  50% { background-position: 12px 14px; }
+  100% { background-position: 24px 0; }
+}
+@keyframes neuron-noise-shimmer {
+  0%, 100% { opacity: .16; transform: translateY(0); }
+  50% { opacity: .32; transform: translateY(4px); }
+}
+@keyframes neuron-noise-flicker {
+  0%, 100% { opacity: .06; }
+  20% { opacity: .09; }
+  40% { opacity: .03; }
+  60% { opacity: .08; }
+}
+@keyframes neuron-scanline {
+  0% { transform: skewX(-28deg) translateX(-140%); opacity: 0; }
+  12% { opacity: .28; }
+  30%, 100% { transform: skewX(-28deg) translateX(140%); opacity: 0; }
+}
+@keyframes neuron-popover-glow {
+  0%, 100% { border-color: rgba(110,231,196,.42); box-shadow: 0 24px 64px rgba(0,0,0,.46), 0 0 30px rgba(110,231,196,.09); }
+  50% { border-color: rgba(188,255,235,.65); box-shadow: 0 30px 82px rgba(0,0,0,.52), 0 0 44px rgba(110,231,196,.24); }
+}
 @keyframes pulse-spin { to { transform: rotate(360deg); } }
 
 .build-progress {
@@ -570,6 +686,8 @@ tbody tr:last-child td { border-bottom: 0; }
       <div class="nav-item active" role="tab" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源<span class="count" id="sources-count"></span></div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="rules" onclick="switchTab('rules')">规则与习惯</div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="history" onclick="switchTab('history')">对话历史</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号<span class="count" id="findings-count"></span></div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="releases" onclick="switchTab('releases')">变更记录<span class="count" id="releases-count"></span></div>
       <div class="nav-section-label">操作</div>
@@ -617,6 +735,11 @@ let projectionMode = localStorage.getItem('memoryguard.projectionMode') || 'nati
 let cyInstance = null;
 let selectedNeuronId = null;
 let selectedNeuronNode = null;
+let selectedNeuronIds = new Set();
+let neuronDragState = null;
+let neuronTapSelectionAdditive = false;
+let historyFocusSessionId = '';
+let historyBackfillContinuation = null;
 let readerLanguage = localStorage.getItem('memoryguard.readerLanguage') || 'zh';
 if (readerLanguage === 'original') readerLanguage = 'en';
 let sourcesScope = 'all';      // 数据源 sub-tab: 'all' | 'user' | 'project'
@@ -815,6 +938,8 @@ function switchTab(tab) {
   if (tab !== 'neurons') {
     selectedNeuronId = null;
     selectedNeuronNode = null;
+    selectedNeuronIds = new Set();
+    neuronDragState = null;
   }
   document.querySelectorAll('.nav-item').forEach(el => {
     const active = el.dataset.tab === tab;
@@ -829,7 +954,46 @@ document.querySelectorAll('.nav-item').forEach(el => el.addEventListener('keydow
   if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); switchTab(el.dataset.tab); }
 }));
 
-function setContent(html) { document.getElementById('content').innerHTML = html; }
+function setContent(html) {
+  document.getElementById('content').innerHTML = html;
+  bindRuleHistoryActionDelegation();
+}
+
+function bindRuleHistoryActionDelegation() {
+  if (document.documentElement.dataset.ruleHistoryDelegated) return;
+  document.documentElement.dataset.ruleHistoryDelegated = '1';
+  document.addEventListener('click', async (event) => {
+    const target = event.target.closest('[data-mg-action]');
+    if (!target) return;
+    const action = target.dataset.mgAction;
+    const memoryId = target.dataset.memoryId || '';
+    const sessionId = target.dataset.sessionId || '';
+    const turnId = target.dataset.turnId || '';
+    const nodeId = target.dataset.nodeId || '';
+    if (!action) return;
+    event.preventDefault();
+    if (action === 'rule-edit') return ensureRuleAudienceEditor(memoryId);
+    if (action === 'neuron-select-node') return selectNeuron(nodeId, true);
+    if (action === 'neuron-open-virtual') return routeVirtualNeuron(selectedNeuronNode);
+    if (action === 'neuron-rule-edit-body') return openNeuronRuleBodyEditor(memoryId);
+    if (action === 'neuron-rule-delete') return governNeuronRule(memoryId, 'delete_memory');
+    if (action === 'neuron-rule-restore') return governNeuronRule(memoryId, 'restore_memory');
+    if (action === 'neuron-rule-body-close') return removeNeuronRuleBodyModal();
+    if (action === 'neuron-rule-body-save') return saveNeuronRuleBody(memoryId);
+    if (action === 'neuron-history-read') return openNeuronHistorySession(sessionId);
+    if (action === 'rule-modal-close') return removeRuleAudienceModal();
+    if (action === 'rule-save') return saveRuleAudience(memoryId);
+    if (action === 'history-read-session') return readHistorySession(sessionId);
+    if (action === 'history-extract') return previewHistoryExtract(sessionId);
+    if (action === 'history-export') return exportHistorySession(sessionId);
+    if (action === 'history-delete') return deleteHistorySession(sessionId);
+    if (action === 'history-timeline') return showHistoryTimeline(sessionId, turnId);
+if (action === 'history-read-turn') return readHistoryTurn(turnId);
+if (action === 'history-back') return renderHistory();
+if (action === 'history-search') return searchHistory();
+if (action === 'history-backfill') return runHistoryBackfill();
+  });
+}
 
 function renderAll() {
   if (!state.report) return;
@@ -924,6 +1088,78 @@ function renderNeuronRailDetail(node) {
     : (isHub ? (node.title || node.label || '同源突触')
       : (node.node_kind === 'topic' ? kindText : (node.label || '记忆胞体')));
 
+  const virtualChildren = (heading = '分支（点击聚焦）') => {
+    const children = nodes.filter(item => item.parent_id === node.id);
+    if (!children.length) return '';
+    return `<div class="claim-list"><h4>${escapeHtml(heading)}</h4>${children.map(item =>
+      `<button class="raw-file-row" type="button" data-mg-action="neuron-select-node" data-node-id="${escapeHtml(item.id || '')}">
+        <span>${escapeHtml(item.label || item.title || '未命名节点')}</span><span class="chip chip-medium">${Number(item.count || 0) || ''}</span>
+      </button>`).join('')}</div>`;
+  };
+
+  // Virtual nodes are graph-native indexes.  Selecting them must never change
+  // the current tab: the rail is the governance surface, and cross-page reads
+  // are deliberate secondary actions only.
+  if (node.node_kind === 'virtual_rule_ref') {
+    const policy = node.injection_policy === 'always' ? '强制注入' : '按需召回';
+    const audience = node.audience || ruleAudience({assignments: node.assignments || []});
+    const restorable = ['deleted', 'shadowed', 'superseded'].includes(node.status || '');
+    return `<div class="popover-kicker">受治理规则 · 图内管理</div>
+      <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(title)}</h3>
+      <div class="detail-section"><h4>规则正文</h4><div class="neuron-detail-body">${escapeHtml(node.body || '暂无正文内容')}</div></div>
+      <div class="row"><span class="key">类型</span><span>${escapeHtml(memoryKindLabel(node.kind || ''))}</span></div>
+      <div class="row"><span class="key">状态</span><span>${escapeHtml(node.status || 'active')}</span></div>
+      <div class="row"><span class="key">注入</span><span>${escapeHtml(policy)}${node.injection_policy === 'always' ? ` · 优先级 ${Number(node.priority || 0)}` : ''}</span></div>
+      <div class="row"><span class="key">适用范围</span><span>${escapeHtml(audience || '按需规则，无固定范围')}</span></div>
+      ${node.locked ? '<div class="muted">此规则已锁定；正文修改将由治理层校验。</div>' : ''}
+      <div class="finding-actions" style="margin:12px 0 6px;display:flex;flex-wrap:wrap;gap:6px">
+        <button class="btn" type="button" data-mg-action="neuron-rule-edit-body" data-memory-id="${escapeHtml(node.memory_id || '')}">编辑正文</button>
+        <button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(node.memory_id || '')}">管理适用范围</button>
+        ${restorable
+          ? `<button class="btn btn-primary" type="button" data-mg-action="neuron-rule-restore" data-memory-id="${escapeHtml(node.memory_id || '')}">恢复</button>`
+          : `<button class="btn btn-danger" type="button" data-mg-action="neuron-rule-delete" data-memory-id="${escapeHtml(node.memory_id || '')}">软删除</button>`}
+      </div>`;
+  }
+
+  if (node.node_kind === 'history_session') {
+    return `<div class="popover-kicker">会话历史索引 · 按需读取</div>
+      <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(node.title || node.label || '会话')}</h3>
+      <div class="neuron-detail-body">${escapeHtml(node.summary || '尚无摘要；原文仍隔离在本地历史库。')}</div>
+      <div class="row"><span class="key">来源</span><span>${escapeHtml(node.provider || 'local')}</span></div>
+      ${node.project_ref ? `<div class="row"><span class="key">项目</span><span>${escapeHtml(node.project_ref)}</span></div>` : ''}
+      <div class="row"><span class="key">时间</span><span>${escapeHtml(node.created_at || node.imported_at || '未知')}</span></div>
+      <div class="row"><span class="key">记录</span><span>${Number(node.turn_count || 0)} 条对话 · ${Number(node.evidence_count || 0)} 条已萃取证据</span></div>
+      <div class="muted">点击此节点只在神经图聚焦；原文不会进入长期记忆或 bootstrap。</div>
+      <div class="finding-actions" style="margin-top:12px"><button class="btn" type="button" data-mg-action="neuron-history-read" data-session-id="${escapeHtml(node.session_id || '')}">在历史页读取原文</button></div>`;
+  }
+
+  if (node.node_kind === 'virtual_bucket') {
+    return `<div class="popover-kicker">规则分支 · 图内管理</div>
+      <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(title)}</h3>
+      <div class="status-item zero"><span class="status-label">规则条目</span><span class="status-num">${node.count || childCount}</span></div>
+      <div class="neuron-detail-body">这是图内规则索引：选择下方规则节点即可在左侧直接治理；原生文件不改动。</div>
+      ${node.has_more ? '<div class="muted">当前仅显示前 50 条；更多规则请继续扫描补齐索引。</div>' : ''}
+      ${virtualChildren()}
+      <div class="finding-actions"><button class="btn" type="button" data-mg-action="neuron-open-virtual">聚焦该分支（图内）</button></div>`;
+  }
+
+  if (node.virtual_category) {
+    const history = node.virtual_category === 'conversation_history';
+  const detail = history
+        ? (node.requires_agent_selection
+        ? '共享组不聚合成员的原始对话。请先显式选择一个 Agent，再查看其独立历史索引。'
+        : `仅显示会话元数据索引；已显示 ${childCount} 条${node.has_more ? '，还有更多' : ''}。原文不会进入神经图或长期记忆。`)
+      : '规则与习惯只引用既有受治理记忆，不创建第二份持久记录。选择分支或规则节点可直接在图内治理。';
+    const label = history && node.requires_agent_selection ? '待选 Agent 后聚焦' : (history ? '查看会话索引（图内）' : '聚焦该分支（图内）');
+    return `<div class="popover-kicker">虚拟索引 · 图内查看</div>
+      <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(title)}</h3>
+      <div class="status-item zero"><span class="status-label">索引条目</span><span class="status-num">${node.count || childCount}</span></div>
+      <div class="neuron-detail-body">${escapeHtml(detail)}</div>
+      ${node.load_error ? `<div class="detail-section"><h4>暂时不可用</h4><div class="neuron-detail-body">${escapeHtml(node.load_error)}</div></div>` : ''}
+      ${virtualChildren(history ? '会话索引（点击聚焦）' : '规则分支（点击聚焦）')}
+      <div class="finding-actions"><button class="btn" type="button" data-mg-action="neuron-open-virtual">${escapeHtml(label)}</button></div>`;
+  }
+
   const linkRows = (items, chip) => (items || []).map(item => {
     const mid = item.memory_id || '';
     const rel = item.relation_label || chip || '相关';
@@ -986,6 +1222,8 @@ function renderContent() {
     case 'overview': renderOverview(); break;
     case 'sources': renderSources(); break;
     case 'neurons': renderNeurons(); break;
+    case 'rules': renderRulesHabits(); break;
+    case 'history': renderHistory(); break;
     case 'findings': renderFindings(); break;
     case 'releases': renderReleases(); break;
     case 'governance': renderGovernance(); break;
@@ -1043,7 +1281,8 @@ async function renderNeurons() {
 function kindColor(kind) {
   const colors = {
     fact: '#6ee7c4', preference: '#f6ad55', project: '#63b3ed', episode: '#fc8181', procedure: '#b794f4', correction: '#f687b3', workflow: '#b794f4', constraint: '#fbd38d',
-    user: '#c084fc', agent: '#38bdf8', session: '#94a3b8', share_group: '#2dd4bf', unknown: '#64748b'
+    user: '#c084fc', agent: '#38bdf8', session: '#94a3b8', share_group: '#2dd4bf', unknown: '#64748b',
+    rules_habits: '#f6ad55', conversation_history: '#7dd3fc'
   };
   return colors[kind] || '#6ee7c4';
 }
@@ -1084,7 +1323,7 @@ function neuronNodePositions(nodes) {
     children[parent].push(node);
   });
   positions.main = { x: 0, y: 0 };
-  const topics = (children.main || []).filter(n => n.node_kind === 'topic');
+  const topics = (children.main || []).filter(n => n.node_kind === 'topic' || n.node_kind === 'virtual_category');
   topics.forEach((node, index) => {
     const angle = index * 2.399963 + neuronHashUnit(node.id) * .8;
     const radius = 230 + neuronHashUnit(node.id + ':r') * 110;
@@ -1102,6 +1341,54 @@ function neuronNodePositions(nodes) {
       y: parent.y + Math.sin(angle) * radius + (neuronHashUnit(node.id + ':y') - .5) * 90,
     };
   });
+  // 轻量级排斥后处理，减少高密度叠点。仅用于可视化舒适度，不影响语义。
+  const radii = {};
+  const nodeKinds = new Set(nodes.map(n => n.node_kind));
+  const estimateRadius = (item) => {
+    const kind = item.node_kind || '';
+    if (kind === 'root') return 30;
+    if (kind === 'source_hub') return 28;
+    if (kind === 'claim_anchor' || kind === 'duplicate_cluster') return 16;
+    if (item.node_kind === 'virtual_bucket') return 35;
+    if (item.node_kind === 'virtual_category') return 30;
+    if (item.node_kind === 'history_session') return 9;
+    return 18 + Math.min(16, (item.provenance_count || 0) * 2.5);
+  };
+  nodes.forEach(node => {
+    radii[node.id] = estimateRadius(node);
+  });
+  if ((nodeKinds.has('virtual_category') || nodeKinds.has('virtual_bucket') || nodes.length > 45) && Object.keys(positions).length) {
+    const ids = nodes.map(item => item.id).filter(id => positions[id]);
+    for (let iter = 0; iter < 70; iter++) {
+      let moved = false;
+      for (let i = 0; i < ids.length; i++) {
+        const idA = ids[i];
+        const posA = positions[idA];
+        if (!posA || idA === 'main') continue;
+        for (let j = i + 1; j < ids.length; j++) {
+          const idB = ids[j];
+          if (idB === 'main') continue;
+          const posB = positions[idB];
+          if (!posB) continue;
+          const dx = posB.x - posA.x;
+          const dy = posB.y - posA.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          const req = (radii[idA] || 20) + (radii[idB] || 20) + 5;
+          if (dist >= req) continue;
+          const gap = req - dist;
+          const nx = dx / dist;
+          const ny = dy / dist;
+          const force = gap / 2 * (1 - iter / 70);
+          posA.x -= nx * force;
+          posA.y -= ny * force;
+          posB.x += nx * force;
+          posB.y += ny * force;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+  }
   return positions;
 }
 
@@ -1117,10 +1404,14 @@ function graphElements(graph) {
     const hub = node.node_kind === 'source_hub';
     const anchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
     const cluster = node.node_kind === 'duplicate_cluster';
+    const virtualCategory = node.node_kind === 'virtual_category';
+    const historySession = node.node_kind === 'history_session';
     // v3：用 provenance_count 替代旧 claim_count 决定大小
     const provCount = node.provenance_count || 0;
     const size = root ? 66
       : hub ? Math.max(22, Math.min(40, 18 + (node.cluster_count || provCount || 2) * 3.5))
+      : virtualCategory ? Math.max(34, Math.min(50, 31 + (node.count || 0) * .22))
+      : historySession ? 12
       : cluster ? Math.max(15, Math.min(30, 12 + (node.cluster_count || 2) * 4))
       : anchor ? 7
       : Math.max(27, Math.min(54, 25 + provCount * 3.2));
@@ -1132,6 +1423,8 @@ function graphElements(graph) {
       record_kind: node.kind || '',
       cluster_count: node.cluster_count || 0,
       provenance_count: provCount,
+      virtual_category: node.virtual_category || '',
+      session_id: node.session_id || '',
       size,
       bg: node.bg || kindColor(node.kind || node.label || ''),
       opacity: 0.85,
@@ -1273,7 +1566,7 @@ function renderNeuronGraph() {
   const modeControls = projectionModeControls();
   const metaBar = renderNeuronMetaBar(graph);
   // 未构建时显示门控
-  if (!graph || graph.empty || !graph.nodes || !graph.nodes.length) {
+  if (!graph || !graph.nodes || !graph.nodes.length || (graph.empty && !graph.virtual_overlay_available)) {
     stopNeuronSignalPulses();
     document.getElementById('neuron-count').textContent = '';
     const reason = graph && graph.reason ? graph.reason : 'not_built';
@@ -1313,16 +1606,22 @@ function renderNeuronGraph() {
     ? `<span class="chip chip-info">待整理残留 · ${enrichPending}</span>`
       + (enrichInfo.auto_applied ? `<span class="chip chip-confirmed">本次整理 · ${enrichInfo.auto_applied}</span>` : '')
     : '';
+  const baseEmptyNotice = graph.base_empty
+    ? `<section class="card projection-gate" style="margin-bottom:14px"><div class="gate-body"><h3>基础投影尚未构建</h3><p class="gate-reason">规则与习惯、对话历史索引仍可浏览；构建投影后会显示受治理记忆的完整关系。</p><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="buildProjection()">构建基础投影</button></div></div></section>`
+    : '';
   const suggestions = [];
   selectedNeuronId = null;
   selectedNeuronNode = null;
+  selectedNeuronIds = new Set();
+  neuronDragState = null;
   renderStatusRail();
   document.getElementById('neuron-count').textContent = stats.node_count || '';
   setContent(`<div class="view-heading"><span class="eyebrow">Live cognition map</span><h2>记忆核心</h2>
-    <p>点击任意光点，在右侧查看可读内容。滚轮缩放，拖拽探索；治理操作请到治理台处理。</p></div>
+    <p>点击任意光点，在右侧查看可读内容。规则与习惯可直接在图内治理；原始对话仅按需打开历史页。</p></div>
     ${metaBar}
     ${modeControls}
     ${sourceMapPanel}
+    ${baseEmptyNotice}
     <section class="neuron-shell">
     <div class="neuron-toolbar">
       <div class="neuron-title"><span class="eyebrow">Cognition map</span><h2>可读神经图</h2>
@@ -1336,6 +1635,8 @@ function renderNeuronGraph() {
       </div>
     </div>
     <div class="neuron-stage" id="neuron-stage">
+      <div class="neuron-canvas-haze" aria-hidden="true"></div>
+      <div class="neuron-noise-layer" aria-hidden="true"></div>
       <div class="neuron-canvas" id="cy" aria-label="本地记忆神经图画布"></div>
       <div class="neuron-legend">
         <div class="legend-item"><span class="legend-node soma"></span>记忆胞体</div>
@@ -1375,11 +1676,13 @@ function renderNeuronGraph() {
         'font-family': 'Segoe UI, PingFang SC, sans-serif', 'font-weight': 500,
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 8,
         'text-outline-width': 2, 'text-outline-color': '#040b09', 'text-wrap': 'wrap', 'text-max-width': 92,
-        'transition-property': 'border-width, border-color, background-color, opacity, shadow-blur', 'transition-duration': '160ms',
+        'transition-property': 'border-width, border-color, background-color, opacity, shadow-blur, background-opacity',
+        'transition-duration': '180ms',
       }},
       { selector: 'node[kind = "root"]', style: {
         'background-color': '#6ee7c4', 'background-opacity': .24, 'border-width': 2.5,
         'border-color': '#bcffeb', 'font-size': 11,
+        'shadow-blur': 18, 'shadow-color': '#9ff0d6', 'shadow-opacity': .5,
       }},
       { selector: 'node[kind = "claim_anchor"]', style: {
         'background-opacity': .68, 'border-width': 0, 'label': '',
@@ -1392,6 +1695,23 @@ function renderNeuronGraph() {
       { selector: 'node[kind = "duplicate_cluster"]', style: {
         'background-opacity': .78, 'border-width': 1.8,
         'border-color': '#d8ffe9', 'label': '',
+      }},
+      { selector: 'node[record_kind = "rules_habits"]', style: {
+        'background-color': '#f6ad55', 'background-opacity': .3,
+        'border-width': 2.4, 'border-color': '#ffe3a1', 'shape': 'round-rectangle',
+        'font-size': 10.5,
+      }},
+      { selector: 'node[record_kind = "conversation_history"]', style: {
+        'background-color': '#7dd3fc', 'background-opacity': .28,
+        'border-width': 2.4, 'border-color': '#c5efff', 'shape': 'round-rectangle',
+        'font-size': 10.5,
+      }},
+      { selector: 'node[kind = "history_session"]', style: {
+        'background-color': '#7dd3fc', 'background-opacity': .7,
+        'border-width': 1.2, 'border-color': '#bae6fd', 'font-size': 8,
+      }},
+      { selector: 'edge[etype = "virtual_index"]', style: {
+        'line-style': 'dotted', 'line-color': '#8de8cf', 'line-opacity': .36, 'width': 1.25,
       }},
       { selector: 'node[status = "tentative"]', style: {
         'background-color': '#2b2a20', 'border-color': '#e9bb64', 'border-style': 'dashed',
@@ -1412,8 +1732,14 @@ function renderNeuronGraph() {
         'line-opacity': .55, 'width': 2.4, 'line-color': '#98f5d0',
       }},
       { selector: 'node.signal', style: {
-        'border-width': 3.2, 'border-color': '#ffffff',
-        'shadow-blur': 28, 'shadow-color': '#bcffeb', 'shadow-opacity': .55,
+        'border-width': 4, 'border-color': '#ffffff',
+        'shadow-blur': 38, 'shadow-color': '#bcffeb', 'shadow-opacity': .8,
+      }},
+      { selector: 'node.hover', style: {
+        'border-width': 3.4, 'border-color': '#fff3a3', 'shadow-blur': 32, 'shadow-color': '#fff3a3', 'shadow-opacity': .58,
+      }},
+      { selector: 'node.focusPulse', style: {
+        'border-width': 4.5, 'border-color': '#ffffff', 'shadow-blur': 48, 'shadow-color': '#ffffff', 'shadow-opacity': .95,
       }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
       { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.5 }},
@@ -1432,18 +1758,59 @@ function renderNeuronGraph() {
     minZoom: .22, maxZoom: 3.6,
   });
 
-  cyInstance.on('tap', 'node', event => selectNeuron(event.target.id()));
+  cyInstance.on('tap', 'node', event => {
+    neuronTapSelectionAdditive = !!(event.originalEvent && (event.originalEvent.shiftKey || event.originalEvent.ctrlKey || event.originalEvent.metaKey));
+    selectNeuron(event.target.id());
+  });
   cyInstance.on('mouseover', 'node', event => {
     const node = event.target;
+    node.addClass('hover');
     node.addClass('neighborhood');
     node.connectedEdges().addClass('neighborhood');
     node.neighborhood('node').addClass('neighborhood');
   });
-  cyInstance.on('mouseout', 'node', () => cyInstance.elements().removeClass('neighborhood'));
+  cyInstance.on('mouseout', 'node', () => cyInstance.elements().removeClass('neighborhood hover'));
   cyInstance.on('tap', event => { if (event.target === cyInstance) hideNeuronPopover(); });
   cyInstance.on('pan zoom resize', () => { if (selectedNeuronId) positionNeuronPopover(selectedNeuronId); });
   cyInstance.on('drag position', 'node', event => {
-    if (selectedNeuronId === event.target.id()) positionNeuronPopover(selectedNeuronId);
+    const selId = event.target.id();
+    if (selectedNeuronId === selId) positionNeuronPopover(selectedNeuronId);
+  });
+  cyInstance.on('grab', 'node', event => {
+    if (!cyInstance) return;
+    const dragRoot = event.target;
+    if (!dragRoot || !dragRoot.selected()) return;
+    const selectedNodes = cyInstance.$('node:selected');
+    if (!selectedNodes.length) return;
+    const basePositions = {};
+    selectedNodes.forEach(n => {
+      if (n.id() === dragRoot.id()) return;
+      basePositions[n.id()] = { ...n.position() };
+    });
+    neuronDragState = {
+      dragRootId: dragRoot.id(),
+      basePositions,
+      rootStart: { ...dragRoot.position() },
+    };
+  });
+  cyInstance.on('drag', 'node', event => {
+    if (!neuronDragState || !cyInstance) return;
+    if (event.target.id() !== neuronDragState.dragRootId) return;
+    const root = cyInstance.getElementById(neuronDragState.dragRootId);
+    if (!root || !root.length) return;
+    const current = root.position();
+    const deltaX = current.x - neuronDragState.rootStart.x;
+    const deltaY = current.y - neuronDragState.rootStart.y;
+    Object.entries(neuronDragState.basePositions).forEach(([nodeId, pos]) => {
+      const n = cyInstance.getElementById(nodeId);
+      if (!n || !n.length) return;
+      n.position({ x: pos.x + deltaX, y: pos.y + deltaY });
+      if (selectedNeuronId === nodeId) positionNeuronPopover(nodeId);
+    });
+    if (selectedNeuronId === neuronDragState.dragRootId) positionNeuronPopover(neuronDragState.dragRootId);
+  });
+  cyInstance.on('free', 'node', () => {
+    neuronDragState = null;
   });
   startNeuronSignalPulses(cyInstance);
 }
@@ -1456,6 +1823,10 @@ function stopNeuronSignalPulses() {
   if (window.__neuronSomaPulse) {
     clearInterval(window.__neuronSomaPulse);
     window.__neuronSomaPulse = null;
+  }
+  if (window.__neuronSparkPulse) {
+    clearInterval(window.__neuronSparkPulse);
+    window.__neuronSparkPulse = null;
   }
   const pending = window.__neuronSignalChains || [];
   pending.forEach(id => clearTimeout(id));
@@ -1553,13 +1924,34 @@ function runNeuronSignalPulse(cy, path) {
 function startNeuronSignalPulses(cy) {
   stopNeuronSignalPulses();
   if (!cy) return;
-  window.__neuronSomaPulse = setInterval(() => {
+  const rootPulse = () => {
     if (!cyInstance || cyInstance !== cy) return;
     try {
       const root = cy.$('node[kind = "root"]');
-      if (root && root.length) root.flashClass('pulse', 700);
+      if (root && root.length) {
+        root.flashClass('pulse', 900);
+        root.flashClass('focusPulse', 480);
+      }
     } catch (e) { /* ignore */ }
-  }, 4200);
+  };
+  const spark = () => {
+    if (!cyInstance || cyInstance !== cy) return;
+    const candidates = cy.nodes('node[kind = "claim_anchor"], node[kind = "history_session"], node[kind = "virtual_bucket"]');
+    if (!candidates || !candidates.length) return;
+    const count = Math.min(2, candidates.length);
+    for (let i = 0; i < count; i++) {
+      const n = candidates[Math.floor(Math.random() * candidates.length)];
+      if (n && n.flashClass) n.flashClass('pulse', 650);
+    }
+    try {
+      const root = cy.$('node[kind = "root"]');
+      if (root && root.length) root.flashClass('focusPulse', 560);
+    } catch (_) { /* ignore */ }
+  };
+  rootPulse();
+  spark();
+  window.__neuronSomaPulse = setInterval(rootPulse, 3600);
+  window.__neuronSparkPulse = setInterval(spark, 5200);
   const fireWave = () => {
     if (!cyInstance || cyInstance !== cy) return;
     const count = 3 + Math.floor(Math.random() * 4); // 3-6
@@ -1594,7 +1986,85 @@ function focusNeuronNode(nodeId) {
   const cyNode = cyInstance.getElementById(nodeId);
   if (!cyNode || !cyNode.length) return;
   cyInstance.animate({ center: { eles: cyNode }, zoom: Math.max(cyInstance.zoom(), 1.18) }, { duration: 420 });
-  cyNode.flashClass('pulse', 900);
+  cyNode.flashClass('focusPulse', 980);
+}
+
+function routeVirtualNeuron(node) {
+  if (!node || !node.virtual_category) return;
+  if (node.virtual_category === 'rules_habits') {
+    showToast('规则与习惯为图内索引，选择下方规则即可直接治理。', 'success');
+    selectNeuron(node.id);
+    return;
+  }
+  if (node.virtual_category === 'conversation_history') {
+    if (node.requires_agent_selection || !activeAgentInstanceId) {
+      showToast('对话历史按 Agent 隔离。请先在数据源页选择一个 Agent。', 'info');
+      return;
+    }
+    showToast('会话历史索引已在图内展示。点击会话节点后再按“读取原文”打开。', 'success');
+    selectNeuron(node.id);
+    return;
+  }
+}
+
+function openNeuronHistorySession(sessionId) {
+  if (!sessionId) return showToast('未找到会话索引', 'error');
+  if (!activeAgentInstanceId) {
+    showToast('对话历史按 Agent 隔离。请先在数据源页选择一个 Agent。', 'info');
+    switchTab('sources');
+    return;
+  }
+  historyFocusSessionId = sessionId;
+  switchTab('history');
+}
+
+function removeNeuronRuleBodyModal() {
+  document.getElementById('neuron-rule-body-modal')?.remove();
+}
+
+function openNeuronRuleBodyEditor(memoryId) {
+  const node = (neuronGraph?.nodes || []).find(item => item.memory_id === memoryId && item.node_kind === 'virtual_rule_ref');
+  if (!memoryId || !node) return showToast('未找到可编辑的规则节点', 'error');
+  removeNeuronRuleBodyModal();
+  const modal = document.createElement('div');
+  modal.id = 'neuron-rule-body-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="编辑规则正文">
+    <div class="modal-head"><h3>编辑规则正文</h3><p>保存后写回同一条受治理记忆，不会创建副本。</p></div>
+    <div class="modal-body"><label class="field"><span>正文</span><textarea id="neuron-rule-body-input" rows="8" maxlength="12000"></textarea></label></div>
+    <div class="modal-actions"><button class="btn" type="button" data-mg-action="neuron-rule-body-close">取消</button><button class="btn btn-primary" type="button" data-mg-action="neuron-rule-body-save" data-memory-id="${escapeHtml(memoryId)}">保存</button></div>
+  </div>`;
+  document.body.appendChild(modal);
+  const input = document.getElementById('neuron-rule-body-input');
+  if (input) input.value = String(node.body || '');
+}
+
+async function refreshNeuronRuleGovernance(memoryId, message = '') {
+  await refreshNeuronGraph(message);
+  const next = (neuronGraph?.nodes || []).find(item => item.memory_id === memoryId && item.node_kind === 'virtual_rule_ref');
+  if (next) selectNeuron(next.id, false);
+}
+
+async function saveNeuronRuleBody(memoryId) {
+  const body = String(document.getElementById('neuron-rule-body-input')?.value || '').trim();
+  if (!body) return showToast('规则正文不能为空', 'error');
+  try {
+    const result = await callApi('edit_memory', memoryId, body, activeShareGroupId || 'default');
+    if (result.error || result.ok === false) throw new Error(result.error || '更新失败');
+    removeNeuronRuleBodyModal();
+    await refreshNeuronRuleGovernance(memoryId, result.message || '规则正文已更新');
+  } catch (error) { showToast(`规则正文更新失败：${error.message || error}`, 'error'); }
+}
+
+async function governNeuronRule(memoryId, method) {
+  if (!memoryId || !['delete_memory', 'restore_memory'].includes(method)) return;
+  const deleting = method === 'delete_memory';
+  if (deleting && !confirm('确认软删除这条规则？可在图内恢复，原始历史不会受影响。')) return;
+  try {
+    const result = await callApi(method, memoryId, activeShareGroupId || 'default');
+    if (result.error || result.ok === false) throw new Error(result.error || '操作失败');
+    await refreshNeuronRuleGovernance(memoryId, result.message || (deleting ? '规则已软删除' : '规则已恢复'));
+  } catch (error) { showToast(`规则${deleting ? '删除' : '恢复'}失败：${error.message || error}`, 'error'); }
 }
 
 function selectNeuron(nodeId, focus = true) {
@@ -1603,9 +2073,41 @@ function selectNeuron(nodeId, focus = true) {
   if (!node) return;
   selectedNeuronId = nodeId;
   selectedNeuronNode = node;
+  const additive = !!neuronTapSelectionAdditive;
+  neuronTapSelectionAdditive = false;
+
   if (cyInstance) {
-    cyInstance.elements().unselect();
-    cyInstance.getElementById(nodeId).select();
+    const target = cyInstance.getElementById(nodeId);
+    const wasSelected = target && target.length && target.selected();
+    if (!additive) {
+      cyInstance.elements().unselect();
+      selectedNeuronIds.clear();
+    }
+    if (target && target.length) {
+      if (additive && wasSelected) {
+        target.unselect();
+        selectedNeuronIds.delete(nodeId);
+      } else {
+        target.select();
+        selectedNeuronIds.add(nodeId);
+      }
+    }
+    if (additive && selectedNeuronIds.size && !selectedNeuronIds.has(nodeId)) {
+      selectedNeuronIds.add(nodeId);
+    }
+    if (!additive) {
+      selectedNeuronId = target && target.length && target.selected() ? nodeId : null;
+      selectedNeuronNode = selectedNeuronId ? node : null;
+    } else if (!selectedNeuronIds.size) {
+      selectedNeuronId = null;
+      selectedNeuronNode = null;
+    } else if (selectedNeuronIds.has(nodeId) && wasSelected === false && additive) {
+      selectedNeuronId = nodeId;
+    } else if (!selectedNeuronIds.has(selectedNeuronId) && selectedNeuronIds.size) {
+      const nextId = selectedNeuronIds.values().next().value;
+      selectedNeuronId = nextId;
+      selectedNeuronNode = (neuronGraph.nodes || []).find(item => item.id === nextId) || node;
+    }
   }
   if (popover) popover.classList.remove('show');
   renderStatusRail();
@@ -1686,8 +2188,21 @@ function optimisticRemoveNeuron(nodeId, memoryId) {
         n.id !== nodeId && n.memory_id !== memoryId && !(n.member_ids || []).includes(memoryId)
       );
     }
-    selectedNeuronId = null;
-    selectedNeuronNode = null;
+    selectedNeuronIds.delete(nodeId);
+    if (memoryId) {
+      [...selectedNeuronIds].forEach(id => {
+        const targetNode = (neuronGraph?.nodes || []).find(item => item.id === id);
+        if (targetNode && targetNode.memory_id === memoryId) selectedNeuronIds.delete(id);
+      });
+    }
+    if (!selectedNeuronIds.size) {
+      selectedNeuronId = null;
+      selectedNeuronNode = null;
+    } else if (!selectedNeuronNode || !selectedNeuronIds.has(selectedNeuronId)) {
+      const nextId = selectedNeuronIds.values().next().value;
+      selectedNeuronId = nextId;
+      selectedNeuronNode = (neuronGraph.nodes || []).find(item => item.id === nextId) || null;
+    }
     renderStatusRail();
   } catch (_) {}
 }
@@ -1760,6 +2275,8 @@ function positionNeuronPopover(nodeId) {
 function hideNeuronPopover() {
   selectedNeuronId = null;
   selectedNeuronNode = null;
+  selectedNeuronIds = new Set();
+  neuronDragState = null;
   const popover = document.getElementById('neuron-popover');
   if (popover) popover.classList.remove('show');
   if (cyInstance) cyInstance.elements().unselect();
@@ -2296,7 +2813,8 @@ function selectAgentCard(instanceId) {
     mode: 'agent',
     agent_instance_id: instanceId,
   }).catch(() => {});
-  renderSources();
+  if (state.activeTab === 'history') renderHistory();
+  else renderSources();
 }
 
 function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) {
@@ -2350,9 +2868,9 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const renderFiles = (files) => `<div class="raw-file-list">
     ${(files || []).map(f => {
       const canOpen = !!f.root_id && f.authorized !== false && f.read_status !== 'discovered';
-      const safeRoot = escapeHtml(f.root_id || '');
-      const safePath = escapeHtml(f.relative_path || '').replaceAll("'", "\\'");
-      const clickAttr = canOpen ? ` onclick="viewSourceFile('${safeRoot}','${safePath}')"` : '';
+      // JSON string keeps arbitrary local filenames out of executable HTML.
+      const viewArgs = escapeHtml(JSON.stringify([String(f.root_id || ''), String(f.relative_path || '')]));
+      const clickAttr = canOpen ? ` onclick="viewSourceFile(...${viewArgs})"` : '';
       const statusText = canOpen ? (f.read_status || '') : '仅发现，需先授权';
       return `<div class="raw-file-row"${clickAttr} style="${canOpen ? '' : 'cursor:default;opacity:.72'}">
         <span class="raw-file-path"><code>${escapeHtml(f.relative_path || '').replaceAll('\\', '/')}</code></span>
@@ -2361,6 +2879,59 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
       </div>`;
     }).join('')}
   </div>`;
+  const knowledgeTypes = new Set(['selected_directory', 'selected_file', 'obsidian_vault']);
+  const nonKnowledgeCategories = new Set([
+    'native_memory', 'project_memory', 'control_surface', 'skill_surface',
+    'conversation_history', 'runtime_evidence', 'ignored_runtime_data',
+  ]);
+  const knowledgeSources = sources.filter(s =>
+    knowledgeTypes.has(s.type) && !nonKnowledgeCategories.has(s.source_category || 'unknown')
+  );
+  const rawGroupsByRoot = new Map(((rawResult && rawResult.groups) || []).map(g => [g.root_id, g]));
+  const sourceTypeLabels = {
+    selected_directory: '文件夹知识库',
+    selected_file: '单文件知识库',
+    obsidian_vault: 'Obsidian 知识库',
+  };
+  const knowledgeCardsHtml = knowledgeSources.length ? knowledgeSources.map(source => {
+    const group = rawGroupsByRoot.get(source.root_id) || {};
+    const files = (group.files || []).map(file => ({
+      ...file,
+      root_id: source.root_id,
+      authorized: true,
+    }));
+    const visibleFiles = files.slice(0, 24);
+    const remaining = Math.max(0, files.length - visibleFiles.length);
+    const connected = source.path_exists !== false;
+    return `<article class="knowledge-card ${connected ? '' : 'missing'}">
+      <div class="finding-header">
+        <div>
+          <div class="knowledge-title">${escapeHtml(source.display_name || '未命名知识库')}</div>
+          <div class="surface-meta">${escapeHtml(sourceTypeLabels[source.type] || '本地知识库')} · ${files.length} 个文件 · ${escapeHtml(scopeLabels[source.scope] || source.scope || '未归属')}</div>
+        </div>
+        <span class="chip chip-${connected ? 'confirmed' : 'high'}">${connected ? '已连接' : '路径失效'}</span>
+      </div>
+      <div class="knowledge-path" title="${escapeHtml(source.path || '')}"><code>${escapeHtml(source.path || '')}</code></div>
+      <details class="knowledge-files">
+        <summary>${files.length ? `查看已扫描文件（${files.length}）` : '暂无可读取文件'}</summary>
+        ${files.length ? renderFiles(visibleFiles) : '<div class="surface-meta" style="margin-top:8px">目录为空，或没有符合扫描策略的文件。</div>'}
+        ${remaining ? `<div class="surface-meta" style="margin-top:8px">另有 ${remaining} 个文件未在卡片中展开。</div>` : ''}
+      </details>
+      <div class="knowledge-actions">
+        <button class="btn btn-danger" type="button"
+          data-source-id="${escapeHtml(source.root_id)}"
+          data-source-name="${escapeHtml(source.display_name || source.root_id)}"
+          onclick="removeSourceCard(this)">删除映射</button>
+      </div>
+    </article>`;
+  }).join('') : `<div class="empty-state"><div><div class="empty-orb"></div>
+    <p>尚未添加本地知识库。添加文件夹后会在这里显示；原文件保持只读。</p></div></div>`;
+  const knowledgeSection = `<section class="card">
+    <div class="card-head"><div><h2>本地知识库</h2>
+      <p>${knowledgeSources.length} 个来源 · 只读扫描；文档需萃取后才进入长期记忆</p></div>
+      <button class="btn btn-primary" type="button" onclick="addSourceDialog()">+ 添加文件夹或文件</button></div>
+    <div class="knowledge-grid">${knowledgeCardsHtml}</div>
+  </section>`;
   const renderCategory = (cat) => {
     const label = catLabels[cat.category] || cat.category || 'unknown';
     const files = cat.files || [];
@@ -2411,6 +2982,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
         <button class="btn" type="button" onclick="importBundleDialog()">导入导出包</button>
       </div></div>
       <div class="agent-cards">${agentCardsHtml}${addCards}</div></section>
+    ${knowledgeSection}
     ${residuals.length ? `<details class="card" style="margin-bottom:16px">
       <summary class="card-head" style="cursor:pointer"><div><h2>残留与清理</h2>
         <p>${residuals.length} 个候选 · 点击展开查看</p></div></summary>
@@ -2533,6 +3105,435 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
         <button class="btn" type="button" onclick="renderSources()">← 返回数据源</button>
       </div>
     </section>`);
+}
+
+function historyScope() {
+  return {agent_instance_id: activeAgentInstanceId || '', share_group_id: activeShareGroupId || ''};
+}
+
+let ruleScopeOptions = null;
+let rulePreviewAgentId = '';
+let rulePreviewProjectRef = '';
+let rulePreviewProvider = '';
+let rulePreviewRuntimeRole = '';
+let ruleRangeFilter = 'all';
+let ruleVisibilityFilter = 'effective';
+let ruleRecordsById = new Map();
+let rulePreviewById = new Map();
+
+function ruleAudience(record) {
+  const items = record.assignments || [];
+  if (!items.length) return record.audience_label || '未配置适用范围';
+  const names = {
+    agent: 'Agent', group: '共享组', project: '项目', agent_project: 'Agent + 项目',
+    provider: '宿主', runtime_role: '运行角色', system: '系统',
+  };
+  return items.map(a => {
+    const target = a.target_type === 'agent_project'
+      ? `${a.target_id} / ${a.project_ref}` : (a.target_id || a.project_ref || '全部');
+    const override = Number.isInteger(a.priority_override) ? `，覆盖优先级 ${a.priority_override}` : '';
+    return `${a.effect === 'exclude' ? '排除 ' : ''}${names[a.target_type] || a.target_type}: ${target}${override}`;
+  }).join('；');
+}
+
+function ruleSelectOptions(items, selected = '') {
+  return (items || []).map(item => `<option value="${escapeHtml(item.id)}" ${item.id === selected ? 'selected' : ''}>${escapeHtml(item.label || item.id)}</option>`).join('');
+}
+
+function rulePreviewState(record) {
+  return rulePreviewById.get(record.memory_id) || 'unavailable';
+}
+
+function ruleCard(record) {
+  const state = rulePreviewState(record);
+  const range = (record.assignments || []).map(a => a.target_type);
+  if (ruleRangeFilter !== 'all' && !range.includes(ruleRangeFilter)) return '';
+  if (rulePreviewAgentId && ruleVisibilityFilter !== 'all' && record.injection_policy === 'always' && state !== ruleVisibilityFilter) return '';
+  const preview = record._preview || {};
+  const stateLabel = state === 'effective' ? '当前 Agent 生效'
+    : state === 'excluded' ? '当前 Agent 被排除' : state === 'unavailable' ? '当前 Agent 不适用' : '';
+  const stateChip = state === 'effective' ? 'chip-confirmed' : (state === 'excluded' ? 'chip-high' : 'chip-info');
+  const sources = state === 'effective' ? `来源：${(preview.matched_sources || []).join('；')}`
+    : state === 'excluded' ? `排除原因：${(preview.excluded_sources || []).join('；')}` : '';
+  const editable = record.injection_policy === 'always' || record.status === 'active';
+  return `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(displayTitle(record))}</strong>
+    <span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : ''}">${record.injection_policy === 'always' ? '强制' : '按需'}</span>
+    ${stateLabel ? `<span class="chip ${stateChip}">${escapeHtml(stateLabel)}</span>` : ''}</div>
+    <p>${escapeHtml(displayBody(record)).slice(0, 300)}</p>
+    <div class="muted">适用范围：${escapeHtml(ruleAudience(record))}</div>
+    ${record.injection_policy === 'always' ? `<div class="muted">基础优先级：${Number(record.priority || 0)}${sources ? ` · ${escapeHtml(sources)}` : ''}</div>` : ''}
+    ${editable ? `<div class="finding-actions"><button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(record.memory_id)}">管理适用范围</button></div>` : ''}
+  </article>`;
+}
+
+async function setRulePreviewAgent(agentId) {
+  rulePreviewAgentId = agentId || '';
+  await renderRulesHabits();
+}
+
+async function setRulePreviewProject(projectRef) {
+  rulePreviewProjectRef = projectRef || '';
+  await renderRulesHabits();
+}
+
+async function setRulePreviewProvider(provider) {
+  rulePreviewProvider = provider || '';
+  await renderRulesHabits();
+}
+
+async function setRulePreviewRuntimeRole(runtimeRole) {
+  rulePreviewRuntimeRole = runtimeRole || '';
+  await renderRulesHabits();
+}
+
+async function setRuleVisibilityFilter(value) {
+  ruleVisibilityFilter = value || 'all';
+  await renderRulesHabits();
+}
+
+async function setRuleRangeFilter(value) {
+  ruleRangeFilter = value || 'all';
+  await renderRulesHabits();
+}
+
+function removeRuleAudienceModal() {
+  document.getElementById('rule-audience-modal')?.remove();
+}
+
+function ruleTargetControls(type, assignment = {}) {
+  const options = ruleScopeOptions || {};
+  const select = (name, list, selected, label) => `<label class="field"><span>${label}</span><select id="rule-audience-${name}"><option value="">请选择</option>${ruleSelectOptions(list, selected || '')}</select></label>`;
+  if (type === 'agent') return select('target', options.agents, assignment.target_id, 'Agent');
+  if (type === 'group') return select('target', options.groups, assignment.target_id, '共享组');
+  if (type === 'project') return select('project', options.projects, assignment.project_ref || assignment.target_id, '项目');
+  if (type === 'agent_project') return `${select('target', options.agents, assignment.target_id, 'Agent')}${select('project', options.projects, assignment.project_ref, '项目')}`;
+  if (type === 'provider') return select('target', options.providers, assignment.target_id, '宿主');
+  if (type === 'runtime_role') return select('target', options.runtime_roles, assignment.target_id, '运行角色');
+  return '<p class="muted">系统范围不需要额外目标；它会对所有可信宿主生效。</p>';
+}
+
+function refreshRuleAudienceTarget() {
+  const type = document.getElementById('rule-audience-type')?.value || 'agent';
+  const box = document.getElementById('rule-audience-targets');
+  if (box) box.innerHTML = ruleTargetControls(type);
+}
+
+function openRuleAudienceEditor(memoryId) {
+  const record = ruleRecordsById.get(memoryId);
+  if (!record || !ruleScopeOptions) return;
+  removeRuleAudienceModal();
+  const legacyIds = new Set(record.legacy_unknown_assignment_ids || []);
+  const assignmentRows = (record.assignments || []).map((item, index) => {
+    const legacy = legacyIds.has(item.assignment_id);
+    return `<label class="raw-file-row" style="grid-template-columns:auto 1fr;align-items:start"><input type="checkbox" data-rule-assignment="${index}" checked><span>${escapeHtml(ruleAudience({assignments:[item]}))}${legacy ? ' · legacy_unknown（仅可保留或删除，不能新增此目标）' : ''}</span></label>`;
+  }).join('') || '<p class="muted">尚未配置适用范围。若设为强制，至少新增一个“包含”范围。</p>';
+  const priority = Number.isInteger(record.priority) ? record.priority : 0;
+  const modal = document.createElement('div');
+  modal.id = 'rule-audience-modal';
+  modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="管理规则适用范围">
+    <div class="modal-head"><h3>管理规则适用范围</h3><p>删除范围不会删除记忆。只有“强制”规则才会按范围注入。</p></div>
+    <div class="modal-body">
+      <label class="field"><span>注入策略</span><select id="rule-audience-policy"><option value="relevant" ${record.injection_policy === 'relevant' ? 'selected' : ''}>按需召回</option><option value="always" ${record.injection_policy === 'always' ? 'selected' : ''}>强制规则</option></select></label>
+      <label class="field"><span>基础优先级</span><select id="rule-audience-priority">${[-100, -50, 0, 50, 100].map(value => `<option value="${value}" ${value === priority ? 'selected' : ''}>${value}</option>`).join('')}</select></label>
+      <h4>已有适用范围</h4><div id="rule-existing-assignments">${assignmentRows}</div>
+      <h4>新增适用范围</h4>
+      <label class="field"><span>作用</span><select id="rule-audience-effect"><option value="include">包含</option><option value="exclude">排除</option></select></label>
+      <label class="field"><span>范围类型</span><select id="rule-audience-type" onchange="refreshRuleAudienceTarget()">${['agent','group','project','agent_project','provider','runtime_role','system'].map(type => `<option value="${type}">${escapeHtml({agent:'Agent',group:'共享组',project:'项目',agent_project:'Agent + 项目',provider:'宿主',runtime_role:'运行角色',system:'系统'}[type])}</option>`).join('')}</select></label>
+      <div id="rule-audience-targets">${ruleTargetControls('agent')}</div>
+      <label class="field"><span>覆盖优先级</span><select id="rule-audience-override"><option value="">不覆盖</option>${[-100, -50, 0, 50, 100].map(value => `<option value="${value}">${value}</option>`).join('')}</select></label>
+      <label class="raw-file-row" style="grid-template-columns:auto 1fr"><input type="checkbox" id="rule-audience-add"><span>保存时加入这条新范围</span></label>
+    </div>
+    <div class="modal-actions"><button class="btn" type="button" data-mg-action="rule-modal-close">取消</button><button class="btn btn-primary" type="button" data-mg-action="rule-save" data-memory-id="${escapeHtml(memoryId)}">确认更新</button></div>
+  </div>`;
+  document.body.appendChild(modal);
+}
+
+async function ensureRuleAudienceEditor(memoryId) {
+  const groupId = activeShareGroupId || 'default';
+  try {
+    if (!ruleScopeOptions) ruleScopeOptions = await callApi('get_rule_scope_options', groupId);
+    if (!ruleScopeOptions || ruleScopeOptions.error) throw new Error(ruleScopeOptions?.error || '无法读取规则范围');
+    if (!ruleRecordsById.has(memoryId)) {
+      const data = await callApi('list_rules_habits', groupId);
+      if (data.error) throw new Error(data.error);
+      ruleRecordsById = new Map(Object.values(data.buckets || {}).flat().map(record => [record.memory_id, record]));
+    }
+    openRuleAudienceEditor(memoryId);
+  } catch (error) { showToast(`无法打开规则范围：${error.message || error}`, 'error'); }
+}
+
+async function saveRuleAudience(memoryId) {
+  const record = ruleRecordsById.get(memoryId);
+  if (!record) return;
+  const policy = document.getElementById('rule-audience-policy')?.value || 'relevant';
+  let assignments = (record.assignments || []).filter((_, index) => document.querySelector(`[data-rule-assignment="${index}"]`)?.checked).map(item => ({...item}));
+  // relevant has no audience relation by definition.  The server performs the
+  // policy flip and assignment cleanup in one transaction after confirmation.
+  if (policy === 'relevant') assignments = [];
+  if (policy !== 'relevant' && document.getElementById('rule-audience-add')?.checked) {
+    const type = document.getElementById('rule-audience-type')?.value || '';
+    const targetId = document.getElementById('rule-audience-target')?.value || '';
+    const projectRef = document.getElementById('rule-audience-project')?.value || '';
+    const effect = document.getElementById('rule-audience-effect')?.value || 'include';
+    const priorityValue = document.getElementById('rule-audience-override')?.value || '';
+    const targetRequired = ['agent', 'group', 'provider', 'runtime_role'].includes(type);
+    if ((targetRequired && !targetId) || (type === 'project' && !projectRef) || (type === 'agent_project' && (!targetId || !projectRef))) {
+      showToast('请选择已发现的适用对象；没有可选对象时不能保存。', 'error');
+      return;
+    }
+    assignments.push({target_type: type, target_id: targetId, project_ref: projectRef, effect, priority_override: priorityValue === '' ? null : Number(priorityValue)});
+  }
+  if (policy === 'always' && !assignments.some(item => item.effect === 'include')) {
+    showToast('强制规则至少需要一个“包含”适用范围。', 'error');
+    return;
+  }
+  if (!confirm(policy === 'relevant' ? '切回按需召回并清理适用范围？记忆正文不会删除。' : '确认更新这条规则的适用范围？')) return;
+  try {
+    const priority = Number(document.getElementById('rule-audience-priority')?.value || 0);
+    const result = await callApi('update_rule_audience', memoryId, assignments, activeShareGroupId || 'default', policy, priority, true);
+    if (result.error || result.ok === false) throw new Error(result.error || '更新失败');
+    removeRuleAudienceModal();
+    showToast(result.message || '适用范围已更新。', 'success');
+    if (state.activeTab === 'neurons') await refreshNeuronRuleGovernance(memoryId);
+    else await renderRulesHabits();
+  } catch (error) { showToast(`规则范围更新失败：${error.message || error}`, 'error'); }
+}
+
+async function renderRulesHabits() {
+  setContent('<div class="loading">正在读取规则与习惯…</div>');
+  try {
+    const groupId = activeShareGroupId || 'default';
+    const [data, options] = await Promise.all([
+      callApi('list_rules_habits', groupId), callApi('get_rule_scope_options', groupId),
+    ]);
+    if (data.error) throw new Error(data.error);
+    if (options.error) throw new Error(options.error);
+    ruleScopeOptions = options;
+    const agents = options.agents || [];
+    const projects = options.projects || [];
+    const providers = options.providers || [];
+    const runtimeRoles = options.runtime_roles || [];
+    if (!agents.some(item => item.id === rulePreviewAgentId)) {
+      rulePreviewAgentId = agents.some(item => item.id === activeAgentInstanceId) ? activeAgentInstanceId : '';
+    }
+    if (!projects.some(item => item.id === rulePreviewProjectRef)) rulePreviewProjectRef = '';
+    if (!providers.some(item => item.id === rulePreviewProvider)) rulePreviewProvider = '';
+    if (!runtimeRoles.some(item => item.id === rulePreviewRuntimeRole)) rulePreviewRuntimeRole = '';
+    rulePreviewById = new Map();
+    const labels = {mandatory: '强制规则', preferences: '长期习惯与偏好', procedures: '工作流程', corrections: '纠错与禁忌', projects: '项目决策'};
+    const allRecords = Object.values(data.buckets || {}).flat();
+    ruleRecordsById = new Map(allRecords.map(record => [record.memory_id, record]));
+    if (rulePreviewAgentId) {
+      const preview = await callApi(
+        'preview_effective_rules', rulePreviewAgentId, groupId,
+        rulePreviewProjectRef, rulePreviewProvider, rulePreviewRuntimeRole,
+      );
+      if (preview.error) throw new Error(preview.error);
+      (preview.effective || []).forEach(item => { rulePreviewById.set(item.memory_id, 'effective'); const r = ruleRecordsById.get(item.memory_id); if (r) r._preview = item; });
+      (preview.excluded || []).forEach(item => { rulePreviewById.set(item.memory_id, 'excluded'); const r = ruleRecordsById.get(item.memory_id); if (r) r._preview = item; });
+      (preview.unavailable || []).forEach(item => { rulePreviewById.set(item.memory_id, 'unavailable'); const r = ruleRecordsById.get(item.memory_id); if (r) r._preview = item; });
+    }
+    const blocks = Object.entries(labels).map(([key, label]) => {
+      const cards = ((data.buckets || {})[key] || []).map(ruleCard).filter(Boolean).join('');
+      if (!cards) return '';
+      return `<section class="card" style="margin-bottom:12px"><div class="section-head"><h3>${label}</h3></div>${cards}</section>`;
+    }).join('');
+    const agentOptions = `<option value="">全部范围（不做有效性预览）</option>${ruleSelectOptions(agents, rulePreviewAgentId)}`;
+    const projectOptions = `<option value="">未确认项目（不猜测）</option>${ruleSelectOptions(projects, rulePreviewProjectRef)}`;
+    const providerOptions = `<option value="">未确认宿主</option>${ruleSelectOptions(providers, rulePreviewProvider)}`;
+    const roleOptions = `<option value="">未确认运行角色</option>${ruleSelectOptions(runtimeRoles, rulePreviewRuntimeRole)}`;
+    const scopeOptions = `<option value="all">全部范围类型</option>${['agent','group','project','agent_project','provider','runtime_role','system'].map(type => `<option value="${type}" ${ruleRangeFilter === type ? 'selected' : ''}>${escapeHtml({agent:'Agent',group:'共享组',project:'项目',agent_project:'Agent + 项目',provider:'宿主',runtime_role:'运行角色',system:'系统'}[type])}</option>`).join('')}`;
+    const visibilityOptions = `<option value="effective" ${ruleVisibilityFilter === 'effective' ? 'selected' : ''}>仅当前 Agent 生效</option><option value="excluded" ${ruleVisibilityFilter === 'excluded' ? 'selected' : ''}>仅当前 Agent 被排除</option><option value="all" ${ruleVisibilityFilter === 'all' ? 'selected' : ''}>不按当前 Agent 过滤</option>`;
+    setContent(`<div class="page-head"><div><h1>规则与习惯</h1><p>规则受众独立于记忆来源。范围删除不会删除记忆；只有强制规则会按范围注入。</p></div></div>
+      <section class="card"><div class="page-actions"><label class="field"><span>预览 Agent</span><select onchange="setRulePreviewAgent(this.value)">${agentOptions}</select></label><label class="field"><span>项目</span><select onchange="setRulePreviewProject(this.value)">${projectOptions}</select></label><label class="field"><span>宿主</span><select onchange="setRulePreviewProvider(this.value)">${providerOptions}</select></label><label class="field"><span>运行角色</span><select onchange="setRulePreviewRuntimeRole(this.value)">${roleOptions}</select></label><label class="field"><span>显示</span><select onchange="setRuleVisibilityFilter(this.value)">${visibilityOptions}</select></label><label class="field"><span>范围</span><select onchange="setRuleRangeFilter(this.value)">${scopeOptions}</select></label></div><p class="muted">预览只使用已发现/可信上下文；未知项目、宿主或角色保持空值，不会猜测命中规则。</p></section>${blocks || '<div class="card empty-state"><p>当前筛选范围没有规则或习惯。</p></div>'}`);
+  } catch (e) { setContent(`<div class="card empty-state"><p>规则加载失败：${escapeHtml(e)}</p></div>`); }
+}
+
+function historyBytes(value) {
+  const n = Number(value || 0);
+  if (!n) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / Math.pow(1024, index)).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function renderHistoryBackfillPanel(inventory) {
+  const sources = (inventory && inventory.sources) || [];
+  const groups = new Map();
+  sources.forEach(source => {
+    const status = source.status || (source.supported ? 'importable' : 'unsupported');
+    const key = [source.provider || 'unknown', status, source.matched_agent_id || '', source.support_reason || ''].join('|');
+    const current = groups.get(key) || { ...source, status, file_count: 0, byte_count: 0, path_count: 0 };
+    current.file_count += Number(source.file_count || 0);
+    current.byte_count += Number(source.byte_count || 0);
+    current.path_count += 1;
+    groups.set(key, current);
+  });
+  const grouped = Array.from(groups.values());
+  const rows = grouped.map(source => {
+    const status = source.status || (source.supported ? 'importable' : 'unsupported');
+    const label = { importable: '可导入', complete: '已完成', partial: '部分导入（会话已索引）', pending_binding: '待绑定 Agent', unsupported: '暂不支持', error: '扫描失败' }[status] || status;
+    const tone = status === 'importable' ? 'chip-confirmed' : (status === 'unsupported' || status === 'pending_binding' || status === 'partial' ? 'chip-medium' : 'chip-high');
+    const bound = source.matched_agent_id ? ` → ${source.matched_agent_id}` : '';
+    const location = source.path_count > 1 ? `${source.path_count} 个本地路径` : (source.path || '');
+    return `<tr><td><strong>${escapeHtml(source.provider || 'unknown')}</strong></td><td class="path-cell">${escapeHtml(location)}</td><td>${Number(source.file_count || 0)}</td><td>${historyBytes(source.byte_count)}</td><td><span class="chip ${tone}">${escapeHtml(label)}</span><div class="surface-meta">${escapeHtml(source.support_reason || '')}${escapeHtml(bound)}</div></td></tr>`;
+  }).join('') || '<tr><td colspan="5" class="empty-note">未发现可识别的本地会话来源。</td></tr>';
+  const canImport = sources.some(source => source.status === 'importable' && source.matched_agent_id);
+  return `<section class="card" id="history-backfill"><div class="card-head"><div><h2>扫描旧会话</h2><p>只扫描本机可读日志。导入会写入独立历史库，不会写入长期记忆或注入当前对话。</p></div><div class="finding-actions"><button class="btn" type="button" onclick="renderHistory()">重新扫描</button>${canImport ? `<button class="btn btn-primary" data-mg-action="history-backfill">导入已绑定来源</button>` : ''}</div></div><div class="source-map-table-wrap"><table class="source-map-table"><thead><tr><th>宿主</th><th>来源</th><th>文件</th><th>大小</th><th>状态 / 绑定</th></tr></thead><tbody>${rows}</tbody></table></div><p class="muted">超大日志只会导入有界可见前缀，并标为“部分导入”；专有数据库会明确标为暂不支持，未绑定宿主不会被错误导入到当前 Agent。</p></section>`;
+}
+
+async function runHistoryBackfill() {
+  if (!confirm('确认导入这一批本机旧会话？原文只进入独立对话历史库，不会写入长期记忆。')) return;
+  try {
+    const data = await callApi('backfill_local_history', historyBackfillContinuation);
+    if (data.error) throw new Error(data.error);
+    historyBackfillContinuation = data.continuation || null;
+    const errors = Array.isArray(data.errors) ? data.errors.length : Number(data.errors || 0);
+    showToast(`旧会话批次完成：导入 ${Number(data.imported || 0)}，跳过 ${Number(data.skipped || 0)}${errors ? `，错误 ${errors}` : ''}`, errors ? 'info' : 'success');
+    await renderHistory();
+  } catch (e) { showToast(`旧会话导入失败：${e.message || e}`, 'error'); }
+}
+
+function historySessionTitle(session) {
+  const title = String(session?.title || '').trim();
+  if (title && title !== '未命名会话') return title;
+  const provider = String(session?.provider || '本地').trim() || '本地';
+  const stamp = String(session?.created_at || session?.imported_at || '').trim();
+  return stamp ? `${provider} 对话 · ${stamp}` : `${provider} 对话`;
+}
+
+function renderHistoryGrouped(data) {
+  const groups = new Map();
+  for (const session of (data.sessions || [])) {
+    const key = session.project_key || 'history-project-unknown';
+    if (!groups.has(key)) groups.set(key, {meta: session, agents: new Map()});
+    const group = groups.get(key);
+    const owner = session.owner_agent_instance_id || session.agent_instance_id || 'unknown-agent';
+    if (!group.agents.has(owner)) group.agents.set(owner, []);
+    group.agents.get(owner).push(session);
+  }
+  return [...groups.values()].map(group => {
+    const meta = group.meta;
+    const status = meta.project_status === 'removed' ? ' · 路径已移除' : '';
+    const parent = meta.project_parent ? ` · ${meta.project_parent}` : '';
+    const agents = [...group.agents.entries()].map(([owner, sessions]) => {
+      const canDelete = !!activeAgentInstanceId && owner === activeAgentInstanceId;
+      return `<section class="history-agent-group"><h3>${escapeHtml(owner)}</h3>${sessions.map(s => `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(historySessionTitle(s))}</strong><span class="chip">${escapeHtml(s.provider || 'local')}</span></div><p>${escapeHtml(s.summary || '尚无摘要')}</p><div class="muted">${escapeHtml(s.created_at || s.imported_at || '')} · ${s.turn_count || 0} 条 · ${s.evidence_count || 0} 条已萃取证据</div><div class="finding-actions"><button class="btn" data-mg-action="history-read-session" data-session-id="${escapeHtml(s.session_id)}">阅读原文</button><button class="btn" data-mg-action="history-extract" data-session-id="${escapeHtml(s.session_id)}">萃取预览</button><button class="btn" data-mg-action="history-export" data-session-id="${escapeHtml(s.session_id)}">导出</button>${canDelete ? `<button class="btn" data-mg-action="history-delete" data-session-id="${escapeHtml(s.session_id)}">删除历史</button>` : '<span class="muted">仅会话 owner 可删除</span>'}</div></article>`).join('')}</section>`;
+    }).join('');
+    return `<section class="card history-project-group"><h2>${escapeHtml(meta.project_label || '未识别项目')}${escapeHtml(status + parent)}</h2>${agents}</section>`;
+  }).join('');
+}
+
+async function renderHistory() {
+  setContent('<div class="loading">正在读取本地对话历史…</div>');
+  let inventory = { sources: [] };
+  try {
+    inventory = await callApi('discover_local_history_sources');
+    if (inventory.error) throw new Error(inventory.error);
+  } catch (e) {
+    setContent(`<div class="card empty-state"><p>旧会话扫描失败：${escapeHtml(e.message || e)}</p></div>`);
+    return;
+  }
+  if (!activeAgentInstanceId && !isShareGroupScope()) {
+    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引可显示在神经图；原文不会进入长期记忆或 bootstrap。</p></div></div>${renderHistoryBackfillPanel(inventory)}<div class="card empty-state"><p>请先在数据源页选择一个 Agent，再查看它的独立对话历史。</p></div>`);
+    return;
+  }
+  try {
+    const data = await callApi('list_history_sessions', historyScope(), 50, 0, null, '', '');
+    if (data.error) throw new Error(data.error);
+    const cards = renderHistoryGrouped(data);
+    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>本地证据库，不会自动进入长期记忆或神经图。</p></div><div class="page-actions"><input id="history-search" placeholder="搜索历史" /><button class="btn" data-mg-action="history-search">搜索</button></div></div><section class="card"><p class="muted">检索顺序：搜索摘要 → 附近时间线 → 单条原文。原始对话归属 owner；当前共享组成员可查，仅 owner 可删。</p></section><div id="history-results">${cards || '<div class="card empty-state"><p>当前 Agent 没有对话历史；可从数据源页导入导出包。</p></div>'}</div>`);
+    const historyHead = document.querySelector('#content .page-head');
+    if (historyHead) {
+      const intro = historyHead.querySelector('p');
+      if (intro) intro.textContent = '会话索引会显示在神经图；原文不会进入长期记忆或 bootstrap，需在此页按需读取。';
+      historyHead.insertAdjacentHTML('afterend', renderHistoryBackfillPanel(inventory));
+    }
+    if (historyFocusSessionId) {
+      const sessionId = historyFocusSessionId;
+      historyFocusSessionId = '';
+      await readHistorySession(sessionId);
+    }
+  } catch (e) { setContent(`<div class="card empty-state"><p>对话历史加载失败：${escapeHtml(e)}</p></div>`); }
+}
+
+async function searchHistory() {
+  const query = document.getElementById('history-search')?.value?.trim();
+  if (!query) return;
+  const box = document.getElementById('history-results');
+  try {
+    const data = await callApi('search_history', query, historyScope(), 20, 0);
+    if (data.error) throw new Error(data.error);
+    box.innerHTML = (data.results || []).map(r => {
+      const anchor = r.anchor_turn_id || r.turn_id || '';
+      const actions = r.can_timeline && anchor
+        ? `<button class="btn" data-mg-action="history-timeline" data-session-id="${escapeHtml(r.session_id)}" data-turn-id="${escapeHtml(anchor)}">查看附近记录</button><button class="btn" data-mg-action="history-read-turn" data-turn-id="${escapeHtml(anchor)}">读取此条原文</button>`
+        : `<button class="btn" data-mg-action="history-read-session" data-session-id="${escapeHtml(r.session_id)}">读取所属会话</button>`;
+      return `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(r.title || '未命名会话')}</strong><span class="chip">${escapeHtml(r.result_type || 'turn')}</span></div><p>${escapeHtml(r.matched_summary || r.summary || '匹配到历史记录')}</p><div class="muted">${escapeHtml(r.provider || '')} · ${escapeHtml(r.turn_created_at || r.created_at || '')}</div><div class="finding-actions">${actions}</div></article>`;
+    }).join('') || '<div class="card empty-state"><p>没有匹配历史。</p></div>';
+  } catch (e) { showToast('历史搜索失败：' + e, 'error'); }
+}
+
+async function showHistoryTimeline(sessionId, turnId) {
+  try {
+    const data = await callApi('history_timeline', sessionId, turnId, historyScope(), 4);
+    if (data.error) throw new Error(data.error);
+    const rows = (data.turns || []).map(t => `<div class="memory-card"><strong>${escapeHtml(t.role)}</strong><p>${escapeHtml(t.content_preview)}</p></div>`).join('');
+    document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button><h3>附近时间线</h3>${rows}`;
+  } catch (e) { showToast('时间线读取失败：' + e, 'error'); }
+}
+
+async function readHistoryTurn(turnId) {
+  try {
+    const data = await callApi('history_read', '', turnId, historyScope(), 1, 0);
+    if (data.error) throw new Error(data.error);
+    const t = data.turn || {};
+    document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button><article class="memory-card"><strong>${escapeHtml(t.role || '')}</strong><pre class="raw-content">${escapeHtml(t.content || '')}</pre></article>`;
+  } catch (e) { showToast('原文读取失败：' + e, 'error'); }
+}
+
+async function readHistorySession(sessionId) {
+  try {
+    const data = await callApi('history_read', sessionId, '', historyScope(), 100, 0);
+    if (data.error) throw new Error(data.error);
+    document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button>${(data.turns || []).map(t => `<article class="memory-card"><strong>${escapeHtml(t.role || '')}</strong><pre class="raw-content">${escapeHtml(t.content || '')}</pre></article>`).join('')}`;
+  } catch (e) { showToast('会话读取失败：' + e, 'error'); }
+}
+
+async function previewHistoryExtract(sessionId) {
+  try {
+    const data = await callApi('history_extract_preview', sessionId, null, historyScope(), 8);
+    if (data.error) throw new Error(data.error);
+    const rows = (data.candidates || []).map(c => `<article class="memory-card"><strong>${escapeHtml(c.title)}</strong><p>${escapeHtml(c.body)}</p><div class="muted">证据：${escapeHtml(c.evidence?.turn_id || '')}</div></article>`).join('');
+    document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button><p class="muted">以下仅为候选预览，尚未写入长期记忆。</p>${rows || '<div class="card empty-state"><p>没有可萃取内容。</p></div>'}`;
+  } catch (e) { showToast('萃取预览失败：' + e, 'error'); }
+}
+
+async function exportHistorySession(sessionId) {
+  try {
+    const data = await callApi('export_history', [sessionId], historyScope());
+    if (data.error) throw new Error(data.error);
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `memoryguard-history-${sessionId}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { showToast('历史导出失败：' + e, 'error'); }
+}
+
+async function deleteHistorySession(sessionId) {
+  if (!confirm('只删除这份历史？关联长期记忆不会自动删除。')) return;
+  try {
+    // Delete is one atomic provenance action: the backend always tombstones
+    // valid evidence before removing raw history, so no cancel branch can
+    // leave a valid link whose source no longer exists.
+    const data = await callApi('delete_history', [sessionId], historyScope(), true, true);
+    if (data.error) throw new Error(data.error);
+    showToast('历史已删除；长期记忆未删除。', 'success'); renderHistory();
+  } catch (e) { showToast('删除失败：' + e, 'error'); }
 }
 
 async function setHostHookMode(provider, agentId, mode) {
@@ -3237,7 +4238,7 @@ async function confirmImport(path) {
   if (!confirm('确认解析此导出包？\n· 会话只作为证据/萃取来源\n· 不直接写入长期记忆\n· 原始文件不被修改')) return;
   showToast('正在解析…');
   try {
-    const result = await callApi('create_import', path, true);
+    const result = await callApi('create_import', path, true, activeAgentInstanceId || 'local-default', '', activeShareGroupId || '');
     if (result.error) {
       showToast(result.error, 'error');
       return;
@@ -3254,12 +4255,19 @@ async function addSourcePrompt() {
   await addSourceDialog();
 }
 
-async function removeSource(rootId) {
-  if (!confirm('移除来源 ' + rootId + '？\n配置会被删除，原始文件不会被改动。')) return;
+async function removeSourceCard(button) {
+  await removeSource(button.dataset.sourceId || '', button.dataset.sourceName || '');
+}
+
+async function removeSource(rootId, displayName = '') {
+  if (!rootId) return showToast('来源标识缺失，无法删除', 'error');
+  const label = displayName || rootId;
+  if (!confirm('删除知识库映射“' + label + '”？\n仅移除 MemoryGuard 映射，磁盘中的原文件不会被删除。')) return;
   try {
     const result = await callApi('remove_source', rootId, true);
     if (result.error) return showToast(result.error, 'error');
-    showToast('来源已移除', 'success');
+    if (!result.ok) return showToast('来源不存在或不可删除', 'error');
+    showToast('知识库映射已删除，原文件未改动', 'success');
     renderSources();
   } catch (e) { showToast('移除失败：' + e, 'error'); }
 }
@@ -3275,12 +4283,12 @@ async function viewSourceFile(rootId, relativePath) {
     }
     const escaped = escapeHtml(result.content);
     const lines = result.content.split('\n').length;
-    const safePath = escapeHtml(relativePath).replaceAll('\\', '/').replaceAll("'", "\\'");
+    const extractArgs = escapeHtml(JSON.stringify([String(rootId || ''), String(relativePath || '')]));
     setContent(`<div class="view-heading"><span class="eyebrow">Raw memory</span><h2>${escapeHtml(result.display_name)} · ${escapeHtml(relativePath).replaceAll('\\', '/')}</h2>
       <p>原始记忆文件，只读查看。size=${result.size} bytes · lines=${lines}</p></div>
       <section class="card"><div class="card-head"><div>
         <button class="btn" type="button" onclick="renderSources()">← 返回数据源</button>
-        <button class="btn btn-primary" type="button" onclick="extractSourceFile('${escapeHtml(rootId)}','${safePath}')">萃取为实用记忆</button>
+        <button class="btn btn-primary" type="button" onclick="extractSourceFile(...${extractArgs})">萃取为实用记忆</button>
       </div></div>
       <pre class="raw-file-content">${escaped}</pre></section>`);
   } catch (e) { showToast('读取失败：' + e, 'error'); }
@@ -3350,13 +4358,13 @@ function showAcceptResult(rootId, relativePath, result) {
     </div>
     <div class="row"><span class="key">memory_id</span><code>${escapeHtml(m.memory_id || '')}</code></div>
   </article>`).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>无写入记录。</p></div>';
-  const safePath = escapeHtml(relativePath).replaceAll('\\', '/').replaceAll("'", "\\'");
+  const viewArgs = escapeHtml(JSON.stringify([String(rootId || ''), String(relativePath || '')]));
   setContent(`<div class="view-heading"><span class="eyebrow">Accept</span><h2>写入结果</h2>
     <p>已接受 ${result.total || 0} 条记忆，写入共享组 <code>${escapeHtml(result.share_group_id || 'default')}</code>。</p></div>
     <section class="card"><div class="card-head"><div><h2>写入的记忆</h2></div></div>
       ${itemsHtml}
       <div class="finding-actions" style="margin-top:14px">
-        <button class="btn" type="button" onclick="viewSourceFile('${escapeHtml(rootId)}','${safePath}')">← 返回源文件</button>
+        <button class="btn" type="button" onclick="viewSourceFile(...${viewArgs})">← 返回源文件</button>
         <button class="btn btn-primary" type="button" onclick="renderSources()">返回数据源</button>
       </div>
     </section>`);
@@ -3581,6 +4589,7 @@ async function renderGovernance() {
     return;
   }
   const tabs = [
+    { id: 'records', label: '记忆记录' },
     { id: 'recent_events', label: '最近写入' },
     { id: 'supersede', label: '覆盖记录' },
     { id: 'conflicts', label: '冲突队列' },
@@ -3627,11 +4636,65 @@ function switchGovernanceSub(subTab) {
 
 function renderGovernanceSub() {
   switch (governanceSubTab) {
+    case 'records': renderMemoryRecords(); break;
     case 'recent_events': renderRecentEvents(); break;
     case 'supersede': renderSupersedeChain(); break;
     case 'conflicts': renderConflictQueue(); break;
     case 'quarantine': renderQuarantine(); break;
     case 'rollback': renderRollback(); break;
+  }
+}
+
+async function renderMemoryRecords() {
+  const container = document.getElementById('governance-content');
+  if (!container) return;
+  container.innerHTML = '<div class="loading">正在读取记忆记录</div>';
+  try {
+    const result = await callApi('list_memory', '', '', activeShareGroupId);
+    if (result.error) return showToast(result.error, 'error');
+    const records = result.records || [];
+    if (!records.length) {
+      container.innerHTML = '<div class="card empty-state"><div><div class="empty-orb"></div><p>当前记忆层没有记录。</p></div></div>';
+      return;
+    }
+    const items = records.map(rec => {
+      const isAlways = rec.injection_policy === 'always';
+      const active = rec.status === 'active';
+      const targetPolicy = isAlways ? 'relevant' : 'always';
+      const badge = isAlways ? '强制' : '按需';
+      const explanation = isAlways
+        ? '强制规则每任务注入'
+        : '按需记忆按相关性召回';
+      const action = active ? `<button class="btn" type="button" data-mg-action="rule-edit" data-memory-id="${escapeHtml(rec.memory_id)}">管理注入范围</button>` : '';
+      return `<article class="plan-item">
+        <div class="finding-header"><span class="finding-rule">${escapeHtml(rec.kind || 'fact')}</span>
+          <span class="chip chip-${isAlways ? 'confirmed' : 'medium'}">${badge}</span>
+          <span class="chip chip-info">优先级 ${escapeHtml(String(rec.priority ?? 0))}</span>
+          <span class="chip chip-medium">${escapeHtml(rec.status || '')}</span></div>
+        <div class="finding-evidence">${escapeHtml((rec.body || '').slice(0, 260))}</div>
+        <div class="surface-meta">${explanation}${rec.locked ? ' · 已锁定（仍可切换注入策略）' : ''}</div>
+        <div class="finding-actions" style="margin-top:10px">${action}</div>
+      </article>`;
+    }).join('');
+    container.innerHTML = `<section class="card"><div class="card-head"><div><h2>记忆记录</h2>
+      <p>强制规则每任务注入；按需记忆按相关性召回。仅 active 记录可切换。</p></div></div>${items}</section>`;
+  } catch (e) {
+    showToast('加载记忆记录失败：' + e, 'error');
+  }
+}
+
+async function toggleMemoryInjectionPolicy(memoryId, targetPolicy, priority) {
+  const label = targetPolicy === 'always' ? '强制' : '按需';
+  if (!confirm(`确认切换为${label}？\n\n强制规则每任务注入；按需记忆按相关性召回。`)) return;
+  try {
+    const result = await callApi('set_memory_injection_policy', memoryId, targetPolicy, priority, activeShareGroupId);
+    if (result.error) return showToast(result.error, 'error');
+    if (result.ok === false) return showToast(result.blocked_reason || '切换被拒绝', 'error');
+    showToast(`已切换为${label}`, 'success');
+    renderMemoryRecords();
+    renderStatusRail();
+  } catch (e) {
+    showToast('切换失败：' + e, 'error');
   }
 }
 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import http.server
+import hashlib
 import os
 import socket
 import subprocess
@@ -709,7 +710,13 @@ def _build_publish_ir(ir, workspace, use_distilled: bool):
 
     from .distiller import MemoryDistiller, _is_publishable
     from .memory_ir import MemoryIR
-    from .schema_v3 import MemoryKind, MemoryRecord, MemoryStatus
+    from .schema_v3 import (
+        Completeness,
+        MemoryKind,
+        MemoryRecord,
+        Provenance,
+        MemoryStatus,
+    )
 
     distill_stats = None
     source_record_map: dict[str, list[str]] = {}
@@ -732,11 +739,22 @@ def _build_publish_ir(ir, workspace, use_distilled: bool):
                 kind = MemoryKind.FACT
             if grp.source_record_ids:
                 source_record_map[memory_id] = list(grp.source_record_ids)
+            completeness = grp.completeness or Completeness.VERIFIABLE.value
+            if not isinstance(completeness, str):
+                completeness = str(completeness)
+            try:
+                completeness_enum = Completeness(completeness)
+            except ValueError:
+                completeness_enum = Completeness.VERIFIABLE
             records.append(MemoryRecord(
                 memory_id=memory_id,
                 kind=kind,
                 title=grp.title,
                 body=grp.body,
+                scope=grp.scope,
+                confidence=grp.confidence,
+                provenance=[Provenance(**p) for p in grp.provenance] if grp.provenance else [],
+                completeness=completeness_enum,
                 status=MemoryStatus.CANDIDATE,
             ))
     else:
@@ -1563,6 +1581,7 @@ class GovernanceApi:
     ) -> dict:
         from .governance_engine import GovernanceEngine
         from .shared_memory_store import SharedMemoryStore
+        from .governance_scope import share_file_source_key
 
         store = SharedMemoryStore(self.workspace, share_group_id)
         engine = GovernanceEngine(
@@ -1852,6 +1871,7 @@ class GovernanceApi:
         的“当前勾选根”口径，更不能固定返回 0。
         """
         from .shared_memory_store import SharedMemoryStore
+        from .governance_scope import share_file_source_key
 
         try:
             store = SharedMemoryStore(
@@ -1874,11 +1894,15 @@ class GovernanceApi:
             event.event_id: event for event in store.list_events()
         }
         events_by_relative_path: dict[str, list] = {}
+        events_by_share_key: dict[str, list] = {}
         for event in event_by_id.values():
             metadata = event.metadata if isinstance(event.metadata, dict) else {}
             relative = str(metadata.get("relative_path", "") or "").strip().replace("\\", "/")
+            share_key = share_file_source_key(metadata)
             if relative:
                 events_by_relative_path.setdefault(relative, []).append(event)
+            if share_key:
+                events_by_share_key.setdefault(share_key, []).append(event)
         roots_by_id = {
             root.root_id: root for root in registry.list_all_sources()
         }
@@ -1893,8 +1917,16 @@ class GovernanceApi:
                 if direct_event is not None:
                     events.append(direct_event)
                 elif source_id.startswith("share-file:"):
-                    relative = source_id.split(":", 1)[1].strip().replace("\\", "/")
-                    events.extend(events_by_relative_path.get(relative, []))
+                    from .governance_scope import parse_share_file_source_key
+                    root_hint, relative = parse_share_file_source_key(source_id)
+                    events.extend(events_by_share_key.get(source_id, []))
+                    if not events and relative:
+                        fallback_key = (
+                            f"share-file:{relative}" if not root_hint
+                            else f"share-file:{root_hint}:{relative}"
+                        )
+                        events.extend(events_by_share_key.get(fallback_key, []))
+                        events.extend(events_by_relative_path.get(relative, []))
                 for event in events:
                     metadata = (
                         dict(event.metadata or {})
@@ -2073,25 +2105,25 @@ class GovernanceApi:
                     "meta": status_meta,
                 }
                 empty["source_map"] = self.get_projection_source_map(scope=parsed)
-                return empty
+                return self._with_virtual_neuron_categories(empty, parsed)
             try:
                 graph = _json_mod.loads(path.read_text(encoding="utf-8"))
             except Exception:
-                return {
+                return self._with_virtual_neuron_categories({
                     "empty": True, "reason": "not_built", "error": "projection_corrupt",
                     "scope": parsed, "meta": status_meta,
-                }
+                }, parsed)
             if graph.get("empty"):
                 graph["scope"] = parsed
                 graph["source_map"] = self.get_projection_source_map(scope=parsed)
                 meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
                 meta.update(status_meta)
                 graph["meta"] = meta
-                return graph
+                return self._with_virtual_neuron_categories(graph, parsed)
             expected = authorized_roots_digest([f"share:{gscope.share_group_id}"])
             meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
             if str(meta.get("authorized_roots_digest", "") or "") != expected:
-                return {
+                return self._with_virtual_neuron_categories({
                     "empty": True,
                     "reason": "not_built",
                     "error": "projection_auth_stale",
@@ -2100,13 +2132,14 @@ class GovernanceApi:
                     "projection_kind": "shared_memory_projection",
                     "source_map": self.get_projection_source_map(scope=parsed),
                     "meta": status_meta,
-                }
+                }, parsed)
             meta.update(status_meta)
             graph["meta"] = meta
             graph["scope"] = parsed
             graph["source_map"] = self.get_projection_source_map(scope=parsed)
             # 共享组无原生 IR：从投影边/子节点补 members + related，供详情跳转
-            return self._hydrate_neuron_graph_from_projection(graph)
+            graph = self._hydrate_neuron_graph_from_projection(graph)
+            return self._with_virtual_neuron_categories(graph, parsed)
 
         graph_mode = "native" if mode == "native" else "reconstructed"
         key = scope_storage_key(gscope)
@@ -2124,14 +2157,14 @@ class GovernanceApi:
                 ),
             }
             empty["source_map"] = self.get_projection_source_map(scope=parsed)
-            return empty
+            return self._with_virtual_neuron_categories(empty, parsed)
 
         reg = SourceRegistry(self.workspace)
         scoped_roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
         allowed_ids = {r.root_id for r in scoped_roots}
         meta = graph.get("meta") if isinstance(graph.get("meta"), dict) else {}
         if not projection_auth_matches(meta, allowed_ids):
-            return {
+            return self._with_virtual_neuron_categories({
                 "empty": True,
                 "reason": "not_built",
                 "error": "projection_auth_stale",
@@ -2142,9 +2175,9 @@ class GovernanceApi:
                     else "reconstructed_governance_projection"
                 ),
                 "source_map": self.get_projection_source_map(scope=parsed),
-            }
+            }, parsed)
         if not allowed_ids:
-            return {
+            return self._with_virtual_neuron_categories({
                 "empty": True,
                 "reason": "not_built",
                 "error": "projection_auth_stale",
@@ -2155,7 +2188,7 @@ class GovernanceApi:
                     else "reconstructed_governance_projection"
                 ),
                 "source_map": self.get_projection_source_map(scope=parsed),
-            }
+            }, parsed)
 
         # 投影本身已按 scope 构建；hydrate 补正文。related 限制在当前授权 IR 内。
         norm = MemoryNormalizer(self.workspace)
@@ -2191,6 +2224,220 @@ class GovernanceApi:
         )
         graph["mode"] = graph_mode
         graph["scope"] = parsed
+        return self._with_virtual_neuron_categories(graph, parsed)
+
+    @staticmethod
+    def _virtual_graph_root(nodes: list[dict]) -> None:
+        """Ensure virtual overlays remain visible before a projection exists."""
+        if any(str(node.get("id") or "") == "main" for node in nodes):
+            return
+        nodes.append({
+            "id": "main", "parent_id": "", "node_kind": "root",
+            "label": "MemoryGuard", "kind": "root", "virtual": True,
+        })
+
+    def _with_virtual_neuron_categories(self, graph: dict, scope: dict) -> dict:
+        """Add governed indexes without modifying ProjectionBuilder or durable data.
+
+        Rule references point at existing shared records.  Conversation sessions
+        contribute only a bounded metadata index; raw turns stay in history.sqlite.
+        """
+        graph = dict(graph or {})
+        nodes = [dict(node) for node in (graph.get("nodes") or [])]
+        edges = [dict(edge) for edge in (graph.get("edges") or [])]
+        self._virtual_graph_root(nodes)
+        node_ids = {str(node.get("id") or "") for node in nodes}
+
+        def add_node(node: dict) -> None:
+            if node["id"] not in node_ids:
+                nodes.append(node)
+                node_ids.add(node["id"])
+
+        def add_edge(source: str, target: str) -> None:
+            edge_id = f"virtual-index:{source}:{target}"
+            if not any(str(edge.get("id") or "") == edge_id for edge in edges):
+                edges.append({
+                    "id": edge_id, "source": source, "target": target,
+                    "edge_type": "virtual_index", "virtual": True,
+                })
+
+        group_id = ""
+        rule_scope_error = ""
+        if str(scope.get("mode") or "") == "share_group":
+            group_id = str(scope.get("share_group_id") or "")
+        else:
+            try:
+                from .agent_binding import AgentBindingStore
+                agent_id = str(scope.get("agent_instance_id") or "")
+                groups = {
+                    str(binding.share_group_id)
+                    for binding in AgentBindingStore(self.workspace).find_by_agent(agent_id)
+                    if binding.share_group_id
+                }
+                if len(groups) == 1:
+                    group_id = next(iter(groups))
+                elif not groups:
+                    rule_scope_error = "rules_require_bound_agent"
+                else:
+                    rule_scope_error = "rules_ambiguous_agent_group"
+            except Exception as exc:
+                rule_scope_error = str(exc)
+        rules_id = "virtual-rules-habits"
+        add_node({
+            "id": rules_id, "parent_id": "main", "node_kind": "virtual_category",
+            "virtual_category": "rules_habits", "label": "规则与习惯",
+            "kind": "rules_habits", "count": 0, "virtual": True,
+        })
+        add_edge("main", rules_id)
+        bucket_labels = {
+            "mandatory": "强制规则", "preferences": "长期习惯与偏好",
+            "procedures": "工作流程", "corrections": "纠错与禁忌",
+            "projects": "项目决策",
+        }
+        try:
+            rule_view = (
+                self.list_rules_habits(group_id)
+                if group_id and not rule_scope_error else {"error": rule_scope_error}
+            )
+        except Exception as exc:
+            rule_view = {"error": str(exc)}
+        buckets = rule_view.get("buckets", {}) if isinstance(rule_view, dict) else {}
+        rule_total = 0
+        for bucket, label in bucket_labels.items():
+            all_records = list(buckets.get(bucket) or [])
+            records = all_records[:50]
+            rule_total += len(all_records)
+            bucket_id = f"{rules_id}:{bucket}"
+            add_node({
+                "id": bucket_id, "parent_id": rules_id, "node_kind": "virtual_bucket",
+                "virtual_category": "rules_habits", "bucket": bucket,
+                "label": label, "kind": bucket, "count": len(all_records),
+                "has_more": len(all_records) > len(records), "virtual": True,
+            })
+            add_edge(rules_id, bucket_id)
+            for record in records:
+                memory_id = str(record.get("memory_id") or "")
+                if not memory_id:
+                    continue
+                # This is a governed-memory reference, not a second durable
+                # record.  Keep enough fields on the virtual node for the
+                # graph rail to govern the original record in place.
+                body = str(record.get("body") or "")
+                body_preview = " ".join(body.split())[:96]
+                ref_id = f"virtual-rule-ref:{bucket}:{memory_id}"
+                add_node({
+                    "id": ref_id, "parent_id": bucket_id, "node_kind": "virtual_rule_ref",
+                    "virtual_category": "rules_habits", "memory_id": memory_id,
+                    "kind": str(record.get("kind") or ""),
+                    "label": body_preview or str(record.get("title") or "未命名规则"),
+                    "body": body,
+                    "status": str(record.get("status") or ""),
+                    "injection_policy": str(record.get("injection_policy") or "relevant"),
+                    "priority": int(record.get("priority") or 0),
+                    "assignments": list(record.get("assignments") or []),
+                    "audience": str(record.get("audience") or ""),
+                    "confidence": record.get("confidence"),
+                    "locked": bool(record.get("locked")),
+                    "virtual": True,
+                })
+                add_edge(bucket_id, ref_id)
+        for node in nodes:
+            if node.get("id") == rules_id:
+                node["count"] = rule_total
+                if rule_view.get("error"):
+                    node["load_error"] = str(rule_view["error"])
+
+        history_id = "virtual-conversation-history"
+        history_node = {
+            "id": history_id, "parent_id": "main", "node_kind": "virtual_category",
+            "virtual_category": "conversation_history", "label": "对话历史",
+            "kind": "conversation_history", "count": 0, "virtual": True,
+        }
+        add_node(history_node)
+        add_edge("main", history_id)
+        try:
+            from .agent_binding import AgentBindingStore
+            from .conversation_history import ConversationHistoryStore, HistoryAccessResolver
+
+            mode = str(scope.get("mode") or "agent")
+            agent_id = str(scope.get("agent_instance_id") or "")
+            requested_group = str(scope.get("share_group_id") or "") if mode == "share_group" else ""
+            if requested_group and not agent_id:
+                members = AgentBindingStore(self.workspace).find_by_group(
+                    requested_group, include_inactive=False,
+                )
+                agent_id = str(members[0].agent_instance_id) if members else ""
+            if not agent_id:
+                raise PermissionError("history_active_binding_required")
+            history_scope = HistoryAccessResolver(self.workspace).resolve(agent_id, {
+                "agent_instance_id": agent_id,
+                "share_group_id": requested_group,
+            })
+            history = ConversationHistoryStore(self.workspace).list_sessions(
+                history_scope, limit=51, offset=0,
+            )
+            sessions = list(history.get("sessions") or [])
+            total = int(history.get("total") or len(sessions))
+            visible = sessions[:50]
+            history_node["count"] = total
+            history_node["total"] = total
+            history_node["has_more"] = total > len(visible)
+            history_node["project_groups"] = list(history.get("project_groups") or [])
+            for session in visible:
+                session_id = str(session.get("session_id") or "")
+                project_key = str(session.get("project_key") or "")
+                owner = str(session.get("owner_agent_instance_id") or "")
+                if not session_id or not project_key or not owner:
+                    continue
+                project_id = f"virtual-history-project:{project_key}"
+                agent_id = "virtual-history-agent:" + hashlib.sha256(
+                    f"{project_key}\x1f{owner}".encode("utf-8")
+                ).hexdigest()[:20]
+                add_node({
+                    "id": project_id, "parent_id": history_id,
+                    "node_kind": "history_project", "virtual_category": "conversation_history",
+                    "project_key": project_key, "project_ref": str(session.get("project_ref") or ""),
+                    "project_status": str(session.get("project_status") or "unknown"),
+                    "project_parent": str(session.get("project_parent") or ""),
+                    "label": str(session.get("project_label") or "未识别项目"), "virtual": True,
+                })
+                add_edge(history_id, project_id)
+                add_node({
+                    "id": agent_id, "parent_id": project_id,
+                    "node_kind": "history_agent", "virtual_category": "conversation_history",
+                    "owner_agent_instance_id": owner, "label": owner, "virtual": True,
+                })
+                add_edge(project_id, agent_id)
+                node_id = f"virtual-history-session:{session_id}"
+                add_node({
+                    "id": node_id, "parent_id": agent_id,
+                    "node_kind": "history_session", "virtual_category": "conversation_history",
+                    "session_id": session_id, "title": str(session.get("title") or ""),
+                    "label": str(session.get("title") or session_id[:8]),
+                    "owner_agent_instance_id": owner, "provider": str(session.get("provider") or ""),
+                    "project_key": project_key, "project_ref": str(session.get("project_ref") or ""),
+                    "project_status": str(session.get("project_status") or "unknown"),
+                    "created_at": str(session.get("created_at") or ""),
+                    "imported_at": str(session.get("imported_at") or ""),
+                    "summary": str(session.get("summary") or ""),
+                    "turn_count": int(session.get("turn_count") or 0),
+                    "evidence_count": int(session.get("evidence_count") or 0), "virtual": True,
+                })
+                add_edge(agent_id, node_id)
+        except Exception as exc:
+            history_node["load_error"] = str(exc)
+
+        graph["nodes"] = nodes
+        graph["edges"] = edges
+        # Preserve the projection's fail-closed truth value.  The overlay is
+        # browseable UI metadata, not evidence that a missing/stale projection
+        # may be treated as valid by a caller.
+        graph["base_empty"] = bool(graph.get("empty") or graph.get("base_empty"))
+        graph["virtual_overlay_available"] = True
+        stats = dict(graph.get("stats") or {})
+        stats["node_count"] = len(nodes)
+        stats["edge_count"] = len(edges)
+        graph["stats"] = stats
         return graph
 
     def _localized_record_fields(self, rec: dict) -> dict:
@@ -3318,7 +3565,17 @@ class GovernanceApi:
     def list_sources(self) -> dict:
         from .source_registry import SourceRegistry
         reg = SourceRegistry(self.workspace)
-        sources = [s.to_dict() for s in reg.list_sources()]
+        sources = []
+        for source in reg.list_sources():
+            item = source.to_dict()
+            source_path = Path(source.path)
+            item["path_exists"] = source_path.exists()
+            item["path_kind"] = (
+                "directory" if source_path.is_dir()
+                else "file" if source_path.is_file()
+                else "missing"
+            )
+            sources.append(item)
         return {"sources": sources, "total": len(sources)}
 
     # ------------------------------------------------------------------
@@ -4332,17 +4589,22 @@ class GovernanceApi:
             return err
         from .memory_ir import MemoryNormalizer
         from .source_registry import SourceRegistry
+        from .governance_scope import share_file_source_key
 
         records = store.list_records()
         record_by_id = {record.memory_id: record for record in records}
         events = store.list_events()
         event_by_id = {event.event_id: event for event in events}
         events_by_relative_path: dict[str, list] = {}
+        events_by_share_key: dict[str, list] = {}
         for event in events:
             metadata = event.metadata if isinstance(event.metadata, dict) else {}
             relative = str(metadata.get("relative_path", "") or "").strip().replace("\\", "/")
+            share_key = share_file_source_key(metadata)
             if relative:
                 events_by_relative_path.setdefault(relative, []).append(event)
+            if share_key:
+                events_by_share_key.setdefault(share_key, []).append(event)
         roots_by_id = {
             root.root_id: root
             for root in SourceRegistry(self.workspace).list_all_sources()
@@ -4449,11 +4711,19 @@ class GovernanceApi:
             if event is not None:
                 return [source_from_event(event, locator)]
             if source_id.startswith("share-file:"):
-                relative = source_id.split(":", 1)[1].strip().replace("\\", "/")
-                return [
-                    source_from_event(item, locator)
-                    for item in events_by_relative_path.get(relative, [])
-                ]
+                from .governance_scope import parse_share_file_source_key
+                root_hint, relative = parse_share_file_source_key(source_id)
+                events_for_source = events_by_share_key.get(source_id, [])
+                if not events_for_source and relative:
+                    fallback_key = (
+                        f"share-file:{relative}" if not root_hint else
+                        f"share-file:{root_hint}:{relative}"
+                    )
+                    events_for_source.extend(events_by_share_key.get(fallback_key, []))
+                    events_for_source.extend(events_by_relative_path.get(relative, []))
+                if not events_for_source:
+                    return []
+                return [source_from_event(item, locator) for item in events_for_source]
             source_record = record_by_id.get(source_id)
             if source_record is not None:
                 resolved: list[dict] = []
@@ -4863,6 +5133,27 @@ class GovernanceApi:
             self.workspace, share_group_id,
         ).human_unlock(memory_id)
 
+    def set_memory_injection_policy(
+        self,
+        memory_id: str,
+        injection_policy: str,
+        priority: int = 0,
+        share_group_id: str = "default",
+        *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """Toggle a governed memory between on-demand and mandatory injection."""
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        from .governance_engine import GovernanceEngine
+        engine = GovernanceEngine(self.workspace, share_group_id)
+        return engine.human_set_injection_policy(
+            memory_id,
+            injection_policy=injection_policy,
+            priority=priority,
+        )
+
     def restore_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """恢复 shadowed 记忆为 active。"""
         err = self._require_admin_or_override(_admin_override)
@@ -5141,6 +5432,10 @@ class GovernanceApi:
             "obsidian_vault": SourceRootType.OBSIDIAN_VAULT,
         }
         enum_type = type_alias.get(source_type, SourceRootType.SELECTED_DIRECTORY)
+        # 系统文件夹选择器只会传 "directory"；识别 Vault 后保留其专属扫描策略。
+        # 显式 selected_directory 仍按调用者指定，不擅自改变来源类型。
+        if source_type == "directory" and (Path(path).expanduser() / ".obsidian").is_dir():
+            enum_type = SourceRootType.OBSIDIAN_VAULT
         reg = SourceRegistry(self.workspace)
         return reg.preview(path, enum_type)
 
@@ -5160,8 +5455,24 @@ class GovernanceApi:
             "obsidian_vault": SourceRootType.OBSIDIAN_VAULT,
         }
         enum_type = type_alias.get(source_type, SourceRootType.SELECTED_DIRECTORY)
+        # 与 preview 一致：文件夹选择器发现 .obsidian 后创建 Vault 来源。
+        if source_type == "directory" and (Path(path).expanduser() / ".obsidian").is_dir():
+            enum_type = SourceRootType.OBSIDIAN_VAULT
         reg = SourceRegistry(self.workspace)
         root = reg.add(path, enum_type, display_name=display_name)
+        # 手工添加的文件/目录是独立知识库，不属于当前 Agent 的授权来源。
+        # 幂等 add 可能返回既有根；只补全没有 Agent 或发现归属的未知映射。
+        is_unowned_root = (
+            not root.agent_instance_id
+            and not root.authorized_agent_ids
+            and not root.discovery_object_id
+            and not root.surface_id
+            and root.target_role in {"", "none"}
+            and root.ownership != "agent_managed"
+        )
+        if root.source_category in {"", "unknown"} and is_unowned_root:
+            root.source_category = "knowledge_source"
+            reg._save()
         return {"ok": True, "root_id": root.root_id}
 
     def preview_source(self, path: str, source_type: str = "selected_directory") -> dict:
@@ -5708,10 +6019,14 @@ class GovernanceApi:
             if d.supported:
                 inv = ad.inventory(bundle)
                 return {"provider": d.provider, "confidence": d.confidence,
-                        "notes": d.notes, "inventory": inv}
+                        "notes": d.notes, "inventory": inv,
+                        "destination": "local_conversation_history",
+                        "writes_long_term_memory": False}
         return {"error": "unsupported bundle format"}
 
-    def create_import(self, path: str, confirmed: bool = False) -> dict:
+    def create_import(self, path: str, confirmed: bool = False,
+                      agent_instance_id: str = "", project_ref: str = "",
+                      share_group_id: str = "") -> dict:
         if not confirmed:
             return {"error": "需要确认才能创建导入"}
         from .adapters import GenericImportAdapter, ChatGPTImportAdapter
@@ -5723,13 +6038,486 @@ class GovernanceApi:
             d = ad.detect(bundle)
             if d.supported:
                 convs = ad.parse(bundle)
-                records = ad.normalize(convs)
+                # Import is evidence-only.  Raw messages never become
+                # SharedMemoryRecord candidates without an explicit extract.
+                agent_id = agent_instance_id or "local-default"
+                archived = ad.archive_history(
+                    convs, workspace=self.workspace, agent_instance_id=agent_id,
+                    project_ref=project_ref, share_group_id=share_group_id,
+                )
                 return {"provider": d.provider,
-                        "conversation_count": len(convs),
-                        "extract_candidate_count": len(records),
+                        "conversation_count": archived["conversation_count"],
+                        "turn_count": archived["turn_count"],
+                        "extract_candidate_count": 0,
                         "memory_record_count": 0,
-                        "written_to_ir": False}
+                        "written_to_ir": False,
+                        "written_to_history": True,
+                        "history_agent_instance_id": agent_id}
         return {"error": "unsupported bundle format"}
+
+    # ------------------------------------------------------------------
+    # Conversation history: raw evidence only; no bootstrap integration.
+    # ------------------------------------------------------------------
+
+    def _history_scope(self, scope: dict | None = None) -> "HistoryScope":
+        from .conversation_history import HistoryAccessResolver
+        scope = scope or {}
+        agent_id = str(scope.get("agent_instance_id") or "local-default")
+        group_id = str(scope.get("share_group_id") or "")
+        if agent_id == "local-default" and group_id:
+            from .agent_binding import AgentBindingStore
+            members = AgentBindingStore(self.workspace).find_by_group(group_id, include_inactive=False)
+            agent_id = str(members[0].agent_instance_id) if members else agent_id
+        return HistoryAccessResolver(self.workspace).resolve(
+            agent_id,
+            {
+                "agent_instance_id": agent_id,
+                "project_ref": str(scope.get("project_ref") or ""),
+                "provider": str(scope.get("provider") or ""),
+                "share_group_id": group_id,
+            },
+        )
+
+    def list_history_sessions(self, scope: dict | None = None, limit: int = 50,
+                              offset: int = 0, extracted: bool | None = None,
+                              date_from: str = "", date_to: str = "") -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).list_sessions(
+            self._history_scope(scope), limit=limit, offset=offset,
+            extracted=extracted, date_from=date_from, date_to=date_to,
+        )
+
+    def search_history(self, query: str, scope: dict | None = None,
+                       limit: int = 20, offset: int = 0) -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).search(
+            self._history_scope(scope), query, limit=limit, offset=offset)
+
+    def history_timeline(self, session_id: str, anchor_turn_id: str,
+                         scope: dict | None = None, radius: int = 4) -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).timeline(
+            self._history_scope(scope), session_id, anchor_turn_id, radius=radius)
+
+    def history_read(self, session_id: str = "", turn_id: str = "",
+                     scope: dict | None = None, limit: int = 100, offset: int = 0) -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).read(
+            self._history_scope(scope), session_id=session_id, turn_id=turn_id,
+            limit=limit, offset=offset)
+
+    def history_extract_preview(self, session_id: str, turn_ids: list[str] | None = None,
+                                scope: dict | None = None, limit: int = 20) -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).extract_preview(
+            self._history_scope(scope), session_id, turn_ids=turn_ids, limit=limit)
+
+    def export_history(self, session_ids: list[str], scope: dict | None = None) -> dict:
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).export(self._history_scope(scope), session_ids=session_ids)
+
+    def delete_history(self, session_ids: list[str], scope: dict | None = None,
+                       invalidate_evidence: bool = False, confirmed: bool = False) -> dict:
+        if not confirmed:
+            return {"error": "confirmation_required"}
+        from .conversation_history import ConversationHistoryStore
+        return ConversationHistoryStore(self.workspace).delete(
+            self._history_scope(scope), session_ids=session_ids,
+            invalidate_evidence=invalidate_evidence)
+
+    def _history_backfill_agent_ids(self) -> dict[str, str]:
+        """Only map a provider to its own discovered/bound Agent instance."""
+        from .agent_binding import AgentBindingStore
+        from .agent_locator import AgentLocator
+
+        try:
+            instances, _ = AgentLocator(self.workspace).detect_instances()
+        except Exception:
+            instances = []
+        active_ids = {
+            str(binding.agent_instance_id)
+            for binding in AgentBindingStore(self.workspace).list_bindings(include_inactive=False)
+            if binding.agent_instance_id
+        }
+        mapping: dict[str, str] = {}
+        aliases = {"claude-code": "claude", "codex": "codex", "cursor": "cursor", "trae": "trae"}
+        for instance in instances:
+            agent_id = str(getattr(instance, "instance_id", "") or "")
+            product = str(getattr(instance, "product", "") or "").strip().casefold()
+            provider = aliases.get(product, product)
+            if provider and agent_id and agent_id in active_ids:
+                mapping.setdefault(provider, agent_id)
+        return mapping
+
+    def discover_local_history_sources(self) -> dict:
+        """Discover old local logs; discovery is read-only and never imports text."""
+        from .history_importers import discover_local_history_sources
+        return discover_local_history_sources(
+            workspace=self.workspace,
+            agent_ids_by_provider=self._history_backfill_agent_ids(),
+        )
+
+    def backfill_local_history(self, continuation: dict | None = None,
+                               confirmed: bool = False) -> dict:
+        """Import a bounded, explicitly confirmed local-history batch."""
+        if not confirmed:
+            return {"error": "confirmation_required"}
+        from .history_importers import backfill_local_history
+        return backfill_local_history(
+            self.workspace,
+            agent_ids_by_provider=self._history_backfill_agent_ids(),
+            continuation=continuation,
+        )
+
+    def _rule_scope_options(self, share_group_id: str) -> dict:
+        """Return *discovered* audience values.  Never accept UI-invented IDs."""
+        from .agent_binding import AgentBindingStore
+        from .agent_locator import AgentLocator
+
+        agents: dict[str, str] = {}
+        providers: dict[str, str] = {}
+        # A project label is not an identity.  Only values emitted by the
+        # locator's project resolver are valid targets; do not fabricate the
+        # workspace basename here.
+        projects: set[str] = set()
+        locator = AgentLocator(self.workspace)
+        try:
+            instances, _ = locator.detect_instances()
+        except Exception:
+            instances = []
+        for instance in instances:
+            agent_id = str(instance.instance_id or "")
+            if not agent_id:
+                continue
+            agents[agent_id] = str(instance.product or agent_id)
+            raw_provider = str(instance.product or "").strip().casefold()
+            provider = {"claude-code": "claude"}.get(raw_provider, raw_provider)
+            if provider:
+                providers[provider] = str(instance.product or provider)
+            # Reuse the locator's project resolver instead of guessing paths.
+            try:
+                tree = locator.get_selection_tree(agent_id)
+            except Exception:
+                tree = {}
+            for scope in tree.get("scopes", []):
+                for project in scope.get("projects", []):
+                    project_ref = str(project.get("project_ref") or "").strip()
+                    if project_ref:
+                        projects.add(project_ref)
+
+        binding_store = AgentBindingStore(self.workspace)
+        bindings = binding_store.list_bindings(include_inactive=False)
+        groups = {str(binding.share_group_id) for binding in bindings if binding.share_group_id}
+        # A group may exist before any Agent is bound to it.  It is still a
+        # discovered local target, so expose it rather than accepting a typed
+        # ID later.
+        try:
+            groups.update(
+                str(item.get("share_group_id") or "")
+                for item in self.list_share_groups().get("groups", [])
+                if item.get("share_group_id")
+            )
+        except Exception:
+            pass
+        for binding in bindings:
+            # A bound ID is a verified, usable target even if its host is not
+            # currently running and therefore not returned by live discovery.
+            if binding.agent_instance_id:
+                agents.setdefault(str(binding.agent_instance_id), str(binding.agent_instance_id))
+        if share_group_id:
+            groups.add(str(share_group_id))
+
+        # Runtime roles are a finite, product-defined context enum.  Existing
+        # assignment values are deliberately *not* fed back as valid choices.
+        # They are reported separately as legacy_unknown below.
+        roles = {"root", "subagent"}
+        legacy_unknown: list[dict] = []
+        try:
+            store, err = self._open_store(share_group_id, read_only=True)
+            if not err:
+                provisional = {
+                    "agents": [{"id": key, "label": value} for key, value in agents.items()],
+                    "groups": [{"id": key, "label": key} for key in groups],
+                    "projects": [{"id": key, "label": key} for key in projects],
+                    "providers": [{"id": key, "label": value} for key, value in providers.items()],
+                    "runtime_roles": [{"id": key, "label": key} for key in roles],
+                }
+                for assignment in store.list_rule_assignments():
+                    if not self._assignment_is_verified(assignment, provisional):
+                        legacy_unknown.append({
+                            **assignment.to_dict(),
+                            "reason": "legacy_unknown_target",
+                        })
+        except Exception:
+            pass
+        return {
+            "agents": [
+                {"id": key, "label": value} for key, value in sorted(agents.items())
+            ],
+            "groups": [{"id": key, "label": key} for key in sorted(groups)],
+            "projects": [{"id": key, "label": key} for key in sorted(projects)],
+            "providers": [
+                {"id": key, "label": value} for key, value in sorted(providers.items())
+            ],
+            "runtime_roles": [{"id": key, "label": key} for key in sorted(roles)],
+            # Existing historical relations are visible so a human can remove
+            # them, but they never become selectable values for a new rule.
+            "legacy_unknown": legacy_unknown,
+            "target_types": [
+                "agent", "group", "project", "agent_project", "provider",
+                "runtime_role", "system",
+            ],
+        }
+
+    @staticmethod
+    def _assignment_key(assignment) -> tuple[str, str, str, str]:
+        if isinstance(assignment, dict):
+            get = assignment.get
+        else:
+            get = lambda name, default="": getattr(assignment, name, default)
+        return (
+            str(get("target_type", "")), str(get("target_id", "")),
+            str(get("project_ref", "")), str(get("effect", "include")),
+        )
+
+    @classmethod
+    def _assignment_is_verified(cls, assignment, options: dict) -> bool:
+        target_type, target_id, project_ref, _effect = cls._assignment_key(assignment)
+        known = {
+            "agent": {item["id"] for item in options.get("agents", [])},
+            "group": {item["id"] for item in options.get("groups", [])},
+            "project": {item["id"] for item in options.get("projects", [])},
+            "provider": {item["id"].casefold() for item in options.get("providers", [])},
+            "runtime_role": {item["id"].casefold() for item in options.get("runtime_roles", [])},
+        }
+        if target_type == "system":
+            return not target_id and not project_ref
+        if target_type == "agent":
+            return target_id in known["agent"]
+        if target_type == "group":
+            return target_id in known["group"]
+        if target_type == "project":
+            return (project_ref or target_id) in known["project"]
+        if target_type == "agent_project":
+            return target_id in known["agent"] and project_ref in known["project"]
+        if target_type == "provider":
+            return target_id.casefold() in known["provider"]
+        if target_type == "runtime_role":
+            return target_id.casefold() in known["runtime_role"]
+        return False
+
+    def get_rule_scope_options(self, share_group_id: str = "default") -> dict:
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        return {"ok": True, **self._rule_scope_options(share_group_id)}
+
+    @staticmethod
+    def _rule_audience_label(assignment) -> str:
+        labels = {
+            "agent": "Agent", "group": "共享组", "project": "项目",
+            "agent_project": "Agent + 项目", "provider": "宿主",
+            "runtime_role": "运行角色", "system": "系统",
+        }
+        suffix = assignment.target_id or assignment.project_ref or "全部"
+        if assignment.target_type == "agent_project":
+            suffix = f"{assignment.target_id} / {assignment.project_ref}"
+        return f"{labels.get(assignment.target_type, assignment.target_type)}: {suffix}"
+
+    def _validated_rule_assignments(
+        self, assignments: list[dict], options: dict, memory_id: str,
+        *, existing_assignments: list | None = None,
+    ) -> list[dict]:
+        """Validate GUI audience choices against server-side discovery data."""
+        from .rule_scope import normalize_assignment
+
+        if not isinstance(assignments, list):
+            raise ValueError("assignments must be a list")
+        allowed = {
+            "agent": {x["id"] for x in options["agents"]},
+            "group": {x["id"] for x in options["groups"]},
+            "project": {x["id"] for x in options["projects"]},
+            "provider": {x["id"].casefold() for x in options["providers"]},
+            "runtime_role": {x["id"].casefold() for x in options["runtime_roles"]},
+        }
+        result: list[dict] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        existing_keys = {
+            self._assignment_key(item) for item in (existing_assignments or [])
+        }
+        for raw in assignments:
+            if not isinstance(raw, dict):
+                raise ValueError("assignment must be an object")
+            value = dict(raw)
+            value["memory_id"] = memory_id
+            target_type = str(value.get("target_type") or "")
+            target_id = str(value.get("target_id") or "")
+            project_ref = str(value.get("project_ref") or "")
+            key_before_normalize = (target_type, target_id, project_ref, str(value.get("effect", "include")))
+            legacy_retained = key_before_normalize in existing_keys
+            if target_type == "agent" and target_id not in allowed["agent"] and not legacy_retained:
+                raise ValueError("unknown_agent_target")
+            if target_type == "group" and target_id not in allowed["group"] and not legacy_retained:
+                raise ValueError("unknown_group_target")
+            if target_type == "project" and (project_ref or target_id) not in allowed["project"] and not legacy_retained:
+                raise ValueError("unknown_project_target")
+            if target_type == "agent_project":
+                if (target_id not in allowed["agent"] or project_ref not in allowed["project"]) and not legacy_retained:
+                    raise ValueError("unknown_agent_project_target")
+            if target_type == "provider" and target_id.casefold() not in allowed["provider"] and not legacy_retained:
+                raise ValueError("unknown_provider_target")
+            if target_type == "runtime_role" and target_id.casefold() not in allowed["runtime_role"] and not legacy_retained:
+                raise ValueError("unknown_runtime_role_target")
+            if target_type == "system" and (target_id or project_ref):
+                raise ValueError("system_target_must_be_empty")
+            normalized = normalize_assignment(value).to_dict()
+            normalized["memory_id"] = memory_id
+            key = (
+                normalized["target_type"], normalized["target_id"],
+                normalized["project_ref"], normalized["effect"],
+            )
+            if key in seen:
+                raise ValueError("duplicate_rule_assignment")
+            seen.add(key)
+            result.append(normalized)
+        return result
+
+    def preview_effective_rules(
+        self, agent_instance_id: str, share_group_id: str = "default",
+        project_ref: str = "", provider: str = "", runtime_role: str = "",
+    ) -> dict:
+        """Read-only audience preview; uses the shared matcher, not UI logic."""
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        options = self._rule_scope_options(share_group_id)
+        agent_ids = {item["id"] for item in options["agents"]}
+        if agent_instance_id not in agent_ids:
+            return {"error": "unknown_agent_target"}
+        if project_ref and project_ref not in {item["id"] for item in options["projects"]}:
+            return {"error": "unknown_project_target"}
+        if provider and provider.casefold() not in {item["id"].casefold() for item in options["providers"]}:
+            return {"error": "unknown_provider_target"}
+        if runtime_role and runtime_role.casefold() not in {item["id"].casefold() for item in options["runtime_roles"]}:
+            return {"error": "unknown_runtime_role_target"}
+
+        from .rule_scope import effective_assignments
+        from .schema_v3 import EffectiveAgentContext, SharedMemoryStatus
+        context = EffectiveAgentContext(
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            project_ref=project_ref,
+            provider=provider,
+            runtime_role=runtime_role,
+        )
+        effective, excluded, unavailable = [], [], []
+        for record in store.list_records(status=SharedMemoryStatus.ACTIVE.value):
+            if record.injection_policy != "always":
+                continue
+            assignments = store.list_rule_assignments(record.memory_id)
+            payload = record.to_dict()
+            payload["assignments"] = [item.to_dict() for item in assignments]
+            includes, excludes = effective_assignments(assignments, context)
+            payload["matched_sources"] = [self._rule_audience_label(item) for item in includes]
+            payload["excluded_sources"] = [self._rule_audience_label(item) for item in excludes]
+            if excludes:
+                excluded.append(payload)
+            elif includes:
+                effective.append(payload)
+            else:
+                payload["audience_label"] = "旧规则未定范围" if not assignments else "当前 Agent 不在适用范围"
+                unavailable.append(payload)
+        return {
+            "ok": True, "context": {
+                "agent_instance_id": agent_instance_id, "share_group_id": share_group_id,
+                "project_ref": project_ref, "provider": provider,
+                "runtime_role": runtime_role,
+            },
+            "effective": effective, "excluded": excluded, "unavailable": unavailable,
+        }
+
+    def update_rule_audience(
+        self, memory_id: str, assignments: list[dict],
+        share_group_id: str = "default", injection_policy: str = "",
+        priority: int = 0, confirmed: bool = False, *,
+        _admin_override: bool = False,
+    ) -> dict:
+        """Confirmed local governance edit; assignment removal never deletes memory."""
+        if not confirmed:
+            return {"ok": False, "error": "confirmation_required"}
+        err = self._require_admin_or_override(_admin_override)
+        if err:
+            return err
+        store, open_err = self._open_store(share_group_id, must_exist=True)
+        if open_err:
+            return open_err
+        record = store.get_record(memory_id)
+        if record is None:
+            return {"ok": False, "error": "memory_not_found"}
+        if str(record.status.value if hasattr(record.status, "value") else record.status) != "active":
+            return {"ok": False, "error": "rule_memory_must_be_active"}
+        target_policy = injection_policy or record.injection_policy
+        if target_policy not in {"relevant", "always"}:
+            return {"ok": False, "error": "invalid_injection_policy"}
+        try:
+            normalized = self._validated_rule_assignments(
+                assignments, self._rule_scope_options(share_group_id), memory_id,
+                existing_assignments=store.list_rule_assignments(memory_id),
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if target_policy == "always" and not any(item["effect"] == "include" for item in normalized):
+            return {"ok": False, "error": "always_rule_requires_include_audience"}
+        if target_policy == "relevant" and normalized:
+            return {"ok": False, "error": "relevant_rule_cannot_have_assignments"}
+
+        # The engine owns the single transaction and its auditable decision:
+        # do not emulate it with two writes in the GUI bridge.
+        from .governance_engine import GovernanceEngine
+        result = GovernanceEngine(self.workspace, share_group_id).human_set_injection_policy(
+            memory_id, target_policy, priority, assignments=normalized,
+        )
+        if result.get("ok") is False or result.get("error"):
+            return result
+        result.update({
+            "ok": True, "memory_id": memory_id,
+            "injection_policy": target_policy,
+            "message": "已更新适用范围；删除适用范围不会删除这条记忆。",
+        })
+        return result
+
+    def list_rules_habits(self, share_group_id: str = "default") -> dict:
+        """Virtual view over existing governed records; no new MemoryKind."""
+        store, err = self._open_store(share_group_id, read_only=True)
+        if err:
+            return err
+        options = self._rule_scope_options(share_group_id)
+        buckets = {"mandatory": [], "preferences": [], "procedures": [], "corrections": [], "projects": []}
+        for record in store.list_records():
+            data = record.to_dict()
+            policy = data.get("injection_policy", "relevant")
+            kind = data.get("kind", "")
+            if policy == "always":
+                bucket = "mandatory"
+            elif kind == "preference":
+                bucket = "preferences"
+            elif kind == "procedure":
+                bucket = "procedures"
+            elif kind == "correction":
+                bucket = "corrections"
+            elif kind == "project":
+                bucket = "projects"
+            else:
+                continue
+            assignments = store.list_rule_assignments(data["memory_id"])
+            data["assignments"] = [item.to_dict() for item in assignments]
+            data["legacy_unknown_assignment_ids"] = [
+                item.assignment_id for item in assignments
+                if not self._assignment_is_verified(item, options)
+            ]
+            data["audience_label"] = "旧规则未定范围" if policy == "always" and not data["assignments"] else ""
+            buckets[bucket].append(data)
+        return {"buckets": buckets, "total": sum(map(len, buckets.values()))}
 
     # ------------------------------------------------------------------
     # MemoryApi（spec §7.2）
@@ -6445,7 +7233,13 @@ class SafeBridgeApi:
                 while len(call_args) <= cidx:
                     call_args.append(sig.parameters[params[len(call_args)]].default)
                 call_args[cidx] = True
-            result = fn(*call_args)
+            # `_admin_override` is an internal capability, never a frontend
+            # argument.  Only the native trusted bridge is the local execution
+            # endpoint that may pass it through after a confirmed mutation.
+            call_kwargs = {}
+            if self._direct_mutations and "_admin_override" in sig.parameters:
+                call_kwargs["_admin_override"] = True
+            result = fn(*call_args, **call_kwargs)
             return result if result is not None else {}
         except Exception as e:
             return {"error": str(e)}

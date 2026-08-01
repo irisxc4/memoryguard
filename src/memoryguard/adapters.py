@@ -54,6 +54,10 @@ class ImportedConversation:
     title: str
     messages: list[dict[str, Any]]  # {role, content, created_at}
     attachments: list[str] = field(default_factory=list)
+    # Per-session trusted metadata.  Empty means unknown; parsers must never
+    # infer this from a title or a message body.
+    project_ref: str = ""
+    project_source: str = "unknown"
 
 
 @dataclass
@@ -80,6 +84,30 @@ class ImportAdapter:
 
     def normalize(self, items: list[ImportedConversation]) -> list[MemoryRecord]:
         raise NotImplementedError
+
+    def archive_history(self, items: list[ImportedConversation], *, workspace: str | Path,
+                        agent_instance_id: str, project_ref: str = "",
+                        share_group_id: str = "") -> dict[str, int]:
+        """Archive imported conversations as raw local history.
+
+        Import adapters may still expose ``normalize`` for old callers, but
+        product imports must use this path.  It never creates an EPISODE or
+        writes to the governed long-term memory store.
+        """
+        from .conversation_history import ConversationHistoryStore, HistoryScope
+        # The concrete provider is deterministic and avoids treating a source
+        # path as a trusted provider label.
+        provider = self.__class__.__name__.replace("ImportAdapter", "").lower()
+        if isinstance(self, ChatGPTImportAdapter):
+            provider = "chatgpt"
+        elif isinstance(self, GenericImportAdapter):
+            provider = "generic"
+        store = ConversationHistoryStore(workspace)
+        return store.import_conversations(
+            items, provider=provider,
+            scope=HistoryScope(agent_instance_id=agent_instance_id, project_ref=project_ref,
+                               provider=provider, share_group_id=share_group_id),
+        )
 
     def explain(self) -> ImportCapability:
         raise NotImplementedError
@@ -354,29 +382,14 @@ class ChatGPTImportAdapter(ImportAdapter):
         return convs
 
     def normalize(self, items: list[ImportedConversation]) -> list[MemoryRecord]:
-        # 复用 Generic 的逻辑，但标记 completeness=UNVERIFIABLE
-        records: list[MemoryRecord] = []
-        for conv in items:
-            for msg in conv.messages:
-                body = msg.get("content", "")
-                if not body.strip():
-                    continue
-                memory_id = stable_hash(conv.conv_id, msg.get("role", ""), body[:200])
-                rec = MemoryRecord(
-                    memory_id=memory_id, kind=MemoryKind.EPISODE,
-                    title=conv.title[:80], body=body, scope="user",
-                    confidence=0.3,
-                    provenance=[Provenance(
-                        source_object_id=conv.conv_id,
-                        locator=f"chatgpt:message:{msg.get('role', '')}",
-                        excerpt_hash=stable_hash(body),
-                    )],
-                    status=MemoryStatus.CANDIDATE,
-                    completeness=Completeness.UNVERIFIABLE,
-                    created_at=_now_iso(),
-                )
-                records.append(rec)
-        return records
+        """Deprecated compatibility method.
+
+        ChatGPT exports are raw conversation evidence.  Returning candidates
+        here used to turn every message into an EPISODE, which polluted the
+        governed memory graph.  Call ``archive_history`` then request an
+        explicit history extract preview instead.
+        """
+        return []
 
     def explain(self) -> ImportCapability:
         return ImportCapability(

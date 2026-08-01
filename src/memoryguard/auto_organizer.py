@@ -26,6 +26,7 @@ from .schema_v3 import (
 )
 from .semantic_dedup import SemanticDedup
 from .shared_memory_store import SharedMemoryStore
+from .governance_scope import share_file_source_key
 
 
 # Secret 检测正则
@@ -94,6 +95,20 @@ class AutoOrganizer:
         """
         actions: list[dict[str, Any]] = []
         propose_only = write_policy == "propose_only"
+        incoming_policy = getattr(event, "injection_policy", "relevant")
+        raw_assignments = list(getattr(event, "rule_assignments", []) or [])
+        incoming_assignments = self.store._normalize_assignments(
+            "pending", raw_assignments,
+        )
+        if incoming_policy == "always" and not incoming_assignments:
+            from .schema_v3 import RuleAssignment
+            if event.agent_instance_id:
+                incoming_assignments = [RuleAssignment(
+                    memory_id="pending", target_type="agent",
+                    target_id=event.agent_instance_id,
+                )]
+        event.rule_assignments = incoming_assignments
+        self._active_rule_assignments = incoming_assignments
 
         # P1.2/P1.5: secret 检测必须在 enricher 之前,防止原始 api_key 进入模型 backend
         # S3.1: 也检查 MCP 层标记的 _secret_detected(原文已脱敏,但需走 quarantine)
@@ -123,7 +138,7 @@ class AutoOrganizer:
                 record = self._create_record(
                     event, kind, SharedMemoryStatus.LOW_CONFIDENCE, confidence=confidence,
                 )
-                self.store.append_record(record)
+                self._append_record(record)
                 actions.append({"action": "propose_only",
                                 "reason": "write policy is propose_only"})
                 actions.append({"action": "risk_flag",
@@ -132,7 +147,7 @@ class AutoOrganizer:
             record = self._create_record(
                 event, kind, SharedMemoryStatus.QUARANTINED, confidence=confidence,
             )
-            self.store.append_record(record)
+            self._append_record(record)
             self.governance.quarantine(
                 record.memory_id,
                 reason=f"检测到敏感信息: {secret_match}",
@@ -188,6 +203,9 @@ class AutoOrganizer:
         # 纠错内容用更低阈值查找相关记忆(P2.3: 0.50->0.60 减少 false positive)
         is_correction = self._is_correction(event, [])
         dedup_threshold = 0.60 if is_correction else 0.80
+        self.governance._incoming_rule_scope = (
+            incoming_policy, incoming_assignments,
+        )
         override_policy = self.governance.evaluate_auto_write(
             event.raw_content, threshold=dedup_threshold,
         )
@@ -217,7 +235,7 @@ class AutoOrganizer:
                 SharedMemoryStatus.LOW_CONFIDENCE,
                 confidence=min(confidence, 0.44),
             )
-            self.store.append_record(record)
+            self._append_record(record)
             reason = override_policy["blocked_reason"]
             actions.append({
                 "action": "manual_override_conflict_candidate",
@@ -231,7 +249,11 @@ class AutoOrganizer:
                 reason=reason,
             )
             return record, actions
-        duplicates = self._find_duplicates(event.raw_content, threshold=dedup_threshold)
+        duplicates = self._find_duplicates(
+            event.raw_content, threshold=dedup_threshold,
+            injection_policy=incoming_policy,
+            assignments=incoming_assignments,
+        )
 
         # 3-semantic. Jaccard 没找到时，尝试 semantic 检查（跨语言/改写）
         # 若 Jaccard 低但 semantic 高，以 semantic 为准
@@ -241,7 +263,12 @@ class AutoOrganizer:
                 event.raw_content, threshold=dedup_threshold,
             )
             if sem_dups:
-                duplicates = [d["record"] for d in sem_dups]
+                duplicates = [
+                    d["record"] for d in sem_dups
+                    if self.store.record_domain_overlaps(
+                        d["record"], incoming_policy, incoming_assignments,
+                    )
+                ]
                 semantic_matched = True
                 actions.append({
                     "action": "semantic_match",
@@ -259,7 +286,7 @@ class AutoOrganizer:
                         event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
                         confidence=confidence,
                     )
-                    self.store.append_record(record)
+                    self._append_record(record)
                     actions.append({"action": "propose_only",
                                     "reason": "write policy is propose_only"})
                     return record, actions
@@ -269,7 +296,7 @@ class AutoOrganizer:
                         event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
                         confidence=confidence,
                     )
-                    self.store.append_record(record)
+                    self._append_record(record)
                     member_ids = [old.memory_id, record.memory_id]
                     explanation = self._explain_conflict(
                         event.raw_content, [old])
@@ -282,7 +309,7 @@ class AutoOrganizer:
                     event, kind, SharedMemoryStatus.ACTIVE,
                     supersedes=[old.memory_id], confidence=confidence,
                 )
-                self.store.append_record(record)
+                self._append_record(record)
                 self.store.supersede(old.memory_id, record.memory_id,
                                       "auto_supersede: correction")
                 actions.append({"action": "supersede", "old_id": old.memory_id})
@@ -297,14 +324,14 @@ class AutoOrganizer:
                         event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
                         confidence=confidence,
                     )
-                    self.store.append_record(record)
+                    self._append_record(record)
                     actions.append({"action": "propose_only",
                                     "reason": "write policy is propose_only"})
                     return record, actions
                 record = self._create_record(
                     event, kind, SharedMemoryStatus.CONFLICTED, confidence=confidence,
                 )
-                self.store.append_record(record)
+                self._append_record(record)
                 member_ids = [old.memory_id for old in duplicates] + [record.memory_id]
                 explanation = self._explain_conflict(event.raw_content, duplicates)
                 group_id = self.store.conflict(member_ids, explanation)
@@ -318,7 +345,7 @@ class AutoOrganizer:
                         event, kind, SharedMemoryStatus.LOW_CONFIDENCE,
                         confidence=confidence,
                     )
-                    self.store.append_record(record)
+                    self._append_record(record)
                     actions.append({"action": "propose_only",
                                     "reason": "write policy is propose_only"})
                     return record, actions
@@ -341,7 +368,7 @@ class AutoOrganizer:
         else:
             status = SharedMemoryStatus.LOW_CONFIDENCE if confidence < 0.45 else SharedMemoryStatus.ACTIVE
         record = self._create_record(event, kind, status, confidence=confidence)
-        self.store.append_record(record)
+        self._append_record(record)
         actions.append({"action": "create_low_confidence" if status == SharedMemoryStatus.LOW_CONFIDENCE else "create_active"})
 
         # 5. 压缩检查
@@ -355,6 +382,14 @@ class AutoOrganizer:
             actions.append(derive_action)
 
         return record, actions
+
+    def _append_record(self, record: SharedMemoryRecord) -> None:
+        self.store.append_record(
+            record,
+            assignments=list(
+                getattr(self, "_active_rule_assignments", []) or []
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 分类
@@ -459,8 +494,11 @@ class AutoOrganizer:
     # 去重
     # ------------------------------------------------------------------
 
-    def _find_duplicates(self, content: str,
-                         threshold: float = 0.85) -> list[SharedMemoryRecord]:
+    def _find_duplicates(
+        self, content: str, threshold: float = 0.85, *,
+        injection_policy: str = "relevant",
+        assignments: list[Any] | None = None,
+    ) -> list[SharedMemoryRecord]:
         """查找与 content 相似的已有 active 记录。
 
         使用简单的 Jaccard 相似度（基于字符/词集合）。
@@ -473,6 +511,10 @@ class AutoOrganizer:
             return []
         duplicates: list[tuple[float, SharedMemoryRecord]] = []
         for rec in active_records:
+            if not self.store.record_domain_overlaps(
+                rec, injection_policy, assignments or [],
+            ):
+                continue
             rec_tokens = self._tokenize(rec.body)
             if not rec_tokens:
                 continue
@@ -574,8 +616,7 @@ class AutoOrganizer:
         memory_id = stable_hash("mem", event.raw_content, event.agent_instance_id,
                                 _now_iso())
         meta = event.metadata if isinstance(event.metadata, dict) else {}
-        rel = str(meta.get("relative_path") or "").strip().replace("\\", "/")
-        source_object_id = f"share-file:{rel}" if rel else event.event_id
+        source_object_id = share_file_source_key(meta) or event.event_id
         locator = str(meta.get("locator") or "event")
         return SharedMemoryRecord(
             memory_id=memory_id,
@@ -591,6 +632,8 @@ class AutoOrganizer:
             )],
             supersedes=supersedes or [],
             locked=False,
+            injection_policy=getattr(event, "injection_policy", "relevant"),
+            priority=getattr(event, "priority", 0),
             created_at=_now_iso(),
             updated_at=_now_iso(),
             agent_instance_id=event.agent_instance_id,

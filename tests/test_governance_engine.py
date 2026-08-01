@@ -17,7 +17,10 @@ from memoryguard.schema_v3 import (
 from memoryguard.shared_memory_store import SharedMemoryStore
 
 
-def _record(memory_id: str = "memory-a") -> SharedMemoryRecord:
+def _record(
+    memory_id: str = "memory-a",
+    agent_instance_id: str = "",
+) -> SharedMemoryRecord:
     return SharedMemoryRecord(
         memory_id=memory_id,
         body="长期偏好：使用 pytest",
@@ -25,6 +28,7 @@ def _record(memory_id: str = "memory-a") -> SharedMemoryRecord:
         status=SharedMemoryStatus.ACTIVE,
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
+        agent_instance_id=agent_instance_id,
     )
 
 
@@ -203,7 +207,9 @@ def test_gui_and_mcp_mutations_delegate_to_engine(
     api.delete_quarantine("q", "group-a", _admin_override=True)
 
     AgentBindingStore(tmp_path).bind_agent("agent-a", "group-a")
-    SharedMemoryStore(tmp_path, "group-a").update_record(_record("mcp-memory"))
+    SharedMemoryStore(tmp_path, "group-a").update_record(
+        _record("mcp-memory", "agent-a")
+    )
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")

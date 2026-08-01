@@ -13,7 +13,14 @@ from typing import Any
 
 from .memory_ir import MemoryIR
 from .policies import _jaccard, _tokenize
-from .schema_v3 import MemoryKind, MemoryRecord, MemoryStatus, Provenance, stable_hash
+from .schema_v3 import (
+    Completeness,
+    MemoryKind,
+    MemoryRecord,
+    MemoryStatus,
+    Provenance,
+    stable_hash,
+)
 
 MERGE_THRESHOLD = 0.85
 DISTILLER_VERSION = "distiller-v1"
@@ -28,7 +35,9 @@ class DistilledGroup:
     kind: str
     title: str
     body: str
+    scope: str = "project"
     source_record_ids: list[str] = field(default_factory=list)
+    completeness: str = Completeness.VERIFIABLE.value
     provenance: list[dict[str, Any]] = field(default_factory=list)
     confidence: float = 0.5
     rationale: str = ""
@@ -40,7 +49,9 @@ class DistilledGroup:
             "kind": self.kind,
             "title": self.title,
             "body": self.body,
+            "scope": self.scope,
             "source_record_ids": list(self.source_record_ids),
+            "completeness": self.completeness,
             "provenance": list(self.provenance),
             "confidence": self.confidence,
             "rationale": self.rationale,
@@ -54,7 +65,9 @@ class DistilledGroup:
             kind=data["kind"],
             title=data["title"],
             body=data["body"],
+            scope=data.get("scope", "project"),
             source_record_ids=list(data.get("source_record_ids", [])),
+            completeness=data.get("completeness", Completeness.VERIFIABLE.value),
             provenance=list(data.get("provenance", [])),
             confidence=float(data.get("confidence", 0.5)),
             rationale=data.get("rationale", ""),
@@ -107,6 +120,25 @@ def _pick_primary(records: list[MemoryRecord]) -> MemoryRecord:
     return max(records, key=lambda r: (len(r.body), r.confidence))
 
 
+def _record_scope(rec: MemoryRecord) -> str:
+    scope = str(getattr(rec, "scope", "project") or "project")
+    return scope if scope else "project"
+
+
+def _record_completeness(rec: MemoryRecord) -> str:
+    completeness = getattr(rec, "completeness", Completeness.VERIFIABLE)
+    if hasattr(completeness, "value"):
+        return completeness.value
+    return str(completeness)
+
+
+def _combined_completeness(records: list[MemoryRecord]) -> str:
+    values = {_record_completeness(r) for r in records}
+    if len(values) == 1:
+        return values.pop()
+    return Completeness.UNVERIFIABLE.value
+
+
 def _truncate_title(title: str) -> str:
     title = title.strip()
     if len(title) <= MAX_TITLE_LEN:
@@ -150,17 +182,28 @@ def _build_group(member_records: list[MemoryRecord], *, rationale: str) -> Disti
     ]
     group_id = stable_hash("distilled-group", *sorted(member_ids))
     avg_conf = sum(r.confidence for r in member_records) / len(member_records)
+    scope = _record_scope(primary)
+    if not all(_record_scope(r) == scope for r in member_records):
+        scope = "ambiguous"
     return DistilledGroup(
         group_id=group_id,
         kind=primary.kind.value if hasattr(primary.kind, "value") else str(primary.kind),
+        scope=scope,
         title=_truncate_title(primary.title),
         body=_extract_core_body(primary.body),
         source_record_ids=member_ids,
         provenance=_merge_provenance(member_records),
+        completeness=_combined_completeness(member_records),
         confidence=avg_conf,
         rationale=rationale,
         enrichment_mode="rule",
     )
+
+
+def _can_merge_records(a: MemoryRecord, b: MemoryRecord) -> bool:
+    if a.kind != b.kind:
+        return False
+    return _record_scope(a) == _record_scope(b)
 
 
 class MemoryDistiller:
@@ -184,13 +227,21 @@ class MemoryDistiller:
             members = [record_map[mid] for mid in dup.member_ids if mid in record_map and _is_publishable(record_map[mid])]
             if len(members) < 2:
                 continue
-            primary = _pick_primary(members)
-            merged_ids = [r.memory_id for r in members]
-            for mid in merged_ids:
-                if mid != primary.memory_id:
-                    redundant.append(mid)
-                assigned.add(mid)
-            groups.append(_build_group(members, rationale="merged_from_duplicate_group"))
+            by_signature: dict[tuple[str, str], list[MemoryRecord]] = {}
+            for rec in members:
+                key = (_record_scope(rec), rec.kind.value if hasattr(rec.kind, "value") else str(rec.kind))
+                by_signature.setdefault(key, []).append(rec)
+            for bucket in by_signature.values():
+                if len(bucket) >= 2:
+                    for rec in bucket:
+                        if rec.memory_id != _pick_primary(bucket).memory_id:
+                            redundant.append(rec.memory_id)
+                        assigned.add(rec.memory_id)
+                    groups.append(_build_group(bucket, rationale="merged_from_duplicate_group"))
+                else:
+                    rec = bucket[0]
+                    groups.append(_build_group([rec], rationale="single_record"))
+                    assigned.add(rec.memory_id)
 
         remaining = [r for r in eligible if r.memory_id not in assigned]
         remaining.sort(key=lambda r: r.memory_id)
@@ -200,6 +251,9 @@ class MemoryDistiller:
             still_remaining: list[MemoryRecord] = []
             seed_tokens = _tokenize(f"{seed.title} {seed.body}")
             for other in remaining:
+                if not _can_merge_records(seed, other):
+                    still_remaining.append(other)
+                    continue
                 other_tokens = _tokenize(f"{other.title} {other.body}")
                 if _jaccard(seed_tokens, other_tokens) >= MERGE_THRESHOLD:
                     cluster.append(other)
@@ -216,6 +270,8 @@ class MemoryDistiller:
             else:
                 assigned.add(seed.memory_id)
                 groups.append(_build_group([seed], rationale="single_record"))
+
+        # 兼容旧行为：若 cluster 组内剩余 seed 仍为空，不再添加重复记录。
 
         output_count = len(groups)
         ratio = round(output_count / input_count, 4) if input_count else 1.0

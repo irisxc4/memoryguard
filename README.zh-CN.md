@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard 治理台：已整理的共享记忆、覆盖关系和版本回滚历史" width="960" />
+  <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard 桌面治理台：可导航的神经图、记忆分类、风险信号和治理入口" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.1</h1>
+<h1 align="center">MemoryGuard v0.3.2</h1>
 
 <p align="center">
   <strong>多个编程 Agent 共享记忆，不共享混乱。</strong><br />
@@ -57,6 +57,23 @@ Agent 写入记忆
 
 治理台**不是审批队列**。Agent 不必停下来等待；你只在真正需要时基于证据治理结果。
 
+## 规则与习惯、对话历史
+
+两个视图刻意分层，不能混为一层记忆：
+
+| 视图 | 用途 | 注入行为 |
+|---|---|---|
+| **规则与习惯** | 受治理的长期偏好、流程、纠错，以及带对象范围的强制规则 | 强制规则只注入被分配的 Agent / 项目 / Provider / 运行角色；普通记录按需召回 |
+| **对话历史** | 本地原文证据归档；个人查询严格隔离，活跃共享组成员可互查 | 永远不会进入 bootstrap；神经元图仅展示项目 → Agent → 会话的安全元数据索引 |
+
+历史必须按 **检索结果 → 有界时间线 → 单条原文/会话** 逐级读取。`萃取预览`只给出带证据的长期记忆候选，绝不自动写入；确认治理后才走正常记忆写入路径。Hook 只归档已验证宿主 seam 实际提供的 payload，尊重私密/禁用标记；拿不到 assistant 原文时会报告覆盖缺口，不会猜造内容。共享历史由服务端按当前活跃 binding 动态授权：活跃成员可查，离组立即撤权；共享可查不等于共享可删，删除始终只允许会话 owner。
+
+<p align="center">
+  <img src="docs/assets/gui-validation-current.png" alt="MemoryGuard 桌面治理台的交互式神经图与本地治理导航" width="960" />
+</p>
+
+神经图是可治理的视图：选中节点即可查看和管理对应记录，不会把原始对话历史变成注入记忆。
+
 ## 60 秒安装
 
 ```bash
@@ -95,8 +112,10 @@ pip install "agent-memguard[gui]"
 ## 你能治理什么
 
 <p align="center">
-  <img src="docs/assets/governance-evidence.png" alt="MemoryGuard 的冲突、敏感内容隔离、覆盖链与版本历史证据视图" width="900" />
+  <img src="docs/assets/x-launch-real-gui-v4.png" alt="MemoryGuard 桌面端的数据源授权界面：治理分类与显式勾选树" width="960" />
 </p>
+
+数据源需要显式授权：原生记忆可在备份后纳入治理；普通文档在你选择萃取前始终只是只读证据。
 
 | 信号 | 你可以做什么 |
 |---|---|
@@ -168,6 +187,13 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 
 </details>
 
+### 强制规则
+
+`memoryguard_memory_write` 默认 `injection_policy="relevant"`。只有用户明确要求
+长期“规则/必须/默认长期遵循/强制”时才写 `always`（可选有界 `priority`）；不得把所有
+procedure 自动升为强制。`memoryguard_memory_update` 可切换策略。bootstrap 先以独立预算
+注入强制规则，再召回相关记忆；强制包敏感或超限会失败封闭。GUI 可改回按需、删除或恢复。
+
 ## 隐私与安全边界
 
 - MemoryGuard 以本地 MCP stdio 服务运行；不需要账号、远端服务器或遥测。
@@ -182,6 +208,17 @@ MemoryGuard 是面向编程 Agent 的**本地 MCP 记忆后端与治理台**。�
 - **之后：** 在需求被验证后探索团队与企业能力；不承诺具体日期。
 
 ## 更新日志
+
+### v0.3.2（2026-07-29）
+
+- 强制 Hook 的 stdin、stdout、stderr 使用 UTF-8，避免 Windows 默认 GBK
+  破坏中文上下文
+- 按 Codex 官方格式写入 `commandWindows`，并让所有 Hook 使用 Python
+  UTF-8 模式启动
+- 运行回执绑定当前 Hook 配置哈希，命令变化后不再沿用旧的
+  `operational` 状态
+- 将压缩前的待沉淀记忆提醒延后到
+  `SessionStart(source="compact")`，严格匹配 Codex 事件输出契约
 
 ### v0.3.1（2026-07-29）
 

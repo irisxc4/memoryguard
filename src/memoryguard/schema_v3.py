@@ -18,6 +18,23 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+
+INJECTION_POLICIES = frozenset({"relevant", "always"})
+PRIORITY_MIN = -100
+PRIORITY_MAX = 100
+
+
+def validate_injection_settings(injection_policy: Any, priority: Any) -> tuple[str, int]:
+    """Validate persisted injection settings at mutation boundaries."""
+    if not isinstance(injection_policy, str) or injection_policy not in INJECTION_POLICIES:
+        raise ValueError("injection_policy must be one of: always, relevant")
+    # bool is an int subclass but never a meaningful explicit priority.
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise ValueError(f"priority must be an integer between {PRIORITY_MIN} and {PRIORITY_MAX}")
+    if not PRIORITY_MIN <= priority <= PRIORITY_MAX:
+        raise ValueError(f"priority must be between {PRIORITY_MIN} and {PRIORITY_MAX}")
+    return injection_policy, priority
 import hashlib
 import json
 
@@ -1113,6 +1130,8 @@ class SharedMemoryRecord:
     supersedes: list[str] = field(default_factory=list)
     conflict_group_id: str = ""
     locked: bool = False
+    injection_policy: str = "relevant"
+    priority: int = 0
     created_at: str = ""
     updated_at: str = ""
     agent_instance_id: str = ""  # 写入来源 Agent
@@ -1128,6 +1147,8 @@ class SharedMemoryRecord:
             "supersedes": list(self.supersedes),
             "conflict_group_id": self.conflict_group_id,
             "locked": self.locked,
+            "injection_policy": self.injection_policy,
+            "priority": self.priority,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "agent_instance_id": self.agent_instance_id,
@@ -1146,9 +1167,149 @@ class SharedMemoryRecord:
             supersedes=list(data.get("supersedes", [])),
             conflict_group_id=data.get("conflict_group_id", ""),
             locked=data.get("locked", False),
+            # Old v3 records did not persist injection settings: keep their
+            # historical task-relevant behaviour by default.
+            injection_policy=data.get("injection_policy", "relevant"),
+            priority=data.get("priority", 0),
             created_at=data.get("created_at", ""),
             updated_at=data.get("updated_at", ""),
             agent_instance_id=data.get("agent_instance_id", ""),
+        )
+
+
+@dataclass(frozen=True)
+class EffectiveAgentContext:
+    """Trusted runtime identity used only to select mandatory-rule audience.
+
+    ``agent_instance_id`` on a record is intentionally *not* reused here: it
+    remains immutable provenance (the writer), while this object describes the
+    agent which is about to receive a rule packet.
+    """
+    agent_instance_id: str
+    share_group_id: str
+    provider: str = ""
+    project_ref: str = ""
+    runtime_role: str = ""
+    runtime_agent_id: str = ""
+    parent_agent_id: str = ""
+
+
+@dataclass(frozen=True)
+class RuleAssignment:
+    """Audience relation for an ``always`` record; one record may have many."""
+    memory_id: str
+    target_type: str
+    target_id: str = ""
+    project_ref: str = ""
+    effect: str = "include"
+    priority_override: int | None = None
+    created_at: str = ""
+    updated_at: str = ""
+
+    @property
+    def assignment_id(self) -> str:
+        return stable_hash(
+            "rule-assignment", self.memory_id, self.target_type,
+            self.target_id, self.project_ref, self.effect,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assignment_id": self.assignment_id,
+            "memory_id": self.memory_id, "target_type": self.target_type,
+            "target_id": self.target_id, "project_ref": self.project_ref,
+            "effect": self.effect, "priority_override": self.priority_override,
+            "created_at": self.created_at, "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class RuleMatchReceipt:
+    """A per-bootstrap match record for an injected rule.
+
+    The receipt is immutable and never replaces source memory data.  It enables
+    explicit feedback from hosts/agents without inferring obedience from "tool
+    call happened".
+    """
+    receipt_id: str
+    memory_id: str
+    share_group_id: str
+    agent_instance_id: str
+    task_hash: str
+    task: str
+    assignment_ids: list[str] = field(default_factory=list)
+    selection_reason: str = ""
+    matcher_version: str = "rule-bootstrap-v1"
+    confidence: float = 1.0
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "memory_id": self.memory_id,
+            "share_group_id": self.share_group_id,
+            "agent_instance_id": self.agent_instance_id,
+            "task_hash": self.task_hash,
+            "task": self.task,
+            "assignment_ids": list(self.assignment_ids),
+            "selection_reason": self.selection_reason,
+            "matcher_version": self.matcher_version,
+            "confidence": self.confidence,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleMatchReceipt":
+        return cls(
+            receipt_id=data["receipt_id"],
+            memory_id=data["memory_id"],
+            share_group_id=data.get("share_group_id", ""),
+            agent_instance_id=data.get("agent_instance_id", ""),
+            task_hash=data["task_hash"],
+            task=data.get("task", ""),
+            assignment_ids=list(data.get("assignment_ids", [])),
+            selection_reason=data.get("selection_reason", ""),
+            matcher_version=data.get("matcher_version", "rule-bootstrap-v1"),
+            confidence=float(data.get("confidence", 1.0)),
+            created_at=data.get("created_at", ""),
+        )
+
+
+@dataclass
+class RuleMatchFeedback:
+    """Explicit feedback for one match receipt.
+
+    outcome: followed|violated|not_applicable|corrected|exception|ignored
+    """
+    feedback_id: str
+    receipt_id: str
+    outcome: str
+    actor: str
+    evidence: str = ""
+    confidence: float = 1.0
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "feedback_id": self.feedback_id,
+            "receipt_id": self.receipt_id,
+            "outcome": self.outcome,
+            "actor": self.actor,
+            "evidence": self.evidence,
+            "confidence": self.confidence,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuleMatchFeedback":
+        return cls(
+            feedback_id=data["feedback_id"],
+            receipt_id=data["receipt_id"],
+            outcome=data["outcome"],
+            actor=data.get("actor", ""),
+            evidence=data.get("evidence", ""),
+            confidence=float(data.get("confidence", 1.0)),
+            created_at=data.get("created_at", ""),
         )
 
 

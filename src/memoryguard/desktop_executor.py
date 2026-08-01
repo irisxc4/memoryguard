@@ -148,7 +148,13 @@ class RequestExecutor:
                     args.append(sig.parameters[param_name].default)
                 args[confirmed_idx] = True  # 桌面端确认后注入
 
-            result = fn(*args) if args else fn()
+            # The request reached this executor only after a user-confirmed
+            # desktop flow.  `_admin_override` remains an internal keyword,
+            # never something stored in untrusted request args.
+            kwargs = {}
+            if "_admin_override" in sig.parameters:
+                kwargs["_admin_override"] = True
+            result = fn(*args, **kwargs) if args else fn(**kwargs)
             result = result if result is not None else {}
             if isinstance(result, dict) and result.get("error"):
                 return {"ok": False, "result": result, "error": result["error"]}

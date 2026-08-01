@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -194,6 +195,63 @@ class TestRequestQueue:
 
 class TestDesktopExecutor:
     """桌面执行器测试。"""
+
+    def test_executor_override_is_internal_keyword_only(self, tmp_path, monkeypatch):
+        """队列只因已确认桌面执行器而获得 override，参数列表不能提供它。"""
+        import memoryguard.gui as gui_module
+        from memoryguard.desktop_executor import RequestExecutor
+
+        captured = {}
+
+        class FakeGovernanceApi:
+            def __init__(self, workspace):
+                captured["workspace"] = workspace
+
+            def commit_shared_memory_governance(
+                self, group_id="", reason="", confirmed=False, *, _admin_override=False,
+            ):
+                captured.update({
+                    "group_id": group_id,
+                    "reason": reason,
+                    "confirmed": confirmed,
+                    "admin_override": _admin_override,
+                })
+                return {"ok": confirmed and _admin_override}
+
+        monkeypatch.setattr(gui_module, "GovernanceApi", FakeGovernanceApi)
+        request = SimpleNamespace(
+            method="commit_shared_memory_governance",
+            args=["group", "desktop", False],
+        )
+        result = RequestExecutor(tmp_path).execute(request)
+
+        assert result["ok"] is True
+        assert captured == {
+            "workspace": str(tmp_path.resolve()),
+            "group_id": "group",
+            "reason": "desktop",
+            "confirmed": True,
+            "admin_override": True,
+        }
+
+    def test_confirmed_executor_injects_admin_override_for_takeover(self, tmp_path, monkeypatch):
+        """桌面确认队列可完成共享接管，普通直接 API 仍没有 admin capability。"""
+        from memoryguard.desktop_executor import RequestExecutor
+        from memoryguard.security import RequestQueue
+        from memoryguard.shared_memory_store import SharedMemoryStore
+
+        monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+        group_id = "executor-takeover-group"
+        SharedMemoryStore(tmp_path, group_id)
+        queue = RequestQueue(tmp_path)
+        request = queue.submit(
+            "commit_shared_memory_governance", [group_id, "desktop confirmed", True],
+        )
+
+        result = RequestExecutor(tmp_path).execute(request)
+
+        assert result["ok"] is True, result
+        assert result["result"].get("version_id")
 
     def test_confirmed_injection_spy(self, tmp_path):
         """spy 测试：验证 confirmed=True 被正确注入到绑定方法。
@@ -699,6 +757,55 @@ class TestSafeBridgeApi:
         assert result.get("ok") is True
         assert "request" in result
         assert "message" in result
+
+    def test_direct_takeover_injects_admin_override_only_for_trusted_bridge(self, tmp_path, monkeypatch):
+        """原生 GUI 已确认路径可提交接管；直接 API 仍必须要求 admin capability。"""
+        from memoryguard.gui import GovernanceApi, SafeBridgeApi
+        from memoryguard.shared_memory_store import SharedMemoryStore
+
+        monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+        group_id = "bridge-takeover-group"
+        SharedMemoryStore(tmp_path, group_id)
+
+        # 用户脚本、MCP/CLI 直接调用不能伪造桌面确认能力。
+        direct = GovernanceApi(str(tmp_path)).commit_shared_memory_governance(
+            group_id, "direct", confirmed=True,
+        )
+        assert direct["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
+
+        # 原生窗口内部桥接（direct_mutations=True）才可注入 keyword-only override。
+        bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
+        result = bridge.request_mutation(
+            "commit_shared_memory_governance", [group_id, "trusted bridge", True],
+        )
+        assert result.get("ok") is True, result
+        assert result.get("version_id")
+
+        # Non-native bridge stays an untrusted caller even when it supplies the
+        # same positional confirmation value.
+        from memoryguard import security
+        monkeypatch.setattr(security, "detect_sandbox_mode", lambda: False)
+        untrusted = SafeBridgeApi(str(tmp_path), direct_mutations=False)
+        denied = untrusted.request_mutation(
+            "commit_shared_memory_governance", [group_id, "untrusted", True],
+        )
+        assert denied["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
+
+    def test_direct_bridge_does_not_override_regular_mutation_signature(self, tmp_path, monkeypatch):
+        """没有 _admin_override 的方法仍按原签名调用。"""
+        from memoryguard.gui import SafeBridgeApi
+
+        bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
+        seen = {}
+
+        def ordinary(confirmed=False):
+            seen["confirmed"] = confirmed
+            return {"ok": True}
+
+        monkeypatch.setattr(bridge._inner, "build_projection", ordinary)
+        result = bridge.request_mutation("build_projection", [])
+        assert result == {"ok": True}
+        assert seen == {"confirmed": True}
 
 
 class TestUriWakeup:

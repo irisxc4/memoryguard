@@ -32,11 +32,15 @@ from .schema_v3 import (
     DecisionEvent,
     MemoryEvent,
     QuarantineEntry,
-    SharedMemoryRecord, SharedMemoryStatus,
+    EffectiveAgentContext, SharedMemoryRecord, SharedMemoryStatus,
     MemoryKind, MemoryStatus,
     Provenance,
-    stable_hash, _now_iso,
+    stable_hash, _now_iso, validate_injection_settings,
+    RuleAssignment,
+    RuleMatchFeedback,
+    RuleMatchReceipt,
 )
+from .rule_scope import effective_assignments, normalize_assignment
 
 
 _SCHEMA = """
@@ -52,15 +56,60 @@ CREATE TABLE IF NOT EXISTS records (
     confidence REAL NOT NULL DEFAULT 0.5,
     conflict_group_id TEXT DEFAULT '',
     locked INTEGER NOT NULL DEFAULT 0,
+    injection_policy TEXT NOT NULL DEFAULT 'relevant',
+    priority INTEGER NOT NULL DEFAULT 0,
     supersedes TEXT DEFAULT '[]',
     provenance TEXT DEFAULT '[]',
     agent_instance_id TEXT DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    canonical_hash TEXT DEFAULT ''
+    canonical_hash TEXT DEFAULT '',
+    dedup_domain TEXT NOT NULL DEFAULT 'relevant'
 );
 CREATE INDEX IF NOT EXISTS idx_records_canonical_hash ON records(canonical_hash);
 CREATE INDEX IF NOT EXISTS idx_records_status ON records(status);
+CREATE TABLE IF NOT EXISTS rule_assignments (
+    memory_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    effect TEXT NOT NULL DEFAULT 'include',
+    priority_override INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, target_type, target_id, project_ref, effect),
+    FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory ON rule_assignments(memory_id);
+CREATE TABLE IF NOT EXISTS rule_match_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    share_group_id TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL,
+    task_hash TEXT NOT NULL,
+    task TEXT NOT NULL,
+    assignment_ids TEXT NOT NULL DEFAULT '[]',
+    selection_reason TEXT NOT NULL DEFAULT '',
+    matcher_version TEXT NOT NULL DEFAULT 'rule-bootstrap-v1',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_share_group ON rule_match_receipts(share_group_id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_agent ON rule_match_receipts(agent_instance_id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_task ON rule_match_receipts(task_hash);
+CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
+    feedback_id TEXT PRIMARY KEY,
+    receipt_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    UNIQUE(receipt_id),
+    FOREIGN KEY (receipt_id) REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt ON rule_match_feedbacks(receipt_id);
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     agent_instance_id TEXT NOT NULL,
@@ -126,12 +175,35 @@ CREATE TRIGGER IF NOT EXISTS records_au AFTER UPDATE ON records BEGIN
 END;
 """
 
+_RULE_ASSIGNMENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rule_assignments (
+    memory_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    effect TEXT NOT NULL DEFAULT 'include',
+    priority_override INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (memory_id, target_type, target_id, project_ref, effect),
+    FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory ON rule_assignments(memory_id);
+"""
+
 # 允许通过 _update_record_field 更新的列（白名单，防 SQL 注入）
 _RECORD_COLUMNS = {
     "body", "status", "kind", "confidence", "conflict_group_id",
-    "locked", "supersedes", "provenance", "agent_instance_id",
+    "locked", "injection_policy", "priority", "supersedes", "provenance", "agent_instance_id",
     "created_at", "updated_at",
 }
+
+# Mandatory rules never compete with task-relevant recall.  These independent
+# limits keep their bounded context safe and are enforced at mutation time.
+MANDATORY_MAX_ITEMS = 20
+MANDATORY_MAX_CHARS = 12000
+MANDATORY_BROADCAST_MAX_ITEMS = 20
+MANDATORY_BROADCAST_MAX_CHARS = 12000
 
 
 import re as _re
@@ -209,6 +281,9 @@ class SharedMemoryStore:
         self.must_exist = must_exist
         # JSONL 备份路径
         self.records_bak_path = self.root / "records.jsonl"
+        self.rule_assignments_bak_path = self.root / "rule_assignments.jsonl"
+        self.rule_match_receipts_bak_path = self.root / "rule_match_receipts.jsonl"
+        self.rule_match_feedbacks_bak_path = self.root / "rule_match_feedbacks.jsonl"
         self.events_bak_path = self.root / "events.jsonl"
         self.decisions_bak_path = self.root / "decisions.jsonl"
         self.conflicts_bak_path = self.root / "conflicts.jsonl"
@@ -228,6 +303,11 @@ class SharedMemoryStore:
                 raise FileNotFoundError(
                     f"shared memory group not found: {self.group_id}"
                 )
+            # A read-only consumer (MCP read/bootstrap) can be the first
+            # process opened after upgrade.  Upgrade the existing database
+            # before creating immutable/ro query connections; otherwise old
+            # rows lack new columns and sqlite.Row lookup fails at read time.
+            self._migrate_existing_records_schema()
 
     def _ensure_dirs(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -244,6 +324,9 @@ class SharedMemoryStore:
         """全量导出所有 JSONL 备份（可从 memory.db 重建）。"""
         for path, items in [
             (self.records_bak_path, self.list_records()),
+            (self.rule_assignments_bak_path, self.list_rule_assignments()),
+            (self.rule_match_receipts_bak_path, self.list_rule_match_receipts()),
+            (self.rule_match_feedbacks_bak_path, self.list_rule_match_feedbacks()),
             (self.events_bak_path, self.list_events()),
             (self.decisions_bak_path, self.list_decisions()),
             (self.conflicts_bak_path, self.list_conflicts()),
@@ -263,7 +346,14 @@ class SharedMemoryStore:
             # 侧车。干净数据库用 immutable 保证绝对无副作用；已经存在有效
             # WAL 时必须用普通只读模式，才能看见尚未 checkpoint 的最新提交。
             wal_path = Path(f"{self.db_path}-wal")
-            has_live_wal = wal_path.exists() and wal_path.stat().st_size > 0
+            # A checkpoint can remove the sidecar between ``exists`` and
+            # ``stat``.  That narrow race is common on Windows because the
+            # hook/MCP writer lives in another process.  Probe once instead:
+            # a disappearing WAL simply means the main DB is now current.
+            try:
+                has_live_wal = wal_path.stat().st_size > 0
+            except FileNotFoundError:
+                has_live_wal = False
             immutable = "" if has_live_wal else "&immutable=1"
             uri = f"file:{self.db_path}?mode=ro{immutable}"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -334,24 +424,164 @@ class SharedMemoryStore:
 
     def _init_db(self) -> None:
         with self._tx() as conn:
+            # Serialize first-open upgrades with read-only consumers too.  The
+            # column inspection below must happen after this lock is acquired.
+            conn.execute("BEGIN IMMEDIATE")
+            # Existing pre-feature databases need their records columns before
+            # _SCHEMA creates indexes/FTS objects that reference them.
+            had_records = bool(
+                conn.execute("PRAGMA table_info(records)").fetchall()
+            )
+            had_records_fts = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='records_fts'"
+            ).fetchone() is not None
+            self._migrate_records_schema(conn)
             conn.executescript(_SCHEMA)
+            self._migrate_rule_assignments(conn)
+            if had_records and not had_records_fts:
+                # External-content FTS needs an explicit rebuild after it is
+                # first attached to a pre-existing records table; otherwise
+                # its UPDATE trigger can report a malformed index.
+                conn.execute("INSERT INTO records_fts(records_fts) VALUES ('rebuild')")
             # S3.2: schema version 标记(在事务内提交)
             conn.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', '2')"
             )
-            # 迁移:旧 DB 可能缺 canonical_hash 列
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(records)").fetchall()]
-            if "canonical_hash" not in cols:
-                conn.execute("ALTER TABLE records ADD COLUMN canonical_hash TEXT DEFAULT ''")
+            self._migrate_records_schema(conn)
+
+    def _migrate_existing_records_schema(self) -> None:
+        """Transactionally migrate an existing group before read-only access."""
+        uri = f"file:{self.db_path}?mode=rw"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            # Deferred transactions allow two upgraded processes to inspect
+            # the same old columns and race ALTER TABLE.  IMMEDIATE serializes
+            # inspection + migration; the waiting opener re-reads columns.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._migrate_records_schema(conn)
+                conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
+                self._migrate_rule_assignments(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+    def _migrate_records_schema(self, conn: sqlite3.Connection) -> None:
+        """Idempotent, lossless records-column migration on an open DB."""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(records)").fetchall()}
+        if not cols:
+            return
+        if "canonical_hash" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN canonical_hash TEXT DEFAULT ''")
+        if "injection_policy" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN injection_policy TEXT NOT NULL DEFAULT 'relevant'")
+        if "priority" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+        if "dedup_domain" not in cols:
+            conn.execute("ALTER TABLE records ADD COLUMN dedup_domain TEXT NOT NULL DEFAULT 'relevant'")
             # 补填已有记录的 canonical_hash
-            rows = conn.execute(
-                "SELECT memory_id, body FROM records WHERE canonical_hash = '' OR canonical_hash IS NULL"
+        rows = conn.execute(
+            "SELECT memory_id, body FROM records WHERE canonical_hash = '' OR canonical_hash IS NULL"
+        ).fetchall()
+        for row in rows:
+            c_hash = self._canonical_hash(row["body"])
+            conn.execute(
+                "UPDATE records SET canonical_hash = ? WHERE memory_id = ?",
+                (c_hash, row["memory_id"]),
+            )
+
+    def _migrate_rule_assignments(self, conn: sqlite3.Connection) -> None:
+        """Losslessly scope pre-audience mandatory records without broadcasting.
+
+        Historical rows with a writer are converted to that writer's private
+        audience.  Rows without provenance remain deliberately unassigned;
+        bootstrap reports them and fails closed instead of granting a global
+        capability by accident.
+        """
+        # Early audience builds lacked FK enforcement. Rebuild once, dropping
+        # orphan rows while preserving every valid assignment.
+        has_fk = bool(conn.execute("PRAGMA foreign_key_list(rule_assignments)").fetchall())
+        if not has_fk:
+            conn.execute("ALTER TABLE rule_assignments RENAME TO rule_assignments_legacy")
+            conn.executescript(_RULE_ASSIGNMENT_SCHEMA)
+            conn.execute(
+                "INSERT OR IGNORE INTO rule_assignments "
+                "(memory_id,target_type,target_id,project_ref,effect,priority_override,created_at,updated_at) "
+                "SELECT a.memory_id,a.target_type,a.target_id,a.project_ref,a.effect,"
+                "a.priority_override,a.created_at,a.updated_at "
+                "FROM rule_assignments_legacy a JOIN records r ON r.memory_id=a.memory_id"
+            )
+            conn.execute("DROP TABLE rule_assignments_legacy")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory "
+                "ON rule_assignments(memory_id)"
+            )
+        rows = conn.execute(
+            "SELECT memory_id, agent_instance_id FROM records "
+            "WHERE injection_policy='always'"
+        ).fetchall()
+        now = _now_iso()
+        for row in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM rule_assignments WHERE memory_id=? LIMIT 1",
+                (row["memory_id"],),
+            ).fetchone()
+            if exists or not (row["agent_instance_id"] or "").strip():
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO rule_assignments "
+                "(memory_id,target_type,target_id,project_ref,effect,priority_override,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (row["memory_id"], "agent", row["agent_instance_id"], "", "include", None, now, now),
+            )
+        # Canonical body identity remains stable; this domain prevents a
+        # relevant fact and an audience-scoped mandatory rule from collapsing.
+        records = conn.execute(
+            "SELECT memory_id,injection_policy,agent_instance_id,dedup_domain "
+            "FROM records"
+        ).fetchall()
+        changes: list[tuple[str, str]] = []
+        for row in records:
+            assignments = self._list_rule_assignments_conn(
+                conn, row["memory_id"],
+            )
+            domain = self._dedup_domain(
+                row["injection_policy"], assignments,
+                writer_id=row["agent_instance_id"] or "",
+                memory_id=row["memory_id"],
+            )
+            if (row["dedup_domain"] or "relevant") != domain:
+                changes.append((domain, row["memory_id"]))
+        if changes:
+            # External-content FTS update triggers can be malformed on a
+            # pre-feature database until their first rebuild. dedup_domain is
+            # unindexed metadata, so suspend/recreate triggers around migration.
+            trigger_rows = conn.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='records' AND sql IS NOT NULL"
             ).fetchall()
-            for row in rows:
-                c_hash = self._canonical_hash(row["body"])
+            for trigger in trigger_rows:
                 conn.execute(
-                    "UPDATE records SET canonical_hash = ? WHERE memory_id = ?",
-                    (c_hash, row["memory_id"]),
+                    f'DROP TRIGGER IF EXISTS "{trigger["name"]}"'
+                )
+            conn.executemany(
+                "UPDATE records SET dedup_domain=? WHERE memory_id=?",
+                changes,
+            )
+            for trigger in trigger_rows:
+                conn.execute(trigger["sql"])
+            has_fts = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='records_fts'"
+            ).fetchone()
+            if has_fts:
+                conn.execute(
+                    "INSERT INTO records_fts(records_fts) VALUES ('rebuild')"
                 )
 
     @staticmethod
@@ -361,28 +591,257 @@ class SharedMemoryStore:
         normalized = " ".join(body.split()).lower()
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
+    @staticmethod
+    def _assignment_key(item: RuleAssignment) -> tuple[Any, ...]:
+        return (
+            item.target_type, item.target_id, item.project_ref, item.effect,
+            item.priority_override,
+        )
+
+    def _normalize_assignments(
+        self, memory_id: str, assignments: list[dict | RuleAssignment],
+    ) -> list[RuleAssignment]:
+        normalized: dict[tuple[Any, ...], RuleAssignment] = {}
+        for raw in assignments:
+            value = raw.to_dict() if isinstance(raw, RuleAssignment) else dict(raw)
+            value["memory_id"] = memory_id
+            item = normalize_assignment(value)
+            if item.target_type == "group":
+                if item.target_id and item.target_id != self.group_id:
+                    raise ValueError("group audience must target the current shared-memory group")
+                item = RuleAssignment(
+                    memory_id=memory_id, target_type="group",
+                    target_id=self.group_id, project_ref=item.project_ref,
+                    effect=item.effect, priority_override=item.priority_override,
+                )
+            normalized[self._assignment_key(item)] = item
+        return sorted(normalized.values(), key=self._assignment_key)
+
+    def _default_assignments(self, record: SharedMemoryRecord) -> list[RuleAssignment]:
+        if record.injection_policy != "always" or not record.agent_instance_id:
+            return []
+        return [RuleAssignment(
+            memory_id=record.memory_id, target_type="agent",
+            target_id=record.agent_instance_id,
+        )]
+
+    def _dedup_domain(
+        self,
+        injection_policy: str,
+        assignments: list[RuleAssignment],
+        *,
+        writer_id: str = "",
+        memory_id: str = "",
+    ) -> str:
+        if injection_policy != "always":
+            return "relevant"
+        if not assignments:
+            return f"always:legacy-unscoped:{memory_id or writer_id}"
+        material = json.dumps(
+            [self._assignment_key(item) for item in assignments],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return f"always:{stable_hash(material)}"
+
+    def _list_rule_assignments_conn(
+        self, conn: sqlite3.Connection, memory_id: str,
+    ) -> list[RuleAssignment]:
+        rows = conn.execute(
+            "SELECT * FROM rule_assignments WHERE memory_id=? "
+            "ORDER BY target_type,target_id,project_ref,effect",
+            (memory_id,),
+        ).fetchall()
+        return [RuleAssignment(
+            memory_id=row["memory_id"], target_type=row["target_type"],
+            target_id=row["target_id"] or "", project_ref=row["project_ref"] or "",
+            effect=row["effect"] or "include",
+            priority_override=row["priority_override"],
+            created_at=row["created_at"] or "", updated_at=row["updated_at"] or "",
+        ) for row in rows]
+
+    def _insert_assignments(
+        self, conn: sqlite3.Connection, memory_id: str,
+        assignments: list[RuleAssignment],
+    ) -> None:
+        now = _now_iso()
+        for item in assignments:
+            conn.execute(
+                "INSERT OR IGNORE INTO rule_assignments "
+                "(memory_id,target_type,target_id,project_ref,effect,priority_override,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (memory_id, item.target_type, item.target_id, item.project_ref,
+                 item.effect, item.priority_override, now, now),
+            )
+
+    @staticmethod
+    def _safe_json_str_list(value: Any) -> list[str]:
+        items = SharedMemoryStore._safe_json_list(value)
+        return [str(item) for item in items]
+
+    def _row_to_rule_match_receipt(
+        self, row: sqlite3.Row,
+    ) -> RuleMatchReceipt:
+        return RuleMatchReceipt(
+            receipt_id=row["receipt_id"],
+            memory_id=row["memory_id"],
+            share_group_id=row["share_group_id"],
+            agent_instance_id=row["agent_instance_id"],
+            task_hash=row["task_hash"],
+            task=row["task"],
+            assignment_ids=self._safe_json_str_list(row["assignment_ids"]),
+            selection_reason=row["selection_reason"] or "",
+            matcher_version=row["matcher_version"] or "rule-bootstrap-v1",
+            confidence=float(row["confidence"]),
+            created_at=row["created_at"] or "",
+        )
+
+    def _row_to_rule_match_feedback(
+        self, row: sqlite3.Row,
+    ) -> RuleMatchFeedback:
+        return RuleMatchFeedback(
+            feedback_id=row["feedback_id"],
+            receipt_id=row["receipt_id"],
+            outcome=row["outcome"],
+            actor=row["actor"],
+            evidence=row["evidence"] or "",
+            confidence=float(row["confidence"]),
+            created_at=row["created_at"] or "",
+        )
+
+    def _insert_rule_match_receipt(
+        self, conn: sqlite3.Connection, receipt: RuleMatchReceipt,
+    ) -> None:
+        d = receipt.to_dict()
+        conn.execute(
+            "INSERT OR REPLACE INTO rule_match_receipts "
+            "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
+            "assignment_ids,selection_reason,matcher_version,confidence,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                d["receipt_id"], d["memory_id"], d["share_group_id"],
+                d["agent_instance_id"], d["task_hash"], d["task"],
+                json.dumps(d["assignment_ids"], ensure_ascii=False),
+                d["selection_reason"], d["matcher_version"],
+                d["confidence"], d["created_at"],
+            ),
+        )
+
+    def _insert_rule_match_feedback(self, conn: sqlite3.Connection, feedback: RuleMatchFeedback) -> None:
+        d = feedback.to_dict()
+        conn.execute(
+            "INSERT INTO rule_match_feedbacks "
+            "(feedback_id,receipt_id,outcome,actor,evidence,confidence,created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                d["feedback_id"], d["receipt_id"], d["outcome"], d["actor"],
+                d["evidence"], d["confidence"], d["created_at"],
+            ),
+        )
+
+    @staticmethod
+    def _include_assignments(
+        assignments: list[RuleAssignment],
+    ) -> list[RuleAssignment]:
+        return [item for item in assignments if item.effect == "include"]
+
+    def audiences_may_overlap(
+        self,
+        left: list[RuleAssignment],
+        right: list[RuleAssignment],
+    ) -> bool:
+        """Conservative overlap test used by dedup/conflict/supersede."""
+        left_includes = self._include_assignments(left)
+        right_includes = self._include_assignments(right)
+        if not left_includes or not right_includes:
+            return False
+        broad = {"group", "system"}
+        for a in left_includes:
+            for b in right_includes:
+                if a.target_type in broad or b.target_type in broad:
+                    return True
+                if (
+                    a.project_ref and b.project_ref
+                    and a.project_ref != b.project_ref
+                ):
+                    continue
+                if a.target_type == "agent" and b.target_type == "agent":
+                    if a.target_id == b.target_id:
+                        return True
+                    continue
+                if a.target_type == "agent_project" and b.target_type in {
+                    "agent", "agent_project",
+                }:
+                    if a.target_id == b.target_id:
+                        return True
+                    continue
+                if b.target_type == "agent_project" and a.target_type == "agent":
+                    if a.target_id == b.target_id:
+                        return True
+                    continue
+                if (
+                    a.target_type == b.target_type
+                    and a.target_id == b.target_id
+                ):
+                    return True
+                # Different provider/project/role dimensions can coexist.
+                if a.target_type != b.target_type:
+                    return True
+        return False
+
+    def record_domain_overlaps(
+        self,
+        record: SharedMemoryRecord,
+        incoming_policy: str,
+        incoming_assignments: list[RuleAssignment],
+    ) -> bool:
+        if record.injection_policy != incoming_policy:
+            return False
+        if incoming_policy != "always":
+            return True
+        # A duplicate merge retains the existing record's audience.  Overlap is
+        # insufficient here: merging agent A's rule with a group rule would
+        # silently remove one audience.  Only equivalent normalized sets are
+        # therefore mergeable; partially-overlapping rules remain distinct.
+        existing = self._normalize_assignments(
+            record.memory_id, self.list_rule_assignments(record.memory_id),
+        )
+        incoming = self._normalize_assignments(record.memory_id, incoming_assignments)
+        return {
+            self._assignment_key(item) for item in existing
+        } == {
+            self._assignment_key(item) for item in incoming
+        }
+
     # ------------------------------------------------------------------
     # 行 <-> 对象 转换
     # ------------------------------------------------------------------
 
-    def _insert_record(self, conn: sqlite3.Connection, record: SharedMemoryRecord) -> None:
+    def _insert_record(
+        self, conn: sqlite3.Connection, record: SharedMemoryRecord,
+        *, dedup_domain: str | None = None,
+    ) -> None:
         d = record.to_dict()
         # S2.2: 计算 canonical_hash
         c_hash = self._canonical_hash(d.get("body", ""))
         conn.execute(
             """INSERT OR REPLACE INTO records
                (memory_id, body, kind, status, confidence, conflict_group_id, locked,
-                supersedes, provenance, agent_instance_id, created_at, updated_at, canonical_hash)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                injection_policy, priority, supersedes, provenance, agent_instance_id, created_at, updated_at, canonical_hash, dedup_domain)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (d["memory_id"], d["body"], d["kind"], d["status"], d["confidence"],
              d.get("conflict_group_id", ""), 1 if d.get("locked") else 0,
+             d.get("injection_policy", "relevant"), d.get("priority", 0),
              json.dumps(d.get("supersedes", []), ensure_ascii=False),
              json.dumps(d.get("provenance", []), ensure_ascii=False),
              d.get("agent_instance_id", ""), d.get("created_at", ""), d.get("updated_at", ""),
-             c_hash),
+             c_hash, dedup_domain or (
+                 "relevant" if record.injection_policy != "always"
+                 else f"always:legacy-unscoped:{record.memory_id}"
+             )),
         )
 
     def _row_to_record(self, row: sqlite3.Row) -> SharedMemoryRecord:
+        columns = set(row.keys())
         d = {
             "memory_id": row["memory_id"],
             "body": row["body"],
@@ -391,13 +850,154 @@ class SharedMemoryStore:
             "confidence": row["confidence"],
             "conflict_group_id": row["conflict_group_id"] or "",
             "locked": bool(row["locked"]),
-            "supersedes": json.loads(row["supersedes"] or "[]"),
-            "provenance": json.loads(row["provenance"] or "[]"),
+            "injection_policy": (
+                (row["injection_policy"] or "relevant")
+                if "injection_policy" in columns else "relevant"
+            ),
+            "priority": (
+                (row["priority"] if row["priority"] is not None else 0)
+                if "priority" in columns else 0
+            ),
+            "supersedes": self._safe_json_list(row["supersedes"]),
+            "provenance": self._safe_json_list(row["provenance"]),
             "agent_instance_id": row["agent_instance_id"] or "",
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
         return SharedMemoryRecord.from_dict(d)
+
+    @staticmethod
+    def _safe_json_list(value: Any) -> list[Any]:
+        """Read historical JSON without allowing one corrupt row to DoS a group."""
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    def _validate_mandatory_budget(
+        self,
+        record: SharedMemoryRecord,
+        *,
+        assignments: list[RuleAssignment] | None = None,
+        conn: sqlite3.Connection | None = None,
+        replacing_id: str = "",
+    ) -> None:
+        """Reject a prospective active mandatory record before it is stored."""
+        validate_injection_settings(record.injection_policy, record.priority)
+        if (
+            record.status != SharedMemoryStatus.ACTIVE
+            or record.injection_policy != "always"
+        ):
+            return
+        query_conn = conn
+        owns_conn = query_conn is None
+        if query_conn is None:
+            query_conn = self._connect()
+        try:
+            audience = assignments
+            if audience is None:
+                lookup_id = replacing_id or record.memory_id
+                audience = self._list_rule_assignments_conn(query_conn, lookup_id)
+                if not audience:
+                    audience = self._default_assignments(record)
+            includes = [item for item in audience if item.effect == "include"]
+            if not includes:
+                return
+            rows = query_conn.execute(
+                "SELECT memory_id,body FROM records "
+                "WHERE status='active' AND injection_policy='always'"
+            ).fetchall()
+            existing: dict[str, tuple[str, list[RuleAssignment]]] = {}
+            for row in rows:
+                if row["memory_id"] in {record.memory_id, replacing_id}:
+                    continue
+                existing[row["memory_id"]] = (
+                    row["body"] or "",
+                    self._list_rule_assignments_conn(query_conn, row["memory_id"]),
+                )
+
+            broad_types = {"group", "system", "project", "provider", "runtime_role"}
+            broad_existing = {
+                memory_id: body for memory_id, (body, items) in existing.items()
+                if any(item.effect == "include" and item.target_type in broad_types for item in items)
+            }
+            if any(item.target_type in broad_types for item in includes):
+                if (
+                    len(broad_existing) + 1 > MANDATORY_BROADCAST_MAX_ITEMS
+                    or sum(len(body) for body in broad_existing.values()) + len(record.body or "")
+                    > MANDATORY_BROADCAST_MAX_CHARS
+                ):
+                    raise ValueError("mandatory_broadcast_budget_exceeded")
+
+            # Enforce against every potentially matching runtime identity, not
+            # merely same-shaped assignments.  E.g. agent(A)+agent_project(A,p)
+            # has a shared context and must consume one common 20-item budget.
+            all_audiences = [items for _body, items in existing.values()]
+            all_audiences.append(audience)
+            candidates = self._potential_effective_contexts(all_audiences)
+            for context in candidates:
+                incoming_includes, incoming_excludes = effective_assignments(
+                    audience, context,
+                )
+                if not incoming_includes or incoming_excludes:
+                    continue
+                scoped = {
+                    memory_id: body for memory_id, (body, items) in existing.items()
+                    if (matched := effective_assignments(items, context))[0]
+                    and not matched[1]
+                }
+                if (
+                    len(scoped) + 1 > MANDATORY_MAX_ITEMS
+                    or sum(len(body) for body in scoped.values()) + len(record.body or "")
+                    > MANDATORY_MAX_CHARS
+                ):
+                    raise ValueError(
+                        "mandatory_rule_budget_exceeded: "
+                        f"max_items={MANDATORY_MAX_ITEMS}, max_chars={MANDATORY_MAX_CHARS}"
+                    )
+        finally:
+            if owns_conn:
+                query_conn.close()
+
+    def _potential_effective_contexts(
+        self, audiences: list[list[RuleAssignment]],
+    ) -> list[EffectiveAgentContext]:
+        """Finite representatives for all audience matches relevant to a write.
+
+        Assignment predicates are equality tests over four independent runtime
+        dimensions.  Values occurring in a rule plus one non-matching sentinel
+        per dimension fully cover their truth values, so this is exhaustive
+        without guessing identities outside the trusted runtime context.
+        """
+        values: dict[str, set[str]] = {
+            "agent": {"__other_agent__"}, "project": {"__other_project__"},
+            "provider": {"__other_provider__"}, "role": {"__other_role__"},
+        }
+        for assignments in audiences:
+            for item in assignments:
+                if item.target_type in {"agent", "agent_project"} and item.target_id:
+                    values["agent"].add(item.target_id)
+                if item.target_type == "project":
+                    values["project"].add(item.project_ref or item.target_id)
+                elif item.project_ref:
+                    values["project"].add(item.project_ref)
+                if item.target_type == "provider" and item.target_id:
+                    values["provider"].add(item.target_id)
+                if item.target_type == "runtime_role" and item.target_id:
+                    values["role"].add(item.target_id)
+        return [
+            EffectiveAgentContext(
+                agent_instance_id=agent, share_group_id=self.group_id,
+                project_ref=project, provider=provider, runtime_role=role,
+            )
+            for agent in sorted(values["agent"])
+            for project in sorted(values["project"])
+            for provider in sorted(values["provider"])
+            for role in sorted(values["role"])
+        ]
 
     def _insert_event(self, conn: sqlite3.Connection, event: MemoryEvent) -> None:
         d = event.to_dict()
@@ -512,57 +1112,67 @@ class SharedMemoryStore:
                  d.get("created_at", ""), d["event_id"]),
             )
 
-    def append_record(self, record: SharedMemoryRecord) -> None:
-        """P0-C: 追加记忆记录,带并发去重(BEGIN IMMEDIATE + canonical_hash)。
-
-        如果 canonical_hash 已存在 active 记录,merge provenance 而非新建。
-        """
+    def write_rule_with_assignments(
+        self, record: SharedMemoryRecord, *,
+        assignments: list[dict | RuleAssignment] | None = None,
+        decision: DecisionEvent | None = None,
+        dedup_domain: str = "",
+    ) -> SharedMemoryRecord:
+        """Atomically persist record, audience and optional audit decision."""
+        validate_injection_settings(record.injection_policy, record.priority)
+        normalized = self._normalize_assignments(record.memory_id, assignments or [])
+        if record.injection_policy == "always" and not normalized:
+            normalized = self._default_assignments(record)
+        if record.injection_policy != "always" and normalized:
+            raise ValueError("rule assignments require injection_policy=always")
+        domain = dedup_domain or self._dedup_domain(
+            record.injection_policy, normalized,
+            writer_id=record.agent_instance_id, memory_id=record.memory_id,
+        )
         c_hash = self._canonical_hash(record.body)
-        # P0-C: 手动事务(BEGIN IMMEDIATE),不走 _tx()(它会自动 BEGIN)
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            # 查同 canonical_hash 的 active 记录
             existing = conn.execute(
-                "SELECT memory_id, provenance FROM records "
-                "WHERE canonical_hash = ? AND status = 'active' LIMIT 1",
-                (c_hash,),
+                "SELECT memory_id,provenance FROM records "
+                "WHERE canonical_hash=? AND dedup_domain=? "
+                "AND status='active' LIMIT 1",
+                (c_hash, domain),
             ).fetchone()
             if existing:
-                # P0-C: merge provenance(追加到现有记录,不新建)
-                old_provs = json.loads(existing["provenance"] or "[]")
-                new_provs = record.to_dict().get("provenance", [])
-                merged = old_provs + [p for p in new_provs if p not in old_provs]
+                old = json.loads(existing["provenance"] or "[]")
+                new = record.to_dict().get("provenance", [])
+                merged = old + [item for item in new if item not in old]
                 conn.execute(
-                    "UPDATE records SET provenance = ?, updated_at = ? WHERE memory_id = ?",
+                    "UPDATE records SET provenance=?,updated_at=? WHERE memory_id=?",
                     (json.dumps(merged, ensure_ascii=False),
-                     record.to_dict().get("updated_at", ""),
-                     existing["memory_id"]),
+                     record.updated_at, existing["memory_id"]),
                 )
-                conn.commit()
-                # 更新 record 的 memory_id 为已存在的(调用方能感知 merge)
                 record.memory_id = existing["memory_id"]
-                return
-            # 无重复:插入新记录
-            d = record.to_dict()
-            conn.execute(
-                """INSERT OR REPLACE INTO records
-                   (memory_id, body, kind, status, confidence, conflict_group_id, locked,
-                    supersedes, provenance, agent_instance_id, created_at, updated_at, canonical_hash)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (d["memory_id"], d["body"], d["kind"], d["status"], d["confidence"],
-                 d.get("conflict_group_id", ""), 1 if d.get("locked") else 0,
-                 json.dumps(d.get("supersedes", []), ensure_ascii=False),
-                 json.dumps(d.get("provenance", []), ensure_ascii=False),
-                 d.get("agent_instance_id", ""), d.get("created_at", ""), d.get("updated_at", ""),
-                 c_hash),
-            )
+            else:
+                self._validate_mandatory_budget(
+                    record, assignments=normalized, conn=conn,
+                )
+                self._insert_record(conn, record, dedup_domain=domain)
+                self._insert_assignments(conn, record.memory_id, normalized)
+            if decision is not None:
+                self._insert_decision(conn, decision)
             conn.commit()
+            return record
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
+
+    def append_record(
+        self, record: SharedMemoryRecord, *,
+        assignments: list[dict | RuleAssignment] | None = None,
+        dedup_domain: str = "",
+    ) -> None:
+        self.write_rule_with_assignments(
+            record, assignments=assignments, dedup_domain=dedup_domain,
+        )
         self._append_jsonl(self.records_bak_path, record)
 
     def append_decision(self, decision: DecisionEvent) -> None:
@@ -725,10 +1335,334 @@ class SharedMemoryStore:
                 "SELECT * FROM records WHERE memory_id=?", (memory_id,)).fetchone()
         return self._row_to_record(row) if row else None
 
+    def list_rule_assignments(self, memory_id: str | None = None) -> list[RuleAssignment]:
+        sql = "SELECT * FROM rule_assignments"
+        params: tuple[Any, ...] = ()
+        if memory_id:
+            sql += " WHERE memory_id=?"
+            params = (memory_id,)
+        sql += " ORDER BY memory_id, target_type, target_id, project_ref, effect"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [RuleAssignment(
+            memory_id=row["memory_id"], target_type=row["target_type"],
+            target_id=row["target_id"] or "", project_ref=row["project_ref"] or "",
+            effect=row["effect"] or "include", priority_override=row["priority_override"],
+            created_at=row["created_at"] or "", updated_at=row["updated_at"] or "",
+        ) for row in rows]
+
+    def append_rule_match_receipt(
+        self, receipt: RuleMatchReceipt,
+    ) -> RuleMatchReceipt:
+        if receipt.share_group_id != self.group_id:
+            raise ValueError("receipt share group mismatch")
+        if not receipt.receipt_id:
+            raise ValueError("receipt_id is required")
+        now = _now_iso()
+        payload = receipt.to_dict()
+        if not payload["created_at"]:
+            payload["created_at"] = now
+        with self._tx() as conn:
+            record = conn.execute(
+                "SELECT 1 FROM records WHERE memory_id=?", (receipt.memory_id,),
+            ).fetchone()
+            if record is None:
+                raise ValueError("receipt memory_not_found")
+            try:
+                self._insert_rule_match_receipt(conn, RuleMatchReceipt(**{**payload, "created_at": payload["created_at"]}))
+            except sqlite3.IntegrityError:
+                # Idempotent by receipt_id; return existing row directly.
+                row = conn.execute(
+                    "SELECT * FROM rule_match_receipts WHERE receipt_id=?",
+                    (receipt.receipt_id,),
+                ).fetchone()
+                if row is None:
+                    raise
+                return self._row_to_rule_match_receipt(row)
+        return self.get_rule_match_receipt(receipt.receipt_id)
+
+    def get_rule_match_receipt(
+        self, receipt_id: str,
+    ) -> RuleMatchReceipt | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_match_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_rule_match_receipt(row)
+
+    def list_rule_match_receipts(
+        self,
+        *,
+        memory_id: str | None = None,
+        agent_instance_id: str | None = None,
+        task_hash: str | None = None,
+        share_group_id: str | None = None,
+    ) -> list[RuleMatchReceipt]:
+        sql = "SELECT * FROM rule_match_receipts"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if memory_id:
+            clauses.append("memory_id=?")
+            params.append(memory_id)
+        if agent_instance_id:
+            clauses.append("agent_instance_id=?")
+            params.append(agent_instance_id)
+        if task_hash:
+            clauses.append("task_hash=?")
+            params.append(task_hash)
+        if share_group_id:
+            clauses.append("share_group_id=?")
+            params.append(share_group_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_match_receipt(row) for row in rows]
+
+    def append_rule_match_feedback(
+        self,
+        feedback: RuleMatchFeedback,
+    ) -> RuleMatchFeedback:
+        if not feedback.receipt_id:
+            raise ValueError("receipt_id is required")
+        allowed = {
+            "followed", "violated", "not_applicable", "corrected",
+            "exception", "ignored",
+        }
+        if feedback.outcome not in allowed:
+            raise ValueError("invalid feedback outcome")
+        if feedback.actor is None or str(feedback.actor).strip() == "":
+            raise ValueError("actor is required")
+        now = _now_iso()
+        payload = feedback.to_dict()
+        if not payload["created_at"]:
+            payload["created_at"] = now
+        actor = str(payload["actor"] or "").strip()
+        if not actor:
+            raise ValueError("actor is required")
+        payload["actor"] = actor
+        feedback_id = payload["feedback_id"] or stable_hash(
+            "rule-feedback", payload["receipt_id"], payload["outcome"],
+            actor, payload["evidence"], payload["created_at"],
+        )
+        payload["feedback_id"] = feedback_id
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rule_match_receipts WHERE receipt_id=?",
+                (feedback.receipt_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("receipt_not_found")
+            try:
+                self._insert_rule_match_feedback(
+                    conn, RuleMatchFeedback(**{**payload, "feedback_id": feedback_id}),
+                )
+            except sqlite3.IntegrityError:
+                existing = conn.execute(
+                    "SELECT * FROM rule_match_feedbacks WHERE receipt_id=?",
+                    (feedback.receipt_id,),
+                ).fetchone()
+                if existing is None:
+                    raise
+                return self._row_to_rule_match_feedback(existing)
+        return self.get_rule_match_feedback_by_receipt(feedback.receipt_id)
+
+    def list_rule_match_feedbacks(
+        self,
+        *,
+        receipt_id: str | None = None,
+        actor: str | None = None,
+    ) -> list[RuleMatchFeedback]:
+        sql = "SELECT * FROM rule_match_feedbacks"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if receipt_id:
+            clauses.append("receipt_id=?")
+            params.append(receipt_id)
+        if actor:
+            clauses.append("actor=?")
+            params.append(actor)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at"
+        with self._db() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_rule_match_feedback(row) for row in rows]
+
+    def get_rule_match_feedback_by_receipt(
+        self, receipt_id: str,
+    ) -> RuleMatchFeedback | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_match_feedbacks WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_rule_match_feedback(row)
+
+    def set_rule_assignments(self, memory_id: str, assignments: list[dict | RuleAssignment]) -> list[RuleAssignment]:
+        """Replace audience relations atomically; record deletion is separate."""
+        normalized = self._normalize_assignments(memory_id, assignments)
+        now = _now_iso()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("memory_not_found")
+            record = self._row_to_record(row)
+            if record.injection_policy != "always":
+                raise ValueError("rule assignments require injection_policy=always")
+            self._validate_mandatory_budget(
+                record, assignments=normalized, conn=conn,
+                replacing_id=memory_id,
+            )
+            conn.execute("DELETE FROM rule_assignments WHERE memory_id=?", (memory_id,))
+            self._insert_assignments(conn, memory_id, normalized)
+            conn.execute(
+                "UPDATE records SET dedup_domain=?,updated_at=? WHERE memory_id=?",
+                (self._dedup_domain(
+                    "always", normalized, writer_id=record.agent_instance_id,
+                    memory_id=memory_id,
+                ), now, memory_id),
+            )
+        return self.list_rule_assignments(memory_id)
+
+    def replace_actor_assignment(
+        self, memory_id: str, actor_agent_id: str,
+        assignments: list[dict | RuleAssignment],
+    ) -> list[RuleAssignment]:
+        """Atomically replace only one actor's agent-scoped relations."""
+        incoming = self._normalize_assignments(memory_id, assignments)
+        if any(
+            item.target_type != "agent" or item.target_id != actor_agent_id
+            for item in incoming
+        ):
+            raise ValueError("actor may replace only its own agent assignment")
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("memory_not_found")
+            record = self._row_to_record(row)
+            if record.injection_policy != "always":
+                raise ValueError("rule assignments require injection_policy=always")
+            retained = [
+                item for item in self._list_rule_assignments_conn(conn, memory_id)
+                if not (item.target_type == "agent" and item.target_id == actor_agent_id)
+            ]
+            final = self._normalize_assignments(memory_id, retained + incoming)
+            self._validate_mandatory_budget(
+                record, assignments=final, conn=conn, replacing_id=memory_id,
+            )
+            conn.execute(
+                "DELETE FROM rule_assignments WHERE memory_id=? "
+                "AND target_type='agent' AND target_id=?",
+                (memory_id, actor_agent_id),
+            )
+            self._insert_assignments(conn, memory_id, incoming)
+            conn.execute(
+                "UPDATE records SET dedup_domain=?,updated_at=? WHERE memory_id=?",
+                (self._dedup_domain(
+                    "always", final, writer_id=record.agent_instance_id,
+                    memory_id=memory_id,
+                ), _now_iso(), memory_id),
+            )
+        return self.list_rule_assignments(memory_id)
+
+    def delete_rule_assignments(self, memory_id: str) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM rule_assignments WHERE memory_id=?", (memory_id,))
+
+    def transition_injection_policy(
+        self, memory_id: str, injection_policy: str, priority: int, *,
+        assignments: list[dict | RuleAssignment] | None = None,
+        decision: DecisionEvent | None = None,
+        provenance: list[Provenance] | None = None,
+    ) -> tuple[SharedMemoryRecord, list[RuleAssignment]]:
+        """Atomically change policy and its audience lifecycle."""
+        injection_policy, priority = validate_injection_settings(
+            injection_policy, priority,
+        )
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("memory_not_found")
+            record = self._row_to_record(row)
+            if record.status != SharedMemoryStatus.ACTIVE:
+                raise ValueError("injection_policy_transition_requires_active_record")
+            normalized = self._normalize_assignments(
+                memory_id, assignments or [],
+            )
+            if injection_policy == "always":
+                if not any(item.effect == "include" for item in normalized):
+                    raise ValueError("always policy requires at least one include assignment")
+                prospective = SharedMemoryRecord.from_dict({
+                    **record.to_dict(),
+                    "injection_policy": "always",
+                    "priority": priority,
+                })
+                self._validate_mandatory_budget(
+                    prospective, assignments=normalized, conn=conn,
+                    replacing_id=memory_id,
+                )
+            elif normalized:
+                raise ValueError("relevant policy cannot retain rule assignments")
+            conn.execute(
+                "DELETE FROM rule_assignments WHERE memory_id=?", (memory_id,),
+            )
+            self._insert_assignments(conn, memory_id, normalized)
+            domain = self._dedup_domain(
+                injection_policy, normalized,
+                writer_id=record.agent_instance_id, memory_id=memory_id,
+            )
+            conn.execute(
+                "UPDATE records SET injection_policy=?,priority=?,"
+                "dedup_domain=?,provenance=?,updated_at=? WHERE memory_id=?",
+                (
+                    injection_policy, priority, domain,
+                    json.dumps(
+                        [item.to_dict() for item in provenance],
+                        ensure_ascii=False,
+                    ) if provenance is not None else json.dumps(
+                        [item.to_dict() for item in record.provenance],
+                        ensure_ascii=False,
+                    ),
+                    _now_iso(), memory_id,
+                ),
+            )
+            if decision is not None:
+                self._insert_decision(conn, decision)
+        updated = self.get_record(memory_id)
+        if updated is None:
+            raise RuntimeError("policy transition lost record")
+        return updated, self.list_rule_assignments(memory_id)
+
     def update_record(self, record: SharedMemoryRecord) -> None:
         """按 memory_id 覆盖写回单条记录。"""
         with self._tx() as conn:
-            self._insert_record(conn, record)
+            assignments = self._list_rule_assignments_conn(
+                conn, record.memory_id,
+            )
+            self._validate_mandatory_budget(
+                record, assignments=assignments, conn=conn,
+                replacing_id=record.memory_id,
+            )
+            domain = self._dedup_domain(
+                record.injection_policy, assignments,
+                writer_id=record.agent_instance_id,
+                memory_id=record.memory_id,
+            )
+            self._insert_record(conn, record, dedup_domain=domain)
+            self._insert_assignments(conn, record.memory_id, assignments)
 
     # ------------------------------------------------------------------
     # 治理动作
@@ -916,12 +1850,19 @@ class SharedMemoryStore:
     # ------------------------------------------------------------------
 
     def create_version_snapshot(self, reason: str = "") -> str:
-        """创建版本快照（保存全部 5 类数据），返回 version_id。"""
+        """创建版本快照（保存全部 7 类数据），返回 version_id。"""
         version_id = stable_hash("v", self.group_id, _now_iso())
         created_at = _now_iso()
         records = self.list_records()
         snapshot = {
             "records": [r.to_dict() for r in records],
+            "rule_assignments": [
+                item.to_dict() for item in self.list_rule_assignments()
+            ],
+            "rule_match_receipts": [item.to_dict() for item in self.list_rule_match_receipts()],
+            "rule_match_feedbacks": [
+                item.to_dict() for item in self.list_rule_match_feedbacks()
+            ],
             "events": [e.to_dict() for e in self.list_events()],
             "decisions": [d.to_dict() for d in self.list_decisions()],
             "conflicts": [c.to_dict() for c in self.list_conflicts()],
@@ -963,14 +1904,16 @@ class SharedMemoryStore:
             ).fetchone()
         if row is None:
             raise FileNotFoundError(f"version not found: {version_id}")
-        # 先备份当前状态
-        self.create_version_snapshot(f"pre-rollback to {version_id}")
-        # 恢复全部 5 类数据
         try:
             snapshot = json.loads(row["snapshot"])
         except (ValueError, TypeError):
-            snapshot = {}
-        self._restore_snapshot(snapshot)
+            raise ValueError("invalid_snapshot_json")
+        prepared = self._validate_snapshot(snapshot)
+        # Validate before creating the pre-rollback version or touching any
+        # table/pointer.  A malformed snapshot must be a true no-op.
+        self.create_version_snapshot(f"pre-rollback to {version_id}")
+        # 恢复全部 5 类数据
+        self._restore_snapshot(prepared)
         # 更新 active 指针
         self._set_active_version(version_id)
         # 记录 DecisionEvent
@@ -982,44 +1925,116 @@ class SharedMemoryStore:
         )
         self.append_decision(decision)
 
-    def _restore_snapshot(self, snapshot: dict[str, Any]) -> None:
+    def _validate_snapshot(self, snapshot: Any) -> dict[str, list[Any]]:
+        """Parse the complete snapshot before a restore can mutate state."""
+        if not isinstance(snapshot, dict):
+            raise ValueError("invalid_snapshot_structure")
+        names = (
+            "records", "rule_assignments", "rule_match_receipts",
+            "rule_match_feedbacks", "events", "decisions",
+            "conflicts", "quarantine",
+        )
+        if any(name in snapshot and not isinstance(snapshot[name], list) for name in names):
+            raise ValueError("invalid_snapshot_structure")
+        try:
+            records = [SharedMemoryRecord.from_dict(value) for value in snapshot.get("records", [])]
+            record_ids = {record.memory_id for record in records}
+            if len(record_ids) != len(records):
+                raise ValueError("duplicate_snapshot_memory_id")
+            for record in records:
+                validate_injection_settings(record.injection_policy, record.priority)
+            records_by_id = {record.memory_id: record for record in records}
+            assignments: list[RuleAssignment] = []
+            for value in snapshot.get("rule_assignments", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_assignment")
+                memory_id = str(value.get("memory_id", ""))
+                if memory_id not in record_ids:
+                    raise ValueError("snapshot_assignment_without_record")
+                if records_by_id[memory_id].injection_policy != "always":
+                    raise ValueError("snapshot_assignment_requires_always")
+                assignments.extend(self._normalize_assignments(memory_id, [value]))
+            rule_match_receipts = []
+            for value in snapshot.get("rule_match_receipts", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_rule_match_receipt")
+                rule_match_receipts.append(RuleMatchReceipt.from_dict(value))
+            rule_match_feedbacks = []
+            for value in snapshot.get("rule_match_feedbacks", []):
+                if not isinstance(value, dict):
+                    raise ValueError("invalid_snapshot_rule_match_feedback")
+                rule_match_feedbacks.append(RuleMatchFeedback.from_dict(value))
+            receipt_ids = {item.receipt_id for item in rule_match_receipts}
+            for feedback in rule_match_feedbacks:
+                if feedback.receipt_id not in receipt_ids:
+                    raise ValueError("snapshot_feedback_without_receipt")
+            events = [MemoryEvent.from_dict(value) for value in snapshot.get("events", [])]
+            decisions = [DecisionEvent(
+                event_id=value["event_id"], actor=value.get("actor", "user"),
+                action=value.get("action", ""), target_ids=list(value.get("target_ids", [])),
+                before_hash=value.get("before_hash", ""), after_hash=value.get("after_hash", ""),
+                reason=value.get("reason", ""), created_at=value.get("created_at", ""),
+            ) for value in snapshot.get("decisions", [])]
+            conflicts = [ConflictGroup.from_dict(value) for value in snapshot.get("conflicts", [])]
+            quarantine = [QuarantineEntry.from_dict(value) for value in snapshot.get("quarantine", [])]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid_snapshot_structure") from exc
+        return {
+            "records": records, "rule_assignments": assignments,
+            "rule_match_receipts": rule_match_receipts,
+            "rule_match_feedbacks": rule_match_feedbacks,
+            "events": events, "decisions": decisions,
+            "conflicts": conflicts, "quarantine": quarantine,
+        }
+
+    def _restore_snapshot(self, snapshot: dict[str, list[Any]]) -> None:
         """用快照原子覆盖全部 5 类数据表。"""
         with self._tx() as conn:
-            for table in ("records", "events", "decisions", "conflicts", "quarantine"):
+            for table in (
+                "rule_match_feedbacks", "rule_match_receipts",
+                "rule_assignments", "records", "events", "decisions",
+                "conflicts", "quarantine",
+            ):
                 conn.execute(f"DELETE FROM {table}")
-            for d in snapshot.get("records", []):
-                try:
-                    self._insert_record(conn, SharedMemoryRecord.from_dict(d))
-                except (ValueError, KeyError):
-                    continue
-            for d in snapshot.get("events", []):
-                try:
-                    self._insert_event(conn, MemoryEvent.from_dict(d))
-                except (ValueError, KeyError):
-                    continue
-            for d in snapshot.get("decisions", []):
-                try:
-                    self._insert_decision(conn, DecisionEvent(
-                        event_id=d["event_id"], actor=d.get("actor", "user"),
-                        action=d.get("action", ""),
-                        target_ids=list(d.get("target_ids", [])),
-                        before_hash=d.get("before_hash", ""),
-                        after_hash=d.get("after_hash", ""),
-                        reason=d.get("reason", ""),
-                        created_at=d.get("created_at", ""),
-                    ))
-                except (ValueError, KeyError):
-                    continue
-            for d in snapshot.get("conflicts", []):
-                try:
-                    self._insert_conflict(conn, ConflictGroup.from_dict(d))
-                except (ValueError, KeyError):
-                    continue
-            for d in snapshot.get("quarantine", []):
-                try:
-                    self._insert_quarantine(conn, QuarantineEntry.from_dict(d))
-                except (ValueError, KeyError):
-                    continue
+            for record in snapshot["records"]:
+                assignments = [
+                    item for item in snapshot["rule_assignments"]
+                    if item.memory_id == record.memory_id
+                ]
+                self._insert_record(
+                    conn, record,
+                    dedup_domain=self._dedup_domain(
+                        record.injection_policy, assignments,
+                        writer_id=record.agent_instance_id,
+                        memory_id=record.memory_id,
+                    ),
+                )
+            for item in snapshot["rule_assignments"]:
+                self._insert_assignments(conn, item.memory_id, [item])
+            for row in conn.execute(
+                "SELECT * FROM records WHERE status='active' "
+                "AND injection_policy='always'"
+            ).fetchall():
+                record = self._row_to_record(row)
+                assignments = self._list_rule_assignments_conn(
+                    conn, record.memory_id,
+                )
+                self._validate_mandatory_budget(
+                    record, assignments=assignments, conn=conn,
+                    replacing_id=record.memory_id,
+                )
+            for event in snapshot["events"]:
+                self._insert_event(conn, event)
+            for decision in snapshot["decisions"]:
+                self._insert_decision(conn, decision)
+            for conflict in snapshot["conflicts"]:
+                self._insert_conflict(conn, conflict)
+            for entry in snapshot["quarantine"]:
+                self._insert_quarantine(conn, entry)
+            for receipt in snapshot["rule_match_receipts"]:
+                self._insert_rule_match_receipt(conn, receipt)
+            for feedback in snapshot["rule_match_feedbacks"]:
+                self._insert_rule_match_feedback(conn, feedback)
 
     def list_versions(self) -> list[dict]:
         """列出所有版本。"""
@@ -1077,6 +2092,16 @@ class SharedMemoryStore:
                 self._row_to_record(row).to_dict()
                 for row in conn.execute("SELECT * FROM records ORDER BY rowid")
             ]
+            rule_assignments = [
+                item.to_dict()
+                for row in conn.execute(
+                    "SELECT DISTINCT memory_id FROM rule_assignments "
+                    "ORDER BY memory_id"
+                )
+                for item in self._list_rule_assignments_conn(
+                    conn, row["memory_id"],
+                )
+            ]
             events = [
                 self._row_to_event(row).to_dict()
                 for row in conn.execute("SELECT * FROM events ORDER BY rowid")
@@ -1112,6 +2137,7 @@ class SharedMemoryStore:
                 })
         return {
             "records": records,
+            "rule_assignments": rule_assignments,
             "events": events,
             "decisions": decisions,
             "conflicts": conflicts,
@@ -1134,6 +2160,11 @@ class SharedMemoryStore:
             "share_group_id": self.group_id,
             "total_records": len(records),
             "active": sum(1 for r in records if r.status == SharedMemoryStatus.ACTIVE),
+            "active_mandatory": sum(
+                1 for r in records
+                if r.status == SharedMemoryStatus.ACTIVE
+                and r.injection_policy == "always"
+            ),
             "shadowed": sum(1 for r in records if r.status == SharedMemoryStatus.SHADOWED),
             "conflicted": sum(1 for r in records if r.status == SharedMemoryStatus.CONFLICTED),
             "quarantined": sum(1 for r in records if r.status == SharedMemoryStatus.QUARANTINED),
@@ -1157,6 +2188,9 @@ class SharedMemoryStore:
         token = stable_hash("clear", self.group_id, _now_iso())[:12]
         sidecars = [
             self.records_bak_path,
+            self.rule_assignments_bak_path,
+            self.rule_match_receipts_bak_path,
+            self.rule_match_feedbacks_bak_path,
             self.events_bak_path,
             self.decisions_bak_path,
             self.conflicts_bak_path,
@@ -1174,7 +2208,7 @@ class SharedMemoryStore:
             with self._tx() as conn:
                 for table in (
                     "quarantine", "conflicts", "decisions", "events",
-                    "records", "active_version", "versions",
+                    "rule_assignments", "records", "active_version", "versions",
                 ):
                     conn.execute(f"DELETE FROM {table}")
         except Exception:
@@ -1221,6 +2255,9 @@ class SharedMemoryStore:
 
         jsonl_map = [
             ("records.jsonl", self._migrate_records_jsonl),
+            ("rule_assignments.jsonl", self._migrate_rule_assignments_jsonl),
+            ("rule_match_receipts.jsonl", self._migrate_rule_match_receipts_jsonl),
+            ("rule_match_feedbacks.jsonl", self._migrate_rule_match_feedbacks_jsonl),
             ("events.jsonl", self._migrate_events_jsonl),
             ("decisions.jsonl", self._migrate_decisions_jsonl),
             ("conflicts.jsonl", self._migrate_conflicts_jsonl),
@@ -1274,8 +2311,33 @@ class SharedMemoryStore:
         with self._tx() as conn:
             for d in self._read_jsonl(path):
                 try:
-                    self._insert_record(conn, SharedMemoryRecord.from_dict(d))
+                    record = SharedMemoryRecord.from_dict(d)
+                    # A pre-audience backup has no authoritative scope.  Keep
+                    # it legacy-unscoped rather than inventing writer scope.
+                    domain = self._dedup_domain(
+                        record.injection_policy, [],
+                        writer_id=record.agent_instance_id,
+                        memory_id=record.memory_id,
+                    )
+                    self._insert_record(
+                        conn, record, dedup_domain=domain,
+                    )
                 except (ValueError, KeyError):
+                    continue
+
+    def _migrate_rule_assignments_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for value in self._read_jsonl(path):
+                try:
+                    memory_id = str(value.get("memory_id", ""))
+                    exists = conn.execute(
+                        "SELECT 1 FROM records WHERE memory_id=?", (memory_id,),
+                    ).fetchone()
+                    if not exists:
+                        raise ValueError("assignment record missing")
+                    item = self._normalize_assignments(memory_id, [value])[0]
+                    self._insert_assignments(conn, memory_id, [item])
+                except (AttributeError, IndexError, KeyError, ValueError):
                     continue
 
     def _migrate_events_jsonl(self, path: Path) -> None:
@@ -1318,6 +2380,26 @@ class SharedMemoryStore:
                 except (ValueError, KeyError):
                     continue
 
+    def _migrate_rule_match_receipts_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for d in self._read_jsonl(path):
+                try:
+                    self._insert_rule_match_receipt(
+                        conn, RuleMatchReceipt.from_dict(d),
+                    )
+                except (ValueError, KeyError, sqlite3.IntegrityError):
+                    continue
+
+    def _migrate_rule_match_feedbacks_jsonl(self, path: Path) -> None:
+        with self._tx() as conn:
+            for d in self._read_jsonl(path):
+                try:
+                    self._insert_rule_match_feedback(
+                        conn, RuleMatchFeedback.from_dict(d),
+                    )
+                except (ValueError, KeyError, sqlite3.IntegrityError):
+                    continue
+
     def _migrate_versions_dir(self) -> None:
         if not self.versions_dir.exists():
             return
@@ -1336,6 +2418,12 @@ class SharedMemoryStore:
             created_at = manifest.get("created_at", "")
             snapshot = {
                 "records": self._read_jsonl(vdir / "records.jsonl"),
+                "rule_match_receipts": self._read_jsonl(
+                    vdir / "rule_match_receipts.jsonl",
+                ),
+                "rule_match_feedbacks": self._read_jsonl(
+                    vdir / "rule_match_feedbacks.jsonl",
+                ),
                 "events": [],
                 "decisions": self._read_jsonl(vdir / "decisions.jsonl"),
                 "conflicts": [],

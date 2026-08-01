@@ -45,6 +45,7 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "${groupLabel} ·" in html
     assert "成员 · 无绑定" in html
     assert "点击任意光点，在右侧查看可读内容" in html
+    assert "规则与习惯可直接在图内治理" in html
     assert "selectedNeuronNode" in html
     assert "findNeuronByMemory" in html
     assert "focusNeuronNode" in html
@@ -251,3 +252,33 @@ def test_memory_layer_lifecycle_actions_are_explicit_and_safe() -> None:
     assert "保留 binding、MCP 配置和空数据库" in html
     assert "现有 MCP 将因无活动 binding 而拒绝读写" in html
     assert "原生文件不变" in html
+
+
+def test_history_ui_routes_result_types_and_exposes_export() -> None:
+    html = render_interactive_html()
+
+    assert "r.matched_summary || r.summary" in html
+    assert "r.can_timeline && anchor" in html
+    assert 'data-mg-action="history-read-session"' in html
+    assert 'data-session-id="${escapeHtml(r.session_id)}"' in html
+    assert "exportHistorySession" in html
+    assert "callApi('export_history', [sessionId], historyScope())" in html
+
+
+def test_history_ui_requires_real_agent_and_refreshes_on_agent_switch() -> None:
+    html = render_interactive_html()
+
+    assert "agent_instance_id: activeAgentInstanceId || ''" in html
+    assert "if (!activeAgentInstanceId)" in html
+    assert "if (state.activeTab === 'history') renderHistory()" in html
+
+
+def test_history_ui_hides_cross_owner_delete_action() -> None:
+    html = render_interactive_html()
+
+    assert "const canDelete = !!activeAgentInstanceId && owner === activeAgentInstanceId;" in html
+    assert "仅会话 owner 可删除" in html
+    assert "${canDelete ? `<button class=\"btn\" data-mg-action=\"history-delete\"" in html
+    assert "当前共享组成员可查，仅 owner 可删" in html
+    assert "meta.project_status === 'unknown' ? ' · 未识别项目'" not in html
+    assert "meta.project_status === 'removed' ? ' · 路径已移除' : ''" in html

@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/assets/hero-governance-console.png" alt="MemoryGuard governance console showing organized shared memory, a supersede chain, and a rollback history" width="960" />
+  <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard desktop governance console with a navigable neuron graph, memory categories, risk signals, and governance controls" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.3.1</h1>
+<h1 align="center">MemoryGuard v0.3.2</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -57,6 +57,35 @@ Agent writes memory
 
 The console is **not an approval queue**. Agents keep moving; you govern the outcome with evidence when it matters.
 
+## Rules, habits, and conversation history
+
+These are deliberately separate surfaces:
+
+| Surface | Purpose | Injection behavior |
+|---|---|---|
+| **Rules & habits** | Governed long-term preferences, procedures, corrections, and scoped mandatory rules | Mandatory rules are injected only into their assigned Agent/project/provider/role; ordinary records are recalled on demand |
+| **Conversation history** | Local raw-evidence archive; personal reads are isolated and active shared-group members may query one another | Never enters bootstrap; the neuron graph carries metadata-only project → Agent → session indexes |
+
+History retrieval is progressive: **search result → bounded timeline → one raw
+turn/session**. `extract preview` only proposes evidence-backed memory
+candidates; it never writes a long-term memory. A user can explicitly govern a
+candidate through the normal memory path. Hooks archive only payloads exposed by
+their verified host seam, honor private/disabled markers, and report partial
+coverage rather than inventing unseen assistant text. A shared-history read is
+resolved server-side from the caller's current active binding: it includes only
+the group's current members and loses access immediately on leave. Shared
+visibility never grants deletion of another Agent's source. Imported sessions
+are grouped by trusted `cwd`/`project_ref` metadata (or “unknown”), never by
+chat body.
+
+<p align="center">
+  <img src="docs/assets/gui-validation-current.png" alt="MemoryGuard desktop console showing the interactive neuron graph and local governance navigation" width="960" />
+</p>
+
+The neuron graph is a governed view: select a node to inspect and manage the
+corresponding record without turning raw conversation history into injected
+memory.
+
 ## Install in 60 seconds
 
 ```bash
@@ -96,8 +125,11 @@ For explicit configuration and provider-specific behavior, see the [Claude Code]
 ## What you can govern
 
 <p align="center">
-  <img src="docs/assets/governance-evidence.png" alt="MemoryGuard evidence views for a conflict, a quarantined secret, a supersede chain, and version history" width="900" />
+  <img src="docs/assets/x-launch-real-gui-v4.png" alt="MemoryGuard desktop source-authorization view with memory governance categories and an explicit selection tree" width="960" />
 </p>
+
+Sources are authorized explicitly. Native memory can be governed with a backup;
+ordinary documents remain read-only evidence until you choose to extract them.
 
 | Signal | What you can do |
 |---|---|
@@ -169,6 +201,15 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 
 </details>
 
+### Mandatory rules
+
+`memoryguard_memory_write` defaults to `injection_policy="relevant"`. Use
+`always` (and optional bounded `priority`) only for an explicit long-term
+mandatory/default rule; do not promote every procedure. `memoryguard_memory_update`
+can switch the policy. Bootstrap injects mandatory rules under an independent
+budget before relevant recall and fails closed for sensitive or over-limit rule
+packages. The GUI can return a rule to on-demand, delete, or restore it.
+
 ## Privacy and safety boundaries
 
 - MemoryGuard runs as a local MCP stdio server; it requires no account, remote server, or telemetry.
@@ -183,6 +224,17 @@ The complete MCP tool reference and CLI command reference are below for evaluati
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Changelog
+
+### v0.3.2 (2026-07-29)
+
+- Force Hook stdin, stdout, and stderr to UTF-8 so Chinese context survives
+  Windows GBK defaults
+- Add the official Codex `commandWindows` override and run every Hook with
+  Python UTF-8 mode
+- Bind runtime receipts to the exact installed Hook definition so changed
+  commands cannot inherit a stale operational status
+- Defer pending-memory reminders from `PreCompact` to
+  `SessionStart(source="compact")`, matching the Codex event output contract
 
 ### v0.3.1 (2026-07-29)
 
