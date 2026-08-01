@@ -34,3 +34,6 @@ jobs:
 
       - name: Run rule lifecycle acceptance script
         run: python scripts/accept_rule_lifecycle.py
+
+      - name: Run rule intelligence merge acceptance script (P3)
+        run: python scripts/accept_rule_merge.py

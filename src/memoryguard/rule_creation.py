@@ -87,6 +87,7 @@ class RuleCreationService:
         store: Any | None = None,
         engine: GovernanceEngine | None = None,
         is_admin: bool = False,
+        merge_service: Any | None = None,
     ) -> None:
         if not isinstance(workspace, (str, Path)) and hasattr(workspace, "workspace"):
             # Small in-process callers often pass an already-open store as the
@@ -104,6 +105,12 @@ class RuleCreationService:
         )
         self.store = self.engine.store
         self.is_admin = bool(is_admin)
+        # P3 Rule Intelligence dual-write.  Optional: a caller that explicitly
+        # injects a merge service wires the new layer in; otherwise it is
+        # lazily created on first successful rule write so every host (GUI/MCP)
+        # mirrors definitions into the shared intelligence store automatically.
+        self._merge_service = merge_service
+        self._merge_workspace = self.workspace
 
     # ------------------------------------------------------------------
     # Context / scope
@@ -570,6 +577,22 @@ class RuleCreationService:
         persisted_atomic = result.get("decision")
         if persisted_atomic:
             try:
+                atomic_memory_id = str(
+                    result.get("memory_id", "") or (result.get("record") or {}).get("memory_id", "")
+                )
+                atomic_assignments: list[dict[str, Any]] = []
+                if atomic_memory_id:
+                    try:
+                        atomic_assignments = [
+                            item.to_dict()
+                            for item in self.store.list_rule_assignments(atomic_memory_id)
+                        ]
+                    except Exception:
+                        atomic_assignments = []
+                self._sync_merge_intelligence(
+                    result, memory_id=atomic_memory_id,
+                    assignments=atomic_assignments,
+                )
                 return RuleDecision.from_dict(
                     persisted_atomic.to_dict()
                     if hasattr(persisted_atomic, "to_dict")
@@ -593,6 +616,9 @@ class RuleCreationService:
                 assignments = [item.to_dict() for item in self.store.list_rule_assignments(memory_id)]
             except Exception:
                 assignments = [dict(assignment)]
+        self._sync_merge_intelligence(
+            result, memory_id=memory_id, assignments=assignments,
+        )
         decision_action = "rule_create_auto" if not manual else "rule_create_manual"
         decision_id = stable_hash(
             "rule-decision", self.group_id, decision_action, memory_id, undo_id,
@@ -637,6 +663,49 @@ class RuleCreationService:
         )
 
     create_rule = create_rule_from_text
+
+    def _sync_merge_intelligence(
+        self,
+        result: Mapping[str, Any],
+        *,
+        memory_id: str,
+        assignments: list[dict[str, Any]],
+    ) -> None:
+        """Mirror a successfully-created rule into the Rule Intelligence layer.
+
+        Best-effort and non-blocking: a P3-layer failure (read-only workspace,
+        schema lock, etc.) must never fail the already-committed rule write.
+        The record itself is the source of truth; the Definition layer is a
+        projection that is rebuilt by backfill if it ever falls behind.
+        """
+        if not memory_id:
+            return
+        try:
+            if self._merge_service is None:
+                from .rule_merge import RuleMergeService, RuleMergeStore
+
+                try:
+                    merge_store = RuleMergeStore(self._merge_workspace)
+                except Exception:
+                    return
+                self._merge_service = RuleMergeService(merge_store)
+            service = self._merge_service
+            record = self.store.get_record(memory_id)
+            if record is None:
+                return
+            try:
+                receipts = self.store.list_rule_match_receipts(memory_id=memory_id)
+            except Exception:
+                receipts = []
+            service.sync_rule(
+                self.store, self.group_id, record,
+                assignments=assignments or self.store.list_rule_assignments(memory_id),
+                receipts=receipts,
+                created_by="auto",
+            )
+        except Exception:
+            # P3 layer is advisory; never propagate to rule creation callers.
+            return
 
     def _target_undo(
         self,
