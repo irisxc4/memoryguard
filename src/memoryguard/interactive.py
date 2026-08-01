@@ -3256,27 +3256,30 @@ function renderRuleCreatePanel(options) {
     ruleContextProjectRef = rulePreviewProjectRef || '';
   }
   const selectedAgent = rulePreviewAgentId || activeAgentInstanceId || agents[0]?.id || '';
+  const selectedAgentLabel = agents.find(item => item.id === selectedAgent)?.label || agents.find(item => item.id === selectedAgent)?.name || selectedAgent || '当前 Agent';
+  const selectedGroupLabel = groups.find(item => item.id === ruleContextGroupId)?.label || groups.find(item => item.id === ruleContextGroupId)?.name || ruleContextGroupId || 'default';
   const result = ruleCreateResult;
   const resultHtml = result ? `<div class="rule-create-result ${result.error ? 'error' : ''}">
     ${result.error ? `<strong>未创建：${escapeHtml(result.error)}</strong>` : `<strong>已创建规则 ${escapeHtml(result.rule_id || result.memory_id || '')}</strong>
       <div class="chips">${result.kind ? `<span class="chip chip-info">分类 ${escapeHtml(result.kind)}</span>` : ''}${ruleConfidenceLabel(result.scope_confidence)}${result.decision_id ? `<span class="chip chip-info">决定 ${escapeHtml(result.decision_id.slice(0, 14))}</span>` : ''}</div>
       <p>${escapeHtml(result.scope_reason || result.blocked_reason || '范围由当前上下文确定')}</p>`}
   </div>` : '';
-  return `<section class="card rule-create-panel"><div class="card-head"><div><h2>一句话新增规则</h2><p>明确当前 Agent、共享组与项目后再保存。系统范围与跨 Agent 范围不会由自动流程创建。</p></div></div>
+  // v2: 日常新增规则零额外选择。  Agent、共享组与项目是只读上下文标签，
+  // 不作为可选项暴露给用户；服务端只读取当前可信上下文自动定范围。
+  return `<section class="card rule-create-panel"><div class="card-head"><div><h2>一句话新增规则</h2><p>规则范围由当前可信上下文自动判断，无需手动选择。系统范围与跨 Agent 范围不会由自动流程创建。</p></div></div>
     <textarea id="rule-create-text" rows="3" maxlength="12000" placeholder="例如：所有 Unity UI 修复先补 EditMode 回归测试"></textarea>
-    <div class="page-actions rule-context-grid"><label class="field"><span>当前 Agent</span><select id="rule-create-agent">${ruleSelectOptions(agents, selectedAgent)}</select></label>
-      <label class="field"><span>共享组</span><select id="rule-create-group" onchange="ruleContextGroupId=this.value">${ruleSelectOptions(groups, ruleContextGroupId)}${groups.length ? '' : '<option value="default">default</option>'}</select></label>
-      <label class="field"><span>项目（可选）</span><select id="rule-create-project" onchange="ruleContextProjectRef=this.value"><option value="">当前上下文未指定项目</option>${ruleSelectOptions(projects, ruleContextProjectRef)}</select></label></div>
-    <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="createRuleFromText()">分析并创建</button><span class="muted">低置信度只会返回当前 Agent / 项目候选，需人工确认。</span></div>${resultHtml}</section>`;
+    <div class="rule-context-readonly"><span class="chip chip-info">当前上下文：${escapeHtml(selectedAgentLabel)} · ${escapeHtml(selectedGroupLabel)}${ruleContextProjectRef ? ` · ${escapeHtml(ruleContextProjectRef)}` : ''}</span></div>
+    <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="createRuleFromText()">分析并创建</button><span class="muted">系统只自动写入当前 Agent / 当前 Agent + 项目范围，绝不扩大。</span></div>${resultHtml}</section>`;
 }
 
 async function createRuleFromText() {
   const text = String(document.getElementById('rule-create-text')?.value || '').trim();
-  const agent = String(document.getElementById('rule-create-agent')?.value || rulePreviewAgentId || activeAgentInstanceId || '').trim();
-  const group = String(document.getElementById('rule-create-group')?.value || ruleContextGroupId || activeShareGroupId || 'default').trim();
-  const project = String(document.getElementById('rule-create-project')?.value || ruleContextProjectRef || '').trim();
+  // v2: GUI 不再要求用户选择 Agent / 共享组 / 项目。  这些值全部来自
+  // 当前可信上下文（上一版已加载的治理范围），用户不可在选择框里改动。
+  const agent = String(rulePreviewAgentId || activeAgentInstanceId || '').trim();
+  const group = String(ruleContextGroupId || activeShareGroupId || 'default').trim();
+  const project = String(ruleContextProjectRef || rulePreviewProjectRef || '').trim();
   if (!text) return showToast('请输入规则正文。', 'error');
-  if (!agent) return showToast('请明确当前 Agent。', 'error');
   ruleCreateResult = null;
   try {
     const result = await callApi('create_rule_from_text', text, {
@@ -3586,9 +3589,14 @@ async function renderRulesHabits() {
     const roleOptions = `<option value="">未确认运行角色</option>${ruleSelectOptions(runtimeRoles, rulePreviewRuntimeRole)}`;
     const scopeOptions = `<option value="all">全部范围类型</option>${['agent','group','project','agent_project','provider','runtime_role','system'].map(type => `<option value="${type}" ${ruleRangeFilter === type ? 'selected' : ''}>${escapeHtml({agent:'Agent',group:'共享组',project:'项目',agent_project:'Agent + 项目',provider:'宿主',runtime_role:'运行角色',system:'系统'}[type])}</option>`).join('')}`;
     const visibilityOptions = `<option value="effective" ${ruleVisibilityFilter === 'effective' ? 'selected' : ''}>仅当前 Agent 生效</option><option value="excluded" ${ruleVisibilityFilter === 'excluded' ? 'selected' : ''}>仅当前 Agent 被排除</option><option value="all" ${ruleVisibilityFilter === 'all' ? 'selected' : ''}>不按当前 Agent 过滤</option>`;
+    // v2: the six diagnostic filters are hidden behind a closed <details> so
+    // they never enter the first-viewport tab order and never participate in
+    // a routine "add rule" request.
+    const diagnosticFilters = `<section class="card"><details id="rule-diagnostics"${diagnosticsExpanded ? ' open' : ''}><summary class="card-head" style="cursor:pointer"><div><h2>诊断与高级筛选</h2><p>管理员或排查时才需要调整；日常使用保持默认值。</p></div></summary>
+      <div class="page-actions"><label class="field"><span>预览 Agent</span><select onchange="setRulePreviewAgent(this.value)">${agentOptions}</select></label><label class="field"><span>项目</span><select onchange="setRulePreviewProject(this.value)">${projectOptions}</select></label><label class="field"><span>宿主</span><select onchange="setRulePreviewProvider(this.value)">${providerOptions}</select></label><label class="field"><span>运行角色</span><select onchange="setRulePreviewRuntimeRole(this.value)">${roleOptions}</select></label><label class="field"><span>显示</span><select onchange="setRuleVisibilityFilter(this.value)">${visibilityOptions}</select></label><label class="field"><span>范围</span><select onchange="setRuleRangeFilter(this.value)">${scopeOptions}</select></label></div><p class="muted">预览只使用已发现/可信上下文；未知项目、宿主或角色保持空值，不会猜测命中规则。</p></details></section>`;
     setContent(`<div class="page-head"><div><h1>规则与习惯</h1><p>规则受众独立于记忆来源。范围删除不会删除记忆；只有强制规则会按范围注入。</p></div></div>
       ${renderRuleCreatePanel(options)}${renderRuleAutoScopePanel()}
-      <section class="card"><div class="page-actions"><label class="field"><span>预览 Agent</span><select onchange="setRulePreviewAgent(this.value)">${agentOptions}</select></label><label class="field"><span>项目</span><select onchange="setRulePreviewProject(this.value)">${projectOptions}</select></label><label class="field"><span>宿主</span><select onchange="setRulePreviewProvider(this.value)">${providerOptions}</select></label><label class="field"><span>运行角色</span><select onchange="setRulePreviewRuntimeRole(this.value)">${roleOptions}</select></label><label class="field"><span>显示</span><select onchange="setRuleVisibilityFilter(this.value)">${visibilityOptions}</select></label><label class="field"><span>范围</span><select onchange="setRuleRangeFilter(this.value)">${scopeOptions}</select></label></div><p class="muted">预览只使用已发现/可信上下文；未知项目、宿主或角色保持空值，不会猜测命中规则。</p></section>${blocks || '<div class="card empty-state"><p>当前筛选范围没有规则或习惯。</p></div>'}`);
+      ${diagnosticFilters}${blocks || '<div class="card empty-state"><p>当前筛选范围没有规则或习惯。</p></div>'}`);
   } catch (e) { setContent(`<div class="card empty-state"><p>规则加载失败：${escapeHtml(e)}</p></div>`); }
 }
 

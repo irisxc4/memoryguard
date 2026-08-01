@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.mcp_server import TOOLS, execute_tool
@@ -41,7 +42,7 @@ def test_mcp_auto_rule_tool_and_scope_stats(tmp_path, monkeypatch):
     assert decision["decision_id"] == created["decision_id"]
 
 
-def test_feedback_corrected_creates_narrow_child_and_exception_has_parent_link(tmp_path, monkeypatch):
+def test_exception_feedback_excludes_parent_and_corrected_is_only_recorded(tmp_path, monkeypatch):
     store = _bind(tmp_path, monkeypatch)
     context = EffectiveAgentContext(
         agent_instance_id="a", share_group_id="team",
@@ -52,21 +53,31 @@ def test_feedback_corrected_creates_narrow_child_and_exception_has_parent_link(t
         "始终先运行测试", context,
         requested_scope={"target_type": "agent", "target_id": "a"},
     )
+    parent_before = store.list_rule_assignments(parent.memory_id)
+    assert any(item.target_type == "agent" and item.effect == "include" for item in parent_before)
+    assert not any(item.effect == "exclude" for item in parent_before)
+
+    # "corrected" is a content-level correction, not a scope-error signal: it is recorded
+    # as an event (P0-2) and must NOT trigger narrowing (P0-3 narrows only on not_applicable).
     receipt_id = stable_hash("receipt", parent.memory_id)
     store.append_rule_match_receipt(RuleMatchReceipt(
         receipt_id=receipt_id, memory_id=parent.memory_id,
         share_group_id="team", agent_instance_id="a", task_hash="t",
-        task="x", assignment_ids=[item.assignment_id for item in store.list_rule_assignments(parent.memory_id)],
+        task="x", assignment_ids=[item.assignment_id for item in parent_before],
         created_at=_now_iso(),
     ))
-
     corrected = service.submit_feedback(
         receipt_id, "corrected", "agent:a", evidence="当前项目仍需先运行测试", effective_context=context,
     )
-    assert corrected.status == "created"
-    assert corrected.parent_rule_id == parent.memory_id
-    assert store.list_rule_assignments(corrected.memory_id)[0].target_type == "agent_project"
+    assert corrected.status == "recorded"
+    assert store.get_rule_match_feedback_by_receipt(receipt_id).outcome == "corrected"
+    # corrected does not narrow: the parent rule's assignments are unchanged.
+    assert [item.to_dict() for item in store.list_rule_assignments(parent.memory_id)] == [
+        item.to_dict() for item in parent_before
+    ]
 
+    # "exception" creates a child exception rule and adds a parent exclude for that project
+    # in the same transaction, so the original stops applying there (P0-5).
     exception_receipt_id = stable_hash("receipt", parent.memory_id, "exception")
     store.append_rule_match_receipt(RuleMatchReceipt(
         receipt_id=exception_receipt_id, memory_id=parent.memory_id,
@@ -80,3 +91,13 @@ def test_feedback_corrected_creates_narrow_child_and_exception_has_parent_link(t
     assert exception.status == "created"
     assert exception.parent_rule_id == parent.memory_id
     assert all(item.effect == "include" for item in store.list_rule_assignments(exception.memory_id))
+    parent_after = store.list_rule_assignments(parent.memory_id)
+    # The store normalizes project paths (lowercase, forward slashes), so compare normalized.
+    def _norm_project(value: str) -> str:
+        return str(Path(value or "")).replace("\\", "/").lower()
+    assert any(
+        item.effect == "exclude" and item.target_type == "agent_project"
+        and item.target_id == "a"
+        and _norm_project(item.project_ref) == _norm_project(context.project_ref)
+        for item in parent_after
+    ), "exception must exclude the parent rule from the offending project (P0-5)"

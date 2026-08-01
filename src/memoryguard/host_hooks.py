@@ -1572,8 +1572,14 @@ def _flush_pending_rule_feedback(
 
     for raw in receipts:
         receipt_id = raw["receipt_id"]
+        # Do not re-write ``unobserved`` for the same receipt on every Stop.
+        # ``get_rule_match_feedback_by_receipt`` resolves the *effective*
+        # feedback and returns None while only unobserved events exist, so
+        # check the raw event history for an existing unobserved marker too.
         try:
-            existing = store.get_rule_match_feedback_by_receipt(receipt_id)
+            existing_events = store.list_rule_match_feedbacks(
+                receipt_id=receipt_id,
+            )
         except Exception as exc:
             _emit_runtime_write_diagnostic(
                 "rule_feedback_fallback_lookup_failed",
@@ -1582,17 +1588,27 @@ def _flush_pending_rule_feedback(
                 exc,
             )
             continue
+        existing = store.get_rule_match_feedback_by_receipt(receipt_id)
         if existing is not None:
             continue
+        if any(item.source == "hook" and item.outcome == "unobserved" for item in existing_events):
+            continue
+        # v2: absence of observation must never be recorded as
+        # "not_applicable".  No feedback may mean the rule was followed but
+        # unobserved, violated, deferred, or simply unknown.  Write an
+        # ``unobserved`` event with confidence 0.0 so the rule lifecycle does
+        # not treat the absence as scope-error evidence and never poisons the
+        # auto-scope accuracy counters.
         feedback = RuleMatchFeedback(
             feedback_id=stable_hash(
-                "rule-feedback", "not_applicable", receipt_id, actor, trigger,
+                "rule-feedback", "unobserved", receipt_id, actor, trigger,
             ),
             receipt_id=receipt_id,
-            outcome="not_applicable",
+            outcome="unobserved",
             actor=actor,
-            evidence=f"auto fallback from stop: {trigger}",
-            confidence=1.0,
+            evidence=f"no observation reported before stop: {trigger}",
+            confidence=0.0,
+            source="hook",
             created_at=_now_iso(),
         )
         try:

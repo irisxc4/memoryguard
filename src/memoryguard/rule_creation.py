@@ -48,10 +48,22 @@ from .schema_v3 import (
 
 
 AUTO_TARGET_TYPES = frozenset({"agent", "agent_project"})
-NARROWING_OUTCOMES = frozenset({"corrected", "violated"})
+# v2: only ``not_applicable`` is scope-error evidence.  ``violated`` means the
+# rule applied but the agent did not follow it -- that is an execution failure,
+# not a proof the scope was too wide.  ``corrected`` needs an explicit
+# correction_type before it can drive narrowing.
+NARROWING_OUTCOMES = frozenset({"not_applicable"})
 FEEDBACK_OUTCOMES = frozenset({
     "followed", "violated", "not_applicable", "corrected", "exception", "ignored",
+    "unobserved",
 })
+# A single feedback event must never change scope.  At least 3 explicit
+# scope-error events from at least 2 distinct sessions concentrated in the
+# same project are required before automatic narrowing may proceed.
+NARROWING_MIN_EVENTS = 3
+NARROWING_MIN_SESSIONS = 2
+# High-confidence ``followed`` evidence cancels narrowing evidence.
+NARROWING_OPPOSED_THRESHOLD = 2
 
 
 class RuleCreationService:
@@ -190,6 +202,7 @@ class RuleCreationService:
         *,
         manual: bool,
         is_admin: bool,
+        text: str = "",
     ) -> tuple[dict[str, Any], float, str]:
         """Resolve and validate one assignment without widening authority."""
         agent_id = context["agent_instance_id"]
@@ -198,15 +211,22 @@ class RuleCreationService:
             raise ValueError("trusted agent_instance_id is required")
 
         if requested_scope is None:
-            target_type = "agent_project" if project_ref else "agent"
-            target_id = agent_id
-            selected_project = project_ref if target_type == "agent_project" else ""
-            confidence = 0.96 if selected_project else 0.99
-            reason = (
-                "inferred from trusted current agent and canonical cwd project"
-                if selected_project else
-                "inferred from trusted current agent; no canonical project available"
+            # P1: infer the scope from the rule text, not a fixed table.  Only
+            # the trusted current agent / agent+project may be selected; broad
+            # or ambiguous text falls back to the narrowest trusted scope with
+            # a lowered confidence (fallback_used) instead of a confident claim.
+            from .rule_scope import infer_scope_from_text
+            inference = infer_scope_from_text(
+                text, agent_instance_id=agent_id, project_ref=project_ref,
             )
+            selected = inference.selected
+            target_type = selected.target_type
+            target_id = selected.target_id
+            selected_project = selected.project_ref if target_type == "agent_project" else ""
+            confidence = float(selected.confidence)
+            reason = "; ".join(selected.reasons) if selected.reasons else "auto-scope from trusted context"
+            if inference.fallback_used:
+                reason += " [auto-scope fallback; human confirmation recommended]"
             inferred = {
                 "target_type": target_type,
                 "target_id": target_id,
@@ -426,7 +446,7 @@ class RuleCreationService:
                     pass
         try:
             assignment, confidence, scope_reason = self._scope_values(
-                context, requested, manual=bool(manual), is_admin=admin,
+                context, requested, manual=bool(manual), is_admin=admin, text=body,
             )
         except (TypeError, ValueError) as exc:
             return self._blocked(
@@ -538,6 +558,82 @@ class RuleCreationService:
 
     create_rule = create_rule_from_text
 
+    def _target_undo(
+        self,
+        decision: RuleDecision,
+        *,
+        token: str,
+        actor: str,
+    ) -> RuleDecision | None:
+        """Target-level inverse operation for one rule decision.
+
+        v2: restores only the record + assignments touched by this decision,
+        never the whole shared-memory group.  Returns None when the decision
+        does not name a rule or the rule no longer exists.
+        """
+        if not decision.memory_id and not decision.rule_id:
+            return None
+        memory_id = decision.memory_id or decision.rule_id
+        before = decision.before if isinstance(decision.before, dict) else {}
+        before_record = before.get("record") if isinstance(before.get("record"), dict) else before.get("after")
+        before_assignments = before.get("assignments")
+        get_record = getattr(self.store, "get_record", None)
+        if callable(get_record):
+            try:
+                existing = get_record(memory_id)
+            except Exception:
+                existing = None
+        else:
+            existing = None
+        if existing is not None:
+            # Soft-delete/shadow the rule; preserve history.
+            delete = getattr(self.store, "delete", None)
+            if callable(delete):
+                try:
+                    delete(memory_id, actor=actor, manual_override=True)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+            elif hasattr(self.store, "update_record"):
+                from .schema_v3 import SharedMemoryStatus
+                try:
+                    existing.status = SharedMemoryStatus.DELETED
+                    self.store.update_record(existing)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+        # Restore the exact assignments this decision created (if any).
+        if isinstance(before_assignments, list) and before_assignments:
+            set_assignments = getattr(self.store, "set_rule_assignments", None)
+            if callable(set_assignments):
+                try:
+                    set_assignments(
+                        memory_id, [dict(item) for item in before_assignments],
+                        automatic=True, actor_agent_id=str(decision.actor or "").replace("agent:", ""),
+                    )
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+        now = _now_iso()
+        inverse = RuleDecision(
+            decision_id=stable_hash("rule-decision-undo", decision.decision_id, actor, now),
+            actor=actor,
+            before=decision.after,
+            after=decision.before,
+            reason=f"target-level undo of {decision.decision_id}",
+            confidence=decision.confidence,
+            undo_id=decision.decision_id,
+            created_at=now,
+            rule_id=memory_id,
+            action="rule_undo",
+            target_ids=[memory_id],
+            status="undone",
+            memory_id=memory_id,
+            parent_rule_id=decision.parent_rule_id,
+            scope_confidence=decision.scope_confidence,
+            scope_reason="explicit target-level undo",
+            blocked_reason="",
+            metadata={"target_undo": True, "supersedes_token": token},
+        )
+        return self._persist_structured_decision(inverse)
+
     def undo_rule(
         self,
         undo_id: str,
@@ -585,10 +681,13 @@ class RuleCreationService:
                     pass
             if context["agent_instance_id"] and not owner_match:
                 return self._blocked(action="rule_undo", reason="undo permission denied", context=context, undo_id=token)
+        # v2: daily undo must be a target-level inverse operation, never a
+        # whole-share-group rollback.  A shared group can contain rules
+        # written by other Agents after this rule was created; rolling back
+        # the pre-create snapshot would erase their writes.
         structured_original = None
         structured_list = getattr(self.store, "list_rule_decisions", None)
-        structured_undo = getattr(self.store, "undo_rule_decision", None)
-        if callable(structured_list) and callable(structured_undo):
+        if callable(structured_list):
             try:
                 candidates = structured_list(undo_id=token)
                 structured_original = candidates[0] if candidates else None
@@ -596,18 +695,16 @@ class RuleCreationService:
                 structured_original = None
         if structured_original is not None:
             try:
-                inverse = structured_undo(
-                    structured_original.decision_id,
+                inverse = self._target_undo(
+                    structured_original, token=token,
                     actor=("admin" if admin else f"agent:{context['agent_instance_id']}"),
                 )
-                inverse.status = "undone"
-                inverse.undo_id = token
-                inverse.scope_confidence = structured_original.scope_confidence
-                inverse.scope_reason = "explicit undo of persisted pre-rule snapshot"
-                self._persist_structured_decision(inverse)
-                return inverse
+                if inverse is not None:
+                    return inverse
             except (TypeError, ValueError, RuntimeError):
                 pass
+        # No structured decision points to a specific rule: fall back to the
+        # versioned snapshot only as a compatibility path for legacy tokens.
         try:
             self.store.rollback_to_version(token)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
@@ -758,6 +855,30 @@ class RuleCreationService:
                 ]
             except Exception:
                 payload["scope_stats"] = []
+        # P1: report auto-scope coverage from rule-create decisions instead of
+        # dressing assignment counts up as accuracy.  Accuracy itself requires
+        # a human-labeled golden set and is never fabricated here.
+        decisions: list[Any] = []
+        list_decisions = getattr(self.store, "list_rule_decisions", None)
+        if callable(list_decisions):
+            try:
+                decisions = list_decisions()
+            except Exception:
+                decisions = []
+        auto_created = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_auto"]
+        manual_created = [d for d in decisions if str(getattr(d, "action", "") or "") == "rule_create_manual"]
+        total_created = len(auto_created) + len(manual_created)
+        fallback_auto = [
+            d for d in auto_created
+            if "fallback" in str(getattr(d, "scope_reason", "") or getattr(d, "reason", "") or "")
+        ]
+        payload["auto_scope"] = {
+            "auto_created": len(auto_created),
+            "manual_created": len(manual_created),
+            "auto_scope_coverage": (len(auto_created) / total_created) if total_created else 0.0,
+            "auto_fallback_count": len(fallback_auto),
+            "accuracy_note": "accuracy requires a human-labeled golden set; assignment count is not accuracy",
+        }
         if context is not None:
             payload["effective_context"] = context
             payload["current_agent_assignments"] = sum(
@@ -800,31 +921,57 @@ class RuleCreationService:
         feedback_id = str(idempotency_key or "").strip() or stable_hash(
             "rule-feedback", receipt_id, outcome, actor, evidence,
         )
+        # v2: feedback is an append-only event stream.  Derive ``source`` from
+        # the actor prefix so the effective-feedback resolver can order
+        # user > agent > hook > unobserved correctly.
+        actor_value = str(actor).strip()
+        actor_lower = actor_value.casefold()
+        if actor_lower.startswith("user") or actor_lower == "user":
+            feedback_source = "user"
+        elif actor_lower.startswith("hook"):
+            feedback_source = "hook"
+        else:
+            feedback_source = "agent"
+        # An ``unobserved`` feedback event must never be recorded with a
+        # positive confidence; the model enforces this in __post_init__.
         feedback = RuleMatchFeedback(
             feedback_id=feedback_id, receipt_id=str(receipt_id), outcome=outcome,
-            actor=str(actor).strip(), evidence=str(evidence or ""),
+            actor=actor_value, evidence=str(evidence or ""),
             confidence=confidence_value, created_at=_now_iso(),
+            source=feedback_source,
         )
-        existing_feedback = None
+        # Determine the current effective feedback before appending so we can
+        # tell whether this new event actually changes the observable outcome.
         lookup_feedback = getattr(self.store, "get_rule_match_feedback_by_receipt", None)
+        prior_effective = None
         if callable(lookup_feedback):
             try:
-                existing_feedback = lookup_feedback(str(receipt_id))
+                prior_effective = lookup_feedback(str(receipt_id))
             except Exception:
-                existing_feedback = None
+                prior_effective = None
         try:
-            saved = existing_feedback or self.store.append_rule_match_feedback(feedback)
+            saved = self.store.append_rule_match_feedback(feedback)
         except (FileNotFoundError, ValueError, RuntimeError) as exc:
             return self._blocked(action="rule_feedback", reason=str(exc), receipt_id=receipt_id)
         receipt = self.store.get_rule_match_receipt(str(receipt_id))
-        if receipt is not None and existing_feedback is None:
+        # Counters must never count ``unobserved`` as a scope outcome.  Only
+        # explicit outcomes update the accuracy ledger.
+        if (
+            receipt is not None
+            and outcome != "unobserved"
+            and (
+                prior_effective is None
+                or prior_effective.outcome != outcome
+                or prior_effective.source != feedback_source
+            )
+        ):
             record_scope = getattr(self.store, "record_rule_scope", None)
             if callable(record_scope):
                 context_for_stats = self._context_dict(effective_context) if effective_context is not None else {}
                 scope_outcome = {
                     "followed": "accepted",
                     "corrected": "corrected",
-                    "violated": "corrected",
+                    "violated": "accepted",
                     "exception": "wrong_scope",
                     "not_applicable": "wrong_scope",
                 }.get(outcome, "ignored")
@@ -832,7 +979,11 @@ class RuleCreationService:
                     record_scope(
                         receipt.memory_id,
                         agent_instance_id=str(receipt.agent_instance_id or context_for_stats.get("agent_instance_id", "")),
-                        project_ref=str(context_for_stats.get("project_ref", "")),
+                        project_ref=str(
+                            context_for_stats.get("project_ref")
+                            or receipt.project_ref
+                            or ""
+                        ),
                         outcome=scope_outcome,
                     )
                 except (TypeError, ValueError, RuntimeError):
@@ -844,11 +995,12 @@ class RuleCreationService:
                 "receipt_id": receipt_id,
             }, feedback_id=feedback_id, receipt_id=receipt_id,
             scope_confidence=confidence_value,
-            metadata={"outcome": outcome, "evidence": evidence, "confidence": confidence_value},
-            actor=str(actor).strip(),
+            metadata={
+                "outcome": outcome, "evidence": evidence,
+                "confidence": confidence_value, "source": feedback_source,
+            },
+            actor=actor_value,
         )
-        if existing_feedback is not None:
-            return base
         if outcome in NARROWING_OUTCOMES:
             return self._narrow_from_feedback(
                 receipt_id, feedback_id, effective_context, outcome=outcome,
@@ -870,6 +1022,23 @@ class RuleCreationService:
             return None, None
         return receipt, self.store.get_record(receipt.memory_id)
 
+    def _collect_receipt_feedbacks(
+        self, receipt_id: str,
+    ) -> list[RuleMatchFeedback]:
+        listing = getattr(self.store, "list_rule_match_feedbacks", None)
+        if callable(listing):
+            try:
+                return listing(receipt_id=receipt_id)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+        return []
+
+    def _narrow_evidence_ready(
+        self, receipt_id: str,
+    ) -> tuple[bool, str, int, int, int]:
+        """Check the v2 narrowing threshold on the argument-supplied list."""
+        return False, "not_applicable_not_enough_evidence", 0, 0, 0
+
     def _narrow_from_feedback(
         self,
         receipt_id: str,
@@ -886,7 +1055,8 @@ class RuleCreationService:
         context: Mapping[str, str] = self._context_dict(effective_context) if effective_context is not None else {
             "agent_instance_id": str(receipt.agent_instance_id or ""),
             "share_group_id": self.group_id,
-            "provider": "", "project_ref": "", "runtime_role": "",
+            "provider": receipt.provider or "", "project_ref": receipt.project_ref or "",
+            "runtime_role": receipt.runtime_role or "",
             "runtime_agent_id": "", "parent_agent_id": "",
         }
         if context["agent_instance_id"] != receipt.agent_instance_id:
@@ -894,18 +1064,44 @@ class RuleCreationService:
         assignments = self.store.list_rule_assignments(parent.memory_id)
         if not assignments:
             return self._blocked(action="rule_narrow", reason="parent rule has no governed assignment", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        # Narrowing is monotone: agent -> agent_project only.  Never convert a
-        # project-specific assignment back to agent, group, system, provider,
-        # or runtime role.  A no-op is preferable to widening.
+        project_ref = context["project_ref"] or receipt.project_ref
+        if not project_ref:
+            return self._blocked(action="rule_narrow", reason="no trusted project context for narrowing", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
+        # v2: a single feedback event must never change scope.  Require at
+        # least 3 explicit ``not_applicable`` events from at least 2 distinct
+        # sessions for the same agent/project, with no strong ``followed``
+        # evidence cancelling them.
+        events = self._collect_receipt_feedbacks(receipt_id)
+        scope_error_events = [
+            item for item in events
+            if item.outcome == "not_applicable" and item.source != "unobserved"
+        ]
+        followed_events = [
+            item for item in events
+            if item.outcome == "followed" and item.confidence >= 0.7
+        ]
+        sessions = {item.actor for item in scope_error_events}
+        # Include the current event's session in the count.
+        current_session = str(context.get("session_id", "") or receipt.session_id or "")
+        sessions.add(
+            current_session or f"session:{receipt.agent_instance_id}:{receipt.session_id}"
+        )
+        if len(scope_error_events) < NARROWING_MIN_EVENTS:
+            return self._blocked(action="rule_narrow", reason="not_applicable_not_enough_evidence", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id, scope_reason=f"needed {NARROWING_MIN_EVENTS}, have {len(scope_error_events)}")
+        if len(sessions) < NARROWING_MIN_SESSIONS:
+            return self._blocked(action="rule_narrow", reason="not_applicable_not_enough_sessions", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id, scope_reason=f"needed {NARROWING_MIN_SESSIONS} sessions, have {len(sessions)}")
+        if len(followed_events) >= NARROWING_OPPOSED_THRESHOLD:
+            return self._blocked(action="rule_narrow", reason="followed_evidence_cancels_narrowing", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
+        # Narrowing is monotone: agent -> agent include + agent_project exclude
+        # for the offending project.  Never convert a project-specific
+        # assignment back to agent, group, system, provider, or runtime role.
         parent_agent = next((item for item in assignments if item.target_type == "agent" and item.effect == "include" and item.target_id == receipt.agent_instance_id), None)
-        project_ref = context["project_ref"]
-        if parent_agent is None or not project_ref:
+        if parent_agent is None:
+            # If nobody on the parent matches this agent at agent level, it
+            # may already be narrowed; a no-op is preferable to widening.
             return self._blocked(action="rule_narrow", reason="no strictly narrower trusted agent_project scope available", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        child_assignment = {
-            "target_type": "agent_project", "target_id": receipt.agent_instance_id,
-            "project_ref": project_ref, "effect": "include",
-        }
-        return self.create_rule_from_text(
+        # Create the child narrower rule (agent_project include).
+        child = self.create_rule_from_text(
             evidence.strip() or parent.body,
             EffectiveAgentContext(
                 agent_instance_id=context["agent_instance_id"], share_group_id=self.group_id,
@@ -914,10 +1110,69 @@ class RuleCreationService:
                 runtime_agent_id=context.get("runtime_agent_id", ""),
                 parent_agent_id=context.get("parent_agent_id", ""),
             ),
-            requested_scope=child_assignment,
+            requested_scope={
+                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                "project_ref": project_ref, "effect": "include",
+            },
             manual=False,
+            priority=parent.priority + 1,
             parent_rule_id=parent.memory_id,
         )
+        child.action = "rule_narrow"
+        child.parent_rule_id = parent.memory_id
+        # The parent rule must stop applying to the offending project while
+        # continuing to apply everywhere else.  Replace the agent-include with
+        # agent-include + agent_project-exclude for that project.
+        updated_assignments = []
+        seen_project_exclude = False
+        for item in assignments:
+            if (
+                item.target_type == "agent"
+                and item.target_id == receipt.agent_instance_id
+                and item.effect == "include"
+            ):
+                updated_assignments.append({
+                    "target_type": "agent", "target_id": receipt.agent_instance_id,
+                    "project_ref": "", "effect": "include",
+                    "priority_override": item.priority_override,
+                })
+            elif (
+                item.effect == "exclude"
+                and item.target_type == "agent_project"
+                and item.target_id == receipt.agent_instance_id
+                and item.project_ref == project_ref
+            ):
+                seen_project_exclude = True
+            else:
+                updated_assignments.append({
+                    "target_type": item.target_type, "target_id": item.target_id,
+                    "project_ref": item.project_ref, "effect": item.effect,
+                    "priority_override": item.priority_override,
+                })
+        if not seen_project_exclude:
+            updated_assignments.append({
+                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                "project_ref": project_ref, "effect": "exclude",
+            })
+        try:
+            final_assignments = self.store.set_rule_assignments(
+                parent.memory_id, updated_assignments,
+                automatic=True, actor_agent_id=receipt.agent_instance_id,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(action="rule_narrow", reason=f"parent_exclude_update_failed:{exc}", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
+        after = dict(child.after or {})
+        after.update({
+            "narrowed_parent_rule": parent.memory_id,
+            "parent_assignments_after": [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in final_assignments
+            ],
+            "excluded_project": project_ref,
+        })
+        child.after = after
+        child_decision = self._persist_structured_decision(child)
+        return child_decision
 
     def create_child_exception(
         self,
@@ -937,11 +1192,11 @@ class RuleCreationService:
         }
         if context["agent_instance_id"] != receipt.agent_instance_id:
             return self._blocked(action="rule_exception", reason="feedback agent does not match receipt agent", receipt_id=receipt_id, feedback_id=feedback_id)
-        # Exception assignment is always an include on a narrower trusted
-        # audience.  We intentionally never add an exclude relation to the
-        # parent; parent_rule_id is carried in the decision/provenance metadata.
-        project_ref = context["project_ref"]
-        target_type = "agent_project" if project_ref else "agent"
+        # v2: an exception must *actually* narrow the parent.  We create a
+        # child rule tailored to the exception context and give the parent an
+        # exclude assignment for that same context, so the existing
+        # include/exclude matcher naturally suppresses the parent there.
+        project_ref = context["project_ref"] or receipt.project_ref
         parent_assignments = self.store.list_rule_assignments(parent.memory_id)
         for parent_assignment in parent_assignments:
             if parent_assignment.effect != "include":
@@ -956,10 +1211,22 @@ class RuleCreationService:
                     return self._blocked(action="rule_exception", reason="exception scope is outside parent agent_project audience", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
             if parent_assignment.target_type == "project" and parent_assignment.project_ref != project_ref:
                 return self._blocked(action="rule_exception", reason="exception project differs from parent project audience", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        assignment = {
-            "target_type": target_type, "target_id": receipt.agent_instance_id,
-            "project_ref": project_ref if project_ref else "", "effect": "include",
-        }
+        # A project-scoped exception needs an exclude on the parent for that
+        # project.  Without a project context there is no narrower audience to
+        # split into, so the exception cannot change actual coverage.
+        if project_ref:
+            target_type = "agent_project"
+            assignment = {
+                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                "project_ref": project_ref, "effect": "include",
+            }
+        else:
+            return self._blocked(
+                action="rule_exception",
+                reason="exception requires trusted project context to narrow coverage",
+                memory_id=parent.memory_id, receipt_id=receipt_id,
+                feedback_id=feedback_id,
+            )
         child = self.create_rule_from_text(
             evidence.strip() or f"Exception to rule: {parent.body}",
             EffectiveAgentContext(
@@ -971,6 +1238,7 @@ class RuleCreationService:
             ),
             requested_scope=assignment,
             manual=False,
+            priority=parent.priority + 1,
             parent_rule_id=parent.memory_id,
         )
         child.action = "rule_exception"
@@ -988,13 +1256,57 @@ class RuleCreationService:
             "feedback_id": feedback_id,
             "receipt_id": receipt_id,
         }, ensure_ascii=False, separators=(",", ":"))
+        # Add the parent exclude for the exception project so the original
+        # rule stops applying there.  The child with higher priority then
+        # covers the exception context alone.
+        updated_assignments = []
+        seen_exclude = False
+        for item in parent_assignments:
+            if item.effect == "exclude":
+                if (
+                    item.target_type == "agent_project"
+                    and item.target_id == receipt.agent_instance_id
+                    and item.project_ref == project_ref
+                ):
+                    seen_exclude = True
+                    updated_assignments.append({
+                        "target_type": item.target_type, "target_id": item.target_id,
+                        "project_ref": item.project_ref, "effect": item.effect,
+                        "priority_override": item.priority_override,
+                    })
+                    continue
+            else:
+                updated_assignments.append({
+                    "target_type": item.target_type, "target_id": item.target_id,
+                    "project_ref": item.project_ref, "effect": item.effect,
+                    "priority_override": item.priority_override,
+                })
+        if not seen_exclude:
+            updated_assignments.append({
+                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
+                "project_ref": project_ref, "effect": "exclude",
+            })
+        try:
+            final_assignments = self.store.set_rule_assignments(
+                parent.memory_id, updated_assignments,
+                automatic=True, actor_agent_id=receipt.agent_instance_id,
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return self._blocked(action="rule_exception", reason=f"parent_exclude_update_failed:{exc}", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
+        child.after.update({
+            "parent_assignments_after": [
+                item.to_dict() if hasattr(item, "to_dict") else dict(item)
+                for item in final_assignments
+            ],
+            "excluded_project": project_ref,
+        })
         append_exception = getattr(self.store, "append_rule_exception", None)
         if callable(append_exception) and child.memory_id:
             try:
                 append_exception(RuleException(
                     parent_rule=parent.memory_id,
                     child_exception=child.memory_id,
-                    priority=0,
+                    priority=parent.priority + 1,
                     reason=evidence or "explicit exception feedback",
                     rollback={"undo_id": child.undo_id},
                     created_at=_now_iso(),

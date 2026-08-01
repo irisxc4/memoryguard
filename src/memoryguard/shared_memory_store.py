@@ -103,11 +103,20 @@ CREATE TABLE IF NOT EXISTS rule_match_receipts (
     matcher_version TEXT NOT NULL DEFAULT 'rule-bootstrap-v1',
     confidence REAL NOT NULL DEFAULT 1.0,
     created_at TEXT NOT NULL,
+    project_ref TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    runtime_role TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    context_hash TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_share_group ON rule_match_receipts(share_group_id);
 CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_agent ON rule_match_receipts(agent_instance_id);
 CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_task ON rule_match_receipts(task_hash);
+-- v2: feedback is an append-only event stream.  A receipt may receive many
+-- feedback events over time; the "effective" one is resolved by authority
+-- (user > agent > hook > unobserved) and latest created_at.  No UNIQUE
+-- constraint on receipt_id.
 CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
     feedback_id TEXT PRIMARY KEY,
     receipt_id TEXT NOT NULL,
@@ -116,10 +125,12 @@ CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
     evidence TEXT NOT NULL DEFAULT '',
     confidence REAL NOT NULL DEFAULT 1.0,
     created_at TEXT NOT NULL,
-    UNIQUE(receipt_id),
+    source TEXT NOT NULL DEFAULT 'agent',
+    authority INTEGER NOT NULL DEFAULT 3,
+    supersedes_feedback_id TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (receipt_id) REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt ON rule_match_feedbacks(receipt_id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt_created ON rule_match_feedbacks(receipt_id, created_at);
 CREATE TABLE IF NOT EXISTS rule_decisions (
     decision_id TEXT PRIMARY KEY,
     actor TEXT NOT NULL,
@@ -815,6 +826,11 @@ class SharedMemoryStore:
     def _row_to_rule_match_receipt(
         self, row: sqlite3.Row,
     ) -> RuleMatchReceipt:
+        def _col(name: str, default: Any = "") -> Any:
+            try:
+                return row[name]
+            except (KeyError, IndexError):
+                return default
         return RuleMatchReceipt(
             receipt_id=row["receipt_id"],
             memory_id=row["memory_id"],
@@ -827,11 +843,21 @@ class SharedMemoryStore:
             matcher_version=row["matcher_version"] or "rule-bootstrap-v1",
             confidence=float(row["confidence"]),
             created_at=row["created_at"] or "",
+            project_ref=canonical_project_ref(str(_col("project_ref", "") or "")),
+            provider=str(_col("provider", "") or ""),
+            runtime_role=str(_col("runtime_role", "") or ""),
+            session_id=str(_col("session_id", "") or ""),
+            context_hash=str(_col("context_hash", "") or ""),
         )
 
     def _row_to_rule_match_feedback(
         self, row: sqlite3.Row,
     ) -> RuleMatchFeedback:
+        def _col(name: str, default: Any = "") -> Any:
+            try:
+                return row[name]
+            except (KeyError, IndexError):
+                return default
         return RuleMatchFeedback(
             feedback_id=row["feedback_id"],
             receipt_id=row["receipt_id"],
@@ -840,37 +866,89 @@ class SharedMemoryStore:
             evidence=row["evidence"] or "",
             confidence=float(row["confidence"]),
             created_at=row["created_at"] or "",
+            source=str(_col("source", "agent") or "agent"),
+            authority=int(_col("authority", 0) or 0),
+            supersedes_feedback_id=str(_col("supersedes_feedback_id", "") or ""),
         )
 
     def _insert_rule_match_receipt(
         self, conn: sqlite3.Connection, receipt: RuleMatchReceipt,
     ) -> None:
         d = receipt.to_dict()
-        conn.execute(
-            "INSERT OR REPLACE INTO rule_match_receipts "
-            "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
-            "assignment_ids,selection_reason,matcher_version,confidence,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                d["receipt_id"], d["memory_id"], d["share_group_id"],
-                d["agent_instance_id"], d["task_hash"], d["task"],
-                json.dumps(d["assignment_ids"], ensure_ascii=False),
-                d["selection_reason"], d["matcher_version"],
-                d["confidence"], d["created_at"],
-            ),
-        )
+        try:
+            row = conn.execute(
+                "SELECT * FROM rule_match_receipts WHERE receipt_id=?",
+                (d["receipt_id"],),
+            ).fetchone()
+            has_new_columns = row is not None and "project_ref" in row.keys()
+        except sqlite3.Error:
+            has_new_columns = False
+        if has_new_columns:
+            conn.execute(
+                "INSERT OR REPLACE INTO rule_match_receipts "
+                "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
+                "assignment_ids,selection_reason,matcher_version,confidence,created_at,"
+                "project_ref,provider,runtime_role,session_id,context_hash)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    d["receipt_id"], d["memory_id"], d["share_group_id"],
+                    d["agent_instance_id"], d["task_hash"], d["task"],
+                    json.dumps(d["assignment_ids"], ensure_ascii=False),
+                    d["selection_reason"], d["matcher_version"],
+                    d["confidence"], d["created_at"],
+                    d.get("project_ref", ""), d.get("provider", ""),
+                    d.get("runtime_role", ""), d.get("session_id", ""),
+                    d.get("context_hash", ""),
+                ),
+            )
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO rule_match_receipts "
+                "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
+                "assignment_ids,selection_reason,matcher_version,confidence,created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    d["receipt_id"], d["memory_id"], d["share_group_id"],
+                    d["agent_instance_id"], d["task_hash"], d["task"],
+                    json.dumps(d["assignment_ids"], ensure_ascii=False),
+                    d["selection_reason"], d["matcher_version"],
+                    d["confidence"], d["created_at"],
+                ),
+            )
 
     def _insert_rule_match_feedback(self, conn: sqlite3.Connection, feedback: RuleMatchFeedback) -> None:
         d = feedback.to_dict()
-        conn.execute(
-            "INSERT INTO rule_match_feedbacks "
-            "(feedback_id,receipt_id,outcome,actor,evidence,confidence,created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (
-                d["feedback_id"], d["receipt_id"], d["outcome"], d["actor"],
-                d["evidence"], d["confidence"], d["created_at"],
-            ),
-        )
+        try:
+            # Probe the schema, not a row: an empty table has no rowid=1, which used to
+            # make the widened INSERT (source/authority/supersedes) silently skipped and
+            # every feedback event read back with the default "agent" source.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(rule_match_feedbacks)").fetchall()}
+            has_new_columns = {"source", "authority", "supersedes_feedback_id"}.issubset(columns)
+        except sqlite3.Error:
+            has_new_columns = False
+        if has_new_columns:
+            conn.execute(
+                "INSERT INTO rule_match_feedbacks "
+                "(feedback_id,receipt_id,outcome,actor,evidence,confidence,created_at,"
+                "source,authority,supersedes_feedback_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    d["feedback_id"], d["receipt_id"], d["outcome"], d["actor"],
+                    d["evidence"], d["confidence"], d["created_at"],
+                    d.get("source", "agent"), d.get("authority", 3),
+                    d.get("supersedes_feedback_id", ""),
+                ),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO rule_match_feedbacks "
+                "(feedback_id,receipt_id,outcome,actor,evidence,confidence,created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    d["feedback_id"], d["receipt_id"], d["outcome"], d["actor"],
+                    d["evidence"], d["confidence"], d["created_at"],
+                ),
+            )
 
     @staticmethod
     def _include_assignments(
@@ -2042,7 +2120,7 @@ class SharedMemoryStore:
             raise ValueError("receipt_id is required")
         allowed = {
             "followed", "violated", "not_applicable", "corrected",
-            "exception", "ignored",
+            "exception", "ignored", "unobserved",
         }
         if feedback.outcome not in allowed:
             raise ValueError("invalid feedback outcome")
@@ -2107,14 +2185,34 @@ class SharedMemoryStore:
     def get_rule_match_feedback_by_receipt(
         self, receipt_id: str,
     ) -> RuleMatchFeedback | None:
+        """Return the *effective* feedback for a receipt.
+
+        v2: feedback is an append-only event stream.  The effective event is
+        resolved by precedence order (user > agent > hook > unobserved) then
+        by the most recent created_at.  Older ``unobserved`` events never
+        block a later explicit user/agent feedback from superseding them.
+        """
+        from .schema_v3 import FEEDBACK_AUTHORITY_ORDER
         with self._db() as conn:
-            row = conn.execute(
-                "SELECT * FROM rule_match_feedbacks WHERE receipt_id=?",
+            rows = conn.execute(
+                "SELECT * FROM rule_match_feedbacks WHERE receipt_id=? "
+                "ORDER BY created_at, rowid",
                 (receipt_id,),
-            ).fetchone()
-        if row is None:
+            ).fetchall()
+        if not rows:
             return None
-        return self._row_to_rule_match_feedback(row)
+        ordered = [self._row_to_rule_match_feedback(row) for row in rows]
+        ordered.sort(
+            key=lambda item: (
+                FEEDBACK_AUTHORITY_ORDER.get(item.source, 0),
+                item.created_at or "",
+            ),
+            reverse=True,
+        )
+        effective = ordered[0]
+        if effective.outcome == "unobserved":
+            return None
+        return effective
 
     # Future narrowing logic can use hit terminology without creating a
     # second table or losing compatibility with existing match receipts.

@@ -1193,6 +1193,8 @@ class EffectiveAgentContext:
     runtime_role: str = ""
     runtime_agent_id: str = ""
     parent_agent_id: str = ""
+    session_id: str = ""
+    context_hash: str = ""
 
 
 @dataclass(frozen=True)
@@ -1521,6 +1523,10 @@ class RuleMatchReceipt:
     The receipt is immutable and never replaces source memory data.  It enables
     explicit feedback from hosts/agents without inferring obedience from "tool
     call happened".
+
+    v2 adds the exact runtime context (project/provider/role/session/hash) that
+    produced the match.  Narrowing and exception decisions must be able to rely
+    on this context without asking the GUI to re-supply it afterwards.
     """
     receipt_id: str
     memory_id: str
@@ -1533,6 +1539,11 @@ class RuleMatchReceipt:
     matcher_version: str = "rule-bootstrap-v1"
     confidence: float = 1.0
     created_at: str = ""
+    project_ref: str = ""
+    provider: str = ""
+    runtime_role: str = ""
+    session_id: str = ""
+    context_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1547,6 +1558,11 @@ class RuleMatchReceipt:
             "matcher_version": self.matcher_version,
             "confidence": self.confidence,
             "created_at": self.created_at,
+            "project_ref": self.project_ref,
+            "provider": self.provider,
+            "runtime_role": self.runtime_role,
+            "session_id": self.session_id,
+            "context_hash": self.context_hash,
         }
 
     @classmethod
@@ -1563,14 +1579,47 @@ class RuleMatchReceipt:
             matcher_version=data.get("matcher_version", "rule-bootstrap-v1"),
             confidence=float(data.get("confidence", 1.0)),
             created_at=data.get("created_at", ""),
+            project_ref=data.get("project_ref", ""),
+            provider=data.get("provider", ""),
+            runtime_role=data.get("runtime_role", ""),
+            session_id=data.get("session_id", ""),
+            context_hash=data.get("context_hash", ""),
         )
+
+
+# Feedback outcome semantics (v2):
+#   followed       -> rule applied and was followed
+#   violated       -> rule applied but not followed (NOT a scope error)
+#   not_applicable -> scope error evidence (rule was injected where it did not apply)
+#   corrected      -> content or scope was corrected; correction_type requested
+#   exception      -> current context needs an exception
+#   unobserved     -> cannot determine; confidence MUST be 0.0
+FEEDBACK_OUTCOMES_V2 = frozenset({
+    "followed", "violated", "not_applicable", "corrected", "exception",
+    "ignored", "unobserved",
+})
+
+# Feedback precedence when multiple events exist for one receipt:
+#   user explicit > agent explicit > hook direct observation > unobserved
+FEEDBACK_AUTHORITY_ORDER = {
+    "user": 4,
+    "agent": 3,
+    "hook": 2,
+    "unobserved": 1,
+}
 
 
 @dataclass
 class RuleMatchFeedback:
-    """Explicit feedback for one match receipt.
+    """Explicit feedback for one match receipt (append-only event).
 
-    outcome: followed|violated|not_applicable|corrected|exception|ignored
+    outcome: followed|violated|not_applicable|corrected|exception|ignored|unobserved
+
+    A receipt may receive multiple feedback events over time.  ``source`` is
+    the producer category (user/agent/hook), ``authority`` orders precedence,
+    and ``supersedes_feedback_id`` points at the feedback event this one
+    replaces (None on the first event).  ``before_hash``/``after_hash`` record
+    the rule state so later merges can verify the effective feedback.
     """
     feedback_id: str
     receipt_id: str
@@ -1579,6 +1628,29 @@ class RuleMatchFeedback:
     evidence: str = ""
     confidence: float = 1.0
     created_at: str = ""
+    source: str = "agent"
+    authority: int = 3
+    supersedes_feedback_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.outcome not in FEEDBACK_OUTCOMES_V2:
+            raise ValueError(
+                f"invalid feedback outcome {self.outcome!r}; allowed: "
+                + ", ".join(sorted(FEEDBACK_OUTCOMES_V2))
+            )
+        if self.outcome == "unobserved":
+            # Absence of observation must never be recorded as high-confidence
+            # evidence.  It represents "unknown", not "not applicable".
+            self.confidence = 0.0
+            if not self.source:
+                self.source = "hook"
+            self.authority = FEEDBACK_AUTHORITY_ORDER.get("unobserved", 1)
+        if not self.source:
+            self.source = "agent"
+        if not self.authority:
+            self.authority = FEEDBACK_AUTHORITY_ORDER.get(
+                self.source, FEEDBACK_AUTHORITY_ORDER.get("agent", 3),
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1589,6 +1661,9 @@ class RuleMatchFeedback:
             "evidence": self.evidence,
             "confidence": self.confidence,
             "created_at": self.created_at,
+            "source": self.source,
+            "authority": self.authority,
+            "supersedes_feedback_id": self.supersedes_feedback_id,
         }
 
     @classmethod
@@ -1601,6 +1676,9 @@ class RuleMatchFeedback:
             evidence=data.get("evidence", ""),
             confidence=float(data.get("confidence", 1.0)),
             created_at=data.get("created_at", ""),
+            source=data.get("source", "agent"),
+            authority=int(data.get("authority", 0) or 0),
+            supersedes_feedback_id=data.get("supersedes_feedback_id", ""),
         )
 
 

@@ -2,7 +2,7 @@ import json
 
 from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.rule_creation import RuleCreationService
-from memoryguard.schema_v3 import EffectiveAgentContext
+from memoryguard.schema_v3 import EffectiveAgentContext, SharedMemoryStatus
 from memoryguard.shared_memory_store import SharedMemoryStore
 
 
@@ -34,7 +34,9 @@ def test_auto_create_infers_trusted_agent_project_and_exposes_undo(tmp_path):
 
     undone = service.undo_rule(result.undo_id, context)
     assert undone.status == "undone"
-    assert store.get_record(result.memory_id) is None
+    # v2 undo is a target-level inverse that soft-deletes the rule (history preserved),
+    # so the record survives with a DELETED status instead of vanishing from storage.
+    assert store.get_record(result.memory_id).status == SharedMemoryStatus.DELETED
 
 
 def test_auto_scope_rejects_broad_or_other_agent_target(tmp_path):

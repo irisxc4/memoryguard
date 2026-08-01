@@ -772,10 +772,15 @@ def test_stop_flushes_pending_mandatory_rule_feedback(tmp_path: Path):
     )
     assert "memoryguard_memory_write" not in stop_result
 
-    feedback = store.get_rule_match_feedback_by_receipt(receipt_id)
-    assert feedback is not None
-    assert feedback.outcome == "not_applicable"
-    assert feedback.actor == "hook:codex:codex-agent"
+    # No observation on Stop is "unknown", never "not applicable": absence of a host
+    # observation may mean followed, violated, deferred, or simply not reached yet.
+    events = store.list_rule_match_feedbacks(receipt_id=receipt_id)
+    assert any(
+        item.outcome == "unobserved" and item.source == "hook" and item.confidence == 0.0
+        for item in events
+    ), "stop with no observation must record unobserved (never not_applicable)"
+    # unobserved is not an *effective* feedback, so the receipt stays pending for a real answer.
+    assert store.get_rule_match_feedback_by_receipt(receipt_id) is None
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state.get("mandatory_match_receipts") == []
@@ -789,7 +794,11 @@ def test_stop_flushes_pending_mandatory_rule_feedback(tmp_path: Path):
         payload={"session_id": session_id, "loop_count": 1},
     )
     assert second_stop == {}
-    assert store.get_rule_match_feedback_by_receipt(receipt_id).feedback_id == feedback.feedback_id
+    # the second stop must not re-write a duplicate unobserved event.
+    assert sum(
+        1 for item in store.list_rule_match_feedbacks(receipt_id=receipt_id)
+        if item.outcome == "unobserved"
+    ) == 1
 
 
 def test_stop_skips_feedback_when_explicit_feedback_is_already_present(tmp_path: Path):

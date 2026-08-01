@@ -200,3 +200,146 @@ def can_manage_assignment(assignment: RuleAssignment, *, actor_agent_id: str, is
         assignment.target_type in {"agent", "agent_project"}
         and assignment.target_id == actor_agent_id
     )
+
+
+# ---------------------------------------------------------------------------
+# Semantic scope inference (P1)
+#
+# One-sentence rule creation should not guess a scope from a hard-coded table.
+# The text is scanned for explicit scope signals; only the trusted current
+# agent and its canonical project are ever selected automatically, so the
+# safety boundary (no auto group/provider/runtime_role/system/other-agent)
+# is unchanged.  Broad or ambiguous requests fall back to the narrowest
+# trusted scope with a lowered confidence and ``fallback_used`` so the cockpit
+# can ask for human confirmation instead of claiming a wide scope confidently.
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+import re as _re
+
+
+@dataclass
+class ScopeCandidate:
+    target_type: str
+    target_id: str
+    project_ref: str
+    confidence: float
+    reasons: list[str] = field(default_factory=list)
+
+    def __hash__(self) -> int:
+        return hash((self.target_type, self.target_id, self.project_ref))
+
+
+@dataclass
+class ScopeInferenceResult:
+    candidates: list[ScopeCandidate]
+    selected: ScopeCandidate
+    margin: float
+    fallback_used: bool
+    policy_version: str
+
+    def to_dict(self) -> dict:
+        return {
+            "selected": {
+                "target_type": self.selected.target_type,
+                "target_id": self.selected.target_id,
+                "project_ref": self.selected.project_ref,
+                "confidence": self.selected.confidence,
+                "reasons": self.selected.reasons,
+            },
+            "candidates": [
+                {
+                    "target_type": c.target_type,
+                    "target_id": c.target_id,
+                    "project_ref": c.project_ref,
+                    "confidence": c.confidence,
+                    "reasons": c.reasons,
+                }
+                for c in self.candidates
+            ],
+            "margin": self.margin,
+            "fallback_used": self.fallback_used,
+            "policy_version": self.policy_version,
+        }
+
+
+_TEXT_SIGNALS: list[tuple[_re.Pattern[str], str, float, str]] = [
+    (_re.compile(r"本项目|当前仓库|当前代码库|当前项目|本仓库|这个项目|这个仓库|这个代码库"),
+     "agent_project", 0.96, "text scopes the rule to the current project"),
+    (_re.compile(r"当前 Agent|只让当前 Agent|仅当前 Agent|这个 Agent|当前助手"),
+     "agent", 0.90, "text scopes the rule to the current agent"),
+    (_re.compile(r"子 Agent|子代理|仅子 Agent|所有子 Agent"),
+     "subagent", 0.60, "text suggests a runtime subagent scope"),
+    (_re.compile(r"所有 Agent|所有项目|全局|任何 Agent|全部项目|全局都必须|所有 agent|任何项目"),
+     "broad", 0.45, "text asks for a wide scope that automatic flow must never claim"),
+]
+
+
+def infer_scope_from_text(
+    text: str,
+    *,
+    agent_instance_id: str,
+    project_ref: str = "",
+) -> ScopeInferenceResult:
+    """Semantic layer over trusted context; never widens authority."""
+    lowered = (text or "").strip().lower()
+    candidates: list[ScopeCandidate] = []
+    seen: set[ScopeCandidate] = set()
+    broad_requested = False
+
+    for pattern, hint, base_conf, reason in _TEXT_SIGNALS:
+        if not pattern.search(lowered):
+            continue
+        if hint == "broad":
+            broad_requested = True
+        cand = ScopeCandidate(
+            target_type={
+                "agent_project": "agent_project",
+                "agent": "agent",
+                "subagent": "runtime_role",
+                "broad": "broad",
+            }[hint],
+            target_id=agent_instance_id if hint in ("agent", "agent_project") else "",
+            project_ref=project_ref if hint == "agent_project" else "",
+            confidence=base_conf,
+            reasons=[reason],
+        )
+        if cand not in seen:
+            candidates.append(cand)
+            seen.add(cand)
+
+    # Trusted context pass: only the current agent and its canonical project
+    # may be auto-selected.  No text signal -> safest fallback to current agent.
+    trusted = [
+        c for c in candidates
+        if c.target_type in ("agent", "agent_project")
+        and c.target_id == agent_instance_id
+        and (c.target_type != "agent_project" or bool(c.project_ref))
+    ]
+    if not trusted:
+        trusted = [ScopeCandidate(
+            target_type="agent_project" if project_ref else "agent",
+            target_id=agent_instance_id,
+            project_ref=project_ref if project_ref else "",
+            confidence=0.80 if project_ref else 0.85,
+            reasons=["no explicit scope signal; safe fallback to trusted current context"],
+        )]
+
+    trusted.sort(key=lambda c: c.confidence, reverse=True)
+    selected = trusted[0]
+    margin = (selected.confidence - trusted[1].confidence) if len(trusted) > 1 else 0.15
+    fallback = broad_requested or len(trusted) > 1
+    if broad_requested:
+        # A wide scope must be human-confirmed: keep the narrowest trusted
+        # selection but never report a confident wide claim.
+        selected.confidence = 0.55 if selected.target_type == "agent_project" else 0.60
+        selected.reasons = selected.reasons + [
+            "text requested a wide scope; auto-flow falls back to the narrowest trusted scope and asks for confirmation",
+        ]
+    return ScopeInferenceResult(
+        candidates=candidates,
+        selected=selected,
+        margin=margin,
+        fallback_used=fallback,
+        policy_version="scope-infer-v1",
+    )
