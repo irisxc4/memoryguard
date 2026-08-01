@@ -6640,6 +6640,78 @@ class GovernanceApi:
             runtime_role=role,
         ), None
 
+    def _resolve_current_rule_agent(self, preference) -> tuple[str, str, str | None]:
+        """Resolve a trusted current agent from runtime state, falling back to
+        persisted governance scope and finally to a unique active binding.
+
+        Returns ``(agent_id, group_id, error_payload)``.  The agent must
+        belong to the resolved group via an ``active`` binding; a system-wide
+        listing is never treated as membership.
+        """
+        from .access_context import load_access_context
+        from .agent_binding import AgentBindingStore
+        from .schema_v3 import BindingStatus
+
+        access = load_access_context()
+        agent = str(access.trusted_agent_id or "").strip()
+
+        env_group = str(os.environ.get("MEMORYGUARD_SHARE_GROUP_ID", "") or "").strip()
+        if env_group:
+            group = env_group
+        elif preference is not None and preference.mode == "share_group":
+            group = preference.share_group_id
+        else:
+            group = "default"
+
+        # Candidate 1: env-injected agent identity is the trusted root anchor.
+        # ``MEMORYGUARD_AGENT_ID`` is set by the host process after OAuth
+        # verification ("current connection's trusted agent identity"); the
+        # binding ledger is only an authorization claim for *shared-group
+        # storage*, not a prerequisite for the anchor itself.  Requiring a
+        # binding here would break first-run creation in a fresh workspace
+        # (no binding files exist yet), a chicken-and-egg deadlock.
+        if agent:
+            return agent, group, None
+
+        # Candidate 2: persisted governance scope selecting one agent.
+        if preference is not None and preference.mode == "agent":
+            scoped_agent = str(preference.agent_instance_id or "").strip()
+            if scoped_agent:
+                store = AgentBindingStore(self.workspace)
+                matches = [
+                    b for b in store.find_by_agent(scoped_agent, include_inactive=False)
+                    if b.share_group_id == group
+                    and getattr(b, "status", BindingStatus.ACTIVE) == BindingStatus.ACTIVE
+                ]
+                if matches:
+                    return scoped_agent, group, None
+                return None, group, {
+                    "ok": False,
+                    "error": "agent_not_bound_to_group",
+                    "reason": f"governed agent {scoped_agent!r} has no active binding in group {group!r}",
+                }
+
+        # Candidate 3: the current group has exactly one active agent.
+        store = AgentBindingStore(self.workspace)
+        bound = [
+            b for b in store.find_by_group(group, include_inactive=False)
+            if getattr(b, "status", BindingStatus.ACTIVE) == BindingStatus.ACTIVE
+        ]
+        if len(bound) == 1:
+            return str(bound[0].agent_instance_id or "").strip(), group, None
+        if len(bound) > 1:
+            return None, group, {
+                "ok": False,
+                "error": "ambiguous_agent_context",
+                "reason": "multiple active agents in group; set governance scope once",
+            }
+        return None, group, {
+            "ok": False,
+            "error": "agent_context_required",
+            "reason": "rule creation requires a trusted current agent "
+            "(env id, agent governance scope, or unique active binding)",
+        }
+
     def _trusted_rule_bridge_context(self):
         """Resolve rule-creation context from trusted runtime state only.
 
@@ -6650,29 +6722,13 @@ class GovernanceApi:
         governance scope used only to choose the storage group).  Missing
         Agent identity fails closed.
         """
-        from .access_context import load_access_context
         from .governance_scope import load_scope_preference
         from .rule_scope import canonical_project_ref
 
-        access = load_access_context()
-        agent = str(access.trusted_agent_id or "").strip()
-        if not agent:
-            return None, {
-                "ok": False,
-                "error": "agent_context_required",
-                "reason": "rule creation requires trusted MEMORYGUARD_AGENT_ID",
-            }
-
         preference = load_scope_preference(self.workspace)
-        env_group = str(os.environ.get("MEMORYGUARD_SHARE_GROUP_ID", "") or "").strip()
-        if env_group:
-            group = env_group
-        elif preference is not None and preference.mode == "share_group":
-            # Scope preference routes the local GUI to its selected store.  It
-            # does not supply Agent identity or project authorization.
-            group = preference.share_group_id
-        else:
-            group = "default"
+        agent, group, error = self._resolve_current_rule_agent(preference)
+        if error:
+            return None, error
 
         project_raw = str(
             os.environ.get("MEMORYGUARD_PROJECT_CWD") or os.getcwd()
