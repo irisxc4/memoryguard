@@ -8,7 +8,7 @@ observation never inflates the merge confidence.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .rule_definition import semantic_hash
@@ -31,6 +31,15 @@ class RuleEvidence:
     semantic_hash: str = ""
     confidence: float = 1.0
     observed_at: str = ""
+    # Independence identity (PR5): two receipts of the same fact must collapse
+    # to ONE independent observation even if their evidence_id differs.
+    independence_key: str = ""
+    share_group_id: str = ""
+    source_root_id: str = ""
+    source_object_id: str = ""
+    session_trusted: int = 0
+    feedback_id: str = ""
+    feedback_authority: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -46,6 +55,13 @@ class RuleEvidence:
             "semantic_hash": self.semantic_hash,
             "confidence": self.confidence,
             "observed_at": self.observed_at,
+            "independence_key": self.independence_key,
+            "share_group_id": self.share_group_id,
+            "source_root_id": self.source_root_id,
+            "source_object_id": self.source_object_id,
+            "session_trusted": self.session_trusted,
+            "feedback_id": self.feedback_id,
+            "feedback_authority": self.feedback_authority,
         }
 
     @classmethod
@@ -63,20 +79,45 @@ class RuleEvidence:
             semantic_hash=data.get("semantic_hash", ""),
             confidence=float(data.get("confidence", 1.0)),
             observed_at=data.get("observed_at", ""),
+            independence_key=data.get("independence_key", ""),
+            share_group_id=data.get("share_group_id", ""),
+            source_root_id=data.get("source_root_id", ""),
+            source_object_id=data.get("source_object_id", ""),
+            session_trusted=int(data.get("session_trusted", 0) or 0),
+            feedback_id=data.get("feedback_id", ""),
+            feedback_authority=int(data.get("feedback_authority", 0) or 0),
         )
+
+
+def evidence_independence_key(evidence: RuleEvidence) -> str:
+    """The identity used to collapse duplicate observations (PR5).
+
+    The same fact reported through different receipts collapses to one
+    independent observation only when it really is one: same share group, same
+    Agent, same canonical project, same source root/object, same session, same
+    content.  Two distinct sessions (or distinct source objects) count as two
+    independent observations even if the prose matches.
+    """
+    return stable_hash(
+        "rule-evidence-independence",
+        evidence.share_group_id or "",
+        evidence.agent_instance_id or "",
+        canonical_project_ref(evidence.project_ref),
+        evidence.source_root_id or "",
+        evidence.source_object_id or evidence.session_id or "",
+        evidence.content_hash or "",
+    )
 
 
 def evidence_dedup_key(evidence: RuleEvidence) -> str:
     """The identity used to collapse duplicate observations.
 
-    Same session + same project + same content hash counts as one observation,
-    no matter how many times a hook reported it.
+    Prefers the PR5 independence key; falls back to the legacy
+    (session + project + content) projection for rows that predate it.
     """
-    return stable_hash(
-        "rule-evidence", evidence.session_id or "",
-        canonical_project_ref(evidence.project_ref),
-        evidence.content_hash or "",
-    )
+    if evidence.independence_key:
+        return evidence.independence_key
+    return evidence_independence_key(evidence)
 
 
 def dedupe_evidence(
@@ -106,18 +147,25 @@ def build_evidence(
     confidence: float = 1.0,
     definition_id: str = "",
     observed_at: str = "",
+    share_group_id: str = "",
+    source_root_id: str = "",
+    source_object_id: str = "",
+    session_trusted: int = 0,
+    feedback_id: str = "",
+    feedback_authority: int = 0,
 ) -> RuleEvidence:
     content_hash = stable_hash("rule-content", str(content or "").strip())
-    return RuleEvidence(
+    canonical_project = canonical_project_ref(project_ref)
+    evidence = RuleEvidence(
         evidence_id=stable_hash(
             "rule-evidence", source_rule_id, agent_instance_id,
-            canonical_project_ref(project_ref), session_id, receipt_id,
+            canonical_project, session_id, receipt_id,
             content_hash,
         ),
         definition_id=definition_id,
         source_rule_id=source_rule_id,
         agent_instance_id=agent_instance_id,
-        project_ref=canonical_project_ref(project_ref),
+        project_ref=canonical_project,
         provider=provider,
         session_id=session_id,
         receipt_id=receipt_id,
@@ -125,6 +173,18 @@ def build_evidence(
         semantic_hash=semantic_hash(content),
         confidence=confidence,
         observed_at=observed_at or _now_iso(),
+        share_group_id=share_group_id,
+        source_root_id=source_root_id,
+        source_object_id=source_object_id,
+        session_trusted=int(session_trusted or 0),
+        feedback_id=feedback_id,
+        feedback_authority=int(feedback_authority or 0),
+    )
+    # Freeze the independence key so re-computation stays stable even if
+    # optional context is empty at build time.
+    return replace(
+        evidence,
+        independence_key=evidence_independence_key(evidence),
     )
 
 
@@ -134,8 +194,9 @@ class NegativeEvidence:
 
     This is the P3-001 counterweight to positive evidence.  One observation
     never rejects a merge; a weighted fraction above the threshold does.
-    The identity is the same (session+project+content) dedup discipline as
-    positive evidence so one repeated report never inflates the score.
+    Two counter-examples prove independence only when they come from distinct
+    trusted sessions / source objects, so negative evidence carries the same
+    independence identity as positive evidence.
     """
 
     evidence_id: str
@@ -146,6 +207,15 @@ class NegativeEvidence:
     content_hash: str = ""
     confidence: float = 1.0
     observed_at: str = ""
+    independence_key: str = ""
+    share_group_id: str = ""
+    session_id: str = ""
+    receipt_id: str = ""
+    feedback_id: str = ""
+    feedback_authority: int = 0
+    source_root_id: str = ""
+    source_object_id: str = ""
+    session_trusted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +227,15 @@ class NegativeEvidence:
             "content_hash": self.content_hash,
             "confidence": self.confidence,
             "observed_at": self.observed_at,
+            "independence_key": self.independence_key,
+            "share_group_id": self.share_group_id,
+            "session_id": self.session_id,
+            "receipt_id": self.receipt_id,
+            "feedback_id": self.feedback_id,
+            "feedback_authority": self.feedback_authority,
+            "source_root_id": self.source_root_id,
+            "source_object_id": self.source_object_id,
+            "session_trusted": self.session_trusted,
         }
 
     @classmethod
@@ -170,7 +249,29 @@ class NegativeEvidence:
             content_hash=data.get("content_hash", ""),
             confidence=float(data.get("confidence", 1.0)),
             observed_at=data.get("observed_at", ""),
+            independence_key=data.get("independence_key", ""),
+            share_group_id=data.get("share_group_id", ""),
+            session_id=data.get("session_id", ""),
+            receipt_id=data.get("receipt_id", ""),
+            feedback_id=data.get("feedback_id", ""),
+            feedback_authority=int(data.get("feedback_authority", 0) or 0),
+            source_root_id=data.get("source_root_id", ""),
+            source_object_id=data.get("source_object_id", ""),
+            session_trusted=int(data.get("session_trusted", 0) or 0),
         )
+
+
+def negative_evidence_independence_key(evidence: NegativeEvidence) -> str:
+    """Independence identity for a counter-example (PR5)."""
+    return stable_hash(
+        "rule-negative-evidence-independence",
+        evidence.share_group_id or "",
+        evidence.agent_instance_id or "",
+        canonical_project_ref(evidence.project_ref),
+        evidence.source_root_id or "",
+        evidence.source_object_id or evidence.session_id or "",
+        evidence.content_hash or "",
+    )
 
 
 def build_negative_evidence(
@@ -182,18 +283,39 @@ def build_negative_evidence(
     confidence: float = 1.0,
     definition_id: str = "",
     observed_at: str = "",
+    share_group_id: str = "",
+    session_id: str = "",
+    receipt_id: str = "",
+    feedback_id: str = "",
+    feedback_authority: int = 0,
+    source_root_id: str = "",
+    source_object_id: str = "",
+    session_trusted: int = 0,
 ) -> NegativeEvidence:
     content_hash = stable_hash("rule-content", str(content or "").strip())
-    return NegativeEvidence(
+    canonical_project = canonical_project_ref(project_ref)
+    evidence = NegativeEvidence(
         evidence_id=stable_hash(
             "rule-negative-evidence", source_rule_id, agent_instance_id,
-            canonical_project_ref(project_ref), content_hash,
+            canonical_project, session_id, receipt_id, content_hash,
         ),
         definition_id=definition_id,
         source_rule_id=source_rule_id,
         agent_instance_id=agent_instance_id,
-        project_ref=canonical_project_ref(project_ref),
+        project_ref=canonical_project,
         content_hash=content_hash,
         confidence=confidence,
         observed_at=observed_at or _now_iso(),
+        share_group_id=share_group_id,
+        session_id=session_id,
+        receipt_id=receipt_id,
+        feedback_id=feedback_id,
+        feedback_authority=int(feedback_authority or 0),
+        source_root_id=source_root_id,
+        source_object_id=source_object_id,
+        session_trusted=int(session_trusted or 0),
+    )
+    return replace(
+        evidence,
+        independence_key=negative_evidence_independence_key(evidence),
     )

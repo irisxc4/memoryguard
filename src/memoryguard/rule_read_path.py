@@ -1,17 +1,27 @@
 """Rule read path: canonical-first enforcement reads with legacy fallback (Phase5).
 
 After backfill + dual-write, the rule-intelligence layer holds the canonical
-Definition set.  The *enforcement* read path (context bootstrap, hooks) should
+Definition set.  The *enforcement* read path (context bootstrap, hooks) may
 prefer that canonical layer so that merged duplicates inject once, not N times
 — while the body text still comes from the legacy record so what an Agent sees
 is exactly what its group stored.
+
+**Safety default (v2).**  The canonical read path is a shadow feature, not the
+production default.  ``resolve_read_path_mode`` and ``build_context_packet``
+default to ``legacy``; the canonical path only runs when explicitly requested
+(``rule-intelligence`` / ``auto`` via an explicit opt-in or env var), and it
+deduplicates *after* the active/audience/exclude match so a canonical collapse
+can never delete the one record that actually applies to the current Agent or
+project.  ``shadow_compare`` exposes the legacy-vs-canonical context diff so an
+operator can switch to ``rule-intelligence`` only when
+``missing == extra == permission_diff == 0``.
 
 This module implements Phase5 of the migration:
 
   * ``RuleReadPath`` resolves a canonical mapping ``memory_id -> definition_id``
     from the rule-intelligence store (Definitions → Bindings → Evidence), scoped
     to one group;
-  * ``dedupe_records`` collapses legacy records that map to the same canonical
+  * ``dedupe_records`` collapses records that map to the same canonical
     Definition, keeping the strongest representative per definition;
   * if the intelligence layer has no data for the group, every resolver returns
     None and the caller falls back to the legacy read path byte-for-byte.
@@ -23,7 +33,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Read-path modes.  "auto" prefers the canonical layer when it has data for the
 # group and otherwise behaves exactly like "legacy".
@@ -34,13 +44,17 @@ _MODES = {MODE_AUTO, MODE_LEGACY, MODE_RULE_INTELLIGENCE}
 
 
 def resolve_read_path_mode(value: str = "") -> str:
-    """Normalize a read-path setting; env fallback; never an unknown value."""
+    """Normalize a read-path setting; env fallback; never an unknown value.
+
+    Defaults to ``legacy``: the canonical read path is shadow-only until an
+    operator opts in (env ``MEMORYGUARD_RULE_READ_PATH`` or an explicit value).
+    """
     candidate = str(value or "").strip().lower()
     if candidate not in _MODES:
         candidate = str(
-            os.environ.get("MEMORYGUARD_RULE_READ_PATH", MODE_AUTO)
+            os.environ.get("MEMORYGUARD_RULE_READ_PATH", MODE_LEGACY)
         ).strip().lower()
-    return candidate if candidate in _MODES else MODE_AUTO
+    return candidate if candidate in _MODES else MODE_LEGACY
 
 
 class RuleReadPath:
@@ -144,29 +158,61 @@ class RuleReadPath:
             "definition_to_memory": definition_to_memory,
         }
 
+    def shadow_compare(self, legacy_store: Any, context: Any) -> dict[str, Any] | None:
+        """Legacy-vs-canonical context diff for one effective context.
+
+        Reuses ``RuleMergeStore.shadow_verify`` so ``missing`` / ``extra`` /
+        ``permission_diff`` are computed against the real legacy matcher.  The
+        canonical read path may switch on for this context only when all three
+        are 0 — a canonical collapse must never under-expose a rule that the
+        legacy path would have injected.
+        """
+        store = self._open()
+        if store is None:
+            return None
+        try:
+            legacy_records = [
+                (r.memory_id, legacy_store.list_rule_assignments(r.memory_id))
+                for r in legacy_store.list_records()
+            ]
+        except Exception:
+            return None
+        try:
+            return store.shadow_verify(context, legacy_records)
+        except Exception:
+            return None
+
 
 def dedupe_records(
     records: list[Any],
     mapping: dict[str, Any] | None,
+    *,
+    key: Callable[[Any], tuple] | None = None,
 ) -> list[Any]:
-    """Collapse legacy records that map to the same canonical Definition.
+    """Collapse records that map to the same canonical Definition.
 
     For every canonical definition, the strongest representative wins
-    deterministically: higher priority, then locked, then confidence, then the
-    lexicographically smallest memory_id.  Unmapped records pass through
-    unchanged, preserving the caller's ordering.
+    deterministically.  The default key is higher priority, then locked, then
+    confidence, then the lexicographically smallest memory_id; callers that
+    already applied audience/status/exclude matching may pass a richer key
+    (e.g. effective priority).  Unmapped records pass through unchanged,
+    preserving the caller's ordering.
     """
     if not mapping or not records:
         return list(records)
     memory_to_definition = mapping.get("memory_to_definition") or {}
+    if key is None:
 
-    def _key(record: Any) -> tuple:
-        return (
-            -int(getattr(record, "priority", 0) or 0),
-            -int(1 if getattr(record, "locked", False) else 0),
-            -float(getattr(record, "confidence", 0.0) or 0.0),
-            str(getattr(record, "memory_id", "") or ""),
-        )
+        def _key(record: Any) -> tuple:
+            return (
+                -int(getattr(record, "priority", 0) or 0),
+                -int(1 if getattr(record, "locked", False) else 0),
+                -float(getattr(record, "confidence", 0.0) or 0.0),
+                str(getattr(record, "memory_id", "") or ""),
+            )
+
+    else:
+        _key = key
 
     by_definition: dict[str, Any] = {}
     representative: dict[str, Any] = {}

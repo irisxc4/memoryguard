@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from memoryguard.agent_binding import AgentBindingStore  # noqa: E402
 from memoryguard.rule_binding import build_binding  # noqa: E402
+from memoryguard.rule_definition import normalize_rule_text  # noqa: E402
 from memoryguard.rule_evidence import build_evidence, build_negative_evidence  # noqa: E402
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore  # noqa: E402
 from memoryguard.rule_semantic_judge import DiceJudge  # noqa: E402
@@ -73,18 +74,25 @@ def _seed_legacy(workspace: Path, group_id: str, bodies: list[str]) -> None:
 
 def _seed_evidence(
     store: RuleMergeStore, definition_id: str, text: str,
-    *, observed_at: str = "",
+    *, source_rule_id: str = "", observed_at: str = "",
 ) -> None:
     for i in range(3):
         store.upsert_evidence(build_evidence(
             definition_id=definition_id,
-            source_rule_id=f"{definition_id}-ev{i}",
+            source_rule_id=source_rule_id or f"{definition_id}-ev{i}",
             agent_instance_id=f"agent-{i}",
             project_ref=f"project-{i}",
             session_id=f"session-{i}",
             content=text,
             observed_at=observed_at or _aged(60),
         ))
+
+
+# team-a's record bodies in memory_id order: the canonical read-path check
+# resolves evidence source ids back to these legacy memory ids, so evidence on
+# team-a's definitions must carry the real memory ids or the canonical read
+# would (correctly) refuse to resolve them.
+_TEAM_A_BODIES = ("提交代码前必须运行测试", "提交前必须执行测试")
 
 
 def _seed_reputations(store: RuleMergeStore) -> None:
@@ -124,9 +132,20 @@ def evaluate() -> dict[str, object]:
 
     # Seed independent evidence on every definition so synonym pairs become
     # auto-merge candidates, plus reputation so the evidence is weighted.
+    # team-a's definitions carry their real legacy memory ids so the canonical
+    # read-path check can resolve them (a canonical read that silently falls
+    # back is a failure, not a pass).
     intel = RuleMergeStore(workspace)
     for definition in intel.list_definitions():
-        _seed_evidence(intel, definition.definition_id, definition.canonical_text)
+        source_rule_id = ""
+        for i, body in enumerate(_TEAM_A_BODIES):
+            if normalize_rule_text(body) == definition.canonical_text:
+                source_rule_id = f"team-a-{i}"
+                break
+        _seed_evidence(
+            intel, definition.definition_id, definition.canonical_text,
+            source_rule_id=source_rule_id,
+        )
     _seed_reputations(intel)
 
     # Negative evidence on the weaker (SHOULD) pnpm definition: a real project
@@ -206,24 +225,31 @@ def evaluate() -> dict[str, object]:
             and judge_decision.get("judge_recommendation")
         )
 
-    # Phase5 read-path: with an intelligence layer present, a bootstrap over a
-    # seeded legacy group prefers the canonical layer (or falls back safely).
+    # Phase5 read-path: with an intelligence layer present, the *explicitly
+    # requested* canonical read must actually engage.  A silent fallback to
+    # legacy when intelligence exists is a failure, not a pass (PR7).
     from memoryguard.context_bootstrap import build_context_packet
     from memoryguard.schema_v3 import EffectiveAgentContext
     from memoryguard.shared_memory_store import SharedMemoryStore
 
     read_path_mode = "legacy"
+    read_path_dedup = 0
     try:
         legacy = SharedMemoryStore(workspace, "team-a")
         packet = build_context_packet(
             legacy,
             task="运行测试",
             effective_context=EffectiveAgentContext("agent-team-a", "team-a"),
-            read_path="auto",
+            read_path="rule-intelligence",
         )
         read_path_mode = packet.get("read_path", {}).get("mode", "legacy")
+        read_path_dedup = int(packet.get("read_path", {}).get("deduplicated", 0))
     except Exception:
         read_path_mode = "legacy"
+
+    # PR7: real machine-acceptance family computed from persisted state.
+    acceptance = intel.governance_acceptance()
+    migration_loss_real = intel.metrics()["migration_loss"]
 
     report = {
         "auto_merge_precision": auto_merge_precision,
@@ -235,9 +261,10 @@ def evaluate() -> dict[str, object]:
         "system_auto_binding": metrics["system_auto_binding"],
         "auto_broad_binding": metrics["auto_broad_binding"],
         "merge_rollback_success": 1 if undo_ok else 0,
-        "migration_loss": backfill["migration_loss"],
+        "migration_loss": migration_loss_real,
         "judge_audited": judge_audited,
         "read_path_mode": read_path_mode,
+        "read_path_dedup": read_path_dedup,
         "candidate_count": len(candidates),
         "conflicted_count": len(conflicted),
         "strength_conflict_found": bool(strength_conflict_found),
@@ -246,6 +273,16 @@ def evaluate() -> dict[str, object]:
         "merged_count": int(merge_ok),
         "definitions_before": canonical_before,
         "binding_count": metrics["binding_count"],
+        "definition_strength_identity_collision": acceptance["definition_strength_identity_collision"],
+        "canonical_read_context_diff": acceptance["canonical_read_context_diff"],
+        "backfill_resurrection_count": acceptance["backfill_resurrection_count"],
+        "proposal_duplicate_count": acceptance["proposal_duplicate_count"],
+        "human_hard_gate_bypass_count": acceptance["human_hard_gate_bypass_count"],
+        "evidence_independence_violation": acceptance["evidence_independence_violation"],
+        "migration_binding_multiset_diff": acceptance["migration_binding_multiset_diff"],
+        "undo_state_digest_diff": acceptance["undo_state_digest_diff"],
+        "rule_intelligence_event_lag": acceptance["rule_intelligence_event_lag"],
+        "acceptance_passed": bool(acceptance["passed"]),
         "passed": bool(
             auto_merge_precision >= 0.995
             and metrics["strength_conflict_merge"] == 0
@@ -256,9 +293,10 @@ def evaluate() -> dict[str, object]:
             and metrics["system_auto_binding"] == 0
             and metrics["auto_broad_binding"] == 0
             and undo_ok
-            and backfill["migration_loss"] == 0
+            and migration_loss_real == 0
             and judge_audited
-            and read_path_mode in {"rule-intelligence", "legacy"}
+            and read_path_mode == "rule-intelligence"
+            and acceptance["passed"]
             and strength_conflict_found
             and suggestion_never_candidate
             and auto_blocked_first

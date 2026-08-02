@@ -20,18 +20,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-from .rule_binding import RuleBinding, build_binding
+from .rule_binding import (
+    AUTO_ALLOWED_TARGET_TYPES,
+    RuleBinding,
+    binding_identity_key,
+    build_binding,
+)
 from .rule_definition import (
-    POLARITY_POSITIVE,
+    STRENGTH_UNKNOWN,
     RuleDefinition,
     RuleStrength,
     build_definition,
+    normalize_rule_text,
 )
 from .rule_evidence import (
     NegativeEvidence,
     RuleEvidence,
     build_evidence,
     build_negative_evidence,
+    dedupe_evidence,
 )
 from .rule_merge_policy import (
     AUTO_MERGE_MIN_AGENTS,
@@ -41,22 +48,28 @@ from .rule_merge_policy import (
     AUTO_READINESS_SCORE,
     COOLDOWN_HOURS,
     MAX_SINGLE_SOURCE_RATIO,
+    MIN_REPUTATION_SAMPLES,
     NEGATIVE_EVIDENCE_THRESHOLD,
     OBSERVING_DAYS,
+    REJECTED_PERSIST_FLOOR,
     TRUSTED_DAYS,
     TRUSTED_MIN_SUCCESS_SAMPLES,
     VALIDATED_SUCCESS_RATE,
     WEIGHTED_EVIDENCE_MIN,
     MergeAssessment,
+    bayesian_accuracy,
     compute_layers,
     contradiction_score,
     days_between,
     evaluate_candidate,
     evidence_weight,
+    feedback_authority_score,
     largest_source_ratio,
     maturity_score,
     merge_readiness_score,
     negative_evidence_score,
+    parameter_conflict,
+    project_importance_score,
     recency_factor,
     weighted_evidence_score,
 )
@@ -77,6 +90,9 @@ class RuleMergeService:
         # P3.3: optional semantic judge.  None keeps the deterministic Dice
         # semantic layer exactly as before; a judge adds an auditable verdict.
         self.judge = judge
+        # PR7: the bounded scan reports how many pairs it evaluated, skipped and
+        # persisted instead of silently dropping them.
+        self.last_scan_summary: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Backfill / dual-write
@@ -123,19 +139,68 @@ class RuleMergeService:
     def backfill_group(
         self, store: Any, group_id: str,
     ) -> dict[str, int]:
-        """Migrate one group's records/assignments/receipts into the P3 layer."""
+        """Migrate one group's governed rules into the P3 layer (PR6).
+
+        Only ``always``-policy rules are migrated (``relevant`` rules are recall,
+        not governance, and must not enter the merge canonical set).  Backfill is
+        idempotent and *never resurrects* a merged/superseded/alias lifecycle:
+
+          * the source link resolves each record to its current canonical
+            Definition (following the alias/merged chain), and a record whose
+            rule was already merged routes its new bindings/evidence to the
+            canonical instead of reviving the merged definition;
+          * a pre-v2 Definition (whose id only covered canonical wording) is
+            migrated onto its v2 id atomically, with the removed audiences
+            re-verified after the pass;
+          * wide legacy assignments (group/project/provider/runtime_role/system)
+            are copied losslessly as ``migration``-sourced bindings carrying the
+            legacy assignment hash + migration run id.
+        """
         ledger = {
             "records": 0, "definitions": 0, "assignments": 0,
             "bindings": 0, "receipts": 0, "evidence": 0,
         }
+        migrated_audiences: dict[str, list[Any]] = {}
         records = store.list_records()
         for record in records:
             if record.status == SharedMemoryStatus.DELETED:
                 continue
+            if str(record.injection_policy or "") != "always":
+                continue  # governed rules only
             ledger["records"] += 1
             definition = self._definition_from_record(record)
-            self.store.upsert_definition(definition)
-            ledger["definitions"] += 1
+            new_id = definition.definition_id
+            # Resolve the current canonical for this source (source link then
+            # alias/merged chain) BEFORE touching any row, so a merged rule is
+            # never resurrected by a re-run.
+            link = self.store.get_source_link(group_id, record.memory_id)
+            canonical_id = new_id
+            if link and link.get("canonical_definition_id"):
+                canonical_id = self.store.resolve_canonical(
+                    link["canonical_definition_id"],
+                )
+            existing = self.store.get_definition(canonical_id)
+            if existing is not None and existing.status != "active":
+                canonical_id = self.store.resolve_canonical(canonical_id)
+                existing = self.store.get_definition(canonical_id)
+            if existing is None:
+                self.store.upsert_definition(definition)
+                ledger["definitions"] += 1
+            elif canonical_id == new_id:
+                # Active rule refresh (idempotent re-run).
+                self.store.upsert_definition(definition)
+                ledger["definitions"] += 1
+            # else: the source routes to a different canonical; leave the
+            # merged/superseded lifecycle untouched.
+
+            # v1 -> v2 identity migration for the active definition.
+            legacy_id = self._legacy_definition_id(record)
+            if legacy_id != canonical_id:
+                removed = self.store.migrate_legacy_definition(
+                    legacy_id, canonical_id,
+                )
+                if removed is not None:
+                    migrated_audiences[canonical_id] = removed
             try:
                 assignments = store.list_rule_assignments(record.memory_id)
             except Exception:
@@ -143,7 +208,7 @@ class RuleMergeService:
             for assignment in assignments:
                 ledger["assignments"] += 1
                 binding = self._binding_from_assignment(
-                    definition, assignment, share_group_id=group_id,
+                    canonical_id, assignment, share_group_id=group_id,
                     owner_agent_id=record.agent_instance_id,
                     created_by="backfill",
                     authorization="backfill",
@@ -157,7 +222,7 @@ class RuleMergeService:
             for receipt in receipts:
                 ledger["receipts"] += 1
                 evidence = build_evidence(
-                    definition_id=definition.definition_id,
+                    definition_id=canonical_id,
                     source_rule_id=record.memory_id,
                     agent_instance_id=receipt.agent_instance_id,
                     project_ref=receipt.project_ref,
@@ -169,6 +234,31 @@ class RuleMergeService:
                 )
                 self.store.upsert_evidence(evidence)
                 ledger["evidence"] += 1
+            self.store.upsert_source_link(
+                share_group_id=group_id, memory_id=record.memory_id,
+                source_revision=record.updated_at or record.created_at,
+                original_definition_id=(
+                    legacy_id if legacy_id != canonical_id else new_id
+                ),
+                canonical_definition_id=canonical_id,
+            )
+        # Scope preservation: every audience removed by a v1->v2 migration must
+        # have been recreated under the canonical definition by this pass.
+        if migrated_audiences:
+            for new_id, removed in migrated_audiences.items():
+                present = {
+                    binding_identity_key(b)
+                    for b in self.store.list_bindings(
+                        definition_id=new_id, status="active",
+                    )
+                }
+                for audience in removed:
+                    if audience not in present:
+                        raise RuntimeError(
+                            "rule_migration_scope_change: an audience "
+                            "disappeared during v1->v2 migration"
+                        )
+        self._mark_orphan_v1_definitions()
         return ledger
 
     def sync_rule(
@@ -181,17 +271,38 @@ class RuleMergeService:
         receipts: Iterable[Any] | None = None,
         created_by: str = "auto",
     ) -> dict[str, Any]:
-        """Dual-write: mirror one newly-created rule into the P3 layer.
+        """Dual-write: mirror one newly-created rule into the P3 layer (PR6).
 
-        Best-effort by design: a P3-layer failure must never block rule
-        creation in the legacy store, so callers wrap this in try/except.
+        The source link is resolved first so a record whose rule was already
+        merged/superseded writes its new bindings/evidence to the current
+        canonical Definition instead of resurrecting the old lifecycle.  The
+        P3-layer definition is only upserted when it is missing or active.
+        Best-effort by design: a P3-layer failure must never block rule creation
+        in the legacy store, so callers wrap this in try/except.
         """
         definition = self._definition_from_record(record)
-        self.store.upsert_definition(definition)
+        new_id = definition.definition_id
+        link = self.store.get_source_link(group_id, record.memory_id)
+        canonical_id = new_id
+        if link and link.get("canonical_definition_id"):
+            canonical_id = self.store.resolve_canonical(
+                link["canonical_definition_id"],
+            )
+        existing = self.store.get_definition(canonical_id)
+        if existing is None or existing.status == "active":
+            if canonical_id != new_id:
+                definition = build_definition(
+                    record.body,
+                    definition_id=canonical_id,
+                    kind=record.kind,
+                    confidence=record.confidence,
+                    created_at=record.created_at,
+                )
+            self.store.upsert_definition(definition)
         bindings = 0
         for assignment in assignments or []:
             binding = self._binding_from_assignment(
-                definition, assignment, share_group_id=group_id,
+                canonical_id, assignment, share_group_id=group_id,
                 owner_agent_id=record.agent_instance_id,
                 created_by=created_by,
                 authorization="dual-write",
@@ -201,7 +312,7 @@ class RuleMergeService:
         evidence = 0
         for receipt in receipts or []:
             item = build_evidence(
-                definition_id=definition.definition_id,
+                definition_id=canonical_id,
                 source_rule_id=record.memory_id,
                 agent_instance_id=receipt.agent_instance_id,
                 project_ref=receipt.project_ref,
@@ -213,11 +324,151 @@ class RuleMergeService:
             )
             self.store.upsert_evidence(item)
             evidence += 1
+        self.store.upsert_source_link(
+            share_group_id=group_id, memory_id=record.memory_id,
+            source_revision=getattr(record, "updated_at", "") or getattr(record, "created_at", "") or "",
+            original_definition_id=new_id,
+            canonical_definition_id=canonical_id,
+        )
         return {
-            "definition_id": definition.definition_id,
+            "definition_id": canonical_id,
             "bindings": bindings,
             "evidence": evidence,
         }
+
+    # ------------------------------------------------------------------
+    # P2 -> P3 transactional outbox consumption (PR4)
+    # ------------------------------------------------------------------
+
+    def consume_outbox(
+        self, workspace: str | Path | None = None, *, only_group: str | None = None,
+    ) -> dict[str, Any]:
+        """Project P2 feedback events into the rule-intelligence layer.
+
+        Feedback is written with its outbox row in one legacy-store transaction
+        (``append_rule_match_feedback``), so no feedback can be missed.  Each
+        event is resolved through the source link to the *current canonical*
+        Definition (a merged rule's new evidence lands on the canonical, never
+        resurrecting the merged definition), projected, and then checkpointed
+        consumed.  Every projection step is idempotent, so re-delivery after a
+        partial failure is safe.
+
+        Outcome → projection:
+          followed       -> positive runtime evidence
+          violated       -> adherence signal (runtime stat only, never negative)
+          not_applicable -> negative scope evidence
+          exception      -> negative/exception evidence
+          corrected      -> negative scope evidence when the evidence mentions scope
+        """
+        workspace = Path(workspace) if workspace is not None else self.store.workspace
+        workspace = Path(workspace).resolve()
+        from .shared_memory_store import SharedMemoryStore
+
+        summary: dict[str, Any] = {
+            "groups": 0, "events_seen": 0, "events_consumed": 0,
+            "definitions_touched": 0,
+        }
+        for group_id, _db_path in iter_legacy_groups(workspace):
+            if only_group and group_id != only_group:
+                continue
+            try:
+                legacy = SharedMemoryStore(workspace, group_id)
+                events = legacy.list_unconsumed_rule_events()
+            except Exception:
+                continue
+            summary["groups"] += 1
+            summary["events_seen"] += len(events)
+            for event in events:
+                if self._consume_feedback_event(legacy, group_id, event):
+                    summary["events_consumed"] += 1
+                    summary["definitions_touched"] += 1
+                    try:
+                        legacy.mark_rule_event_consumed(event["event_id"])
+                    except Exception:
+                        pass
+        return summary
+
+    def _consume_feedback_event(
+        self, legacy: Any, group_id: str, event: dict[str, Any],
+    ) -> bool:
+        """Project one outbox event; idempotent, checkpointed by the caller."""
+        memory_id = str(event.get("memory_id") or "")
+        outcome = str(event.get("outcome") or "")
+        if outcome in {"ignored", "unobserved"} or not memory_id:
+            return True  # nothing to project; still checkpoint so it never retries
+        try:
+            record = legacy.get_record(memory_id)
+        except Exception:
+            record = None
+        if record is None:
+            return True  # source gone; do not resurrect it
+        definition = self._definition_from_record(record)
+        canonical_id = definition.definition_id
+        link = self.store.get_source_link(group_id, memory_id)
+        if link and link.get("canonical_definition_id"):
+            canonical_id = link["canonical_definition_id"]
+        # Follow the alias/merged/superseded chain: feedback on a source whose
+        # definition was merged lands on the current canonical, never reviving
+        # the merged definition.
+        canonical_id = self.store.resolve_canonical(canonical_id)
+        if self.store.get_definition(canonical_id) is None:
+            self.store.upsert_definition(definition)
+        agent = str(event.get("agent_instance_id") or "")
+        project = str(event.get("project_ref") or "")
+        session = str(event.get("session_id") or "")
+        created_at = str(event.get("created_at") or "") or _now_iso()
+        confidence = float(event.get("confidence") or 1.0)
+        receipt_id = str(event.get("receipt_id") or "")
+        provider = str(event.get("provider") or "")
+        evidence_text = str(event.get("evidence") or "")
+        share_group_id = str(event.get("share_group_id") or group_id)
+        feedback_id = str(event.get("feedback_id") or "")
+        authority = int(event.get("authority") or 0)
+        if outcome == "followed":
+            self.store.upsert_evidence(build_evidence(
+                definition_id=canonical_id, source_rule_id=memory_id,
+                agent_instance_id=agent, project_ref=project,
+                session_id=session, receipt_id=receipt_id, provider=provider,
+                content=record.body, confidence=confidence, observed_at=created_at,
+                share_group_id=share_group_id, session_trusted=1,
+                feedback_id=feedback_id, feedback_authority=authority,
+            ))
+        elif outcome in {"not_applicable", "exception"}:
+            self.store.upsert_negative_evidence(build_negative_evidence(
+                definition_id=canonical_id, source_rule_id=memory_id,
+                agent_instance_id=agent, project_ref=project,
+                content=record.body, confidence=confidence, observed_at=created_at,
+                share_group_id=share_group_id, session_id=session,
+                receipt_id=receipt_id, feedback_id=feedback_id,
+                feedback_authority=authority, session_trusted=1,
+            ))
+        elif outcome == "corrected":
+            lowered = evidence_text.casefold()
+            if any(
+                marker in lowered
+                for marker in ("scope", "范围", "not applicable", "不适用")
+            ):
+                self.store.upsert_negative_evidence(build_negative_evidence(
+                    definition_id=canonical_id, source_rule_id=memory_id,
+                    agent_instance_id=agent, project_ref=project,
+                    content=record.body, confidence=confidence,
+                    observed_at=created_at, share_group_id=share_group_id,
+                    session_id=session, receipt_id=receipt_id,
+                    feedback_id=feedback_id, feedback_authority=authority,
+                    session_trusted=1,
+                ))
+        # Every observed outcome feeds the idempotent runtime-feedback ledger;
+        # counters are derived in recompute_runtime_stats, never incremented.
+        self.store.upsert_runtime_feedback(
+            feedback_id=str(event.get("feedback_id") or ""),
+            definition_id=canonical_id, outcome=outcome,
+            agent_instance_id=agent, project_ref=project, session_id=session,
+            source=str(event.get("source") or ""),
+            authority=int(event.get("authority") or 0),
+            created_at=created_at,
+        )
+        self.store.recompute_runtime_stats(canonical_id)
+        return True
 
     # ------------------------------------------------------------------
     # Duplicate detection → proposals
@@ -250,6 +501,12 @@ class RuleMergeService:
         fresh.
         """
         judge = judge if judge is not None else self.judge
+        # Project any pending P2 feedback before scanning so the evidence and
+        # maturity snapshot is fresh (idempotent; no-op when the outbox is empty).
+        try:
+            self.consume_outbox(self.store.workspace)
+        except Exception:
+            pass
         candidates = self.store.list_definitions(status="active")
         if definition_ids:
             wanted = set(definition_ids)
@@ -262,48 +519,89 @@ class RuleMergeService:
             candidates = [d for d in candidates if d.definition_id in wanted]
 
         proposals: list[dict[str, Any]] = []
-        for i in range(len(candidates)):
-            for j in range(i + 1, len(candidates)):
-                a, b = candidates[i], candidates[j]
-                negative_score = self._negative_score(a, b)
-                assessment = self._assess_pair(
-                    a, b, min_score=min_score, min_evidence=min_evidence,
-                    min_agents=min_agents, min_projects=min_projects,
-                    negative_score=negative_score, judge=judge,
-                )
-                governance = self._proposal_governance(
-                    a, b, negative_score=negative_score,
-                )
-                if assessment.can_auto_merge:
-                    status = "candidate"
-                    conflict_type = ""
-                    # P3-001 §4: a freshly-eligible candidate enters a 72h
-                    # cooldown during which evidence can only accumulate.
-                    governance["cooldown_until"] = (
-                        datetime.fromisoformat(_now_iso())
-                        + timedelta(hours=COOLDOWN_HOURS)
-                    ).isoformat()
-                elif assessment.conflict_type == "strength":
-                    status = "conflicted"
-                    conflict_type = "strength"
-                else:
-                    status = "rejected"
-                    conflict_type = assessment.conflict_type
-                proposal = self.store.create_proposal(
-                    [a.definition_id, b.definition_id],
-                    assessment.duplicate_score,
-                    evidence=self._combined_evidence(a, b),
-                    contradiction_score=contradiction_score(a, b),
-                    explanation="; ".join(assessment.reasons),
-                    readiness_score=governance["readiness_score"],
-                    governance_reasons="; ".join(governance["governance_reasons"]),
-                    cooldown_until=governance["cooldown_until"],
-                    negative_score=governance["negative_score"],
-                    conflict_type=conflict_type,
-                    judge=assessment.judge,
-                )
-                self.store.set_proposal_status(proposal["proposal_id"], status)
-                proposals.append(self.store.get_proposal(proposal["proposal_id"]))
+        # PR7 bounded scan: candidates are bucketed by semantic_hash (intent +
+        # polarity + parameters), so only pairs that could actually be the same
+        # rule are full-assessed — never every pair in an O(N²) sweep.  Pairs
+        # from different buckets are different rules by construction.
+        buckets: dict[str, list[Any]] = {}
+        for definition in candidates:
+            buckets.setdefault(
+                definition.semantic_hash or "∅", [],
+            ).append(definition)
+        pairs_evaluated = 0
+        pairs_skipped = 0
+        rejected_persisted = 0
+        for members in buckets.values():
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    a, b = members[i], members[j]
+                    # Deterministic pair order so the proposal's stored
+                    # definition_ids and its captured revisions stay aligned.
+                    if a.definition_id > b.definition_id:
+                        a, b = b, a
+                    pairs_evaluated += 1
+                    negative_score = self._negative_score(a, b)
+                    assessment = self._assess_pair(
+                        a, b, min_score=min_score, min_evidence=min_evidence,
+                        min_agents=min_agents, min_projects=min_projects,
+                        negative_score=negative_score, judge=judge,
+                    )
+                    governance = self._proposal_governance(
+                        a, b, negative_score=negative_score,
+                    )
+                    if assessment.can_auto_merge:
+                        status = "candidate"
+                        conflict_type = ""
+                        # P3-001 §4: a freshly-eligible candidate enters a 72h
+                        # cooldown during which evidence can only accumulate.
+                        governance["cooldown_until"] = (
+                            datetime.fromisoformat(_now_iso())
+                            + timedelta(hours=COOLDOWN_HOURS)
+                        ).isoformat()
+                    elif assessment.conflict_type == "strength":
+                        status = "conflicted"
+                        conflict_type = "strength"
+                    elif assessment.duplicate_score < REJECTED_PERSIST_FLOOR:
+                        # Ordinary rejection: count it, don't persist another
+                        # near-identical row the governance UI will never use.
+                        pairs_skipped += 1
+                        continue
+                    else:
+                        status = "rejected"
+                        conflict_type = assessment.conflict_type
+                        rejected_persisted += 1
+                    proposal = self.store.create_proposal(
+                        [a.definition_id, b.definition_id],
+                        assessment.duplicate_score,
+                        evidence=self._combined_evidence(a, b),
+                        contradiction_score=contradiction_score(a, b),
+                        explanation="; ".join(assessment.reasons),
+                        readiness_score=governance["readiness_score"],
+                        governance_reasons="; ".join(
+                            governance["governance_reasons"],
+                        ),
+                        cooldown_until=governance["cooldown_until"],
+                        negative_score=governance["negative_score"],
+                        conflict_type=conflict_type,
+                        judge=assessment.judge,
+                        definition_a=a,
+                        definition_b=b,
+                        weight_breakdown=governance.get(
+                            "weight_breakdown", "",
+                        ),
+                    )
+                    self.store.set_proposal_status(
+                        proposal["proposal_id"], status,
+                    )
+                    proposals.append(
+                        self.store.get_proposal(proposal["proposal_id"]),
+                    )
+        self.last_scan_summary = {
+            "pairs_evaluated": pairs_evaluated,
+            "pairs_skipped": pairs_skipped,
+            "rejected_persisted": rejected_persisted,
+            "proposals_persisted": len(proposals),
+        }
         return proposals
 
     def merge_proposal(
@@ -339,15 +637,24 @@ class RuleMergeService:
             raise ValueError("rule_merge_definition_not_found")
 
         status = str(proposal.get("status", "") or "")
-        human_path = (
-            status == "approved"
-            or str(actor or "").casefold() in HUMAN_ACTORS
-        )
+        # The human path is granted by a *first-class approval record*, never by
+        # the actor string: merge_proposal(actor="admin") is no longer an
+        # approval by itself.
+        approval = None
+        if status == "approved":
+            approval = self.store.get_valid_approval(proposal_id)
+        human_path = status == "approved" and approval is not None
         if status not in {"candidate", "approved"}:
             self.store.set_proposal_status(proposal_id, "rejected")
             return {
                 "ok": False,
                 "blocked_reason": "rule_merge_proposal_not_approved",
+                "conflict_type": proposal.get("conflict_type") or "",
+            }
+        if status == "approved" and not human_path:
+            return {
+                "ok": False,
+                "blocked_reason": "rule_merge_approval_required",
                 "conflict_type": proposal.get("conflict_type") or "",
             }
 
@@ -358,10 +665,19 @@ class RuleMergeService:
 
         if human_path:
             # Human approval relaxes the *evidence and similarity* thresholds,
-            # but the two governance conflicts the layer treats as never-
-            # mergeable — strength mismatch (P3-002) and negative evidence
-            # (P3-001 §5) — still block even a human-approved merge.
-            strength_ok = str(a.rule_strength or "") == str(b.rule_strength or "")
+            # but the governance conflicts — strength (P3-002), negative
+            # evidence (P3-001 §5), polarity, parameters and contradiction —
+            # still block even a human-approved merge.  An ``unknown`` strength
+            # is likewise never mergeable.
+            strength_ok = (
+                str(a.rule_strength or "") == str(b.rule_strength or "")
+                and str(a.rule_strength or "") != STRENGTH_UNKNOWN
+            )
+            polarity_ok = a.polarity == b.polarity
+            params_ok = not parameter_conflict(a, b)
+            contradiction_ok = (
+                contradiction_score(a, b) <= 0
+            )
             negative_ok = negative_score < NEGATIVE_EVIDENCE_THRESHOLD
             if not strength_ok:
                 self.store.set_proposal_status(proposal_id, "conflicted")
@@ -378,6 +694,24 @@ class RuleMergeService:
                     "blocked_reason": "merge_safety_evaluation_failed",
                     "conflict_type": "negative_evidence",
                     "assessment": {"reasons": ["negative_evidence"]},
+                }
+            if not (polarity_ok and params_ok and contradiction_ok):
+                reasons = []
+                if not polarity_ok:
+                    reasons.append("polarity_conflict")
+                if not params_ok:
+                    reasons.append("parameter_conflict")
+                if not contradiction_ok:
+                    reasons.append("contradiction")
+                conflict_type = "polarity" if not polarity_ok else (
+                    "parameter" if not params_ok else "contradiction"
+                )
+                self.store.set_proposal_status(proposal_id, "rejected")
+                return {
+                    "ok": False,
+                    "blocked_reason": "merge_safety_evaluation_failed",
+                    "conflict_type": conflict_type,
+                    "assessment": {"reasons": reasons},
                 }
         else:
             # Automatic path: every hard safety condition must hold (P3 §5 +
@@ -430,6 +764,23 @@ class RuleMergeService:
             }
 
         canonical, merged = self._pick_canonical(a, b)
+        # For a human-approved merge, pin the merge to the exact state the
+        # approver reviewed: definition revisions + evidence digest captured at
+        # the last scan/approval, and the approval id itself.  The store
+        # re-verifies all of these and the hard gates inside its transaction.
+        expected_revisions = None
+        expected_digest = ""
+        approval_id = ""
+        if approval is not None:
+            approval_id = approval.get("approval_id", "")
+            rev_a = int(proposal.get("definition_revision_a") or 0)
+            rev_b = int(proposal.get("definition_revision_b") or 0)
+            if rev_a > 0 and rev_b > 0:
+                expected_revisions = {
+                    str(a.definition_id): rev_a,
+                    str(b.definition_id): rev_b,
+                }
+            expected_digest = str(proposal.get("evidence_digest") or "")
         decision = self.store.execute_merge(
             proposal_id=proposal_id,
             canonical_definition_id=canonical.definition_id,
@@ -443,6 +794,9 @@ class RuleMergeService:
                 or human_path
             ),
             judge=judge_verdict,
+            approval_id=approval_id,
+            expected_definition_revisions=expected_revisions,
+            expected_evidence_digest=expected_digest,
         )
         return {
             "ok": True,
@@ -467,9 +821,34 @@ class RuleMergeService:
             created_at=record.created_at,
         )
 
+    @staticmethod
+    def _legacy_definition_id(record: SharedMemoryRecord) -> str:
+        """The pre-v2 definition id this record's body would have produced."""
+        return stable_hash(
+            "rule-definition", "canonical", normalize_rule_text(record.body),
+        )
+
+    def _mark_orphan_v1_definitions(self) -> None:
+        """Mark pre-v2 definitions with no recoverable body as ``unknown``.
+
+        A v1-format definition still active after backfill has no legacy source
+        record to recover its strength from (its source was deleted, or it was
+        never covered by a migration).  It can never assert whether a proposed
+        merge is a strength conflict, so it is excluded from automatic merging.
+        """
+        for definition in self.store.list_definitions(status="active"):
+            legacy_id = stable_hash(
+                "rule-definition", "canonical", definition.canonical_text,
+            )
+            if definition.definition_id != legacy_id:
+                continue  # already a v2 id
+            if self.store.get_definition_alias(definition.definition_id):
+                continue
+            self.store.set_definition_strength_unknown(definition.definition_id)
+
     def _binding_from_assignment(
         self,
-        definition: RuleDefinition,
+        definition_id: str,
         assignment: Any,
         *,
         share_group_id: str,
@@ -477,10 +856,33 @@ class RuleMergeService:
         created_by: str,
         authorization: str,
     ) -> RuleBinding:
+        target_type = str(getattr(assignment, "target_type", "agent") or "agent")
+        source = created_by
+        auth = authorization
+        if target_type not in AUTO_ALLOWED_TARGET_TYPES:
+            # Lossless copy of a legacy wide assignment (group/project/provider/
+            # runtime_role/system) that P0-P2 already permitted.  Not an
+            # automatic broadening: the binding is built only FROM a legacy
+            # assignment and is audited with the legacy hash + migration run id.
+            source = "migration"
+            auth = json.dumps({
+                "legacy_assignment_hash": stable_hash(
+                    "legacy-assignment", share_group_id,
+                    str(getattr(assignment, "target_type", "") or ""),
+                    str(getattr(assignment, "target_id", "") or ""),
+                    str(getattr(assignment, "project_ref", "") or ""),
+                ),
+                "migration_run_id": stable_hash(
+                    "rule-migration", share_group_id, "v1",
+                ),
+                "source_database": "shared-memory",
+                "source_revision": "1",
+                "created_by": created_by or "backfill",
+            }, ensure_ascii=False, sort_keys=True)
         return build_binding(
-            definition.definition_id,
+            definition_id,
             share_group_id=share_group_id,
-            target_type=getattr(assignment, "target_type", "agent"),
+            target_type=target_type,
             target_id=getattr(assignment, "target_id", ""),
             project_ref=getattr(assignment, "project_ref", ""),
             provider=getattr(assignment, "provider", ""),
@@ -488,8 +890,8 @@ class RuleMergeService:
             effect=getattr(assignment, "effect", "include"),
             priority=getattr(assignment, "priority_override", 0) or 0,
             owner_agent_id=owner_agent_id,
-            created_by=created_by,
-            authorization=authorization,
+            created_by=source,
+            authorization=auth,
         )
 
     def _combined_evidence(
@@ -539,16 +941,27 @@ class RuleMergeService:
     # ------------------------------------------------------------------
 
     def _maturity_of(self, definition: RuleDefinition) -> str:
-        """Recompute the lifecycle stage of one definition (P3-001 §1).
+        """Recompute the lifecycle stage of one definition (P3-001 §1, PR5).
 
-        observing <7d → candidate (evidence thresholds met) → validated (no
-        conflict, success >=95% when known) → trusted (>=30d, >=20 success
-        samples, no conflict).  Execution data is optional: when unknown it is
-        treated as neutral (neither qualifies nor blocks), so the layer never
-        fabricates a success rate.
+        Maturity is driven by *this definition's own* runtime feedback — the
+        agent reputation of its contributors is a weight input, never a
+        substitute for the rule's execution history (a rule must not borrow a
+        different rule's success record).  Independent evidence is counted
+        after the PR5 independence dedup, so repeated receipts of the same fact
+        cannot inflate the stage.
+
+          observing   < 7 days, or independent evidence / agent / project
+                      thresholds not yet met
+          candidate   evidence thresholds met (no runtime feedback yet)
+          validated   >= 7 days + >= 10 rule-specific feedback events with
+                      followed/applicable >= 95% and no negative evidence
+          trusted     >= 30 days + >= 20 rule-specific feedback events across
+                      >= 3 independent projects with no negative evidence
         """
         age = days_between(definition.created_at)
-        evidence = self.store.list_evidence(definition.definition_id)
+        evidence = dedupe_evidence(
+            self.store.list_evidence(definition.definition_id),
+        )
         agents = {e.agent_instance_id for e in evidence if e.agent_instance_id}
         projects = {
             e.project_ref for e in evidence if (e.project_ref or "").strip()
@@ -562,13 +975,30 @@ class RuleMergeService:
             or len(projects) < AUTO_MERGE_MIN_PROJECTS
         ):
             return "observing"
+        stats = self.store.get_runtime_stats(definition.definition_id) or {}
+        followed = int(stats.get("followed") or 0)
+        total_runtime = (
+            followed
+            + int(stats.get("violated") or 0)
+            + int(stats.get("not_applicable") or 0)
+            + int(stats.get("exception_count") or 0)
+        )
+        if total_runtime <= 0:
+            # Evidence exists but no execution feedback yet: candidate, never
+            # validated — an unknown success rate must not be guessed.
+            return "candidate"
+        success_rate = followed / total_runtime
         state = "candidate"
-        success = self._execution_success(definition)
-        if not negative and (success is None or success >= VALIDATED_SUCCESS_RATE):
+        if (
+            not negative
+            and total_runtime >= TRUSTED_MIN_SUCCESS_SAMPLES // 2
+            and success_rate >= VALIDATED_SUCCESS_RATE
+        ):
             state = "validated"
             if (
                 age >= TRUSTED_DAYS
-                and self._success_sample_count(evidence) >= TRUSTED_MIN_SUCCESS_SAMPLES
+                and total_runtime >= TRUSTED_MIN_SUCCESS_SAMPLES
+                and len(projects) >= 3
             ):
                 state = "trusted"
         return state
@@ -595,54 +1025,79 @@ class RuleMergeService:
             return None
         return sum(rates) / len(rates)
 
-    def _success_sample_count(self, evidence: list[Any]) -> int:
-        reps = {r["agent_id"]: r for r in self.store.list_agent_reputations()}
-        total = 0
-        seen: set[str] = set()
-        for e in evidence:
-            agent = e.agent_instance_id or ""
-            if agent and agent in reps and agent not in seen:
-                seen.add(agent)
-                total += int(reps[agent]["sample_count"] or 0)
-        return total
-
     # ------------------------------------------------------------------
     # P3-003 evidence weighting (reputation + project profile + recency)
     # ------------------------------------------------------------------
 
     def _evidence_weights(self, evidence_list: list[Any]) -> list[float]:
-        """Weight each observation (P3-003 §2); cold-start neutral is 1.0."""
+        """Weight each observation (P3-003 §2, PR5 Bayesian).
+
+        Unknown sources default to 0.5, never to full credit; an established
+        verified production Agent ranks above a fresh unknown one.
+        """
         reps = {r["agent_id"]: r for r in self.store.list_agent_reputations()}
         profiles = {p["project_ref"]: p for p in self.store.list_project_profiles()}
         weights: list[float] = []
         for ev in evidence_list:
             rep = reps.get(ev.agent_instance_id or "")
             profile = profiles.get(ev.project_ref or "")
+            sample_count = int(rep.get("sample_count") or 0) if rep else 0
+            if rep and sample_count >= MIN_REPUTATION_SAMPLES:
+                agent_reliability = (
+                    float(rep.get("success_rate") or 0.0)
+                    + float(rep.get("rule_accuracy") or 0.0)
+                ) / 2.0
+            elif rep:
+                raw = (
+                    float(rep.get("success_rate") or 0.0)
+                    + float(rep.get("rule_accuracy") or 0.0)
+                ) / 2.0
+                shrink = sample_count / MIN_REPUTATION_SAMPLES
+                agent_reliability = raw * shrink + 0.5 * (1.0 - shrink)
+            else:
+                agent_reliability = 0.5
+            stats = self.store.get_runtime_stats(ev.definition_id)
+            total_runtime = (
+                int((stats or {}).get("followed") or 0)
+                + int((stats or {}).get("violated") or 0)
+                + int((stats or {}).get("not_applicable") or 0)
+                + int((stats or {}).get("exception_count") or 0)
+            )
+            if stats and total_runtime > 0:
+                rule_specific_success = bayesian_accuracy(
+                    int(stats.get("followed") or 0),
+                    total_runtime - int(stats.get("followed") or 0),
+                )
+            else:
+                rule_specific_success = 0.5
             weights.append(evidence_weight(
-                agent_reputation=(
-                    (rep["success_rate"] + rep["rule_accuracy"]) / 2.0
-                    if rep else 1.0
-                ),
+                agent_reliability=agent_reliability,
                 project_importance=(
-                    profile["production_level"] if profile else 1.0
+                    project_importance_score(
+                        float(profile.get("production_level") or 0.0),
+                        float(profile.get("criticality") or 0.0),
+                        bool(profile.get("owner_verified")),
+                    )
+                    if profile else 0.5
                 ),
-                historical_success=(
-                    rep["success_rate"] if rep and rep["sample_count"] > 0 else 1.0
+                rule_specific_success=rule_specific_success,
+                feedback_authority=feedback_authority_score(
+                    "", int(getattr(ev, "feedback_authority", 0) or 0),
                 ),
-                feedback_quality=rep["feedback_quality"] if rep else 1.0,
                 recency=recency_factor(days_between(ev.observed_at)),
+                evidence_confidence=float(getattr(ev, "confidence", 1.0) or 0.0),
             ))
         return weights
 
     def _negative_score(self, a: RuleDefinition, b: RuleDefinition) -> float:
         """Weighted contradiction fraction of both definitions (P3-001 §5)."""
-        positive = self._combined_evidence(a, b)
+        positive = dedupe_evidence(self._combined_evidence(a, b))
         positive_weight = weighted_evidence_score(self._evidence_weights(positive))
-        negative = [
+        negative = dedupe_evidence([
             e
             for definition in (a, b)
             for e in self.store.list_negative_evidence(definition.definition_id)
-        ]
+        ])
         negative_weight = weighted_evidence_score(self._evidence_weights(negative))
         return negative_evidence_score(negative_weight, positive_weight)
 
@@ -744,6 +1199,17 @@ class RuleMergeService:
             "single_source_ratio": round(dominance_ratio, 4),
             "governance_reasons": reasons,
             "eligible": not reasons,
+            # PR5: persist the full weight breakdown for every proposal so the
+            # weight model is auditable, not a self-reported score.
+            "weight_breakdown": json.dumps({
+                "per_agent": {
+                    k: round(v, 4)
+                    for k, v in sorted(per_agent.items()) if k
+                },
+                "total_weight": round(sum(weights), 4),
+                "evidence_count": len(evidence),
+                "min_evidence": WEIGHTED_EVIDENCE_MIN,
+            }, ensure_ascii=False, sort_keys=True),
         }
 
     # ------------------------------------------------------------------
@@ -790,19 +1256,29 @@ class RuleMergeService:
             created_at=now,
             rule_strength=new_value,
         )
-        self.store.upsert_definition(new_definition)
-        version = self.store.record_definition_version(
-            definition_id=definition_id,
-            superseded_by=new_definition_id,
+        # Atomic: create the new Definition, migrate every active Binding to it,
+        # record the evolution link, mark the old Definition superseded — in one
+        # transaction, so a half-evolved orphan can never exist.
+        result = self.store.evolve_definition_atomic(
+            old_definition_id=definition_id,
+            new_definition=new_definition,
             old_strength=old_strength,
             new_strength=new_value,
             change_reason=reason,
             actor=actor,
             evidence=evidence,
         )
-        self.store.set_definition_status(
-            definition_id, "superseded", superseded_by=new_definition_id,
-        )
+        version = {
+            "version_id": result["version_id"],
+            "definition_id": definition_id,
+            "superseded_by": new_definition_id,
+            "old_strength": old_strength,
+            "new_strength": new_value,
+            "change_reason": reason,
+            "actor": actor,
+            "evidence": evidence or {},
+            "created_at": now,
+        }
         return {
             "old_definition_id": definition_id,
             "new_definition_id": new_definition_id,

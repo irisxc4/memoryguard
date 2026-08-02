@@ -224,3 +224,142 @@ def test_forced_legacy_ignores_intelligence(tmp_path):
     ]
     test_rules = [b for b in bodies if "测试" in b]
     assert len(test_rules) == 2  # both legacy records inject
+
+
+# ---------------------------------------------------------------------------
+# audience-aware canonical dedup (the dedup must run *after* the audience/
+# status/exclude match, never before)
+# ---------------------------------------------------------------------------
+
+
+_CROSS_BODY = "提交代码前必须运行测试"
+
+
+def _seed_cross(tmp_path, group, records, *, evidence_agents=2):
+    """Seed legacy records + backfill + evidence, returning (legacy, intel)."""
+    legacy = SharedMemoryStore(tmp_path, group)
+    for spec in records:
+        legacy.append_record(SharedMemoryRecord(
+            memory_id=spec["memory_id"], body=spec["body"],
+            kind=MemoryKind.PROCEDURE,
+            status=spec.get("status", SharedMemoryStatus.ACTIVE),
+            injection_policy=spec.get("policy", "always"),
+            priority=spec.get("priority", 10),
+            locked=spec.get("locked", False),
+            agent_instance_id=spec.get("agent", "agent-1"),
+            created_at=_now_iso(), updated_at=_now_iso(),
+        ), assignments=spec["assignments"])
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+    service.backfill_group(legacy, group)
+    for d in intel.list_definitions():
+        for spec in records:
+            if normalize_rule_text(spec["body"]) != d.canonical_text:
+                continue
+            for i in range(evidence_agents):
+                intel.upsert_evidence(build_evidence(
+                    definition_id=d.definition_id,
+                    source_rule_id=spec["memory_id"],
+                    agent_instance_id=f"ev{i}", project_ref=f"ep{i}",
+                    session_id=f"s{i}", content=d.canonical_text,
+                    observed_at=_now_iso(),
+                ))
+    return legacy, intel
+
+
+def _mandatory_bodies(packet):
+    return [
+        m["body"] for m in packet["context_packet"]["mandatory_items"]
+    ]
+
+
+def test_canonical_read_cross_agent_keeps_each_agents_rule(tmp_path):
+    # Two agents share one canonical rule (identical wording).  A global dedup
+    # would prefer m1 (agent-1) and starve agent-2; the post-audience dedup
+    # must keep each agent's own matched record.
+    legacy, _ = _seed_cross(tmp_path, "g1", [
+        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
+         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
+        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-2",
+         "assignments": [{"target_type": "agent", "target_id": "agent-2"}]},
+    ])
+    for agent_id in ("agent-1", "agent-2"):
+        packet = build_context_packet(
+            legacy, task="写测试",
+            effective_context=_context(agent_id, "g1"),
+            read_path=MODE_RULE_INTELLIGENCE,
+        )
+        assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet)), agent_id
+
+
+def test_canonical_read_cross_project_keeps_each_projects_rule(tmp_path):
+    legacy, _ = _seed_cross(tmp_path, "g1", [
+        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
+         "assignments": [{"target_type": "agent_project", "target_id": "agent-1",
+                          "project_ref": "/proj/x"}]},
+        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-2",
+         "assignments": [{"target_type": "agent_project", "target_id": "agent-2",
+                          "project_ref": "/proj/y"}]},
+    ])
+    packet = build_context_packet(
+        legacy, task="写测试",
+        effective_context=EffectiveAgentContext(
+            "agent-2", "g1", project_ref="/proj/y",
+        ),
+        read_path=MODE_RULE_INTELLIGENCE,
+    )
+    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
+
+
+def test_canonical_read_applies_exclude_before_dedupe(tmp_path):
+    # m2 is the stronger record (higher priority, locked) but is *excluded* for
+    # agent-1.  The canonical collapse must not let m2 delete m1's injection.
+    legacy, _ = _seed_cross(tmp_path, "g1", [
+        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
+         "priority": 10,
+         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
+        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-1",
+         "priority": 50, "locked": True,
+         "assignments": [{"target_type": "agent", "target_id": "agent-1",
+                          "effect": "exclude"}]},
+    ])
+    packet = build_context_packet(
+        legacy, task="写测试",
+        effective_context=_context("agent-1", "g1"),
+        read_path=MODE_RULE_INTELLIGENCE,
+    )
+    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
+
+
+def test_shadowed_record_never_replaces_active_representative(tmp_path):
+    # m2 is shadowed but the strongest by raw priority/locked; the active/
+    # status filter must run before canonical dedup so m1 (active) survives.
+    legacy, _ = _seed_cross(tmp_path, "g1", [
+        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
+         "priority": 10,
+         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
+        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-1",
+         "priority": 50, "locked": True,
+         "status": SharedMemoryStatus.SHADOWED,
+         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
+    ])
+    packet = build_context_packet(
+        legacy, task="写测试",
+        effective_context=_context("agent-1", "g1"),
+        read_path=MODE_RULE_INTELLIGENCE,
+    )
+    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
+
+
+def test_shadow_compare_reports_zero_diff_when_switch_safe(tmp_path):
+    legacy, _ = _seed_cross(tmp_path, "g1", [
+        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
+         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
+    ])
+    diff = RuleReadPath(tmp_path, "g1").shadow_compare(
+        legacy, _context("agent-1", "g1"),
+    )
+    assert diff is not None
+    assert diff["missing"] == []
+    assert diff["extra"] == []
+    assert diff["permission_diff"] == 0

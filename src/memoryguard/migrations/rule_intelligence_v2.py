@@ -67,6 +67,58 @@ CREATE TABLE IF NOT EXISTS rule_definition_versions (
 );
 CREATE INDEX IF NOT EXISTS idx_rule_definition_versions_definition
     ON rule_definition_versions(definition_id);
+CREATE TABLE IF NOT EXISTS rule_merge_approvals (
+    approval_id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    capability_id TEXT NOT NULL DEFAULT '',
+    expected_definition_revisions TEXT NOT NULL DEFAULT '{}',
+    approval_scope TEXT NOT NULL DEFAULT 'merge',
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_merge_approvals_proposal
+    ON rule_merge_approvals(proposal_id);
+CREATE TABLE IF NOT EXISTS rule_definition_aliases (
+    old_definition_id TEXT PRIMARY KEY,
+    new_definition_id TEXT NOT NULL,
+    migration_decision_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rule_source_links (
+    share_group_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    source_revision TEXT NOT NULL DEFAULT '',
+    original_definition_id TEXT NOT NULL DEFAULT '',
+    canonical_definition_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (share_group_id, memory_id)
+);
+CREATE TABLE IF NOT EXISTS rule_definition_runtime_stats (
+    definition_id TEXT PRIMARY KEY,
+    followed INTEGER NOT NULL DEFAULT 0,
+    violated INTEGER NOT NULL DEFAULT 0,
+    not_applicable INTEGER NOT NULL DEFAULT 0,
+    exception_count INTEGER NOT NULL DEFAULT 0,
+    distinct_sessions INTEGER NOT NULL DEFAULT 0,
+    distinct_projects INTEGER NOT NULL DEFAULT 0,
+    last_observed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS rule_runtime_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    definition_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    authority INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_runtime_feedback_definition
+    ON rule_runtime_feedback(definition_id);
 """
 
 # (table, column, DDL) added only when the column is absent.
@@ -85,8 +137,35 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_merge_proposals", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_proposals", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "candidate_since", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "last_evaluated_at", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "assessment_revision", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_merge_proposals", "definition_revision_a", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_merge_proposals", "definition_revision_b", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_merge_proposals", "evidence_digest", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "policy_version", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "weight_breakdown", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "independence_key", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "share_group_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "source_root_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "source_object_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_evidence", "feedback_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_evidence", "feedback_authority", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_negative_evidence", "independence_key", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "share_group_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "session_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "receipt_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "feedback_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "feedback_authority", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_negative_evidence", "source_root_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "source_object_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_negative_evidence", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_merge_decisions", "readiness_at_merge", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_decisions", "strength_ok", "INTEGER NOT NULL DEFAULT 1"),
+    ("rule_merge_decisions", "polarity_ok", "INTEGER NOT NULL DEFAULT 1"),
+    ("rule_merge_decisions", "parameters_ok", "INTEGER NOT NULL DEFAULT 1"),
+    ("rule_merge_decisions", "contradiction_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "negative_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "judge_source", "TEXT NOT NULL DEFAULT ''"),

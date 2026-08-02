@@ -315,6 +315,27 @@ CREATE TABLE IF NOT EXISTS rule_match_feedbacks (
     FOREIGN KEY (receipt_id) REFERENCES rule_match_receipts(receipt_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_match_feedbacks_receipt_created ON rule_match_feedbacks(receipt_id, created_at);
+CREATE TABLE IF NOT EXISTS rule_event_outbox (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    share_group_id TEXT NOT NULL DEFAULT '',
+    memory_id TEXT NOT NULL DEFAULT '',
+    receipt_id TEXT NOT NULL DEFAULT '',
+    feedback_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    authority INTEGER NOT NULL DEFAULT 0,
+    actor TEXT NOT NULL DEFAULT '',
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    evidence TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_event_outbox_unconsumed ON rule_event_outbox(consumed_at);
 """
 
 _RULE_LIFECYCLE_SCHEMA = """
@@ -3537,13 +3558,20 @@ class SharedMemoryStore:
         persisted = RuleMatchFeedback(**{**payload, "feedback_id": feedback_id})
         with self._tx() as conn:
             row = conn.execute(
-                "SELECT 1 FROM rule_match_receipts WHERE receipt_id=?",
+                "SELECT * FROM rule_match_receipts WHERE receipt_id=?",
                 (feedback.receipt_id,),
             ).fetchone()
             if row is None:
                 raise ValueError("receipt_not_found")
             try:
                 self._insert_rule_match_feedback(conn, persisted)
+                # P2 -> P3 transactional outbox: the feedback event and its
+                # outbox row land in the same transaction, so the rule-
+                # intelligence projection can never miss a feedback event
+                # (no more "best-effort mirror once at rule creation").
+                self._enqueue_rule_feedback_event(
+                    conn, receipt_row=row, feedback=persisted,
+                )
             except sqlite3.IntegrityError:
                 # Idempotency is keyed by feedback_id, not receipt_id.  A
                 # second event for one receipt is valid and must remain stored.
@@ -3560,6 +3588,60 @@ class SharedMemoryStore:
         # Return event just persisted, not effective event.  Callers must
         # resolve effective authority explicitly before triggering governance.
         return persisted
+
+    def _enqueue_rule_feedback_event(
+        self, conn: sqlite3.Connection, *, receipt_row: sqlite3.Row,
+        feedback: RuleMatchFeedback,
+    ) -> None:
+        """Write the transactional outbox row for one feedback event.
+
+        The event id is a pure function of the feedback id, so re-delivery is
+        idempotent and the P3 consumer can project each event exactly once.
+        """
+        event_id = stable_hash("rule-outbox-feedback", feedback.feedback_id)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO rule_event_outbox (
+                event_id, event_type, share_group_id, memory_id, receipt_id,
+                feedback_id, outcome, source, authority, actor, agent_instance_id,
+                project_ref, session_id, provider, confidence, evidence, created_at
+            ) VALUES (?, 'rule_feedback', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (event_id,
+             str(receipt_row["share_group_id"] or ""),
+             str(receipt_row["memory_id"] or ""),
+             str(receipt_row["receipt_id"] or ""),
+             str(feedback.feedback_id or ""),
+             str(feedback.outcome or ""),
+             str(feedback.source or ""),
+             int(feedback.authority or 0),
+             str(feedback.actor or ""),
+             str(receipt_row["agent_instance_id"] or ""),
+             str(receipt_row["project_ref"] or ""),
+             str(receipt_row["session_id"] or ""),
+             str(receipt_row["provider"] or ""),
+             float(feedback.confidence or 1.0),
+             str(feedback.evidence or ""),
+             str(feedback.created_at or _now_iso()),
+             ),
+        )
+
+    def list_unconsumed_rule_events(self) -> list[dict[str, Any]]:
+        """Unconsumed transactional-outbox rows (feedback → P3 projection)."""
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rule_event_outbox WHERE consumed_at='' "
+                "ORDER BY created_at, rowid"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_rule_event_consumed(self, event_id: str) -> None:
+        """Mark an outbox row consumed (idempotent projection checkpoint)."""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE rule_event_outbox SET consumed_at=? WHERE event_id=?",
+                (_now_iso(), event_id),
+            )
 
     def list_rule_match_feedbacks(
         self,

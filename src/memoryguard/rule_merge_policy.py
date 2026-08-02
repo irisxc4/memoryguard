@@ -22,6 +22,7 @@ from typing import Any
 
 from .rule_definition import (
     POLARITY_POSITIVE,
+    STRENGTH_UNKNOWN,
     RuleDefinition,
     RuleIntent,
     semantic_surface,
@@ -57,6 +58,17 @@ TRUSTED_DAYS = 30
 VALIDATED_SUCCESS_RATE = 0.95
 TRUSTED_MIN_SUCCESS_SAMPLES = 20
 
+# Proposal identity policy.  The proposal id is stable across scans (no
+# timestamp) so cooldown and first-merge acknowledgment accumulate on one row;
+# a policy change that must invalidate old proposals bumps this version.
+MERGE_POLICY_VERSION = "rule-merge-policy-v3"
+
+# PR7 bounded scan: only pairs whose similarity is high enough to be a real
+# duplicate are persisted as ``rejected`` proposals for governance visibility;
+# everything below this floor is counted in the scan summary instead of written
+# to the proposal table (which used to grow without bound).
+REJECTED_PERSIST_FLOOR = 0.7
+
 # Merge Readiness Score (P3-001 §2).
 W_READINESS_SEMANTIC = 0.25
 W_READINESS_EVIDENCE = 0.20
@@ -65,12 +77,28 @@ W_READINESS_EXECUTION = 0.15
 W_READINESS_DIVERSITY = 0.10
 W_READINESS_STABILITY = 0.10
 
-# Evidence weight (P3-003 §2).
-W_AGENT_REPUTATION = 0.35
-W_PROJECT_IMPORTANCE = 0.25
-W_HISTORICAL_SUCCESS = 0.20
-W_FEEDBACK_QUALITY = 0.10
+# Evidence weight (P3-003 §2, PR5 Bayesian).
+# Unknown sources default to 0.5 (a neutral prior), never to full credit: a
+# new Agent with no track record must not outweigh a verified production one.
+W_AGENT_RELIABILITY = 0.30
+W_PROJECT_IMPORTANCE = 0.20
+W_RULE_SPECIFIC_SUCCESS = 0.20
+W_FEEDBACK_AUTHORITY = 0.10
 W_RECENCY = 0.10
+W_EVIDENCE_CONFIDENCE = 0.10
+# Bayesian prior: an unknown source starts at 0.5 and moves with feedback.
+BAYESIAN_PRIOR = 4.0
+BAYESIAN_PRIOR_ACCURACY = 0.5
+# Minimum sample count before an agent reputation is treated as established.
+MIN_REPUTATION_SAMPLES = 20
+# Feedback producer -> authority score (user explicit > agent > hook > legacy).
+_FEEDBACK_AUTHORITY_SCORES = {
+    "user": 1.0,
+    "agent": 0.75,
+    "hook": 0.5,
+    "legacy": 0.3,
+    "unobserved": 0.3,
+}
 
 # Maturity score for readiness computation.
 _MATURITY_SCORES = {
@@ -125,27 +153,88 @@ def recency_factor(days_old: float) -> float:
     return math.exp(-max(0.0, days_old) / 90.0)
 
 
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def bayesian_accuracy(
+    followed: int, violated: int = 0, *,
+    prior: float = BAYESIAN_PRIOR,
+    prior_accuracy: float = BAYESIAN_PRIOR_ACCURACY,
+) -> float:
+    """Bayesian posterior accuracy with shrinkage toward a neutral prior.
+
+    An unknown source with zero feedback is ``prior_accuracy`` (0.5); each
+    followed/violated observation moves the estimate.  Small samples stay near
+    the prior instead of claiming full credit or full blame.
+    """
+    followed = max(0, int(followed))
+    violated = max(0, int(violated))
+    if followed + violated == 0:
+        return float(prior_accuracy)
+    return (
+        prior * prior_accuracy + followed
+    ) / (prior + followed + violated)
+
+
+def feedback_authority_score(
+    source: str = "", authority: int = 0,
+) -> float:
+    """Map a feedback producer to an authority score in [0, 1].
+
+    An unknown producer (no authority, no recognised source) is neutral 0.5,
+    never full credit.
+    """
+    if authority:
+        return _clamp(authority / 4.0)
+    key = str(source or "").casefold()
+    if key in _FEEDBACK_AUTHORITY_SCORES:
+        return _FEEDBACK_AUTHORITY_SCORES[key]
+    return 0.5
+
+
+def project_importance_score(
+    production_level: float = 0.0, criticality: float = 0.0,
+    owner_verified: bool = False,
+) -> float:
+    """Project importance from production level, criticality and ownership.
+
+    Unknown project -> 0.5 (neutral, never full credit); verified ownership
+    adds a small bonus.
+    """
+    if not production_level and not criticality:
+        return 0.5
+    return _clamp(
+        float(production_level or 0.0)
+        * (0.5 + 0.5 * float(criticality or 0.0))
+        + (0.1 if owner_verified else 0.0)
+    )
+
+
 def evidence_weight(
     *,
-    agent_reputation: float = 1.0,
-    project_importance: float = 1.0,
-    historical_success: float = 1.0,
-    feedback_quality: float = 1.0,
+    agent_reliability: float = 0.5,
+    project_importance: float = 0.5,
+    rule_specific_success: float = 0.5,
+    feedback_authority: float = 0.5,
     recency: float = 1.0,
+    evidence_confidence: float = 0.5,
 ) -> float:
-    """Evidence weight (P3-003 §2).
+    """Evidence weight (P3-003 §2, PR5).
 
-    Cold-start neutral is 1.0 (every component defaults to 1.0, the weights
-    sum to 1.0): until a reputation / project profile exists, evidence counts
-    exactly as it did before the weighted model.  Known data can only tighten
-    or loosen the vote from that neutral point.
+    The default for every *unknown* component is 0.5, never 1.0: an unvetted
+    source must not outrank a verified production source.  The component mix is
+    0.30 agent reliability + 0.20 project importance + 0.20 rule-specific
+    success + 0.10 feedback authority + 0.10 recency + 0.10 evidence
+    confidence.
     """
     return (
-        W_AGENT_REPUTATION * max(0.0, min(1.0, agent_reputation))
-        + W_PROJECT_IMPORTANCE * max(0.0, min(1.0, project_importance))
-        + W_HISTORICAL_SUCCESS * max(0.0, min(1.0, historical_success))
-        + W_FEEDBACK_QUALITY * max(0.0, min(1.0, feedback_quality))
-        + W_RECENCY * max(0.0, min(1.0, recency))
+        W_AGENT_RELIABILITY * _clamp(agent_reliability)
+        + W_PROJECT_IMPORTANCE * _clamp(project_importance)
+        + W_RULE_SPECIFIC_SUCCESS * _clamp(rule_specific_success)
+        + W_FEEDBACK_AUTHORITY * _clamp(feedback_authority)
+        + W_RECENCY * _clamp(recency)
+        + W_EVIDENCE_CONFIDENCE * _clamp(evidence_confidence)
     )
 
 
@@ -384,8 +473,13 @@ def evaluate_candidate(
         reasons.append("parameter_conflict")
 
     # P3-002: strength is a hard gate.  MUST vs SHOULD on the same intent is a
-    # governance conflict, never a duplicate to collapse.
-    strength_ok = str(a.rule_strength or "") == str(b.rule_strength or "")
+    # governance conflict, never a duplicate to collapse.  An ``unknown``
+    # strength (pre-migration orphan with an unrecoverable original body) can
+    # never be asserted safe, so it also blocks the merge.
+    strength_ok = (
+        str(a.rule_strength or "") == str(b.rule_strength or "")
+        and str(a.rule_strength or "") != STRENGTH_UNKNOWN
+    )
     if not strength_ok:
         reasons.append("strength_conflict")
 

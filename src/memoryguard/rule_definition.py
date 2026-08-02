@@ -23,6 +23,13 @@ from .schema_v3 import MemoryKind, _now_iso, stable_hash
 POLARITY_POSITIVE = "positive"
 POLARITY_NEGATIVE = "negative"
 
+# Sentinel for a definition whose strength can no longer be recovered from its
+# original legacy body (a pre-migration orphan).  A ``unknown``-strength
+# definition is never eligible for automatic merging: the layer cannot assert
+# whether a proposed merge is a MUST/SHOULD governance conflict, so it fails
+# closed instead of guessing.
+STRENGTH_UNKNOWN = "unknown"
+
 
 class RuleStrength(str, Enum):
     """Governance weight of a rule (P3-002).  Strength is a hard merge gate.
@@ -58,10 +65,13 @@ _STRENGTH_MARKERS: tuple[tuple[RuleStrength, tuple[str, ...]], ...] = (
 
 # Negative-intent markers: "提交前必须运行测试" is positive; "不要提交未测试代码"
 # is negative.  The list is deliberately conservative so positive text is never
-# misread as a prohibition.
+# misread as a prohibition.  English prohibitions (must not / do not / never /
+# prohibit / avoid) were previously missed and parsed as positive polarity.
 _NEGATIVE_MARKERS = (
     "不要", "禁止", "绝不", "不得", "避免", "严禁", "不要使用", "别", "别用",
     "不许", "不应当", "不得使用", "禁止使用",
+    "must not", "mustn't", "do not", "don't", "cannot", "can't",
+    "prohibit", "prohibited", "never", "avoid",
 )
 # Normalization: things that never carry semantic weight.
 _STRIP_TOKENS = (
@@ -346,10 +356,14 @@ def build_definition(
 ) -> RuleDefinition:
     """Build a Definition from raw rule text (used by backfill and dual-write).
 
-    The definition id is anchored to the *canonical surface wording*: the exact
-    same sentence collapses to one Definition on ingest, while a synonym
-    rephrase becomes a distinct Definition that the merge layer can later
-    evaluate.  ``semantic_hash`` is the similarity key for that evaluation and
+    The definition id (v2) is anchored to the canonical surface wording **plus
+    the governance dimensions that materially change a rule's obligation**:
+    polarity, rule strength, parameter schema and rule kind.  The exact same
+    sentence collapses to one Definition on ingest, while a synonym rephrase
+    becomes a distinct Definition the merge layer can later evaluate — and a
+    MUST/SHOULD pair that differ only in modality token now receive *distinct*
+    ids so the strength conflict can surface instead of being overwritten at
+    ingest.  ``semantic_hash`` is the similarity key for that evaluation and
     is intentionally a different (wider) projection than the id.
     """
     text = str(body or "").strip()
@@ -361,7 +375,14 @@ def build_definition(
     normalized_intent = intent.canonical()
     canon = normalize_rule_text(text)
     definition_id = definition_id or stable_hash(
-        "rule-definition", "canonical", canon,
+        "rule-definition-v2",
+        canon,
+        polarity,
+        strength,
+        json.dumps(
+            {"parameters": parameters}, ensure_ascii=False, sort_keys=True,
+        ),
+        kind_value,
     )
     return RuleDefinition(
         definition_id=definition_id,

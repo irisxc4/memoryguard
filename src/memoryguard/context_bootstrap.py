@@ -108,15 +108,16 @@ def build_context_packet(
     max_items: int = DEFAULT_MAX_ITEMS,
     max_chars: int = DEFAULT_MAX_CHARS,
     effective_context: EffectiveAgentContext | None = None,
-    read_path: str = "auto",
+    read_path: str = "legacy",
 ) -> dict[str, Any]:
     """Build bounded long-term-memory context from a read-only trusted store.
 
-    ``read_path`` controls the Phase5 canonical read path: ``auto`` (default)
-    prefers the rule-intelligence layer when it has data for this group and
-    otherwise behaves exactly like ``legacy``; ``legacy`` forces the old path;
-    ``rule-intelligence`` prefers the canonical layer (falling back to legacy
-    when the layer has no data).
+    ``read_path`` controls the Phase5 canonical read path.  It is shadow by
+    default: ``legacy`` (the default and the env fallback) forces the old
+    byte-for-byte path; ``auto`` / ``rule-intelligence`` prefer the canonical
+    layer when it has data for this group (falling back to legacy when it does
+    not), deduplicating merged duplicates only *after* the active/audience/
+    exclude match so a collapse can never under-expose a rule.
     """
     task = (task or "").strip()
     if not task:
@@ -152,37 +153,31 @@ def build_context_packet(
     )
     query_tokens = _tokens(f"{task} {project_hint}")
     all_records = store.list_records()
-    # Phase5 read path: prefer the canonical rule-intelligence layer when it has
-    # data for this group so merged duplicates inject once.  Body text still
-    # comes from the legacy record; old tables are untouched.
+    # Phase5 canonical read path (shadow by default: ``read_path`` and the env
+    # fallback resolve to legacy unless explicitly opted in).  The mapping is
+    # resolved up front but applied *after* active/audience/exclude matching
+    # below, so a canonical collapse can never drop the one record that applies
+    # to the current Agent/project.  Body text still comes from the legacy
+    # record; old tables are untouched.
+    canonical_mapping: dict[str, Any] | None = None
     read_path_summary: dict[str, Any] = {
         "mode": MODE_LEGACY,
         "canonical_definitions": 0,
-        "records_before": len(all_records),
-        "records_after": len(all_records),
+        "records_before": 0,
+        "records_after": 0,
         "deduplicated": 0,
     }
     if resolve_read_path_mode(read_path) != MODE_LEGACY:
         try:
-            from .rule_read_path import (
-                RuleReadPath,
-                canonical_read_summary,
-                dedupe_records,
-            )
+            from .rule_read_path import RuleReadPath
 
             read = RuleReadPath(store.workspace, store.group_id)
             if read.has_intelligence():
-                mapping = read.resolve_canonical_map(
+                canonical_mapping = read.resolve_canonical_map(
                     known_memory_ids={r.memory_id for r in all_records},
                 )
-                if mapping:
-                    before = len(all_records)
-                    all_records = dedupe_records(all_records, mapping)
-                    read_path_summary = canonical_read_summary(
-                        mapping, before, len(all_records),
-                    )
         except Exception:
-            pass  # keep the legacy summary; the canonical read is advisory
+            canonical_mapping = None  # keep the legacy path; canonical is advisory
     omitted = {
         "non_active": 0,
         "sensitive": 0,
@@ -316,6 +311,26 @@ def build_context_packet(
                     "effective_priority": effective_priorities[record.memory_id],
                     "reason": "matched_include",
                 })
+    # Canonical dedup of the *matched* mandatory set (post audience/exclude):
+    # a merged duplicate collapses to its strongest representative, but only
+    # among records that actually apply to this Agent/project.
+    if canonical_mapping:
+        from .rule_read_path import dedupe_records
+
+        def _mandatory_key(record: Any) -> tuple:
+            return (
+                -int(effective_priorities.get(record.memory_id, record.priority) or 0),
+                -int(1 if record.locked else 0),
+                -float(record.confidence or 0.0),
+                str(record.memory_id or ""),
+            )
+
+        read_path_summary["records_before"] += len(raw_mandatory)
+        raw_mandatory = dedupe_records(
+            raw_mandatory, canonical_mapping, key=_mandatory_key,
+        )
+        read_path_summary["records_after"] += len(raw_mandatory)
+
     invalid_mandatory_priorities = [
         record for record in raw_mandatory
         if isinstance(effective_priorities.get(record.memory_id), bool)
@@ -463,6 +478,33 @@ def build_context_packet(
             continue
         seen_bodies.add(normalized)
         unique.append(candidate)
+
+    # Canonical dedup of the *matched* relevant set (post active/relevance): the
+    # first (best-ranked) candidate per canonical definition survives.
+    if canonical_mapping:
+        from .rule_read_path import dedupe_records
+
+        memory_to_definition = canonical_mapping.get("memory_to_definition") or {}
+        read_path_summary["records_before"] += len(unique)
+
+        def _relevant_key(candidate: _Candidate) -> tuple:
+            return (0,)  # keep ranking order; first per definition wins
+
+        deduped = dedupe_records(
+            [c.record for c in unique], canonical_mapping, key=_relevant_key,
+        )
+        kept_ids = {r.memory_id for r in deduped}
+        unique = [c for c in unique if c.record.memory_id in kept_ids]
+        read_path_summary["records_after"] += len(unique)
+
+    if canonical_mapping:
+        from .rule_read_path import canonical_read_summary
+
+        read_path_summary = canonical_read_summary(
+            canonical_mapping,
+            int(read_path_summary["records_before"]),
+            int(read_path_summary["records_after"]),
+        )
 
     preferences = [
         item for item in unique if item.record.kind == MemoryKind.PREFERENCE

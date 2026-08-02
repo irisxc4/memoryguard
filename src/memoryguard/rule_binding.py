@@ -22,6 +22,12 @@ AUTO_ALLOWED_TARGET_TYPES = {"agent", "agent_project"}
 AUTO_SOURCES = {"auto", "backfill"}
 # Created-by values allowed to carry system/broad audiences (human governance).
 MANUAL_SOURCES = {"manual", "human", "user", "admin"}
+# Migration is a lossless, audited copy of a legacy assignment that P0-P2
+# already permitted (group/project/provider/runtime_role/system).  It is not an
+# automatic broadening: the binding is only ever built FROM a legacy assignment
+# and carries a legacy-assignment hash + migration run id, so it may carry the
+# same broad scopes the legacy layer already granted.
+MIGRATION_SOURCES = {"migration"}
 
 
 @dataclass(frozen=True)
@@ -142,7 +148,11 @@ def validate_binding_scope(binding: RuleBinding) -> RuleBinding:
             f"automatic binding cannot broaden target_type; "
             f"allowed target types are agent and agent_project"
         )
-    if binding.target_type == "system" and source not in MANUAL_SOURCES:
+    if (
+        binding.target_type == "system"
+        and source not in MANUAL_SOURCES
+        and source not in MIGRATION_SOURCES
+    ):
         raise ValueError("system binding requires manual governance")
     return replace(
         binding,

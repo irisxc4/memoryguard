@@ -32,6 +32,7 @@ from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
 from memoryguard.rule_merge_policy import (
     AUTO_MERGE_MIN_EVIDENCE,
     AUTO_READINESS_SCORE,
+    TRUSTED_MIN_SUCCESS_SAMPLES,
     WEIGHTED_EVIDENCE_MIN,
     compute_layers,
     evaluate_candidate,
@@ -198,7 +199,17 @@ def test_maturity_engine_stages(tmp_path):
     aged = _def("提交代码前必须运行测试", created_at=_aged(90))
     store.upsert_definition(aged)
     _strong_evidence(store, aged.definition_id, aged.canonical_text)
-    # 90 days + 3 agents/projects + success 0.98 + 400 samples -> trusted.
+    # Maturity is driven by *this definition's own* runtime feedback, never by
+    # borrowing another rule's agent reputation.  Seed >= 20 followed events
+    # across >= 3 projects -> trusted.
+    for i in range(TRUSTED_MIN_SUCCESS_SAMPLES):
+        store.upsert_runtime_feedback(
+            feedback_id=f"rt-{i}", definition_id=aged.definition_id,
+            outcome="followed", agent_instance_id=f"agent-{i % 3}",
+            project_ref=f"p{i % 3}", session_id=f"sess-{i}",
+            created_at=_aged(30), source="user", authority=4,
+        )
+    store.recompute_runtime_stats(aged.definition_id)
     assert svc._maturity_of(aged) == "trusted"
 
     # Negative evidence blocks validation: candidate at best.
@@ -292,19 +303,30 @@ def test_readiness_blocks_auto_for_young_unproven_rules(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_evidence_weight_cold_start_neutral_is_one():
-    # With no reputation/project data every component defaults to 1.0 and the
-    # weighted vote equals the old unweighted count (strict superset).
-    assert evidence_weight() == pytest.approx(1.0)
-    production = evidence_weight(
-        agent_reputation=0.98, project_importance=1.0,
-        historical_success=0.98, feedback_quality=0.95, recency=1.0,
+def test_evidence_weight_unknown_is_neutral_not_full_credit():
+    # PR5: an unknown source defaults to 0.5, never to full credit — an
+    # unvetted Agent must not outrank a verified production one.  (Recency is
+    # time-based, so a fresh unknown observation still scores its 0.10 slice.)
+    unknown = evidence_weight()
+    assert unknown == pytest.approx(0.55)
+    verified = evidence_weight(
+        agent_reliability=0.98, project_importance=1.0,
+        rule_specific_success=0.98, feedback_authority=1.0,
+        recency=1.0, evidence_confidence=1.0,
     )
     experimental = evidence_weight(
-        agent_reputation=0.7, project_importance=0.5,
-        historical_success=0.7, feedback_quality=0.5, recency=0.5,
+        agent_reliability=0.6, project_importance=0.5,
+        rule_specific_success=0.5, feedback_authority=0.5,
+        recency=0.5, evidence_confidence=0.5,
     )
-    assert production > experimental
+    assert verified > unknown > experimental or unknown >= experimental
+    # Low-confidence evidence weighs less than high-confidence evidence.
+    low_confidence = evidence_weight(
+        agent_reliability=0.98, project_importance=1.0,
+        rule_specific_success=0.98, feedback_authority=1.0,
+        recency=1.0, evidence_confidence=0.2,
+    )
+    assert low_confidence < verified
 
 
 def test_single_agent_dominance_blocks_auto(tmp_path):

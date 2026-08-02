@@ -243,10 +243,12 @@ TOOLS = [
                 "read_path": {
                     "type": "string",
                     "enum": ["auto", "legacy", "rule-intelligence"],
-                    "default": "auto",
-                    "description": "Phase5 canonical read path: auto prefers the "
-                    "rule-intelligence layer when data exists, legacy forces the "
-                    "old path, rule-intelligence prefers canonical (legacy fallback)",
+                    "default": "legacy",
+                    "description": "Phase5 canonical read path (shadow by "
+                    "default): legacy forces the old path; auto / "
+                    "rule-intelligence prefer the rule-intelligence layer when "
+                    "data exists, deduplicating merged duplicates only after "
+                    "the active/audience/exclude match",
                 },
             },
             "required": ["task"],
@@ -1795,7 +1797,7 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
             max_items=int(args.get("max_items", DEFAULT_MAX_ITEMS)),
             max_chars=int(args.get("max_chars", DEFAULT_MAX_CHARS)),
             effective_context=_effective_agent_context(args, group_id),
-            read_path=str(args.get("read_path", "auto") or "auto"),
+            read_path=str(args.get("read_path", "legacy") or "legacy"),
         )
     except (TypeError, ValueError) as exc:
         return _mcp_error(str(exc))
@@ -1878,6 +1880,14 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         return _mcp_error(str(exc))
+    # Project the feedback into the rule-intelligence layer now.  The outbox
+    # row was written atomically with the feedback, and consumption is
+    # idempotent, so a failure here is safe to defer to the next scan.
+    try:
+        from .rule_merge import RuleMergeService, RuleMergeStore
+        RuleMergeService(RuleMergeStore(workspace)).consume_outbox(workspace)
+    except Exception:
+        pass
     payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
     # Keep the original feedback fields at the top-level for existing MCP
     # clients while exposing the lifecycle decision/narrowing result.

@@ -52,9 +52,16 @@ def _setup(tmp_path, *, third_definition=False):
 
 
 def _merge(store, a, b):
+    # Pair-scoped evidence: the merge transaction re-verifies the evidence
+    # digest against the pair's own evidence, so unrelated definitions'
+    # evidence must not leak into the proposal snapshot.
+    pair_evidence = [
+        e for e in store.list_evidence()
+        if e.definition_id in {a.definition_id, b.definition_id}
+    ]
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=pair_evidence,
     )
     store.set_proposal_status(proposal["proposal_id"], "approved")
     return RuleMergeService(store).merge_proposal(proposal["proposal_id"])
