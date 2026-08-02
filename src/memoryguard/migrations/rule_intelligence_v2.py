@@ -5,9 +5,9 @@ Extends the v1 ``rule-intelligence`` schema with the governance layer:
   * ``rule_definitions``      + rule_strength / maturity_state
   * ``rule_merge_proposals``  + readiness_score / governance_reasons /
                                cooldown_until / first_merge_acknowledged /
-                               negative_score / conflict_type
+                               negative_score / conflict_type / judge_*
   * ``rule_merge_decisions``  + readiness_at_merge / strength_ok /
-                               negative_ok / first_merge_acknowledged
+                               negative_ok / first_merge_acknowledged / judge_*
   * new tables: rule_negative_evidence, agent_reputation, project_profile,
     rule_definition_versions
 
@@ -79,10 +79,22 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_merge_proposals", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_merge_proposals", "negative_score", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_proposals", "conflict_type", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "judge_source", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "judge_model", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "judge_score", "REAL NOT NULL DEFAULT 0.0"),
+    ("rule_merge_proposals", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
+    ("rule_merge_proposals", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_decisions", "readiness_at_merge", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_decisions", "strength_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "negative_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 1"),
+    ("rule_merge_decisions", "judge_source", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_decisions", "judge_model", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_decisions", "judge_score", "REAL NOT NULL DEFAULT 0.0"),
+    ("rule_merge_decisions", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
+    ("rule_merge_decisions", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_decisions", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
 )
 
 SCHEMA_VERSION = "rule-intelligence-v2"

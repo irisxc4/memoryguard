@@ -212,7 +212,7 @@ def test_mcp_schema_and_dispatch_use_trusted_binding(tmp_path, monkeypatch):
     schema = tool["inputSchema"]
     assert schema["required"] == ["task"]
     assert set(schema["properties"]) == {
-        "task", "project_hint", "max_items", "max_chars",
+        "task", "project_hint", "max_items", "max_chars", "read_path",
     }
     assert schema["additionalProperties"] is False
 

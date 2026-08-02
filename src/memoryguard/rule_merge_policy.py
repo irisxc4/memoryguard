@@ -211,6 +211,7 @@ class LayerScores:
     intent_score: float
     semantic_score: float
     duplicate_score: float
+    judge: Any | None = None  # JudgeVerdict (audit evidence, never a gate)
 
 
 def intent_similarity(a: RuleIntent, b: RuleIntent) -> float:
@@ -233,8 +234,15 @@ def intent_similarity(a: RuleIntent, b: RuleIntent) -> float:
     return 0.75 * (shared / 3.0) + 0.25 * param_jaccard
 
 
-def compute_layers(a: RuleDefinition, b: RuleDefinition) -> LayerScores:
-    """Compose the three layers for a Definition pair."""
+def compute_layers(a: RuleDefinition, b: RuleDefinition, *, judge: Any | None = None) -> LayerScores:
+    """Compose the three layers for a Definition pair.
+
+    ``judge`` is an optional semantic judge (P3.3).  When None the semantic
+    layer is the deterministic character-bigram Dice over the synonym-collapsed
+    surface — exactly the pre-judge behaviour.  When provided, the judge's
+    verdict is attached to the result for audit; the judge may *refine* the
+    semantic score but never relaxes the hard gates that consume it.
+    """
     # Layer 1: exact semantic hash (normalized intent + polarity + params).
     hash_score = 1.0 if a.semantic_hash and a.semantic_hash == b.semantic_hash else 0.0
 
@@ -251,6 +259,18 @@ def compute_layers(a: RuleDefinition, b: RuleDefinition) -> LayerScores:
         semantic_surface(b.canonical_text),
     )
 
+    # P3.3: a pluggable embedding/LLM judge may refine the semantic layer and
+    # always attaches its verdict as audit evidence.
+    judge_verdict = None
+    if judge is not None:
+        try:
+            judge_verdict = judge.judge(a, b)
+            refined = float(getattr(judge_verdict, "semantic_score", semantic_score))
+            if 0.0 <= refined <= 1.0:
+                semantic_score = refined
+        except Exception:
+            judge_verdict = None
+
     duplicate_score = (
         W_HASH * hash_score
         + W_INTENT * intent_score
@@ -261,6 +281,7 @@ def compute_layers(a: RuleDefinition, b: RuleDefinition) -> LayerScores:
         intent_score=intent_score,
         semantic_score=semantic_score,
         duplicate_score=duplicate_score,
+        judge=judge_verdict,
     )
 
 
@@ -314,6 +335,7 @@ class MergeAssessment:
     negative_ok: bool
     can_auto_merge: bool
     reasons: tuple[str, ...]
+    judge: Any | None = None  # JudgeVerdict, audit-only (never gates)
 
     @property
     def conflict_type(self) -> str:
@@ -340,9 +362,14 @@ def evaluate_candidate(
     min_projects: int = AUTO_MERGE_MIN_PROJECTS,
     negative_score: float = 0.0,
     negative_threshold: float = NEGATIVE_EVIDENCE_THRESHOLD,
+    judge: Any | None = None,
 ) -> MergeAssessment:
-    """Evaluate the merge safety conditions (P3 §5 + P3-002 + P3-001 §5)."""
-    layers = compute_layers(a, b)
+    """Evaluate the merge safety conditions (P3 §5 + P3-002 + P3-001 §5).
+
+    ``judge`` is a P3.3 semantic judge: its verdict is attached to the
+    assessment as audit evidence only and never relaxes the hard gates.
+    """
+    layers = compute_layers(a, b, judge=judge)
     reasons: list[str] = []
 
     if layers.duplicate_score < min_score:
@@ -416,4 +443,5 @@ def evaluate_candidate(
         negative_ok=negative_ok,
         can_auto_merge=can_auto_merge,
         reasons=tuple(reasons),
+        judge=layers.judge,
     )

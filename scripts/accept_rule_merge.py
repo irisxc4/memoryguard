@@ -17,7 +17,11 @@ the full governance metric family (P3-001/002/003):
 * ``single_agent_dominance``     -- one Agent held >=60% of evidence weight on
                                     a candidate (must be 0);
 * ``merge_rollback_success``     -- undo restored the exact pre-merge state;
-* ``migration_loss``             -- backfill count drift (must be 0).
+* ``migration_loss``             -- backfill count drift (must be 0);
+* ``judge_audited``              -- the merged decision carries the P3.3 judge
+                                    source + recommendation (must be true);
+* ``read_path_mode``             -- Phase5 bootstrap resolved through the
+                                    canonical layer or fell back safely.
 
 Exits non-zero when any gate fails, mirroring ``accept_rule_lifecycle.py``.
 """
@@ -37,6 +41,7 @@ from memoryguard.agent_binding import AgentBindingStore  # noqa: E402
 from memoryguard.rule_binding import build_binding  # noqa: E402
 from memoryguard.rule_evidence import build_evidence, build_negative_evidence  # noqa: E402
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore  # noqa: E402
+from memoryguard.rule_semantic_judge import DiceJudge  # noqa: E402
 from memoryguard.schema_v3 import (  # noqa: E402
     MemoryKind,
     SharedMemoryRecord,
@@ -114,7 +119,7 @@ def evaluate() -> dict[str, object]:
         "建议使用pnpm安装依赖",     # SUGGESTION -> strength conflict
     ])
 
-    service = RuleMergeService(RuleMergeStore(workspace))
+    service = RuleMergeService(RuleMergeStore(workspace), judge=DiceJudge())
     backfill = service.backfill_legacy(workspace)
 
     # Seed independent evidence on every definition so synonym pairs become
@@ -191,6 +196,35 @@ def evaluate() -> dict[str, object]:
         undo = service.undo_decision(decision_id)
         undo_ok = bool(undo.get("status") == "undone")
 
+    # P3.3 judge audit: the merge decision must carry the judge's source.
+    judge_audited = False
+    if decision_id:
+        judge_decision = intel.get_merge_decision(decision_id)
+        judge_audited = bool(
+            judge_decision
+            and judge_decision.get("judge_source") == "dice"
+            and judge_decision.get("judge_recommendation")
+        )
+
+    # Phase5 read-path: with an intelligence layer present, a bootstrap over a
+    # seeded legacy group prefers the canonical layer (or falls back safely).
+    from memoryguard.context_bootstrap import build_context_packet
+    from memoryguard.schema_v3 import EffectiveAgentContext
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    read_path_mode = "legacy"
+    try:
+        legacy = SharedMemoryStore(workspace, "team-a")
+        packet = build_context_packet(
+            legacy,
+            task="运行测试",
+            effective_context=EffectiveAgentContext("agent-team-a", "team-a"),
+            read_path="auto",
+        )
+        read_path_mode = packet.get("read_path", {}).get("mode", "legacy")
+    except Exception:
+        read_path_mode = "legacy"
+
     report = {
         "auto_merge_precision": auto_merge_precision,
         "strength_conflict_merge": metrics["strength_conflict_merge"],
@@ -202,6 +236,8 @@ def evaluate() -> dict[str, object]:
         "auto_broad_binding": metrics["auto_broad_binding"],
         "merge_rollback_success": 1 if undo_ok else 0,
         "migration_loss": backfill["migration_loss"],
+        "judge_audited": judge_audited,
+        "read_path_mode": read_path_mode,
         "candidate_count": len(candidates),
         "conflicted_count": len(conflicted),
         "strength_conflict_found": bool(strength_conflict_found),
@@ -221,6 +257,8 @@ def evaluate() -> dict[str, object]:
             and metrics["auto_broad_binding"] == 0
             and undo_ok
             and backfill["migration_loss"] == 0
+            and judge_audited
+            and read_path_mode in {"rule-intelligence", "legacy"}
             and strength_conflict_found
             and suggestion_never_candidate
             and auto_blocked_first

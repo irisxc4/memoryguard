@@ -72,8 +72,11 @@ HUMAN_ACTORS = {"human", "user", "admin", "manual"}
 class RuleMergeService:
     """High-level merge pipeline over one Rule Intelligence store."""
 
-    def __init__(self, store: RuleMergeStore):
+    def __init__(self, store: RuleMergeStore, judge: Any | None = None):
         self.store = store
+        # P3.3: optional semantic judge.  None keeps the deterministic Dice
+        # semantic layer exactly as before; a judge adds an auditable verdict.
+        self.judge = judge
 
     # ------------------------------------------------------------------
     # Backfill / dual-write
@@ -228,6 +231,7 @@ class RuleMergeService:
         min_agents: int = AUTO_MERGE_MIN_AGENTS,
         min_projects: int = AUTO_MERGE_MIN_PROJECTS,
         definition_ids: list[str] | None = None,
+        judge: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Find duplicate-active Definition pairs and persist merge proposals.
 
@@ -245,6 +249,7 @@ class RuleMergeService:
         Maturity is recomputed before scanning so the readiness snapshot is
         fresh.
         """
+        judge = judge if judge is not None else self.judge
         candidates = self.store.list_definitions(status="active")
         if definition_ids:
             wanted = set(definition_ids)
@@ -264,7 +269,7 @@ class RuleMergeService:
                 assessment = self._assess_pair(
                     a, b, min_score=min_score, min_evidence=min_evidence,
                     min_agents=min_agents, min_projects=min_projects,
-                    negative_score=negative_score,
+                    negative_score=negative_score, judge=judge,
                 )
                 governance = self._proposal_governance(
                     a, b, negative_score=negative_score,
@@ -295,13 +300,14 @@ class RuleMergeService:
                     cooldown_until=governance["cooldown_until"],
                     negative_score=governance["negative_score"],
                     conflict_type=conflict_type,
+                    judge=assessment.judge,
                 )
                 self.store.set_proposal_status(proposal["proposal_id"], status)
                 proposals.append(self.store.get_proposal(proposal["proposal_id"]))
         return proposals
 
     def merge_proposal(
-        self, proposal_id: str, *, actor: str = "auto",
+        self, proposal_id: str, *, actor: str = "auto", judge: Any | None = None,
     ) -> dict[str, Any]:
         """Evaluate and execute one merge proposal.
 
@@ -318,6 +324,7 @@ class RuleMergeService:
           * **auto**: every hard gate AND the readiness score, cooldown and
             first-merge acknowledgment must hold.
         """
+        judge = judge if judge is not None else self.judge
         proposal = self.store.get_proposal(proposal_id)
         if proposal is None:
             raise ValueError("rule_merge_proposal_not_found")
@@ -345,6 +352,9 @@ class RuleMergeService:
             }
 
         negative_score = self._negative_score(a, b)
+        judge_verdict = getattr(
+            compute_layers(a, b, judge=judge), "judge", None,
+        )
 
         if human_path:
             # Human approval relaxes the *evidence and similarity* thresholds,
@@ -380,6 +390,7 @@ class RuleMergeService:
                 min_agents=AUTO_MERGE_MIN_AGENTS,
                 min_projects=AUTO_MERGE_MIN_PROJECTS,
                 negative_score=negative_score,
+                judge=judge,
             )
             if not assessment.can_auto_merge:
                 new_status = (
@@ -431,6 +442,7 @@ class RuleMergeService:
                 bool(proposal.get("first_merge_acknowledged"))
                 or human_path
             ),
+            judge=judge_verdict,
         )
         return {
             "ok": True,
@@ -498,6 +510,7 @@ class RuleMergeService:
         min_agents: int,
         min_projects: int,
         negative_score: float = 0.0,
+        judge: Any | None = None,
     ) -> MergeAssessment:
         return evaluate_candidate(
             a, b,
@@ -507,6 +520,7 @@ class RuleMergeService:
             min_agents=min_agents,
             min_projects=min_projects,
             negative_score=negative_score,
+            judge=judge,
         )
 
     @staticmethod

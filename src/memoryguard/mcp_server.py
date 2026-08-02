@@ -240,6 +240,14 @@ TOOLS = [
                     "maximum": 12000,
                     "default": 6000,
                 },
+                "read_path": {
+                    "type": "string",
+                    "enum": ["auto", "legacy", "rule-intelligence"],
+                    "default": "auto",
+                    "description": "Phase5 canonical read path: auto prefers the "
+                    "rule-intelligence layer when data exists, legacy forces the "
+                    "old path, rule-intelligence prefers canonical (legacy fallback)",
+                },
             },
             "required": ["task"],
             "additionalProperties": False,
@@ -1787,6 +1795,7 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
             max_items=int(args.get("max_items", DEFAULT_MAX_ITEMS)),
             max_chars=int(args.get("max_chars", DEFAULT_MAX_CHARS)),
             effective_context=_effective_agent_context(args, group_id),
+            read_path=str(args.get("read_path", "auto") or "auto"),
         )
     except (TypeError, ValueError) as exc:
         return _mcp_error(str(exc))

@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS rule_merge_proposals (
     first_merge_acknowledged INTEGER NOT NULL DEFAULT 0,
     negative_score REAL NOT NULL DEFAULT 0.0,
     conflict_type TEXT NOT NULL DEFAULT '',
+    judge_source TEXT NOT NULL DEFAULT '',
+    judge_model TEXT NOT NULL DEFAULT '',
+    judge_score REAL NOT NULL DEFAULT 0.0,
+    judge_confidence REAL NOT NULL DEFAULT 0.0,
+    judge_recommendation TEXT NOT NULL DEFAULT '',
+    judge_rationale TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'candidate',
     explanation TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
@@ -145,6 +151,12 @@ CREATE TABLE IF NOT EXISTS rule_merge_decisions (
     strength_ok INTEGER NOT NULL DEFAULT 1,
     negative_ok INTEGER NOT NULL DEFAULT 1,
     first_merge_acknowledged INTEGER NOT NULL DEFAULT 1,
+    judge_source TEXT NOT NULL DEFAULT '',
+    judge_model TEXT NOT NULL DEFAULT '',
+    judge_score REAL NOT NULL DEFAULT 0.0,
+    judge_confidence REAL NOT NULL DEFAULT 0.0,
+    judge_recommendation TEXT NOT NULL DEFAULT '',
+    judge_rationale TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'merged',
     created_at TEXT NOT NULL,
     undone_at TEXT NOT NULL DEFAULT ''
@@ -243,10 +255,22 @@ class RuleMergeStore:
         ("rule_merge_proposals", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
         ("rule_merge_proposals", "negative_score", "REAL NOT NULL DEFAULT 0.0"),
         ("rule_merge_proposals", "conflict_type", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "judge_source", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "judge_model", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "judge_score", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_proposals", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_proposals", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
         ("rule_merge_decisions", "readiness_at_merge", "REAL NOT NULL DEFAULT 0.0"),
         ("rule_merge_decisions", "strength_ok", "INTEGER NOT NULL DEFAULT 1"),
         ("rule_merge_decisions", "negative_ok", "INTEGER NOT NULL DEFAULT 1"),
         ("rule_merge_decisions", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 1"),
+        ("rule_merge_decisions", "judge_source", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_decisions", "judge_model", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_decisions", "judge_score", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_decisions", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
+        ("rule_merge_decisions", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_decisions", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
     )
 
     @staticmethod
@@ -835,6 +859,7 @@ class RuleMergeStore:
         cooldown_until: str = "",
         negative_score: float = 0.0,
         conflict_type: str = "",
+        judge: Any | None = None,
     ) -> dict[str, Any]:
         evidence_list = dedupe_evidence(list(evidence or []))
         agents = {ev.agent_instance_id for ev in evidence_list if ev.agent_instance_id}
@@ -864,8 +889,10 @@ class RuleMergeStore:
                     evidence_count, agent_count, project_count,
                     contradiction_score, readiness_score, governance_reasons,
                     cooldown_until, first_merge_acknowledged, negative_score,
-                    conflict_type, status, explanation, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    conflict_type, judge_source, judge_model, judge_score,
+                    judge_confidence, judge_recommendation, judge_rationale,
+                    status, explanation, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     proposal_id,
@@ -875,6 +902,12 @@ class RuleMergeStore:
                     float(contradiction_score), float(readiness_score),
                     governance_reasons or "", cooldown_until or "",
                     0, float(negative_score), conflict_type or "",
+                    self._judge_field(judge, "source"),
+                    self._judge_field(judge, "model"),
+                    self._judge_score(judge),
+                    self._judge_field(judge, "confidence"),
+                    self._judge_field(judge, "recommendation"),
+                    self._judge_field(judge, "rationale"),
                     "candidate", explanation, now,
                 ),
             )
@@ -920,6 +953,7 @@ class RuleMergeStore:
         cooldown_until: str = "",
         negative_score: float = 0.0,
         conflict_type: str = "",
+        judge: Any | None = None,
     ) -> dict[str, Any] | None:
         """Persist the governance snapshot of one merge proposal."""
         with self._db() as conn:
@@ -927,11 +961,19 @@ class RuleMergeStore:
                 """
                 UPDATE rule_merge_proposals SET
                     readiness_score=?, governance_reasons=?, cooldown_until=?,
-                    negative_score=?, conflict_type=?
+                    negative_score=?, conflict_type=?, judge_source=?,
+                    judge_model=?, judge_score=?, judge_confidence=?,
+                    judge_recommendation=?, judge_rationale=?
                 WHERE proposal_id=?
                 """,
                 (float(readiness_score), governance_reasons or "",
                  cooldown_until or "", float(negative_score), conflict_type or "",
+                 self._judge_field(judge, "source"),
+                 self._judge_field(judge, "model"),
+                 self._judge_score(judge),
+                 self._judge_field(judge, "confidence"),
+                 self._judge_field(judge, "recommendation"),
+                 self._judge_field(judge, "rationale"),
                  proposal_id),
             )
         return self.get_proposal(proposal_id)
@@ -998,6 +1040,21 @@ class RuleMergeStore:
         return count
 
     @staticmethod
+    def _judge_score(judge: Any | None) -> float:
+        if judge is None:
+            return 0.0
+        return float(getattr(judge, "semantic_score", 0.0) or 0.0)
+
+    @staticmethod
+    def _judge_field(judge: Any | None, name: str) -> str:
+        if judge is None:
+            return ""
+        value = getattr(judge, name, "")
+        if value is None:
+            return ""
+        return str(value) if not isinstance(value, float) else f"{value:.4f}"
+
+    @staticmethod
     def _row_to_proposal(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "proposal_id": row["proposal_id"],
@@ -1013,6 +1070,12 @@ class RuleMergeStore:
             "first_merge_acknowledged": int(row["first_merge_acknowledged"] or 0),
             "negative_score": float(row["negative_score"] or 0.0),
             "conflict_type": row["conflict_type"] or "",
+            "judge_source": row["judge_source"] or "",
+            "judge_model": row["judge_model"] or "",
+            "judge_score": float(row["judge_score"] or 0.0),
+            "judge_confidence": float(row["judge_confidence"] or 0.0),
+            "judge_recommendation": row["judge_recommendation"] or "",
+            "judge_rationale": row["judge_rationale"] or "",
             "status": row["status"] or "candidate",
             "explanation": row["explanation"] or "",
             "created_at": row["created_at"] or "",
@@ -1036,6 +1099,7 @@ class RuleMergeStore:
         strength_ok: bool = True,
         negative_ok: bool = True,
         first_merge_acknowledged: bool = True,
+        judge: Any | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> dict[str, Any]:
         decision_id = stable_hash(
@@ -1047,8 +1111,10 @@ class RuleMergeStore:
                 decision_id, proposal_id, canonical_definition_id,
                 merged_definition_ids, before_bindings, after_bindings,
                 migration, actor, readiness_at_merge, strength_ok, negative_ok,
-                first_merge_acknowledged, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?)
+                first_merge_acknowledged, judge_source, judge_model,
+                judge_score, judge_confidence, judge_recommendation,
+                judge_rationale, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'merged', ?)
         """
         values = (
             decision_id, proposal_id, canonical_definition_id,
@@ -1058,7 +1124,14 @@ class RuleMergeStore:
             json.dumps(migration, ensure_ascii=False, sort_keys=True),
             actor, float(readiness_at_merge),
             1 if strength_ok else 0, 1 if negative_ok else 0,
-            1 if first_merge_acknowledged else 0, now,
+            1 if first_merge_acknowledged else 0,
+            self._judge_field(judge, "source"),
+            self._judge_field(judge, "model"),
+            self._judge_score(judge),
+            self._judge_field(judge, "confidence"),
+            self._judge_field(judge, "recommendation"),
+            self._judge_field(judge, "rationale"),
+            now,
         )
         if conn is not None:
             conn.execute(sql, values)
@@ -1078,6 +1151,12 @@ class RuleMergeStore:
             "strength_ok": bool(strength_ok),
             "negative_ok": bool(negative_ok),
             "first_merge_acknowledged": bool(first_merge_acknowledged),
+            "judge_source": self._judge_field(judge, "source"),
+            "judge_model": self._judge_field(judge, "model"),
+            "judge_score": self._judge_score(judge),
+            "judge_confidence": self._judge_field(judge, "confidence"),
+            "judge_recommendation": self._judge_field(judge, "recommendation"),
+            "judge_rationale": self._judge_field(judge, "rationale"),
             "status": "merged",
             "created_at": now,
             "undone_at": "",
@@ -1104,6 +1183,12 @@ class RuleMergeStore:
             "strength_ok": bool(row["strength_ok"]),
             "negative_ok": bool(row["negative_ok"]),
             "first_merge_acknowledged": bool(row["first_merge_acknowledged"]),
+            "judge_source": row["judge_source"] or "",
+            "judge_model": row["judge_model"] or "",
+            "judge_score": float(row["judge_score"] or 0.0),
+            "judge_confidence": float(row["judge_confidence"] or 0.0),
+            "judge_recommendation": row["judge_recommendation"] or "",
+            "judge_rationale": row["judge_rationale"] or "",
             "status": row["status"] or "merged",
             "created_at": row["created_at"] or "",
             "undone_at": row["undone_at"] or "",
@@ -1131,6 +1216,12 @@ class RuleMergeStore:
             "strength_ok": bool(r["strength_ok"]),
             "negative_ok": bool(r["negative_ok"]),
             "first_merge_acknowledged": bool(r["first_merge_acknowledged"]),
+            "judge_source": r["judge_source"] or "",
+            "judge_model": r["judge_model"] or "",
+            "judge_score": float(r["judge_score"] or 0.0),
+            "judge_confidence": float(r["judge_confidence"] or 0.0),
+            "judge_recommendation": r["judge_recommendation"] or "",
+            "judge_rationale": r["judge_rationale"] or "",
             "status": r["status"] or "merged",
             "created_at": r["created_at"] or "",
             "undone_at": r["undone_at"] or "",
@@ -1151,6 +1242,7 @@ class RuleMergeStore:
         strength_ok: bool = True,
         negative_ok: bool = True,
         first_merge_acknowledged: bool = True,
+        judge: Any | None = None,
     ) -> dict[str, Any]:
         """Atomically merge definitions into a canonical one.
 
@@ -1265,6 +1357,7 @@ class RuleMergeStore:
                     strength_ok=strength_ok,
                     negative_ok=negative_ok,
                     first_merge_acknowledged=first_merge_acknowledged,
+                    judge=judge,
                     conn=conn,
                 )
                 conn.execute(

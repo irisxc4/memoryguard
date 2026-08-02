@@ -22,6 +22,7 @@ from .schema_v3 import (
 )
 from .rule_scope import effective_assignments, normalize_assignment
 from .rule_scope import canonical_project_ref
+from .rule_read_path import MODE_LEGACY, resolve_read_path_mode
 from .shared_memory_store import (
     MANDATORY_MAX_CHARS,
     MANDATORY_MAX_ITEMS,
@@ -107,8 +108,16 @@ def build_context_packet(
     max_items: int = DEFAULT_MAX_ITEMS,
     max_chars: int = DEFAULT_MAX_CHARS,
     effective_context: EffectiveAgentContext | None = None,
+    read_path: str = "auto",
 ) -> dict[str, Any]:
-    """Build bounded long-term-memory context from a read-only trusted store."""
+    """Build bounded long-term-memory context from a read-only trusted store.
+
+    ``read_path`` controls the Phase5 canonical read path: ``auto`` (default)
+    prefers the rule-intelligence layer when it has data for this group and
+    otherwise behaves exactly like ``legacy``; ``legacy`` forces the old path;
+    ``rule-intelligence`` prefers the canonical layer (falling back to legacy
+    when the layer has no data).
+    """
     task = (task or "").strip()
     if not task:
         raise ValueError("task is required")
@@ -143,6 +152,37 @@ def build_context_packet(
     )
     query_tokens = _tokens(f"{task} {project_hint}")
     all_records = store.list_records()
+    # Phase5 read path: prefer the canonical rule-intelligence layer when it has
+    # data for this group so merged duplicates inject once.  Body text still
+    # comes from the legacy record; old tables are untouched.
+    read_path_summary: dict[str, Any] = {
+        "mode": MODE_LEGACY,
+        "canonical_definitions": 0,
+        "records_before": len(all_records),
+        "records_after": len(all_records),
+        "deduplicated": 0,
+    }
+    if resolve_read_path_mode(read_path) != MODE_LEGACY:
+        try:
+            from .rule_read_path import (
+                RuleReadPath,
+                canonical_read_summary,
+                dedupe_records,
+            )
+
+            read = RuleReadPath(store.workspace, store.group_id)
+            if read.has_intelligence():
+                mapping = read.resolve_canonical_map(
+                    known_memory_ids={r.memory_id for r in all_records},
+                )
+                if mapping:
+                    before = len(all_records)
+                    all_records = dedupe_records(all_records, mapping)
+                    read_path_summary = canonical_read_summary(
+                        mapping, before, len(all_records),
+                    )
+        except Exception:
+            pass  # keep the legacy summary; the canonical read is advisory
     omitted = {
         "non_active": 0,
         "sensitive": 0,
@@ -512,6 +552,7 @@ def build_context_packet(
         },
         "assignment_receipt": assignment_receipt,
         "legacy_unscoped_rule_ids": legacy_unscoped,
+        "read_path": read_path_summary,
         "recalled_memory_ids": [item["memory_id"] for item in items],
         "mandatory_overflow": mandatory_overflow,
         "mandatory_invalid_reason": mandatory_error,
