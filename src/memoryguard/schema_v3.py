@@ -24,6 +24,7 @@ from typing import Any
 INJECTION_POLICIES = frozenset({"relevant", "always"})
 PRIORITY_MIN = -100
 PRIORITY_MAX = 100
+SESSION_SOURCES = frozenset({"host", "transport", "generated", "absent"})
 
 
 def validate_injection_settings(injection_policy: Any, priority: Any) -> tuple[str, int]:
@@ -1610,6 +1611,26 @@ class RuleMatchReceipt:
     runtime_role: str = ""
     session_id: str = ""
     context_hash: str = ""
+    session_trusted: bool = False
+    session_source: str = "absent"
+
+    def __post_init__(self) -> None:
+        """Normalize session provenance without inferring trust from presence.
+
+        A session id is useful context, but it is not proof that the host or
+        transport authenticated it.  Trust therefore remains false unless the
+        caller explicitly supplies ``True`` plus a non-absent provenance.
+        """
+        self.session_id = str(self.session_id or "")
+        source = str(self.session_source or "").strip().casefold()
+        if source not in SESSION_SOURCES:
+            source = "absent"
+        self.session_source = source
+        self.session_trusted = (
+            self.session_trusted is True
+            and bool(self.session_id)
+            and source != "absent"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1629,6 +1650,8 @@ class RuleMatchReceipt:
             "runtime_role": self.runtime_role,
             "session_id": self.session_id,
             "context_hash": self.context_hash,
+            "session_trusted": self.session_trusted,
+            "session_source": self.session_source,
         }
 
     @classmethod
@@ -1650,6 +1673,8 @@ class RuleMatchReceipt:
             runtime_role=data.get("runtime_role", ""),
             session_id=data.get("session_id", ""),
             context_hash=data.get("context_hash", ""),
+            session_trusted=data.get("session_trusted", False),
+            session_source=data.get("session_source", "absent"),
         )
 
 
@@ -1788,6 +1813,25 @@ class RuleFeedbackEvidence(Mapping[str, Any]):
     source: str = "agent"
     authority: int = 3
     supersedes_feedback_id: str = ""
+    session_trusted: bool = False
+    session_source: str = "absent"
+
+    def __post_init__(self) -> None:
+        # Keep this derived projection fail-closed as well as the receipt
+        # model; callers may construct it directly in narrowing integrations.
+        session_id = str(self.session_id or "")
+        source = str(self.session_source or "").strip().casefold()
+        if source not in SESSION_SOURCES:
+            source = "absent"
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "session_source", source)
+        object.__setattr__(
+            self,
+            "session_trusted",
+            self.session_trusted is True
+            and bool(session_id)
+            and source != "absent",
+        )
 
     @property
     def feedback(self) -> RuleMatchFeedback:
@@ -1818,6 +1862,8 @@ class RuleFeedbackEvidence(Mapping[str, Any]):
             runtime_role=self.runtime_role,
             session_id=self.session_id,
             context_hash=self.context_hash,
+            session_trusted=self.session_trusted,
+            session_source=self.session_source,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1834,6 +1880,8 @@ class RuleFeedbackEvidence(Mapping[str, Any]):
             "runtime_role": self.runtime_role,
             "session_id": self.session_id,
             "context_hash": self.context_hash,
+            "session_trusted": self.session_trusted,
+            "session_source": self.session_source,
             "outcome": self.outcome,
             "actor": self.actor,
             "evidence": self.evidence,

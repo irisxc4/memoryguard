@@ -515,6 +515,7 @@ class AutoOrganizer:
             assignments=list(
                 getattr(self, "_active_rule_assignments", []) or []
             ),
+            emit_lifecycle_outbox=True,
         )
 
     # ------------------------------------------------------------------
@@ -870,7 +871,7 @@ class AutoOrganizer:
             updated_at=_now_iso(),
             agent_instance_id=event.agent_instance_id,
         )
-        self.store.append_record(derived_record)
+        self.store.append_record(derived_record, emit_lifecycle_outbox=True)
 
         # 记录 DecisionEvent
         decision = DecisionEvent(

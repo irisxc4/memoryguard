@@ -58,6 +58,14 @@ TRUSTED_DAYS = 30
 VALIDATED_SUCCESS_RATE = 0.95
 TRUSTED_MIN_SUCCESS_SAMPLES = 20
 
+# Automatic merge maturity policy.  Exact and structured-intent matches may
+# use validated evidence; a semantic-only match needs the stronger trusted
+# lifecycle state.  Human approval is handled by the orchestration layer and
+# may explicitly override this automatic gate.
+VALIDATED_MATURITY_STATES = frozenset({"validated", "trusted"})
+TRUSTED_MATURITY_STATES = frozenset({"trusted"})
+INTENTION_MATCH_THRESHOLD = 0.75
+
 # Proposal identity policy.  The proposal id is stable across scans (no
 # timestamp) so cooldown and first-merge acknowledgment accumulate on one row;
 # a policy change that must invalidate old proposals bumps this version.
@@ -303,6 +311,37 @@ class LayerScores:
     judge: Any | None = None  # JudgeVerdict (audit evidence, never a gate)
 
 
+def merge_match_kind(layers: LayerScores) -> str:
+    """Classify the deterministic evidence supporting a pair.
+
+    The strongest deterministic layer wins.  A pair that is neither an exact
+    hash nor a sufficiently aligned intent is treated as semantic-only and is
+    therefore subject to the strictest maturity gate.
+    """
+    if layers.hash_score >= 1.0:
+        return "exact"
+    if layers.intent_score >= INTENTION_MATCH_THRESHOLD:
+        return "intention"
+    return "semantic"
+
+
+def maturity_gate(
+    a: RuleDefinition, b: RuleDefinition, match_kind: str,
+) -> tuple[bool, tuple[str, ...]]:
+    """Return the automatic maturity gate for a classified pair."""
+    required = (
+        TRUSTED_MATURITY_STATES
+        if match_kind == "semantic" else VALIDATED_MATURITY_STATES
+    )
+    required_name = "trusted" if match_kind == "semantic" else "validated"
+    if (
+        str(a.maturity_state or "").casefold() in required
+        and str(b.maturity_state or "").casefold() in required
+    ):
+        return True, ()
+    return False, (f"maturity_requires_{required_name}",)
+
+
 def intent_similarity(a: RuleIntent, b: RuleIntent) -> float:
     """Deterministic intent overlap: action/object/trigger/parameters."""
     def _field(x: str, y: str) -> int:
@@ -329,8 +368,8 @@ def compute_layers(a: RuleDefinition, b: RuleDefinition, *, judge: Any | None = 
     ``judge`` is an optional semantic judge (P3.3).  When None the semantic
     layer is the deterministic character-bigram Dice over the synonym-collapsed
     surface — exactly the pre-judge behaviour.  When provided, the judge's
-    verdict is attached to the result for audit; the judge may *refine* the
-    semantic score but never relaxes the hard gates that consume it.
+    verdict is attached to the result for audit; it never changes the
+    deterministic semantic or duplicate scores used by policy.
     """
     # Layer 1: exact semantic hash (normalized intent + polarity + params).
     hash_score = 1.0 if a.semantic_hash and a.semantic_hash == b.semantic_hash else 0.0
@@ -348,15 +387,13 @@ def compute_layers(a: RuleDefinition, b: RuleDefinition, *, judge: Any | None = 
         semantic_surface(b.canonical_text),
     )
 
-    # P3.3: a pluggable embedding/LLM judge may refine the semantic layer and
-    # always attaches its verdict as audit evidence.
+    # P3.3: a pluggable embedding/LLM judge always attaches its verdict as
+    # audit evidence.  Its score is deliberately not used for policy
+    # arithmetic: deterministic semantic/duplicate scores remain authoritative.
     judge_verdict = None
     if judge is not None:
         try:
             judge_verdict = judge.judge(a, b)
-            refined = float(getattr(judge_verdict, "semantic_score", semantic_score))
-            if 0.0 <= refined <= 1.0:
-                semantic_score = refined
         except Exception:
             judge_verdict = None
 
@@ -425,6 +462,32 @@ class MergeAssessment:
     can_auto_merge: bool
     reasons: tuple[str, ...]
     judge: Any | None = None  # JudgeVerdict, audit-only (never gates)
+    match_kind: str = "semantic"  # exact | intention | semantic
+    maturity_ok: bool = True
+    similarity_ok: bool = True
+
+    @property
+    def hard_gates_ok(self) -> bool:
+        """Whether the non-readiness safety gates pass.
+
+        Scanning keeps these pairs as governance-visible candidates even when
+        automatic maturity is not ready.  Execution still requires the full
+        ``can_auto_merge`` result on the automatic path.
+        """
+        return (
+            self.polarity_ok
+            and self.parameters_ok
+            and self.evidence_ok
+            and self.contradiction_ok
+            and self.strength_ok
+            and self.negative_ok
+            and self.similarity_ok
+        )
+
+    @property
+    def match_type(self) -> str:
+        """Compatibility alias for callers that use ``match_type``."""
+        return self.match_kind
 
     @property
     def conflict_type(self) -> str:
@@ -459,9 +522,12 @@ def evaluate_candidate(
     assessment as audit evidence only and never relaxes the hard gates.
     """
     layers = compute_layers(a, b, judge=judge)
-    reasons: list[str] = []
+    match_kind = merge_match_kind(layers)
+    maturity_ok, maturity_reasons = maturity_gate(a, b, match_kind)
+    reasons: list[str] = list(maturity_reasons)
 
-    if layers.duplicate_score < min_score:
+    similarity_ok = layers.duplicate_score >= min_score
+    if not similarity_ok:
         reasons.append("insufficient_similarity")
 
     polarity_ok = a.polarity == b.polarity
@@ -519,13 +585,14 @@ def evaluate_candidate(
         reasons.append("contradiction")
 
     can_auto_merge = (
-        layers.duplicate_score >= min_score
+        similarity_ok
         and polarity_ok
         and params_ok
         and evidence_ok
         and contradiction_ok
         and strength_ok
         and negative_ok
+        and maturity_ok
     )
     return MergeAssessment(
         duplicate_score=layers.duplicate_score,
@@ -538,4 +605,7 @@ def evaluate_candidate(
         can_auto_merge=can_auto_merge,
         reasons=tuple(reasons),
         judge=layers.judge,
+        match_kind=match_kind,
+        maturity_ok=maturity_ok,
+        similarity_ok=similarity_ok,
     )

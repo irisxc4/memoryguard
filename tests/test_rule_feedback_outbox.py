@@ -37,20 +37,32 @@ def _seed_record(store: SharedMemoryStore, memory_id: str, body: str, agent="age
     ), assignments=[{"target_type": "agent", "target_id": agent}])
 
 
-def _seed_receipt(store: SharedMemoryStore, receipt_id: str, memory_id: str) -> None:
+def _seed_receipt(
+    store: SharedMemoryStore,
+    receipt_id: str,
+    memory_id: str,
+    *,
+    session_id: str = "sess-1",
+    session_trusted: bool = False,
+    session_source: str = "absent",
+) -> None:
     store.append_rule_match_receipt(RuleMatchReceipt(
         receipt_id=receipt_id, memory_id=memory_id, share_group_id=store.group_id,
         agent_instance_id="agent-1", task_hash="th", task="写测试",
-        project_ref="/proj/x", session_id="sess-1", provider="codex",
+        project_ref="/proj/x", session_id=session_id, provider="codex",
+        session_trusted=session_trusted, session_source=session_source,
     ))
 
 
 def _feedback(store: SharedMemoryStore, receipt_id: str, outcome: str,
-              *, feedback_id: str = "") -> None:
+              *, feedback_id: str = "", confidence: float = 1.0,
+              source: str = "agent", authority: int = 3,
+              created_at: str = "") -> None:
     store.append_rule_match_feedback(RuleMatchFeedback(
         feedback_id=feedback_id or f"fb-{outcome}",
         receipt_id=receipt_id, outcome=outcome, actor="agent:agent-1",
-        source="agent", authority=3, confidence=1.0, created_at=_now_iso(),
+        source=source, authority=authority, confidence=confidence,
+        created_at=created_at or _now_iso(),
     ))
 
 
@@ -60,10 +72,21 @@ def _consume(tmp_path):
     return intel, summary
 
 
-def _setup_legacy(tmp_path, *, group="g1", body="提交代码前必须运行测试"):
+def _setup_legacy(
+    tmp_path,
+    *,
+    group="g1",
+    body="提交代码前必须运行测试",
+    session_id="sess-1",
+    session_trusted=False,
+    session_source="absent",
+):
     store = SharedMemoryStore(tmp_path, group)
     _seed_record(store, "m1", body)
-    _seed_receipt(store, "rcpt-1", "m1")
+    _seed_receipt(
+        store, "rcpt-1", "m1", session_id=session_id,
+        session_trusted=session_trusted, session_source=session_source,
+    )
     return store
 
 
@@ -114,16 +137,145 @@ def test_consume_outbox_not_applicable_adds_negative_evidence(tmp_path):
     assert stats["not_applicable"] == 1
 
 
+def test_effective_feedback_replace_and_clear_retracts_only_current_receipt(
+    tmp_path,
+):
+    legacy = SharedMemoryStore(tmp_path, "g1")
+    _seed_record(legacy, "m1", "Submit code only after running tests")
+    _seed_record(legacy, "m2", "Run tests before submitting code")
+    _seed_receipt(
+        legacy, "rcpt-1", "m1", session_id="trusted-1",
+        session_trusted=True, session_source="host",
+    )
+    _seed_receipt(
+        legacy, "rcpt-2", "m2", session_id="trusted-2",
+        session_trusted=True, session_source="host",
+    )
+
+    # Hook feedback has stable authority, so a later event can replace and
+    # then clear the effective state for exactly one receipt.
+    _feedback(
+        legacy, "rcpt-1", "followed", feedback_id="fb-1-followed",
+        source="hook", authority=2, created_at="2026-01-01T00:00:01+00:00",
+    )
+    _feedback(
+        legacy, "rcpt-2", "followed", feedback_id="fb-2-followed",
+        source="hook", authority=2, created_at="2026-01-01T00:00:02+00:00",
+    )
+    intel, _ = _consume(tmp_path)
+    assert intel.count_evidence() == 2
+    projection_1 = intel.get_effective_feedback_projection("rcpt-1")
+    projection_2 = intel.get_effective_feedback_projection("rcpt-2")
+    definition_1 = projection_1["definition_id"]
+    definition_2 = projection_2["definition_id"]
+
+    _feedback(
+        legacy, "rcpt-1", "not_applicable", feedback_id="fb-1-replaced",
+        source="hook", authority=2, created_at="2026-01-01T00:00:03+00:00",
+    )
+    _consume(tmp_path)
+    assert intel.count_evidence() == 1
+    assert intel.count_negative_evidence() == 1
+    assert intel.get_effective_feedback_projection("rcpt-1")[
+        "effective_feedback_id"
+    ] == "fb-1-replaced"
+
+    _feedback(
+        legacy, "rcpt-1", "unobserved", feedback_id="fb-1-cleared",
+        source="hook", authority=2, created_at="2026-01-01T00:00:04+00:00",
+    )
+    _consume(tmp_path)
+    projection = intel.get_effective_feedback_projection("rcpt-1")
+    assert projection["effective_feedback_id"] == ""
+    assert projection["outcome"] == "tombstone"
+    assert intel.count_evidence() == 1  # rcpt-2 remains effective
+    assert intel.count_negative_evidence() == 0
+    remaining = intel.list_evidence()
+    assert {item.receipt_id for item in remaining} == {"rcpt-2"}
+    assert intel.get_runtime_stats(definition_2)["followed"] == 1
+    with intel._db() as conn:
+        runtime_ids = {
+            row["feedback_id"]
+            for row in conn.execute(
+                "SELECT feedback_id FROM rule_runtime_feedback"
+            ).fetchall()
+        }
+    assert runtime_ids == {"fb-2-followed"}
+
+
+def test_confidence_zero_is_projected_without_becoming_unknown(tmp_path):
+    store = _setup_legacy(tmp_path)
+    _feedback(
+        store, "rcpt-1", "followed", feedback_id="fb-zero",
+        confidence=0.0,
+    )
+    event = store.list_unconsumed_rule_events()[0]
+    assert event["confidence"] == 0.0
+
+    intel, _ = _consume(tmp_path)
+    evidence = intel.list_evidence()
+    assert len(evidence) == 1
+    assert evidence[0].confidence == 0.0
+    definition_id = intel.list_definitions()[0].definition_id
+    assert intel.get_runtime_stats(definition_id)["followed"] == 1
+
+
+def test_session_trusted_fails_closed_without_provenance(tmp_path):
+    store = _setup_legacy(
+        tmp_path, session_id="session-present", session_trusted=True,
+        session_source="absent",
+    )
+    receipt = store.get_rule_match_receipt("rcpt-1")
+    assert receipt is not None
+    assert receipt.session_trusted is False
+
+    _feedback(store, "rcpt-1", "followed", feedback_id="fb-untrusted")
+    event = store.list_unconsumed_rule_events()[0]
+    assert event["session_trusted"] == 0
+
+    intel, _ = _consume(tmp_path)
+    evidence = intel.list_evidence()
+    assert len(evidence) == 1
+    assert evidence[0].session_trusted == 0
+    definition_id = intel.list_definitions()[0].definition_id
+    assert intel.get_runtime_stats(definition_id)["distinct_sessions"] == 0
+
+
 def test_consume_outbox_is_idempotent(tmp_path):
     store = _setup_legacy(tmp_path)
     _feedback(store, "rcpt-1", "followed")
-    _consume(tmp_path)
+    first_intel, _ = _consume(tmp_path)
+    evidence_count = first_intel.count_evidence()
     intel, summary = _consume(tmp_path)
     assert summary["events_seen"] == 0  # already consumed
-    assert intel.count_evidence() == intel.count_evidence()  # stable
+    assert intel.count_evidence() == evidence_count
     definition_id = intel.list_definitions()[0].definition_id
     stats = intel.get_runtime_stats(definition_id)
     assert stats["followed"] == 1  # not double-counted
+
+
+def test_assignment_change_projects_to_p3(tmp_path):
+    group = "g1"
+    legacy = SharedMemoryStore(tmp_path, group)
+    _seed_record(legacy, "rule-1", "run tests")
+    record = legacy.get_record("rule-1")
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+    service.backfill_group(legacy, group)
+    definition_id = service._definition_from_record(record).definition_id
+
+    legacy.set_rule_assignments(
+        record.memory_id,
+        [{"target_type": "agent", "target_id": "agent-2"}],
+    )
+    service.consume_outbox(tmp_path, only_group=group)
+
+    bindings = intel.list_bindings(definition_id=definition_id)
+    assert any(item.target_id == "agent-2" for item in bindings)
+    assert not any(
+        item.target_id == "agent-1" and item.status == "active"
+        for item in bindings
+    )
 
 
 def test_merged_source_feedback_lands_on_canonical(tmp_path):
@@ -131,8 +283,14 @@ def test_merged_source_feedback_lands_on_canonical(tmp_path):
     legacy = SharedMemoryStore(tmp_path, group)
     _seed_record(legacy, "m1", "提交代码前必须运行测试")
     _seed_record(legacy, "m2", "提交前必须执行测试")
-    _seed_receipt(legacy, "rcpt-1", "m1")
-    _seed_receipt(legacy, "rcpt-2", "m2")
+    _seed_receipt(
+        legacy, "rcpt-1", "m1", session_id="trusted-1",
+        session_trusted=True, session_source="host",
+    )
+    _seed_receipt(
+        legacy, "rcpt-2", "m2", session_id="trusted-2",
+        session_trusted=True, session_source="host",
+    )
 
     intel = RuleMergeStore(tmp_path)
     service = RuleMergeService(intel)
@@ -149,7 +307,8 @@ def test_merged_source_feedback_lands_on_canonical(tmp_path):
                     ) == d.canonical_text
                 ),
                 agent_instance_id=f"a{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", content=d.canonical_text,
+                session_id=f"s{i}", session_trusted=1,
+                content=d.canonical_text,
                 observed_at=_now_iso(),
             ))
         intel.upsert_agent_reputation(
@@ -164,7 +323,9 @@ def test_merged_source_feedback_lands_on_canonical(tmp_path):
     cand = [p for p in candidates if p["status"] == "candidate"]
     assert cand, "synonym pair must be a merge candidate"
     pid = cand[0]["proposal_id"]
-    intel.approve_proposal(pid, approved_by="admin")
+    intel.approve_proposal(
+        pid, approved_by="admin", capability_id="admin:test-suite",
+    )
     result = service.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
     canonical_id = result["canonical_definition_id"]

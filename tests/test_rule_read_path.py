@@ -126,7 +126,8 @@ def _seed_intelligence_pair(tmp_path, *, merge: bool):
                     if normalize_rule_text(_BODIES[mid]) == d.canonical_text
                 ),
                 agent_instance_id=f"agent-{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", content=d.canonical_text,
+                session_id=f"s{i}", session_trusted=1,
+                content=d.canonical_text,
                 observed_at=_now_iso(),
             ))
         intel.upsert_agent_reputation(
@@ -150,7 +151,9 @@ def _seed_intelligence_pair(tmp_path, *, merge: bool):
         pid = cand[0]["proposal_id"]
         # Human-approved merge bypasses the soft readiness/cooldown gates (the
         # hard gates still hold); this test only exercises the canonical read.
-        intel.set_proposal_status(pid, "approved")
+        intel.approve_proposal(
+            pid, approved_by="admin", capability_id="admin:test-suite",
+        )
         result = service.merge_proposal(pid, actor="admin")
         assert result["ok"] is True
     return legacy, intel

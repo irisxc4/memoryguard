@@ -158,8 +158,8 @@ def test_evidence_independence_violation_metric(tmp_path):
     store = RuleMergeStore(tmp_path)
     d = build_definition("提交代码前必须运行测试")
     store.upsert_definition(d)
-    # Two receipts of the same fact (same independence key) are a violation
-    # unless deduplicated by the maturity/readiness layers.
+    # The DB-level independence invariant keeps one strongest row for the
+    # same fact; governance must report no residual duplicate rows.
     store.upsert_evidence(build_evidence(
         definition_id=d.definition_id, source_rule_id="m1",
         agent_instance_id="a", project_ref="p", session_id="s",
@@ -170,4 +170,5 @@ def test_evidence_independence_violation_metric(tmp_path):
         agent_instance_id="a", project_ref="p", session_id="s",
         receipt_id="r2", content=d.canonical_text,
     ))
-    assert store.governance_acceptance()["evidence_independence_violation"] >= 1
+    assert store.count_evidence() == 1
+    assert store.governance_acceptance()["evidence_independence_violation"] == 0

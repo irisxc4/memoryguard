@@ -46,6 +46,14 @@ def _svc(store: RuleMergeStore) -> RuleMergeService:
     return RuleMergeService(store)
 
 
+def _approve(store: RuleMergeStore, proposal_id: str):
+    return store.approve_proposal(
+        proposal_id,
+        approved_by="admin",
+        capability_id="admin:test-suite",
+    )
+
+
 def _def(text: str, definition_id: str = "", kind="procedure") -> RuleDefinition:
     return build_definition(text, definition_id=definition_id, kind=kind)
 
@@ -58,8 +66,28 @@ def _evidence(store: RuleMergeStore, definition_id: str, *, agents, projects, co
             agent_instance_id=agent,
             project_ref=project,
             session_id=sessions[i] if sessions else f"s{i}",
+            session_trusted=1,
             content=content,
         ))
+
+
+def test_semantic_hash_bucket_does_not_drop_near_duplicate_pair(tmp_path):
+    store = _store(tmp_path)
+    service = _svc(store)
+    a = _def("提交代码前必须运行测试")
+    b = _def("提交代码时必须运行测试")
+    assert a.semantic_hash != b.semantic_hash
+    store.upsert_definition(a)
+    store.upsert_definition(b)
+
+    pairs = service._candidate_pairs([a, b])
+    assert any(
+        {left.definition_id, right.definition_id}
+        == {a.definition_id, b.definition_id}
+        for left, right in pairs
+    )
+    service.scan_and_propose()
+    assert service.last_scan_summary["pairs_evaluated"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -208,14 +236,17 @@ def test_merge_is_atomic_and_scope_invariant(tmp_path):
             d.definition_id, share_group_id="g1", target_type="agent",
             target_id="agent-2", owner_agent_id="agent-2", created_by="backfill",
         ))
-        _evidence(store, d.definition_id, agents=["a1", "a2", "a3"], projects=["p1", "p2", "p3"], content="提交代码前必须运行测试")
+        _evidence(
+            store, d.definition_id, agents=["a1", "a2", "a3"],
+            projects=["p1", "p2", "p3"], content=d.canonical_text,
+        )
     before = {b.audience_identity() for b in store.list_bindings()}
 
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     result = _svc(store).merge_proposal(proposal["proposal_id"])
     assert result["ok"] is True
 
@@ -243,13 +274,13 @@ def test_merge_undo_restores_original_state(tmp_path):
         store.upsert_evidence(build_evidence(
             definition_id=d.definition_id, source_rule_id=src,
             agent_instance_id="a1", project_ref="p1", session_id="s1",
-            content="提交代码前必须运行测试",
+            session_trusted=1, content=d.canonical_text,
         ))
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     decision = _svc(store).merge_proposal(proposal["proposal_id"])["decision"]
     assert store.count_definitions() == 1
 
@@ -280,18 +311,21 @@ def test_concurrent_second_merge_fails_closed(tmp_path):
             d.definition_id, share_group_id="g1", target_type="agent",
             target_id="agent-1", owner_agent_id="agent-1", created_by="backfill",
         ))
-        _evidence(store, d.definition_id, agents=["a1", "a2", "a3"], projects=["p1", "p2", "p3"], content="x")
+        _evidence(
+            store, d.definition_id, agents=["a1", "a2", "a3"],
+            projects=["p1", "p2", "p3"], content=d.canonical_text,
+        )
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     svc = _svc(store)
     first = svc.merge_proposal(proposal["proposal_id"])
     assert first["ok"] is True
     # A racing second merge on the already-merged proposal must fail.
     with pytest.raises((ValueError, RuntimeError)):
-        store.set_proposal_status(proposal["proposal_id"], "approved")
+        _approve(store, proposal["proposal_id"])
         svc.merge_proposal(proposal["proposal_id"])
     decisions = store.list_merge_decisions()
     assert len(decisions) == 1

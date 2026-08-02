@@ -129,7 +129,8 @@ def test_gui_get_neuron_graph_requires_scope(tmp_path: Path) -> None:
     api = GovernanceApi(str(tmp_path))
     out = api.get_neuron_graph()
     assert out.get("empty") is True
-    assert out.get("error") == "missing_governance_scope" or out.get("reason") == "missing_governance_scope"
+    assert out.get("error") == "missing_governance_scope"
+    assert out.get("reason") == "missing_governance_scope"
 
 
 def test_gui_publish_rejects_cross_agent_target(tmp_path: Path) -> None:
@@ -175,7 +176,7 @@ def test_scope_storage_key_does_not_collide() -> None:
     b = scope_storage_key(GovernanceScope(mode="agent", agent_instance_id="agent?a"))
     assert a != b
     assert a.count("-") >= 2
-    assert stable_hash("agent", "agent:a")[:16] in a or True
+    assert a.endswith(stable_hash("agent", "agent:a")[:16])
     # 哈希后缀保证不同原始 ID 不碰撞
     assert a.split("-")[-1] != b.split("-")[-1]
 
@@ -214,7 +215,7 @@ def test_revoked_authorization_invalidates_projection(tmp_path: Path) -> None:
     after = api.get_neuron_graph(agent_instance_id="agent-a")
     assert after.get("empty") is True
     assert after.get("reason") == "not_built"
-    assert after.get("error") in {"projection_auth_stale", None} or after.get("error") == "projection_auth_stale"
+    assert after.get("error") in {"projection_auth_stale", None}
 
 
 def test_set_projection_source_enabled_requires_authorization(tmp_path: Path) -> None:

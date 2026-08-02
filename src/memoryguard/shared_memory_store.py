@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS rule_match_receipts (
     runtime_role TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     context_hash TEXT NOT NULL DEFAULT '',
+    session_trusted INTEGER NOT NULL DEFAULT 0,
+    session_source TEXT NOT NULL DEFAULT 'absent',
     FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_share_group ON rule_match_receipts(share_group_id);
@@ -296,6 +298,8 @@ CREATE TABLE IF NOT EXISTS rule_match_receipts (
     runtime_role TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     context_hash TEXT NOT NULL DEFAULT '',
+    session_trusted INTEGER NOT NULL DEFAULT 0,
+    session_source TEXT NOT NULL DEFAULT 'absent',
     FOREIGN KEY (memory_id) REFERENCES records(memory_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rule_match_receipts_share_group ON rule_match_receipts(share_group_id);
@@ -330,8 +334,14 @@ CREATE TABLE IF NOT EXISTS rule_event_outbox (
     project_ref TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     provider TEXT NOT NULL DEFAULT '',
+    session_trusted INTEGER NOT NULL DEFAULT 0,
+    session_source TEXT NOT NULL DEFAULT 'absent',
     confidence REAL NOT NULL DEFAULT 1.0,
     evidence TEXT NOT NULL DEFAULT '',
+    previous_effective_feedback_id TEXT NOT NULL DEFAULT '',
+    new_effective_feedback_id TEXT NOT NULL DEFAULT '',
+    previous_outcome TEXT NOT NULL DEFAULT '',
+    new_outcome TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     consumed_at TEXT NOT NULL DEFAULT ''
 );
@@ -921,10 +931,33 @@ class SharedMemoryStore:
             ("runtime_role", "TEXT NOT NULL DEFAULT ''"),
             ("session_id", "TEXT NOT NULL DEFAULT ''"),
             ("context_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("session_trusted", "INTEGER NOT NULL DEFAULT 0"),
+            ("session_source", "TEXT NOT NULL DEFAULT 'absent'"),
         ):
             if name not in receipt_columns:
                 conn.execute(
                     f"ALTER TABLE rule_match_receipts ADD COLUMN {name} {sql}"
+                )
+
+        outbox_columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rule_event_outbox)"
+            ).fetchall()
+        }
+        # Outbox upgrades stay additive so old raw ``rule_feedback`` events
+        # remain consumable by legacy P3 readers.
+        for name, sql in (
+            ("session_trusted", "INTEGER NOT NULL DEFAULT 0"),
+            ("session_source", "TEXT NOT NULL DEFAULT 'absent'"),
+            ("previous_effective_feedback_id", "TEXT NOT NULL DEFAULT ''"),
+            ("new_effective_feedback_id", "TEXT NOT NULL DEFAULT ''"),
+            ("previous_outcome", "TEXT NOT NULL DEFAULT ''"),
+            ("new_outcome", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in outbox_columns:
+                conn.execute(
+                    f"ALTER TABLE rule_event_outbox ADD COLUMN {name} {sql}"
                 )
 
         columns = {
@@ -1024,6 +1057,46 @@ class SharedMemoryStore:
             "CREATE INDEX idx_rule_match_feedbacks_receipt_created "
             "ON rule_match_feedbacks(receipt_id, created_at)"
         )
+
+    def _insert_rule_lifecycle_outbox(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        event_type: str,
+        memory_id: str,
+        actor: str = "",
+        agent_instance_id: str = "",
+        confidence: float = 1.0,
+        payload: dict[str, Any] | None = None,
+        created_at: str = "",
+    ) -> str:
+        """Append a lifecycle mutation to the transactional rule outbox."""
+        payload = dict(payload or {})
+        created_at = created_at or _now_iso()
+        identity = (
+            payload.get("event_id")
+            or payload.get("decision_id")
+            or created_at
+        )
+        event_id = stable_hash(
+            "rule-outbox-lifecycle", self.group_id, event_type,
+            memory_id, identity,
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO rule_event_outbox (
+                event_id, event_type, share_group_id, memory_id, actor,
+                agent_instance_id, confidence, evidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id, event_type, self.group_id, memory_id,
+                actor or "", agent_instance_id or "", float(confidence),
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                created_at,
+            ),
+        )
+        return event_id
 
     @staticmethod
     def _canonical_hash(body: str) -> str:
@@ -1190,6 +1263,14 @@ class SharedMemoryStore:
                 return row[name]
             except (KeyError, IndexError):
                 return default
+        raw_session_trusted = _col("session_trusted", 0)
+        session_trusted = (
+            raw_session_trusted is True
+            or (
+                isinstance(raw_session_trusted, (int, float))
+                and raw_session_trusted == 1
+            )
+        )
         return RuleMatchReceipt(
             receipt_id=row["receipt_id"],
             memory_id=row["memory_id"],
@@ -1207,6 +1288,8 @@ class SharedMemoryStore:
             runtime_role=str(_col("runtime_role", "") or ""),
             session_id=str(_col("session_id", "") or ""),
             context_hash=str(_col("context_hash", "") or ""),
+            session_trusted=session_trusted,
+            session_source=str(_col("session_source", "absent") or "absent"),
         )
 
     def _row_to_rule_match_feedback(
@@ -1246,7 +1329,7 @@ class SharedMemoryStore:
             }
             has_new_columns = {
                 "project_ref", "provider", "runtime_role", "session_id",
-                "context_hash",
+                "context_hash", "session_trusted", "session_source",
             }.issubset(columns)
         except sqlite3.Error:
             has_new_columns = False
@@ -1255,8 +1338,9 @@ class SharedMemoryStore:
                 "INSERT INTO rule_match_receipts "
                 "(receipt_id,memory_id,share_group_id,agent_instance_id,task_hash,task,"
                 "assignment_ids,selection_reason,matcher_version,confidence,created_at,"
-                "project_ref,provider,runtime_role,session_id,context_hash)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "project_ref,provider,runtime_role,session_id,context_hash,"
+                "session_trusted,session_source)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     d["receipt_id"], d["memory_id"], d["share_group_id"],
                     d["agent_instance_id"], d["task_hash"], d["task"],
@@ -1266,6 +1350,8 @@ class SharedMemoryStore:
                     d.get("project_ref", ""), d.get("provider", ""),
                     d.get("runtime_role", ""), d.get("session_id", ""),
                     d.get("context_hash", ""),
+                    int(d.get("session_trusted") is True),
+                    d.get("session_source", "absent"),
                 ),
             )
         else:
@@ -1872,6 +1958,7 @@ class SharedMemoryStore:
         dedup_domain: str = "",
         automatic: bool = False,
         actor_agent_id: str = "",
+        emit_lifecycle_outbox: bool = False,
     ) -> SharedMemoryRecord:
         """Atomically persist record, audience and optional audit decision."""
         validate_injection_settings(record.injection_policy, record.priority)
@@ -1891,6 +1978,7 @@ class SharedMemoryStore:
             writer_id=record.agent_instance_id, memory_id=record.memory_id,
         )
         c_hash = self._canonical_hash(record.body)
+        mutation_kind = "created"
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1901,6 +1989,7 @@ class SharedMemoryStore:
                 (c_hash, domain),
             ).fetchone()
             if existing:
+                mutation_kind = "updated"
                 old = json.loads(existing["provenance"] or "[]")
                 new = record.to_dict().get("provenance", [])
                 merged = old + [item for item in new if item not in old]
@@ -1921,6 +2010,26 @@ class SharedMemoryStore:
                     self._insert_rule_decision(conn, decision)
                 else:
                     self._insert_decision(conn, decision)
+            if emit_lifecycle_outbox:
+                self._insert_rule_lifecycle_outbox(
+                    conn,
+                    event_type=(
+                        "rule_created" if mutation_kind == "created"
+                        else "rule_updated"
+                    ),
+                    memory_id=record.memory_id,
+                    actor=(
+                        getattr(decision, "actor", "auto")
+                        if decision is not None else "auto"
+                    ),
+                    agent_instance_id=actor_agent_id,
+                    confidence=float(record.confidence),
+                    payload={
+                        "mutation_kind": mutation_kind,
+                        "assignments": [item.to_dict() for item in normalized],
+                    },
+                    created_at=record.updated_at or _now_iso(),
+                )
             conn.commit()
             return record
         except Exception:
@@ -2071,6 +2180,27 @@ class SharedMemoryStore:
                 }
                 persisted_decision = decision
                 self._insert_rule_decision(conn, persisted_decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type=(
+                    "rule_created" if mutation_kind == "created"
+                    else "rule_updated"
+                ),
+                memory_id=target_record.memory_id,
+                actor=(persisted_decision.actor if persisted_decision else "auto"),
+                agent_instance_id=actor_agent_id,
+                confidence=float(target_record.confidence),
+                payload={
+                    "event_id": event.event_id,
+                    "decision_id": (
+                        persisted_decision.decision_id
+                        if persisted_decision else ""
+                    ),
+                    "mutation_kind": mutation_kind,
+                    "target_ids": [target_record.memory_id],
+                },
+                created_at=now,
+            )
             target_record = self._row_to_record(
                 conn.execute(
                     "SELECT * FROM records WHERE memory_id=?",
@@ -2190,6 +2320,36 @@ class SharedMemoryStore:
                 "inverse_provenance": metadata.get("added_provenance", []),
             }
             self._insert_rule_decision(conn, decision)
+            if mutation_kind == "created":
+                self._insert_rule_lifecycle_outbox(
+                    conn,
+                    event_type="rule_deleted",
+                    memory_id=rule_id,
+                    actor=decision.actor,
+                    agent_instance_id=actor_agent_id or current.agent_instance_id,
+                    confidence=float(current.confidence),
+                    payload={
+                        "decision_id": decision.decision_id,
+                        "mutation_kind": "deleted",
+                        "inverse_event_id": str(metadata.get("event_id") or ""),
+                    },
+                    created_at=now,
+                )
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_undo",
+                memory_id=rule_id,
+                actor=decision.actor,
+                agent_instance_id=actor_agent_id or current.agent_instance_id,
+                confidence=float(current.confidence),
+                payload={
+                    "decision_id": decision.decision_id,
+                    "mutation_kind": mutation_kind,
+                    "undo_of": str(metadata.get("decision_id") or ""),
+                    "inverse_event_id": str(metadata.get("event_id") or ""),
+                },
+                created_at=now,
+            )
             result_record = self._row_to_record(
                 conn.execute(
                     "SELECT * FROM records WHERE memory_id=?", (rule_id,),
@@ -2397,6 +2557,28 @@ class SharedMemoryStore:
                 after_payload["record"] = record.to_dict()
                 decision.after = after_payload
             self._insert_rule_decision(conn, decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type=f"rule_{mutation_kind}",
+                memory_id=record.memory_id,
+                actor=decision.actor,
+                agent_instance_id=actor_agent_id,
+                confidence=float(record.confidence),
+                payload={
+                    "event_id": event.event_id,
+                    "decision_id": decision.decision_id,
+                    "mutation_kind": mutation_kind,
+                    "target_ids": [record.memory_id, *old_ids],
+                    "record_hashes": {
+                        record.memory_id: after_hash,
+                        **{
+                            key: value["hash"]
+                            for key, value in before_records.items()
+                        },
+                    },
+                },
+                created_at=now,
+            )
         backup_items: list[tuple[Path, Any]] = [
             (self.records_bak_path, record),
             (self.events_bak_path, event),
@@ -2555,6 +2737,21 @@ class SharedMemoryStore:
                 "undo_of": decision.decision_id,
             }
             self._insert_rule_decision(conn, inverse_decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_undo",
+                memory_id=memory_id,
+                actor=inverse_decision.actor,
+                agent_instance_id=inverse_decision.owner_agent_id,
+                confidence=float(inverse_decision.confidence),
+                payload={
+                    "decision_id": inverse_decision.decision_id,
+                    "undo_of": decision.decision_id,
+                    "mutation_kind": mutation_kind,
+                    "target_ids": [memory_id, *old_ids],
+                },
+                created_at=now,
+            )
         backup_items: list[tuple[Path, Any]] = [
             (self.records_bak_path, current),
             (self.rule_decisions_bak_path, inverse_decision),
@@ -2582,9 +2779,11 @@ class SharedMemoryStore:
         self, record: SharedMemoryRecord, *,
         assignments: list[dict | RuleAssignment] | None = None,
         dedup_domain: str = "",
+        emit_lifecycle_outbox: bool = False,
     ) -> None:
         self.write_rule_with_assignments(
             record, assignments=assignments, dedup_domain=dedup_domain,
+            emit_lifecycle_outbox=emit_lifecycle_outbox,
         )
         self._append_jsonl(self.records_bak_path, record)
 
@@ -3401,6 +3600,30 @@ class SharedMemoryStore:
                 if not isinstance(decision, RuleDecision):
                     decision = RuleDecision.from_dict(dict(decision))
                 self._insert_rule_decision(conn, decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="exception_revoked",
+                memory_id=parent_rule_id,
+                actor=(decision.actor if decision is not None else "user"),
+                agent_instance_id=(
+                    decision.owner_agent_id if decision is not None
+                    else parent_record.agent_instance_id
+                ),
+                confidence=float(parent_record.confidence),
+                payload={
+                    "exception_id": exception_id,
+                    "child_rule_id": child_rule_id,
+                    "parent_rule_id": parent_rule_id,
+                    "decision_id": (
+                        decision.decision_id if decision is not None else ""
+                    ),
+                    "sibling_transfer": (
+                        transferred_sibling.exception_id
+                        if transferred_sibling is not None else ""
+                    ),
+                },
+                created_at=now,
+            )
             row = conn.execute(
                 "SELECT * FROM rule_exceptions WHERE exception_id=?",
                 (exception_id,),
@@ -3528,6 +3751,45 @@ class SharedMemoryStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_rule_match_receipt(row) for row in rows]
 
+    def _effective_rule_match_feedback_rows(
+        self, rows: list[sqlite3.Row],
+    ) -> RuleMatchFeedback | None:
+        """Resolve one receipt's effective feedback from rows on one conn."""
+        from .schema_v3 import FEEDBACK_AUTHORITY_ORDER
+
+        if not rows:
+            return None
+        ordered = [self._row_to_rule_match_feedback(row) for row in rows]
+        ordered.sort(
+            key=lambda item: (
+                int(item.authority or FEEDBACK_AUTHORITY_ORDER.get(item.source, 0)),
+                FEEDBACK_AUTHORITY_ORDER.get(item.source, 0),
+                item.created_at or "",
+                item.feedback_id,
+            ),
+            reverse=True,
+        )
+        effective = ordered[0]
+        return None if effective.outcome == "unobserved" else effective
+
+    @staticmethod
+    def _effective_feedback_key(
+        feedback: RuleMatchFeedback | None,
+    ) -> tuple[str, str]:
+        if feedback is None:
+            return "", ""
+        return str(feedback.feedback_id or ""), str(feedback.outcome or "")
+
+    def _effective_rule_match_feedback_conn(
+        self, conn: sqlite3.Connection, receipt_id: str,
+    ) -> RuleMatchFeedback | None:
+        rows = conn.execute(
+            "SELECT * FROM rule_match_feedbacks WHERE receipt_id=? "
+            "ORDER BY created_at, rowid",
+            (receipt_id,),
+        ).fetchall()
+        return self._effective_rule_match_feedback_rows(rows)
+
     def append_rule_match_feedback(
         self,
         feedback: RuleMatchFeedback,
@@ -3563,15 +3825,11 @@ class SharedMemoryStore:
             ).fetchone()
             if row is None:
                 raise ValueError("receipt_not_found")
+            previous_effective = self._effective_rule_match_feedback_conn(
+                conn, feedback.receipt_id,
+            )
             try:
                 self._insert_rule_match_feedback(conn, persisted)
-                # P2 -> P3 transactional outbox: the feedback event and its
-                # outbox row land in the same transaction, so the rule-
-                # intelligence projection can never miss a feedback event
-                # (no more "best-effort mirror once at rule creation").
-                self._enqueue_rule_feedback_event(
-                    conn, receipt_row=row, feedback=persisted,
-                )
             except sqlite3.IntegrityError:
                 # Idempotency is keyed by feedback_id, not receipt_id.  A
                 # second event for one receipt is valid and must remain stored.
@@ -3584,6 +3842,20 @@ class SharedMemoryStore:
                 if str(existing["receipt_id"]) != str(feedback.receipt_id):
                     raise ValueError("feedback_id_collision")
                 persisted = self._row_to_rule_match_feedback(existing)
+            else:
+                # Resolve both sides before leaving this P2 transaction.  Raw
+                # low-authority feedback is still stored, but it must not
+                # create a P3 event while a stronger effective event remains.
+                new_effective = self._effective_rule_match_feedback_conn(
+                    conn, feedback.receipt_id,
+                )
+                if self._effective_feedback_key(previous_effective) != self._effective_feedback_key(new_effective):
+                    self._enqueue_rule_feedback_event(
+                        conn,
+                        receipt_row=row,
+                        previous_effective=previous_effective,
+                        new_effective=new_effective,
+                    )
         self._append_jsonl(self.rule_match_feedbacks_bak_path, persisted)
         # Return event just persisted, not effective event.  Callers must
         # resolve effective authority explicitly before triggering governance.
@@ -3591,38 +3863,75 @@ class SharedMemoryStore:
 
     def _enqueue_rule_feedback_event(
         self, conn: sqlite3.Connection, *, receipt_row: sqlite3.Row,
-        feedback: RuleMatchFeedback,
+        previous_effective: RuleMatchFeedback | None,
+        new_effective: RuleMatchFeedback | None,
     ) -> None:
-        """Write the transactional outbox row for one feedback event.
+        """Write one transactional outbox row for an effective-state change.
 
-        The event id is a pure function of the feedback id, so re-delivery is
-        idempotent and the P3 consumer can project each event exactly once.
+        Raw feedback remains append-only in ``rule_match_feedbacks``.  The
+        outbox is deliberately narrower: only a changed effective state is
+        sent to P3, with legacy ``feedback_id``/``outcome`` aliases retained.
         """
-        event_id = stable_hash("rule-outbox-feedback", feedback.feedback_id)
+        # ``None`` is a meaningful effective-state transition: a receipt can
+        # become unobserved/revoked after having contributed evidence.  Emit a
+        # tombstone so P3 can retract the previous projection instead of
+        # leaving stale runtime/evidence rows behind.
+        context = new_effective or previous_effective
+        if context is None:
+            return
+        event_id = stable_hash(
+            "rule-outbox-effective-rule-feedback",
+            str(receipt_row["receipt_id"] or ""),
+            str(new_effective.feedback_id if new_effective else "<cleared>"),
+            str(previous_effective.feedback_id if previous_effective else ""),
+        )
+        session_id = str(receipt_row["session_id"] or "")
+        session_source = str(receipt_row["session_source"] or "").strip().casefold()
+        if session_source not in {"host", "transport", "generated", "absent"}:
+            session_source = "absent"
+        raw_session_trusted = receipt_row["session_trusted"]
+        session_trusted = (
+            raw_session_trusted is True
+            or (
+                isinstance(raw_session_trusted, (int, float))
+                and raw_session_trusted == 1
+            )
+        )
+        session_trusted = (
+            session_trusted and bool(session_id) and session_source != "absent"
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO rule_event_outbox (
                 event_id, event_type, share_group_id, memory_id, receipt_id,
                 feedback_id, outcome, source, authority, actor, agent_instance_id,
-                project_ref, session_id, provider, confidence, evidence, created_at
-            ) VALUES (?, 'rule_feedback', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                project_ref, session_id, provider, session_trusted, session_source,
+                confidence, evidence, previous_effective_feedback_id,
+                new_effective_feedback_id, previous_outcome, new_outcome, created_at
+            ) VALUES (?, 'effective_rule_feedback_changed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (event_id,
              str(receipt_row["share_group_id"] or ""),
              str(receipt_row["memory_id"] or ""),
              str(receipt_row["receipt_id"] or ""),
-             str(feedback.feedback_id or ""),
-             str(feedback.outcome or ""),
-             str(feedback.source or ""),
-             int(feedback.authority or 0),
-             str(feedback.actor or ""),
+             str(new_effective.feedback_id if new_effective else ""),
+             str(new_effective.outcome if new_effective else ""),
+             str(context.source or ""),
+             int(context.authority or 0),
+             str(context.actor or ""),
              str(receipt_row["agent_instance_id"] or ""),
              str(receipt_row["project_ref"] or ""),
-             str(receipt_row["session_id"] or ""),
+             session_id,
              str(receipt_row["provider"] or ""),
-             float(feedback.confidence or 1.0),
-             str(feedback.evidence or ""),
-             str(feedback.created_at or _now_iso()),
+             int(session_trusted),
+             session_source,
+             float(context.confidence if context.confidence is not None else 1.0),
+             str(new_effective.evidence if new_effective else ""),
+             str(previous_effective.feedback_id if previous_effective else ""),
+             str(new_effective.feedback_id if new_effective else ""),
+             str(previous_effective.outcome if previous_effective else ""),
+             str(new_effective.outcome if new_effective else ""),
+             str(new_effective.created_at if new_effective else _now_iso()),
              ),
         )
 
@@ -3675,29 +3984,13 @@ class SharedMemoryStore:
         by the most recent created_at.  Older ``unobserved`` events never
         block a later explicit user/agent feedback from superseding them.
         """
-        from .schema_v3 import FEEDBACK_AUTHORITY_ORDER
         with self._db() as conn:
             rows = conn.execute(
                 "SELECT * FROM rule_match_feedbacks WHERE receipt_id=? "
                 "ORDER BY created_at, rowid",
                 (receipt_id,),
             ).fetchall()
-        if not rows:
-            return None
-        ordered = [self._row_to_rule_match_feedback(row) for row in rows]
-        ordered.sort(
-            key=lambda item: (
-                int(item.authority or FEEDBACK_AUTHORITY_ORDER.get(item.source, 0)),
-                FEEDBACK_AUTHORITY_ORDER.get(item.source, 0),
-                item.created_at or "",
-                item.feedback_id,
-            ),
-            reverse=True,
-        )
-        effective = ordered[0]
-        if effective.outcome == "unobserved":
-            return None
-        return effective
+        return self._effective_rule_match_feedback_rows(rows)
 
     get_effective_rule_match_feedback = get_rule_match_feedback_by_receipt
     get_effective_rule_feedback = get_rule_match_feedback_by_receipt
@@ -3724,7 +4017,8 @@ class SharedMemoryStore:
                 "r.task AS receipt_task, "
                 "r.agent_instance_id AS receipt_agent_instance_id, "
                 "r.project_ref AS receipt_project_ref, r.provider, "
-                "r.runtime_role, r.session_id, r.context_hash "
+                "r.runtime_role, r.session_id, r.context_hash, "
+                "r.session_trusted, r.session_source "
                 "FROM rule_match_feedbacks f "
                 "JOIN rule_match_receipts r ON r.receipt_id=f.receipt_id "
                 "WHERE r.memory_id=? AND r.agent_instance_id=? "
@@ -3767,10 +4061,18 @@ class SharedMemoryStore:
                 runtime_role=str(row["runtime_role"] or ""),
                 session_id=str(row["session_id"] or ""),
                 context_hash=str(row["context_hash"] or ""),
+                session_trusted=(
+                    row["session_trusted"] is True
+                    or (
+                        isinstance(row["session_trusted"], (int, float))
+                        and row["session_trusted"] == 1
+                    )
+                ),
+                session_source=str(row["session_source"] or "absent"),
                 outcome=str(row["outcome"] or ""),
                 actor=str(row["actor"] or ""),
                 evidence=str(row["evidence"] or ""),
-                confidence=float(row["confidence"] or 0.0),
+                confidence=float(row["confidence"]),
                 created_at=str(row["created_at"] or ""),
                 source=str(row["source"] or "agent"),
                 authority=int(row["authority"] or 0),
@@ -3809,6 +4111,7 @@ class SharedMemoryStore:
             record = self._row_to_record(row)
             if record.injection_policy != "always":
                 raise ValueError("rule assignments require injection_policy=always")
+            before = self._list_rule_assignments_conn(conn, memory_id)
             self._validate_mandatory_budget(
                 record, assignments=normalized, conn=conn,
                 replacing_id=memory_id,
@@ -3821,6 +4124,21 @@ class SharedMemoryStore:
                     "always", normalized, writer_id=record.agent_instance_id,
                     memory_id=memory_id,
                 ), now, memory_id),
+            )
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="assignments_replaced",
+                memory_id=memory_id,
+                actor="auto" if automatic else "user",
+                agent_instance_id=actor_agent_id or record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={
+                    "before": [item.to_dict() for item in before],
+                    "after": [item.to_dict() for item in normalized],
+                    "before_hash": self._assignment_hash(before),
+                    "after_hash": self._assignment_hash(normalized),
+                },
+                created_at=now,
             )
         return self.list_rule_assignments(memory_id)
 
@@ -4019,6 +4337,43 @@ class SharedMemoryStore:
                 self._insert_rule_exception(conn, persisted_exception)
             if decision is not None:
                 self._insert_rule_decision(conn, decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="exception_split",
+                memory_id=parent_rule_id,
+                actor=(decision.actor if decision is not None else "auto"),
+                agent_instance_id=actor_agent_id,
+                confidence=float(child_record.confidence),
+                payload={
+                    "parent_rule_id": parent_rule_id,
+                    "child_rule_id": child_record.memory_id,
+                    "exception_id": (
+                        persisted_exception.exception_id
+                        if persisted_exception is not None else ""
+                    ),
+                    "parent_before_hash": current_hash,
+                    "parent_after_hash": self._assignment_hash(normalized_parent),
+                    "child_assignments": [item.to_dict() for item in normalized_child],
+                    "parent_assignments": [item.to_dict() for item in normalized_parent],
+                },
+                created_at=now,
+            )
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="assignments_replaced",
+                memory_id=parent_rule_id,
+                actor=(decision.actor if decision is not None else "auto"),
+                agent_instance_id=actor_agent_id,
+                confidence=float(parent_record.confidence),
+                payload={
+                    "before": [item.to_dict() for item in parent_before],
+                    "after": [item.to_dict() for item in normalized_parent],
+                    "before_hash": current_hash,
+                    "after_hash": self._assignment_hash(normalized_parent),
+                    "child_rule_id": child_record.memory_id,
+                },
+                created_at=now,
+            )
             result = RuleMutationResult(
                 parent_rule_id=parent_rule_id,
                 child_record=child_record,
@@ -4139,6 +4494,37 @@ class SharedMemoryStore:
                 if not isinstance(decision, RuleDecision):
                     decision = RuleDecision.from_dict(dict(decision))
                 self._insert_rule_decision(conn, decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="assignments_replaced",
+                memory_id=parent_rule_id,
+                actor=(decision.actor if decision is not None else "auto"),
+                agent_instance_id=actor_agent_id,
+                confidence=float(record.confidence),
+                payload={
+                    "before": [item.to_dict() for item in current],
+                    "after": [item.to_dict() for item in normalized],
+                    "before_hash": current_hash,
+                    "after_hash": self._assignment_hash(normalized),
+                    "narrowing": True,
+                },
+                created_at=_now_iso(),
+            )
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_narrowed",
+                memory_id=parent_rule_id,
+                actor=(decision.actor if decision is not None else "auto"),
+                agent_instance_id=actor_agent_id,
+                confidence=float(record.confidence),
+                payload={
+                    "before_hash": current_hash,
+                    "after_hash": self._assignment_hash(normalized),
+                    "before": [item.to_dict() for item in current],
+                    "after": [item.to_dict() for item in normalized],
+                },
+                created_at=_now_iso(),
+            )
         backup_status, backup_errors = ("ok", [])
         if decision is not None:
             backup_status, backup_errors = self._append_jsonl_degraded([
@@ -4178,8 +4564,9 @@ class SharedMemoryStore:
             record = self._row_to_record(row)
             if record.injection_policy != "always":
                 raise ValueError("rule assignments require injection_policy=always")
+            before = self._list_rule_assignments_conn(conn, memory_id)
             retained = [
-                item for item in self._list_rule_assignments_conn(conn, memory_id)
+                item for item in before
                 if not (item.target_type == "agent" and item.target_id == actor_agent_id)
             ]
             final = self._normalize_assignments(
@@ -4202,11 +4589,47 @@ class SharedMemoryStore:
                     memory_id=memory_id,
                 ), _now_iso(), memory_id),
             )
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="assignment_changed",
+                memory_id=memory_id,
+                actor="auto" if automatic else "user",
+                agent_instance_id=actor_agent_id or record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={
+                    "actor_agent_id": actor_agent_id,
+                    "before": [item.to_dict() for item in before],
+                    "after": [item.to_dict() for item in final],
+                    "after_hash": self._assignment_hash(final),
+                },
+                created_at=_now_iso(),
+            )
         return self.list_rule_assignments(memory_id)
 
     def delete_rule_assignments(self, memory_id: str) -> None:
         with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
+            before = self._list_rule_assignments_conn(conn, memory_id)
             conn.execute("DELETE FROM rule_assignments WHERE memory_id=?", (memory_id,))
+            if row is not None and before:
+                record = self._row_to_record(row)
+                self._insert_rule_lifecycle_outbox(
+                    conn,
+                    event_type="assignments_replaced",
+                    memory_id=memory_id,
+                    actor="user",
+                    agent_instance_id=record.agent_instance_id,
+                    confidence=float(record.confidence),
+                    payload={
+                        "before": [item.to_dict() for item in before],
+                        "after": [],
+                        "before_hash": self._assignment_hash(before),
+                        "after_hash": self._assignment_hash([]),
+                    },
+                    created_at=_now_iso(),
+                )
 
     def transition_injection_policy(
         self, memory_id: str, injection_policy: str, priority: int, *,
@@ -4281,6 +4704,23 @@ class SharedMemoryStore:
                     self._insert_rule_decision(conn, decision)
                 else:
                     self._insert_decision(conn, decision)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="assignments_replaced",
+                memory_id=memory_id,
+                actor=getattr(decision, "actor", "user") or "user",
+                agent_instance_id=actor_id,
+                confidence=float(record.confidence),
+                payload={
+                    "injection_policy": injection_policy,
+                    "priority": priority,
+                    "before_policy": record.injection_policy,
+                    "before_priority": record.priority,
+                    "after": [item.to_dict() for item in normalized],
+                    "after_hash": self._assignment_hash(normalized),
+                },
+                created_at=_now_iso(),
+            )
         updated = self.get_record(memory_id)
         if updated is None:
             raise RuntimeError("policy transition lost record")
@@ -4303,6 +4743,16 @@ class SharedMemoryStore:
             )
             self._insert_record(conn, record, dedup_domain=domain)
             self._insert_assignments(conn, record.memory_id, assignments)
+            self._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_updated",
+                memory_id=record.memory_id,
+                actor="system",
+                agent_instance_id=record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={"mutation_kind": "updated"},
+                created_at=record.updated_at or _now_iso(),
+            )
 
     # ------------------------------------------------------------------
     # 治理动作
@@ -4332,6 +4782,25 @@ class SharedMemoryStore:
                 conn.execute(
                     "UPDATE records SET supersedes=?, updated_at=? WHERE memory_id=?",
                     (json.dumps(sup, ensure_ascii=False), now, new_id),
+                )
+            target_row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (new_id,),
+            ).fetchone()
+            if target_row is not None:
+                target = self._row_to_record(target_row)
+                self._insert_rule_lifecycle_outbox(
+                    conn,
+                    event_type="rule_superseded",
+                    memory_id=new_id,
+                    actor=actor,
+                    agent_instance_id=target.agent_instance_id,
+                    confidence=float(target.confidence),
+                    payload={
+                        "old_record_ids": [old_id],
+                        "target_ids": [old_id, new_id],
+                        "reason": reason,
+                    },
+                    created_at=now,
                 )
         # 记录 DecisionEvent
         decision = DecisionEvent(
@@ -4383,6 +4852,25 @@ class SharedMemoryStore:
                     f"WHERE memory_id IN ({placeholders})",
                     (SharedMemoryStatus.CONFLICTED.value, group_id, now, *member_ids),
                 )
+                first_row = conn.execute(
+                    "SELECT * FROM records WHERE memory_id=?", (member_ids[0],),
+                ).fetchone()
+                if first_row is not None:
+                    first = self._row_to_record(first_row)
+                    self._insert_rule_lifecycle_outbox(
+                        conn,
+                        event_type="rule_conflicted",
+                        memory_id=member_ids[0],
+                        actor="auto",
+                        agent_instance_id=first.agent_instance_id,
+                        confidence=float(first.confidence),
+                        payload={
+                            "conflict_group_id": group_id,
+                            "target_ids": list(member_ids),
+                            "reason": reason,
+                        },
+                        created_at=now,
+                    )
         # 记录 DecisionEvent
         decision = DecisionEvent(
             event_id=stable_hash("conflict_dec", group_id, _now_iso()),
@@ -4480,10 +4968,34 @@ class SharedMemoryStore:
         else:
             col_val = value
         with self._tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
             conn.execute(
                 f"UPDATE records SET {field}=? WHERE memory_id=?",
                 (col_val, memory_id),
             )
+            if row is not None and field == "status":
+                record = self._row_to_record(row)
+                status_value = str(value.value if hasattr(value, "value") else value)
+                event_type = {
+                    SharedMemoryStatus.DELETED.value: "rule_deleted",
+                    SharedMemoryStatus.ACTIVE.value: "rule_restored",
+                }.get(status_value, "rule_updated")
+                self._insert_rule_lifecycle_outbox(
+                    conn,
+                    event_type=event_type,
+                    memory_id=memory_id,
+                    actor="agent",
+                    agent_instance_id=record.agent_instance_id,
+                    confidence=float(record.confidence),
+                    payload={
+                        "field": field,
+                        "before_status": record.status.value,
+                        "after_status": status_value,
+                    },
+                    created_at=_now_iso(),
+                )
 
     # ------------------------------------------------------------------
     # 版本管理

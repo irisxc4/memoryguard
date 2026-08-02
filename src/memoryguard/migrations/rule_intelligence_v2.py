@@ -109,16 +109,37 @@ CREATE TABLE IF NOT EXISTS rule_definition_runtime_stats (
 CREATE TABLE IF NOT EXISTS rule_runtime_feedback (
     feedback_id TEXT PRIMARY KEY,
     definition_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL DEFAULT '',
     outcome TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL DEFAULT '',
     project_ref TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
     authority INTEGER NOT NULL DEFAULT 0,
+    session_trusted INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rule_runtime_feedback_definition
     ON rule_runtime_feedback(definition_id);
+CREATE TABLE IF NOT EXISTS rule_effective_feedback_projection (
+    receipt_id TEXT PRIMARY KEY,
+    effective_feedback_id TEXT NOT NULL DEFAULT '',
+    definition_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    positive_evidence_id TEXT NOT NULL DEFAULT '',
+    negative_evidence_id TEXT NOT NULL DEFAULT '',
+    session_trusted INTEGER NOT NULL DEFAULT 0,
+    session_source TEXT NOT NULL DEFAULT 'absent',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS rule_projection_state (
+    scope_id TEXT PRIMARY KEY,
+    last_outbox_event_id TEXT NOT NULL DEFAULT '',
+    last_projected_event_id TEXT NOT NULL DEFAULT '',
+    projection_lag INTEGER NOT NULL DEFAULT 0,
+    projection_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 """
 
 # (table, column, DDL) added only when the column is absent.
@@ -143,6 +164,9 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_merge_proposals", "definition_revision_a", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_merge_proposals", "definition_revision_b", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_merge_proposals", "evidence_digest", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "negative_digest", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "binding_digest", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_merge_proposals", "runtime_digest", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "policy_version", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "weight_breakdown", "TEXT NOT NULL DEFAULT ''"),
     ("rule_evidence", "independence_key", "TEXT NOT NULL DEFAULT ''"),
@@ -174,9 +198,25 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_merge_decisions", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_decisions", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_decisions", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_runtime_feedback", "receipt_id", "TEXT NOT NULL DEFAULT ''"),
+    ("rule_runtime_feedback", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 SCHEMA_VERSION = "rule-intelligence-v2"
+
+
+def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            conn.execute(statement)
+    if buffer.strip():
+        raise sqlite3.OperationalError("incomplete SQL schema statement")
 
 
 def migrate(db_path: str) -> dict[str, Any]:
@@ -186,29 +226,36 @@ def migrate(db_path: str) -> dict[str, Any]:
     first (idempotent) — this makes the module usable standalone on a fresh
     database as well as on an upgraded one.
     """
-    from .rule_definition_v1 import migrate as migrate_v1
+    from .rule_definition_v1 import apply_v1
 
-    migrate_v1(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        conn.executescript(GOVERNANCE_SCHEMA)
-        for table, column, ddl in GOVERNANCE_UPGRADE_COLUMNS:
-            existing = {
-                str(row[1])
-                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-            }
-            if column not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_meta ("
-            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (SCHEMA_VERSION, "1"),
-        )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            apply_v1(conn)
+            _execute_sql_script_atomic(conn, GOVERNANCE_SCHEMA)
+            for table, column, ddl in GOVERNANCE_UPGRADE_COLUMNS:
+                existing = {
+                    str(row[1])
+                    for row in conn.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS schema_meta ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (SCHEMA_VERSION, "1"),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
     return {

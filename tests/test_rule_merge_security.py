@@ -34,6 +34,14 @@ def _store(tmp_path) -> RuleMergeStore:
     return RuleMergeStore(tmp_path)
 
 
+def _approve(store: RuleMergeStore, proposal_id: str):
+    return store.approve_proposal(
+        proposal_id,
+        approved_by="admin",
+        capability_id="admin:test-suite",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Wall 1: Python layer rejects auto broad scopes
 # ---------------------------------------------------------------------------
@@ -169,9 +177,9 @@ def test_merge_never_creates_system_scope(tmp_path):
             ))
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     result = _svc_merge(store).merge_proposal(proposal["proposal_id"])
     assert result["ok"] is True
     metrics = store.metrics()
@@ -197,9 +205,9 @@ def test_merge_preserves_binding_audience_identity_set(tmp_path):
     before = {b.audience_identity() for b in store.list_bindings()}
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     result = _svc_merge(store).merge_proposal(proposal["proposal_id"])
     assert result["ok"] is True
     after = {b.audience_identity() for b in store.list_bindings()}

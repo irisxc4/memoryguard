@@ -68,7 +68,7 @@ def _evidence(store: RuleMergeStore, definition_id: str, *, agents, projects, co
             source_rule_id=f"r-{definition_id}-{i}",
             agent_instance_id=agent,
             project_ref=project,
-            session_id=f"s{i}",
+            session_id=f"s{i}", session_trusted=1,
             content=content,
             observed_at=observed_at or _now_iso(),
         ))
@@ -90,6 +90,39 @@ def _strong_evidence(store: RuleMergeStore, definition_id: str, content: str):
         store.upsert_project_profile(
             project_ref=project, production_level=1.0, owner_verified=True,
         )
+
+
+def _eligible_evidence(store: RuleMergeStore, definition_id: str, content: str):
+    """Add legacy-compatible evidence whose empty session is not untrusted."""
+    for i, (agent, project) in enumerate(
+        zip(("agent-a", "agent-b", "agent-c"), ("p1", "p2", "p3"))
+    ):
+        store.upsert_evidence(build_evidence(
+            definition_id=definition_id,
+            source_rule_id=f"eligible-{definition_id}-{i}",
+            agent_instance_id=agent, project_ref=project, session_id="",
+            content=content, observed_at=_aged(60),
+        ))
+
+
+def _project_runtime(store: RuleMergeStore, definition_id: str):
+    for i in range(TRUSTED_MIN_SUCCESS_SAMPLES):
+        feedback_id = f"runtime-{definition_id}-{i}"
+        receipt_id = f"receipt-{definition_id}-{i}"
+        store.upsert_runtime_feedback(
+            feedback_id=feedback_id, receipt_id=receipt_id,
+            definition_id=definition_id, outcome="followed",
+            agent_instance_id=f"runtime-agent-{i % 3}",
+            project_ref=f"runtime-project-{i % 3}",
+            session_id=f"runtime-session-{i}", source="hook", authority=2,
+            session_trusted=1, created_at=_aged(30),
+        )
+        store.upsert_effective_feedback_projection(
+            receipt_id=receipt_id, effective_feedback_id=feedback_id,
+            definition_id=definition_id, outcome="followed",
+            session_trusted=1, session_source="host",
+        )
+    store.recompute_runtime_stats(definition_id)
 
 
 # ---------------------------------------------------------------------------
@@ -137,9 +170,10 @@ def test_strength_conflict_never_merges_and_is_never_forced(tmp_path):
     assert result["ok"] is False
     assert result["conflict_type"] == "strength"
     # Human approval refuses too: resolving a strength conflict is not a merge.
-    store.set_proposal_status(pid, "approved")
-    result = _svc(store).merge_proposal(pid, actor="admin")
-    assert result["ok"] is False
+    with pytest.raises(ValueError, match="rule_merge_proposal_not_approvable"):
+        store.approve_proposal(
+            pid, approved_by="admin", capability_id="admin:test-suite",
+        )
     assert store.count_definitions() == 2
 
 
@@ -207,6 +241,7 @@ def test_maturity_engine_stages(tmp_path):
             feedback_id=f"rt-{i}", definition_id=aged.definition_id,
             outcome="followed", agent_instance_id=f"agent-{i % 3}",
             project_ref=f"p{i % 3}", session_id=f"sess-{i}",
+            session_trusted=1,
             created_at=_aged(30), source="user", authority=4,
         )
     store.recompute_runtime_stats(aged.definition_id)
@@ -269,15 +304,57 @@ def test_fresh_candidate_never_auto_merges_even_with_strong_evidence(tmp_path):
     assert "cooldown_active" in result["governance_reasons"]
     assert "first_merge_requires_approval" in result["governance_reasons"]
 
-    # Explicit human review of the first-merge risk + cooldown expiry unlocks
-    # the *automatic* path (actor stays "auto"; only the risk is acknowledged).
+    # Explicit review of cold-start gates is insufficient without projected
+    # runtime feedback; auto merge must remain fail-closed.
     pid = candidates[0]["proposal_id"]
     store.acknowledge_first_merge(pid, actor="human")
     store.clear_proposal_cooldown(pid)
     result = _svc(store).merge_proposal(pid)
+    assert result["ok"] is False
+    assert "runtime_feedback_missing" in result["governance_reasons"]
+
+
+def test_auto_merge_requires_runtime_and_ready_projection(tmp_path):
+    store = _store(tmp_path)
+    svc = _svc(store)
+    a = _def("提交代码前必须运行测试", created_at=_aged(90))
+    b = _def("提交前必须执行测试", created_at=_aged(90))
+    store.upsert_definition(a)
+    store.upsert_definition(b)
+    for definition in (a, b):
+        _strong_evidence(store, definition.definition_id, definition.canonical_text)
+        _eligible_evidence(store, definition.definition_id, definition.canonical_text)
+
+    proposals = svc.scan_and_propose()
+    candidates = [p for p in proposals if p["status"] == "candidate"]
+    assert candidates
+    pid = candidates[0]["proposal_id"]
+    store.acknowledge_first_merge(pid, actor="human")
+    store.clear_proposal_cooldown(pid)
+
+    blocked = svc.merge_proposal(pid)
+    assert blocked["ok"] is False
+    assert "runtime_feedback_missing" in blocked["governance_reasons"]
+
+    for definition in (a, b):
+        _project_runtime(store, definition.definition_id)
+    store.set_projection_state(
+        "rule-intelligence", last_projected_event_id="runtime-ready",
+        projection_lag=1,
+    )
+    svc.scan_and_propose()
+    store.clear_proposal_cooldown(pid)
+
+    with pytest.raises(RuntimeError, match="rule_merge_projection_incomplete"):
+        svc.merge_proposal(pid)
+
+    store.set_projection_state(
+        "rule-intelligence", last_projected_event_id="runtime-ready",
+        projection_lag=0,
+    )
+    result = svc.merge_proposal(pid)
     assert result["ok"] is True
-    decision = store.get_merge_decision(result["decision"]["decision_id"])
-    assert decision["first_merge_acknowledged"] is True
+    assert result["decision"]["execution_mode"] == "auto"
 
 
 def test_readiness_blocks_auto_for_young_unproven_rules(tmp_path):
@@ -319,7 +396,7 @@ def test_evidence_weight_unknown_is_neutral_not_full_credit():
         rule_specific_success=0.5, feedback_authority=0.5,
         recency=0.5, evidence_confidence=0.5,
     )
-    assert verified > unknown > experimental or unknown >= experimental
+    assert verified > unknown > experimental
     # Low-confidence evidence weighs less than high-confidence evidence.
     low_confidence = evidence_weight(
         agent_reliability=0.98, project_importance=1.0,
@@ -340,12 +417,14 @@ def test_single_agent_dominance_blocks_auto(tmp_path):
         store.upsert_evidence(build_evidence(
             definition_id=a.definition_id, source_rule_id=f"a{i}",
             agent_instance_id="agent-a", project_ref=f"p{i}",
-            session_id=f"s{i}", content=a.canonical_text, observed_at=_aged(60),
+            session_id=f"s{i}", session_trusted=1,
+            content=a.canonical_text, observed_at=_aged(60),
         ))
     store.upsert_evidence(build_evidence(
         definition_id=b.definition_id, source_rule_id="b0",
         agent_instance_id="agent-b", project_ref="q0",
-        session_id="t0", content=b.canonical_text, observed_at=_aged(60),
+        session_id="t0", session_trusted=1,
+        content=b.canonical_text, observed_at=_aged(60),
     ))
     store.upsert_agent_reputation(
         agent_id="agent-a", success_rate=0.98, rule_accuracy=0.98,
@@ -443,8 +522,14 @@ def test_metrics_governance_family_stays_safe_after_clean_merge(tmp_path):
             d.definition_id, share_group_id="g1", target_type="agent",
             target_id="agent-1", owner_agent_id="agent-1", created_by="backfill",
         ))
-    proposal = store.create_proposal([a.definition_id, b.definition_id], 0.99)
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    proposal = store.create_proposal(
+        [a.definition_id, b.definition_id], 0.99,
+        definition_a=a, definition_b=b,
+    )
+    store.approve_proposal(
+        proposal["proposal_id"], approved_by="admin",
+        capability_id="admin:test-suite",
+    )
     result = _svc(store).merge_proposal(proposal["proposal_id"])
     assert result["ok"] is True
 

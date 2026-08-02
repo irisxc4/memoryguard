@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from memoryguard.rule_definition import build_definition
+from memoryguard.rule_binding import build_binding
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
 from memoryguard.schema_v3 import _now_iso
@@ -31,7 +32,7 @@ def _seed(store: RuleMergeStore, definition, *, tag: str, count: int = 3):
         store.upsert_evidence(build_evidence(
             definition_id=definition.definition_id,
             source_rule_id=f"{tag}-{i}", agent_instance_id=f"a{i}",
-            project_ref=f"p{i}", session_id=f"s{i}",
+            project_ref=f"p{i}", session_id=f"s{i}", session_trusted=1,
             content=definition.canonical_text, observed_at=_now_iso(),
         ))
 
@@ -53,6 +54,41 @@ def _candidate(store: RuleMergeStore, service: RuleMergeService):
     candidates = [p for p in proposals if p["status"] == "candidate"]
     assert candidates, "expected a merge candidate"
     return candidates[0]
+
+
+def _approve(store: RuleMergeStore, proposal_id: str, **kwargs):
+    return store.approve_proposal(
+        proposal_id,
+        approved_by="admin",
+        capability_id="admin:test-suite",
+        **kwargs,
+    )
+
+
+def _toctou_fixture(tmp_path):
+    store = RuleMergeStore(tmp_path)
+    service = RuleMergeService(store)
+    a = build_definition("提交代码前必须运行测试")
+    b = build_definition("提交前必须执行测试")
+    store.upsert_definition(a)
+    store.upsert_definition(b)
+    _seed(store, a, tag="a")
+    _seed(store, b, tag="b")
+    _reps(store)
+    candidate = _candidate(store, service)
+    proposal = store.get_proposal(candidate["proposal_id"])
+    assert proposal is not None
+    assert {
+        "definition_revision_a", "definition_revision_b", "evidence_digest",
+        "binding_digest", "runtime_digest", "assessment_revision",
+        "policy_version",
+    } <= proposal.keys()
+    assert proposal["evidence_digest"]
+    assert proposal["binding_digest"]
+    assert proposal["runtime_digest"]
+    assert proposal["policy_version"]
+    _approve(store, candidate["proposal_id"])
+    return store, service, a, b, candidate["proposal_id"]
 
 
 def test_repeated_scan_reuses_proposal_and_preserves_cooldown(tmp_path):
@@ -80,7 +116,89 @@ def test_repeated_scan_reuses_proposal_and_preserves_cooldown(tmp_path):
     )
     assert p2["candidate_since"] == p1["candidate_since"]
     assert p2["assessment_revision"] == p1["assessment_revision"] + 1
-    assert store.metrics()["proposal_count"] == p1["assessment_revision"] + 1 or True
+    assert store.metrics()["proposal_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("drift", "error"),
+    [
+        ("definition", "rule_merge_definition_revision_drift"),
+        ("evidence", "rule_merge_evidence_digest_drift"),
+        ("binding", "rule_merge_binding_digest_drift"),
+        ("runtime", "rule_merge_runtime_digest_drift"),
+        ("assessment", "rule_merge_assessment_snapshot_mismatch"),
+        ("policy", "rule_merge_policy_snapshot_mismatch"),
+    ],
+)
+def test_human_merge_rechecks_complete_toctou_snapshot(
+    tmp_path, drift, error,
+):
+    store, service, a, b, proposal_id = _toctou_fixture(tmp_path)
+    snapshot = store.get_proposal(proposal_id)
+    assert snapshot is not None
+    if drift == "definition":
+        store.bump_definition_revision(a.definition_id)
+    elif drift == "evidence":
+        store.upsert_evidence(build_evidence(
+            definition_id=a.definition_id, source_rule_id="late-evidence",
+            agent_instance_id="late-agent", project_ref="late-project",
+            session_id="", content=a.canonical_text,
+        ))
+    elif drift == "binding":
+        store.upsert_binding(build_binding(
+            a.definition_id, share_group_id="g1", target_type="agent",
+            target_id="late-agent", owner_agent_id="late-agent",
+            created_by="test",
+        ))
+    elif drift == "runtime":
+        store.upsert_runtime_feedback(
+            feedback_id="late-runtime", definition_id=a.definition_id,
+            outcome="followed", session_id="late-session",
+            session_trusted=1,
+        )
+    else:
+        column = "assessment_revision" if drift == "assessment" else "policy_version"
+        value = "changed-policy" if drift == "policy" else None
+        with store._db() as conn:
+            if value is None:
+                conn.execute(
+                    "UPDATE rule_merge_proposals "
+                    "SET assessment_revision=assessment_revision+1 "
+                    "WHERE proposal_id=?",
+                    (proposal_id,),
+                )
+            else:
+                conn.execute(
+                    f"UPDATE rule_merge_proposals SET {column}=? "
+                    "WHERE proposal_id=?",
+                    (value, proposal_id),
+                )
+
+    approval = store.get_valid_approval(proposal_id)
+    assert approval is not None
+    canonical, merged = service._pick_canonical(a, b)
+    expected_revisions = {
+        snapshot["definition_ids"][0]: snapshot["definition_revision_a"],
+        snapshot["definition_ids"][1]: snapshot["definition_revision_b"],
+    }
+    with pytest.raises(RuntimeError, match=error):
+        store.execute_merge(
+            proposal_id=proposal_id,
+            canonical_definition_id=canonical.definition_id,
+            merged_definition_ids=[merged.definition_id], actor="admin",
+            readiness_at_merge=snapshot["readiness_score"],
+            strength_ok=True, negative_ok=True,
+            first_merge_acknowledged=True,
+            approval_id=approval["approval_id"],
+            execution_mode="human-approved",
+            expected_definition_revisions=expected_revisions,
+            expected_evidence_digest=snapshot["evidence_digest"],
+            expected_negative_digest=snapshot["negative_digest"],
+            expected_binding_digest=snapshot["binding_digest"],
+            expected_assessment_revision=snapshot["assessment_revision"],
+            expected_policy_version=snapshot["policy_version"],
+            expected_runtime_digest=snapshot["runtime_digest"],
+        )
 
 
 def test_repeated_scan_preserves_first_merge_acknowledgement(tmp_path):
@@ -122,9 +240,9 @@ def test_human_cannot_merge_polarity_conflict(tmp_path):
     )
     pair = store.create_proposal(
         [pos.definition_id, neg.definition_id], 0.95,
-        evidence=store.list_evidence(),
+        evidence=store.list_evidence(), definition_a=pos, definition_b=neg,
     )
-    store.set_proposal_status(pair["proposal_id"], "approved")
+    _approve(store, pair["proposal_id"])
     result = service.merge_proposal(pair["proposal_id"], actor="admin")
     assert result["ok"] is False
     assert result["conflict_type"] == "polarity"
@@ -149,8 +267,9 @@ def test_human_cannot_merge_parameter_conflict(tmp_path):
     pair = store.create_proposal(
         [pytest_def.definition_id, unittest_def.definition_id], 0.95,
         evidence=store.list_evidence(),
+        definition_a=pytest_def, definition_b=unittest_def,
     )
-    store.set_proposal_status(pair["proposal_id"], "approved")
+    _approve(store, pair["proposal_id"])
     result = service.merge_proposal(pair["proposal_id"], actor="admin")
     assert result["ok"] is False
     assert result["conflict_type"] == "parameter"
@@ -171,7 +290,7 @@ def test_store_rejects_proposal_definition_mismatch(tmp_path):
         [a.definition_id, b.definition_id], 0.95,
         evidence=store.list_evidence(),
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    _approve(store, proposal["proposal_id"])
     # Merging a different pair than the evaluated one must be refused.
     with pytest.raises(RuntimeError, match="definition_mismatch"):
         store.execute_merge(
@@ -194,7 +313,7 @@ def test_store_rejects_definition_revision_drift(tmp_path):
     _reps(store)
 
     cand = _candidate(store, service)
-    store.approve_proposal(cand["proposal_id"], approved_by="admin")
+    _approve(store, cand["proposal_id"])
     # A definition edited after approval must block the merge.
     store.bump_definition_revision(a.definition_id)
     with pytest.raises(RuntimeError, match="revision_drift"):
@@ -235,9 +354,7 @@ def test_approved_proposal_requires_valid_approval(tmp_path):
     expired = (
         datetime.now(timezone.utc) - timedelta(hours=1)
     ).isoformat()
-    store.approve_proposal(
-        cand["proposal_id"], approved_by="admin", expires_at=expired,
-    )
+    _approve(store, cand["proposal_id"], expires_at=expired)
     assert store.get_valid_approval(cand["proposal_id"]) is None
     result = service.merge_proposal(cand["proposal_id"], actor="admin")
     assert result["ok"] is False

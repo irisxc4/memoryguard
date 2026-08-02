@@ -4,6 +4,68 @@ Command failures and integration errors.
 
 ---
 
+## [ERR-20260802-003] p3_runtime_digest_transient_projection_lag
+
+**Logged**: 2026-08-02
+**Priority**: medium
+**Status**: resolved
+**Area**: database
+
+### Summary
+将瞬时 projection lag/error 纳入 merge runtime digest 后，lag 恢复为零会被误判为运行时漂移。
+
+### Resolution
+- Runtime digest 只保存 outbox high-water mark；lag/error 仍由 auto transaction 单独 fail-closed 校验。
+
+---
+
+## [ERR-20260802-001] p3_store_proposal_placeholder_mismatch
+
+**Logged**: 2026-08-02T16:45:00+08:00
+**Priority**: high
+**Status**: resolved
+**Area**: database
+
+### Summary
+P3 proposal schema 增加 digest 字段后，`create_proposal()` 的 SQL 占位符数量与列/参数不一致，导致扫描无法落库。
+
+### Error
+```
+sqlite3.OperationalError: 33 values for 32 columns
+```
+
+### Context
+- `rule_merge_store.py:create_proposal()` 增加了 `binding_digest` 与 `runtime_digest`。
+- 初次修补少一个占位符，随后修补多一个；通过显式分组计数确认最终为 32 个。
+
+### Resolution
+- **Resolved**: 2026-08-02
+- **Notes**: 将 INSERT 的 32 个占位符按 4 组、每组 8 个分行，focused scan test 已通过。
+
+---
+
+## [ERR-20260802-002] p3_test_path_and_nested_powershell
+
+**Logged**: 2026-08-02T16:46:00+08:00
+**Priority**: low
+**Status**: resolved
+**Area**: infra
+
+### Summary
+Windows 调试中先使用了相对错误测试路径，并在嵌套 PowerShell 双引号中让变量提前展开。
+
+### Error
+```
+no tests ran in 0.00s
+At line ... An expression was expected after '('
+```
+
+### Resolution
+- **Resolved**: 2026-08-02
+- **Notes**: 在仓库 workdir 下使用 `tests/...`；嵌套 PowerShell 改用外层单引号和绝对路径。
+
+---
+
 ## [ERR-20260730-004] src_layout_runtime_import
 
 **Logged**: 2026-07-30T16:55:00+08:00

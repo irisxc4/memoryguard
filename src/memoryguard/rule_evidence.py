@@ -16,6 +16,14 @@ from .rule_scope import canonical_project_ref
 from .schema_v3 import _now_iso, stable_hash
 
 
+def _trusted_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or "").strip().casefold() in {"1", "true", "yes"}
+
+
 @dataclass(frozen=True)
 class RuleEvidence:
     """One observed origin of a definition."""
@@ -37,7 +45,7 @@ class RuleEvidence:
     share_group_id: str = ""
     source_root_id: str = ""
     source_object_id: str = ""
-    session_trusted: int = 0
+    session_trusted: bool = False
     feedback_id: str = ""
     feedback_authority: int = 0
 
@@ -83,7 +91,7 @@ class RuleEvidence:
             share_group_id=data.get("share_group_id", ""),
             source_root_id=data.get("source_root_id", ""),
             source_object_id=data.get("source_object_id", ""),
-            session_trusted=int(data.get("session_trusted", 0) or 0),
+            session_trusted=_trusted_flag(data.get("session_trusted", False)),
             feedback_id=data.get("feedback_id", ""),
             feedback_authority=int(data.get("feedback_authority", 0) or 0),
         )
@@ -123,16 +131,40 @@ def evidence_dedup_key(evidence: RuleEvidence) -> str:
 def dedupe_evidence(
     evidences: list[RuleEvidence] | tuple[RuleEvidence, ...],
 ) -> list[RuleEvidence]:
-    """Collapse duplicate observations (session + project + content)."""
-    seen: set[str] = set()
-    kept: list[RuleEvidence] = []
+    """Collapse duplicate observations with one deterministic winner.
+
+    The database uniqueness constraint is the primary guard.  This helper is
+    the in-memory snapshot equivalent used by proposal/readiness code, so it
+    must choose the same winner rather than depending on query order.
+    """
+    best: dict[str, RuleEvidence] = {}
     for evidence in evidences:
         key = evidence_dedup_key(evidence)
-        if key in seen:
+        current = best.get(key)
+        if current is None:
+            best[key] = evidence
             continue
-        seen.add(key)
-        kept.append(evidence)
-    return kept
+        candidate_rank = (
+            int(getattr(evidence, "feedback_authority", 0) or 0),
+            float(
+                getattr(evidence, "confidence", 1.0)
+                if getattr(evidence, "confidence", None) is not None else 0.0
+            ),
+            str(getattr(evidence, "observed_at", "") or ""),
+            str(getattr(evidence, "evidence_id", "") or ""),
+        )
+        current_rank = (
+            int(getattr(current, "feedback_authority", 0) or 0),
+            float(
+                getattr(current, "confidence", 1.0)
+                if getattr(current, "confidence", None) is not None else 0.0
+            ),
+            str(getattr(current, "observed_at", "") or ""),
+            str(getattr(current, "evidence_id", "") or ""),
+        )
+        if candidate_rank > current_rank:
+            best[key] = evidence
+    return [best[key] for key in sorted(best)]
 
 
 def build_evidence(
@@ -150,7 +182,7 @@ def build_evidence(
     share_group_id: str = "",
     source_root_id: str = "",
     source_object_id: str = "",
-    session_trusted: int = 0,
+    session_trusted: bool = False,
     feedback_id: str = "",
     feedback_authority: int = 0,
 ) -> RuleEvidence:
@@ -176,7 +208,7 @@ def build_evidence(
         share_group_id=share_group_id,
         source_root_id=source_root_id,
         source_object_id=source_object_id,
-        session_trusted=int(session_trusted or 0),
+        session_trusted=_trusted_flag(session_trusted),
         feedback_id=feedback_id,
         feedback_authority=int(feedback_authority or 0),
     )
@@ -215,7 +247,7 @@ class NegativeEvidence:
     feedback_authority: int = 0
     source_root_id: str = ""
     source_object_id: str = ""
-    session_trusted: int = 0
+    session_trusted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -257,7 +289,7 @@ class NegativeEvidence:
             feedback_authority=int(data.get("feedback_authority", 0) or 0),
             source_root_id=data.get("source_root_id", ""),
             source_object_id=data.get("source_object_id", ""),
-            session_trusted=int(data.get("session_trusted", 0) or 0),
+            session_trusted=_trusted_flag(data.get("session_trusted", False)),
         )
 
 
@@ -290,7 +322,7 @@ def build_negative_evidence(
     feedback_authority: int = 0,
     source_root_id: str = "",
     source_object_id: str = "",
-    session_trusted: int = 0,
+    session_trusted: bool = False,
 ) -> NegativeEvidence:
     content_hash = stable_hash("rule-content", str(content or "").strip())
     canonical_project = canonical_project_ref(project_ref)
@@ -313,7 +345,7 @@ def build_negative_evidence(
         feedback_authority=int(feedback_authority or 0),
         source_root_id=source_root_id,
         source_object_id=source_object_id,
-        session_trusted=int(session_trusted or 0),
+        session_trusted=_trusted_flag(session_trusted),
     )
     return replace(
         evidence,

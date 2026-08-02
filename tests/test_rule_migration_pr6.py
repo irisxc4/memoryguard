@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from memoryguard.rule_definition import normalize_rule_text
+from memoryguard.rule_definition import RuleDefinition, normalize_rule_text
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
 from memoryguard.schema_v3 import (
@@ -22,6 +22,7 @@ from memoryguard.schema_v3 import (
     SharedMemoryRecord,
     SharedMemoryStatus,
     _now_iso,
+    stable_hash,
 )
 from memoryguard.shared_memory_store import SharedMemoryStore
 
@@ -52,7 +53,8 @@ def _evidence_for_merge(store: RuleMergeStore, group_id: str,
                     ) == definition.canonical_text
                 ),
                 agent_instance_id=f"a{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", content=definition.canonical_text,
+                session_id=f"s{i}", session_trusted=1,
+                content=definition.canonical_text,
                 observed_at=_now_iso(),
             ))
         store.upsert_agent_reputation(
@@ -67,7 +69,9 @@ def _merge_synonym_pair(store: RuleMergeStore, service: RuleMergeService):
     cand = [p for p in candidates if p["status"] == "candidate"]
     assert cand, "synonym pair must be a merge candidate"
     pid = cand[0]["proposal_id"]
-    store.approve_proposal(pid, approved_by="admin")
+    store.approve_proposal(
+        pid, approved_by="admin", capability_id="admin:test-suite",
+    )
     result = service.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
     return result
@@ -96,6 +100,51 @@ def test_backfill_after_merge_does_not_resurrect_definition(tmp_path):
         e.source_rule_id == "m2"
         for e in intel.list_evidence(definition_id=canonical_id)
     )
+
+
+def test_v1_strength_collision_splits_existing_evidence_by_source(tmp_path):
+    group = "g1"
+    must_body = "必须运行测试"
+    should_body = "应该运行测试"
+    legacy = SharedMemoryStore(tmp_path, group)
+    _seed_record(legacy, "must", must_body)
+    _seed_record(legacy, "should", should_body)
+
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+    must_definition = service._definition_from_record(legacy.get_record("must"))
+    should_definition = service._definition_from_record(legacy.get_record("should"))
+    legacy_id = stable_hash(
+        "rule-definition", "canonical", normalize_rule_text(must_body),
+    )
+    intel.upsert_definition(RuleDefinition.from_dict({
+        **must_definition.to_dict(),
+        "definition_id": legacy_id,
+        "rule_strength": "observation",
+    }))
+    for source_id, body in (("must", must_body), ("should", should_body)):
+        intel.upsert_evidence(build_evidence(
+            definition_id=legacy_id,
+            source_rule_id=source_id,
+            agent_instance_id=source_id,
+            project_ref=f"p-{source_id}",
+            session_id=f"s-{source_id}",
+            session_trusted=True,
+            content=body,
+            observed_at=_now_iso(),
+        ))
+
+    service.backfill_group(legacy, group)
+
+    assert {
+        item.source_rule_id: item.definition_id
+        for item in intel.list_evidence()
+    } == {
+        "must": must_definition.definition_id,
+        "should": should_definition.definition_id,
+    }
+    assert not intel.list_evidence(definition_id=legacy_id)
+    assert intel.get_definition(legacy_id).status == "alias"
 
 
 def test_sync_after_merge_targets_canonical_definition(tmp_path):

@@ -36,15 +36,20 @@ from .rule_definition import (
 from .rule_evidence import RuleEvidence, dedupe_evidence
 from .rule_merge_policy import (
     MERGE_POLICY_VERSION,
+    AUTO_READINESS_SCORE,
+    INTENTION_MATCH_THRESHOLD,
     MAX_SINGLE_SOURCE_RATIO,
     MIN_REPUTATION_SAMPLES,
     NEGATIVE_EVIDENCE_THRESHOLD,
     bayesian_accuracy,
     contradiction_score,
+    compute_layers,
     days_between,
     evidence_weight,
     feedback_authority_score,
     largest_source_ratio,
+    maturity_score,
+    merge_readiness_score,
     negative_evidence_score,
     parameter_conflict,
     project_importance_score,
@@ -167,6 +172,9 @@ CREATE TABLE IF NOT EXISTS rule_merge_proposals (
     definition_revision_a INTEGER NOT NULL DEFAULT 0,
     definition_revision_b INTEGER NOT NULL DEFAULT 0,
     evidence_digest TEXT NOT NULL DEFAULT '',
+    negative_digest TEXT NOT NULL DEFAULT '',
+    binding_digest TEXT NOT NULL DEFAULT '',
+    runtime_digest TEXT NOT NULL DEFAULT '',
     policy_version TEXT NOT NULL DEFAULT '',
     weight_breakdown TEXT NOT NULL DEFAULT ''
 );
@@ -294,21 +302,59 @@ CREATE TABLE IF NOT EXISTS rule_definition_runtime_stats (
 CREATE TABLE IF NOT EXISTS rule_runtime_feedback (
     feedback_id TEXT PRIMARY KEY,
     definition_id TEXT NOT NULL,
+    receipt_id TEXT NOT NULL DEFAULT '',
     outcome TEXT NOT NULL,
     agent_instance_id TEXT NOT NULL DEFAULT '',
     project_ref TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT '',
     authority INTEGER NOT NULL DEFAULT 0,
+    session_trusted INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rule_runtime_feedback_definition
     ON rule_runtime_feedback(definition_id);
+CREATE TABLE IF NOT EXISTS rule_effective_feedback_projection (
+    receipt_id TEXT PRIMARY KEY,
+    effective_feedback_id TEXT NOT NULL DEFAULT '',
+    definition_id TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT '',
+    positive_evidence_id TEXT NOT NULL DEFAULT '',
+    negative_evidence_id TEXT NOT NULL DEFAULT '',
+    session_trusted INTEGER NOT NULL DEFAULT 0,
+    session_source TEXT NOT NULL DEFAULT 'absent',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_rule_effective_feedback_definition
+    ON rule_effective_feedback_projection(definition_id);
+CREATE TABLE IF NOT EXISTS rule_projection_state (
+    scope_id TEXT PRIMARY KEY,
+    last_outbox_event_id TEXT NOT NULL DEFAULT '',
+    last_projected_event_id TEXT NOT NULL DEFAULT '',
+    projection_lag INTEGER NOT NULL DEFAULT 0,
+    projection_error TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 """
 
 
 def _now() -> str:
     return _now_iso()
+
+
+def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
+    """Execute schema statements without executescript's implicit commit."""
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            conn.execute(statement)
+    if buffer.strip():
+        raise sqlite3.OperationalError("incomplete SQL schema statement")
 
 
 class RuleMergeStore:
@@ -334,9 +380,14 @@ class RuleMergeStore:
 
     def _init_db(self) -> None:
         with self._db() as conn:
-            conn.executescript(_SCHEMA)
-            self._apply_upgrade(conn)
-            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _execute_sql_script_atomic(conn, _SCHEMA)
+                self._apply_upgrade(conn)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     # ------------------------------------------------------------------
     # in-place upgrade for databases created before the governance layer
@@ -363,6 +414,9 @@ class RuleMergeStore:
         ("rule_merge_proposals", "definition_revision_a", "INTEGER NOT NULL DEFAULT 0"),
         ("rule_merge_proposals", "definition_revision_b", "INTEGER NOT NULL DEFAULT 0"),
         ("rule_merge_proposals", "evidence_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "negative_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "binding_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_merge_proposals", "runtime_digest", "TEXT NOT NULL DEFAULT ''"),
         ("rule_merge_proposals", "policy_version", "TEXT NOT NULL DEFAULT ''"),
         ("rule_merge_proposals", "weight_breakdown", "TEXT NOT NULL DEFAULT ''"),
         ("rule_evidence", "independence_key", "TEXT NOT NULL DEFAULT ''"),
@@ -394,6 +448,8 @@ class RuleMergeStore:
         ("rule_merge_decisions", "judge_confidence", "REAL NOT NULL DEFAULT 0.0"),
         ("rule_merge_decisions", "judge_recommendation", "TEXT NOT NULL DEFAULT ''"),
         ("rule_merge_decisions", "judge_rationale", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_runtime_feedback", "receipt_id", "TEXT NOT NULL DEFAULT ''"),
+        ("rule_runtime_feedback", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
     )
 
     @staticmethod
@@ -414,6 +470,38 @@ class RuleMergeStore:
                 conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
                 )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rule_effective_feedback_projection (
+                receipt_id TEXT PRIMARY KEY,
+                effective_feedback_id TEXT NOT NULL DEFAULT '',
+                definition_id TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                positive_evidence_id TEXT NOT NULL DEFAULT '',
+                negative_evidence_id TEXT NOT NULL DEFAULT '',
+                session_trusted INTEGER NOT NULL DEFAULT 0,
+                session_source TEXT NOT NULL DEFAULT 'absent',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "idx_rule_effective_feedback_definition "
+            "ON rule_effective_feedback_projection(definition_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rule_projection_state (
+                scope_id TEXT PRIMARY KEY,
+                last_outbox_event_id TEXT NOT NULL DEFAULT '',
+                last_projected_event_id TEXT NOT NULL DEFAULT '',
+                projection_lag INTEGER NOT NULL DEFAULT 0,
+                projection_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
         # Independence indexes reference columns the upgrade may have just added,
         # so they are created only after the ALTER loop (never in _SCHEMA).
         for index_table in ("rule_evidence", "rule_negative_evidence"):
@@ -424,6 +512,128 @@ class RuleMergeStore:
                     f"idx_{index_table}_independence "
                     f"ON {index_table}(independence_key)"
                 )
+        self._dedupe_existing_independence_rows(conn, "rule_evidence")
+        self._dedupe_existing_independence_rows(conn, "rule_negative_evidence")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_evidence_independent "
+            "ON rule_evidence(definition_id, independence_key) "
+            "WHERE independence_key <> ''"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_rule_negative_evidence_independent "
+            "ON rule_negative_evidence(definition_id, independence_key) "
+            "WHERE independence_key <> ''"
+        )
+
+    @staticmethod
+    def _dedupe_existing_independence_rows(
+        conn: sqlite3.Connection, table: str,
+    ) -> None:
+        """Keep strongest/latest row before installing independence UNIQUE."""
+        if table not in {"rule_evidence", "rule_negative_evidence"}:
+            raise ValueError("invalid evidence table")
+        rows = conn.execute(
+            f"SELECT rowid, definition_id, independence_key, "
+            f"feedback_authority, confidence, observed_at "
+            f"FROM {table} WHERE independence_key <> '' "
+            f"ORDER BY definition_id, independence_key, "
+            f"feedback_authority DESC, confidence DESC, observed_at DESC, rowid DESC"
+        ).fetchall()
+        seen: set[tuple[str, str]] = set()
+        for row in rows:
+            key = (str(row["definition_id"] or ""), str(row["independence_key"] or ""))
+            if key in seen:
+                conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["rowid"],))
+            else:
+                seen.add(key)
+
+    @classmethod
+    def _rehome_evidence_rows(
+        cls,
+        conn: sqlite3.Connection,
+        table: str,
+        old_definition_id: str,
+        new_definition_id: str,
+        *,
+        source_rule_id: str = "",
+    ) -> None:
+        """Move evidence across Definition ids without losing a collision.
+
+        V2 identity splits can encounter the same independent observation on
+        both sides of the split.  A blind UPDATE violates the unique
+        independence invariant; choose the deterministic winner first, then
+        move only the surviving row inside the migration transaction.
+        """
+        if table not in {"rule_evidence", "rule_negative_evidence"}:
+            raise ValueError("invalid evidence table")
+        clauses = ["definition_id=?"]
+        params: list[Any] = [old_definition_id]
+        if source_rule_id:
+            clauses.append("source_rule_id=?")
+            params.append(source_rule_id)
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE " + " AND ".join(clauses)
+            + " ORDER BY rowid",
+            params,
+        ).fetchall()
+        for row in rows:
+            independence_key = str(row["independence_key"] or "")
+            existing = None
+            if independence_key:
+                existing = conn.execute(
+                    f"SELECT * FROM {table} WHERE definition_id=? "
+                    "AND independence_key=?",
+                    (new_definition_id, independence_key),
+                ).fetchone()
+            if existing is not None:
+                candidate_wins = cls._evidence_payload_wins(
+                    dict(row), existing,
+                )
+                if candidate_wins:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE evidence_id=?",
+                        (existing["evidence_id"],),
+                    )
+                else:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE evidence_id=?",
+                        (row["evidence_id"],),
+                    )
+                    continue
+            conn.execute(
+                f"UPDATE {table} SET definition_id=? WHERE evidence_id=?",
+                (new_definition_id, row["evidence_id"]),
+            )
+
+    @staticmethod
+    def _rehome_runtime_feedback_rows(
+        conn: sqlite3.Connection,
+        old_definition_id: str,
+        new_definition_id: str,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT feedback_id FROM rule_runtime_feedback "
+            "WHERE definition_id=? ORDER BY rowid",
+            (old_definition_id,),
+        ).fetchall()
+        for row in rows:
+            feedback_id = str(row["feedback_id"] or "")
+            existing = conn.execute(
+                "SELECT 1 FROM rule_runtime_feedback "
+                "WHERE feedback_id=? AND definition_id<>?",
+                (feedback_id, old_definition_id),
+            ).fetchone()
+            if existing is not None:
+                conn.execute(
+                    "DELETE FROM rule_runtime_feedback WHERE feedback_id=?",
+                    (feedback_id,),
+                )
+                continue
+            conn.execute(
+                "UPDATE rule_runtime_feedback SET definition_id=? "
+                "WHERE feedback_id=?",
+                (new_definition_id, feedback_id),
+            )
 
     # ------------------------------------------------------------------
     # Definitions
@@ -513,7 +723,9 @@ class RuleMergeStore:
             semantic_hash=row["semantic_hash"] or "",
             parameter_schema=row["parameter_schema"] or "{}",
             status=row["status"] or "active",
-            confidence=float(row["confidence"] or 1.0),
+            confidence=float(
+                row["confidence"] if row["confidence"] is not None else 1.0
+            ),
             revision=int(row["revision"] or 1),
             rule_strength=row["rule_strength"] or "observation",
             maturity_state=row["maturity_state"] or "observing",
@@ -587,6 +799,7 @@ class RuleMergeStore:
         new_definition_id: str,
         *,
         migration_decision_id: str = "",
+        source_rule_id: str = "",
     ) -> list[tuple[Any, ...]] | None:
         """Atomically repoint a pre-v2 Definition onto its v2 id.
 
@@ -628,14 +841,44 @@ class RuleMergeStore:
                 ]
                 # Evidence moves; bindings are recreated by the backfill pass
                 # under the v2 id (same audience, v2-based binding ids).
+                self._rehome_evidence_rows(
+                    conn, "rule_evidence", old_definition_id,
+                    new_definition_id, source_rule_id=source_rule_id,
+                )
+                self._rehome_evidence_rows(
+                    conn, "rule_negative_evidence", old_definition_id,
+                    new_definition_id, source_rule_id=source_rule_id,
+                )
+                self._rehome_runtime_feedback_rows(
+                    conn, old_definition_id, new_definition_id,
+                )
                 conn.execute(
-                    "UPDATE rule_evidence SET definition_id=? WHERE definition_id=?",
+                    "UPDATE rule_effective_feedback_projection "
+                    "SET definition_id=? WHERE definition_id=?",
                     (new_definition_id, old_definition_id),
                 )
-                conn.execute(
-                    "DELETE FROM rule_bindings WHERE definition_id=?",
-                    (old_definition_id,),
-                )
+                for binding_row in binding_rows:
+                    duplicate = conn.execute(
+                        "SELECT * FROM rule_bindings "
+                        "WHERE definition_id=? AND status='active'",
+                        (new_definition_id,),
+                    ).fetchall()
+                    old_binding = self._row_to_binding(binding_row)
+                    if any(
+                        binding_identity_key(self._row_to_binding(item))
+                        == binding_identity_key(old_binding)
+                        for item in duplicate
+                    ):
+                        conn.execute(
+                            "DELETE FROM rule_bindings WHERE binding_id=?",
+                            (binding_row["binding_id"],),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE rule_bindings SET definition_id=?, revision=revision+1, "
+                            "updated_at=? WHERE binding_id=?",
+                            (new_definition_id, now, binding_row["binding_id"]),
+                        )
                 conn.execute(
                     "UPDATE rule_definitions SET status='alias', superseded_by=?, "
                     "updated_at=? WHERE definition_id=?",
@@ -647,6 +890,129 @@ class RuleMergeStore:
                     "VALUES (?, ?, ?, ?)",
                     (old_definition_id, new_definition_id, migration_decision_id, now),
                 )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return removed_audiences
+
+    def split_legacy_evidence(
+        self,
+        old_definition_id: str,
+        source_targets: dict[str, str],
+    ) -> list[tuple[Any, ...]] | None:
+        """Split v1 evidence by legacy source before aliasing the v1 row.
+
+        A v1 id was surface-only, so MUST/SHOULD records could share it.  The
+        old row must stay active while this transaction routes each known
+        ``source_rule_id`` to its v2 definition; callers alias it only after
+        rebuilding the source bindings.  Unknown rows receive an explicit
+        migration marker and are conservatively handled by the finalizer.
+        """
+        targets = {
+            str(source): str(target)
+            for source, target in dict(source_targets or {}).items()
+            if str(source) and str(target)
+        }
+        if not targets:
+            return None
+        now = _now()
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT * FROM rule_definitions WHERE definition_id=?",
+                    (old_definition_id,),
+                ).fetchone()
+                if row is None or row["status"] in {"alias", "merged"}:
+                    conn.rollback()
+                    return None
+                for target in set(targets.values()):
+                    target_row = conn.execute(
+                        "SELECT 1 FROM rule_definitions WHERE definition_id=?",
+                        (target,),
+                    ).fetchone()
+                    if target_row is None:
+                        raise ValueError("v2_migration_target_missing")
+                binding_rows = conn.execute(
+                    "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
+                    (old_definition_id,),
+                ).fetchall()
+                removed_audiences = [
+                    binding_identity_key(self._row_to_binding(item))
+                    for item in binding_rows
+                ]
+
+                evidence_rows: list[sqlite3.Row] = []
+                for table in ("rule_evidence", "rule_negative_evidence"):
+                    evidence_rows.extend(conn.execute(
+                        f"SELECT * FROM {table} WHERE definition_id=?",
+                        (old_definition_id,),
+                    ).fetchall())
+                    for evidence_row in conn.execute(
+                        f"SELECT * FROM {table} WHERE definition_id=?",
+                        (old_definition_id,),
+                    ).fetchall():
+                        target = targets.get(str(evidence_row["source_rule_id"] or ""))
+                        if target:
+                            self._rehome_evidence_rows(
+                                conn, table, old_definition_id, target,
+                                source_rule_id=str(evidence_row["source_rule_id"] or ""),
+                            )
+                        else:
+                            conn.execute(
+                                f"UPDATE {table} SET source_root_id=? "
+                                "WHERE evidence_id=?",
+                                (
+                                    "ambiguous_migration_evidence",
+                                    evidence_row["evidence_id"],
+                                ),
+                            )
+
+                # Runtime/projection rows do not carry source_rule_id.  Resolve
+                # them through the receipt/feedback identity of the evidence
+                # that was just split; unknown rows remain on v1 for the
+                # conservative finalizer instead of being guessed here.
+                receipt_targets: dict[str, str] = {}
+                feedback_targets: dict[str, str] = {}
+                for evidence_row in evidence_rows:
+                    target = targets.get(str(evidence_row["source_rule_id"] or ""))
+                    if not target:
+                        continue
+                    receipt_id = str(evidence_row["receipt_id"] or "")
+                    feedback_id = str(evidence_row["feedback_id"] or "")
+                    if receipt_id:
+                        receipt_targets[receipt_id] = target
+                    if feedback_id:
+                        feedback_targets[feedback_id] = target
+                runtime_rows = conn.execute(
+                    "SELECT * FROM rule_runtime_feedback WHERE definition_id=?",
+                    (old_definition_id,),
+                ).fetchall()
+                for runtime_row in runtime_rows:
+                    target = (
+                        feedback_targets.get(str(runtime_row["feedback_id"] or ""))
+                        or receipt_targets.get(str(runtime_row["receipt_id"] or ""))
+                    )
+                    if target:
+                        conn.execute(
+                            "UPDATE rule_runtime_feedback SET definition_id=? "
+                            "WHERE feedback_id=?",
+                            (target, runtime_row["feedback_id"]),
+                        )
+                projection_rows = conn.execute(
+                    "SELECT * FROM rule_effective_feedback_projection "
+                    "WHERE definition_id=?",
+                    (old_definition_id,),
+                ).fetchall()
+                for projection in projection_rows:
+                    target = receipt_targets.get(str(projection["receipt_id"] or ""))
+                    if target:
+                        conn.execute(
+                            "UPDATE rule_effective_feedback_projection SET definition_id=? "
+                            "WHERE receipt_id=?",
+                            (target, projection["receipt_id"]),
+                        )
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -765,12 +1131,14 @@ class RuleMergeStore:
         *,
         feedback_id: str,
         definition_id: str,
+        receipt_id: str = "",
         outcome: str,
         agent_instance_id: str = "",
         project_ref: str = "",
         session_id: str = "",
         source: str = "",
         authority: int = 0,
+        session_trusted: int = 0,
         created_at: str = "",
     ) -> None:
         """Idempotently record one projected feedback event (feedback_id PK)."""
@@ -778,14 +1146,60 @@ class RuleMergeStore:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO rule_runtime_feedback (
-                    feedback_id, definition_id, outcome, agent_instance_id,
-                    project_ref, session_id, source, authority, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    feedback_id, definition_id, receipt_id, outcome,
+                    agent_instance_id, project_ref, session_id, source,
+                    authority, session_trusted, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (feedback_id, definition_id, outcome or "",
+                (feedback_id, definition_id, receipt_id or "", outcome or "",
                  agent_instance_id or "", project_ref or "", session_id or "",
-                 source or "", int(authority or 0), created_at or _now()),
+                 source or "", int(authority or 0), int(bool(session_trusted)),
+                 created_at or _now()),
             )
+
+    def delete_runtime_feedback(self, feedback_id: str) -> None:
+        if not feedback_id:
+            return
+        with self._db() as conn:
+            conn.execute(
+                "DELETE FROM rule_runtime_feedback WHERE feedback_id=?",
+                (feedback_id,),
+            )
+
+    @staticmethod
+    def _runtime_rows_for_definition(
+        conn: sqlite3.Connection, definition_id: str,
+    ) -> list[sqlite3.Row]:
+        """Read runtime stats from the effective receipt projection.
+
+        Direct runtime inserts remain supported for older callers, but once a
+        definition has projection rows, the projection is authoritative: raw
+        superseded feedback must not inflate counters or trusted-session
+        diversity.
+        """
+        projection_exists = conn.execute(
+            "SELECT 1 FROM rule_effective_feedback_projection "
+            "WHERE definition_id=? LIMIT 1",
+            (definition_id,),
+        ).fetchone()
+        if projection_exists is not None:
+            return conn.execute(
+                """
+                SELECT r.*
+                FROM rule_effective_feedback_projection p
+                JOIN rule_runtime_feedback r
+                  ON r.feedback_id=p.effective_feedback_id
+                WHERE p.definition_id=?
+                  AND p.effective_feedback_id<>''
+                  AND p.outcome NOT IN ('ignored', 'unobserved')
+                ORDER BY r.created_at, r.feedback_id
+                """,
+                (definition_id,),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM rule_runtime_feedback WHERE definition_id=?",
+            (definition_id,),
+        ).fetchall()
 
     def recompute_runtime_stats(self, definition_id: str) -> dict[str, Any]:
         """Recompute a definition's runtime counters from the feedback ledger.
@@ -794,10 +1208,7 @@ class RuleMergeStore:
         even if an outbox event is re-delivered after a partial failure.
         """
         with self._db() as conn:
-            rows = conn.execute(
-                "SELECT * FROM rule_runtime_feedback WHERE definition_id=?",
-                (definition_id,),
-            ).fetchall()
+            rows = self._runtime_rows_for_definition(conn, definition_id)
             followed = sum(1 for r in rows if r["outcome"] == "followed")
             violated = sum(1 for r in rows if r["outcome"] == "violated")
             not_applicable = sum(
@@ -808,7 +1219,9 @@ class RuleMergeStore:
             )
             sessions = {
                 str(r["session_id"] or "")
-                for r in rows if (r["session_id"] or "").strip()
+                for r in rows
+                if (r["session_id"] or "").strip()
+                and int(r["session_trusted"] or 0) == 1
             }
             projects = {
                 str(r["project_ref"] or "")
@@ -854,8 +1267,14 @@ class RuleMergeStore:
                 "WHERE definition_id=?",
                 (definition_id,),
             ).fetchone()
+            runtime_rows = self._runtime_rows_for_definition(conn, definition_id)
         if row is None:
             return None
+        trusted_rows = [
+            item for item in runtime_rows
+            if (item["session_id"] or "").strip()
+            and int(item["session_trusted"] or 0) == 1
+        ]
         return {
             "definition_id": row["definition_id"],
             "followed": int(row["followed"] or 0),
@@ -865,6 +1284,13 @@ class RuleMergeStore:
             "distinct_sessions": int(row["distinct_sessions"] or 0),
             "distinct_projects": int(row["distinct_projects"] or 0),
             "last_observed_at": row["last_observed_at"] or "",
+            "trusted_followed": sum(
+                1 for item in trusted_rows if item["outcome"] == "followed"
+            ),
+            "trusted_total": len(trusted_rows),
+            "trusted_sessions": len({
+                str(item["session_id"] or "") for item in trusted_rows
+            }),
         }
 
     # ------------------------------------------------------------------
@@ -934,6 +1360,33 @@ class RuleMergeStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_binding(r) for r in rows]
 
+    def revoke_stale_source_bindings(
+        self,
+        definition_id: str,
+        share_group_id: str,
+        owner_agent_id: str,
+        desired_identity_keys: set[str],
+    ) -> int:
+        """Revoke bindings removed by one legacy source assignment update."""
+        now = _now()
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rule_bindings WHERE definition_id=? "
+                "AND share_group_id=? AND owner_agent_id=? AND status='active'",
+                (definition_id, share_group_id, owner_agent_id or ""),
+            ).fetchall()
+            revoked = 0
+            for row in rows:
+                if binding_identity_key(self._row_to_binding(row)) in desired_identity_keys:
+                    continue
+                conn.execute(
+                    "UPDATE rule_bindings SET status='revoked', revision=revision+1, "
+                    "updated_at=? WHERE binding_id=?",
+                    (now, row["binding_id"]),
+                )
+                revoked += 1
+        return revoked
+
     @staticmethod
     def _row_to_binding(row: sqlite3.Row) -> RuleBinding:
         return RuleBinding(
@@ -970,6 +1423,20 @@ class RuleMergeStore:
     def upsert_evidence(self, evidence: RuleEvidence) -> RuleEvidence:
         payload = evidence.to_dict()
         with self._db() as conn:
+            independence_key = str(payload["independence_key"] or "")
+            if independence_key:
+                existing = conn.execute(
+                    "SELECT * FROM rule_evidence "
+                    "WHERE definition_id=? AND independence_key=?",
+                    (payload["definition_id"], independence_key),
+                ).fetchone()
+                if existing is not None and existing["evidence_id"] != payload["evidence_id"]:
+                    if not self._evidence_payload_wins(payload, existing):
+                        return self._row_to_evidence(existing)
+                    conn.execute(
+                        "DELETE FROM rule_evidence WHERE evidence_id=?",
+                        (existing["evidence_id"],),
+                    )
             conn.execute(
                 """
                 INSERT INTO rule_evidence (
@@ -1010,6 +1477,31 @@ class RuleMergeStore:
             )
         return evidence
 
+    @staticmethod
+    def _evidence_payload_wins(
+        payload: dict[str, Any], existing: sqlite3.Row,
+    ) -> bool:
+        """Choose one row for an independence key deterministically."""
+        candidate = (
+            int(payload.get("feedback_authority") or 0),
+            float(
+                payload["confidence"]
+                if payload.get("confidence") is not None else 1.0
+            ),
+            str(payload.get("observed_at") or ""),
+            str(payload.get("evidence_id") or ""),
+        )
+        current = (
+            int(existing["feedback_authority"] or 0),
+            float(
+                existing["confidence"]
+                if existing["confidence"] is not None else 1.0
+            ),
+            str(existing["observed_at"] or ""),
+            str(existing["evidence_id"] or ""),
+        )
+        return candidate > current
+
     def list_evidence(
         self, definition_id: str | None = None,
     ) -> list[RuleEvidence]:
@@ -1036,13 +1528,15 @@ class RuleMergeStore:
             receipt_id=row["receipt_id"] or "",
             content_hash=row["content_hash"] or "",
             semantic_hash=row["semantic_hash"] or "",
-            confidence=float(row["confidence"] or 1.0),
+            confidence=float(
+                row["confidence"] if row["confidence"] is not None else 1.0
+            ),
             observed_at=row["observed_at"] or "",
             independence_key=row["independence_key"] or "",
             share_group_id=row["share_group_id"] or "",
             source_root_id=row["source_root_id"] or "",
             source_object_id=row["source_object_id"] or "",
-            session_trusted=int(row["session_trusted"] or 0),
+            session_trusted=bool(int(row["session_trusted"] or 0)),
             feedback_id=row["feedback_id"] or "",
             feedback_authority=int(row["feedback_authority"] or 0),
         )
@@ -1061,6 +1555,20 @@ class RuleMergeStore:
     ) -> Any:
         payload = evidence.to_dict()
         with self._db() as conn:
+            independence_key = str(payload["independence_key"] or "")
+            if independence_key:
+                existing = conn.execute(
+                    "SELECT * FROM rule_negative_evidence "
+                    "WHERE definition_id=? AND independence_key=?",
+                    (payload["definition_id"], independence_key),
+                ).fetchone()
+                if existing is not None and existing["evidence_id"] != payload["evidence_id"]:
+                    if not self._evidence_payload_wins(payload, existing):
+                        return evidence
+                    conn.execute(
+                        "DELETE FROM rule_negative_evidence WHERE evidence_id=?",
+                        (existing["evidence_id"],),
+                    )
             conn.execute(
                 """
                 INSERT INTO rule_negative_evidence (
@@ -1123,7 +1631,9 @@ class RuleMergeStore:
                 agent_instance_id=row["agent_instance_id"] or "",
                 project_ref=row["project_ref"] or "",
                 content_hash=row["content_hash"] or "",
-                confidence=float(row["confidence"] or 1.0),
+                confidence=float(
+                    row["confidence"] if row["confidence"] is not None else 1.0
+                ),
                 observed_at=row["observed_at"] or "",
                 independence_key=row["independence_key"] or "",
                 share_group_id=row["share_group_id"] or "",
@@ -1133,7 +1643,7 @@ class RuleMergeStore:
                 feedback_authority=int(row["feedback_authority"] or 0),
                 source_root_id=row["source_root_id"] or "",
                 source_object_id=row["source_object_id"] or "",
-                session_trusted=int(row["session_trusted"] or 0),
+                session_trusted=bool(int(row["session_trusted"] or 0)),
             )
             for row in rows
         ]
@@ -1144,6 +1654,136 @@ class RuleMergeStore:
                 "SELECT COUNT(*) AS c FROM rule_negative_evidence"
             ).fetchone()
         return int(row["c"])
+
+    def delete_evidence(self, evidence_id: str) -> None:
+        if not evidence_id:
+            return
+        with self._db() as conn:
+            conn.execute(
+                "DELETE FROM rule_evidence WHERE evidence_id=?",
+                (evidence_id,),
+            )
+
+    def delete_negative_evidence(self, evidence_id: str) -> None:
+        if not evidence_id:
+            return
+        with self._db() as conn:
+            conn.execute(
+                "DELETE FROM rule_negative_evidence WHERE evidence_id=?",
+                (evidence_id,),
+            )
+
+    def get_effective_feedback_projection(
+        self, receipt_id: str,
+    ) -> dict[str, Any] | None:
+        with self._db() as conn:
+            row = conn.execute(
+                "SELECT * FROM rule_effective_feedback_projection "
+                "WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def upsert_effective_feedback_projection(
+        self,
+        *,
+        receipt_id: str,
+        effective_feedback_id: str = "",
+        definition_id: str = "",
+        outcome: str = "",
+        positive_evidence_id: str = "",
+        negative_evidence_id: str = "",
+        session_trusted: int = 0,
+        session_source: str = "absent",
+    ) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO rule_effective_feedback_projection (
+                    receipt_id, effective_feedback_id, definition_id, outcome,
+                    positive_evidence_id, negative_evidence_id,
+                    session_trusted, session_source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(receipt_id) DO UPDATE SET
+                    effective_feedback_id=excluded.effective_feedback_id,
+                    definition_id=excluded.definition_id,
+                    outcome=excluded.outcome,
+                    positive_evidence_id=excluded.positive_evidence_id,
+                    negative_evidence_id=excluded.negative_evidence_id,
+                    session_trusted=excluded.session_trusted,
+                    session_source=excluded.session_source,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    receipt_id, effective_feedback_id or "", definition_id or "",
+                    outcome or "", positive_evidence_id or "",
+                    negative_evidence_id or "", int(bool(session_trusted)),
+                    session_source or "absent", _now(),
+                ),
+            )
+
+    def clear_evidence_projection(self, receipt_id: str) -> None:
+        projection = self.get_effective_feedback_projection(receipt_id)
+        if not projection:
+            return
+        self.delete_evidence(str(projection.get("positive_evidence_id") or ""))
+        self.delete_negative_evidence(
+            str(projection.get("negative_evidence_id") or "")
+        )
+        self.delete_runtime_feedback(
+            str(projection.get("effective_feedback_id") or "")
+        )
+
+    def set_projection_state(
+        self,
+        scope_id: str,
+        *,
+        last_outbox_event_id: str = "",
+        last_projected_event_id: str = "",
+        projection_lag: int = 0,
+        projection_error: str = "",
+    ) -> None:
+        with self._db() as conn:
+            conn.execute(
+                """
+                INSERT INTO rule_projection_state (
+                    scope_id, last_outbox_event_id, last_projected_event_id,
+                    projection_lag, projection_error, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope_id) DO UPDATE SET
+                    last_outbox_event_id=excluded.last_outbox_event_id,
+                    last_projected_event_id=excluded.last_projected_event_id,
+                    projection_lag=excluded.projection_lag,
+                    projection_error=excluded.projection_error,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    scope_id, last_outbox_event_id or "",
+                    last_projected_event_id or "", max(0, int(projection_lag)),
+                    projection_error or "", _now(),
+                ),
+            )
+
+    def projection_status(self) -> dict[str, Any]:
+        with self._db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rule_projection_state ORDER BY scope_id"
+            ).fetchall()
+        return {
+            "scopes": [dict(row) for row in rows],
+            "projection_lag": sum(int(row["projection_lag"] or 0) for row in rows),
+            "projection_error": next(
+                (str(row["projection_error"] or "") for row in rows
+                 if row["projection_error"]),
+                "",
+            ),
+        }
+
+    def projection_ready(self) -> bool:
+        status = self.projection_status()
+        return status["projection_lag"] == 0 and not status["projection_error"]
 
     # ------------------------------------------------------------------
     # Agent reputation / project profile (P3-003 §2)
@@ -1457,6 +2097,168 @@ class RuleMergeStore:
     # Merge proposals
     # ------------------------------------------------------------------
 
+    def _binding_digest(
+        self, definition_ids: Iterable[str],
+        *, conn: sqlite3.Connection | None = None,
+    ) -> str:
+        ids = sorted({str(item) for item in definition_ids})
+        owns = conn is None
+        connection = conn or self._db()
+        try:
+            rows: list[dict[str, Any]] = []
+            for definition_id in ids:
+                for row in connection.execute(
+                    "SELECT * FROM rule_bindings "
+                    "WHERE definition_id=? AND status='active' "
+                    "ORDER BY binding_id",
+                    (definition_id,),
+                ).fetchall():
+                    rows.append(self._row_to_binding(row).to_dict())
+            return stable_hash(
+                "rule-proposal-bindings",
+                json.dumps(rows, ensure_ascii=False, sort_keys=True),
+            )
+        finally:
+            if owns:
+                connection.close()
+
+    def _projection_watermark(self, conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        """Capture P3 state plus every legacy outbox high-water mark."""
+        state = [
+            {
+                "scope_id": row["scope_id"],
+                "last_outbox_event_id": row["last_outbox_event_id"] or "",
+                "last_projected_event_id": row["last_projected_event_id"] or "",
+            }
+            for row in conn.execute(
+                "SELECT * FROM rule_projection_state ORDER BY scope_id"
+            ).fetchall()
+        ]
+        legacy_state: list[dict[str, Any]] = []
+        for group_id, db_path in iter_legacy_groups(self.workspace):
+            legacy_conn = sqlite3.connect(str(db_path), timeout=2.0)
+            try:
+                row = legacy_conn.execute(
+                    "SELECT COUNT(*) AS total, COALESCE(MAX(rowid), 0) AS max_rowid, "
+                    "COALESCE(MAX(created_at), '') AS max_created_at "
+                    "FROM rule_event_outbox"
+                ).fetchone()
+                legacy_state.append({
+                    "group_id": group_id,
+                    "total": int(row[0] or 0),
+                    "max_rowid": int(row[1] or 0),
+                    "max_created_at": str(row[2] or ""),
+                })
+            except sqlite3.Error:
+                legacy_state.append({
+                    "group_id": group_id,
+                    "total": -1,
+                    "max_rowid": -1,
+                    "max_created_at": "error",
+                })
+            finally:
+                legacy_conn.close()
+        return [{"p3": state}, {"legacy": legacy_state}]
+
+    def _runtime_digest(
+        self, definition_ids: Iterable[str],
+        *, conn: sqlite3.Connection | None = None,
+    ) -> str:
+        ids = sorted({str(item) for item in definition_ids})
+        owns = conn is None
+        connection = conn or self._db()
+        try:
+            rows = []
+            for definition_id in ids:
+                rows.extend(
+                    dict(row) for row in connection.execute(
+                        "SELECT * FROM rule_runtime_feedback "
+                        "WHERE definition_id=? ORDER BY feedback_id",
+                        (definition_id,),
+                    ).fetchall()
+                )
+            return stable_hash(
+                "rule-proposal-runtime",
+                json.dumps(
+                    {
+                        "runtime": rows,
+                        "projection_watermark": self._projection_watermark(
+                            connection,
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+        finally:
+            if owns:
+                connection.close()
+
+    def _evidence_digest_from_ids(
+        self,
+        evidence_ids: Iterable[str],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        """Digest evidence ids *and payload* for TOCTOU protection."""
+        ids = sorted({str(item) for item in evidence_ids if str(item)})
+        owns = conn is None
+        connection = conn or self._db()
+        try:
+            rows: list[dict[str, Any]] = []
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                rows = [
+                    dict(row) for row in connection.execute(
+                        f"SELECT * FROM rule_evidence "
+                        f"WHERE evidence_id IN ({placeholders}) "
+                        "ORDER BY evidence_id",
+                        ids,
+                    ).fetchall()
+                ]
+            return stable_hash(
+                "rule-proposal-evidence",
+                json.dumps(
+                    {"requested_ids": ids, "rows": rows},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+        finally:
+            if owns:
+                connection.close()
+
+    def _negative_digest(
+        self,
+        definition_ids: Iterable[str],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> str:
+        ids = sorted({str(item) for item in definition_ids if str(item)})
+        owns = conn is None
+        connection = conn or self._db()
+        try:
+            rows: list[dict[str, Any]] = []
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                rows = [
+                    dict(row) for row in connection.execute(
+                        f"SELECT * FROM rule_negative_evidence "
+                        f"WHERE definition_id IN ({placeholders}) "
+                        "ORDER BY evidence_id",
+                        ids,
+                    ).fetchall()
+                ]
+            return stable_hash(
+                "rule-proposal-negative-evidence",
+                json.dumps(rows, ensure_ascii=False, sort_keys=True, default=str),
+            )
+        finally:
+            if owns:
+                connection.close()
+
     def create_proposal(
         self,
         definition_ids: list[str],
@@ -1499,12 +2301,12 @@ class RuleMergeStore:
         # Digest over *all* evidence ids (not the deduped projection) so the
         # merge transaction can recompute it from the raw rows and detect any
         # drift in the evidence set since the scan/approval.
-        evidence_digest = stable_hash(
-            "rule-proposal-evidence",
-            json.dumps(
-                sorted(e.evidence_id for e in (evidence or [])), ensure_ascii=False,
-            ),
+        evidence_digest = self._evidence_digest_from_ids(
+            e.evidence_id for e in (evidence or [])
         )
+        negative_digest = self._negative_digest(sorted_ids)
+        binding_digest = self._binding_digest(sorted_ids)
+        runtime_digest = self._runtime_digest(sorted_ids)
         revision_a = int(getattr(definition_a, "revision", 0) or 0) if definition_a else 0
         revision_b = int(getattr(definition_b, "revision", 0) or 0) if definition_b else 0
         now = _now()
@@ -1528,7 +2330,8 @@ class RuleMergeStore:
                         judge_rationale=?, explanation=?, candidate_since=?,
                         last_evaluated_at=?, assessment_revision=?,
                         definition_revision_a=?, definition_revision_b=?,
-                        evidence_digest=?, policy_version=?, weight_breakdown=?
+                        evidence_digest=?, negative_digest=?, binding_digest=?, runtime_digest=?,
+                        policy_version=?, weight_breakdown=?
                     WHERE proposal_id=?
                     """,
                     (
@@ -1547,7 +2350,8 @@ class RuleMergeStore:
                         explanation,
                         existing["candidate_since"] or now,
                         now, int(existing["assessment_revision"] or 0) + 1,
-                        revision_a, revision_b, evidence_digest,
+                        revision_a, revision_b, evidence_digest, negative_digest,
+                        binding_digest, runtime_digest,
                         MERGE_POLICY_VERSION, weight_breakdown or "",
                         proposal_id,
                     ),
@@ -1564,9 +2368,15 @@ class RuleMergeStore:
                     judge_confidence, judge_recommendation, judge_rationale,
                     status, explanation, created_at, candidate_since,
                     last_evaluated_at, assessment_revision, definition_revision_a,
-                    definition_revision_b, evidence_digest, policy_version,
-                    weight_breakdown
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    definition_revision_b, evidence_digest, negative_digest,
+                    binding_digest, runtime_digest, policy_version, weight_breakdown
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?
+                )
                 """,
                 (
                     proposal_id,
@@ -1583,7 +2393,8 @@ class RuleMergeStore:
                     self._judge_field(judge, "recommendation"),
                     self._judge_field(judge, "rationale"),
                     "candidate", explanation, now, now, now, 1,
-                    revision_a, revision_b, evidence_digest, MERGE_POLICY_VERSION,
+                    revision_a, revision_b, evidence_digest, negative_digest,
+                    binding_digest, runtime_digest, MERGE_POLICY_VERSION,
                     weight_breakdown or "",
                 ),
             )
@@ -1640,24 +2451,13 @@ class RuleMergeStore:
                 "candidate", "conflicted", "rejected",
             }:
                 return self._row_to_proposal(row)
+            if status == "approved" and current != "candidate":
+                raise ValueError("rule_merge_proposal_not_approvable")
             if status == "approved":
-                # Approval is first-class data.  Approving from candidate /
-                # conflicted / rejected is recorded so the merge transaction
-                # can verify a real approval exists — but the merge's hard
-                # gates still decide whether the pair is actually mergeable.
-                approval_id = stable_hash(
-                    "rule-merge-approval", proposal_id, now,
-                )
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO rule_merge_approvals (
-                        approval_id, proposal_id, approved_by, capability_id,
-                        expected_definition_revisions, approval_scope,
-                        created_at, expires_at
-                    ) VALUES (?, ?, 'manual', 'store-status', '{}', 'merge', ?, '')
-                    """,
-                    (approval_id, proposal_id, now),
-                )
+                # Status mutation is not approval.  Only approve_proposal()
+                # may create the capability-backed approval row and advance
+                # the proposal to ``approved``.
+                raise ValueError("rule_merge_approval_required")
             conn.execute(
                 "UPDATE rule_merge_proposals SET status=? WHERE proposal_id=?",
                 (status, proposal_id),
@@ -1673,6 +2473,7 @@ class RuleMergeStore:
         expected_definition_revisions: dict[str, int] | None = None,
         approval_scope: str = "merge",
         expires_at: str = "",
+        access_context: Any | None = None,
     ) -> dict[str, Any]:
         """First-class approval: records who approved what, then approves.
 
@@ -1690,6 +2491,37 @@ class RuleMergeStore:
                 raise ValueError("rule_merge_proposal_not_found")
             if str(row["status"] or "") != "candidate":
                 raise ValueError("rule_merge_proposal_not_approvable")
+        if not capability_id:
+            raise ValueError("rule_merge_approval_capability_required")
+        if access_context is not None:
+            if not bool(getattr(access_context, "is_admin", False)):
+                raise ValueError("rule_merge_admin_capability_required")
+        elif not str(capability_id).startswith("admin:"):
+            raise ValueError("rule_merge_admin_capability_required")
+        proposal_definition_ids = json.loads(row["definition_ids"] or "[]")
+        if len(proposal_definition_ids) != 2:
+            raise ValueError("rule_merge_proposal_must_pair_two_definitions")
+        definitions = [
+            self.get_definition(str(definition_id))
+            for definition_id in proposal_definition_ids
+        ]
+        if any(definition is None for definition in definitions):
+            raise ValueError("rule_merge_definition_not_found")
+        layers = compute_layers(definitions[0], definitions[1])
+        if not (
+            layers.hash_score >= 1.0
+            or layers.intent_score >= INTENTION_MATCH_THRESHOLD
+        ):
+            raise ValueError("rule_merge_similarity_gate_failed")
+        if not expected_definition_revisions:
+            expected_definition_revisions = {
+                str(proposal_definition_ids[0]): int(
+                    row["definition_revision_a"] or 0
+                ),
+                str(proposal_definition_ids[1]): int(
+                    row["definition_revision_b"] or 0
+                ),
+            }
         approval_id = stable_hash(
             "rule-merge-approval", proposal_id, approved_by, capability_id, _now(),
         )
@@ -1699,6 +2531,13 @@ class RuleMergeStore:
             ensure_ascii=False, sort_keys=True,
         )
         with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT status FROM rule_merge_proposals WHERE proposal_id=?",
+                (proposal_id,),
+            ).fetchone()
+            if current is None or str(current["status"] or "") != "candidate":
+                raise ValueError("rule_merge_proposal_not_approvable")
             conn.execute(
                 """
                 INSERT OR REPLACE INTO rule_merge_approvals (
@@ -1711,10 +2550,13 @@ class RuleMergeStore:
                  capability_id or "", expected, approval_scope or "merge",
                  now, expires_at or ""),
             )
-            conn.execute(
-                "UPDATE rule_merge_proposals SET status='approved' WHERE proposal_id=?",
+            updated = conn.execute(
+                "UPDATE rule_merge_proposals SET status='approved' "
+                "WHERE proposal_id=? AND status='candidate'",
                 (proposal_id,),
             )
+            if updated.rowcount != 1:
+                raise ValueError("rule_merge_proposal_not_approvable")
         return {
             "approval_id": approval_id, "proposal_id": proposal_id,
             "approved_by": approved_by or "human",
@@ -1737,6 +2579,9 @@ class RuleMergeStore:
             ).fetchall()
         now = _now()
         for row in rows:
+            capability_id = str(row["capability_id"] or "")
+            if not capability_id.startswith("admin:"):
+                continue
             expires_at = str(row["expires_at"] or "")
             if expires_at and expires_at < now:
                 continue
@@ -1865,6 +2710,306 @@ class RuleMergeStore:
         return str(value) if not isinstance(value, float) else f"{value:.4f}"
 
     @staticmethod
+    def _recompute_runtime_stats_conn(
+        conn: sqlite3.Connection, definition_id: str,
+    ) -> dict[str, Any]:
+        rows = RuleMergeStore._runtime_rows_for_definition(conn, definition_id)
+        followed = sum(1 for row in rows if row["outcome"] == "followed")
+        violated = sum(1 for row in rows if row["outcome"] == "violated")
+        not_applicable = sum(
+            1 for row in rows if row["outcome"] == "not_applicable"
+        )
+        exception_count = sum(1 for row in rows if row["outcome"] == "exception")
+        sessions = {
+            str(row["session_id"] or "")
+            for row in rows
+            if (row["session_id"] or "").strip()
+            and int(row["session_trusted"] or 0) == 1
+        }
+        projects = {
+            str(row["project_ref"] or "")
+            for row in rows if (row["project_ref"] or "").strip()
+        }
+        last_observed = max(
+            (str(row["created_at"] or "") for row in rows), default="",
+        )
+        stats = {
+            "definition_id": definition_id,
+            "followed": followed,
+            "violated": violated,
+            "not_applicable": not_applicable,
+            "exception_count": exception_count,
+            "distinct_sessions": len(sessions),
+            "distinct_projects": len(projects),
+            "last_observed_at": last_observed,
+        }
+        conn.execute(
+            """
+            INSERT INTO rule_definition_runtime_stats (
+                definition_id, followed, violated, not_applicable,
+                exception_count, distinct_sessions, distinct_projects,
+                last_observed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(definition_id) DO UPDATE SET
+                followed=excluded.followed, violated=excluded.violated,
+                not_applicable=excluded.not_applicable,
+                exception_count=excluded.exception_count,
+                distinct_sessions=excluded.distinct_sessions,
+                distinct_projects=excluded.distinct_projects,
+                last_observed_at=excluded.last_observed_at
+            """,
+            (
+                definition_id, followed, violated, not_applicable,
+                exception_count, len(sessions), len(projects), last_observed,
+            ),
+        )
+        return stats
+
+    def _conn_projection_ready(self, conn: sqlite3.Connection) -> bool:
+        rows = conn.execute("SELECT * FROM rule_projection_state").fetchall()
+        if not (
+            sum(int(row["projection_lag"] or 0) for row in rows) == 0
+            and not any(str(row["projection_error"] or "") for row in rows)
+        ):
+            return False
+        for _group_id, db_path in iter_legacy_groups(self.workspace):
+            legacy_conn = sqlite3.connect(str(db_path), timeout=2.0)
+            try:
+                pending = legacy_conn.execute(
+                    "SELECT COUNT(*) FROM rule_event_outbox WHERE consumed_at=''"
+                ).fetchone()
+                if int(pending[0] or 0) > 0:
+                    return False
+            except sqlite3.Error:
+                return False
+            finally:
+                legacy_conn.close()
+        return True
+
+    def _auto_maturity_gate(
+        self,
+        definition_rows: dict[str, sqlite3.Row],
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> bool:
+        ordered = list(definition_rows.values())
+        if len(ordered) != 2:
+            return False
+        definitions = [self._row_to_definition(row) for row in ordered]
+        layers = compute_layers(definitions[0], definitions[1])
+        if (
+            layers.hash_score >= 1.0
+            or layers.intent_score >= INTENTION_MATCH_THRESHOLD
+        ):
+            required = {"validated", "trusted"}
+        else:
+            required = {"trusted"}
+        if any(definition.maturity_state not in required for definition in definitions):
+            return False
+        owns = conn is None
+        connection = conn or self._db()
+        try:
+            for definition in definitions:
+                runtime_rows = self._runtime_rows_for_definition(
+                    connection, definition.definition_id,
+                )
+                trusted_sessions = {
+                    str(row["session_id"] or "")
+                    for row in runtime_rows
+                    if (row["session_id"] or "").strip()
+                    and int(row["session_trusted"] or 0) == 1
+                }
+                if not trusted_sessions:
+                    return False
+        finally:
+            if owns:
+                connection.close()
+        return True
+
+    def _conn_readiness(
+        self,
+        conn: sqlite3.Connection,
+        definition_rows: dict[str, sqlite3.Row],
+    ) -> float:
+        definitions = [self._row_to_definition(row) for row in definition_rows.values()]
+        evidence_rows = [
+            row
+            for definition in definitions
+            for row in conn.execute(
+                "SELECT * FROM rule_evidence WHERE definition_id=?",
+                (definition.definition_id,),
+            ).fetchall()
+            if self._evidence_row_is_eligible(row)
+        ]
+        evidence_rows = self._dedupe_conn_rows(evidence_rows)
+        weights = self._conn_evidence_weights(conn, evidence_rows)
+        confidence = min(1.0, weighted_evidence_score(weights) / 2.5)
+        maturity = min(
+            maturity_score(definition.maturity_state)
+            for definition in definitions
+        )
+        successes: list[float] = []
+        agents = set()
+        projects = set()
+        for definition in definitions:
+            runtime_rows = self._runtime_rows_for_definition(
+                conn, definition.definition_id,
+            )
+            runtime_rows = [
+                row for row in runtime_rows
+                if (row["session_id"] or "").strip()
+                and int(row["session_trusted"] or 0) == 1
+            ]
+            total = len(runtime_rows)
+            followed = sum(
+                1 for row in runtime_rows if row["outcome"] == "followed"
+            )
+            successes.append(followed / total if total else 0.0)
+            for row in runtime_rows:
+                if row["agent_instance_id"]:
+                    agents.add(row["agent_instance_id"])
+                if row["project_ref"]:
+                    projects.add(row["project_ref"])
+        for row in evidence_rows:
+            if row["agent_instance_id"]:
+                agents.add(row["agent_instance_id"])
+            if row["project_ref"]:
+                projects.add(row["project_ref"])
+        execution = sum(successes) / len(successes) if successes else 0.0
+        diversity = min(1.0, (len(agents) + len(projects)) / 4.0)
+        stability = min(
+            1.0,
+            min(days_between(definition.created_at) for definition in definitions)
+            / 30.0,
+        )
+        return merge_readiness_score(
+            duplicate_score=compute_layers(definitions[0], definitions[1]).duplicate_score,
+            evidence_confidence=confidence,
+            maturity=maturity,
+            execution_success=execution,
+            source_diversity=diversity,
+            stability=stability,
+        )
+
+    @staticmethod
+    def _evidence_row_is_eligible(row: sqlite3.Row) -> bool:
+        """Treat explicit untrusted sessions as non-independent evidence.
+
+        Legacy rows without a session remain compatible; once a producer
+        supplies a session, that session must carry explicit trust from the
+        immutable receipt/outbox snapshot before it can satisfy governance.
+        """
+        session_id = str(row["session_id"] or "") if "session_id" in row.keys() else ""
+        if (
+            str(row["source_root_id"] or "")
+            == "ambiguous_migration_evidence"
+        ):
+            return False
+        return not session_id.strip() or int(row["session_trusted"] or 0) == 1
+
+    @staticmethod
+    def _dedupe_conn_rows(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+        best: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            key = str(row["independence_key"] or row["evidence_id"] or "")
+            current = best.get(key)
+            if current is None or (
+                int(row["feedback_authority"] or 0),
+                float(row["confidence"] if row["confidence"] is not None else 1.0),
+                str(row["observed_at"] or ""),
+                str(row["evidence_id"] or ""),
+            ) > (
+                int(current["feedback_authority"] or 0),
+                float(
+                    current["confidence"]
+                    if current["confidence"] is not None else 1.0
+                ),
+                str(current["observed_at"] or ""),
+                str(current["evidence_id"] or ""),
+            ):
+                best[key] = row
+        return list(best.values())
+
+    def _state_snapshot_conn(
+        self, conn: sqlite3.Connection, definition_ids: Iterable[str],
+    ) -> dict[str, str]:
+        ids = sorted({str(item) for item in definition_ids})
+        placeholders = ",".join("?" for _ in ids)
+        definitions = [
+            dict(row) for row in conn.execute(
+                f"SELECT definition_id,status,revision,superseded_by "
+                f"FROM rule_definitions WHERE definition_id IN ({placeholders}) "
+                f"ORDER BY definition_id",
+                ids,
+            ).fetchall()
+        ]
+        bindings = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_bindings WHERE status='active' "
+                f"AND definition_id IN ({placeholders}) ORDER BY binding_id",
+                ids,
+            ).fetchall()
+        ]
+        evidence = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_evidence WHERE definition_id IN ({placeholders}) "
+                f"ORDER BY evidence_id",
+                ids,
+            ).fetchall()
+        ]
+        negative = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_negative_evidence "
+                f"WHERE definition_id IN ({placeholders}) ORDER BY evidence_id",
+                ids,
+            ).fetchall()
+        ]
+        runtime = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_runtime_feedback "
+                f"WHERE definition_id IN ({placeholders}) ORDER BY feedback_id",
+                ids,
+            ).fetchall()
+        ]
+        effective_projection = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_effective_feedback_projection "
+                f"WHERE definition_id IN ({placeholders}) ORDER BY receipt_id",
+                ids,
+            ).fetchall()
+        ]
+        projection_state = [
+            dict(row) for row in conn.execute(
+                "SELECT * FROM rule_projection_state ORDER BY scope_id"
+            ).fetchall()
+        ]
+        links = [
+            dict(row) for row in conn.execute(
+                f"SELECT * FROM rule_source_links WHERE "
+                f"canonical_definition_id IN ({placeholders}) "
+                f"OR original_definition_id IN ({placeholders}) "
+                f"ORDER BY share_group_id,memory_id",
+                ids + ids,
+            ).fetchall()
+        ]
+        return {
+            "definitions": stable_hash("merge-state-definitions", json.dumps(definitions, sort_keys=True, default=str)),
+            "bindings": stable_hash("merge-state-bindings", json.dumps(bindings, sort_keys=True, default=str)),
+            "evidence": stable_hash("merge-state-evidence", json.dumps(evidence, sort_keys=True, default=str)),
+            "negative": stable_hash("merge-state-negative", json.dumps(negative, sort_keys=True, default=str)),
+            "runtime": stable_hash("merge-state-runtime", json.dumps(runtime, sort_keys=True, default=str)),
+            "effective_projection": stable_hash(
+                "merge-state-effective-projection",
+                json.dumps(effective_projection, sort_keys=True, default=str),
+            ),
+            "projection_state": stable_hash(
+                "merge-state-projection-state",
+                json.dumps(projection_state, sort_keys=True, default=str),
+            ),
+            "source_links": stable_hash("merge-state-links", json.dumps(links, sort_keys=True, default=str)),
+        }
+
+    @staticmethod
     def _row_to_proposal(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "proposal_id": row["proposal_id"],
@@ -1895,6 +3040,9 @@ class RuleMergeStore:
             "definition_revision_a": int(row["definition_revision_a"] or 0),
             "definition_revision_b": int(row["definition_revision_b"] or 0),
             "evidence_digest": row["evidence_digest"] or "",
+            "negative_digest": row["negative_digest"] or "",
+            "binding_digest": row["binding_digest"] or "",
+            "runtime_digest": row["runtime_digest"] or "",
             "policy_version": row["policy_version"] or "",
             "weight_breakdown": row["weight_breakdown"] or "",
         }
@@ -1970,6 +3118,8 @@ class RuleMergeStore:
             "before_bindings": before_bindings,
             "after_bindings": after_bindings,
             "migration": migration,
+            "execution_mode": migration.get("execution_mode", "auto"),
+            "auto_merge": bool(migration.get("auto_merge", actor == "auto")),
             "actor": actor,
             "readiness_at_merge": float(readiness_at_merge),
             "strength_ok": bool(strength_ok),
@@ -2005,6 +3155,14 @@ class RuleMergeStore:
             "before_bindings": json.loads(row["before_bindings"] or "[]"),
             "after_bindings": json.loads(row["after_bindings"] or "[]"),
             "migration": json.loads(row["migration"] or "{}"),
+            "execution_mode": json.loads(row["migration"] or "{}").get(
+                "execution_mode", "auto"
+            ),
+            "auto_merge": bool(
+                json.loads(row["migration"] or "{}").get(
+                    "auto_merge", (row["actor"] or "auto") == "auto"
+                )
+            ),
             "actor": row["actor"] or "auto",
             "readiness_at_merge": float(row["readiness_at_merge"] or 0.0),
             "strength_ok": bool(row["strength_ok"]),
@@ -2042,6 +3200,14 @@ class RuleMergeStore:
             "proposal_id": r["proposal_id"],
             "canonical_definition_id": r["canonical_definition_id"],
             "merged_definition_ids": json.loads(r["merged_definition_ids"] or "[]"),
+            "execution_mode": json.loads(r["migration"] or "{}").get(
+                "execution_mode", "auto"
+            ),
+            "auto_merge": bool(
+                json.loads(r["migration"] or "{}").get(
+                    "auto_merge", (r["actor"] or "auto") == "auto"
+                )
+            ),
             "readiness_at_merge": float(r["readiness_at_merge"] or 0.0),
             "strength_ok": bool(r["strength_ok"]),
             "polarity_ok": bool(r["polarity_ok"]),
@@ -2077,8 +3243,14 @@ class RuleMergeStore:
         first_merge_acknowledged: bool = True,
         judge: Any | None = None,
         approval_id: str = "",
+        execution_mode: str = "auto",
         expected_definition_revisions: dict[str, int] | None = None,
         expected_evidence_digest: str = "",
+        expected_negative_digest: str = "",
+        expected_binding_digest: str = "",
+        expected_assessment_revision: int | None = None,
+        expected_policy_version: str = "",
+        expected_runtime_digest: str = "",
     ) -> dict[str, Any]:
         """Atomically merge definitions into a canonical one.
 
@@ -2101,6 +3273,11 @@ class RuleMergeStore:
             the merge can be undone precisely.
         """
         now = _now()
+        execution_mode = str(execution_mode or "auto").strip().casefold()
+        if execution_mode not in {"auto", "approved", "human-approved"}:
+            raise ValueError("rule_merge_execution_mode_invalid")
+        if execution_mode in {"approved", "human-approved"} and not approval_id:
+            raise RuntimeError("rule_merge_approval_required")
         merged = sorted({str(x) for x in merged_definition_ids} - {canonical_definition_id})
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2119,6 +3296,7 @@ class RuleMergeStore:
                     raise RuntimeError("rule_merge_proposal_definition_mismatch")
 
                 # Approval: a human merge requires a valid first-class approval.
+                approval_expected_revisions: dict[str, int] = {}
                 if approval_id:
                     approval_row = conn.execute(
                         "SELECT * FROM rule_merge_approvals WHERE approval_id=? "
@@ -2127,9 +3305,21 @@ class RuleMergeStore:
                     ).fetchone()
                     if approval_row is None:
                         raise RuntimeError("rule_merge_approval_invalid")
+                    if not str(approval_row["capability_id"] or "").startswith("admin:"):
+                        raise RuntimeError("rule_merge_approval_capability_invalid")
                     if str(approval_row["expires_at"] or "") and \
                             str(approval_row["expires_at"]) < now:
                         raise RuntimeError("rule_merge_approval_expired")
+                    if str(approval_row["approval_scope"] or "merge") != "merge":
+                        raise RuntimeError("rule_merge_approval_scope_invalid")
+                    approval_expected_revisions = {
+                        str(key): int(value)
+                        for key, value in json.loads(
+                            approval_row["expected_definition_revisions"] or "{}"
+                        ).items()
+                    }
+                elif execution_mode in {"approved", "human-approved"}:
+                    raise RuntimeError("rule_merge_approval_required")
 
                 # Lock the proposal so a concurrent merge cannot double-run.
                 conn.execute(
@@ -2141,6 +3331,10 @@ class RuleMergeStore:
                 before_bindings: list[dict[str, Any]] = []
                 original_bindings: dict[str, list[str]] = {}
                 original_evidence: dict[str, list[str]] = {}
+                original_negative_evidence: dict[str, list[str]] = {}
+                original_runtime_feedback: dict[str, list[str]] = {}
+                original_effective_projection: dict[str, dict[str, Any]] = {}
+                original_revisions: dict[str, int] = {}
                 definition_rows: dict[str, sqlite3.Row] = {}
                 all_definition_ids = [canonical_definition_id, *merged]
                 before_identities: set[str] = set()
@@ -2151,12 +3345,10 @@ class RuleMergeStore:
                     ).fetchone()
                     if row is None:
                         raise ValueError("rule_definition_not_found")
-                    if (
-                        row["status"] in {"merged", "alias", "superseded"}
-                        and definition_id != canonical_definition_id
-                    ):
+                    if row["status"] != "active":
                         raise ValueError("rule_definition_already_merged")
                     definition_rows[definition_id] = row
+                    original_revisions[definition_id] = int(row["revision"] or 0)
                     binding_rows = conn.execute(
                         "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
                         (definition_id,),
@@ -2171,6 +3363,92 @@ class RuleMergeStore:
                         (definition_id,),
                     ).fetchall()
                     original_evidence[definition_id] = [r["evidence_id"] for r in evidence_rows]
+                    negative_rows = conn.execute(
+                        "SELECT evidence_id FROM rule_negative_evidence "
+                        "WHERE definition_id=?",
+                        (definition_id,),
+                    ).fetchall()
+                    original_negative_evidence[definition_id] = [
+                        r["evidence_id"] for r in negative_rows
+                    ]
+                    runtime_rows = conn.execute(
+                        "SELECT feedback_id FROM rule_runtime_feedback "
+                        "WHERE definition_id=?",
+                        (definition_id,),
+                    ).fetchall()
+                    original_runtime_feedback[definition_id] = [
+                        r["feedback_id"] for r in runtime_rows
+                    ]
+                    projection_rows = conn.execute(
+                        "SELECT * FROM rule_effective_feedback_projection "
+                        "WHERE definition_id=?",
+                        (definition_id,),
+                    ).fetchall()
+                    for projection_row in projection_rows:
+                        original_effective_projection[projection_row["receipt_id"]] = dict(
+                            projection_row
+                        )
+
+                if set((expected_definition_revisions or {})) != set(
+                    all_definition_ids
+                ):
+                    raise RuntimeError("rule_merge_definition_snapshot_required")
+                if not expected_evidence_digest:
+                    raise RuntimeError("rule_merge_evidence_snapshot_required")
+                if not expected_negative_digest:
+                    raise RuntimeError("rule_merge_negative_snapshot_required")
+                if not expected_binding_digest:
+                    raise RuntimeError("rule_merge_binding_snapshot_required")
+                if expected_assessment_revision is None:
+                    raise RuntimeError("rule_merge_assessment_snapshot_required")
+                if not expected_policy_version:
+                    raise RuntimeError("rule_merge_policy_snapshot_required")
+
+                proposal_definition_ids = json.loads(
+                    proposal["definition_ids"] or "[]"
+                )
+                proposal_revisions = {
+                    str(proposal_definition_ids[0]): int(
+                        proposal["definition_revision_a"] or 0
+                    ),
+                    str(proposal_definition_ids[1]): int(
+                        proposal["definition_revision_b"] or 0
+                    ),
+                }
+                supplied_revisions = {
+                    str(key): int(value)
+                    for key, value in (expected_definition_revisions or {}).items()
+                }
+                if supplied_revisions != proposal_revisions:
+                    raise RuntimeError("rule_merge_definition_snapshot_mismatch")
+                if approval_expected_revisions and (
+                    approval_expected_revisions != supplied_revisions
+                ):
+                    raise RuntimeError("rule_merge_approval_snapshot_mismatch")
+                if str(expected_evidence_digest) != str(
+                    proposal["evidence_digest"] or ""
+                ):
+                    raise RuntimeError("rule_merge_evidence_snapshot_mismatch")
+                if str(expected_negative_digest) != str(
+                    proposal["negative_digest"] or ""
+                ):
+                    raise RuntimeError("rule_merge_negative_snapshot_mismatch")
+                if str(expected_binding_digest) != str(
+                    proposal["binding_digest"] or ""
+                ):
+                    raise RuntimeError("rule_merge_binding_snapshot_mismatch")
+                if str(expected_runtime_digest) != str(
+                    proposal["runtime_digest"] or ""
+                ):
+                    raise RuntimeError("rule_merge_runtime_snapshot_mismatch")
+                if int(expected_assessment_revision) != int(
+                    proposal["assessment_revision"] or 0
+                ):
+                    raise RuntimeError("rule_merge_assessment_snapshot_mismatch")
+                if str(expected_policy_version) != str(
+                    proposal["policy_version"] or ""
+                ):
+                    raise RuntimeError("rule_merge_policy_snapshot_mismatch")
 
                 # Hard gates re-computed against the *current* rows inside the
                 # transaction: strength/polarity/parameter/negative evidence.
@@ -2183,6 +3461,17 @@ class RuleMergeStore:
                     if not ok:
                         raise RuntimeError(f"rule_merge_hard_gate_regression: {gate}")
 
+                if execution_mode == "auto":
+                    if not self._conn_projection_ready(conn):
+                        raise RuntimeError("rule_merge_projection_incomplete")
+                    if not self._auto_maturity_gate(definition_rows, conn=conn):
+                        raise RuntimeError("rule_merge_maturity_gate_failed")
+                    current_readiness = self._conn_readiness(conn, definition_rows)
+                    if abs(
+                        current_readiness - float(proposal["readiness_score"] or 0.0)
+                    ) > 1e-6:
+                        raise RuntimeError("rule_merge_readiness_drift")
+
                 # Expected definition revisions: the merge runs on the exact
                 # state the approver reviewed, not a drifted one.
                 if expected_definition_revisions:
@@ -2194,6 +3483,14 @@ class RuleMergeStore:
                             expected_revision,
                         ):
                             raise RuntimeError("rule_merge_definition_revision_drift")
+                if expected_assessment_revision is not None and int(
+                    proposal["assessment_revision"] or 0
+                ) != int(expected_assessment_revision):
+                    raise RuntimeError("rule_merge_assessment_revision_drift")
+                if expected_policy_version and str(
+                    proposal["policy_version"] or ""
+                ) != str(expected_policy_version):
+                    raise RuntimeError("rule_merge_policy_version_drift")
 
                 # Expected evidence digest: reject a silently-changed evidence set.
                 if expected_evidence_digest:
@@ -2202,12 +3499,25 @@ class RuleMergeStore:
                         for definition_id in all_definition_ids
                         for eid in original_evidence[definition_id]
                     )
-                    digest = stable_hash(
-                        "rule-proposal-evidence",
-                        json.dumps(evidence_ids, ensure_ascii=False),
+                    digest = self._evidence_digest_from_ids(
+                        evidence_ids, conn=conn,
                     )
                     if digest != expected_evidence_digest:
                         raise RuntimeError("rule_merge_evidence_digest_drift")
+                if expected_negative_digest:
+                    digest = self._negative_digest(
+                        all_definition_ids, conn=conn,
+                    )
+                    if digest != expected_negative_digest:
+                        raise RuntimeError("rule_merge_negative_digest_drift")
+                if expected_binding_digest:
+                    digest = self._binding_digest(all_definition_ids, conn=conn)
+                    if digest != expected_binding_digest:
+                        raise RuntimeError("rule_merge_binding_digest_drift")
+                if expected_runtime_digest:
+                    digest = self._runtime_digest(all_definition_ids, conn=conn)
+                    if digest != expected_runtime_digest:
+                        raise RuntimeError("rule_merge_runtime_digest_drift")
 
                 # Update every merged definition's Bindings to the canonical id.
                 for definition_id in merged:
@@ -2221,10 +3531,32 @@ class RuleMergeStore:
                         (canonical_definition_id, definition_id),
                     )
                     conn.execute(
+                        "UPDATE rule_negative_evidence SET definition_id=? "
+                        "WHERE definition_id=?",
+                        (canonical_definition_id, definition_id),
+                    )
+                    conn.execute(
+                        "UPDATE rule_runtime_feedback SET definition_id=? "
+                        "WHERE definition_id=?",
+                        (canonical_definition_id, definition_id),
+                    )
+                    conn.execute(
+                        "UPDATE rule_effective_feedback_projection "
+                        "SET definition_id=? WHERE definition_id=?",
+                        (canonical_definition_id, definition_id),
+                    )
+                    conn.execute(
                         "UPDATE rule_definitions SET status='merged', superseded_by=?, "
                         "updated_at=? WHERE definition_id=?",
                         (canonical_definition_id, now, definition_id),
                     )
+                conn.execute(
+                    "UPDATE rule_definitions SET revision=revision+1, updated_at=? "
+                    "WHERE definition_id=?",
+                    (now, canonical_definition_id),
+                )
+                for definition_id in all_definition_ids:
+                    self._recompute_runtime_stats_conn(conn, definition_id)
 
                 # Scope invariance: audience identity set must be unchanged.
                 after_rows = conn.execute(
@@ -2246,7 +3578,16 @@ class RuleMergeStore:
                 migration = {
                     "original_bindings": original_bindings,
                     "original_evidence": original_evidence,
+                    "original_negative_evidence": original_negative_evidence,
+                    "original_runtime_feedback": original_runtime_feedback,
+                    "original_effective_projection": original_effective_projection,
+                    "original_revisions": original_revisions,
                 }
+                migration["execution_mode"] = execution_mode
+                migration["auto_merge"] = execution_mode == "auto"
+                migration["post_state"] = self._state_snapshot_conn(
+                    conn, all_definition_ids,
+                )
                 decision = self.record_merge_decision(
                     proposal_id=proposal_id,
                     canonical_definition_id=canonical_definition_id,
@@ -2298,7 +3639,34 @@ class RuleMergeStore:
                 migration = json.loads(row["migration"] or "{}")
                 original_bindings = migration.get("original_bindings", {})
                 original_evidence = migration.get("original_evidence", {})
+                original_negative_evidence = migration.get(
+                    "original_negative_evidence", {}
+                )
+                original_runtime_feedback = migration.get(
+                    "original_runtime_feedback", {}
+                )
+                original_effective_projection = migration.get(
+                    "original_effective_projection", {}
+                )
+                original_revisions = migration.get("original_revisions", {})
                 all_definition_ids = [canonical, *merged]
+                expected_post_state = migration.get("post_state")
+                if expected_post_state:
+                    actual_post_state = self._state_snapshot_conn(
+                        conn, all_definition_ids,
+                    )
+                    if actual_post_state != expected_post_state:
+                        conn.execute(
+                            "UPDATE rule_merge_decisions SET status='conflict' "
+                            "WHERE decision_id=?",
+                            (decision_id,),
+                        )
+                        conn.commit()
+                        return {
+                            "decision_id": decision_id,
+                            "status": "conflict",
+                            "reason": "post_merge_state_drift",
+                        }
                 # Restore binding ownership for every merged definition.
                 for definition_id, binding_ids in original_bindings.items():
                     for binding_id in binding_ids:
@@ -2313,12 +3681,55 @@ class RuleMergeStore:
                             "UPDATE rule_evidence SET definition_id=? WHERE evidence_id=?",
                             (definition_id, evidence_id),
                         )
+                for definition_id, evidence_ids in original_negative_evidence.items():
+                    for evidence_id in evidence_ids:
+                        conn.execute(
+                            "UPDATE rule_negative_evidence SET definition_id=? "
+                            "WHERE evidence_id=?",
+                            (definition_id, evidence_id),
+                        )
+                for definition_id, feedback_ids in original_runtime_feedback.items():
+                    for feedback_id in feedback_ids:
+                        conn.execute(
+                            "UPDATE rule_runtime_feedback SET definition_id=? "
+                            "WHERE feedback_id=?",
+                            (definition_id, feedback_id),
+                        )
+                for projection in original_effective_projection.values():
+                    conn.execute(
+                        """
+                        UPDATE rule_effective_feedback_projection SET
+                            effective_feedback_id=?, definition_id=?, outcome=?,
+                            positive_evidence_id=?, negative_evidence_id=?,
+                            session_trusted=?, session_source=?, updated_at=?
+                        WHERE receipt_id=?
+                        """,
+                        (
+                            projection.get("effective_feedback_id", ""),
+                            projection.get("definition_id", ""),
+                            projection.get("outcome", ""),
+                            projection.get("positive_evidence_id", ""),
+                            projection.get("negative_evidence_id", ""),
+                            int(projection.get("session_trusted", 0) or 0),
+                            projection.get("session_source", "absent"),
+                            projection.get("updated_at", ""),
+                            projection.get("receipt_id", ""),
+                        ),
+                    )
                 for definition_id in merged:
                     conn.execute(
                         "UPDATE rule_definitions SET status='active', superseded_by='', "
                         "updated_at=? WHERE definition_id=?",
                         (now, definition_id),
                     )
+                for definition_id, revision in original_revisions.items():
+                    conn.execute(
+                        "UPDATE rule_definitions SET revision=?, updated_at=? "
+                        "WHERE definition_id=?",
+                        (int(revision), now, definition_id),
+                    )
+                for definition_id in all_definition_ids:
+                    self._recompute_runtime_stats_conn(conn, definition_id)
                 # Proposal returns to candidate so a fresh evaluation can rerun.
                 conn.execute(
                     "UPDATE rule_merge_proposals SET status='candidate' "
@@ -2849,6 +4260,11 @@ class RuleMergeStore:
         if len(ordered) != 2:
             raise ValueError("rule_merge_pair_required")
         a, b = (self._row_to_definition(row) for row in ordered)
+        layers = compute_layers(a, b)
+        similarity_ok = (
+            layers.hash_score >= 1.0
+            or layers.intent_score >= INTENTION_MATCH_THRESHOLD
+        )
         strength_ok = (
             str(a.rule_strength or "") == str(b.rule_strength or "")
             and str(a.rule_strength or "") != STRENGTH_UNKNOWN
@@ -2863,6 +4279,7 @@ class RuleMergeStore:
                 "SELECT * FROM rule_negative_evidence WHERE definition_id=?",
                 (definition_row["definition_id"],),
             ).fetchall()
+            if self._evidence_row_is_eligible(row)
         ]
         positive_rows = [
             row
@@ -2871,7 +4288,10 @@ class RuleMergeStore:
                 "SELECT * FROM rule_evidence WHERE definition_id=?",
                 (definition_row["definition_id"],),
             ).fetchall()
+            if self._evidence_row_is_eligible(row)
         ]
+        negative_rows = self._dedupe_conn_rows(negative_rows)
+        positive_rows = self._dedupe_conn_rows(positive_rows)
         positive_weight = weighted_evidence_score(
             self._conn_evidence_weights(conn, positive_rows),
         )
@@ -2883,6 +4303,7 @@ class RuleMergeStore:
             < NEGATIVE_EVIDENCE_THRESHOLD
         )
         return {
+            "similarity_ok": similarity_ok,
             "strength_ok": strength_ok,
             "polarity_ok": polarity_ok,
             "parameters_ok": params_ok,
@@ -2960,7 +4381,9 @@ class RuleMergeStore:
                     "", int(ev["feedback_authority"] or 0),
                 ),
                 recency=recency_factor(days_between(ev["observed_at"] or "")),
-                evidence_confidence=float(ev["confidence"] or 0.0),
+                evidence_confidence=float(
+                    ev["confidence"] if ev["confidence"] is not None else 0.0
+                ),
             ))
         return weights
 

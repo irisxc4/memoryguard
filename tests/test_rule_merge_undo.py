@@ -61,9 +61,12 @@ def _merge(store, a, b):
     ]
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
-        evidence=pair_evidence,
+        evidence=pair_evidence, definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    store.approve_proposal(
+        proposal["proposal_id"], approved_by="admin",
+        capability_id="admin:test-suite",
+    )
     return RuleMergeService(store).merge_proposal(proposal["proposal_id"])
 
 

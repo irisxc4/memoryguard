@@ -83,6 +83,7 @@ def _seed_evidence(
             agent_instance_id=f"agent-{i}",
             project_ref=f"project-{i}",
             session_id=f"session-{i}",
+            session_trusted=True,
             content=text,
             observed_at=observed_at or _aged(60),
         ))
@@ -147,6 +148,24 @@ def evaluate() -> dict[str, object]:
             source_rule_id=source_rule_id,
         )
     _seed_reputations(intel)
+    # Auto-maturity is fail-closed on runtime provenance as well as positive
+    # evidence. Seed trusted, rule-specific executions so this scenario tests
+    # the intended cooldown/first-merge gate instead of the earlier runtime
+    # gate.
+    for definition in intel.list_definitions():
+        for i in range(20):
+            intel.upsert_runtime_feedback(
+                feedback_id=f"runtime-{definition.definition_id}-{i}",
+                definition_id=definition.definition_id,
+                receipt_id=f"receipt-{definition.definition_id}-{i}",
+                outcome="followed",
+                agent_instance_id=f"agent-{i % 3}",
+                project_ref=f"project-{i % 3}",
+                session_id=f"runtime-session-{definition.definition_id}-{i}",
+                source="user", authority=4, session_trusted=1,
+                created_at=_aged(45),
+            )
+        intel.recompute_runtime_stats(definition.definition_id)
 
     # Negative evidence on the weaker (SHOULD) pnpm definition: a real project
     # contradicts the rule, so neither it nor its MUST twin may merge.

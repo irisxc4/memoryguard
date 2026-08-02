@@ -907,6 +907,26 @@ class GovernanceEngine:
                     memory_id,
                 ),
             )
+            lifecycle_event = {
+                SharedMemoryStatus.DELETED.value: "rule_deleted",
+                SharedMemoryStatus.ACTIVE.value: "rule_restored",
+                SharedMemoryStatus.QUARANTINED.value: "rule_quarantined",
+            }.get(prospective.status.value, "rule_updated")
+            self.store._insert_rule_lifecycle_outbox(
+                conn,
+                event_type=lifecycle_event,
+                memory_id=memory_id,
+                actor="user",
+                agent_instance_id=record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={
+                    "action": action,
+                    "before_status": record.status.value,
+                    "after_status": prospective.status.value,
+                    "body_changed": body is not None,
+                },
+                created_at=now,
+            )
         after = self._state(self.store.get_record(memory_id))
         return self._finish(
             action=action,
@@ -1155,6 +1175,20 @@ class GovernanceEngine:
                     memory_id,
                 ),
             )
+            self.store._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_restored",
+                memory_id=memory_id,
+                actor="user",
+                agent_instance_id=record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={
+                    "descendants_shadowed": descendants,
+                    "before_status": record.status.value,
+                    "after_status": SharedMemoryStatus.ACTIVE.value,
+                },
+                created_at=now,
+            )
         after = self._state(self.store.get_record(memory_id))
         return self._finish(
             action="restore",
@@ -1227,6 +1261,20 @@ class GovernanceEngine:
                 ),
             )
             self.store._insert_quarantine(conn, entry)
+            self.store._insert_rule_lifecycle_outbox(
+                conn,
+                event_type="rule_quarantined",
+                memory_id=memory_id,
+                actor=actor,
+                agent_instance_id=record.agent_instance_id,
+                confidence=float(record.confidence),
+                payload={
+                    "quarantine_id": entry.quarantine_id,
+                    "manual_override": manual_override,
+                    "reason": reason,
+                },
+                created_at=now,
+            )
         after = self._state(self.store.get_record(memory_id))
         return self._finish(
             action=action,

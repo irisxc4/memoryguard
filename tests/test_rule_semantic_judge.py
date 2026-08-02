@@ -58,7 +58,8 @@ def _strong_evidence(store: RuleMergeStore, definition_id: str, content: str):
         store.upsert_evidence(build_evidence(
             definition_id=definition_id, source_rule_id=f"r-{i}",
             agent_instance_id=agent, project_ref=project,
-            session_id=f"s{i}", content=content, observed_at=_aged(60),
+            session_id=f"s{i}", session_trusted=1,
+            content=content, observed_at=_aged(60),
         ))
     for agent in ("agent-a", "agent-b", "agent-c"):
         store.upsert_agent_reputation(
@@ -215,6 +216,37 @@ def test_compute_layers_with_judge_attaches_verdict():
     assert layers.judge.source == SOURCE_DICE
 
 
+def test_judge_is_audit_only_and_cannot_replace_semantic_hash_bucket():
+    a = _def("提交代码前必须运行测试")
+    b = _def("提交代码时必须运行测试")
+
+    class AuditConflictJudge:
+        def judge(self, left, right):
+            return JudgeVerdict(
+                semantic_score=0.0, confidence=1.0, source="llm",
+                model="audit-only", recommendation=RECOMMEND_CONFLICT,
+                rationale="deliberately disagrees for audit coverage",
+            )
+
+    plain_layers = compute_layers(a, b)
+    judged_layers = compute_layers(a, b, judge=AuditConflictJudge())
+    assert judged_layers.judge is not None
+    assert judged_layers.judge.recommendation == RECOMMEND_CONFLICT
+    assert judged_layers.hash_score == plain_layers.hash_score
+    assert judged_layers.intent_score == plain_layers.intent_score
+    assert judged_layers.semantic_score == plain_layers.semantic_score
+    assert judged_layers.duplicate_score == plain_layers.duplicate_score
+
+    plain = evaluate_candidate(a, b)
+    judged = evaluate_candidate(a, b, judge=AuditConflictJudge())
+    for field in (
+        "duplicate_score", "polarity_ok", "parameters_ok", "evidence_ok",
+        "contradiction_ok", "strength_ok", "negative_ok", "can_auto_merge",
+        "reasons", "match_kind", "maturity_ok", "similarity_ok",
+    ):
+        assert getattr(judged, field) == getattr(plain, field)
+
+
 def test_judge_never_relaxes_a_hard_gate():
     # MUST vs SHOULD on the same intent is a strength conflict.  Even a judge
     # that claims "merge" cannot turn it into a mergeable candidate.
@@ -265,7 +297,10 @@ def test_judge_verdict_audited_on_proposal_and_decision(tmp_path):
     pid = proposal["proposal_id"]
     store.acknowledge_first_merge(pid, actor="human")
     store.clear_proposal_cooldown(pid)
-    result = svc.merge_proposal(pid)
+    store.approve_proposal(
+        pid, approved_by="admin", capability_id="admin:test-suite",
+    )
+    result = svc.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
     decision = result["decision"]
     assert decision["judge_source"] == SOURCE_DICE
@@ -290,8 +325,12 @@ def test_judge_verdict_audited_even_on_human_approved_merge(tmp_path):
         ))
     proposal = store.create_proposal(
         [a.definition_id, b.definition_id], 0.99,
+        definition_a=a, definition_b=b,
     )
-    store.set_proposal_status(proposal["proposal_id"], "approved")
+    store.approve_proposal(
+        proposal["proposal_id"], approved_by="admin",
+        capability_id="admin:test-suite",
+    )
     result = svc.merge_proposal(proposal["proposal_id"], actor="admin")
     assert result["ok"] is True
     assert result["decision"]["judge_source"] == SOURCE_DICE

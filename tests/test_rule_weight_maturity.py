@@ -164,7 +164,8 @@ def test_definition_maturity_uses_rule_specific_feedback(tmp_path):
         store.upsert_evidence(build_evidence(
             definition_id=definition.definition_id, source_rule_id=f"e{i}",
             agent_instance_id=f"a{i}", project_ref=f"p{i}",
-            session_id=f"s{i}", content=definition.canonical_text,
+            session_id=f"s{i}", session_trusted=True,
+            content=definition.canonical_text,
         ))
     # Even with an impeccable agent reputation, NO rule-specific feedback means
     # the definition cannot claim validated — it must not borrow the agent's
@@ -181,6 +182,7 @@ def test_definition_maturity_uses_rule_specific_feedback(tmp_path):
             feedback_id=f"rt-{i}", definition_id=definition.definition_id,
             outcome="followed", agent_instance_id=f"a{i % 3}",
             project_ref=f"p{i % 3}", session_id=f"sess-{i}",
+            session_trusted=1,
             created_at=_now_iso(), source="user", authority=4,
         )
     store.recompute_runtime_stats(definition.definition_id)
@@ -199,7 +201,8 @@ def test_proposal_persists_weight_breakdown(tmp_path):
             store.upsert_evidence(build_evidence(
                 definition_id=d.definition_id, source_rule_id=f"{d.definition_id}-{i}",
                 agent_instance_id=f"a{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", content=d.canonical_text,
+                session_id=f"s{i}", session_trusted=True,
+                content=d.canonical_text,
             ))
         store.upsert_agent_reputation(
             agent_id="a0", success_rate=0.98, rule_accuracy=0.98,

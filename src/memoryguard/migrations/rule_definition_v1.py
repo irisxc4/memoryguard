@@ -110,21 +110,45 @@ CREATE INDEX IF NOT EXISTS idx_rule_merge_decisions_proposal
 SCHEMA_VERSION = "rule-intelligence-v1"
 
 
+def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            conn.execute(statement)
+    if buffer.strip():
+        raise sqlite3.OperationalError("incomplete SQL schema statement")
+
+
+def apply_v1(conn: sqlite3.Connection) -> None:
+    """Apply v1 schema inside caller-owned transaction."""
+    _execute_sql_script_atomic(conn, RULE_INTELLIGENCE_SCHEMA)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_meta ("
+        "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (SCHEMA_VERSION, "1"),
+    )
+
+
 def migrate(db_path: str) -> dict[str, Any]:
     """Apply the Rule Intelligence v1 schema and return a migration ledger."""
     conn = sqlite3.connect(db_path)
     try:
-        conn.executescript(RULE_INTELLIGENCE_SCHEMA)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_meta ("
-            "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-        )
-        conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (SCHEMA_VERSION, "1"),
-        )
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            apply_v1(conn)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
     return {

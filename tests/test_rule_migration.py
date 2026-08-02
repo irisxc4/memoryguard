@@ -100,6 +100,7 @@ def test_backfill_synonym_rules_become_candidates_not_forced_merge(tmp_path):
                 agent_instance_id=f"agent-{i}",
                 project_ref=f"project-{i}",
                 session_id=f"session-{i}",
+                session_trusted=True,
                 content=definition.canonical_text,
             ))
     proposals = service.scan_and_propose()
