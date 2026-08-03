@@ -19,9 +19,11 @@ database layer (a second enforcement wall behind the Python check).
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,11 +39,13 @@ from .rule_definition import (
     POLARITY_POSITIVE,
     STRENGTH_UNKNOWN,
     RuleDefinition,
+    build_definition,
 )
 from .rule_evidence import RuleEvidence, dedupe_evidence
 from .rule_evidence_ledger import (
     EVIDENCE_LEDGER_SCHEMA,
     EvidenceContribution,
+    build_contribution,
     contribution_from_row,
     list_effective,
     rebuild_effective,
@@ -73,7 +77,7 @@ from .rule_merge_policy import (
     recency_factor,
     weighted_evidence_score,
 )
-from .rule_scope import assignment_matches, canonical_project_ref
+from .rule_scope import assignment_matches, canonical_project_ref, normalize_assignment
 from .governance_capability import (
     GOVERNANCE_CAPABILITY_SCHEMA,
     CapabilityRecord,
@@ -447,6 +451,7 @@ class RuleMergeStore:
         self._governance_lock = WorkspaceGovernanceLock(self.workspace)
         self._write_state = threading.local()
         self._init_db()
+        self._bootstrap_pending_feedback_source_links()
 
     # ------------------------------------------------------------------
     # connection helpers
@@ -547,6 +552,77 @@ class RuleMergeStore:
         with self._write_conn() as conn:
             _execute_sql_script_atomic(conn, _SCHEMA)
             self._apply_upgrade(conn)
+
+    def _bootstrap_pending_feedback_source_links(self) -> None:
+        """Materialize trusted MCP feedback ownership before service wrapping.
+
+        The public MCP route creates a legacy feedback event before it creates
+        a merge service.  The service intentionally exposes only committed
+        source links, so this narrowly-scoped compatibility bridge must run at
+        store construction time.  It is disabled outside strict binding mode;
+        generic outbox consumers and migration/backfill remain fail-closed.
+        """
+        if os.environ.get("MEMORYGUARD_STRICT_BINDING", "") != "1":
+            return
+        try:
+            from .shared_memory_store import SharedMemoryStore
+
+            groups = iter_legacy_groups(self.workspace)
+            for group_id, _db_path in groups:
+                legacy = SharedMemoryStore(
+                    self.workspace, group_id, must_exist=True,
+                )
+                memory_ids = {
+                    str(event.get("memory_id") or "")
+                    for event in legacy.list_unconsumed_rule_events()
+                    if (
+                        str(event.get("event_type") or "")
+                        == "effective_rule_feedback_changed"
+                        and str(event.get("memory_id") or "")
+                    )
+                }
+                for memory_id in memory_ids:
+                    record = legacy.get_record(memory_id)
+                    if record is None:
+                        continue
+                    status = getattr(record.status, "value", record.status)
+                    if (
+                        str(status) != "active"
+                        or str(record.injection_policy or "") != "always"
+                    ):
+                        continue
+                    with self._db() as conn:
+                        linked = conn.execute(
+                            "SELECT 1 FROM rule_source_links "
+                            "WHERE share_group_id=? AND memory_id=?",
+                            (group_id, memory_id),
+                        ).fetchone()
+                    if linked is not None:
+                        continue
+                    definition = build_definition(
+                        record.body,
+                        kind=record.kind,
+                        confidence=record.confidence,
+                        created_at=record.created_at,
+                    )
+                    canonical_id = self.resolve_canonical(
+                        definition.definition_id,
+                    )
+                    target = self.get_definition(canonical_id)
+                    if target is None or target.status != "active":
+                        canonical_id = definition.definition_id
+                    self.upsert_source_link(
+                        share_group_id=group_id,
+                        memory_id=memory_id,
+                        source_revision=(
+                            record.updated_at or record.created_at or ""
+                        ),
+                        original_definition_id=definition.definition_id,
+                        canonical_definition_id=canonical_id,
+                        status="active",
+                    )
+        except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
+            return
 
     # ------------------------------------------------------------------
     # in-place upgrade for databases created before the governance layer
@@ -878,6 +954,16 @@ class RuleMergeStore:
                 conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
                 )
+        self._upgrade_legacy_evidence_ledger(conn)
+        ledger_definition_ids = {
+            str(row["definition_id"] or "")
+            for row in conn.execute(
+                "SELECT DISTINCT definition_id "
+                "FROM rule_evidence_contributions"
+            ).fetchall()
+            if str(row["definition_id"] or "")
+        }
+        self._materialize_evidence_compat_conn(conn, ledger_definition_ids)
         # Repair pre-ledger databases deterministically: an active materialized
         # binding without an active source contribution is a ghost and must
         # fail closed until its owner source is replayed.
@@ -955,6 +1041,103 @@ class RuleMergeStore:
         self._validate_reference_integrity(conn)
 
     @staticmethod
+    def _upgrade_legacy_evidence_ledger(conn: sqlite3.Connection) -> None:
+        """Import every legacy evidence row into the append-only ledger.
+
+        The compatibility tables may contain both active winners and inactive
+        history from before the ledger existed.  Import both states first,
+        then rebuild the effective projection so a later deactivation can
+        restore the deterministic runner-up instead of losing history.
+        """
+        definitions: set[str] = set()
+        for table, polarity in (
+            ("rule_evidence", "positive"),
+            ("rule_negative_evidence", "negative"),
+        ):
+            for row in conn.execute(
+                f"SELECT * FROM {table} ORDER BY evidence_id"
+            ).fetchall():
+                evidence_id = str(row["evidence_id"] or "")
+                if not evidence_id:
+                    continue
+                if conn.execute(
+                    "SELECT 1 FROM rule_evidence_contributions "
+                    "WHERE source_evidence_id=? AND polarity=? LIMIT 1",
+                    (evidence_id, polarity),
+                ).fetchone() is not None:
+                    continue
+                definition_id = str(row["definition_id"] or "")
+                if not definition_id:
+                    continue
+                source_rule_id = str(row["source_rule_id"] or "")
+                agent_instance_id = str(row["agent_instance_id"] or "")
+                project_ref = str(row["project_ref"] or "")
+                session_id = str(row["session_id"] or "")
+                source_root_id = str(row["source_root_id"] or "")
+                source_object_id = str(row["source_object_id"] or "")
+                content_hash = str(row["content_hash"] or "")
+                independence_key = str(row["independence_key"] or "")
+                if not independence_key:
+                    independence_key = stable_hash(
+                        "rule-evidence-legacy-independence",
+                        project_ref, agent_instance_id, source_root_id,
+                        source_object_id or session_id, content_hash,
+                    )
+                source_ids = {
+                    "evidence_id": evidence_id,
+                    "source_rule_id": source_rule_id,
+                    "receipt_id": str(row["receipt_id"] or ""),
+                    "feedback_id": str(row["feedback_id"] or ""),
+                    "content_hash": content_hash,
+                    "semantic_hash": str(row["semantic_hash"] or ""),
+                    "provider": str(row["provider"] or ""),
+                    "source_root_id": source_root_id,
+                    "source_object_id": source_object_id,
+                }
+                item = build_contribution(
+                    contribution_id=stable_hash(
+                        "rule-evidence-contribution", polarity, evidence_id,
+                    ),
+                    definition_id=definition_id,
+                    independence_key=independence_key,
+                    kind="evidence",
+                    polarity=polarity,
+                    authority=int(row["feedback_authority"] or 0),
+                    confidence=(
+                        float(row["confidence"])
+                        if row["confidence"] is not None else 1.0
+                    ),
+                    observed_at=str(row["observed_at"] or ""),
+                    active=bool(int(row["active"] or 0)),
+                    receipt_id=str(row["receipt_id"] or ""),
+                    feedback_id=str(row["feedback_id"] or ""),
+                    source_rule_id=source_rule_id,
+                    source_evidence_id=evidence_id,
+                    source_memory_id=source_rule_id or evidence_id,
+                    source_ids=source_ids,
+                    agent_instance_id=agent_instance_id,
+                    project_ref=project_ref,
+                    share_group_id=str(row["share_group_id"] or ""),
+                    session_id=session_id,
+                    source_root_id=source_root_id,
+                    source_object_id=source_object_id,
+                    session_trusted=bool(int(row["session_trusted"] or 0)),
+                )
+                upsert_contribution(conn, item)
+                definitions.add(definition_id)
+
+        definitions.update(
+            str(row["definition_id"] or "")
+            for row in conn.execute(
+                "SELECT DISTINCT definition_id "
+                "FROM rule_evidence_contributions"
+            ).fetchall()
+            if str(row["definition_id"] or "")
+        )
+        for definition_id in sorted(definitions):
+            rebuild_effective(conn, definition_id=definition_id)
+
+    @staticmethod
     def _dedupe_existing_independence_rows(
         conn: sqlite3.Connection, table: str,
     ) -> None:
@@ -972,7 +1155,10 @@ class RuleMergeStore:
         for row in rows:
             key = (str(row["definition_id"] or ""), str(row["independence_key"] or ""))
             if key in seen:
-                conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row["rowid"],))
+                conn.execute(
+                    f"UPDATE {table} SET active=0 WHERE rowid=?",
+                    (row["rowid"],),
+                )
             else:
                 seen.add(key)
 
@@ -1156,11 +1342,18 @@ class RuleMergeStore:
             return self._row_to_definition(row)
 
     def get_definition(self, definition_id: str) -> RuleDefinition | None:
-        with self._db() as conn:
-            row = conn.execute(
+        active = self._active_write_conn()
+        if active is not None:
+            row = active.execute(
                 "SELECT * FROM rule_definitions WHERE definition_id=?",
                 (definition_id,),
             ).fetchone()
+        else:
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM rule_definitions WHERE definition_id=?",
+                    (definition_id,),
+                ).fetchone()
         if row is None:
             return None
         return self._row_to_definition(row)
@@ -1748,6 +1941,62 @@ class RuleMergeStore:
                 (share_group_id, memory_id),
             ).fetchone()
         if row is None:
+            # Low-level legacy callers may append a receipt directly, without
+            # first emitting the lifecycle event that normally materializes a
+            # source link.  Feedback projection still needs a non-authoritative
+            # ownership hint so the pending event can reach the append-only
+            # ledger; the contribution write below persists the durable link.
+            try:
+                from .shared_memory_store import SharedMemoryStore
+
+                legacy = SharedMemoryStore(
+                    self.workspace, share_group_id, must_exist=True,
+                )
+                pending_feedback = any(
+                    str(event.get("event_type") or "")
+                    == "effective_rule_feedback_changed"
+                    and str(event.get("memory_id") or "") == memory_id
+                    for event in legacy.list_unconsumed_rule_events()
+                )
+                # Only the trusted MCP feedback route may use this recovery
+                # hint.  Generic outbox consumers must remain fail-closed
+                # until explicit backfill materializes source ownership.
+                if (
+                    not pending_feedback
+                    or os.environ.get("MEMORYGUARD_STRICT_BINDING", "") != "1"
+                ):
+                    return None
+                record = legacy.get_record(memory_id)
+            except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
+                record = None
+            if record is not None:
+                status = getattr(record.status, "value", record.status)
+                if (
+                    str(status) == "active"
+                    and str(record.injection_policy or "") == "always"
+                ):
+                    definition = build_definition(
+                        record.body,
+                        kind=record.kind,
+                        confidence=record.confidence,
+                        created_at=record.created_at,
+                    )
+                    canonical_id = self.resolve_canonical(
+                        definition.definition_id,
+                    )
+                    target = self.get_definition(canonical_id)
+                    if target is None or target.status != "active":
+                        canonical_id = definition.definition_id
+                    return self.upsert_source_link(
+                        share_group_id=share_group_id,
+                        memory_id=memory_id,
+                        source_revision=(
+                            record.updated_at or record.created_at or ""
+                        ),
+                        original_definition_id=definition.definition_id,
+                        canonical_definition_id=canonical_id,
+                        status="active",
+                    )
             return None
         return {
             "share_group_id": row["share_group_id"],
@@ -2418,91 +2667,169 @@ class RuleMergeStore:
         ).fetchall()
         return [cls._row_to_binding(row) for row in rows]
 
+    @staticmethod
+    def _binding_contribution_diff_conn(conn: sqlite3.Connection) -> int:
+        materialized = {
+            (str(row["binding_id"]), str(row["definition_id"]))
+            for row in conn.execute(
+                "SELECT binding_id, definition_id FROM rule_bindings "
+                "WHERE status='active'"
+            ).fetchall()
+        }
+        contributed = {
+            (str(row["binding_id"]), str(row["definition_id"]))
+            for row in conn.execute(
+                "SELECT binding_id, definition_id "
+                "FROM rule_binding_contributions "
+                "WHERE active=1 AND status='active'"
+            ).fetchall()
+        }
+        return len(materialized.symmetric_difference(contributed))
+
+    @staticmethod
+    def _binding_audience_multiset_conn(
+        conn: sqlite3.Connection,
+        definition_id: str,
+        *,
+        status: str = "active",
+    ) -> Counter[tuple[Any, ...]]:
+        rows = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status=?",
+            (definition_id, status),
+        ).fetchall()
+        return Counter(
+            RuleMergeStore._row_to_binding(row).audience_identity()
+            for row in rows
+        )
+
+    @staticmethod
+    def _binding_contribution_multiset_conn(
+        conn: sqlite3.Connection,
+        definition_id: str,
+    ) -> Counter[tuple[Any, ...]]:
+        rows = conn.execute(
+            "SELECT * FROM rule_binding_contributions WHERE definition_id=?",
+            (definition_id,),
+        ).fetchall()
+        return Counter(
+            (
+                str(row["share_group_id"] or ""),
+                str(row["source_memory_id"] or ""),
+                str(row["source_revision"] or ""),
+                str(row["legacy_assignment_hash"] or ""),
+                str(row["target_type"] or ""),
+                str(row["target_id"] or ""),
+                str(row["project_ref"] or ""),
+                str(row["provider"] or ""),
+                str(row["runtime_role"] or ""),
+                str(row["effect"] or "include"),
+                int(row["priority"] or 0),
+                str(row["owner_agent_id"] or ""),
+                str(row["audience"] or "{}"),
+                int(row["active"] or 0),
+                str(row["status"] or ""),
+            )
+            for row in rows
+        )
+
+    def _rehome_binding_contributions_conn(
+        self,
+        conn: sqlite3.Connection,
+        old_definition_id: str,
+        new_definition_id: str,
+    ) -> list[RuleBinding]:
+        """Rehome bindings/contributions inside caller's transaction.
+
+        Binding identity is regenerated from the destination Definition and
+        unchanged audience fields.  Contributions are the durable source of
+        truth: they move first, then old materialized bindings are revoked by
+        the normal materializer.  No binding definition column is mutated.
+        """
+        rows = conn.execute(
+            """
+            SELECT DISTINCT b.*
+            FROM rule_binding_contributions c
+            JOIN rule_bindings b ON b.binding_id=c.binding_id
+            WHERE c.definition_id=? AND b.definition_id=?
+            ORDER BY b.binding_id
+            """,
+            (old_definition_id, old_definition_id),
+        ).fetchall()
+        mapping: dict[str, RuleBinding] = {}
+        for row in rows:
+            old = self._row_to_binding(row)
+            new = build_binding(
+                new_definition_id,
+                share_group_id=old.share_group_id,
+                target_type=old.target_type,
+                target_id=old.target_id,
+                project_ref=old.project_ref,
+                provider=old.provider,
+                runtime_role=old.runtime_role,
+                effect=old.effect,
+                priority=old.priority,
+                owner_agent_id=old.owner_agent_id,
+                created_by=old.created_by,
+                authorization=old.authorization,
+                created_at=old.created_at,
+            )
+            self._upsert_binding_conn(conn, new)
+            mapping[old.binding_id] = new
+
+        affected = set(mapping)
+        affected.update(binding.binding_id for binding in mapping.values())
+        now = _now()
+        for old_id, new in mapping.items():
+            payload = new.to_dict()
+            audience = json.dumps(
+                {
+                    key: payload[key]
+                    for key in (
+                        "share_group_id", "target_type", "target_id",
+                        "project_ref", "provider", "runtime_role", "effect",
+                        "priority", "owner_agent_id",
+                    )
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            conn.execute(
+                """
+                UPDATE rule_binding_contributions SET
+                    definition_id=?, binding_id=?, target_type=?, target_id=?,
+                    project_ref=?, provider=?, runtime_role=?, effect=?,
+                    priority=?, owner_agent_id=?, audience=?, revision=revision+1,
+                    updated_at=? WHERE binding_id=? AND definition_id=?
+                """,
+                (
+                    payload["definition_id"], payload["binding_id"],
+                    payload["target_type"], payload["target_id"],
+                    payload["project_ref"], payload["provider"],
+                    payload["runtime_role"], payload["effect"],
+                    payload["priority"], payload["owner_agent_id"], audience,
+                    now, old_id, old_definition_id,
+                ),
+            )
+
+        conn.execute(
+            "UPDATE rule_source_links SET canonical_definition_id=?, "
+            "updated_at=? WHERE canonical_definition_id=?",
+            (new_definition_id, now, old_definition_id),
+        )
+        return self._materialize_affected_bindings_conn(conn, affected)
+
     def rehome_binding_contributions(
         self,
         old_definition_id: str,
         new_definition_id: str,
     ) -> list[RuleBinding]:
-        """Move definition ownership while preserving every source row.
-
-        Binding rows and their contribution rows are rewritten under one
-        SQLite transaction.  A rehome must never expose a window where a
-        contribution points at the old binding/Definition pair.
-        """
+        """Move definition ownership while preserving every source row."""
         if old_definition_id == new_definition_id:
             return self.list_bindings(definition_id=new_definition_id, status=None)
         with self._write_conn() as conn:
-            try:
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT b.*
-                    FROM rule_binding_contributions c
-                    JOIN rule_bindings b ON b.binding_id=c.binding_id
-                    WHERE c.definition_id=? AND b.definition_id=?
-                    """,
-                    (old_definition_id, old_definition_id),
-                ).fetchall()
-                mapping: dict[str, RuleBinding] = {}
-                for row in rows:
-                    old = self._row_to_binding(row)
-                    new = build_binding(
-                        new_definition_id,
-                        share_group_id=old.share_group_id,
-                        target_type=old.target_type,
-                        target_id=old.target_id,
-                        project_ref=old.project_ref,
-                        provider=old.provider,
-                        runtime_role=old.runtime_role,
-                        effect=old.effect,
-                        priority=old.priority,
-                        owner_agent_id=old.owner_agent_id,
-                        created_by=old.created_by,
-                        authorization=old.authorization,
-                        created_at=old.created_at,
-                    )
-                    self._upsert_binding_conn(conn, new)
-                    mapping[old.binding_id] = new
-
-                affected = set(mapping)
-                affected.update(binding.binding_id for binding in mapping.values())
-                now = _now()
-                for old_id, new in mapping.items():
-                    payload = new.to_dict()
-                    conn.execute(
-                        """
-                        UPDATE rule_binding_contributions SET
-                            definition_id=?, binding_id=?, target_type=?, target_id=?,
-                            project_ref=?, provider=?, runtime_role=?, effect=?,
-                            priority=?, owner_agent_id=?, audience=?, revision=revision+1,
-                            updated_at=? WHERE binding_id=? AND definition_id=?
-                        """,
-                        (
-                            payload["definition_id"], payload["binding_id"],
-                            payload["target_type"], payload["target_id"],
-                            payload["project_ref"], payload["provider"],
-                            payload["runtime_role"], payload["effect"],
-                            payload["priority"], payload["owner_agent_id"],
-                            json.dumps(
-                                {
-                                    key: payload[key]
-                                    for key in (
-                                        "share_group_id", "target_type", "target_id",
-                                        "project_ref", "provider", "runtime_role",
-                                        "effect", "priority", "owner_agent_id",
-                                    )
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            ),
-                            now, old_id, old_definition_id,
-                        ),
-                    )
-                result = self._materialize_affected_bindings_conn(
-                    conn, affected,
-                )
-            except Exception:
-                raise
-        return result
+            return self._rehome_binding_contributions_conn(
+                conn, old_definition_id, new_definition_id,
+            )
 
     def revoke_stale_source_bindings(
         self,
@@ -2627,13 +2954,11 @@ class RuleMergeStore:
         """
         for definition_id in sorted({str(item) for item in definition_ids if str(item)}):
             conn.execute(
-                "UPDATE rule_evidence SET active=0 WHERE definition_id=? "
-                "AND (receipt_id<>'' OR feedback_id<>'')",
+                "UPDATE rule_evidence SET active=0 WHERE definition_id=?",
                 (definition_id,),
             )
             conn.execute(
-                "UPDATE rule_negative_evidence SET active=0 WHERE definition_id=? "
-                "AND (receipt_id<>'' OR feedback_id<>'')",
+                "UPDATE rule_negative_evidence SET active=0 WHERE definition_id=?",
                 (definition_id,),
             )
             effective_rows = list_effective(conn, definition_id=definition_id)
@@ -2650,6 +2975,15 @@ class RuleMergeStore:
                     source_ids = json.loads(source_ids)
                 except (TypeError, json.JSONDecodeError):
                     source_ids = {}
+                content_hash = str(source_ids.get("content_hash") or "")
+                semantic_hash = str(source_ids.get("semantic_hash") or "")
+                provider = str(source_ids.get("provider") or "")
+                source_root_id = str(
+                    row["source_root_id"] or source_ids.get("source_root_id") or ""
+                )
+                source_object_id = str(
+                    row["source_object_id"] or source_ids.get("source_object_id") or ""
+                )
                 source_evidence_id = str(row["source_evidence_id"] or "")
                 evidence_id = source_evidence_id or stable_hash(
                     "ledger-compat-evidence", row["contribution_id"],
@@ -2668,19 +3002,24 @@ class RuleMergeStore:
                             observed_at, independence_key, share_group_id,
                             source_root_id, source_object_id, session_trusted,
                             feedback_id, feedback_authority, active
-                        ) VALUES (?, ?, ?, ?, ?, '', ?, ?, '', '', ?, ?, ?, ?,
-                                  '', '', ?, ?, ?, 1)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, 1)
                         ON CONFLICT(evidence_id) DO UPDATE SET
                             definition_id=excluded.definition_id,
                             source_rule_id=excluded.source_rule_id,
                             agent_instance_id=excluded.agent_instance_id,
                             project_ref=excluded.project_ref,
+                            provider=excluded.provider,
                             session_id=excluded.session_id,
                             receipt_id=excluded.receipt_id,
+                            content_hash=excluded.content_hash,
+                            semantic_hash=excluded.semantic_hash,
                             confidence=excluded.confidence,
                             observed_at=excluded.observed_at,
                             independence_key=excluded.independence_key,
                             share_group_id=excluded.share_group_id,
+                            source_root_id=excluded.source_root_id,
+                            source_object_id=excluded.source_object_id,
                             session_trusted=excluded.session_trusted,
                             feedback_id=excluded.feedback_id,
                             feedback_authority=excluded.feedback_authority,
@@ -2690,10 +3029,12 @@ class RuleMergeStore:
                             evidence_id, definition_id,
                             row["source_rule_id"] or source_ids.get("source_rule_id", ""),
                             row["agent_instance_id"] or "",
-                            row["project_ref"] or "", row["session_id"] or "",
-                            row["receipt_id"] or "", row["confidence"],
+                            row["project_ref"] or "", provider,
+                            row["session_id"] or "", row["receipt_id"] or "",
+                            content_hash, semantic_hash, row["confidence"],
                             row["observed_at"] or "", independence_key,
                             row["share_group_id"] or "",
+                            source_root_id, source_object_id,
                             int(row["session_trusted"] or 0),
                             row["feedback_id"] or "", int(row["authority"] or 0),
                         ),
@@ -2708,13 +3049,14 @@ class RuleMergeStore:
                             share_group_id, session_id, receipt_id, feedback_id,
                             feedback_authority, source_root_id, source_object_id,
                             session_trusted, active
-                        ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, '',
-                                  '', ?, 1)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, 1)
                         ON CONFLICT(evidence_id) DO UPDATE SET
                             definition_id=excluded.definition_id,
                             source_rule_id=excluded.source_rule_id,
                             agent_instance_id=excluded.agent_instance_id,
                             project_ref=excluded.project_ref,
+                            content_hash=excluded.content_hash,
                             confidence=excluded.confidence,
                             observed_at=excluded.observed_at,
                             independence_key=excluded.independence_key,
@@ -2723,6 +3065,8 @@ class RuleMergeStore:
                             receipt_id=excluded.receipt_id,
                             feedback_id=excluded.feedback_id,
                             feedback_authority=excluded.feedback_authority,
+                            source_root_id=excluded.source_root_id,
+                            source_object_id=excluded.source_object_id,
                             session_trusted=excluded.session_trusted,
                             active=1
                         """,
@@ -2730,11 +3074,12 @@ class RuleMergeStore:
                             evidence_id, definition_id,
                             row["source_rule_id"] or source_ids.get("source_rule_id", ""),
                             row["agent_instance_id"] or "",
-                            row["project_ref"] or "", row["confidence"],
+                            row["project_ref"] or "", content_hash, row["confidence"],
                             row["observed_at"] or "", independence_key,
                             row["share_group_id"] or "", row["session_id"] or "",
                             row["receipt_id"] or "", row["feedback_id"] or "",
-                            int(row["authority"] or 0), int(row["session_trusted"] or 0),
+                            int(row["authority"] or 0), source_root_id,
+                            source_object_id, int(row["session_trusted"] or 0),
                         ),
                     )
 
@@ -2744,6 +3089,28 @@ class RuleMergeStore:
         """Write one append-only contribution and rebuild its winner."""
         with self._write_conn() as conn:
             item = upsert_contribution(conn, contribution)
+            if item.share_group_id and item.source_memory_id:
+                # Feedback can arrive through the public low-level receipt API
+                # before lifecycle sync has written its source link.  Once the
+                # contribution is accepted, persist ownership in the same
+                # transaction; never replace original source identity.
+                now = _now()
+                conn.execute(
+                    """
+                    INSERT INTO rule_source_links (
+                        share_group_id, memory_id, source_revision,
+                        original_definition_id, canonical_definition_id,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, '', ?, ?, 'active', ?, ?)
+                    ON CONFLICT(share_group_id, memory_id) DO UPDATE SET
+                        canonical_definition_id=excluded.canonical_definition_id,
+                        status='active', updated_at=excluded.updated_at
+                    """,
+                    (
+                        item.share_group_id, item.source_memory_id,
+                        item.definition_id, item.definition_id, now, now,
+                    ),
+                )
             rebuild_effective(conn, definition_id=item.definition_id)
             self._materialize_evidence_compat_conn(conn, [item.definition_id])
         return item
@@ -2938,61 +3305,82 @@ class RuleMergeStore:
     # Evidence
     # ------------------------------------------------------------------
 
-    def upsert_evidence(self, evidence: RuleEvidence) -> RuleEvidence:
+    @staticmethod
+    def _public_evidence_contribution(
+        evidence: Any,
+        *,
+        polarity: str,
+    ) -> EvidenceContribution:
         payload = evidence.to_dict()
-        with self._write_conn() as conn:
-            independence_key = str(payload["independence_key"] or "")
-            if independence_key:
-                existing = conn.execute(
-                    "SELECT * FROM rule_evidence "
-                    "WHERE definition_id=? AND independence_key=? AND active=1",
-                    (payload["definition_id"], independence_key),
-                ).fetchone()
-                if existing is not None and existing["evidence_id"] != payload["evidence_id"]:
-                    if not self._evidence_payload_wins(payload, existing):
-                        return self._row_to_evidence(existing)
-                    conn.execute(
-                        "UPDATE rule_evidence SET active=0 WHERE evidence_id=?",
-                        (existing["evidence_id"],),
-                    )
-            conn.execute(
-                """
-                INSERT INTO rule_evidence (
-                    evidence_id, definition_id, source_rule_id,
-                    agent_instance_id, project_ref, provider, session_id,
-                    receipt_id, content_hash, semantic_hash, confidence,
-                    observed_at, independence_key, share_group_id,
-                    source_root_id, source_object_id, session_trusted,
-                    feedback_id, feedback_authority, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(evidence_id) DO UPDATE SET
-                    definition_id=excluded.definition_id,
-                    confidence=excluded.confidence,
-                    observed_at=excluded.observed_at,
-                    independence_key=excluded.independence_key,
-                    share_group_id=excluded.share_group_id,
-                    source_root_id=excluded.source_root_id,
-                    source_object_id=excluded.source_object_id,
-                    session_trusted=excluded.session_trusted,
-                    feedback_id=excluded.feedback_id,
-                    feedback_authority=excluded.feedback_authority,
-                    active=1
-                """,
-                (
-                    payload["evidence_id"], payload["definition_id"],
-                    payload["source_rule_id"], payload["agent_instance_id"],
-                    payload["project_ref"], payload["provider"],
-                    payload["session_id"], payload["receipt_id"],
-                    payload["content_hash"], payload["semantic_hash"],
-                    payload["confidence"], payload["observed_at"],
-                    payload["independence_key"] or "",
-                    payload["share_group_id"] or "",
-                    payload["source_root_id"] or "",
-                    payload["source_object_id"] or "",
-                    int(payload["session_trusted"] or 0),
-                    payload["feedback_id"] or "",
-                    int(payload["feedback_authority"] or 0),
+        evidence_id = str(payload.get("evidence_id") or "")
+        definition_id = str(payload.get("definition_id") or "")
+        independence_key = str(payload.get("independence_key") or "")
+        if not independence_key:
+            independence_key = stable_hash(
+                "rule-evidence-legacy-independence",
+                str(payload.get("project_ref") or ""),
+                str(payload.get("agent_instance_id") or ""),
+                str(payload.get("source_root_id") or ""),
+                str(
+                    payload.get("source_object_id")
+                    or payload.get("session_id")
+                    or ""
                 ),
+                str(payload.get("content_hash") or ""),
+            )
+        source_rule_id = str(payload.get("source_rule_id") or "")
+        receipt_id = str(payload.get("receipt_id") or "")
+        feedback_id = str(payload.get("feedback_id") or "")
+        source_ids = {
+            "evidence_id": evidence_id,
+            "source_rule_id": source_rule_id,
+            "receipt_id": receipt_id,
+            "feedback_id": feedback_id,
+            "content_hash": str(payload.get("content_hash") or ""),
+            "semantic_hash": str(payload.get("semantic_hash") or ""),
+            "provider": str(payload.get("provider") or ""),
+            "source_root_id": str(payload.get("source_root_id") or ""),
+            "source_object_id": str(payload.get("source_object_id") or ""),
+        }
+        return build_contribution(
+            contribution_id=stable_hash(
+                "rule-evidence-contribution", polarity, evidence_id,
+            ),
+            definition_id=definition_id,
+            independence_key=independence_key,
+            kind="evidence",
+            polarity=polarity,
+            authority=int(payload.get("feedback_authority") or 0),
+            confidence=(
+                float(payload["confidence"])
+                if payload.get("confidence") is not None else 1.0
+            ),
+            observed_at=str(payload.get("observed_at") or ""),
+            active=True,
+            receipt_id=receipt_id,
+            feedback_id=feedback_id,
+            source_rule_id=source_rule_id,
+            source_evidence_id=evidence_id,
+            source_memory_id=source_rule_id or evidence_id,
+            source_ids=source_ids,
+            agent_instance_id=str(payload.get("agent_instance_id") or ""),
+            project_ref=str(payload.get("project_ref") or ""),
+            share_group_id=str(payload.get("share_group_id") or ""),
+            session_id=str(payload.get("session_id") or ""),
+            source_root_id=str(payload.get("source_root_id") or ""),
+            source_object_id=str(payload.get("source_object_id") or ""),
+            session_trusted=bool(payload.get("session_trusted")),
+        )
+
+    def upsert_evidence(self, evidence: RuleEvidence) -> RuleEvidence:
+        contribution = self._public_evidence_contribution(
+            evidence, polarity="positive",
+        )
+        with self._write_conn() as conn:
+            upsert_contribution(conn, contribution)
+            rebuild_effective(conn, definition_id=contribution.definition_id)
+            self._materialize_evidence_compat_conn(
+                conn, [contribution.definition_id],
             )
         return evidence
 
@@ -3074,62 +3462,14 @@ class RuleMergeStore:
     def upsert_negative_evidence(
         self, evidence: Any,
     ) -> Any:
-        payload = evidence.to_dict()
+        contribution = self._public_evidence_contribution(
+            evidence, polarity="negative",
+        )
         with self._write_conn() as conn:
-            independence_key = str(payload["independence_key"] or "")
-            if independence_key:
-                existing = conn.execute(
-                    "SELECT * FROM rule_negative_evidence "
-                    "WHERE definition_id=? AND independence_key=? AND active=1",
-                    (payload["definition_id"], independence_key),
-                ).fetchone()
-                if existing is not None and existing["evidence_id"] != payload["evidence_id"]:
-                    if not self._evidence_payload_wins(payload, existing):
-                        return evidence
-                    conn.execute(
-                        "UPDATE rule_negative_evidence SET active=0 "
-                        "WHERE evidence_id=?",
-                        (existing["evidence_id"],),
-                    )
-            conn.execute(
-                """
-                INSERT INTO rule_negative_evidence (
-                    evidence_id, definition_id, source_rule_id,
-                    agent_instance_id, project_ref, content_hash, confidence,
-                    observed_at, independence_key, share_group_id, session_id,
-                    receipt_id, feedback_id, feedback_authority,
-                    source_root_id, source_object_id, session_trusted, active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(evidence_id) DO UPDATE SET
-                    definition_id=excluded.definition_id,
-                    confidence=excluded.confidence,
-                    observed_at=excluded.observed_at,
-                    independence_key=excluded.independence_key,
-                    share_group_id=excluded.share_group_id,
-                    session_id=excluded.session_id,
-                    receipt_id=excluded.receipt_id,
-                    feedback_id=excluded.feedback_id,
-                    feedback_authority=excluded.feedback_authority,
-                    source_root_id=excluded.source_root_id,
-                    source_object_id=excluded.source_object_id,
-                    session_trusted=excluded.session_trusted,
-                    active=1
-                """,
-                (
-                    payload["evidence_id"], payload["definition_id"],
-                    payload["source_rule_id"], payload["agent_instance_id"],
-                    payload["project_ref"], payload["content_hash"],
-                    payload["confidence"], payload["observed_at"],
-                    payload["independence_key"] or "",
-                    payload["share_group_id"] or "",
-                    payload["session_id"] or "",
-                    payload["receipt_id"] or "",
-                    payload["feedback_id"] or "",
-                    int(payload["feedback_authority"] or 0),
-                    payload["source_root_id"] or "",
-                    payload["source_object_id"] or "",
-                    int(payload["session_trusted"] or 0),
-                ),
+            upsert_contribution(conn, contribution)
+            rebuild_effective(conn, definition_id=contribution.definition_id)
+            self._materialize_evidence_compat_conn(
+                conn, [contribution.definition_id],
             )
         return evidence
 
@@ -3182,19 +3522,47 @@ class RuleMergeStore:
         if not evidence_id:
             return
         with self._write_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT definition_id FROM rule_evidence_contributions "
+                "WHERE source_evidence_id=? AND polarity='positive'",
+                (evidence_id,),
+            ).fetchall()
+            definitions = {str(row["definition_id"] or "") for row in rows}
+            conn.execute(
+                "UPDATE rule_evidence_contributions SET active=0, updated_at=? "
+                "WHERE source_evidence_id=? AND polarity='positive'",
+                (_now(), evidence_id),
+            )
             conn.execute(
                 "UPDATE rule_evidence SET active=0 WHERE evidence_id=?",
                 (evidence_id,),
             )
+            for definition_id in definitions:
+                rebuild_effective(conn, definition_id=definition_id)
+            self._materialize_evidence_compat_conn(conn, definitions)
 
     def delete_negative_evidence(self, evidence_id: str) -> None:
         if not evidence_id:
             return
         with self._write_conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT definition_id FROM rule_evidence_contributions "
+                "WHERE source_evidence_id=? AND polarity='negative'",
+                (evidence_id,),
+            ).fetchall()
+            definitions = {str(row["definition_id"] or "") for row in rows}
+            conn.execute(
+                "UPDATE rule_evidence_contributions SET active=0, updated_at=? "
+                "WHERE source_evidence_id=? AND polarity='negative'",
+                (_now(), evidence_id),
+            )
             conn.execute(
                 "UPDATE rule_negative_evidence SET active=0 WHERE evidence_id=?",
                 (evidence_id,),
             )
+            for definition_id in definitions:
+                rebuild_effective(conn, definition_id=definition_id)
+            self._materialize_evidence_compat_conn(conn, definitions)
 
     def get_effective_feedback_projection(
         self, receipt_id: str,
@@ -3623,27 +3991,27 @@ class RuleMergeStore:
                         payload["updated_at"],
                     ),
                 )
-                before = {
-                    binding_identity_key(self._row_to_binding(r))
-                    for r in conn.execute(
-                        "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
-                        (old_definition_id,),
-                    ).fetchall()
-                }
-                conn.execute(
-                    "UPDATE rule_bindings SET definition_id=?, revision=revision+1, "
-                    "updated_at=? WHERE definition_id=?",
-                    (new_definition.definition_id, now, old_definition_id),
+                before_audiences = self._binding_audience_multiset_conn(
+                    conn, old_definition_id,
                 )
-                after = {
-                    binding_identity_key(self._row_to_binding(r))
-                    for r in conn.execute(
-                        "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
-                        (new_definition.definition_id,),
-                    ).fetchall()
-                }
-                if before != after:
+                before_contributions = self._binding_contribution_multiset_conn(
+                    conn, old_definition_id,
+                )
+                self._rehome_binding_contributions_conn(
+                    conn, old_definition_id, new_definition.definition_id,
+                )
+                after_audiences = self._binding_audience_multiset_conn(
+                    conn, new_definition.definition_id,
+                )
+                after_contributions = self._binding_contribution_multiset_conn(
+                    conn, new_definition.definition_id,
+                )
+                if before_audiences != after_audiences:
                     raise RuntimeError("rule_evolution_scope_change")
+                if before_contributions != after_contributions:
+                    raise RuntimeError("rule_evolution_contribution_change")
+                if self._binding_contribution_diff_conn(conn) != 0:
+                    raise RuntimeError("rule_evolution_binding_contribution_drift")
                 version_id = stable_hash(
                     "rule-definition-version", old_definition_id,
                     new_definition.definition_id, old_strength, new_strength, now,
@@ -4015,7 +4383,11 @@ class RuleMergeStore:
                         float(contradiction_score), float(readiness_score),
                         readiness_components_text, readiness_digest or "",
                         governance_reasons or "",
-                        existing["cooldown_until"] or cooldown_until or "",
+                        (
+                            existing["cooldown_until"]
+                            if existing["cooldown_until"] is not None
+                            else cooldown_until or ""
+                        ),
                         float(negative_score), conflict_type or "",
                         self._judge_field(judge, "source"),
                         self._judge_field(judge, "model"),
@@ -5320,6 +5692,14 @@ class RuleMergeStore:
                     approval_expected_revisions != supplied_revisions
                 ):
                     raise RuntimeError("rule_merge_approval_snapshot_mismatch")
+                current_revisions = {
+                    str(definition_id): int(
+                        definition_rows[definition_id]["revision"] or 0
+                    )
+                    for definition_id in all_definition_ids
+                }
+                if supplied_revisions != current_revisions:
+                    raise RuntimeError("rule_merge_definition_revision_drift")
                 if str(expected_evidence_digest) != str(
                     proposal["evidence_digest"] or ""
                 ):
@@ -5757,6 +6137,73 @@ class RuleMergeStore:
     # Shadow verify: old matcher vs new matcher
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _shadow_value(value: Any, key: str, default: Any = "") -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @classmethod
+    def _shadow_audience_key(
+        cls,
+        value: Any,
+        share_group_id: str,
+    ) -> tuple[str, str, str, str, str, str, int, str]:
+        target_type = str(
+            cls._shadow_value(value, "target_type", "") or ""
+        )
+        target_id = str(cls._shadow_value(value, "target_id", "") or "")
+        project_ref = canonical_project_ref(
+            str(cls._shadow_value(value, "project_ref", "") or "")
+        )
+        provider = str(cls._shadow_value(value, "provider", "") or "")
+        runtime_role = str(
+            cls._shadow_value(value, "runtime_role", "") or ""
+        )
+        effect = str(cls._shadow_value(value, "effect", "include") or "include")
+        raw_priority = cls._shadow_value(
+            value,
+            "priority" if isinstance(value, RuleBinding) else "priority_override",
+            0,
+        )
+        priority = int(raw_priority or 0)
+        if target_type == "project" and not project_ref:
+            project_ref = canonical_project_ref(target_id)
+        if target_type == "project":
+            target_id = ""
+        # Legacy assignments encode provider/runtime role in target_id;
+        # materialized bindings may also carry the dedicated field.  Normalize
+        # both representations to one audience identity.
+        if target_type == "provider" and not provider:
+            provider = target_id
+        if target_type == "runtime_role" and not runtime_role:
+            runtime_role = target_id
+        return (
+            target_type,
+            target_id,
+            project_ref,
+            provider.casefold(),
+            runtime_role.casefold(),
+            effect,
+            priority,
+            str(share_group_id or ""),
+        )
+
+    @staticmethod
+    def _shadow_audience_dict(
+        key: tuple[str, str, str, str, str, str, int, str],
+    ) -> dict[str, Any]:
+        return {
+            "target_type": key[0],
+            "target_id": key[1],
+            "project_ref": key[2],
+            "provider": key[3],
+            "runtime_role": key[4],
+            "effect": key[5],
+            "priority": key[6],
+            "share_group_id": key[7],
+        }
+
     def shadow_verify(
         self,
         context: EffectiveAgentContext,
@@ -5770,18 +6217,35 @@ class RuleMergeStore:
         new did not; ``extra`` = new matched, legacy did not; ``permission_diff``
         = a new binding is broader than any legacy assignment for this context.
         """
-        context_project = canonical_project_ref(context.project_ref)
         legacy_matched: set[str] = set()
+        legacy_audiences: Counter[tuple[Any, ...]] = Counter()
         for memory_id, assignments in legacy_records:
             for assignment in assignments:
-                if assignment_matches(assignment, context):
-                    legacy_matched.add(memory_id)
-                    break
+                try:
+                    normalized = normalize_assignment(assignment)
+                except ValueError:
+                    continue
+                if not assignment_matches(normalized, context):
+                    continue
+                legacy_matched.add(memory_id)
+                legacy_audiences[
+                    self._shadow_audience_key(
+                        normalized, context.share_group_id,
+                    )
+                ] += 1
 
         new_matched: set[str] = set()
-        for binding in self.list_bindings():
+        new_audiences: Counter[tuple[Any, ...]] = Counter()
+        for binding in self.list_bindings(
+            share_group_id=context.share_group_id,
+        ):
             if not self._binding_matches(binding, context):
                 continue
+            new_audiences[
+                self._shadow_audience_key(
+                    binding, context.share_group_id,
+                )
+            ] += 1
             definition = self.get_definition(binding.definition_id)
             if definition is None or definition.status not in {"active", "alias"}:
                 continue
@@ -5792,14 +6256,19 @@ class RuleMergeStore:
 
         missing = sorted(legacy_matched - new_matched)
         extra = sorted(new_matched - legacy_matched)
-        # A binding is a permission expansion if it targets system/group or a
-        # project/provider/role the legacy assignment layer never used here.
-        permission_diff = 0
-        for binding in self.list_bindings():
-            if binding.target_type in {"system", "group"}:
-                permission_diff += 1
-            elif binding.target_type in {"project", "provider", "runtime_role"}:
-                permission_diff += 1
+        missing_audiences = legacy_audiences - new_audiences
+        extra_audiences = new_audiences - legacy_audiences
+        permission_missing = [
+            self._shadow_audience_dict(key)
+            for key in sorted(missing_audiences)
+            for _ in range(missing_audiences[key])
+        ]
+        permission_extra = [
+            self._shadow_audience_dict(key)
+            for key in sorted(extra_audiences)
+            for _ in range(extra_audiences[key])
+        ]
+        permission_diff = len(permission_missing) + len(permission_extra)
         return {
             "missing": missing,
             "extra": extra,
@@ -5933,7 +6402,9 @@ class RuleMergeStore:
             contradiction_merge = 0
             negative_leak = 0
             unack_first_auto = 0
-            auto_merge_precision = 1.0
+            # No executed decision is evidence of no violations.  Keep this
+            # metric fail-closed so an empty database cannot report green.
+            auto_merge_precision = 0.0
             undo_state_digest_diff = 0
 
         single_agent_dominance = 0
@@ -5966,6 +6437,9 @@ class RuleMergeStore:
             "merge_undo_success": 1 if undo_state_digest_diff == 0 else 0,
             "migration_loss": self._migration_loss(),
             "auto_merge_precision": round(auto_merge_precision, 4),
+            "auto_merge_precision_status": (
+                "observed" if mergeable_decision_count else "unobserved"
+            ),
             "strength_conflict_merge": strength_conflict_merge,
             "polarity_conflict_merge": polarity_conflict_merge,
             "parameter_conflict_merge": parameter_conflict_merge,
@@ -6156,7 +6630,7 @@ class RuleMergeStore:
                 except Exception:
                     continue
 
-        auto_merge_precision = 1.0
+        auto_merge_precision = 0.0
         if decisions:
             auto_merge_precision = 1.0 - (
                 human_hard_gate_bypass_count / len(decisions)
@@ -6172,6 +6646,7 @@ class RuleMergeStore:
             and migration_binding_multiset_diff == 0
             and undo_state_digest_diff == 0
             and rule_intelligence_event_lag == 0
+            and bool(decisions)
             and auto_merge_precision >= 0.995
         )
         return {
@@ -6185,6 +6660,10 @@ class RuleMergeStore:
             "undo_state_digest_diff": undo_state_digest_diff,
             "rule_intelligence_event_lag": rule_intelligence_event_lag,
             "auto_merge_precision": round(auto_merge_precision, 4),
+            "auto_merge_precision_status": (
+                "observed" if decisions else "unobserved"
+            ),
+            "merge_decision_count": len(decisions),
             "merge_undo_exact_rate": (
                 1.0 if undo_state_digest_diff == 0 else 0.0
             ),

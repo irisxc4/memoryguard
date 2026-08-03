@@ -23,7 +23,13 @@ import sqlite3
 from typing import Any
 
 from ..governance_capability import GOVERNANCE_CAPABILITY_SCHEMA
-from ..rule_evidence_ledger import EVIDENCE_LEDGER_SCHEMA
+from ..rule_evidence_ledger import (
+    EVIDENCE_LEDGER_SCHEMA,
+    build_contribution,
+    rebuild_effective,
+    upsert_contribution,
+)
+from ..schema_v3 import stable_hash
 
 GOVERNANCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rule_negative_evidence (
@@ -233,6 +239,85 @@ def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
         raise sqlite3.OperationalError("incomplete SQL schema statement")
 
 
+def _upgrade_legacy_evidence_ledger(conn: sqlite3.Connection) -> None:
+    """Import old positive/negative rows, including inactive history."""
+    definitions: set[str] = set()
+    for table, polarity in (
+        ("rule_evidence", "positive"),
+        ("rule_negative_evidence", "negative"),
+    ):
+        for row in conn.execute(
+            f"SELECT * FROM {table} ORDER BY evidence_id"
+        ).fetchall():
+            evidence_id = str(row["evidence_id"] or "")
+            definition_id = str(row["definition_id"] or "")
+            if not evidence_id or not definition_id:
+                continue
+            if conn.execute(
+                "SELECT 1 FROM rule_evidence_contributions "
+                "WHERE source_evidence_id=? AND polarity=? LIMIT 1",
+                (evidence_id, polarity),
+            ).fetchone() is not None:
+                continue
+            source_rule_id = str(row["source_rule_id"] or "")
+            agent_instance_id = str(row["agent_instance_id"] or "")
+            project_ref = str(row["project_ref"] or "")
+            session_id = str(row["session_id"] or "")
+            source_root_id = str(row["source_root_id"] or "")
+            source_object_id = str(row["source_object_id"] or "")
+            independence_key = str(row["independence_key"] or "")
+            if not independence_key:
+                independence_key = stable_hash(
+                    "rule-evidence-legacy-independence",
+                    project_ref, agent_instance_id, source_root_id,
+                    source_object_id or session_id,
+                    str(row["content_hash"] or ""),
+                )
+            item = build_contribution(
+                contribution_id=stable_hash(
+                    "rule-evidence-contribution", polarity, evidence_id,
+                ),
+                definition_id=definition_id,
+                independence_key=independence_key,
+                kind="evidence",
+                polarity=polarity,
+                authority=int(row["feedback_authority"] or 0),
+                confidence=(
+                    float(row["confidence"])
+                    if row["confidence"] is not None else 1.0
+                ),
+                observed_at=str(row["observed_at"] or ""),
+                active=bool(int(row["active"] or 0)),
+                receipt_id=str(row["receipt_id"] or ""),
+                feedback_id=str(row["feedback_id"] or ""),
+                source_rule_id=source_rule_id,
+                source_evidence_id=evidence_id,
+                source_memory_id=source_rule_id or evidence_id,
+                source_ids={
+                    "evidence_id": evidence_id,
+                    "source_rule_id": source_rule_id,
+                    "receipt_id": str(row["receipt_id"] or ""),
+                    "feedback_id": str(row["feedback_id"] or ""),
+                    "content_hash": str(row["content_hash"] or ""),
+                    "semantic_hash": str(row["semantic_hash"] or ""),
+                    "provider": str(row["provider"] or ""),
+                    "source_root_id": source_root_id,
+                    "source_object_id": source_object_id,
+                },
+                agent_instance_id=agent_instance_id,
+                project_ref=project_ref,
+                share_group_id=str(row["share_group_id"] or ""),
+                session_id=session_id,
+                source_root_id=source_root_id,
+                source_object_id=source_object_id,
+                session_trusted=bool(int(row["session_trusted"] or 0)),
+            )
+            upsert_contribution(conn, item)
+            definitions.add(definition_id)
+    for definition_id in sorted(definitions):
+        rebuild_effective(conn, definition_id=definition_id)
+
+
 def migrate(db_path: str) -> dict[str, Any]:
     """Apply the governance-layer upgrade; safe to re-run.
 
@@ -243,6 +328,7 @@ def migrate(db_path: str) -> dict[str, Any]:
     from .rule_definition_v1 import apply_v1
 
     conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
@@ -258,6 +344,7 @@ def migrate(db_path: str) -> dict[str, Any]:
                 }
                 if column not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            _upgrade_legacy_evidence_ledger(conn)
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS schema_meta ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"

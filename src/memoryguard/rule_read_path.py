@@ -32,6 +32,7 @@ migration.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
@@ -131,10 +132,9 @@ class RuleReadPath:
                     "Store.projection_status() must expose projection_lag and projection_error"
                 )
             else:
-                try:
-                    projection = projection_status_fn()
-                except Exception:
-                    projection = None
+                projection = self._projection_status_for_group(
+                    projection_status_fn,
+                )
                 if not isinstance(projection, Mapping):
                     failures.append("projection_status_unavailable")
                     wiring_requirements.append(
@@ -183,16 +183,29 @@ class RuleReadPath:
                     )
                 else:
                     metrics = value
-                    if "binding_contribution_diff" not in metrics:
-                        derived = self._derive_binding_contribution_diff(store)
-                        if derived is not _MISSING:
-                            metrics = dict(metrics)
-                            metrics["binding_contribution_diff"] = derived
-                            checks["binding_contribution_diff_source"] = (
-                                "persisted_contributions"
-                            )
                     for field in ("migration_loss", "binding_contribution_diff"):
-                        metric = metrics.get(field, _MISSING)
+                        if field == "migration_loss":
+                            metric = self._migration_loss_for_group(
+                                store, legacy_store,
+                            )
+                        else:
+                            metric = self._derive_binding_contribution_diff(store)
+                            if metric is not _MISSING:
+                                checks["binding_contribution_diff_source"] = (
+                                    "persisted_contributions"
+                                )
+                        if metric is _MISSING:
+                            allow_aggregate = (
+                                not callable(getattr(store, "get_source_link", None))
+                                if field == "migration_loss" else
+                                not callable(
+                                    getattr(store, "list_binding_contributions", None),
+                                )
+                            )
+                            metric = self._metric_for_group(
+                                metrics, field,
+                                allow_aggregate=allow_aggregate,
+                            )
                         checks[field] = None if metric is _MISSING else metric
                         if metric is _MISSING:
                             failures.append(f"{field}_unavailable")
@@ -238,7 +251,147 @@ class RuleReadPath:
         return result
 
     @staticmethod
-    def _derive_binding_contribution_diff(store: Any) -> Any:
+    def _projection_from_scopes(
+        value: Mapping[str, Any],
+        group_id: str,
+    ) -> Mapping[str, Any]:
+        scopes = value.get("scopes", _MISSING)
+        if not isinstance(scopes, (list, tuple)):
+            for key in ("per_group", "group_metrics", "groups", "by_group"):
+                grouped = value.get(key, _MISSING)
+                if isinstance(grouped, Mapping):
+                    selected = grouped.get(group_id, _MISSING)
+                    if isinstance(selected, Mapping):
+                        return selected
+            return value
+
+        selected = [
+            scope for scope in scopes
+            if isinstance(scope, Mapping)
+            and str(scope.get("scope_id", "") or "") == group_id
+        ]
+        if not selected:
+            # Pre-group stores used one global checkpoint.  Keep it as the
+            # legacy fallback, never include another concrete group's state.
+            selected = [
+                scope for scope in scopes
+                if isinstance(scope, Mapping)
+                and str(scope.get("scope_id", "") or "") == "rule-intelligence"
+            ]
+        return {
+            **dict(value),
+            "scopes": selected,
+            "projection_lag": sum(
+                int(scope.get("projection_lag", 0) or 0)
+                for scope in selected
+            ),
+            "projection_error": next(
+                (
+                    str(scope.get("projection_error", "") or "")
+                    for scope in selected
+                    if scope.get("projection_error")
+                ),
+                "",
+            ),
+        }
+
+    def _projection_status_for_group(
+        self,
+        projection_status_fn: Callable[..., Any],
+    ) -> Mapping[str, Any] | None:
+        """Read projection state for this group, preserving legacy scope."""
+        try:
+            value = projection_status_fn(group_ids={self.group_id})
+            group_call_succeeded = True
+        except TypeError:
+            try:
+                value = projection_status_fn()
+            except Exception:
+                return None
+            group_call_succeeded = False
+        except Exception:
+            return None
+        if not isinstance(value, Mapping):
+            return None
+
+        scoped = self._projection_from_scopes(value, self.group_id)
+        if (
+            not group_call_succeeded
+            or "scopes" not in value
+            or scoped.get("scopes")
+        ):
+            return scoped
+
+        # The current Store uses a concrete group scope when present, while
+        # old workspaces may only have the global legacy checkpoint.
+        try:
+            global_value = projection_status_fn()
+        except Exception:
+            return scoped
+        if not isinstance(global_value, Mapping):
+            return scoped
+        return self._projection_from_scopes(global_value, self.group_id)
+
+    @staticmethod
+    def _row_group_id(row: Any) -> str:
+        if isinstance(row, Mapping):
+            return str(
+                row.get("share_group_id", row.get("group_id", "")) or ""
+            ).strip()
+        return str(
+            getattr(row, "share_group_id", getattr(row, "group_id", ""))
+            or ""
+        ).strip()
+
+    def _list_group_rows(
+        self,
+        fn: Callable[..., Any],
+        *,
+        active: bool | None = None,
+        status: str | None = None,
+    ) -> list[Any] | Any:
+        """Call a public list API with group scope; filter old APIs safely."""
+        kwargs: dict[str, Any] = {"share_group_id": self.group_id}
+        if active is not None:
+            kwargs["active"] = active
+        if status is not None:
+            kwargs["status"] = status
+        try:
+            rows = fn(**kwargs)
+        except TypeError:
+            fallback = {
+                key: value for key, value in kwargs.items()
+                if key != "share_group_id"
+            }
+            try:
+                rows = fn(**fallback)
+            except Exception:
+                return _MISSING
+            if not isinstance(rows, (list, tuple)):
+                return _MISSING
+            if not rows:
+                return []
+            filtered: list[Any] = []
+            for row in rows:
+                row_group = self._row_group_id(row)
+                if not row_group:
+                    return _MISSING
+                if row_group == self.group_id:
+                    filtered.append(row)
+            return filtered
+        except Exception:
+            return _MISSING
+
+        if not isinstance(rows, (list, tuple)):
+            return _MISSING
+        # A group-aware API is authoritative.  If it still annotates rows,
+        # reject cross-group leakage rather than trusting a malformed result.
+        annotated = [self._row_group_id(row) for row in rows]
+        if any(group and group != self.group_id for group in annotated):
+            return _MISSING
+        return list(rows)
+
+    def _derive_binding_contribution_diff(self, store: Any) -> Any:
         """Derive contribution materialization diff from public persisted APIs.
 
         Real ``RuleMergeStore`` versions before the aggregate metric was added
@@ -250,31 +403,120 @@ class RuleReadPath:
         contributions_fn = getattr(store, "list_binding_contributions", None)
         if not callable(bindings_fn) or not callable(contributions_fn):
             return _MISSING
-        try:
-            bindings = bindings_fn(status="active")
-            contributions = contributions_fn(active=True)
-        except (TypeError, AttributeError, OSError, RuntimeError):
-            return _MISSING
-        except Exception:
-            return _MISSING
-        if not isinstance(bindings, (list, tuple)) or not isinstance(
-            contributions, (list, tuple),
-        ):
+        bindings = self._list_group_rows(bindings_fn, status="active")
+        contributions = self._list_group_rows(contributions_fn, active=True)
+        if bindings is _MISSING or contributions is _MISSING:
             return _MISSING
         binding_ids = {
-            str(getattr(binding, "binding_id", "") or "")
+            (
+                str(
+                    binding.get("binding_id", "")
+                    if isinstance(binding, Mapping)
+                    else getattr(binding, "binding_id", "")
+                ).strip(),
+                str(
+                    binding.get("definition_id", "")
+                    if isinstance(binding, Mapping)
+                    else getattr(binding, "definition_id", "")
+                ).strip(),
+            )
             for binding in bindings
         }
         contribution_ids = {
-            str(
-                row.get("binding_id", "")
-                if isinstance(row, Mapping)
-                else getattr(row, "binding_id", "")
-                or ""
+            (
+                str(
+                    row.get("binding_id", "")
+                    if isinstance(row, Mapping)
+                    else getattr(row, "binding_id", "")
+                ).strip(),
+                str(
+                    row.get("definition_id", "")
+                    if isinstance(row, Mapping)
+                    else getattr(row, "definition_id", "")
+                ).strip(),
             )
             for row in contributions
         }
         return len(binding_ids.symmetric_difference(contribution_ids))
+
+    def _metric_for_group(
+        self,
+        metrics: Mapping[str, Any],
+        field: str,
+        *,
+        allow_aggregate: bool,
+    ) -> Any:
+        for key in ("per_group", "group_metrics", "groups", "by_group"):
+            grouped = metrics.get(key, _MISSING)
+            if isinstance(grouped, Mapping) and self.group_id in grouped:
+                value = grouped[self.group_id]
+                if isinstance(value, Mapping):
+                    return value.get(field, _MISSING)
+        value = metrics.get(field, _MISSING)
+        if isinstance(value, Mapping):
+            return value.get(self.group_id, _MISSING)
+        # A global zero cannot hide a non-zero current-group value.  Preserve
+        # this safe compatibility fact for old callers that do not provide a
+        # legacy store or per-group metric shape; non-zero aggregates remain
+        # unavailable unless current-group evidence was obtained above.
+        if not allow_aggregate and value == 0:
+            return 0
+        return value if allow_aggregate else _MISSING
+
+    def _migration_loss_for_group(
+        self,
+        store: Any,
+        legacy_store: Any | None,
+    ) -> Any:
+        """Compute migration loss from current group's public source links."""
+        if legacy_store is None:
+            return _MISSING
+        list_records = getattr(legacy_store, "list_records", None)
+        get_source_link = getattr(store, "get_source_link", None)
+        get_definition = getattr(store, "get_definition", None)
+        resolve_canonical = getattr(store, "resolve_canonical", None)
+        if not all(
+            callable(fn)
+            for fn in (list_records, get_source_link, get_definition, resolve_canonical)
+        ):
+            return _MISSING
+        legacy_group = str(getattr(legacy_store, "group_id", "") or "").strip()
+        if legacy_group and legacy_group != self.group_id:
+            return _MISSING
+        try:
+            records = list_records()
+        except Exception:
+            return _MISSING
+
+        loss = 0
+        links: list[Mapping[str, Any]] = []
+        for record in records:
+            memory_id = str(getattr(record, "memory_id", "") or "")
+            try:
+                link = get_source_link(self.group_id, memory_id)
+            except Exception:
+                return _MISSING
+            if isinstance(link, Mapping):
+                links.append(link)
+            policy = str(getattr(record, "injection_policy", "") or "")
+            status = getattr(record, "status", "")
+            status = str(getattr(status, "value", status) or "")
+            if policy == "always" and status != "deleted" and link is None:
+                loss += 1
+
+        for link in links:
+            canonical = str(link.get("canonical_definition_id", "") or "")
+            if not canonical:
+                continue
+            try:
+                target = get_definition(resolve_canonical(canonical))
+            except Exception:
+                return _MISSING
+            target_status = getattr(target, "status", "") if target else ""
+            target_status = getattr(target_status, "value", target_status)
+            if target is None or str(target_status or "") != "active":
+                loss += 1
+        return loss
 
     def _resolve_shadow_summary(
         self,
@@ -287,40 +529,139 @@ class RuleReadPath:
     ) -> Mapping[str, Any] | None:
         """Resolve an already-normalized public shadow audience diff."""
         if isinstance(shadow_summary, Mapping):
-            return shadow_summary
+            selected = self._shadow_for_group(shadow_summary)
+            if selected is not None:
+                return selected
+
+        if legacy_store is not None and context is not None:
+            try:
+                value = self.shadow_compare(legacy_store, context)
+            except Exception:
+                value = None
+            if isinstance(value, Mapping):
+                return value
 
         if metrics is not None:
             metric_shadow = metrics.get("shadow_summary", _MISSING)
             if isinstance(metric_shadow, Mapping):
-                return metric_shadow
+                selected = self._shadow_for_group(metric_shadow)
+                if selected is not None:
+                    return selected
 
         for name in ("shadow_summary", "get_shadow_summary"):
             candidate = getattr(store, name, None)
             if isinstance(candidate, Mapping):
-                return candidate
+                selected = self._shadow_for_group(candidate)
+                if selected is not None:
+                    return selected
             if not callable(candidate):
                 continue
-            try:
-                value = candidate()
-            except TypeError:
+            values: list[Any] = []
+            for kwargs in (
+                {"share_group_id": self.group_id},
+                {"group_id": self.group_id},
+                {},
+            ):
                 try:
-                    value = candidate(legacy_store, context)
-                except Exception:
+                    values.append(candidate(**kwargs))
+                    break
+                except TypeError:
                     continue
-            except Exception:
-                continue
-            if isinstance(value, Mapping):
-                return value
+                except Exception:
+                    break
+            if not values and legacy_store is not None and context is not None:
+                try:
+                    values.append(candidate(legacy_store, context))
+                except Exception:
+                    pass
+            for value in values:
+                if isinstance(value, Mapping):
+                    selected = self._shadow_for_group(value)
+                    if selected is not None:
+                        return selected
 
-        if legacy_store is not None and context is not None:
-            try:
-                value = self.shadow_compare(
-                    legacy_store, context,
-                )
-            except Exception:
-                return None
-            return value if isinstance(value, Mapping) else None
         return None
+
+    def _shadow_for_group(
+        self,
+        value: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        """Select a public shadow result without accepting another group."""
+        direct = value.get(self.group_id, _MISSING)
+        if isinstance(direct, Mapping):
+            return direct
+        for key in ("per_group", "group_metrics", "groups", "by_group"):
+            grouped = value.get(key, _MISSING)
+            if isinstance(grouped, Mapping):
+                selected = grouped.get(self.group_id, _MISSING)
+                return selected if isinstance(selected, Mapping) else None
+        declared_group = str(value.get("group_id", "") or "").strip()
+        if declared_group and declared_group != self.group_id:
+            return None
+        return value
+
+    @staticmethod
+    def _shadow_value(value: Any, key: str, default: Any = "") -> Any:
+        if isinstance(value, Mapping):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @classmethod
+    def _shadow_audience_key(
+        cls,
+        value: Any,
+        share_group_id: str,
+        *,
+        priority_field: str,
+    ) -> tuple[str, str, str, str, str, str, int, str] | None:
+        """Normalize one legacy assignment or P3 binding audience.
+
+        Permission equivalence is about the audience boundary, not whether a
+        target type happens to be broad.  Legacy provider/runtime-role
+        assignments encode their dedicated value in ``target_id``; P3 keeps
+        that value in the dedicated field as well, so both representations
+        must collapse to the same key.
+        """
+        target_type = str(
+            cls._shadow_value(value, "target_type", "") or ""
+        )
+        target_id = str(cls._shadow_value(value, "target_id", "") or "")
+        from .rule_scope import canonical_project_ref
+
+        project_ref = canonical_project_ref(
+            str(cls._shadow_value(value, "project_ref", "") or "")
+        )
+        provider = str(cls._shadow_value(value, "provider", "") or "")
+        runtime_role = str(
+            cls._shadow_value(value, "runtime_role", "") or ""
+        )
+        effect = str(
+            cls._shadow_value(value, "effect", "include") or "include"
+        )
+        raw_priority = cls._shadow_value(value, priority_field, 0)
+        try:
+            priority = int(raw_priority or 0)
+        except (TypeError, ValueError):
+            return None
+
+        if target_type == "project":
+            if not project_ref:
+                project_ref = canonical_project_ref(target_id)
+            target_id = ""
+        if target_type == "provider" and not provider:
+            provider = target_id
+        if target_type == "runtime_role" and not runtime_role:
+            runtime_role = target_id
+        return (
+            target_type,
+            target_id,
+            project_ref,
+            provider.casefold(),
+            runtime_role.casefold(),
+            effect,
+            priority,
+            str(share_group_id or ""),
+        )
 
     @staticmethod
     def _is_zero_diff(value: Any) -> bool:
@@ -417,14 +758,16 @@ class RuleReadPath:
     def shadow_compare(self, legacy_store: Any, context: Any) -> dict[str, Any] | None:
         """Legacy-vs-canonical context diff for one effective context.
 
-        Reuses ``RuleMergeStore.shadow_verify`` so ``missing`` / ``extra`` /
-        ``permission_diff`` are computed against the real legacy matcher.  The
+        Recomputes ``missing`` / ``extra`` / ``permission_diff`` from public
+        group-scoped APIs.  The
         canonical read path may switch on for this context only when all three
         are 0 — a canonical collapse must never under-expose a rule that the
         legacy path would have injected.
         """
         store = self._open()
         if store is None:
+            return None
+        if str(getattr(context, "share_group_id", "") or "") != self.group_id:
             return None
         try:
             legacy_records = [
@@ -433,10 +776,116 @@ class RuleReadPath:
             ]
         except Exception:
             return None
-        try:
-            return store.shadow_verify(context, legacy_records)
-        except Exception:
+        bindings_fn = getattr(store, "list_bindings", None)
+        list_evidence = getattr(store, "list_evidence", None)
+        get_definition = getattr(store, "get_definition", None)
+        if not all(
+            callable(fn)
+            for fn in (bindings_fn, list_evidence, get_definition)
+        ):
             return None
+        bindings = self._list_group_rows(bindings_fn, status="active")
+        if bindings is _MISSING:
+            return None
+
+        from .rule_scope import assignment_matches, normalize_assignment
+        from .schema_v3 import RuleAssignment
+
+        legacy_matched: set[str] = set()
+        legacy_audiences: Counter[tuple[Any, ...]] = Counter()
+        for memory_id, assignments in legacy_records:
+            for assignment in assignments:
+                try:
+                    normalized = normalize_assignment(assignment)
+                except ValueError:
+                    continue
+                if not assignment_matches(normalized, context):
+                    continue
+                legacy_matched.add(memory_id)
+                audience = self._shadow_audience_key(
+                    normalized,
+                    context.share_group_id,
+                    priority_field="priority_override",
+                )
+                if audience is None:
+                    return None
+                legacy_audiences[audience] += 1
+
+        legacy_ids = {memory_id for memory_id, _ in legacy_records}
+        new_matched: set[str] = set()
+        new_audiences: Counter[tuple[Any, ...]] = Counter()
+        for binding in bindings:
+            target_type = str(
+                self._shadow_value(binding, "target_type", "") or ""
+            )
+            try:
+                binding_assignment = RuleAssignment(
+                    memory_id=str(
+                        self._shadow_value(binding, "definition_id", "") or ""
+                    ),
+                    target_type=target_type,
+                    target_id=str(
+                        self._shadow_value(binding, "target_id", "") or ""
+                    ),
+                    project_ref=str(
+                        self._shadow_value(binding, "project_ref", "") or ""
+                    ),
+                    effect=str(
+                        self._shadow_value(binding, "effect", "include")
+                        or "include"
+                    ),
+                )
+            except Exception:
+                continue
+            if not assignment_matches(binding_assignment, context):
+                continue
+            audience = self._shadow_audience_key(
+                binding,
+                context.share_group_id,
+                priority_field="priority",
+            )
+            if audience is None:
+                return None
+            new_audiences[audience] += 1
+            definition_id = str(
+                self._shadow_value(binding, "definition_id", "") or ""
+            )
+            try:
+                definition = get_definition(definition_id)
+            except Exception:
+                return None
+            definition_status = (
+                self._shadow_value(definition, "status", "")
+                if definition else ""
+            )
+            definition_status = str(
+                getattr(definition_status, "value", definition_status) or ""
+            )
+            if definition is None or definition_status not in {"active", "alias"}:
+                continue
+            definition_id = str(
+                self._shadow_value(definition, "definition_id", "")
+                or definition_id
+            )
+            try:
+                evidence_rows = list_evidence(definition_id=definition_id)
+            except Exception:
+                return None
+            for evidence in evidence_rows:
+                source_id = str(getattr(evidence, "source_rule_id", "") or "")
+                if source_id and source_id in legacy_ids:
+                    new_matched.add(source_id)
+
+        permission_missing = legacy_audiences - new_audiences
+        permission_extra = new_audiences - legacy_audiences
+        permission_diff = sum(permission_missing.values()) + sum(
+            permission_extra.values()
+        )
+        return {
+            "missing": sorted(legacy_matched - new_matched),
+            "extra": sorted(new_matched - legacy_matched),
+            "permission_diff": permission_diff,
+        }
 
 
 def dedupe_records(

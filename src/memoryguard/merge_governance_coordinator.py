@@ -288,11 +288,11 @@ class MergeGovernanceCoordinator:
         if not base.exists():
             return []
         from .shared_memory_store import SharedMemoryStore
+        from .rule_merge_store import iter_legacy_groups
 
         return [
-            SharedMemoryStore(self.workspace, child.name, must_exist=True)
-            for child in sorted(base.iterdir())
-            if child.is_dir() and (child / "memory.db").exists()
+            SharedMemoryStore(self.workspace, group_id, must_exist=True)
+            for group_id, _db_path in iter_legacy_groups(self.workspace)
         ]
 
     def _capture(self, stores: Iterable[Any]) -> ProjectionBarrierSnapshot:

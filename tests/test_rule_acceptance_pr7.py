@@ -54,8 +54,12 @@ def test_governance_acceptance_zero_on_clean_state(tmp_path):
         "rule_intelligence_event_lag",
     ):
         assert acceptance[key] == 0, key
-    assert acceptance["passed"] is True
-    assert acceptance["auto_merge_precision"] >= 0.995
+    # A clean store has no observed merge decision.  Precision is therefore
+    # unobserved, not a vacuous pass; acceptance must remain fail-closed.
+    assert acceptance["passed"] is False
+    assert acceptance["auto_merge_precision"] == 0.0
+    assert acceptance["auto_merge_precision_status"] == "unobserved"
+    assert acceptance["merge_decision_count"] == 0
 
 
 def test_scan_is_bounded_not_quadratic(tmp_path):

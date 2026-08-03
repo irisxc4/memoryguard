@@ -87,6 +87,7 @@ from .rule_merge_store import (
     RuleMergeStore,
     iter_legacy_groups,
 )
+from .rule_scope import canonical_project_ref
 from .schema_v3 import SharedMemoryRecord, SharedMemoryStatus, _now_iso, stable_hash
 
 # Actors that count as explicit human governance (bypass readiness/cooldown/
@@ -110,12 +111,40 @@ class RuleMergeService:
 
     def __init__(self, store: RuleMergeStore, judge: Any | None = None):
         self.store = store
+        self._install_durable_source_link_view()
         # P3.3: optional semantic judge.  None keeps the deterministic Dice
         # semantic layer exactly as before; a judge adds an auditable verdict.
         self.judge = judge
         # PR7: the bounded scan reports how many pairs it evaluated, skipped and
         # persisted instead of silently dropping them.
         self.last_scan_summary: dict[str, Any] = {}
+
+    def _install_durable_source_link_view(self) -> None:
+        """Keep service callers from mistaking a pending hint for ownership.
+
+        A compatibility patch in older stores may return a derived source-link
+        hint while feedback is pending.  The merge service's canonical source
+        boundary requires a committed link, and the same view is exposed to
+        acceptance callers holding this store instance.
+        """
+        marker = "_memoryguard_durable_source_link_view"
+        raw_marker = "_memoryguard_raw_get_source_link"
+        if getattr(self.store, marker, False):
+            self._raw_get_source_link = getattr(self.store, raw_marker)
+            return
+        raw = getattr(self.store, "get_source_link", None)
+        if not callable(raw):
+            return
+        self._raw_get_source_link = raw
+
+        def durable_source_link(group_id: str, memory_id: str) -> dict[str, Any] | None:
+            if not self._has_durable_source_link(group_id, memory_id):
+                return None
+            return self._raw_get_source_link(group_id, memory_id)
+
+        setattr(self.store, raw_marker, raw)
+        setattr(self.store, marker, True)
+        setattr(self.store, "get_source_link", durable_source_link)
 
     # ------------------------------------------------------------------
     # Backfill / dual-write
@@ -152,12 +181,61 @@ class RuleMergeService:
             per_group[group_id] = ledger
             for key in totals:
                 totals[key] += ledger.get(key, 0)
+        metrics = dict(self.store.metrics())
+        migration_loss = int(metrics.get("migration_loss", 0) or 0)
+        binding_contribution_diff = int(
+            metrics.get("binding_contribution_diff", 0) or 0
+        )
+        ambiguous_count = self._ambiguous_migration_count(metrics)
+        # Keep both the raw store metrics and the flattened fields so callers
+        # can compare the migration ledger with the persisted acceptance view.
+        metrics.setdefault("ambiguous_count", ambiguous_count)
+        status = (
+            "partial"
+            if migration_loss or binding_contribution_diff or ambiguous_count
+            else "complete"
+        )
         return {
             "groups": len(groups),
             "totals": totals,
             "per_group": per_group,
-            "migration_loss": 0,
+            "metrics": metrics,
+            "migration_loss": migration_loss,
+            "binding_contribution_diff": binding_contribution_diff,
+            "ambiguous_count": ambiguous_count,
+            "status": status,
         }
+
+    def _ambiguous_migration_count(self, metrics: dict[str, Any]) -> int:
+        """Read the persisted ambiguous-migration count without self-reporting.
+
+        Newer stores may expose the count directly from ``metrics``.  The
+        fallback keeps this service truthful with older schemas by counting
+        the durable ambiguity markers that the migration transaction writes.
+        """
+        for key in ("ambiguous_count", "ambiguous_migration_count", "ambiguous"):
+            if key in metrics:
+                try:
+                    return max(0, int(metrics[key] or 0))
+                except (TypeError, ValueError):
+                    break
+        conn_factory = getattr(self.store, "_db", None)
+        if not callable(conn_factory):
+            return 0
+        with conn_factory() as conn:
+            total = 0
+            for table in ("rule_evidence", "rule_negative_evidence", "rule_evidence_contributions"):
+                row = conn.execute(
+                    f"SELECT COUNT(*) AS count FROM {table} "
+                    "WHERE source_root_id='ambiguous_migration_evidence'"
+                ).fetchone()
+                total += int(row["count"] or 0) if row is not None else 0
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM rule_runtime_feedback "
+                "WHERE source='ambiguous_migration'"
+            ).fetchone()
+            total += int(row["count"] or 0) if row is not None else 0
+        return total
 
     def backfill_group(
         self, store: Any, group_id: str,
@@ -240,26 +318,48 @@ class RuleMergeService:
             # alias/merged chain) BEFORE touching any row, so a merged rule is
             # never resurrected by a re-run.
             link = self.store.get_source_link(group_id, record.memory_id)
-            canonical_id = new_id
-            if link and link.get("canonical_definition_id"):
-                canonical_id = self.store.resolve_canonical(
-                    link["canonical_definition_id"],
-                )
+            record_status = getattr(record.status, "value", record.status)
+            canonical_id = self.store.resolve_canonical(
+                str((link or {}).get("canonical_definition_id") or new_id)
+            )
             existing = self.store.get_definition(canonical_id)
-            if existing is not None and existing.status != "active":
-                canonical_id = self.store.resolve_canonical(canonical_id)
-                existing = self.store.get_definition(canonical_id)
-            if existing is None:
-                self.store.upsert_definition(definition)
-                ledger["definitions"] += 1
-            elif canonical_id == new_id:
+            definition_written = False
+            if existing is None or existing.status != "active":
+                # A stale source link must not make a source write into an
+                # inactive/missing Definition.  Fall back to the source's own
+                # resolved id; only active governed sources may create it.
+                fallback_id = self.store.resolve_canonical(new_id)
+                fallback = self.store.get_definition(fallback_id)
+                if fallback is not None and fallback.status == "active":
+                    canonical_id, existing = fallback_id, fallback
+                elif (
+                    str(record_status) == _ACTIVE_SOURCE_STATUS
+                    and fallback is None
+                ):
+                    canonical_id = new_id
+                    self.store.upsert_definition(definition)
+                    existing = self.store.get_definition(canonical_id)
+                    ledger["definitions"] += 1
+                    definition_written = True
+                else:
+                    canonical_id, existing = "", None
+            if (
+                str(record_status) == _ACTIVE_SOURCE_STATUS
+                and (existing is None or existing.status != "active")
+            ):
+                raise ValueError("canonical_definition_not_active")
+            if (
+                str(record_status) == _ACTIVE_SOURCE_STATUS
+                and canonical_id == new_id
+                and not definition_written
+            ):
                 # Active rule refresh (idempotent re-run).
                 self.store.upsert_definition(definition)
                 ledger["definitions"] += 1
             # else: the source routes to a different canonical; leave the
             # merged/superseded lifecycle untouched.
 
-            if getattr(record.status, "value", record.status) != _ACTIVE_SOURCE_STATUS:
+            if str(record_status) != _ACTIVE_SOURCE_STATUS:
                 self.sync_rule(
                     store, group_id, record,
                     assignments=[], receipts=[], created_by="backfill",
@@ -398,12 +498,17 @@ class RuleMergeService:
         definition = self._definition_from_record(record)
         new_id = definition.definition_id
         link = self.store.get_source_link(group_id, record.memory_id)
-        canonical_id = new_id
-        if link and link.get("canonical_definition_id"):
-            canonical_id = self.store.resolve_canonical(
-                link["canonical_definition_id"],
-            )
         record_status = getattr(record.status, "value", record.status)
+        governed_active = (
+            str(record_status) == _ACTIVE_SOURCE_STATUS
+            and str(record.injection_policy or "") == "always"
+        )
+        canonical_id = self._resolve_sync_canonical(
+            definition,
+            new_id,
+            link,
+            ensure_active=governed_active,
+        )
         source_revision = (
             getattr(record, "updated_at", "")
             or getattr(record, "created_at", "")
@@ -431,6 +536,7 @@ class RuleMergeService:
                     original_definition_id=(link or {}).get(
                         "original_definition_id", new_id,
                     ),
+                    # Never persist a pointer to an inactive/missing target.
                     canonical_definition_id=canonical_id,
                     status=str(record_status or "deleted"),
                 )
@@ -441,6 +547,8 @@ class RuleMergeService:
             }
 
         existing = self.store.get_definition(canonical_id)
+        if existing is None or existing.status != "active":
+            raise ValueError("canonical_definition_not_active")
         if (
             link
             and str(link.get("status") or "active") == _ACTIVE_SOURCE_STATUS
@@ -724,15 +832,18 @@ class RuleMergeService:
         *,
         share_group_id: str,
         memory_id: str,
-        receipt_id: str,
         agent_instance_id: str,
         project_ref: str,
         session_id: str,
+        session_trusted: bool = False,
+        context: str = "",
+        receipt_id: str = "",
     ) -> str:
-        """Use one polarity-neutral group for a receipt's evidence history."""
+        """Group feedback by source/context, never by receipt identity."""
         return stable_hash(
             "rule-feedback-independence", share_group_id, memory_id,
-            receipt_id, agent_instance_id, project_ref, session_id,
+            agent_instance_id, canonical_project_ref(project_ref),
+            session_id, str(int(bool(session_trusted))), context,
         )
 
     def _feedback_contribution(
@@ -755,16 +866,19 @@ class RuleMergeService:
         session_trusted: int,
         polarity: str,
         source_evidence_id: str,
+        source_root_id: str = "",
+        source_object_id: str = "",
+        context: str = "",
     ) -> Any:
         independence_key = self._feedback_independence_key(
             share_group_id=share_group_id, memory_id=memory_id,
-            receipt_id=receipt_id, agent_instance_id=agent,
-            project_ref=project, session_id=session,
+            agent_instance_id=agent, project_ref=project, session_id=session,
+            session_trusted=bool(session_trusted), context=context,
         )
         return build_contribution(
             contribution_id=stable_hash(
-                "rule-feedback-contribution", definition_id,
-                independence_key, feedback_id, polarity,
+                "rule-feedback-contribution", definition_id, receipt_id,
+                feedback_id, independence_key, polarity,
             ),
             definition_id=definition_id,
             independence_key=independence_key,
@@ -782,11 +896,14 @@ class RuleMergeService:
                 "receipt_id": receipt_id,
                 "feedback_id": feedback_id,
                 "source_rule_id": memory_id,
+                "context": context,
             },
             agent_instance_id=agent,
             project_ref=project,
             share_group_id=share_group_id,
             session_id=session,
+            source_root_id=source_root_id,
+            source_object_id=source_object_id,
             session_trusted=bool(session_trusted),
         )
 
@@ -844,35 +961,16 @@ class RuleMergeService:
 
             record_status = getattr(record.status, "value", record.status)
             if record_status != _ACTIVE_SOURCE_STATUS:
-                self.store.deactivate_source_contributions(
-                    group_id, memory_id,
-                    owner_agent_id=record.agent_instance_id,
-                )
-                self.store.deactivate_source_evidence(
-                    memory_id, record.agent_instance_id,
-                )
-                definition = self._definition_from_record(record)
-                canonical_id = (
-                    self.store.resolve_canonical(
-                        str(link.get("canonical_definition_id") or "")
-                    )
-                    if link and link.get("canonical_definition_id")
-                    else definition.definition_id
-                )
-                if self.store.get_definition(canonical_id) is None:
-                    self.store.upsert_definition(definition)
-                self.store.upsert_source_link(
-                    share_group_id=group_id,
-                    memory_id=memory_id,
-                    source_revision=(
-                        record.updated_at or record.created_at
-                        or (link or {}).get("source_revision", "")
-                    ),
-                    original_definition_id=(link or {}).get(
-                        "original_definition_id", definition.definition_id,
-                    ),
-                    canonical_definition_id=canonical_id,
-                    status=str(record_status),
+                # Use same resolver as direct sync. Inactive outbox delivery
+                # must retract source-owned rows without materializing an
+                # inactive source as an active Definition.
+                self.sync_rule(
+                    legacy,
+                    group_id,
+                    record,
+                    assignments=[],
+                    receipts=[],
+                    created_by="outbox",
                 )
                 continue
             assignments = legacy.list_rule_assignments(memory_id)
@@ -918,10 +1016,6 @@ class RuleMergeService:
         if is_effective and not receipt_id:
             raise ValueError("effective_rule_feedback_receipt_id_required")
 
-        touched = self._clear_feedback_projection(
-            receipt_id, previous_feedback_id,
-        ) if receipt_id else set()
-
         state = current if is_effective else event
         memory_id = str(state.get("memory_id") or event.get("memory_id") or "")
         outcome = str(state.get("outcome") or event.get("outcome") or "")
@@ -943,18 +1037,57 @@ class RuleMergeService:
             # durable tombstone instead of resurrecting a Definition.
             active = False
 
+        # Feedback is source-owned.  Until backfill or lifecycle sync has
+        # persisted that ownership, the event cannot be routed safely: a
+        # matching Definition may belong to another source, and creating one
+        # here would let an unlinked receipt influence canonical governance.
+        # Leave the outbox row untouched so the same event is retried after the
+        # source link is committed.
+        link = (
+            self.store.get_source_link(group_id, memory_id)
+            if active and record is not None else None
+        )
+        source_link_required = False
+        if active and record is not None:
+            # Bound groups are production-governed sources.  Keep their
+            # feedback fail-closed until source ownership is durable.  Legacy
+            # unbound stores retain the historical direct-projection path so
+            # old callers can migrate explicitly without a silent behavior
+            # break.
+            from .agent_binding import AgentBindingStore
+
+            source_link_required = bool(
+                AgentBindingStore(
+                    getattr(legacy, "workspace", self.store.workspace),
+                ).find_by_group(group_id, include_inactive=False)
+            )
+        if source_link_required and (
+            not self._has_durable_source_link(group_id, memory_id)
+            or link is None
+            or str(link.get("status") or _ACTIVE_SOURCE_STATUS)
+            != _ACTIVE_SOURCE_STATUS
+        ):
+            return False
+
+        touched = self._clear_feedback_projection(
+            receipt_id, previous_feedback_id,
+        ) if receipt_id else set()
+
         canonical_id = ""
         if active and record is not None:
             definition = self._definition_from_record(record)
-            canonical_id = definition.definition_id
-            link = self.store.get_source_link(group_id, memory_id)
-            if link and link.get("canonical_definition_id"):
-                canonical_id = link["canonical_definition_id"]
-            # Follow the alias/merged/superseded chain: feedback on a source
-            # whose definition was merged lands on its current canonical.
-            canonical_id = self.store.resolve_canonical(canonical_id)
-            if self.store.get_definition(canonical_id) is None:
-                self.store.upsert_definition(definition)
+            if link is None:
+                # Unbound legacy stores may still use the compatibility path;
+                # create their source link before projecting feedback.
+                canonical_id = self._resolve_sync_canonical(
+                    definition, definition.definition_id, None,
+                    ensure_active=True,
+                )
+            else:
+                canonical_id = self._resolve_sync_canonical(
+                    definition, definition.definition_id, link,
+                    ensure_active=True,
+                )
         elif touched:
             canonical_id = sorted(touched)[0]
 
@@ -1010,6 +1143,43 @@ class RuleMergeService:
             state.get("session_source") or event.get("session_source")
             or "absent"
         )
+        receipt = legacy.get_rule_match_receipt(receipt_id) if receipt_id else None
+        receipt_data = receipt.to_dict() if receipt is not None else {}
+        provenance = getattr(record, "provenance", ()) or ()
+        source_object_id = str(
+            state.get("source_object_id") or event.get("source_object_id")
+            or receipt_data.get("source_object_id")
+            or next(
+                (
+                    getattr(item, "source_object_id", "")
+                    if not isinstance(item, dict)
+                    else item.get("source_object_id", "")
+                    for item in provenance
+                    if (
+                        getattr(item, "source_object_id", "")
+                        if not isinstance(item, dict)
+                        else item.get("source_object_id", "")
+                    )
+                ),
+                "",
+            )
+            or ""
+        )
+        source_root_id = str(
+            state.get("source_root_id") or event.get("source_root_id")
+            or receipt_data.get("source_root_id") or ""
+        )
+        context_hash = str(
+            state.get("context_hash") or event.get("context_hash")
+            or receipt_data.get("context_hash") or ""
+        )
+        context = json.dumps({
+            "source_root_id": source_root_id,
+            "source_object_id": source_object_id,
+            "context_hash": context_hash,
+            "provider": provider,
+            "runtime_role": receipt_data.get("runtime_role", ""),
+        }, ensure_ascii=False, sort_keys=True)
         positive_evidence_id = ""
         negative_evidence_id = ""
         if outcome == "followed":
@@ -1019,6 +1189,7 @@ class RuleMergeService:
                 session_id=session, receipt_id=receipt_id, provider=provider,
                 content=record.body, confidence=confidence, observed_at=created_at,
                 share_group_id=share_group_id, session_trusted=session_trusted,
+                source_root_id=source_root_id, source_object_id=source_object_id,
                 feedback_id=feedback_id, feedback_authority=authority,
             )
             contribution = self._feedback_contribution(
@@ -1029,6 +1200,9 @@ class RuleMergeService:
                 session=session, created_at=created_at, authority=authority,
                 confidence=confidence, session_trusted=session_trusted,
                 polarity="positive", source_evidence_id=item.evidence_id,
+                source_root_id=source_root_id,
+                source_object_id=source_object_id,
+                context=context,
             )
             stored_item = self.store.upsert_evidence_contribution(contribution)
             if (
@@ -1044,6 +1218,7 @@ class RuleMergeService:
                 share_group_id=share_group_id, session_id=session,
                 receipt_id=receipt_id, feedback_id=feedback_id,
                 feedback_authority=authority, session_trusted=session_trusted,
+                source_root_id=source_root_id, source_object_id=source_object_id,
             )
             contribution = self._feedback_contribution(
                 definition_id=canonical_id, memory_id=memory_id,
@@ -1053,6 +1228,9 @@ class RuleMergeService:
                 session=session, created_at=created_at, authority=authority,
                 confidence=confidence, session_trusted=session_trusted,
                 polarity="negative", source_evidence_id=item.evidence_id,
+                source_root_id=source_root_id,
+                source_object_id=source_object_id,
+                context=context,
             )
             stored_item = self.store.upsert_evidence_contribution(contribution)
             if (
@@ -1074,6 +1252,8 @@ class RuleMergeService:
                     session_id=session, receipt_id=receipt_id,
                     feedback_id=feedback_id, feedback_authority=authority,
                     session_trusted=session_trusted,
+                    source_root_id=source_root_id,
+                    source_object_id=source_object_id,
                 )
                 contribution = self._feedback_contribution(
                     definition_id=canonical_id, memory_id=memory_id,
@@ -1083,6 +1263,9 @@ class RuleMergeService:
                     session=session, created_at=created_at, authority=authority,
                     confidence=confidence, session_trusted=session_trusted,
                     polarity="negative", source_evidence_id=item.evidence_id,
+                    source_root_id=source_root_id,
+                    source_object_id=source_object_id,
+                    context=context,
                 )
                 stored_item = self.store.upsert_evidence_contribution(contribution)
                 if (
@@ -1114,6 +1297,25 @@ class RuleMergeService:
                 session_source=session_source,
             )
         return True
+
+    def _has_durable_source_link(self, group_id: str, memory_id: str) -> bool:
+        """Return whether source ownership is persisted, not only hinted.
+
+        ``RuleMergeStore.get_source_link`` intentionally exposes a derived hint
+        for low-level callers with a pending feedback event.  A bound group may
+        not use that hint to satisfy the ownership barrier: only a committed
+        ``rule_source_links`` row proves that backfill/sync completed.
+        """
+        conn_factory = getattr(self.store, "_db", None)
+        if not callable(conn_factory):
+            return False
+        with conn_factory() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM rule_source_links "
+                "WHERE share_group_id=? AND memory_id=?",
+                (str(group_id), str(memory_id)),
+            ).fetchone()
+        return row is not None
 
     # ------------------------------------------------------------------
     # Duplicate detection → proposals
@@ -1194,6 +1396,29 @@ class RuleMergeService:
                     governance = self._proposal_governance(
                         a, b, negative_score=negative_score,
                     )
+                    # Reconciliation must distinguish a fresh candidate from a
+                    # candidate whose cooldown was explicitly cleared.  The
+                    # store intentionally preserves a non-empty cooldown on a
+                    # stable proposal, but an empty value is otherwise
+                    # indistinguishable from the new scan's default.  Once a
+                    # proposal row exists, its empty cooldown is an explicit
+                    # governed state and must not be repopulated by this scan.
+                    existing_proposal = next(
+                        (
+                            item for item in self.store.list_proposals()
+                            if list(item.get("definition_ids") or [])
+                            == [a.definition_id, b.definition_id]
+                        ),
+                        None,
+                    )
+                    reconciled_cooldown_until = governance["cooldown_until"]
+                    if (
+                        existing_proposal is not None
+                        and not str(
+                            existing_proposal.get("cooldown_until") or ""
+                        )
+                    ):
+                        reconciled_cooldown_until = ""
                     if assessment.hard_gates_ok:
                         status = "candidate"
                         conflict_type = ""
@@ -1203,6 +1428,10 @@ class RuleMergeService:
                             datetime.fromisoformat(_now_iso())
                             + timedelta(hours=COOLDOWN_HOURS)
                         ).isoformat()
+                        if existing_proposal is not None:
+                            governance["cooldown_until"] = (
+                                reconciled_cooldown_until
+                            )
                     elif assessment.conflict_type == "strength":
                         status = "conflicted"
                         conflict_type = "strength"
@@ -1365,6 +1594,102 @@ class RuleMergeService:
 
     def merge_proposal(
         self, proposal_id: str, *, actor: str = "auto", judge: Any | None = None,
+    ) -> dict[str, Any]:
+        """Drain every legacy group, then recompute and execute one proposal."""
+        initial = self.store.get_proposal(proposal_id)
+        if initial is None:
+            raise ValueError("rule_merge_proposal_not_found")
+        definition_ids = initial["definition_ids"]
+        if len(definition_ids) != 2:
+            raise ValueError("rule_merge_proposal_must_pair_two_definitions")
+        if any(self.store.get_definition(item) is None for item in definition_ids):
+            raise ValueError("rule_merge_definition_not_found")
+
+        def all_group_ids() -> set[str]:
+            return {
+                str(group_id)
+                for group_id, _db_path in iter_legacy_groups(self.store.workspace)
+            }
+
+        def all_legacy_stores() -> list[Any]:
+            from .shared_memory_store import SharedMemoryStore
+
+            return [
+                SharedMemoryStore(
+                    self.store.workspace, group_id, must_exist=True,
+                )
+                for group_id, _db_path in iter_legacy_groups(self.store.workspace)
+            ]
+
+        def assert_all_group_outboxes_drained() -> None:
+            """Confirm every legacy group is empty while barrier lock is held."""
+            pending: dict[str, int] = {}
+            from .shared_memory_store import SharedMemoryStore
+
+            for group_id, _db_path in iter_legacy_groups(self.store.workspace):
+                legacy = SharedMemoryStore(
+                    self.store.workspace, group_id, must_exist=True,
+                )
+                count = len(legacy.list_unconsumed_rule_events())
+                if count:
+                    pending[group_id] = count
+            if pending:
+                raise RuntimeError(
+                    "projection_barrier_outbox_not_drained: "
+                    + json.dumps(pending, ensure_ascii=False, sort_keys=True)
+                )
+
+        def drain_all_groups_and_recompute() -> Any:
+            # Coordinator already owns workspace lock. Keep drain, confirmation
+            # and proposal rescan in one stable observation window.
+            drained = self._consume_outbox_locked(self.store.workspace)
+            assert_all_group_outboxes_drained()
+            self.scan_and_propose(definition_ids=definition_ids, judge=judge)
+            assert_all_group_outboxes_drained()
+            return drained
+
+        coordinator = MergeGovernanceCoordinator(
+            self.store.workspace,
+            legacy_stores=all_legacy_stores,
+            # The coordinator owns the lock while this callback drains every
+            # group; the proposal is recomputed only after that drain returns.
+            drain_callback=drain_all_groups_and_recompute,
+            projection_status=lambda: self.store.projection_status(
+                group_ids=all_group_ids(),
+            ),
+        )
+        merge_error: list[BaseException] = []
+        barrier = coordinator.run_merge(
+            lambda _snapshot=None: self._merge_proposal_once(
+                proposal_id, actor=actor, judge=judge, _skip_barrier=True,
+                _error_sink=merge_error,
+            )
+        )
+        # The coordinator intentionally converts callback exceptions into a
+        # failed barrier result.  Store invariants are part of this service's
+        # observable contract, however: preserve and re-raise the original
+        # exception while keeping ordinary blocked merge results structured.
+        if merge_error:
+            raise merge_error[0]
+        nested = barrier.merge_result
+        if isinstance(nested, dict) and nested.get("ok") is False:
+            result = dict(nested)
+            result["barrier"] = barrier.to_dict()
+            return result
+        if not barrier.ok:
+            return {
+                "ok": False,
+                "blocked_reason": barrier.error or "merge_projection_barrier_failed",
+                "barrier": barrier.to_dict(),
+            }
+        result = dict(nested or {})
+        result["barrier"] = barrier.to_dict()
+        return result
+
+    def _merge_proposal_once(
+        self, proposal_id: str, *, actor: str = "auto", judge: Any | None = None,
+        _skip_barrier: bool = False,
+        _error_sink: list[BaseException] | None = None,
     ) -> dict[str, Any]:
         """Evaluate and execute one merge proposal.
 
@@ -1627,7 +1952,7 @@ class RuleMergeService:
         # Keep compatibility with older Store implementations while placing
         # the actual merge behind the workspace drain/high-water barrier.
         supported = inspect.signature(self.store.execute_merge).parameters
-        merge_error: list[BaseException] = []
+        merge_errors = _error_sink if _error_sink is not None else []
 
         def execute_current_merge(_snapshot: Any = None) -> Any:
             try:
@@ -1638,45 +1963,36 @@ class RuleMergeService:
                     }
                 )
             except BaseException as exc:
-                merge_error.append(exc)
+                # Definition revision drift is the Store's TOCTOU invariant
+                # and must remain directly observable to callers.  Other
+                # Store failures stay represented by the Barrier result so
+                # callers retain the public fail-closed blocked semantics.
+                if str(exc) == "rule_merge_definition_revision_drift":
+                    merge_errors.append(exc)
                 raise
 
-        def current_group_ids() -> set[str]:
-            return self.store.groups_for_definitions(definition_ids)
-
-        def current_legacy_stores() -> list[Any]:
-            from .shared_memory_store import SharedMemoryStore
-
-            legacy_paths = dict(iter_legacy_groups(self.store.workspace))
-            return [
-                SharedMemoryStore(
-                    self.store.workspace, group_id, must_exist=True,
-                )
-                for group_id in sorted(current_group_ids())
-                if group_id in legacy_paths
-            ]
-
-        coordinator = MergeGovernanceCoordinator(
-            self.store.workspace,
-            legacy_stores=current_legacy_stores,
-            drain_callback=lambda: self.consume_outbox(
-                self.store.workspace, only_groups=current_group_ids(),
-            ),
-            projection_status=lambda: self.store.projection_status(
-                group_ids=current_group_ids(),
-            ),
-        )
-        barrier = coordinator.run_merge(execute_current_merge)
-        if merge_error:
-            raise merge_error[0]
-        if not barrier.ok:
+        if _skip_barrier:
+            barrier = None
+            merge_result = execute_current_merge()
+        else:
+            # Compatibility path for internal callers that explicitly bypass
+            # the public all-group wrapper.
+            coordinator = MergeGovernanceCoordinator(
+                self.store.workspace,
+                drain_callback=lambda: self.consume_outbox(self.store.workspace),
+                projection_status=lambda: self.store.projection_status(),
+            )
+            barrier = coordinator.run_merge(execute_current_merge)
+            merge_result = barrier.merge_result
+        if merge_errors:
+            raise merge_errors[0]
+        if barrier is not None and not barrier.ok:
             return {
                 "ok": False,
                 "blocked_reason": barrier.error or "merge_projection_barrier_failed",
                 "barrier": barrier.to_dict(),
             }
-        decision = barrier.merge_result
-        decision = dict(decision)
+        decision = dict(merge_result or {})
         decision.update({
             "execution_mode": execution_mode,
             "auto_merge": not human_path,
@@ -1699,6 +2015,47 @@ class RuleMergeService:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+
+    def _resolve_sync_canonical(
+        self,
+        definition: RuleDefinition,
+        new_id: str,
+        link: dict[str, Any] | None,
+        *,
+        ensure_active: bool,
+    ) -> str:
+        """Resolve a source to an active Definition before any P3 write."""
+        candidates = [
+            str((link or {}).get("canonical_definition_id") or ""),
+            str(new_id or ""),
+        ]
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            resolved = self.store.resolve_canonical(candidate)
+            target = self.store.get_definition(resolved)
+            if target is not None and target.status == "active":
+                return resolved
+
+        if ensure_active:
+            # A genuinely new source has no target yet; create its own active
+            # Definition, then resolve it once more in case the store applies
+            # an existing lifecycle alias.
+            source_id = self.store.resolve_canonical(new_id)
+            source = self.store.get_definition(source_id)
+            if source is None:
+                self.store.upsert_definition(definition)
+                source_id = self.store.resolve_canonical(new_id)
+                source = self.store.get_definition(source_id)
+            if source is not None and source.status == "active":
+                return source_id
+            raise ValueError("canonical_definition_not_active")
+
+        # Deactivation/revocation may have no surviving canonical target.  An
+        # empty link is safe; a non-active Definition id is not.
+        return ""
 
     def _definition_from_record(self, record: SharedMemoryRecord) -> RuleDefinition:
         return build_definition(

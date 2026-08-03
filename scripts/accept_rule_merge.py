@@ -42,6 +42,44 @@ the full governance metric family (P3-001/002/003):
                                          untrusted-session evidence;
 * ``shadow_permission_false_positive`` -- exact legacy audience has no false
                                          shadow permission diff.
+* ``pending_unlinked_group``            -- an outbox event for a group that
+                                         has not been linked is not consumed
+                                         or dropped before backfill.
+* ``unlinked_negative_feedback``        -- a negative feedback event survives
+                                         an unlinked phase and reaches its
+                                         canonical Definition after backfill.
+* ``new_source_canonical_route``        -- a new source whose old Definition
+                                         was merged routes to the active
+                                         canonical Definition.
+* ``inactive_binding_target``           -- retracting one source does not
+                                         revoke another source's binding.
+* ``strength_evolution_contribution_diff`` -- strength evolution preserves
+                                         source-contribution ownership.
+* ``strength_evolution_rollback``       -- a rejected evolution is an exact
+                                         no-op over the public state.
+* ``public_positive_runner_up`` / ``public_negative_runner_up`` -- removing
+                                         a public feedback winner restores the
+                                         retained runner-up of either polarity.
+* ``all_evidence_writes_contributions`` -- direct positive and negative
+                                         evidence writes are represented in
+                                         the public contribution ledger.
+* ``duplicate_receipt_independence`` / ``distinct_session_independence`` --
+                                         duplicate receipts collapse while
+                                         distinct trusted sessions remain
+                                         independent.
+* ``exact_wide_shadow_diff``            -- a lossless wide legacy audience is
+                                         not called a permission expansion.
+* ``true_permission_expansion``         -- a genuinely broader binding is
+                                         detected by shadow verification.
+* ``exact_system_migration_audience_diff`` -- legacy system audience
+                                         multiset survives real backfill.
+* ``true_system_expansion_missed``      -- system-only shadow expansion is
+                                         detected; raw expansion is reported.
+* ``backfill_real_migration_loss``      -- a new unbackfilled source is
+                                         detected, then disappears after the
+                                         real backfill API runs.
+* ``unrelated_group_readiness``         -- one group's lag cannot block an
+                                         unrelated healthy group.
 
 Exits non-zero when any gate fails, mirroring ``accept_rule_lifecycle.py``.
 """
@@ -52,6 +90,7 @@ import json
 import os
 import sys
 import tempfile
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,6 +110,7 @@ from memoryguard.rule_merge import RuleMergeService, RuleMergeStore  # noqa: E40
 from memoryguard.rule_merge_policy import build_readiness_snapshot  # noqa: E402
 from memoryguard.rule_read_path import RuleReadPath  # noqa: E402
 from memoryguard.rule_semantic_judge import DiceJudge  # noqa: E402
+from memoryguard.rule_scope import canonical_project_ref, normalize_assignment  # noqa: E402
 from memoryguard.schema_v3 import (  # noqa: E402
     EffectiveAgentContext,
     MemoryKind,
@@ -201,6 +241,41 @@ def _binding_source_projection_diff(store: RuleMergeStore) -> int:
         for item in store.list_binding_contributions(active=True)
     }
     return len(bindings.symmetric_difference(contributions))
+
+
+def _audience_key(value: object, share_group_id: str) -> tuple[object, ...]:
+    """Normalize legacy assignments and materialized bindings to one audience key."""
+    if hasattr(value, "priority_override"):
+        value = normalize_assignment(value)  # type: ignore[arg-type]
+    target_type = str(getattr(value, "target_type", "") or "")
+    target_id = str(getattr(value, "target_id", "") or "")
+    project_ref = canonical_project_ref(
+        str(getattr(value, "project_ref", "") or "")
+    )
+    provider = str(getattr(value, "provider", "") or "")
+    runtime_role = str(getattr(value, "runtime_role", "") or "")
+    effect = str(getattr(value, "effect", "include") or "include")
+    priority = getattr(value, "priority", None)
+    if priority is None:
+        priority = getattr(value, "priority_override", 0)
+    priority = int(priority or 0)
+    if target_type == "project":
+        project_ref = project_ref or canonical_project_ref(target_id)
+        target_id = ""
+    if target_type == "provider" and not provider:
+        provider = target_id
+    if target_type == "runtime_role" and not runtime_role:
+        runtime_role = target_id
+    return (
+        str(share_group_id or ""), target_type, target_id, project_ref,
+        provider.casefold(), runtime_role.casefold(), effect, priority,
+    )
+
+
+def _audience_multiset(
+    values: list[object], share_group_id: str,
+) -> Counter[tuple[object, ...]]:
+    return Counter(_audience_key(value, share_group_id) for value in values)
 
 
 def _acceptance_context() -> AccessContext:
@@ -763,6 +838,984 @@ def _shadow_permission_false_positive() -> int:
     return int(shadow.get("permission_diff", 0) != 0)
 
 
+def _mcp_feedback(
+    workspace: Path,
+    group_id: str,
+    agent_id: str,
+    receipt_id: str,
+    session_id: str,
+    project_ref: str,
+    outcome: str,
+    *,
+    evidence: str = "",
+    context_hash: str = "",
+) -> dict[str, object]:
+    """Submit feedback through the production MCP boundary.
+
+    The acceptance harness deliberately changes only the trusted launch
+    context needed by the real resolver, then restores it.  It never calls a
+    projection helper or writes a contribution row itself.
+    """
+    env = {
+        "MEMORYGUARD_WORKSPACE": str(workspace),
+        "MEMORYGUARD_AGENT_ID": agent_id,
+        "MEMORYGUARD_STRICT_BINDING": "1",
+        "MEMORYGUARD_ADMIN": "0",
+        "MEMORYGUARD_SESSION_ID": session_id,
+        "MEMORYGUARD_SESSION_SOURCE": "host",
+        "MEMORYGUARD_CONTEXT_HASH": context_hash or f"context-{receipt_id}",
+        "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_RUNTIME_ROLE": "worker",
+        "MEMORYGUARD_PROJECT_CWD": project_ref,
+    }
+    previous = {key: os.environ.get(key) for key in env}
+    try:
+        os.environ.update(env)
+        from memoryguard.mcp_server import execute_tool
+
+        result = execute_tool(
+            "memoryguard_rule_feedback",
+            {
+                "workspace": str(workspace),
+                "receipt_id": receipt_id,
+                "outcome": outcome,
+                "actor": agent_id,
+                "evidence": evidence,
+                "idempotency_key": f"acceptance-{receipt_id}-{outcome}",
+            },
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if result.get("isError"):
+        content = result.get("content", [])
+        detail = content[0].get("text", "feedback failed") if content else "feedback failed"
+        raise RuntimeError(str(detail))
+    content = result.get("content", [])
+    if not content:
+        raise RuntimeError("feedback returned no public response")
+    raw = content[0].get("text", "")
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"feedback response is not JSON: {raw!r}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("feedback response is not an object")
+    return payload
+
+
+def _mcp_bootstrap_receipt(
+    workspace: Path,
+    *,
+    group_id: str,
+    agent_id: str,
+    memory_id: str,
+    task: str,
+    session_id: str,
+    project_ref: str,
+    context_hash: str,
+) -> dict[str, object]:
+    """Create and persist one trusted receipt through the public MCP API."""
+    env = {
+        "MEMORYGUARD_WORKSPACE": str(workspace),
+        "MEMORYGUARD_AGENT_ID": agent_id,
+        "MEMORYGUARD_STRICT_BINDING": "1",
+        "MEMORYGUARD_ADMIN": "0",
+        "MEMORYGUARD_SESSION_ID": session_id,
+        "MEMORYGUARD_SESSION_SOURCE": "host",
+        "MEMORYGUARD_CONTEXT_HASH": context_hash,
+        "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_RUNTIME_ROLE": "worker",
+        "MEMORYGUARD_PROJECT_CWD": project_ref,
+    }
+    previous = {key: os.environ.get(key) for key in env}
+    try:
+        os.environ.update(env)
+        from memoryguard.mcp_server import execute_tool
+
+        result = execute_tool(
+            "memoryguard_context_bootstrap",
+            {"workspace": str(workspace), "task": task},
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if result.get("isError"):
+        content = result.get("content", [])
+        detail = content[0].get("text", "bootstrap failed") if content else "bootstrap failed"
+        raise RuntimeError(str(detail))
+    content = result.get("content", [])
+    if not content:
+        raise RuntimeError("bootstrap returned no public response")
+    try:
+        payload = json.loads(content[0].get("text", ""))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("bootstrap response is not JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("bootstrap response is not an object")
+    receipts = [
+        item for item in payload.get("mandatory_match_receipts", [])
+        if isinstance(item, dict) and item.get("memory_id") == memory_id
+    ]
+    persistence = payload.get("receipt_persistence", {})
+    if (
+        len(receipts) != 1
+        or not isinstance(persistence, dict)
+        or persistence.get("status") != "persisted"
+        or receipts[0].get("session_id") != session_id
+        or receipts[0].get("session_source") != "host"
+        or receipts[0].get("session_trusted") is not True
+    ):
+        raise RuntimeError("public bootstrap did not return one trusted persisted receipt")
+    return receipts[0]
+
+
+def _append_receipt(
+    legacy: SharedMemoryStore,
+    *,
+    memory_id: str,
+    group_id: str,
+    agent_id: str,
+    receipt_id: str,
+    session_id: str,
+    project_ref: str,
+    context_hash: str = "",
+) -> RuleMatchReceipt:
+    receipt = RuleMatchReceipt(
+        receipt_id=receipt_id,
+        memory_id=memory_id,
+        share_group_id=group_id,
+        agent_instance_id=agent_id,
+        task_hash=f"task-{receipt_id}",
+        task="acceptance feedback task",
+        session_id=session_id,
+        session_trusted=True,
+        session_source="host",
+        project_ref=project_ref,
+        provider="codex",
+        runtime_role="worker",
+        context_hash=context_hash or f"context-{receipt_id}",
+        created_at=_now_iso(),
+    )
+    saved = legacy.append_rule_match_receipt(receipt)
+    if saved.receipt_id != receipt_id:
+        raise RuntimeError("receipt persistence changed the receipt identity")
+    return saved
+
+
+def _feedback_case(
+    workspace: Path,
+    *,
+    group_id: str,
+    agent_id: str,
+    memory_id: str,
+    body: str = "must run tests before commit",
+    assignment: dict[str, str] | None = None,
+    backfill: bool = True,
+) -> tuple[SharedMemoryStore, RuleMergeStore, RuleMergeService, str]:
+    AgentBindingStore(workspace).bind_agent(agent_id, group_id)
+    legacy = SharedMemoryStore(workspace, group_id)
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id=memory_id,
+            body=body,
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            priority=10,
+            agent_instance_id=agent_id,
+            created_at=_aged(30),
+            updated_at=_aged(30),
+        ),
+        assignments=[assignment or {
+            "target_type": "agent",
+            "target_id": agent_id,
+        }],
+    )
+    store = RuleMergeStore(workspace)
+    service = RuleMergeService(store, judge=DiceJudge())
+    if backfill:
+        service.backfill_group(legacy, group_id)
+    return legacy, store, service, str(workspace / "project")
+
+
+def _pending_unlinked_group() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "pending-group", "pending-agent", "pending-rule"
+    legacy, store, service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+        backfill=False,
+    )
+    _append_receipt(
+        legacy, memory_id=memory_id, group_id=group_id, agent_id=agent_id,
+        receipt_id="pending-receipt", session_id="pending-session",
+        project_ref=project_ref,
+    )
+    legacy.append_rule_match_feedback(RuleMatchFeedback(
+        feedback_id="pending-feedback", receipt_id="pending-receipt",
+        outcome="followed", actor=agent_id, source="agent", authority=3,
+    ))
+    service.consume_outbox(workspace, only_group=group_id)
+    still_pending = any(
+        item.get("receipt_id") == "pending-receipt"
+        for item in legacy.list_unconsumed_rule_events()
+    )
+    if not still_pending or store.get_source_link(group_id, memory_id) is not None:
+        return 1
+    service.backfill_group(legacy, group_id)
+    service.consume_outbox(workspace, only_group=group_id)
+    return int(
+        bool(legacy.list_unconsumed_rule_events())
+        or store.get_source_link(group_id, memory_id) is None
+    )
+
+
+def _unlinked_negative_feedback() -> int:
+    """Verify the public source-link route and the negative merge hard gate.
+
+    ``_pending_unlinked_group`` covers the fail-closed pre-link barrier with a
+    low-level event.  This probe must cover the complementary production path:
+    a trusted receipt is created by public bootstrap, public feedback causes a
+    durable source link, and the resulting negative evidence blocks a merge.
+    """
+    if _pending_unlinked_group():
+        return 1
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id = "negative-public-group", "negative-public-agent"
+    memory_id = "pair-0-0"
+    bodies = _TEAM_A_BODIES
+    legacy, store, service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+        body=bodies[0],
+        backfill=False,
+    )
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id="pair-0-1",
+            body=bodies[1],
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            priority=10,
+            agent_instance_id=agent_id,
+            created_at=_aged(30),
+            updated_at=_aged(30),
+        ),
+        assignments=[{"target_type": "agent", "target_id": agent_id}],
+    )
+    definition_ids = _seed_merge_pair(
+        workspace, legacy, store, service, group_id, 0, bodies,
+    )
+    receipt = _mcp_bootstrap_receipt(
+        workspace,
+        group_id=group_id,
+        agent_id=agent_id,
+        memory_id=memory_id,
+        task=bodies[0],
+        session_id="negative-public-session",
+        project_ref=project_ref,
+        context_hash="negative-public-context",
+    )
+    saved_receipt = legacy.get_rule_match_receipt(str(receipt["receipt_id"]))
+    if (
+        saved_receipt is None
+        or not saved_receipt.session_trusted
+        or saved_receipt.session_source != "host"
+    ):
+        return 1
+    _mcp_feedback(
+        workspace, group_id, agent_id, str(receipt["receipt_id"]),
+        str(receipt["session_id"]), project_ref, "not_applicable",
+        evidence="scope mismatch", context_hash=str(receipt["context_hash"]),
+    )
+    durable_links = [
+        item for item in store._list_source_links()
+        if item.get("share_group_id") == group_id
+        and item.get("memory_id") == memory_id
+        and item.get("status") == "active"
+    ]
+    if len(durable_links) != 1:
+        return 1
+    link = durable_links[0]
+    negative = [
+        item for item in store.list_negative_evidence()
+        if item.source_rule_id == memory_id
+        and item.receipt_id == receipt["receipt_id"]
+    ]
+    if (
+        not negative
+        or any(item.definition_id != link["canonical_definition_id"] for item in negative)
+        or legacy.list_unconsumed_rule_events()
+    ):
+        return 1
+    proposals = service.scan_and_propose(definition_ids=definition_ids)
+    pair = next(
+        (
+            item for item in proposals
+            if set(item.get("definition_ids", [])) == set(definition_ids)
+        ),
+        None,
+    )
+    if pair is None or pair.get("status") == "candidate":
+        return 1
+    blocked = service.merge_proposal(str(pair["proposal_id"]))
+    return int(bool(blocked.get("ok")))
+
+
+def _new_source_canonical_route() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id = "new-source-group", "new-source-agent"
+    AgentBindingStore(workspace).bind_agent(agent_id, group_id)
+    legacy = SharedMemoryStore(workspace, group_id)
+    # Reuse the production acceptance pair: its distinct normalized wording is
+    # known to be a real candidate under the current similarity policy.
+    bodies = _TEAM_A_BODIES
+    for index, body in enumerate(bodies):
+        legacy.append_record(
+            SharedMemoryRecord(
+                memory_id=f"pair-0-{index}", body=body,
+                kind=MemoryKind.PROCEDURE, status=SharedMemoryStatus.ACTIVE,
+                injection_policy="always", priority=10,
+                agent_instance_id=agent_id, created_at=_aged(30),
+                updated_at=_aged(30),
+            ),
+            assignments=[{"target_type": "agent", "target_id": agent_id}],
+        )
+    store = RuleMergeStore(workspace)
+    service = RuleMergeService(store, judge=DiceJudge())
+    definition_ids = _seed_merge_pair(
+        workspace, legacy, store, service, group_id, 0, bodies,
+    )
+    merged = _merge_pair(service, store, definition_ids)
+    decision = merged["decision"]
+    canonical_id = str(decision["canonical_definition_id"])
+    old_id = str(decision["merged_definition_ids"][0])
+    old_definition = store.get_definition(old_id)
+    if old_definition is None:
+        raise RuntimeError("merged source Definition disappeared")
+    old_source_id = f"pair-0-{definition_ids.index(old_id)}"
+    merged_source_id = f"{old_source_id}-revision-2"
+    old_record = legacy.get_record(old_source_id)
+    if old_record is None:
+        raise RuntimeError("merged source record disappeared")
+    # A genuinely new source arrives after its previous source Definition was
+    # merged.  Its source id and legacy dedup domain differ; canonical routing
+    # must come from production identity/lifecycle resolution, not a test-made
+    # source link.
+    new_record = SharedMemoryRecord(
+        memory_id=merged_source_id, body=old_record.body,
+        kind=MemoryKind.PROCEDURE, status=SharedMemoryStatus.ACTIVE,
+        injection_policy="always", priority=10, agent_instance_id=agent_id,
+        created_at=_now_iso(), updated_at=_now_iso(),
+    )
+    legacy.append_record(
+        new_record,
+        assignments=[{"target_type": "agent", "target_id": agent_id}],
+        dedup_domain="new-source-canonical-revision-2",
+    )
+    receipt = _append_receipt(
+        legacy,
+        memory_id=merged_source_id,
+        group_id=group_id,
+        agent_id=agent_id,
+        receipt_id="new-source-revision-receipt",
+        session_id="new-source-revision-session",
+        project_ref="new-source-project",
+    )
+    sync = service.sync_rule(
+        legacy, group_id, new_record,
+        assignments=legacy.list_rule_assignments(new_record.memory_id),
+        receipts=[receipt], created_by="outbox",
+    )
+    link = store.get_source_link(group_id, new_record.memory_id)
+    target = store.get_definition(canonical_id)
+    source_contributions = store.list_binding_contributions(
+        source_memory_id=new_record.memory_id, active=True,
+    )
+    active_target_bindings = store.list_bindings(
+        definition_id=canonical_id, share_group_id=group_id, status="active",
+    )
+    active_target_evidence = store.list_evidence(definition_id=canonical_id)
+    new_source_evidence = [
+        item for item in active_target_evidence
+        if item.source_rule_id == new_record.memory_id
+        and item.receipt_id == receipt.receipt_id
+    ]
+    inactive_target_bindings = store.list_bindings(
+        definition_id=old_id, share_group_id=group_id, status="active",
+    )
+    inactive_target_evidence = store.list_evidence(definition_id=old_id)
+    source_binding_ids = {
+        str(item.get("binding_id", "")) for item in source_contributions
+    }
+    active_target_binding_ids = {
+        item.binding_id for item in active_target_bindings
+    }
+    return int(
+        sync.get("definition_id") != canonical_id
+        or link is None
+        or link.get("canonical_definition_id") != canonical_id
+        or link.get("status") != "active"
+        or store.get_source_link(group_id, old_source_id) is None
+        or old_record.memory_id == new_record.memory_id
+        or legacy.get_record(new_record.memory_id) is None
+        or target is None
+        or target.status != "active"
+        or sync.get("bindings", 0) < 1
+        or sync.get("evidence", 0) < 1
+        or len(source_contributions) < 1
+        or any(item.get("definition_id") != canonical_id for item in source_contributions)
+        or not source_binding_ids.issubset(active_target_binding_ids)
+        or len(new_source_evidence) != 1
+        or store.get_definition(old_id) is None
+        or store.get_definition(old_id).status == "active"
+        or bool(inactive_target_bindings)
+        or bool(inactive_target_evidence)
+    )
+
+
+def _inactive_binding_target() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id = "inactive-binding-group", "inactive-binding-agent"
+    AgentBindingStore(workspace).bind_agent(agent_id, group_id)
+    legacy = SharedMemoryStore(workspace, group_id)
+    for index in range(2):
+        legacy.append_record(
+            SharedMemoryRecord(
+                memory_id=f"source-{index}", body="run tests before commit",
+                kind=MemoryKind.PROCEDURE, status=SharedMemoryStatus.ACTIVE,
+                injection_policy="always", priority=10,
+                agent_instance_id=agent_id, created_at=_aged(30),
+                updated_at=_aged(30),
+            ),
+            assignments=[{"target_type": "agent", "target_id": agent_id}],
+            # Keep identical source bodies/audiences distinct in legacy.  This
+            # changes only source deduplication, not the Definition identity.
+            dedup_domain=f"inactive-binding-probe-source-{index}",
+        )
+    _append_receipt(
+        legacy,
+        memory_id="source-1",
+        group_id=group_id,
+        agent_id=agent_id,
+        receipt_id="receipt-source-1",
+        session_id="session-source-1",
+        project_ref="project-inactive-binding",
+    )
+    store = RuleMergeStore(workspace)
+    service = RuleMergeService(store)
+    service.backfill_group(legacy, group_id)
+    legacy.delete("source-0", actor=agent_id, manual_override=False)
+    service.consume_outbox(workspace, only_group=group_id)
+    retained = store.list_binding_contributions(
+        source_memory_id="source-1", active=True,
+    )
+    active_bindings = store.list_bindings(share_group_id=group_id, status="active")
+    removed = store.list_binding_contributions(
+        source_memory_id="source-0", active=True,
+    )
+    evidence = store.list_evidence()
+    retained_evidence = [
+        item for item in evidence if item.source_rule_id == "source-1"
+    ]
+    removed_evidence = [
+        item for item in evidence if item.source_rule_id == "source-0"
+    ]
+    source_1_link = store.get_source_link(group_id, "source-1")
+    canonical_id = ""
+    if source_1_link is not None:
+        canonical_id = str(source_1_link.get("canonical_definition_id", ""))
+    canonical = store.get_definition(canonical_id) if canonical_id else None
+    canonical_active = 0
+    canonical_inactive = 0
+    if canonical is not None:
+        canonical_active = int(canonical.status == "active")
+        canonical_inactive = int(canonical.status != "active")
+    source_1_link_inactive = 0
+    if source_1_link is not None:
+        source_1_link_inactive = int(
+            str(source_1_link.get("status", "")) != "active"
+        )
+
+    failures = {
+        "source_count": int(len(legacy.list_records()) != 2),
+        "source_1_link_missing": int(source_1_link is None),
+        "source_1_link_inactive": source_1_link_inactive,
+        "canonical_missing": int(canonical is None),
+        "canonical_inactive": canonical_inactive,
+        "source_1_binding_count": int(len(retained) != 1),
+        "source_1_evidence_count": int(len(retained_evidence) != 1),
+        "source_1_binding_target": sum(
+            int(item.get("definition_id", "") != canonical_id)
+            for item in retained
+        ),
+        "source_1_evidence_target": sum(
+            int(item.definition_id != canonical_id)
+            for item in retained_evidence
+        ),
+        "source_1_active_binding_count": int(len(active_bindings) != 1),
+        "active_binding_target": sum(
+            int(item.definition_id != canonical_id)
+            for item in active_bindings
+        ),
+        "source_0_binding_not_removed": int(len(removed) != 0),
+        "source_0_evidence_not_removed": int(len(removed_evidence) != 0),
+    }
+    return sum(failures.values())
+
+
+def _strength_evolution_contribution_diff() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "strength-group", "strength-agent", "strength-rule"
+    legacy, store, service, _project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+        body="suggestion run tests before commit",
+    )
+    old = next(
+        item for item in store.list_definitions()
+        if item.canonical_text == normalize_rule_text("suggestion run tests before commit")
+    )
+    before = {
+        (item.get("source_memory_id"), item.get("legacy_assignment_hash"), item.get("binding_id"))
+        for item in store.list_binding_contributions(active=True)
+        if item.get("definition_id") == old.definition_id
+    }
+    evolved = service.evolve_strength(
+        old.definition_id, "must", reason="acceptance strength evolution", actor="admin",
+    )
+    new_id = evolved["new_definition_id"]
+    after_bindings = {
+        (item.binding_id, item.definition_id)
+        for item in store.list_bindings(status="active")
+    }
+    after_contributions = {
+        (str(item.get("binding_id", "")), str(item.get("definition_id", "")))
+        for item in store.list_binding_contributions(active=True)
+    }
+    source_after = {
+        (item.get("source_memory_id"), item.get("legacy_assignment_hash"), item.get("binding_id"))
+        for item in store.list_binding_contributions(active=True)
+        if item.get("source_memory_id") == memory_id
+    }
+    expected_source = {
+        (source, assignment_hash)
+        for source, assignment_hash, _binding_id in before
+    }
+    observed_source = {
+        (source, assignment_hash)
+        for source, assignment_hash, _binding_id in source_after
+    }
+    diff = int(
+        not before
+        or not source_after
+        or any(definition_id != new_id for _, definition_id in after_bindings)
+        or after_bindings != after_contributions
+        or observed_source != expected_source
+    )
+    return diff
+
+
+def _public_state_digest(store: RuleMergeStore) -> str:
+    payload = {
+        "definitions": [item.to_dict() for item in store.list_definitions()],
+        "bindings": [item.to_dict() for item in store.list_bindings(status=None)],
+        "contributions": store.list_binding_contributions(active=None),
+        "versions": store.list_definition_versions(),
+    }
+    return stable_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+
+
+def _strength_evolution_rollback() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "strength-rollback-group", "strength-rollback-agent", "strength-rollback-rule"
+    _legacy, store, service, _project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+        body="suggestion run tests before commit",
+    )
+    old = next(
+        item for item in store.list_definitions()
+        if item.canonical_text == normalize_rule_text("suggestion run tests before commit")
+    )
+    evolved = service.evolve_strength(old.definition_id, "must", actor="admin")
+    before = _public_state_digest(store)
+    rejected = False
+    try:
+        service.evolve_strength(old.definition_id, "observation", actor="admin")
+    except (RuntimeError, ValueError):
+        rejected = True
+    after = _public_state_digest(store)
+    return int(not rejected or before != after or store.get_definition(evolved["new_definition_id"]) is None)
+
+
+def _public_runner_up(outcome: str) -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = f"runner-{outcome}-group", f"runner-{outcome}-agent", f"runner-{outcome}-rule"
+    legacy, store, _service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+    )
+    receipt_ids = (f"{outcome}-winner", f"{outcome}-runner")
+    shared_context_hash = f"{outcome}-runner-up-context"
+    for receipt_id in receipt_ids:
+        _append_receipt(
+            legacy, memory_id=memory_id, group_id=group_id, agent_id=agent_id,
+            receipt_id=receipt_id, session_id=f"{outcome}-same-session",
+            project_ref=project_ref, context_hash=shared_context_hash,
+        )
+        _mcp_feedback(
+            workspace, group_id, agent_id, receipt_id, f"{outcome}-same-session",
+            project_ref, outcome,
+            evidence="scope mismatch" if outcome == "not_applicable" else "",
+            context_hash=shared_context_hash,
+        )
+    definition_id = store.get_source_link(group_id, memory_id)["canonical_definition_id"]
+    rows = (
+        store.list_negative_evidence(definition_id)
+        if outcome == "not_applicable" else store.list_evidence(definition_id)
+    )
+    if len(rows) != 1 or rows[0].receipt_id not in receipt_ids:
+        return 1
+    winner = rows[0].receipt_id
+    runner = receipt_ids[1] if winner == receipt_ids[0] else receipt_ids[0]
+    store.deactivate_evidence_contributions_for_receipt(winner)
+    restored = (
+        store.list_negative_evidence(definition_id)
+        if outcome == "not_applicable" else store.list_evidence(definition_id)
+    )
+    return int(len(restored) != 1 or restored[0].receipt_id != runner)
+
+
+def _all_evidence_writes_contributions() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    store = RuleMergeStore(workspace)
+    definition = build_definition("must run tests before commit")
+    store.upsert_definition(definition)
+    positive = build_evidence(
+        definition_id=definition.definition_id, source_rule_id="direct-positive",
+        agent_instance_id="direct-agent", project_ref="direct-project",
+        session_id="direct-session-positive", receipt_id="direct-receipt-positive",
+        feedback_id="direct-feedback-positive", content=definition.canonical_text,
+        session_trusted=True,
+    )
+    negative = build_negative_evidence(
+        definition_id=definition.definition_id, source_rule_id="direct-negative",
+        agent_instance_id="direct-agent", project_ref="direct-project",
+        session_id="direct-session-negative", receipt_id="direct-receipt-negative",
+        feedback_id="direct-feedback-negative", content=definition.canonical_text,
+        session_trusted=True,
+    )
+    store.upsert_evidence(positive)
+    store.upsert_negative_evidence(negative)
+    positive_rows = store.list_evidence(definition.definition_id)
+    negative_rows = store.list_negative_evidence(definition.definition_id)
+    if (
+        {item.evidence_id for item in positive_rows} != {positive.evidence_id}
+        or {item.evidence_id for item in negative_rows} != {negative.evidence_id}
+    ):
+        return 1
+    # The public receipt deactivation path can only remove a row if its write
+    # was materialized as a contribution.  Keep the opposite polarity live to
+    # prove the operation is scoped to one evidence contribution.
+    store.deactivate_evidence_contributions_for_receipt(positive.receipt_id)
+    if store.list_evidence(definition.definition_id) or not store.list_negative_evidence(
+        definition.definition_id
+    ):
+        return 1
+    store.deactivate_evidence_contributions_for_receipt(negative.receipt_id)
+    return int(bool(store.list_negative_evidence(definition.definition_id)))
+
+
+def _duplicate_receipt_independence() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "duplicate-receipt-group", "duplicate-receipt-agent", "duplicate-receipt-rule"
+    legacy, store, _service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+    )
+    session_id = "duplicate-session"
+    shared_context_hash = "duplicate-source-context"
+    for receipt_id in ("duplicate-a", "duplicate-b"):
+        _append_receipt(
+            legacy, memory_id=memory_id, group_id=group_id, agent_id=agent_id,
+            receipt_id=receipt_id, session_id=session_id, project_ref=project_ref,
+            context_hash=shared_context_hash,
+        )
+        _mcp_feedback(
+            workspace, group_id, agent_id, receipt_id, session_id,
+            project_ref, "followed", context_hash=shared_context_hash,
+        )
+    definition_id = store.get_source_link(group_id, memory_id)["canonical_definition_id"]
+    evidence = store.list_evidence(definition_id)
+    return int(
+        len(evidence) != 1
+        or store.metrics().get("evidence_independence_violation", 0) != 0
+        or evidence[0].receipt_id not in {"duplicate-a", "duplicate-b"}
+    )
+
+
+def _distinct_session_independence() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "distinct-session-group", "distinct-session-agent", "distinct-session-rule"
+    legacy, store, _service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+    )
+    for index, session_id in enumerate(("distinct-session-a", "distinct-session-b")):
+        receipt_id = f"distinct-receipt-{index}"
+        _append_receipt(
+            legacy, memory_id=memory_id, group_id=group_id, agent_id=agent_id,
+            receipt_id=receipt_id, session_id=session_id, project_ref=project_ref,
+        )
+        _mcp_feedback(
+            workspace, group_id, agent_id, receipt_id, session_id,
+            project_ref, "followed",
+        )
+    definition_id = store.get_source_link(group_id, memory_id)["canonical_definition_id"]
+    evidence = store.list_evidence(definition_id)
+    sessions = {item.session_id for item in evidence}
+    return int(
+        len(evidence) != 2
+        or len(sessions) != 2
+        or {
+            item.receipt_id for item in evidence
+        } != {"distinct-receipt-0", "distinct-receipt-1"}
+    )
+
+
+def _exact_wide_shadow_diff() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "wide-shadow-group", "wide-shadow-agent", "wide-shadow-rule"
+    legacy, store, service, _project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+        assignment={"target_type": "group", "target_id": group_id},
+    )
+    _append_receipt(
+        legacy, memory_id=memory_id, group_id=group_id, agent_id=agent_id,
+        receipt_id="wide-shadow-receipt", session_id="wide-shadow-session",
+        project_ref=str(workspace / "project"),
+    )
+    service.backfill_group(legacy, group_id)
+    context = EffectiveAgentContext(
+        agent_instance_id=agent_id, share_group_id=group_id,
+        project_ref=str(workspace / "project"), provider="codex",
+        runtime_role="worker",
+    )
+    read = RuleReadPath(workspace, group_id)
+    shadow = read.shadow_compare(legacy, context) or {}
+    return int(
+        bool(shadow.get("missing"))
+        or bool(shadow.get("extra"))
+        or int(shadow.get("permission_diff", 0) or 0) != 0
+    )
+
+
+def _exact_system_migration_audience_diff() -> tuple[int, dict[str, int]]:
+    """Compare real legacy system audiences before/after production backfill."""
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = (
+        "system-migration-group", "system-migration-agent", "system-migration-rule",
+    )
+    AgentBindingStore(workspace).bind_agent(agent_id, group_id)
+    legacy = SharedMemoryStore(workspace, group_id)
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id=memory_id,
+            body="must preserve system migration audience",
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            priority=10,
+            agent_instance_id=agent_id,
+            created_at=_aged(30),
+            updated_at=_aged(30),
+        ),
+        assignments=[
+            {"target_type": "system", "target_id": "", "priority_override": 7},
+            {"target_type": "agent", "target_id": agent_id, "priority_override": 3},
+        ],
+        dedup_domain="system-migration-fixture",
+    )
+    before = _audience_multiset(
+        list(legacy.list_rule_assignments(memory_id)), group_id,
+    )
+    store = RuleMergeStore(workspace)
+    RuleMergeService(store).backfill_group(legacy, group_id)
+    link = store.get_source_link(group_id, memory_id)
+    if link is None:
+        raise RuntimeError("system migration source link missing")
+    after = _audience_multiset(
+        list(store.list_bindings(
+            definition_id=str(link["canonical_definition_id"]),
+            share_group_id=group_id,
+            status="active",
+        )),
+        group_id,
+    )
+    diff = before - after
+    diff.update(after - before)
+    legacy_system_count = sum(
+        count for key, count in before.items() if key[1] == "system"
+    )
+    migrated_system_count = sum(
+        count for key, count in after.items() if key[1] == "system"
+    )
+    return int(bool(diff)), {
+        "legacy_audience_count": sum(before.values()),
+        "migrated_audience_count": sum(after.values()),
+        "legacy_system_audience_count": legacy_system_count,
+        "migrated_system_audience_count": migrated_system_count,
+        "audience_multiset_delta_count": sum(diff.values()),
+    }
+
+
+def _true_permission_expansion() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = "permission-group", "permission-agent", "permission-rule"
+    legacy, store, service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+    )
+    definition = next(iter(store.list_definitions(status="active")))
+    store.upsert_binding(build_binding(
+        definition.definition_id, share_group_id=group_id,
+        target_type="group", target_id=group_id,
+        owner_agent_id=agent_id, created_by="manual",
+    ))
+    context = EffectiveAgentContext(
+        agent_instance_id=agent_id, share_group_id=group_id,
+        project_ref=project_ref, provider="codex", runtime_role="worker",
+    )
+    legacy_records = [
+        (record.memory_id, legacy.list_rule_assignments(record.memory_id))
+        for record in legacy.list_records()
+    ]
+    shadow = store.shadow_verify(context, legacy_records)
+    return int(int(shadow.get("permission_diff", 0) or 0) <= 0)
+
+
+def _true_system_permission_expansion() -> tuple[int, dict[str, int]]:
+    """Detect a canonical system audience absent from legacy's agent snapshot."""
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id, memory_id = (
+        "system-expansion-group", "system-expansion-agent", "system-expansion-rule",
+    )
+    legacy, store, service, project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id=memory_id,
+    )
+    definition = next(iter(store.list_definitions(status="active")))
+    store.upsert_evidence(build_evidence(
+        definition_id=definition.definition_id,
+        source_rule_id=memory_id,
+        agent_instance_id=agent_id,
+        project_ref=project_ref,
+        session_id="system-expansion-session",
+        session_trusted=True,
+        content="must run tests before commit",
+    ))
+    store.upsert_binding(build_binding(
+        definition.definition_id,
+        share_group_id=group_id,
+        target_type="system",
+        target_id="",
+        owner_agent_id=agent_id,
+        created_by="manual",
+    ))
+    context = EffectiveAgentContext(
+        agent_instance_id=agent_id,
+        share_group_id=group_id,
+        project_ref=project_ref,
+        provider="codex",
+        runtime_role="worker",
+    )
+    legacy_records = [
+        (record.memory_id, legacy.list_rule_assignments(record.memory_id))
+        for record in legacy.list_records()
+    ]
+    shadow = store.shadow_verify(context, legacy_records)
+    raw_detected = int(shadow.get("permission_diff", 0) or 0)
+    legacy_system_count = sum(
+        len([
+            item for item in assignments
+            if str(getattr(item, "target_type", "") or "") == "system"
+        ])
+        for _memory_id, assignments in legacy_records
+    )
+    canonical_system_count = len([
+        binding for binding in store.list_bindings(
+            share_group_id=group_id, status="active",
+        )
+        if binding.target_type == "system"
+    ])
+    missed = int(not (
+        raw_detected > 0
+        and canonical_system_count > legacy_system_count
+        and not shadow.get("missing")
+    ))
+    return missed, {
+        "raw_detected_expansion": raw_detected,
+        "canonical_system_audience_count": canonical_system_count,
+        "legacy_system_audience_count": legacy_system_count,
+    }
+
+
+def _backfill_real_migration_loss() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_id, agent_id = "migration-loss-group", "migration-loss-agent"
+    legacy, store, service, _project_ref = _feedback_case(
+        workspace, group_id=group_id, agent_id=agent_id, memory_id="original-rule",
+    )
+    clean_before = store.metrics()["migration_loss"]
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id="new-unbackfilled-rule", body="must run lint before commit",
+            kind=MemoryKind.PROCEDURE, status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always", priority=10, agent_instance_id=agent_id,
+            created_at=_now_iso(), updated_at=_now_iso(),
+        ),
+        assignments=[{"target_type": "agent", "target_id": agent_id}],
+    )
+    detected = store.metrics()["migration_loss"]
+    service.backfill_group(legacy, group_id)
+    repaired = store.metrics()["migration_loss"]
+    return int(clean_before != 0 or int(detected) < 1 or repaired != 0)
+
+
+def _unrelated_group_readiness() -> int:
+    workspace = Path(tempfile.mkdtemp())
+    group_a, group_b = "readiness-a", "readiness-b"
+    legacy_a = _seed_rule(
+        workspace, group_a, "readiness-rule-a", "must run tests before commit",
+        agent_id="readiness-agent-a", with_receipt=True,
+    )
+    legacy_b = _seed_rule(
+        workspace, group_b, "readiness-rule-b", "must run tests before commit",
+        agent_id="readiness-agent-b", with_receipt=True,
+    )
+    store = RuleMergeStore(workspace)
+    service = RuleMergeService(store)
+    service.backfill_group(legacy_a, group_a)
+    service.backfill_group(legacy_b, group_b)
+    store.set_projection_state(group_a, projection_lag=1)
+    store.set_projection_state(group_b, projection_lag=0)
+    context_a = EffectiveAgentContext(
+        agent_instance_id="agent-readiness-a", share_group_id=group_a,
+        project_ref="project-a", provider="codex", runtime_role="worker",
+    )
+    context_b = EffectiveAgentContext(
+        agent_instance_id="agent-readiness-b", share_group_id=group_b,
+        project_ref="project-a", provider="codex", runtime_role="worker",
+    )
+    readiness_a = RuleReadPath(workspace, group_a).canonical_readiness(
+        legacy_store=legacy_a, context=context_a,
+    )
+    readiness_b = RuleReadPath(workspace, group_b).canonical_readiness(
+        legacy_store=legacy_b, context=context_b,
+    )
+    return int(bool(readiness_a.get("ready")) or not bool(readiness_b.get("ready")))
+
+
 def _binding_projection_probe() -> int:
     workspace = Path(tempfile.mkdtemp())
     legacy = _seed_rule(
@@ -777,12 +1830,24 @@ def _binding_projection_probe() -> int:
     return _binding_source_projection_diff(store)
 
 
-def _extended_acceptance() -> tuple[dict[str, int], list[dict[str, str]]]:
+def _extended_acceptance() -> tuple[
+    dict[str, int], list[dict[str, str]], dict[str, int]
+]:
     errors: list[dict[str, str]] = []
+    observations: dict[str, int] = {}
 
     def run(name: str, callback: object) -> int:
         try:
             value = callback()  # type: ignore[operator]
+            if isinstance(value, tuple):
+                result, observed = value
+                if not isinstance(observed, dict):
+                    raise TypeError(f"{name} observations are not an object")
+                observations.update({
+                    f"{name}_{key}": int(item)
+                    for key, item in observed.items()
+                })
+                value = result
             return int(value)
         except Exception as exc:  # acceptance must report source blockers
             errors.append({"metric": name, "error": f"{type(exc).__name__}: {exc}"})
@@ -813,6 +1878,62 @@ def _extended_acceptance() -> tuple[dict[str, int], list[dict[str, str]]]:
         "shadow_permission_false_positive": run(
             "shadow_permission_false_positive", _shadow_permission_false_positive,
         ),
+        "pending_unlinked_group": run(
+            "pending_unlinked_group", _pending_unlinked_group,
+        ),
+        "unlinked_negative_feedback": run(
+            "unlinked_negative_feedback", _unlinked_negative_feedback,
+        ),
+        "new_source_canonical_route": run(
+            "new_source_canonical_route", _new_source_canonical_route,
+        ),
+        "inactive_binding_target": run(
+            "inactive_binding_target", _inactive_binding_target,
+        ),
+        "strength_evolution_contribution_diff": run(
+            "strength_evolution_contribution_diff",
+            _strength_evolution_contribution_diff,
+        ),
+        "strength_evolution_rollback": run(
+            "strength_evolution_rollback", _strength_evolution_rollback,
+        ),
+        "public_positive_runner_up": run(
+            "public_positive_runner_up", lambda: _public_runner_up("followed"),
+        ),
+        "public_negative_runner_up": run(
+            "public_negative_runner_up",
+            lambda: _public_runner_up("not_applicable"),
+        ),
+        "all_evidence_writes_contributions": run(
+            "all_evidence_writes_contributions",
+            _all_evidence_writes_contributions,
+        ),
+        "duplicate_receipt_independence": run(
+            "duplicate_receipt_independence", _duplicate_receipt_independence,
+        ),
+        "distinct_session_independence": run(
+            "distinct_session_independence", _distinct_session_independence,
+        ),
+        "exact_wide_shadow_diff": run(
+            "exact_wide_shadow_diff", _exact_wide_shadow_diff,
+        ),
+        "true_permission_expansion": run(
+            "true_permission_expansion", _true_permission_expansion,
+        ),
+        "exact_system_migration_audience_diff": run(
+            "exact_system_migration_audience_diff",
+            _exact_system_migration_audience_diff,
+        ),
+        "true_system_expansion_missed": run(
+            "true_system_expansion_missed",
+            _true_system_permission_expansion,
+        ),
+        "backfill_real_migration_loss": run(
+            "backfill_real_migration_loss", _backfill_real_migration_loss,
+        ),
+        "unrelated_group_readiness": run(
+            "unrelated_group_readiness", _unrelated_group_readiness,
+        ),
     }
     try:
         metrics["v1_collision_binding_leak"], metrics["v1_collision_runtime_leak"] = (
@@ -829,7 +1950,7 @@ def _extended_acceptance() -> tuple[dict[str, int], list[dict[str, str]]]:
         })
         metrics["v1_collision_binding_leak"] = 1
         metrics["v1_collision_runtime_leak"] = 1
-    return metrics, errors
+    return metrics, errors, observations
 
 
 def evaluate() -> dict[str, object]:
@@ -1008,10 +2129,14 @@ def evaluate() -> dict[str, object]:
     # PR7: real machine-acceptance family computed from persisted state.
     acceptance = intel.governance_acceptance()
     migration_loss_real = intel.metrics()["migration_loss"]
-    extended_metrics, extended_metric_errors = _extended_acceptance()
+    extended_metrics, extended_metric_errors, extended_observations = (
+        _extended_acceptance()
+    )
 
     report = {
         "auto_merge_precision": auto_merge_precision,
+        "auto_merge_precision_status": acceptance["auto_merge_precision_status"],
+        "merge_decision_count": acceptance["merge_decision_count"],
         "strength_conflict_merge": metrics["strength_conflict_merge"],
         "negative_evidence_leak": metrics["negative_evidence_leak"],
         "first_merge_human_approval": metrics["first_merge_human_approval"],
@@ -1043,9 +2168,12 @@ def evaluate() -> dict[str, object]:
         "rule_intelligence_event_lag": acceptance["rule_intelligence_event_lag"],
         "acceptance_passed": bool(acceptance["passed"]),
         **extended_metrics,
+        **extended_observations,
         "extended_metric_errors": extended_metric_errors,
         "passed": bool(
             auto_merge_precision >= 0.995
+            and acceptance["auto_merge_precision_status"] == "observed"
+            and acceptance["merge_decision_count"] > 0
             and metrics["strength_conflict_merge"] == 0
             and metrics["negative_evidence_leak"] == 0
             and metrics["first_merge_human_approval"] == 0
@@ -1063,6 +2191,9 @@ def evaluate() -> dict[str, object]:
             and auto_blocked_first
             and merge_ok
             and all(value == 0 for value in extended_metrics.values())
+            and extended_observations.get(
+                "true_system_expansion_missed_raw_detected_expansion", 0,
+            ) > 0
             and not extended_metric_errors
         ),
     }
