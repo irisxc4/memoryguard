@@ -1,4 +1,4 @@
-import tomllib
+from memoryguard import toml_compat as tomllib
 
 from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.provider_adapters import CodexAdapter

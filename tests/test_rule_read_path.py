@@ -479,6 +479,45 @@ def test_canonical_readiness_requires_all_shadow_audience_diffs_zero():
         assert f"shadow_{field}_nonzero" in read.last_readiness["failures"]
 
 
+class _DanglingAliasStore(_ReadinessStore):
+    """Source link resolves to an alias whose resolver returns a dangling
+    non-active target — it must never enter the canonical map."""
+
+    def list_source_links(self, *, share_group_id=None, status=None,
+                          canonical_definition_id=None):
+        return [{
+            "share_group_id": "g1",
+            "memory_id": "m1",
+            "original_definition_id": "definition-alias",
+            "canonical_definition_id": "definition-alias",
+            "status": "active",
+        }]
+
+    def get_definition(self, definition_id):
+        if definition_id != "definition-alias":
+            return None
+        return SimpleNamespace(
+            definition_id="definition-alias",
+            status="alias",
+            rule_strength="must",
+            maturity_state="validated",
+        )
+
+    def resolve_canonical(self, definition_id):
+        # The resolver returns the alias itself: a dangling alias with no
+        # superseded_by.  Strict active-only enforcement must fail closed.
+        return definition_id
+
+
+def test_dangling_alias_never_enters_canonical_map():
+    read = _readiness_reader(_DanglingAliasStore())
+    mapping = read.resolve_canonical_map(known_memory_ids={"m1"})
+    # Readiness only gates wiring (APIs present); the dangling-alias rejection
+    # is a data-level fail-closed inside resolve_canonical_map, so the map is
+    # None even though the store is wired.
+    assert mapping is None
+
+
 def test_canonical_read_cross_agent_keeps_each_agents_rule(
     tmp_path, canonical_readiness_ready,
 ):

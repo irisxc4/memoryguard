@@ -764,9 +764,10 @@ class RuleReadPath:
                 return None
             if definition is None or str(
                 getattr(definition.status, "value", definition.status) or ""
-            ) not in {"active", "alias"}:
-                # Active source link resolving to a non-active definition must
-                # fail closed instead of silently dropping or inventing a map.
+            ) != "active":
+                # Active source link resolving to anything but the strict
+                # active canonical must fail closed.  A dangling alias (no
+                # superseded_by) must never enter the canonical map.
                 return None
             if canonical_id not in bound:
                 # Enforcement projection is incomplete for this group: fail

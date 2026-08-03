@@ -16,7 +16,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 # 首期零运行时第三方依赖：纯标准库实现，保证无网络、无供应链风险。
-dependencies = []
+dependencies = [
+    # Python 3.10 lacks the stdlib tomllib (added in 3.11); use the tomli
+    # backport so the declared requires-python >=3.10 contract holds.
+    "tomli>=2.0.1; python_version < '3.11'",
+]
 
 [project.urls]
 Homepage = "https://github.com/irisxc4/memoryguard"
