@@ -1934,6 +1934,13 @@ class RuleMergeStore:
     def get_source_link(
         self, share_group_id: str, memory_id: str,
     ) -> dict[str, Any] | None:
+        """Return the persisted source link, or None.
+
+        This is a pure read: it never derives a Definition, never opens the
+        legacy store and never writes.  Source ownership recovery is an
+        explicit mutation performed by backfill/sync/outbox consumers under
+        the workspace governance lock, never by a read path.
+        """
         with self._db() as conn:
             row = conn.execute(
                 "SELECT * FROM rule_source_links "
@@ -1941,62 +1948,6 @@ class RuleMergeStore:
                 (share_group_id, memory_id),
             ).fetchone()
         if row is None:
-            # Low-level legacy callers may append a receipt directly, without
-            # first emitting the lifecycle event that normally materializes a
-            # source link.  Feedback projection still needs a non-authoritative
-            # ownership hint so the pending event can reach the append-only
-            # ledger; the contribution write below persists the durable link.
-            try:
-                from .shared_memory_store import SharedMemoryStore
-
-                legacy = SharedMemoryStore(
-                    self.workspace, share_group_id, must_exist=True,
-                )
-                pending_feedback = any(
-                    str(event.get("event_type") or "")
-                    == "effective_rule_feedback_changed"
-                    and str(event.get("memory_id") or "") == memory_id
-                    for event in legacy.list_unconsumed_rule_events()
-                )
-                # Only the trusted MCP feedback route may use this recovery
-                # hint.  Generic outbox consumers must remain fail-closed
-                # until explicit backfill materializes source ownership.
-                if (
-                    not pending_feedback
-                    or os.environ.get("MEMORYGUARD_STRICT_BINDING", "") != "1"
-                ):
-                    return None
-                record = legacy.get_record(memory_id)
-            except (FileNotFoundError, OSError, sqlite3.Error, ValueError):
-                record = None
-            if record is not None:
-                status = getattr(record.status, "value", record.status)
-                if (
-                    str(status) == "active"
-                    and str(record.injection_policy or "") == "always"
-                ):
-                    definition = build_definition(
-                        record.body,
-                        kind=record.kind,
-                        confidence=record.confidence,
-                        created_at=record.created_at,
-                    )
-                    canonical_id = self.resolve_canonical(
-                        definition.definition_id,
-                    )
-                    target = self.get_definition(canonical_id)
-                    if target is None or target.status != "active":
-                        canonical_id = definition.definition_id
-                    return self.upsert_source_link(
-                        share_group_id=share_group_id,
-                        memory_id=memory_id,
-                        source_revision=(
-                            record.updated_at or record.created_at or ""
-                        ),
-                        original_definition_id=definition.definition_id,
-                        canonical_definition_id=canonical_id,
-                        status="active",
-                    )
             return None
         return {
             "share_group_id": row["share_group_id"],
@@ -2006,6 +1957,36 @@ class RuleMergeStore:
             "canonical_definition_id": row["canonical_definition_id"] or "",
             "status": row["status"] or "active",
         }
+
+    def list_source_links(
+        self,
+        *,
+        share_group_id: str | None = None,
+        status: str | None = None,
+        canonical_definition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pure-read listing of persisted source links.
+
+        Source links are the fact table for Source -> canonical Definition
+        ownership.  Evidence only carries belief, never ownership.
+        """
+        sql = "SELECT * FROM rule_source_links WHERE 1=1"
+        params: list[Any] = []
+        if share_group_id is not None:
+            sql += " AND share_group_id=?"
+            params.append(share_group_id)
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        if canonical_definition_id is not None:
+            sql += " AND canonical_definition_id=?"
+            params.append(canonical_definition_id)
+        sql += " ORDER BY share_group_id, memory_id"
+        with self._db() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(sql, params).fetchall()
+            ]
 
     # ------------------------------------------------------------------
     # Runtime feedback / definition statistics (P2 -> P3 projection, PR4)
@@ -3645,8 +3626,16 @@ class RuleMergeStore:
                     projection_lag, projection_error, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scope_id) DO UPDATE SET
-                    last_outbox_event_id=excluded.last_outbox_event_id,
-                    last_projected_event_id=excluded.last_projected_event_id,
+                    last_outbox_event_id=CASE
+                        WHEN excluded.last_outbox_event_id = ''
+                        THEN rule_projection_state.last_outbox_event_id
+                        ELSE excluded.last_outbox_event_id
+                    END,
+                    last_projected_event_id=CASE
+                        WHEN excluded.last_projected_event_id = ''
+                        THEN rule_projection_state.last_projected_event_id
+                        ELSE excluded.last_projected_event_id
+                    END,
                     projection_lag=excluded.projection_lag,
                     projection_error=excluded.projection_error,
                     updated_at=excluded.updated_at
@@ -6256,17 +6245,19 @@ class RuleMergeStore:
 
         missing = sorted(legacy_matched - new_matched)
         extra = sorted(new_matched - legacy_matched)
-        missing_audiences = legacy_audiences - new_audiences
-        extra_audiences = new_audiences - legacy_audiences
+        # P3-03: permission boundaries compare the *unique* audience set, not
+        # the number of contributing sources.  Two legacy assignments that both
+        # materialize into one shared P3 binding are not a permission change;
+        # source integrity is verified separately by ``missing``/``extra``.
+        missing_audiences = set(legacy_audiences) - set(new_audiences)
+        extra_audiences = set(new_audiences) - set(legacy_audiences)
         permission_missing = [
             self._shadow_audience_dict(key)
             for key in sorted(missing_audiences)
-            for _ in range(missing_audiences[key])
         ]
         permission_extra = [
             self._shadow_audience_dict(key)
             for key in sorted(extra_audiences)
-            for _ in range(extra_audiences[key])
         ]
         permission_diff = len(permission_missing) + len(permission_extra)
         return {

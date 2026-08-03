@@ -320,9 +320,13 @@ class TestScopeWriteback:
 class TestSafeCleanup:
     """场景10-12：残留归档与路径安全。"""
 
-    def test_archive_dry_run(self, temp_workspace):
+    def test_archive_dry_run(self, temp_workspace, monkeypatch):
         """场景10：归档预演模式不实际移动。"""
         from memoryguard.agent_cleanup import AgentCleanup
+        # 产品策略要求归档路径位于用户主目录下。CI 的临时目录不在真实
+        # HOME 中，因此把 Path.home 指向临时工作区父目录，使测试目录
+        # 落在模拟 HOME 之下，同时保留产品安全边界。
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: temp_workspace.parent))
         cleanup = AgentCleanup(temp_workspace)
         test_dir = temp_workspace / ".test-agent"
         test_dir.mkdir()
@@ -334,9 +338,12 @@ class TestSafeCleanup:
         assert result.get("ok") is True
         assert test_dir.exists()  # dry_run 不实际移动
 
-    def test_archive_refuses_symlink(self, temp_workspace):
+    def test_archive_refuses_symlink(self, temp_workspace, monkeypatch):
         """场景12：符号链接归档被拒绝。"""
         from memoryguard.agent_cleanup import AgentCleanup
+        # 与 test_archive_dry_run 一致：把 Path.home 指向临时工作区父目录，
+        # 使测试目录位于模拟 HOME 之下，避免 CI 触发 outside_user_home。
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: temp_workspace.parent))
         cleanup = AgentCleanup(temp_workspace)
         target = temp_workspace / "real-dir"
         target.mkdir()

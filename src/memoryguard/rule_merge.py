@@ -111,40 +111,12 @@ class RuleMergeService:
 
     def __init__(self, store: RuleMergeStore, judge: Any | None = None):
         self.store = store
-        self._install_durable_source_link_view()
         # P3.3: optional semantic judge.  None keeps the deterministic Dice
         # semantic layer exactly as before; a judge adds an auditable verdict.
         self.judge = judge
         # PR7: the bounded scan reports how many pairs it evaluated, skipped and
         # persisted instead of silently dropping them.
         self.last_scan_summary: dict[str, Any] = {}
-
-    def _install_durable_source_link_view(self) -> None:
-        """Keep service callers from mistaking a pending hint for ownership.
-
-        A compatibility patch in older stores may return a derived source-link
-        hint while feedback is pending.  The merge service's canonical source
-        boundary requires a committed link, and the same view is exposed to
-        acceptance callers holding this store instance.
-        """
-        marker = "_memoryguard_durable_source_link_view"
-        raw_marker = "_memoryguard_raw_get_source_link"
-        if getattr(self.store, marker, False):
-            self._raw_get_source_link = getattr(self.store, raw_marker)
-            return
-        raw = getattr(self.store, "get_source_link", None)
-        if not callable(raw):
-            return
-        self._raw_get_source_link = raw
-
-        def durable_source_link(group_id: str, memory_id: str) -> dict[str, Any] | None:
-            if not self._has_durable_source_link(group_id, memory_id):
-                return None
-            return self._raw_get_source_link(group_id, memory_id)
-
-        setattr(self.store, raw_marker, raw)
-        setattr(self.store, marker, True)
-        setattr(self.store, "get_source_link", durable_source_link)
 
     # ------------------------------------------------------------------
     # Backfill / dual-write
@@ -406,6 +378,9 @@ class RuleMergeService:
                     receipt_id=receipt.receipt_id,
                     content=record.body,
                     confidence=receipt.confidence,
+                    share_group_id=group_id,
+                    source_root_id="shared-memory",
+                    source_object_id=record.memory_id,
                     session_trusted=int(
                         session_trust_is_valid(
                             getattr(receipt, "session_id", ""),
@@ -605,6 +580,9 @@ class RuleMergeService:
                 receipt_id=receipt.receipt_id,
                 content=record.body,
                 confidence=getattr(receipt, "confidence", 1.0),
+                share_group_id=group_id,
+                source_root_id="shared-memory",
+                source_object_id=record.memory_id,
                 session_trusted=int(
                     session_trust_is_valid(
                         getattr(receipt, "session_id", ""),
@@ -1299,23 +1277,18 @@ class RuleMergeService:
         return True
 
     def _has_durable_source_link(self, group_id: str, memory_id: str) -> bool:
-        """Return whether source ownership is persisted, not only hinted.
+        """Return whether a committed source link row exists for the source.
 
-        ``RuleMergeStore.get_source_link`` intentionally exposes a derived hint
-        for low-level callers with a pending feedback event.  A bound group may
-        not use that hint to satisfy the ownership barrier: only a committed
-        ``rule_source_links`` row proves that backfill/sync completed.
+        ``get_source_link`` is a pure read, so existence of a returned row is
+        itself the durable ownership proof: the method can no longer derive or
+        write a hint.
         """
-        conn_factory = getattr(self.store, "_db", None)
-        if not callable(conn_factory):
-            return False
-        with conn_factory() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM rule_source_links "
-                "WHERE share_group_id=? AND memory_id=?",
-                (str(group_id), str(memory_id)),
-            ).fetchone()
-        return row is not None
+        link = self.store.get_source_link(str(group_id), str(memory_id))
+        return (
+            link is not None
+            and str(link.get("share_group_id") or "") == str(group_id)
+            and str(link.get("memory_id") or "") == str(memory_id)
+        )
 
     # ------------------------------------------------------------------
     # Duplicate detection → proposals
@@ -1644,6 +1617,18 @@ class RuleMergeService:
             # and proposal rescan in one stable observation window.
             drained = self._consume_outbox_locked(self.store.workspace)
             assert_all_group_outboxes_drained()
+            # P3-04: never form cross-agent consensus while the workspace still
+            # carries unmigrated legacy rules or unprojected binding
+            # contributions.  Drain only flushes the outbox; a legacy rule with
+            # no pending event would never appear in it, so the migration
+            # metrics are the authoritative coverage gate.
+            metrics = self.store.metrics()
+            migration_loss = int(metrics.get('migration_loss', 0) or 0)
+            binding_diff = int(metrics.get('binding_contribution_diff', 0) or 0)
+            if migration_loss != 0:
+                raise RuntimeError('rule_merge_migration_incomplete')
+            if binding_diff != 0:
+                raise RuntimeError('rule_merge_binding_projection_incomplete')
             self.scan_and_propose(definition_ids=definition_ids, judge=judge)
             assert_all_group_outboxes_drained()
             return drained

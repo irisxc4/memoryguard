@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -64,6 +65,20 @@ def main() -> int:
     # (admin 建 binding -> 每次调用前切换到匹配的可信 agent 身份)
     os.environ["MEMORYGUARD_ADMIN"] = "1"
     os.environ.pop("MEMORYGUARD_ALLOW_ANON", None)
+
+    # 确定性 Agent Fixture：CI Runner 可能没有安装任何本地 Agent 产品。
+    # 在临时 HOME 中创建已知 surface 目录，使 list_agents() 不依赖真实安装状态。
+    fixture_home = Path(tempfile.mkdtemp(prefix="mg-fixture-home-"))
+    (fixture_home / ".claude").mkdir(parents=True, exist_ok=True)
+    (fixture_home / ".claude" / "CLAUDE.md").write_text(
+        "# fixture\n", encoding="utf-8")
+    (fixture_home / ".claude" / "memory").mkdir(parents=True, exist_ok=True)
+    (fixture_home / ".claude" / "memory" / "preference.md").write_text(
+        "# fixture memory\n", encoding="utf-8")
+    os.environ["APPDATA"] = str(fixture_home / "AppData" / "Roaming")
+    os.environ["LOCALAPPDATA"] = str(fixture_home / "AppData" / "Local")
+    _orig_home = Path.home
+    Path.home = staticmethod(lambda: fixture_home)  # type: ignore[assignment]
 
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
@@ -299,6 +314,8 @@ def main() -> int:
     # 汇总
     # -----------------------------------------------------------------
     print("\n" + "=" * 60)
+    Path.home = _orig_home
+    shutil.rmtree(fixture_home, ignore_errors=True)
     if all_pass:
         print("v3.2 完整验收：全部通过")
         return 0

@@ -6,8 +6,10 @@ MCP, hooks, bootstrap and future GUI governance.
 from __future__ import annotations
 
 from dataclasses import replace
+import ntpath
 import os
 from pathlib import Path
+import re
 from typing import Iterable
 
 from .schema_v3 import EffectiveAgentContext, RuleAssignment
@@ -48,30 +50,39 @@ def validate_automatic_assignment(
     return assignment
 
 
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def canonical_project_ref(value: str | os.PathLike[str] | None) -> str:
     """Canonical project identity shared by rules and raw history.
 
     Only filesystem-looking values are resolved.  Legacy logical labels stay
     labels, while Windows spelling/slash aliases collapse to one stable key.
+
+    Windows drive/UNC paths are normalised with ``ntpath`` on every platform so
+    a Linux CI runner, an editor on Windows and a macOS shell all derive the
+    same canonical key for ``C:\\Work\\App`` and ``c:/work/app``.
     """
     text = str(value or "").strip()
     if not text:
         return ""
-    filesystem_ref = (
-        "/" in text or "\\" in text or bool(os.path.isabs(text))
-        or (len(text) >= 2 and text[1] == ":")
-    )
-    if not filesystem_ref:
+    if _WINDOWS_DRIVE.match(text) or text.startswith(("\\\\", "//")):
+        try:
+            normalized = ntpath.normpath(text)
+        except (OSError, RuntimeError, ValueError):
+            return ""
+        normalized = normalized.replace("\\", "/").casefold()
+        if normalized.endswith("/") and len(normalized) > 1:
+            return normalized
+        return normalized.rstrip("/")
+    if "/" not in text and "\\" not in text and not os.path.isabs(text):
         return text
     try:
         resolved = Path(text).expanduser().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         return ""
     normalized = os.path.normcase(str(resolved)).replace("\\", "/")
-    if normalized == "/" or (
-        len(normalized) == 3
-        and normalized[1:] == ":/"
-    ):
+    if normalized == "/":
         return normalized
     return normalized.rstrip("/")
 

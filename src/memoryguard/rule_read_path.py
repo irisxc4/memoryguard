@@ -685,10 +685,12 @@ class RuleReadPath:
         """Build ``memory_id -> definition_id`` for active definitions bound to
         this group.  Returns None when the layer has no data for the group.
 
-        The mapping is derived from Evidence: every ``source_rule_id`` of a
-        bound Definition is a legacy memory_id (backfill/dual-write anchor).
-        Stale evidence whose source id no longer exists in the legacy store is
-        dropped so the canonical read never invents records.
+        The mapping is derived from the Source Link fact table, never from
+        Evidence: an active source link resolves through ``resolve_canonical``
+        to an active, group-bound Definition.  Evidence only carries belief and
+        diagnostics; a source with a link but no receipts must still reach the
+        canonical map, and stale evidence without a link must not establish
+        ownership.
         """
         readiness = self.canonical_readiness(
             shadow_summary=shadow_summary,
@@ -701,55 +703,89 @@ class RuleReadPath:
         store = self._open()
         if store is None:
             return None
+        list_source_links = getattr(store, "list_source_links", None)
+        get_definition = getattr(store, "get_definition", None)
+        resolve_canonical = getattr(store, "resolve_canonical", None)
         try:
-            definitions = store.list_definitions(status="active")
-            if not definitions:
-                return None
             bindings = store.list_bindings(
                 share_group_id=self.group_id, status="active",
             )
             if not bindings:
                 return None
             bound = {b.definition_id for b in bindings}
+            if not callable(list_source_links) or not callable(get_definition):
+                return None
+            links = list_source_links(
+                share_group_id=self.group_id, status="active",
+            )
         except Exception:
             return None
 
         memory_to_definition: dict[str, str] = {}
         definition_to_memory: dict[str, list[str]] = {}
-        for definition in definitions:
-            if definition.definition_id not in bound:
+        for link in links:
+            memory_id = str(link.get("memory_id") or "").strip()
+            if not memory_id:
+                return None
+            if known_memory_ids is not None and memory_id not in known_memory_ids:
                 continue
-            source_ids: list[str] = []
+            raw_target = str(
+                link.get("canonical_definition_id")
+                or link.get("original_definition_id")
+                or ""
+            ).strip()
+            if not raw_target:
+                return None
+            canonical_id = raw_target
+            if callable(resolve_canonical):
+                try:
+                    resolved = resolve_canonical(raw_target)
+                except Exception:
+                    return None
+                canonical_id = str(resolved or raw_target)
+            definition = None
             try:
-                for evidence in store.list_evidence(
-                    definition_id=definition.definition_id,
-                ):
-                    source = str(evidence.source_rule_id or "").strip()
-                    if not source:
-                        continue
-                    if known_memory_ids is not None and source not in known_memory_ids:
-                        continue
-                    if source not in memory_to_definition:
-                        source_ids.append(source)
-                        memory_to_definition[source] = definition.definition_id
+                definition = get_definition(canonical_id)
             except Exception:
-                continue
-            if source_ids:
-                definition_to_memory[definition.definition_id] = source_ids
+                return None
+            if definition is None or str(
+                getattr(definition.status, "value", definition.status) or ""
+            ) not in {"active", "alias"}:
+                # Active source link resolving to a non-active definition must
+                # fail closed instead of silently dropping or inventing a map.
+                return None
+            if canonical_id not in bound:
+                # Enforcement projection is incomplete for this group: fail
+                # closed rather than omitting an active governed source.
+                return None
+            previous = memory_to_definition.get(memory_id)
+            if previous is not None and previous != canonical_id:
+                return None
+            memory_to_definition[memory_id] = canonical_id
+            definition_to_memory.setdefault(canonical_id, []).append(memory_id)
 
         if not memory_to_definition:
             return None
+        for memory_ids in definition_to_memory.values():
+            memory_ids.sort()
+
+        definitions_out: dict[str, dict[str, Any]] = {}
+        for definition_id in sorted(definition_to_memory):
+            definition = None
+            try:
+                definition = get_definition(definition_id)
+            except Exception:
+                return None
+            if definition is None:
+                return None
+            definitions_out[definition_id] = {
+                "rule_strength": getattr(definition, "rule_strength", ""),
+                "maturity_state": getattr(definition, "maturity_state", ""),
+            }
         return {
             "mode": MODE_RULE_INTELLIGENCE,
             "group_id": self.group_id,
-            "definitions": {
-                d.definition_id: {
-                    "rule_strength": d.rule_strength,
-                    "maturity_state": d.maturity_state,
-                }
-                for d in definitions
-                if d.definition_id in definition_to_memory
-            },
+            "definitions": definitions_out,
             "memory_to_definition": memory_to_definition,
             "definition_to_memory": definition_to_memory,
             "readiness": readiness,
@@ -876,11 +912,13 @@ class RuleReadPath:
                 if source_id and source_id in legacy_ids:
                     new_matched.add(source_id)
 
-        permission_missing = legacy_audiences - new_audiences
-        permission_extra = new_audiences - legacy_audiences
-        permission_diff = sum(permission_missing.values()) + sum(
-            permission_extra.values()
-        )
+        # P3-03: permission boundaries compare the *unique* audience set, not
+        # the number of contributing sources.  Two legacy assignments that both
+        # materialize into one shared P3 binding are not a permission change;
+        # source integrity is verified separately by missing/extra.
+        permission_missing = set(legacy_audiences) - set(new_audiences)
+        permission_extra = set(new_audiences) - set(legacy_audiences)
+        permission_diff = len(permission_missing) + len(permission_extra)
         return {
             "missing": sorted(legacy_matched - new_matched),
             "extra": sorted(new_matched - legacy_matched),
