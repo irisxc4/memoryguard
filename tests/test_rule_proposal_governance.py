@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_evidence import build_evidence
@@ -57,10 +58,20 @@ def _candidate(store: RuleMergeStore, service: RuleMergeService):
 
 
 def _approve(store: RuleMergeStore, proposal_id: str, **kwargs):
+    context = AccessContext("test-admin", True, True, False)
+    expired_at = kwargs.pop("expires_at", "")
+    if expired_at:
+        expiry = datetime.fromisoformat(expired_at).timestamp()
+        token = store.issue_merge_capability(
+            proposal_id, context, issued_at=expiry - 300, expires_at=expiry,
+        )
+    else:
+        token = store.issue_merge_capability(proposal_id, context)
     return store.approve_proposal(
         proposal_id,
-        approved_by="admin",
-        capability_id="admin:test-suite",
+        approved_by=context.principal,
+        capability_token=token,
+        access_context=context,
         **kwargs,
     )
 
@@ -213,7 +224,12 @@ def test_repeated_scan_preserves_first_merge_acknowledgement(tmp_path):
     _reps(store)
 
     cand = _candidate(store, service)
-    store.acknowledge_first_merge(cand["proposal_id"], actor="human")
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(cand["proposal_id"], context)
+    store.acknowledge_first_merge(
+        cand["proposal_id"], actor="human", capability_token=token,
+        access_context=context,
+    )
     _candidate(store, service)  # rescan
     assert (
         store.get_proposal(cand["proposal_id"])["first_merge_acknowledged"] == 1
@@ -242,7 +258,9 @@ def test_human_cannot_merge_polarity_conflict(tmp_path):
         [pos.definition_id, neg.definition_id], 0.95,
         evidence=store.list_evidence(), definition_a=pos, definition_b=neg,
     )
-    _approve(store, pair["proposal_id"])
+    with pytest.raises(ValueError, match="rule_merge_similarity_gate_failed"):
+        _approve(store, pair["proposal_id"])
+    assert store.get_proposal(pair["proposal_id"])["status"] == "candidate"
     result = service.merge_proposal(pair["proposal_id"], actor="admin")
     assert result["ok"] is False
     assert result["conflict_type"] == "polarity"
@@ -269,7 +287,9 @@ def test_human_cannot_merge_parameter_conflict(tmp_path):
         evidence=store.list_evidence(),
         definition_a=pytest_def, definition_b=unittest_def,
     )
-    _approve(store, pair["proposal_id"])
+    with pytest.raises(ValueError, match="rule_merge_similarity_gate_failed"):
+        _approve(store, pair["proposal_id"])
+    assert store.get_proposal(pair["proposal_id"])["status"] == "candidate"
     result = service.merge_proposal(pair["proposal_id"], actor="admin")
     assert result["ok"] is False
     assert result["conflict_type"] == "parameter"
@@ -354,8 +374,9 @@ def test_approved_proposal_requires_valid_approval(tmp_path):
     expired = (
         datetime.now(timezone.utc) - timedelta(hours=1)
     ).isoformat()
-    _approve(store, cand["proposal_id"], expires_at=expired)
+    with pytest.raises(ValueError, match="capability rejected"):
+        _approve(store, cand["proposal_id"], expires_at=expired)
     assert store.get_valid_approval(cand["proposal_id"]) is None
     result = service.merge_proposal(cand["proposal_id"], actor="admin")
     assert result["ok"] is False
-    assert result["blocked_reason"] == "rule_merge_approval_required"
+    assert result["blocked_reason"] == "auto_merge_not_ready"

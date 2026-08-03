@@ -32,6 +32,7 @@ migration.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,6 +42,7 @@ MODE_AUTO = "auto"
 MODE_LEGACY = "legacy"
 MODE_RULE_INTELLIGENCE = "rule-intelligence"
 _MODES = {MODE_AUTO, MODE_LEGACY, MODE_RULE_INTELLIGENCE}
+_MISSING = object()
 
 
 def resolve_read_path_mode(value: str = "") -> str:
@@ -64,6 +66,17 @@ class RuleReadPath:
         self.workspace = Path(workspace).resolve()
         self.group_id = group_id
         self._store: Any | None = None
+        self._last_readiness: dict[str, Any] = {
+            "ready": False,
+            "group_id": self.group_id,
+            "failures": ["not_checked"],
+            "wiring_requirements": [],
+        }
+
+    @property
+    def last_readiness(self) -> dict[str, Any]:
+        """Return last public readiness decision for diagnostics/tests."""
+        return dict(self._last_readiness)
 
     def _open(self) -> Any | None:
         if self._store is None:
@@ -90,9 +103,243 @@ class RuleReadPath:
         except Exception:
             return False
 
+    def canonical_readiness(
+        self,
+        *,
+        shadow_summary: Mapping[str, Any] | None = None,
+        legacy_store: Any | None = None,
+        context: Any | None = None,
+    ) -> dict[str, Any]:
+        """Check whether canonical enforcement may replace legacy reads.
+
+        This is deliberately fail-closed.  It consumes only public Store
+        state/metrics and the normalized shadow audience diff; it never
+        infers permission changes from binding target types or private tables.
+        """
+        failures: list[str] = []
+        wiring_requirements: list[str] = []
+        checks: dict[str, Any] = {}
+        store = self._open()
+
+        if store is None:
+            failures.append("store_unavailable")
+        else:
+            projection_status_fn = getattr(store, "projection_status", None)
+            if not callable(projection_status_fn):
+                failures.append("projection_status_unavailable")
+                wiring_requirements.append(
+                    "Store.projection_status() must expose projection_lag and projection_error"
+                )
+            else:
+                try:
+                    projection = projection_status_fn()
+                except Exception:
+                    projection = None
+                if not isinstance(projection, Mapping):
+                    failures.append("projection_status_unavailable")
+                    wiring_requirements.append(
+                        "Store.projection_status() must expose projection_lag and projection_error"
+                    )
+                else:
+                    lag = projection.get("projection_lag", _MISSING)
+                    error = projection.get("projection_error", _MISSING)
+                    checks["projection_lag"] = (
+                        None if lag is _MISSING else lag
+                    )
+                    checks["projection_error"] = (
+                        None if error is _MISSING else error
+                    )
+                    if lag is _MISSING:
+                        failures.append("projection_lag_unavailable")
+                        wiring_requirements.append(
+                            "Store.projection_status() must expose projection_lag"
+                        )
+                    elif lag != 0:
+                        failures.append("projection_lag_nonzero")
+                    if error is _MISSING:
+                        failures.append("projection_error_unavailable")
+                        wiring_requirements.append(
+                            "Store.projection_status() must expose projection_error"
+                        )
+                    elif error not in ("", None):
+                        failures.append("projection_error_present")
+
+            metrics_fn = getattr(store, "metrics", None)
+            metrics: Mapping[str, Any] | None = None
+            if not callable(metrics_fn):
+                failures.append("metrics_unavailable")
+                wiring_requirements.append(
+                    "Store.metrics() must expose migration_loss and binding_contribution_diff"
+                )
+            else:
+                try:
+                    value = metrics_fn()
+                except Exception:
+                    value = None
+                if not isinstance(value, Mapping):
+                    failures.append("metrics_unavailable")
+                    wiring_requirements.append(
+                        "Store.metrics() must expose migration_loss and binding_contribution_diff"
+                    )
+                else:
+                    metrics = value
+                    if "binding_contribution_diff" not in metrics:
+                        derived = self._derive_binding_contribution_diff(store)
+                        if derived is not _MISSING:
+                            metrics = dict(metrics)
+                            metrics["binding_contribution_diff"] = derived
+                            checks["binding_contribution_diff_source"] = (
+                                "persisted_contributions"
+                            )
+                    for field in ("migration_loss", "binding_contribution_diff"):
+                        metric = metrics.get(field, _MISSING)
+                        checks[field] = None if metric is _MISSING else metric
+                        if metric is _MISSING:
+                            failures.append(f"{field}_unavailable")
+                            wiring_requirements.append(
+                                f"Store.metrics() must expose {field}"
+                            )
+                        elif metric != 0:
+                            failures.append(f"{field}_nonzero")
+
+            shadow = self._resolve_shadow_summary(
+                store,
+                shadow_summary=shadow_summary,
+                legacy_store=legacy_store,
+                context=context,
+                metrics=metrics,
+            )
+            if not isinstance(shadow, Mapping):
+                failures.append("shadow_summary_unavailable")
+                wiring_requirements.append(
+                    "Store.shadow_summary() or explicit normalized shadow_summary is required"
+                )
+            else:
+                normalized_shadow: dict[str, Any] = {}
+                for field in ("missing", "extra", "permission_diff"):
+                    diff = shadow.get(field, _MISSING)
+                    normalized_shadow[field] = (
+                        None if diff is _MISSING else diff
+                    )
+                    if diff is _MISSING:
+                        failures.append(f"shadow_{field}_unavailable")
+                    elif not self._is_zero_diff(diff):
+                        failures.append(f"shadow_{field}_nonzero")
+                checks["shadow"] = normalized_shadow
+
+        result = {
+            "ready": not failures,
+            "group_id": self.group_id,
+            "checks": checks,
+            "failures": failures,
+            "wiring_requirements": wiring_requirements,
+        }
+        self._last_readiness = result
+        return result
+
+    @staticmethod
+    def _derive_binding_contribution_diff(store: Any) -> Any:
+        """Derive contribution materialization diff from public persisted APIs.
+
+        Real ``RuleMergeStore`` versions before the aggregate metric was added
+        still expose both active bindings and active source contributions.  A
+        test double or an incomplete Store does not get an optimistic zero:
+        missing APIs remain ``_MISSING`` and keep the canonical gate closed.
+        """
+        bindings_fn = getattr(store, "list_bindings", None)
+        contributions_fn = getattr(store, "list_binding_contributions", None)
+        if not callable(bindings_fn) or not callable(contributions_fn):
+            return _MISSING
+        try:
+            bindings = bindings_fn(status="active")
+            contributions = contributions_fn(active=True)
+        except (TypeError, AttributeError, OSError, RuntimeError):
+            return _MISSING
+        except Exception:
+            return _MISSING
+        if not isinstance(bindings, (list, tuple)) or not isinstance(
+            contributions, (list, tuple),
+        ):
+            return _MISSING
+        binding_ids = {
+            str(getattr(binding, "binding_id", "") or "")
+            for binding in bindings
+        }
+        contribution_ids = {
+            str(
+                row.get("binding_id", "")
+                if isinstance(row, Mapping)
+                else getattr(row, "binding_id", "")
+                or ""
+            )
+            for row in contributions
+        }
+        return len(binding_ids.symmetric_difference(contribution_ids))
+
+    def _resolve_shadow_summary(
+        self,
+        store: Any,
+        *,
+        shadow_summary: Mapping[str, Any] | None,
+        legacy_store: Any | None,
+        context: Any | None,
+        metrics: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        """Resolve an already-normalized public shadow audience diff."""
+        if isinstance(shadow_summary, Mapping):
+            return shadow_summary
+
+        if metrics is not None:
+            metric_shadow = metrics.get("shadow_summary", _MISSING)
+            if isinstance(metric_shadow, Mapping):
+                return metric_shadow
+
+        for name in ("shadow_summary", "get_shadow_summary"):
+            candidate = getattr(store, name, None)
+            if isinstance(candidate, Mapping):
+                return candidate
+            if not callable(candidate):
+                continue
+            try:
+                value = candidate()
+            except TypeError:
+                try:
+                    value = candidate(legacy_store, context)
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if isinstance(value, Mapping):
+                return value
+
+        if legacy_store is not None and context is not None:
+            try:
+                value = self.shadow_compare(
+                    legacy_store, context,
+                )
+            except Exception:
+                return None
+            return value if isinstance(value, Mapping) else None
+        return None
+
+    @staticmethod
+    def _is_zero_diff(value: Any) -> bool:
+        """Accept only normalized empty diff values; unknown stays unsafe."""
+        if value is None:
+            return False
+        if isinstance(value, (str, bytes, Mapping)):
+            return len(value) == 0
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return len(value) == 0
+        return value == 0
+
     def resolve_canonical_map(
         self,
         known_memory_ids: set[str] | None = None,
+        *,
+        shadow_summary: Mapping[str, Any] | None = None,
+        legacy_store: Any | None = None,
+        context: Any | None = None,
     ) -> dict[str, Any] | None:
         """Build ``memory_id -> definition_id`` for active definitions bound to
         this group.  Returns None when the layer has no data for the group.
@@ -102,6 +349,14 @@ class RuleReadPath:
         Stale evidence whose source id no longer exists in the legacy store is
         dropped so the canonical read never invents records.
         """
+        readiness = self.canonical_readiness(
+            shadow_summary=shadow_summary,
+            legacy_store=legacy_store,
+            context=context,
+        )
+        if not readiness["ready"]:
+            return None
+
         store = self._open()
         if store is None:
             return None
@@ -156,6 +411,7 @@ class RuleReadPath:
             },
             "memory_to_definition": memory_to_definition,
             "definition_to_memory": definition_to_memory,
+            "readiness": readiness,
         }
 
     def shadow_compare(self, legacy_store: Any, context: Any) -> dict[str, Any] | None:

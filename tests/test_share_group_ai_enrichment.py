@@ -21,8 +21,8 @@ def test_share_group_build_enriches_then_graphs(tmp_path):
     ws = tmp_path
     api = GovernanceApi(ws)
     gid = "sg-enrich-1"
-    api.bind_agent("agent-a", gid, _admin_override=True)
-    api.bind_agent("agent-b", gid, _admin_override=True)
+    api.bind_agent("agent-a", gid)
+    api.bind_agent("agent-b", gid)
 
     org = AutoOrganizer(ws, gid)
     org.organize(MemoryEvent(
@@ -74,7 +74,7 @@ def test_share_group_mcp_list_share_group_filter(tmp_path):
     ws = tmp_path
     api = GovernanceApi(ws)
     gid = "sg-mcp-1"
-    api.bind_agent("agent-a", gid, _admin_override=True)
+    api.bind_agent("agent-a", gid)
     AutoOrganizer(ws, gid).organize(MemoryEvent(
         event_id="e2", agent_instance_id="agent-a", share_group_id=gid,
         raw_content="Always prefer English docs in CI pipelines carefully",

@@ -14,9 +14,11 @@ one legacy-store transaction, and ``consume_outbox`` projects it idempotently:
 """
 from __future__ import annotations
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_definition import normalize_rule_text
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
+from memoryguard.governance_engine import GovernanceEngine
 from memoryguard.schema_v3 import (
     MemoryKind,
     RuleMatchFeedback,
@@ -28,13 +30,22 @@ from memoryguard.schema_v3 import (
 from memoryguard.shared_memory_store import SharedMemoryStore
 
 
-def _seed_record(store: SharedMemoryStore, memory_id: str, body: str, agent="agent-1"):
+def _seed_record(
+    store: SharedMemoryStore,
+    memory_id: str,
+    body: str,
+    agent="agent-1",
+    *,
+    dedup_domain: str = "",
+):
     store.append_record(SharedMemoryRecord(
         memory_id=memory_id, body=body, kind=MemoryKind.PROCEDURE,
         status=SharedMemoryStatus.ACTIVE, injection_policy="always",
         priority=10, agent_instance_id=agent,
         created_at=_now_iso(), updated_at=_now_iso(),
-    ), assignments=[{"target_type": "agent", "target_id": agent}])
+    ), assignments=[{"target_type": "agent", "target_id": agent}],
+        dedup_domain=dedup_domain,
+    )
 
 
 def _seed_receipt(
@@ -90,6 +101,25 @@ def _setup_legacy(
     return store
 
 
+def _setup_same_definition_sources(tmp_path):
+    group = "g1"
+    legacy = SharedMemoryStore(tmp_path, group)
+    body = "run tests before submit"
+    _seed_record(
+        legacy, "m1", body, agent="owner", dedup_domain="source-m1",
+    )
+    _seed_record(
+        legacy, "m2", body, agent="owner", dedup_domain="source-m2",
+    )
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+    service.backfill_group(legacy, group)
+    definition_id = service._definition_from_record(
+        legacy.get_record("m1"),
+    ).definition_id
+    return legacy, intel, service, group, definition_id
+
+
 def test_feedback_writes_outbox_event_atomically(tmp_path):
     store = _setup_legacy(tmp_path)
     assert store.list_unconsumed_rule_events() == []
@@ -113,6 +143,14 @@ def test_consume_outbox_projects_followed_to_evidence(tmp_path):
     ))
     assert stats is not None
     assert stats["followed"] == 1
+    with intel._db() as conn:
+        contributions = conn.execute(
+            "SELECT contribution_id, receipt_id, active "
+            "FROM rule_evidence_contributions WHERE receipt_id=?",
+            ("rcpt-1",),
+        ).fetchall()
+    assert len(contributions) == 1
+    assert contributions[0]["active"] == 1
 
 
 def test_consume_outbox_violated_is_adherence_not_negative(tmp_path):
@@ -278,6 +316,110 @@ def test_assignment_change_projects_to_p3(tmp_path):
     )
 
 
+def test_two_sources_same_definition_same_owner_update_isolated(tmp_path):
+    legacy, intel, service, group, definition_id = (
+        _setup_same_definition_sources(tmp_path)
+    )
+
+    legacy.set_rule_assignments(
+        "m1", [{"target_type": "agent", "target_id": "agent-2"}],
+    )
+    service.consume_outbox(tmp_path, only_group=group)
+
+    source_a = intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m1", active=True,
+    )
+    source_b = intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m2", active=True,
+    )
+    assert {row["target_id"] for row in source_a} == {"agent-2"}
+    assert {row["target_id"] for row in source_b} == {"owner"}
+    assert {row["definition_id"] for row in source_a + source_b} == {
+        definition_id,
+    }
+
+
+def test_delete_one_source_preserves_other_source_binding(tmp_path):
+    legacy, intel, service, group, definition_id = (
+        _setup_same_definition_sources(tmp_path)
+    )
+
+    legacy.delete("m1")
+    service.consume_outbox(tmp_path, only_group=group)
+
+    assert intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m1", active=True,
+    ) == []
+    remaining = intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m2", active=True,
+    )
+    assert len(remaining) == 1
+    assert intel.list_bindings(definition_id=definition_id, status="active")
+    assert intel.get_source_link(group, "m1")["status"] == "deleted"
+    assert intel.get_source_link(group, "m2")["status"] == "active"
+
+
+def test_delete_source_deactivates_evidence_and_runtime(tmp_path):
+    legacy = _setup_legacy(tmp_path)
+    _feedback(legacy, "rcpt-1", "followed", feedback_id="fb-source-delete")
+    intel, _ = _consume(tmp_path)
+    definition_id = intel.list_definitions()[0].definition_id
+    assert intel.count_evidence() == 1
+    assert intel.get_runtime_stats(definition_id)["followed"] == 1
+
+    legacy.delete("m1")
+    RuleMergeService(intel).consume_outbox(tmp_path, only_group="g1")
+
+    assert intel.count_evidence() == 0
+    assert intel.get_runtime_stats(definition_id)["followed"] == 0
+    with intel._db() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM rule_evidence_contributions "
+            "WHERE source_rule_id=? AND active=1",
+            ("m1",),
+        ).fetchone()[0] == 0
+
+
+def test_delete_last_source_revokes_binding(tmp_path):
+    legacy, intel, service, group, definition_id = (
+        _setup_same_definition_sources(tmp_path)
+    )
+
+    legacy.delete("m1")
+    service.consume_outbox(tmp_path, only_group=group)
+    assert intel.list_bindings(definition_id=definition_id, status="active")
+
+    legacy.delete("m2")
+    service.consume_outbox(tmp_path, only_group=group)
+    assert intel.list_bindings(definition_id=definition_id, status="active") == []
+    assert intel.list_bindings(definition_id=definition_id, status="revoked")
+
+
+def test_rule_restore_reactivates_only_its_own_contributions(tmp_path):
+    legacy, intel, service, group, _definition_id = (
+        _setup_same_definition_sources(tmp_path)
+    )
+    legacy.set_rule_assignments(
+        "m1", [{"target_type": "agent", "target_id": "agent-2"}],
+    )
+    service.consume_outbox(tmp_path, only_group=group)
+
+    legacy.delete("m1")
+    service.consume_outbox(tmp_path, only_group=group)
+    GovernanceEngine(tmp_path, group, store=legacy).human_restore("m1")
+    service.consume_outbox(tmp_path, only_group=group)
+
+    source_a = intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m1", active=True,
+    )
+    source_b = intel.list_binding_contributions(
+        share_group_id=group, source_memory_id="m2", active=True,
+    )
+    assert {row["target_id"] for row in source_a} == {"agent-2"}
+    assert {row["target_id"] for row in source_b} == {"owner"}
+    assert intel.get_source_link(group, "m1")["status"] == "active"
+
+
 def test_merged_source_feedback_lands_on_canonical(tmp_path):
     group = "g1"
     legacy = SharedMemoryStore(tmp_path, group)
@@ -319,17 +461,41 @@ def test_merged_source_feedback_lands_on_canonical(tmp_path):
             project_ref=f"p{i}", production_level=1.0,
         )
 
+    before_contributions = sorted(
+        (row["source_memory_id"], row["legacy_assignment_hash"])
+        for row in intel.list_binding_contributions(active=True)
+    )
     candidates = service.scan_and_propose()
     cand = [p for p in candidates if p["status"] == "candidate"]
     assert cand, "synonym pair must be a merge candidate"
     pid = cand[0]["proposal_id"]
+    context = AccessContext("test-admin", True, True, False)
+    token = intel.issue_merge_capability(pid, context)
     intel.approve_proposal(
-        pid, approved_by="admin", capability_id="admin:test-suite",
+        pid, approved_by=context.principal,
+        capability_token=token, access_context=context,
     )
     result = service.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
     canonical_id = result["canonical_definition_id"]
     merged_id = result["merged_definition_ids"][0]
+
+    contributions = intel.list_binding_contributions(active=True)
+    assert sorted(
+        (row["source_memory_id"], row["legacy_assignment_hash"])
+        for row in contributions
+    ) == before_contributions
+    assert {row["definition_id"] for row in contributions} == {canonical_id}
+    with intel._db() as conn:
+        binding_definition_ids = {
+            row["definition_id"]
+            for row in conn.execute(
+                "SELECT b.definition_id FROM rule_bindings b "
+                "JOIN rule_binding_contributions c ON c.binding_id=b.binding_id "
+                "WHERE c.active=1"
+            ).fetchall()
+        }
+    assert binding_definition_ids == {canonical_id}
 
     # Feedback arrives for the *merged* source m2 after the merge.
     _feedback(legacy, "rcpt-2", "followed", feedback_id="fb-after-merge")

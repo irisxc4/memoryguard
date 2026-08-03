@@ -234,10 +234,12 @@ def test_source_map_accepts_real_memory_ir_without_source_objects(
 def test_lifecycle_operation_on_missing_group_does_not_create_ghost_store(
     tmp_path: Path,
     operation: str,
+    monkeypatch,
 ):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     api = GovernanceApi(tmp_path)
     result = getattr(api, operation)(
-        "missing-group", confirmed=True, _admin_override=True,
+        "missing-group", confirmed=True,
     )
     assert "group not found" in result["error"]
     assert not (
@@ -257,6 +259,7 @@ def test_export_contains_full_history_and_file_mapping(
         display_name="Native notes",
     )
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     personal_id = AgentBindingStore(tmp_path).ensure_personal_memory_group(
         "agent-a",
@@ -274,7 +277,7 @@ def test_export_contains_full_history_and_file_mapping(
     SharedMemoryStore(tmp_path, personal_id).create_version_snapshot("before export")
 
     result = GovernanceApi(tmp_path).export_memory_group(
-        personal_id, confirmed=True, _admin_override=True,
+        personal_id, confirmed=True,
     )
     export_path = Path(result["export_path"])
     assert export_path.is_file()
@@ -301,6 +304,7 @@ def test_clear_exports_then_empties_only_target_group(
     tmp_path: Path, monkeypatch,
 ):
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     bindings = AgentBindingStore(tmp_path)
     personal_id = bindings.ensure_personal_memory_group("agent-a")["group_id"]
@@ -315,7 +319,7 @@ def test_clear_exports_then_empties_only_target_group(
     bindings.leave_shared_group_to_personal("agent-a", confirmed=True)
 
     result = GovernanceApi(tmp_path).clear_memory_group(
-        personal_id, confirmed=True, _admin_override=True,
+        personal_id, confirmed=True,
     )
     assert Path(result["export_path"]).is_file()
     assert result["after"]["total_records"] == 0
@@ -347,12 +351,15 @@ def test_maintenance_window_rejects_mcp_writes(
     assert not store.maintenance_marker.exists()
 
 
-def test_archive_exports_unbinds_and_moves_only_target_group(tmp_path: Path):
+def test_archive_exports_unbinds_and_moves_only_target_group(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     bindings = AgentBindingStore(tmp_path)
     personal_id = bindings.ensure_personal_memory_group("agent-a")["group_id"]
     shared_path = SharedMemoryStore(tmp_path, "shared-team").db_path
     result = GovernanceApi(tmp_path).archive_memory_group(
-        personal_id, confirmed=True, _admin_override=True,
+        personal_id, confirmed=True,
     )
     assert Path(result["export_path"]).is_file()
     assert Path(result["archived_to"]).is_dir()

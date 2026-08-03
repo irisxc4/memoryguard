@@ -495,6 +495,7 @@ def test_shared_takeover_commit_survives_projection_refresh_failure(
 
     group_id = "shared-takeover"
     SharedMemoryStore(tmp_path, group_id)
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     api = GovernanceApi(str(tmp_path))
 
     def fail_projection(*args, **kwargs):
@@ -505,7 +506,6 @@ def test_shared_takeover_commit_survives_projection_refresh_failure(
         group_id,
         "MCP 正式接管（推荐）",
         True,
-        _admin_override=True,
     )
 
     assert result.get("ok") is True

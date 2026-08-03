@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import (
     AUTO_ALLOWED_TARGET_TYPES,
     build_binding,
@@ -35,10 +36,13 @@ def _store(tmp_path) -> RuleMergeStore:
 
 
 def _approve(store: RuleMergeStore, proposal_id: str):
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(proposal_id, context)
     return store.approve_proposal(
         proposal_id,
-        approved_by="admin",
-        capability_id="admin:test-suite",
+        approved_by=context.principal,
+        capability_token=token,
+        access_context=context,
     )
 
 

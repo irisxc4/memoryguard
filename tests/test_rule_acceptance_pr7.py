@@ -13,6 +13,7 @@ from memoryguard.context_bootstrap import build_context_packet
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
+from memoryguard.rule_read_path import RuleReadPath
 from memoryguard.schema_v3 import (
     EffectiveAgentContext,
     MemoryKind,
@@ -126,6 +127,26 @@ def test_canonical_read_engages_when_intelligence_exists(tmp_path):
         read_path="rule-intelligence",
     )
     assert packet["read_path"]["mode"] == "rule-intelligence"
+
+
+def test_real_store_readiness_is_complete_without_monkeypatch(tmp_path):
+    legacy, intel, _ = _backfill(tmp_path)
+    for definition in intel.list_definitions():
+        intel.upsert_evidence(build_evidence(
+            definition_id=definition.definition_id, source_rule_id="m0",
+            agent_instance_id="a0", project_ref="p0", session_id="s0",
+            content=definition.canonical_text,
+        ))
+    context = EffectiveAgentContext("agent-1", "g1")
+    read = RuleReadPath(tmp_path, "g1")
+    readiness = read.canonical_readiness(
+        legacy_store=legacy, context=context,
+    )
+    assert readiness["ready"] is True
+    assert readiness["checks"]["binding_contribution_diff"] == 0
+    assert readiness["checks"]["shadow"] == {
+        "missing": [], "extra": [], "permission_diff": 0,
+    }
 
 
 def test_acceptance_fails_when_canonical_read_falls_back(tmp_path):

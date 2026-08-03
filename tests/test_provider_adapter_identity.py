@@ -247,6 +247,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     workspace.mkdir()
     home.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
 
@@ -276,7 +277,6 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     result = GovernanceApi(workspace).install_shared_group_mcp_redirects(
         "team-mixed",
         confirmed=True,
-        _admin_override=True,
     )
 
     assert result["ok"] is False
@@ -441,6 +441,7 @@ def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstal
     workspace.mkdir()
     home.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
     store = AgentBindingStore(workspace)
@@ -455,10 +456,10 @@ def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstal
 
     api = GovernanceApi(workspace)
     first = api.install_shared_group_mcp_redirects(
-        "team-shared", confirmed=True, _admin_override=True,
+        "team-shared", confirmed=True,
     )
     second = api.install_shared_group_mcp_redirects(
-        "team-shared", confirmed=True, _admin_override=True,
+        "team-shared", confirmed=True,
     )
 
     assert first["configured_count"] == second["configured_count"] == 2

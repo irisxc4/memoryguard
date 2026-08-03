@@ -196,8 +196,8 @@ class TestRequestQueue:
 class TestDesktopExecutor:
     """桌面执行器测试。"""
 
-    def test_executor_override_is_internal_keyword_only(self, tmp_path, monkeypatch):
-        """队列只因已确认桌面执行器而获得 override，参数列表不能提供它。"""
+    def test_executor_confirmation_cannot_forge_admin_override(self, tmp_path, monkeypatch):
+        """桌面确认和内部关键字均不能伪造治理管理员能力。"""
         import memoryguard.gui as gui_module
         from memoryguard.desktop_executor import RequestExecutor
 
@@ -216,7 +216,10 @@ class TestDesktopExecutor:
                     "confirmed": confirmed,
                     "admin_override": _admin_override,
                 })
-                return {"ok": confirmed and _admin_override}
+                return {
+                    "ok": False,
+                    "error": "admin capability required (set MEMORYGUARD_ADMIN=1)",
+                }
 
         monkeypatch.setattr(gui_module, "GovernanceApi", FakeGovernanceApi)
         request = SimpleNamespace(
@@ -225,7 +228,8 @@ class TestDesktopExecutor:
         )
         result = RequestExecutor(tmp_path).execute(request)
 
-        assert result["ok"] is True
+        assert result["ok"] is False
+        assert result["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
         assert captured == {
             "workspace": str(tmp_path.resolve()),
             "group_id": "group",
@@ -234,13 +238,13 @@ class TestDesktopExecutor:
             "admin_override": True,
         }
 
-    def test_confirmed_executor_injects_admin_override_for_takeover(self, tmp_path, monkeypatch):
-        """桌面确认队列可完成共享接管，普通直接 API 仍没有 admin capability。"""
+    def test_confirmed_executor_requires_real_admin_context_for_takeover(self, tmp_path, monkeypatch):
+        """Desktop confirmation succeeds only with real admin context."""
         from memoryguard.desktop_executor import RequestExecutor
         from memoryguard.security import RequestQueue
         from memoryguard.shared_memory_store import SharedMemoryStore
 
-        monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+        monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
         group_id = "executor-takeover-group"
         SharedMemoryStore(tmp_path, group_id)
         queue = RequestQueue(tmp_path)
@@ -758,8 +762,8 @@ class TestSafeBridgeApi:
         assert "request" in result
         assert "message" in result
 
-    def test_direct_takeover_injects_admin_override_only_for_trusted_bridge(self, tmp_path, monkeypatch):
-        """原生 GUI 已确认路径可提交接管；直接 API 仍必须要求 admin capability。"""
+    def test_direct_takeover_cannot_forge_admin_override(self, tmp_path, monkeypatch):
+        """Native GUI confirmation cannot forge admin capability."""
         from memoryguard.gui import GovernanceApi, SafeBridgeApi
         from memoryguard.shared_memory_store import SharedMemoryStore
 
@@ -773,13 +777,15 @@ class TestSafeBridgeApi:
         )
         assert direct["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
 
-        # 原生窗口内部桥接（direct_mutations=True）才可注入 keyword-only override。
+        # Native bridge confirmation must not bypass AccessContext.
         bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
         result = bridge.request_mutation(
             "commit_shared_memory_governance", [group_id, "trusted bridge", True],
         )
-        assert result.get("ok") is True, result
-        assert result.get("version_id")
+        assert result == {
+            "ok": False,
+            "error": "admin capability required (set MEMORYGUARD_ADMIN=1)",
+        }
 
         # Non-native bridge stays an untrusted caller even when it supplies the
         # same positional confirmation value.

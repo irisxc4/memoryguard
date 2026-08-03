@@ -1,14 +1,17 @@
 """Migration: Rule Intelligence Layer v1 (P3).
 
-Creates the four new tables plus the merge-decision ledger in the
+Creates the binding/contribution tables plus the merge-decision ledger in the
 ``rule-intelligence`` database.  Idempotent ``CREATE TABLE IF NOT EXISTS`` —
 the same script is safe to re-run after upgrades and is shared with the
 ``RuleMergeStore`` bootstrap.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
+
+from ..governance_capability import GOVERNANCE_CAPABILITY_SCHEMA
 
 RULE_INTELLIGENCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rule_definitions (
@@ -60,6 +63,36 @@ CREATE INDEX IF NOT EXISTS idx_rule_bindings_definition
     ON rule_bindings(definition_id);
 CREATE INDEX IF NOT EXISTS idx_rule_bindings_group
     ON rule_bindings(share_group_id);
+CREATE TABLE IF NOT EXISTS rule_binding_contributions (
+    contribution_id TEXT PRIMARY KEY,
+    share_group_id TEXT NOT NULL,
+    source_memory_id TEXT NOT NULL,
+    source_revision TEXT NOT NULL DEFAULT '',
+    legacy_assignment_hash TEXT NOT NULL DEFAULT '',
+    definition_id TEXT NOT NULL,
+    binding_id TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL DEFAULT '',
+    project_ref TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT '',
+    runtime_role TEXT NOT NULL DEFAULT '',
+    effect TEXT NOT NULL DEFAULT 'include',
+    priority INTEGER NOT NULL DEFAULT 0,
+    owner_agent_id TEXT NOT NULL DEFAULT '',
+    audience TEXT NOT NULL DEFAULT '{}',
+    active INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active',
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (binding_id) REFERENCES rule_bindings(binding_id),
+    FOREIGN KEY (definition_id) REFERENCES rule_definitions(definition_id),
+    UNIQUE (share_group_id, source_memory_id, legacy_assignment_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_rule_binding_contributions_binding
+    ON rule_binding_contributions(binding_id);
+CREATE INDEX IF NOT EXISTS idx_rule_binding_contributions_source
+    ON rule_binding_contributions(share_group_id, source_memory_id);
 CREATE TABLE IF NOT EXISTS rule_evidence (
     evidence_id TEXT PRIMARY KEY,
     definition_id TEXT NOT NULL DEFAULT '',
@@ -72,7 +105,8 @@ CREATE TABLE IF NOT EXISTS rule_evidence (
     content_hash TEXT NOT NULL DEFAULT '',
     semantic_hash TEXT NOT NULL DEFAULT '',
     confidence REAL NOT NULL DEFAULT 1.0,
-    observed_at TEXT NOT NULL
+    observed_at TEXT NOT NULL,
+    FOREIGN KEY (definition_id) REFERENCES rule_definitions(definition_id)
 );
 CREATE INDEX IF NOT EXISTS idx_rule_evidence_definition
     ON rule_evidence(definition_id);
@@ -101,11 +135,15 @@ CREATE TABLE IF NOT EXISTS rule_merge_decisions (
     actor TEXT NOT NULL DEFAULT 'auto',
     status TEXT NOT NULL DEFAULT 'merged',
     created_at TEXT NOT NULL,
-    undone_at TEXT NOT NULL DEFAULT ''
+    undone_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (proposal_id) REFERENCES rule_merge_proposals(proposal_id),
+    FOREIGN KEY (canonical_definition_id) REFERENCES rule_definitions(definition_id)
 );
 CREATE INDEX IF NOT EXISTS idx_rule_merge_decisions_proposal
     ON rule_merge_decisions(proposal_id);
 """
+
+RULE_INTELLIGENCE_SCHEMA += "\n" + GOVERNANCE_CAPABILITY_SCHEMA
 
 SCHEMA_VERSION = "rule-intelligence-v1"
 
@@ -124,9 +162,104 @@ def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
         raise sqlite3.OperationalError("incomplete SQL schema statement")
 
 
+def _validate_reference_integrity(conn: sqlite3.Connection) -> None:
+    """Reject orphaned references when upgrading a pre-FK v1 database."""
+    checks = (
+        (
+            "rule_bindings.definition_id",
+            """
+            SELECT 1 FROM rule_bindings child
+            LEFT JOIN rule_definitions parent
+              ON parent.definition_id=child.definition_id
+            WHERE child.definition_id <> '' AND parent.definition_id IS NULL
+            LIMIT 1
+            """,
+        ),
+        (
+            "rule_binding_contributions.definition_id",
+            """
+            SELECT 1 FROM rule_binding_contributions child
+            LEFT JOIN rule_definitions parent
+              ON parent.definition_id=child.definition_id
+            WHERE child.definition_id <> '' AND parent.definition_id IS NULL
+            LIMIT 1
+            """,
+        ),
+        (
+            "rule_binding_contributions.binding_id",
+            """
+            SELECT 1 FROM rule_binding_contributions child
+            LEFT JOIN rule_bindings parent
+              ON parent.binding_id=child.binding_id
+            WHERE child.binding_id <> '' AND parent.binding_id IS NULL
+            LIMIT 1
+            """,
+        ),
+        (
+            "rule_evidence.definition_id",
+            """
+            SELECT 1 FROM rule_evidence child
+            LEFT JOIN rule_definitions parent
+              ON parent.definition_id=child.definition_id
+            WHERE child.definition_id <> '' AND parent.definition_id IS NULL
+            LIMIT 1
+            """,
+        ),
+        (
+            "rule_merge_decisions.proposal_id",
+            """
+            SELECT 1 FROM rule_merge_decisions child
+            LEFT JOIN rule_merge_proposals parent
+              ON parent.proposal_id=child.proposal_id
+            WHERE child.proposal_id <> '' AND parent.proposal_id IS NULL
+            LIMIT 1
+            """,
+        ),
+        (
+            "rule_merge_decisions.canonical_definition_id",
+            """
+            SELECT 1 FROM rule_merge_decisions child
+            LEFT JOIN rule_definitions parent
+              ON parent.definition_id=child.canonical_definition_id
+            WHERE child.canonical_definition_id <> ''
+              AND parent.definition_id IS NULL
+            LIMIT 1
+            """,
+        ),
+    )
+    for label, sql in checks:
+        if conn.execute(sql).fetchone() is not None:
+            raise sqlite3.IntegrityError(
+                f"rule_reference_integrity_failed:{label}"
+            )
+
+    definitions = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT definition_id FROM rule_definitions"
+        ).fetchall()
+    }
+    for row in conn.execute(
+        "SELECT definition_ids FROM rule_merge_proposals"
+    ).fetchall():
+        try:
+            values = json.loads(row[0] or "[]")
+        except (TypeError, ValueError) as exc:
+            raise sqlite3.IntegrityError(
+                "rule_reference_integrity_failed:proposal.definition_ids.json"
+            ) from exc
+        if not isinstance(values, list) or any(
+            str(value) not in definitions for value in values
+        ):
+            raise sqlite3.IntegrityError(
+                "rule_reference_integrity_failed:proposal.definition_ids"
+            )
+
+
 def apply_v1(conn: sqlite3.Connection) -> None:
     """Apply v1 schema inside caller-owned transaction."""
     _execute_sql_script_atomic(conn, RULE_INTELLIGENCE_SCHEMA)
+    _validate_reference_integrity(conn)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_meta ("
         "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -142,6 +275,7 @@ def migrate(db_path: str) -> dict[str, Any]:
     """Apply the Rule Intelligence v1 schema and return a migration ledger."""
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
         try:
             apply_v1(conn)
@@ -154,7 +288,8 @@ def migrate(db_path: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "tables": [
-            "rule_definitions", "rule_bindings", "rule_evidence",
+            "rule_definitions", "rule_bindings", "rule_binding_contributions",
+            "rule_evidence",
             "rule_merge_proposals", "rule_merge_decisions",
         ],
     }

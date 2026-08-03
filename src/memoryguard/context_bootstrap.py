@@ -175,6 +175,8 @@ def build_context_packet(
             if read.has_intelligence():
                 canonical_mapping = read.resolve_canonical_map(
                     known_memory_ids={r.memory_id for r in all_records},
+                    legacy_store=store,
+                    context=effective_context,
                 )
         except Exception:
             canonical_mapping = None  # keep the legacy path; canonical is advisory
@@ -404,6 +406,7 @@ def build_context_packet(
                         store.group_id,
                         effective_context.agent_instance_id,
                         session_id,
+                        effective_context.session_source,
                         context_hash,
                         task_hash,
                         record.memory_id,
@@ -423,6 +426,8 @@ def build_context_packet(
                     runtime_role=effective_context.runtime_role,
                     session_id=session_id,
                     context_hash=context_hash,
+                    session_trusted=effective_context.session_trusted,
+                    session_source=effective_context.session_source,
                 ).to_dict()
             )
 

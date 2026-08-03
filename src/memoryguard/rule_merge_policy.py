@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Any
@@ -28,7 +29,7 @@ from .rule_definition import (
     semantic_surface,
 )
 from .rule_evidence import dedupe_evidence
-from .schema_v3 import _now_iso
+from .schema_v3 import _now_iso, stable_hash
 
 # Auto-merge thresholds (P3 §5).
 AUTO_MERGE_SCORE = 0.95
@@ -115,6 +116,235 @@ _MATURITY_SCORES = {
     "validated": 0.8,
     "trusted": 1.0,
 }
+
+_MATURITY_RANKS = {
+    "observing": 0,
+    "candidate": 1,
+    "validated": 2,
+    "trusted": 3,
+}
+MATURITY_VALIDATED_TOTAL = 10
+MATURITY_VALIDATED_DISTINCT = 2
+MATURITY_TRUSTED_TOTAL = 20
+MATURITY_TRUSTED_SESSIONS = 5
+MATURITY_TRUSTED_DISTINCT = 3
+
+READINESS_COMPONENTS = (
+    "semantic",
+    "evidence",
+    "maturity",
+    "execution",
+    "diversity",
+    "stability",
+)
+
+_MISSING = object()
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            result = to_dict()
+        except Exception:
+            result = None
+        if isinstance(result, Mapping):
+            return result
+    return None
+
+
+def _stable_snapshot(value: Any) -> Any:
+    """Convert public snapshot objects to deterministic JSON-shaped data."""
+    mapping = _as_mapping(value)
+    if mapping is not None:
+        return {
+            str(key): _stable_snapshot(item)
+            for key, item in sorted(mapping.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_snapshot(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_stable_snapshot(item) for item in value), key=str)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _value(value: Any, *names: str, default: Any = _MISSING) -> Any:
+    mapping = _as_mapping(value)
+    if mapping is not None:
+        for name in names:
+            if name in mapping:
+                return mapping[name]
+    for name in names:
+        if hasattr(value, name):
+            return getattr(value, name)
+    return default
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or "").strip().casefold() in {"1", "true", "yes"}
+
+
+def _items(value: Any, *container_names: str) -> list[Any]:
+    if value is None:
+        return []
+    mapping = _as_mapping(value)
+    if mapping is not None:
+        for name in container_names:
+            candidate = mapping.get(name, _MISSING)
+            if isinstance(candidate, (list, tuple, set, frozenset)):
+                return list(candidate)
+        return [value]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return list(value)
+    return [value]
+
+
+def _nonempty_values(value: Any) -> set[str]:
+    if value is None or value is _MISSING:
+        return set()
+    if isinstance(value, (str, bytes)):
+        item = str(value).strip()
+        return {item} if item else set()
+    if isinstance(value, (int, float)):
+        return {
+            str(index) for index in range(max(0, int(value)))
+        }
+    try:
+        return {
+            str(item).strip()
+            for item in value
+            if str(item).strip()
+        }
+    except TypeError:
+        item = str(value).strip()
+        return {item} if item else set()
+
+
+def _trusted_observation_sets(value: Any) -> tuple[int, set[str], set[str], set[str]]:
+    trusted_total = 0
+    sessions: set[str] = set()
+    agents: set[str] = set()
+    projects: set[str] = set()
+    observations = _items(
+        value, "events", "feedback", "runtime_feedback", "observations",
+    )
+    if observations and not (
+        len(observations) == 1 and observations[0] is value
+    ):
+        for observation in observations:
+            if not _boolish(_value(observation, "session_trusted", "trusted", default=False)):
+                continue
+            session = str(_value(observation, "session_id", default="") or "").strip()
+            agent = str(
+                _value(observation, "agent_instance_id", "agent_id", default="")
+                or ""
+            ).strip()
+            project = str(
+                _value(observation, "project_ref", "project", default="") or ""
+            ).strip()
+            # A partial or anonymous observation cannot establish independent
+            # maturity.  Empty/untrusted values count as zero.
+            if not (session and agent and project):
+                continue
+            trusted_total += 1
+            sessions.add(session)
+            agents.add(agent)
+            projects.add(project)
+        return trusted_total, sessions, agents, projects
+
+    mapping = _as_mapping(value)
+    if mapping is None:
+        return 0, sessions, agents, projects
+    trusted_total_value = mapping.get("trusted_total", _MISSING)
+    if trusted_total_value is not _MISSING:
+        try:
+            trusted_total = max(0, int(trusted_total_value))
+        except (TypeError, ValueError):
+            trusted_total = 0
+    sessions_value = mapping.get(
+        "trusted_sessions", mapping.get("distinct_trusted_sessions", _MISSING),
+    )
+    agents_value = mapping.get(
+        "trusted_agents", mapping.get("distinct_trusted_agents", _MISSING),
+    )
+    projects_value = mapping.get(
+        "trusted_projects", mapping.get("distinct_trusted_projects", _MISSING),
+    )
+    if sessions_value is not _MISSING:
+        sessions = _nonempty_values(sessions_value)
+    if agents_value is not _MISSING:
+        agents = _nonempty_values(agents_value)
+    if projects_value is not _MISSING:
+        projects = _nonempty_values(projects_value)
+    return trusted_total, sessions, agents, projects
+
+
+def build_maturity_snapshot(
+    evidence: Any = None,
+    runtime: Any = None,
+) -> dict[str, Any]:
+    """Build one deterministic maturity snapshot from trusted observations.
+
+    Runtime feedback is authoritative.  Only observations carrying explicit
+    trusted session metadata and all three non-empty identities count.  The
+    returned counts are intentionally plain data so Service/Store callers can
+    persist or audit the same decision without reimplementing thresholds.
+    """
+    del evidence  # Evidence provenance is not execution maturity.
+    total, sessions, agents, projects = _trusted_observation_sets(runtime)
+    snapshot = {
+        "trusted_total": total,
+        "trusted_sessions": len(sessions),
+        "trusted_agents": len(agents),
+        "trusted_projects": len(projects),
+        "unknown": not bool(runtime),
+    }
+    snapshot["state"] = maturity_state_from_snapshot(snapshot)
+    return snapshot
+
+
+def maturity_state_from_snapshot(snapshot: Mapping[str, Any] | None) -> str:
+    """Map persisted trusted counts to one maturity stage, fail closed."""
+    data = snapshot if isinstance(snapshot, Mapping) else {}
+    total = max(0, int(data.get("trusted_total", 0) or 0))
+    sessions = max(0, int(data.get("trusted_sessions", 0) or 0))
+    agents = max(0, int(data.get("trusted_agents", 0) or 0))
+    projects = max(0, int(data.get("trusted_projects", 0) or 0))
+    if (
+        total >= MATURITY_TRUSTED_TOTAL
+        and sessions >= MATURITY_TRUSTED_SESSIONS
+        and agents >= MATURITY_TRUSTED_DISTINCT
+        and projects >= MATURITY_TRUSTED_DISTINCT
+    ):
+        return "trusted"
+    if (
+        total >= MATURITY_VALIDATED_TOTAL
+        and sessions >= MATURITY_VALIDATED_DISTINCT
+        and agents >= MATURITY_VALIDATED_DISTINCT
+        and projects >= MATURITY_VALIDATED_DISTINCT
+    ):
+        return "validated"
+    return "candidate" if total else "observing"
+
+
+def maturity_state(evidence: Any = None, runtime: Any = None) -> str:
+    """Convenience entry point using the single maturity policy helper."""
+    return maturity_state_from_snapshot(build_maturity_snapshot(evidence, runtime))
+
+
+def maturity_meets(state: str, required: str) -> bool:
+    """Return whether one stage satisfies another stage's requirement."""
+    return _MATURITY_RANKS.get(str(state or "").casefold(), -1) >= _MATURITY_RANKS.get(
+        str(required or "").casefold(), 99,
+    )
 
 
 def _chars(value: str) -> list[str]:
@@ -291,14 +521,278 @@ def merge_readiness_score(
     evidence but no age lands around 0.6x; a 90-day, heavily-followed rule
     lands above the auto threshold.
     """
-    return (
-        W_READINESS_SEMANTIC * max(0.0, min(1.0, duplicate_score))
-        + W_READINESS_EVIDENCE * max(0.0, min(1.0, evidence_confidence))
-        + W_READINESS_MATURITY * max(0.0, min(1.0, maturity))
-        + W_READINESS_EXECUTION * max(0.0, min(1.0, execution_success))
-        + W_READINESS_DIVERSITY * max(0.0, min(1.0, source_diversity))
-        + W_READINESS_STABILITY * max(0.0, min(1.0, stability))
+    components = {
+        "semantic": duplicate_score,
+        "evidence": evidence_confidence,
+        "maturity": maturity,
+        "execution": execution_success,
+        "diversity": source_diversity,
+        "stability": stability,
+    }
+    return _score_readiness_components(components)
+
+
+def _score_readiness_components(components: Mapping[str, Any]) -> float:
+    """Score fixed readiness components; one arithmetic source for all callers."""
+    weights = {
+        "semantic": W_READINESS_SEMANTIC,
+        "evidence": W_READINESS_EVIDENCE,
+        "maturity": W_READINESS_MATURITY,
+        "execution": W_READINESS_EXECUTION,
+        "diversity": W_READINESS_DIVERSITY,
+        "stability": W_READINESS_STABILITY,
+    }
+    return sum(
+        weights[name] * _clamp(float(components.get(name, 0.0) or 0.0))
+        for name in READINESS_COMPONENTS
     )
+
+
+def _numeric_component(
+    value: Any,
+    names: tuple[str, ...],
+    unknown: list[str],
+    label: str,
+) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _clamp(float(value))
+    raw = _value(value, *names, default=_MISSING)
+    if raw is _MISSING or raw is None:
+        unknown.append(label)
+        return 0.0
+    try:
+        return _clamp(float(raw))
+    except (TypeError, ValueError):
+        unknown.append(label)
+        return 0.0
+
+
+def _confidence_component(
+    evidence: Any,
+    unknown: list[str],
+) -> float:
+    items = _items(evidence, "items", "evidence")
+    if not items or (len(items) == 1 and items[0] is evidence):
+        single = _value(evidence, "confidence", "average_confidence", default=_MISSING)
+        if single is _MISSING or single is None:
+            unknown.append("evidence.confidence")
+            return 0.0
+        try:
+            return _clamp(float(single))
+        except (TypeError, ValueError):
+            unknown.append("evidence.confidence")
+            return 0.0
+    values: list[float] = []
+    for index, item in enumerate(items):
+        raw = _value(item, "confidence", default=_MISSING)
+        if raw is _MISSING or raw is None:
+            unknown.append(f"evidence[{index}].confidence")
+            continue
+        try:
+            # Do not use ``or`` here: confidence=0 is meaningful evidence.
+            values.append(_clamp(float(raw)))
+        except (TypeError, ValueError):
+            unknown.append(f"evidence[{index}].confidence")
+    if not values:
+        unknown.append("evidence.confidence")
+        return 0.0
+    return _clamp(sum(values) / len(values))
+
+
+def _quality_component(
+    snapshot: Any,
+    direct_names: tuple[str, ...],
+    unknown: list[str],
+    label: str,
+) -> float | None:
+    items = _items(snapshot, "items", "records", "profiles", "agents")
+    if not items or (len(items) == 1 and items[0] is snapshot):
+        items = [snapshot]
+    values: list[float] = []
+    for item in items:
+        raw = _value(item, *direct_names, default=_MISSING)
+        if raw is _MISSING:
+            if direct_names == ("score", "reliability"):
+                success = _value(item, "success_rate", default=_MISSING)
+                accuracy = _value(item, "rule_accuracy", default=_MISSING)
+                if success is not _MISSING and accuracy is not _MISSING:
+                    raw = (
+                        float(success or 0.0) + float(accuracy or 0.0)
+                    ) / 2.0
+            else:
+                production = _value(item, "production_level", default=_MISSING)
+                criticality = _value(item, "criticality", default=0.0)
+                owner_verified = _value(item, "owner_verified", default=False)
+                if production is not _MISSING:
+                    raw = project_importance_score(
+                        float(production or 0.0), float(criticality or 0.0),
+                        _boolish(owner_verified),
+                    )
+        if raw is _MISSING or raw is None:
+            continue
+        try:
+            values.append(_clamp(float(raw)))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        unknown.append(label)
+        return None
+    return _clamp(sum(values) / len(values))
+
+
+def _runtime_success(runtime: Any, unknown: list[str]) -> float:
+    raw_followed = _value(
+        runtime, "trusted_followed", "followed", default=_MISSING,
+    )
+    raw_total = _value(runtime, "trusted_total", default=_MISSING)
+    if raw_total is _MISSING:
+        raw_total = _value(
+            runtime, "total", "runtime_total", default=_MISSING,
+        )
+    if raw_total is _MISSING:
+        total = sum(
+            int(_value(runtime, name, default=0) or 0)
+            for name in ("followed", "violated", "not_applicable", "exception_count")
+        )
+        if total == 0:
+            unknown.append("runtime.success")
+            return 0.0
+        raw_total = total
+    try:
+        total = int(raw_total)
+        followed = int(0 if raw_followed is _MISSING else raw_followed)
+    except (TypeError, ValueError):
+        unknown.append("runtime.success")
+        return 0.0
+    if total <= 0:
+        unknown.append("runtime.success")
+        return 0.0
+    return _clamp(followed / total)
+
+
+def _definition_components(
+    definition: Any,
+    runtime: Any,
+    unknown: list[str],
+) -> tuple[float, float]:
+    definitions = _items(definition, "definitions", "items")
+    if not definitions or (len(definitions) == 1 and definitions[0] is definition):
+        definitions = [definition]
+    states: list[float] = []
+    ages: list[float] = []
+    for index, item in enumerate(definitions):
+        state = _value(item, "maturity_state", "state", default=_MISSING)
+        if state is _MISSING or state is None or not str(state).strip():
+            unknown.append(f"definition[{index}].maturity")
+        else:
+            states.append(maturity_score(str(state)))
+        created = _value(item, "created_at", default=_MISSING)
+        if created is _MISSING or not str(created or "").strip():
+            unknown.append(f"definition[{index}].stability")
+        else:
+            ages.append(_clamp(days_between(str(created)) / TRUSTED_DAYS))
+    if not states:
+        maturity = maturity_score(build_maturity_snapshot(runtime=runtime)["state"])
+    else:
+        maturity = min(states)
+    if not ages:
+        stability = 0.0
+    else:
+        stability = min(ages)
+    return maturity, stability
+
+
+def build_readiness_snapshot(
+    definition: Any = None,
+    evidence: Any = None,
+    runtime: Any = None,
+    reputation: Any = None,
+    project: Any = None,
+    similarity: Any = None,
+) -> dict[str, Any]:
+    """Build deterministic readiness data from six public snapshots.
+
+    Components stay fixed and feed the same score helper as the compatibility
+    ``merge_readiness_score`` API.  Missing values are listed explicitly and
+    score as zero; a real numeric zero, especially evidence confidence zero,
+    remains zero.  ``digest`` covers normalized inputs and outputs, making the
+    snapshot suitable for proposal/Store TOCTOU checks.
+    """
+    unknown: list[str] = []
+    semantic = _numeric_component(
+        similarity, ("duplicate_score", "similarity", "semantic_score"),
+        unknown, "similarity.score",
+    )
+    evidence_confidence = _confidence_component(evidence, unknown)
+    reputation_quality = _quality_component(
+        reputation, ("score", "reliability"), unknown, "reputation.score",
+    )
+    project_quality = _quality_component(
+        project, ("score", "importance"), unknown, "project.score",
+    )
+    if reputation_quality is not None:
+        evidence_confidence *= reputation_quality
+    if project_quality is not None:
+        evidence_confidence *= project_quality
+    maturity, stability = _definition_components(definition, runtime, unknown)
+    execution = _runtime_success(runtime, unknown)
+
+    evidence_items = _items(evidence, "items", "evidence")
+    evidence_agents = {
+        str(_value(item, "agent_instance_id", "agent_id", default="") or "").strip()
+        for item in evidence_items
+        if str(_value(item, "agent_instance_id", "agent_id", default="") or "").strip()
+    }
+    evidence_projects = {
+        str(_value(item, "project_ref", "project", default="") or "").strip()
+        for item in evidence_items
+        if str(_value(item, "project_ref", "project", default="") or "").strip()
+    }
+    runtime_total, runtime_sessions, runtime_agents, runtime_projects = (
+        _trusted_observation_sets(runtime)
+    )
+    diversity_count = (
+        len(evidence_agents | runtime_agents)
+        + len(evidence_projects | runtime_projects)
+    )
+    if not diversity_count and evidence is None and runtime_total == 0:
+        unknown.append("evidence.diversity")
+    diversity = _clamp(diversity_count / 4.0)
+
+    # Reputation/project snapshots are part of the immutable digest and their
+    # absence is visible.  They do not replace rule-owned execution evidence.
+    components = {
+        "semantic": semantic,
+        "evidence": evidence_confidence,
+        "maturity": maturity,
+        "execution": execution,
+        "diversity": diversity,
+        "stability": stability,
+    }
+    normalized_unknown = sorted(set(unknown))
+    score = _score_readiness_components(components)
+    payload = {
+        "components": {
+            name: round(float(components[name]), 12)
+            for name in READINESS_COMPONENTS
+        },
+        "score": round(float(score), 12),
+        "unknown": normalized_unknown,
+        "inputs": {
+            "definition": _stable_snapshot(definition),
+            "evidence": _stable_snapshot(evidence),
+            "runtime": _stable_snapshot(runtime),
+            "reputation": _stable_snapshot(reputation),
+            "project": _stable_snapshot(project),
+            "similarity": _stable_snapshot(similarity),
+        },
+    }
+    digest = stable_hash(
+        "rule-readiness-snapshot-v1",
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+    )
+    payload["digest"] = digest
+    return payload
 
 
 @dataclass(frozen=True)
@@ -329,14 +823,10 @@ def maturity_gate(
     a: RuleDefinition, b: RuleDefinition, match_kind: str,
 ) -> tuple[bool, tuple[str, ...]]:
     """Return the automatic maturity gate for a classified pair."""
-    required = (
-        TRUSTED_MATURITY_STATES
-        if match_kind == "semantic" else VALIDATED_MATURITY_STATES
-    )
     required_name = "trusted" if match_kind == "semantic" else "validated"
     if (
-        str(a.maturity_state or "").casefold() in required
-        and str(b.maturity_state or "").casefold() in required
+        maturity_meets(a.maturity_state, required_name)
+        and maturity_meets(b.maturity_state, required_name)
     ):
         return True, ()
     return False, (f"maturity_requires_{required_name}",)

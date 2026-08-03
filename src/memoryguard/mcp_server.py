@@ -40,6 +40,10 @@ _MUTATING_TOOLS = {
     "memoryguard_rule_feedback",
     "memoryguard_rule_create_auto",
     "memoryguard_rule_undo",
+    "memoryguard_rule_merge_capability_issue",
+    "memoryguard_rule_merge_approve",
+    "memoryguard_rule_merge_acknowledge",
+    "memoryguard_rule_merge_cooldown_clear",
 }
 
 
@@ -367,6 +371,76 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"workspace": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_capability_issue",
+        "description": (
+            "Issue one opaque, single-use rule-merge capability for a candidate "
+            "proposal. Requires the trusted admin AccessContext. The raw token "
+            "is returned once to the caller; persistent storage keeps only its hash."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "ttl_seconds": {"type": "number", "exclusiveMinimum": 0, "default": 300},
+                "workspace": {"type": "string"},
+            },
+            "required": ["proposal_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_approve",
+        "description": (
+            "Approve one candidate rule-merge proposal with a server-issued "
+            "single-use capability and trusted admin AccessContext."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "capability_token": {"type": "string"},
+                "expected_definition_revisions": {"type": "object"},
+                "workspace": {"type": "string"},
+            },
+            "required": ["proposal_id", "capability_token"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_acknowledge",
+        "description": (
+            "Acknowledge first-merge risk with a server-issued single-use "
+            "capability and trusted admin AccessContext."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "capability_token": {"type": "string"},
+                "workspace": {"type": "string"},
+            },
+            "required": ["proposal_id", "capability_token"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_cooldown_clear",
+        "description": (
+            "Clear one rule-merge proposal cooldown with a server-issued "
+            "single-use capability and trusted admin AccessContext."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "proposal_id": {"type": "string"},
+                "capability_token": {"type": "string"},
+                "workspace": {"type": "string"},
+            },
+            "required": ["proposal_id", "capability_token"],
             "additionalProperties": False,
         },
     },
@@ -735,6 +809,34 @@ def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -
             return _mcp_error("confidence must be between 0 and 1")
         return None
 
+    if name == "memoryguard_rule_merge_capability_issue":
+        if not str(args.get("proposal_id", "") or "").strip():
+            return _mcp_error("proposal_id is required")
+        if "ttl_seconds" in args:
+            try:
+                ttl_seconds = float(args["ttl_seconds"])
+            except (TypeError, ValueError):
+                return _mcp_error("ttl_seconds must be a positive number")
+            if ttl_seconds <= 0:
+                return _mcp_error("ttl_seconds must be a positive number")
+        return None
+
+    if name in {
+        "memoryguard_rule_merge_approve",
+        "memoryguard_rule_merge_acknowledge",
+        "memoryguard_rule_merge_cooldown_clear",
+    }:
+        if not str(args.get("proposal_id", "") or "").strip():
+            return _mcp_error("proposal_id is required")
+        token = args.get("capability_token")
+        if not isinstance(token, str) or not token.strip():
+            return _mcp_error("capability_token is required")
+        if name == "memoryguard_rule_merge_approve":
+            revisions = args.get("expected_definition_revisions")
+            if revisions is not None and not isinstance(revisions, dict):
+                return _mcp_error("expected_definition_revisions must be an object")
+        return None
+
     return None
 
 
@@ -932,6 +1034,14 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         return _handle_rule_undo(args)
     if name == "memoryguard_rule_scope_stats":
         return _handle_rule_scope_stats(args)
+    if name == "memoryguard_rule_merge_capability_issue":
+        return _handle_rule_merge_capability_issue(args)
+    if name == "memoryguard_rule_merge_approve":
+        return _handle_rule_merge_approve(args)
+    if name == "memoryguard_rule_merge_acknowledge":
+        return _handle_rule_merge_acknowledge(args)
+    if name == "memoryguard_rule_merge_cooldown_clear":
+        return _handle_rule_merge_cooldown_clear(args)
     if name.startswith("memoryguard_history_"):
         return _handle_history(args, name)
 
@@ -1340,6 +1450,8 @@ def _effective_agent_context(args: dict[str, Any], group_id: str):
     """
     from .schema_v3 import EffectiveAgentContext
     from .rule_scope import canonical_project_ref
+    from .access_context import load_access_context
+    access_context = load_access_context()
     return EffectiveAgentContext(
         agent_instance_id=str(args.get("agent_instance_id", "") or ""),
         share_group_id=group_id,
@@ -1353,8 +1465,10 @@ def _effective_agent_context(args: dict[str, Any], group_id: str):
         # Session/context identity is a trusted host launch fact.  Never read
         # these from the MCP request body: feedback/narrowing must not be able
         # to manufacture a second session by changing ordinary tool args.
-        session_id=os.environ.get("MEMORYGUARD_SESSION_ID", "").strip(),
+        session_id=access_context.session_id,
         context_hash=os.environ.get("MEMORYGUARD_CONTEXT_HASH", "").strip(),
+        session_trusted=access_context.session_trusted,
+        session_source=access_context.session_source,
     )
 
 
@@ -1926,6 +2040,107 @@ def _rule_lifecycle_response(result: Any) -> dict[str, Any]:
     if payload.get("status") == "blocked":
         response["isError"] = True
     return response
+
+
+def _governance_json_response(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(payload, ensure_ascii=False, indent=2),
+        }],
+    }
+
+
+def _handle_rule_merge_capability_issue(args: dict[str, Any]) -> dict[str, Any]:
+    """Issue one opaque merge capability through the trusted admin context."""
+    from .access_context import load_access_context
+    from .rule_merge_store import RuleMergeStore
+
+    workspace = _resolve_memory_workspace(args)
+    proposal_id = str(args.get("proposal_id", "") or "").strip()
+    access_context = load_access_context()
+    ok, error = access_context.require_capability_issue()
+    if not ok:
+        return _mcp_error(error)
+    kwargs: dict[str, Any] = {}
+    if "ttl_seconds" in args:
+        kwargs["ttl_seconds"] = float(args["ttl_seconds"])
+    try:
+        token = RuleMergeStore(workspace).issue_merge_capability(
+            proposal_id, access_context, **kwargs,
+        )
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        return _mcp_error(str(exc))
+    # Raw token exists only in this one response and is never written to the
+    # Store.  All later governance actions consume it immediately.
+    return _governance_json_response({
+        "ok": True,
+        "proposal_id": proposal_id,
+        "capability_token": token,
+        "token_persistence": "sha256_only",
+    })
+
+
+def _handle_rule_merge_approve(args: dict[str, Any]) -> dict[str, Any]:
+    from .access_context import load_access_context
+    from .rule_merge_store import RuleMergeStore
+
+    workspace = _resolve_memory_workspace(args)
+    access_context = load_access_context()
+    ok, error = access_context.require_capability_issue()
+    if not ok:
+        return _mcp_error(error)
+    try:
+        result = RuleMergeStore(workspace).approve_proposal(
+            str(args.get("proposal_id", "") or "").strip(),
+            capability_token=str(args.get("capability_token", "")),
+            expected_definition_revisions=args.get("expected_definition_revisions"),
+            access_context=access_context,
+        )
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        return _mcp_error(str(exc))
+    return _governance_json_response({"ok": True, **result})
+
+
+def _handle_rule_merge_acknowledge(args: dict[str, Any]) -> dict[str, Any]:
+    from .access_context import load_access_context
+    from .rule_merge_store import RuleMergeStore
+
+    workspace = _resolve_memory_workspace(args)
+    access_context = load_access_context()
+    ok, error = access_context.require_capability_issue()
+    if not ok:
+        return _mcp_error(error)
+    try:
+        result = RuleMergeStore(workspace).acknowledge_first_merge(
+            str(args.get("proposal_id", "") or "").strip(),
+            actor=access_context.principal,
+            capability_token=str(args.get("capability_token", "")),
+            access_context=access_context,
+        )
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        return _mcp_error(str(exc))
+    return _governance_json_response({"ok": True, **(result or {})})
+
+
+def _handle_rule_merge_cooldown_clear(args: dict[str, Any]) -> dict[str, Any]:
+    from .access_context import load_access_context
+    from .rule_merge_store import RuleMergeStore
+
+    workspace = _resolve_memory_workspace(args)
+    access_context = load_access_context()
+    ok, error = access_context.require_capability_issue()
+    if not ok:
+        return _mcp_error(error)
+    try:
+        result = RuleMergeStore(workspace).clear_proposal_cooldown(
+            str(args.get("proposal_id", "") or "").strip(),
+            capability_token=str(args.get("capability_token", "")),
+            access_context=access_context,
+        )
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        return _mcp_error(str(exc))
+    return _governance_json_response({"ok": True, **(result or {})})
 
 
 def _rule_service_for_args(args: dict[str, Any], workspace: Path):

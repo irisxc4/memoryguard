@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import (
     RuleStrength,
@@ -55,6 +56,20 @@ def _store(tmp_path) -> RuleMergeStore:
 
 def _svc(store: RuleMergeStore) -> RuleMergeService:
     return RuleMergeService(store)
+
+
+def _approve(store: RuleMergeStore, proposal_id: str):
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(proposal_id, context)
+    return store.approve_proposal(
+        proposal_id, approved_by=context.principal,
+        capability_token=token, access_context=context,
+    )
+
+
+def _governance_token(store: RuleMergeStore, proposal_id: str) -> tuple[str, AccessContext]:
+    context = AccessContext("test-admin", True, True, False)
+    return store.issue_merge_capability(proposal_id, context), context
 
 
 def _def(text: str, *, created_at: str = "") -> object:
@@ -170,9 +185,9 @@ def test_strength_conflict_never_merges_and_is_never_forced(tmp_path):
     assert result["ok"] is False
     assert result["conflict_type"] == "strength"
     # Human approval refuses too: resolving a strength conflict is not a merge.
-    with pytest.raises(ValueError, match="rule_merge_proposal_not_approvable"):
+    with pytest.raises(ValueError, match="rule_merge_approval_capability_required"):
         store.approve_proposal(
-            pid, approved_by="admin", capability_id="admin:test-suite",
+            pid,
         )
     assert store.count_definitions() == 2
 
@@ -307,8 +322,14 @@ def test_fresh_candidate_never_auto_merges_even_with_strong_evidence(tmp_path):
     # Explicit review of cold-start gates is insufficient without projected
     # runtime feedback; auto merge must remain fail-closed.
     pid = candidates[0]["proposal_id"]
-    store.acknowledge_first_merge(pid, actor="human")
-    store.clear_proposal_cooldown(pid)
+    token, context = _governance_token(store, pid)
+    store.acknowledge_first_merge(
+        pid, actor="human", capability_token=token, access_context=context,
+    )
+    token, context = _governance_token(store, pid)
+    store.clear_proposal_cooldown(
+        pid, capability_token=token, access_context=context,
+    )
     result = _svc(store).merge_proposal(pid)
     assert result["ok"] is False
     assert "runtime_feedback_missing" in result["governance_reasons"]
@@ -329,8 +350,14 @@ def test_auto_merge_requires_runtime_and_ready_projection(tmp_path):
     candidates = [p for p in proposals if p["status"] == "candidate"]
     assert candidates
     pid = candidates[0]["proposal_id"]
-    store.acknowledge_first_merge(pid, actor="human")
-    store.clear_proposal_cooldown(pid)
+    token, context = _governance_token(store, pid)
+    store.acknowledge_first_merge(
+        pid, actor="human", capability_token=token, access_context=context,
+    )
+    token, context = _governance_token(store, pid)
+    store.clear_proposal_cooldown(
+        pid, capability_token=token, access_context=context,
+    )
 
     blocked = svc.merge_proposal(pid)
     assert blocked["ok"] is False
@@ -343,10 +370,14 @@ def test_auto_merge_requires_runtime_and_ready_projection(tmp_path):
         projection_lag=1,
     )
     svc.scan_and_propose()
-    store.clear_proposal_cooldown(pid)
+    token, context = _governance_token(store, pid)
+    store.clear_proposal_cooldown(
+        pid, capability_token=token, access_context=context,
+    )
 
-    with pytest.raises(RuntimeError, match="rule_merge_projection_incomplete"):
-        svc.merge_proposal(pid)
+    blocked = svc.merge_proposal(pid)
+    assert blocked["ok"] is False
+    assert blocked["barrier"]["error"] == "projection_barrier_lag: 1"
 
     store.set_projection_state(
         "rule-intelligence", last_projected_event_id="runtime-ready",
@@ -526,10 +557,7 @@ def test_metrics_governance_family_stays_safe_after_clean_merge(tmp_path):
         [a.definition_id, b.definition_id], 0.99,
         definition_a=a, definition_b=b,
     )
-    store.approve_proposal(
-        proposal["proposal_id"], approved_by="admin",
-        capability_id="admin:test-suite",
-    )
+    _approve(store, proposal["proposal_id"])
     result = _svc(store).merge_proposal(proposal["proposal_id"])
     assert result["ok"] is True
 

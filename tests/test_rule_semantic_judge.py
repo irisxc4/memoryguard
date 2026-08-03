@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_evidence import build_evidence
@@ -295,10 +296,20 @@ def test_judge_verdict_audited_on_proposal_and_decision(tmp_path):
     assert proposal["judge_score"] > 0.0
 
     pid = proposal["proposal_id"]
-    store.acknowledge_first_merge(pid, actor="human")
-    store.clear_proposal_cooldown(pid)
+    context = AccessContext("test-admin", True, True, False)
+    acknowledge_token = store.issue_merge_capability(pid, context)
+    store.acknowledge_first_merge(
+        pid, actor="human", capability_token=acknowledge_token,
+        access_context=context,
+    )
+    cooldown_token = store.issue_merge_capability(pid, context)
+    store.clear_proposal_cooldown(
+        pid, capability_token=cooldown_token, access_context=context,
+    )
+    approval_token = store.issue_merge_capability(pid, context)
     store.approve_proposal(
-        pid, approved_by="admin", capability_id="admin:test-suite",
+        pid, approved_by=context.principal, capability_token=approval_token,
+        access_context=context,
     )
     result = svc.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
@@ -327,9 +338,11 @@ def test_judge_verdict_audited_even_on_human_approved_merge(tmp_path):
         [a.definition_id, b.definition_id], 0.99,
         definition_a=a, definition_b=b,
     )
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(proposal["proposal_id"], context)
     store.approve_proposal(
-        proposal["proposal_id"], approved_by="admin",
-        capability_id="admin:test-suite",
+        proposal["proposal_id"], approved_by=context.principal,
+        capability_token=token, access_context=context,
     )
     result = svc.merge_proposal(proposal["proposal_id"], actor="admin")
     assert result["ok"] is True

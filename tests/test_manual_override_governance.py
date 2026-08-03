@@ -205,10 +205,11 @@ def test_restore_old_memory_shadows_active_superseding_descendants(tmp_path):
 
 
 def test_conflict_and_quarantine_queues_close_after_human_resolution(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     from memoryguard.gui import GovernanceApi
 
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     store = SharedMemoryStore(tmp_path, "group-a")
     first = SharedMemoryRecord(
         memory_id="first",
@@ -231,7 +232,6 @@ def test_conflict_and_quarantine_queues_close_after_human_resolution(
         conflict_id,
         "first",
         "group-a",
-        _admin_override=True,
     )
     assert resolved["ok"] is True
     conflict = next(
@@ -257,7 +257,6 @@ def test_conflict_and_quarantine_queues_close_after_human_resolution(
     released = api.release_quarantine(
         entry.quarantine_id,
         "group-a",
-        _admin_override=True,
     )
     assert released["ok"] is True
     assert next(
@@ -281,7 +280,6 @@ def test_conflict_and_quarantine_queues_close_after_human_resolution(
     deleted = api.delete_quarantine(
         delete_entry.quarantine_id,
         "group-a",
-        _admin_override=True,
     )
     assert deleted["ok"] is True
     assert store.get_record("fourth").status == SharedMemoryStatus.DELETED

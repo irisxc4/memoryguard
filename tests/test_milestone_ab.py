@@ -31,8 +31,8 @@ def test_cross_group_dup_canonical_hash(monkeypatch):
 
     with tempfile.TemporaryDirectory() as ws:
         api = GovernanceApi(ws)
-        api.bind_agent("agent-a", "g1", _admin_override=True)
-        api.bind_agent("agent-b", "g2", _admin_override=True)
+        api.bind_agent("agent-a", "g1")
+        api.bind_agent("agent-b", "g2")
 
         # 前 100 字相同,后文不同(前缀法会误报)
         prefix = "A" * 100
@@ -65,8 +65,8 @@ def test_cross_group_dup_same_content_detected(monkeypatch):
 
     with tempfile.TemporaryDirectory() as ws:
         api = GovernanceApi(ws)
-        api.bind_agent("agent-a", "g1", _admin_override=True)
-        api.bind_agent("agent-b", "g2", _admin_override=True)
+        api.bind_agent("agent-a", "g1")
+        api.bind_agent("agent-b", "g2")
 
         same = "完全相同的跨组内容用于测试"
         org1 = AutoOrganizer(ws, "g1")
@@ -101,8 +101,8 @@ def test_gui_bind_agent_non_admin_denied(monkeypatch):
         assert "admin" in result.get("error", "")
 
 
-def test_gui_bind_agent_admin_override(monkeypatch):
-    """A2: admin 或 _admin_override 可绑定。"""
+def test_gui_bind_agent_rejects_admin_override_forgery(monkeypatch):
+    """A2: 未授权 GUI 不能用 _admin_override 伪造 admin。"""
     from memoryguard.gui import GovernanceApi
 
     monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
@@ -110,9 +110,11 @@ def test_gui_bind_agent_admin_override(monkeypatch):
 
     with tempfile.TemporaryDirectory() as ws:
         api = GovernanceApi(ws)
-        # _admin_override=True 绕过(本地 GUI 场景)
         result = api.bind_agent("agent-a", "g1", _admin_override=True)
-        assert result.get("ok"), f"admin_override should work: {result}"
+        assert result == {
+            "ok": False,
+            "error": "admin capability required (set MEMORYGUARD_ADMIN=1)",
+        }
 
 
 def test_preflight_check_prints_status(monkeypatch):
@@ -294,8 +296,8 @@ if __name__ == "__main__":
     print("OK: A1 - same content detected")
     test_gui_bind_agent_non_admin_denied()
     print("OK: A2 - GUI non-admin denied")
-    test_gui_bind_agent_admin_override()
-    print("OK: A2 - admin override works")
+    test_gui_bind_agent_rejects_admin_override_forgery()
+    print("OK: A2 - forged admin override denied")
     test_preflight_check_prints_status()
     print("OK: A3 - preflight prints status")
     test_preflight_check_warns_missing_agent()

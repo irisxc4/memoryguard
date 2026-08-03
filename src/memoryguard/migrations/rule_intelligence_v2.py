@@ -9,7 +9,8 @@ Extends the v1 ``rule-intelligence`` schema with the governance layer:
   * ``rule_merge_decisions``  + readiness_at_merge / strength_ok /
                                negative_ok / first_merge_acknowledged / judge_*
   * new tables: rule_negative_evidence, agent_reputation, project_profile,
-    rule_definition_versions
+    rule_definition_versions, rule_evidence_contributions,
+    rule_evidence_effective
 
 The migration is idempotent two ways: ``CREATE TABLE IF NOT EXISTS`` for the
 new tables and a ``PRAGMA table_info`` guard before every ``ALTER TABLE ADD
@@ -20,6 +21,9 @@ from __future__ import annotations
 
 import sqlite3
 from typing import Any
+
+from ..governance_capability import GOVERNANCE_CAPABILITY_SCHEMA
+from ..rule_evidence_ledger import EVIDENCE_LEDGER_SCHEMA
 
 GOVERNANCE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rule_negative_evidence (
@@ -142,11 +146,19 @@ CREATE TABLE IF NOT EXISTS rule_projection_state (
 );
 """
 
+# Lane D: contribution history plus the rebuildable effective-winner
+# projection.  Kept in the v2 migration so fresh and upgraded databases share
+# one idempotent schema entry point.
+GOVERNANCE_SCHEMA += EVIDENCE_LEDGER_SCHEMA
+GOVERNANCE_SCHEMA += "\n" + GOVERNANCE_CAPABILITY_SCHEMA
+
 # (table, column, DDL) added only when the column is absent.
 GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_definitions", "rule_strength", "TEXT NOT NULL DEFAULT 'observation'"),
     ("rule_definitions", "maturity_state", "TEXT NOT NULL DEFAULT 'observing'"),
     ("rule_merge_proposals", "readiness_score", "REAL NOT NULL DEFAULT 0.0"),
+    ("rule_merge_proposals", "readiness_components", "TEXT NOT NULL DEFAULT '{}'"),
+    ("rule_merge_proposals", "readiness_digest", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "governance_reasons", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "cooldown_until", "TEXT NOT NULL DEFAULT ''"),
     ("rule_merge_proposals", "first_merge_acknowledged", "INTEGER NOT NULL DEFAULT 0"),
@@ -176,6 +188,7 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_evidence", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_evidence", "feedback_id", "TEXT NOT NULL DEFAULT ''"),
     ("rule_evidence", "feedback_authority", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_evidence", "active", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_negative_evidence", "independence_key", "TEXT NOT NULL DEFAULT ''"),
     ("rule_negative_evidence", "share_group_id", "TEXT NOT NULL DEFAULT ''"),
     ("rule_negative_evidence", "session_id", "TEXT NOT NULL DEFAULT ''"),
@@ -185,6 +198,7 @@ GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("rule_negative_evidence", "source_root_id", "TEXT NOT NULL DEFAULT ''"),
     ("rule_negative_evidence", "source_object_id", "TEXT NOT NULL DEFAULT ''"),
     ("rule_negative_evidence", "session_trusted", "INTEGER NOT NULL DEFAULT 0"),
+    ("rule_negative_evidence", "active", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "readiness_at_merge", "REAL NOT NULL DEFAULT 0.0"),
     ("rule_merge_decisions", "strength_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("rule_merge_decisions", "polarity_ok", "INTEGER NOT NULL DEFAULT 1"),
@@ -230,6 +244,7 @@ def migrate(db_path: str) -> dict[str, Any]:
 
     conn = sqlite3.connect(db_path)
     try:
+        conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("BEGIN IMMEDIATE")
         try:
             apply_v1(conn)
@@ -262,7 +277,8 @@ def migrate(db_path: str) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "tables": [
             "rule_negative_evidence", "agent_reputation", "project_profile",
-            "rule_definition_versions",
+            "rule_definition_versions", "rule_evidence_contributions",
+            "rule_evidence_effective",
         ],
         "upgraded_columns": list(GOVERNANCE_UPGRADE_COLUMNS),
     }

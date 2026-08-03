@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_evidence import build_evidence
@@ -63,9 +64,11 @@ def _merge(store, a, b):
         [a.definition_id, b.definition_id], 0.99,
         evidence=pair_evidence, definition_a=a, definition_b=b,
     )
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(proposal["proposal_id"], context)
     store.approve_proposal(
-        proposal["proposal_id"], approved_by="admin",
-        capability_id="admin:test-suite",
+        proposal["proposal_id"], approved_by=context.principal,
+        capability_token=token, access_context=context,
     )
     return RuleMergeService(store).merge_proposal(proposal["proposal_id"])
 

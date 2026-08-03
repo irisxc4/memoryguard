@@ -31,6 +31,7 @@ from memoryguard.rule_scope import infer_scope_from_text  # noqa: E402
 
 
 DEFAULT_GOLDEN = ROOT / "tests" / "golden" / "rule_scope_cases.json"
+MIN_CATEGORY_ACCURACY = 0.90
 
 # Narrow-to-wide partial order for *safe activation* checks.  ``agent_project``
 # (current agent + current project) is the narrowest audience this system can
@@ -94,6 +95,8 @@ def evaluate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
     categories = Counter()
     category_intent = Counter()
     category_safe = Counter()
+    category_over_broad = Counter()
+    production_defects: list[dict[str, Any]] = []
 
     for case in cases:
         case_id = str(case.get("case_id", ""))
@@ -170,6 +173,7 @@ def evaluate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
                     and not actual["fallback"]
                 ):
                     over_broad += 1
+                    category_over_broad[category] += 1
                 elif actual["target_type"] != intent["target_type"]:
                     under_scoped += 1
             errors.append({
@@ -179,7 +183,43 @@ def evaluate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
                 "actual": actual,
             })
 
+        if case_id == "conflict-007" and (not intent_ok or not activation_ok):
+            # This case is a known conflict-resolution safety witness.  Keep
+            # the production result visible; never rewrite it into a pass.
+            production_defects.append({
+                "case_id": case_id,
+                "category": category,
+                "intent": intent,
+                "actual": actual,
+            })
+
     denominator = total or 1
+    category_diff: dict[str, dict[str, Any]] = {}
+    production_defect_categories = {
+        str(item["category"]) for item in production_defects
+    }
+    for category in sorted(categories):
+        category_total = categories[category]
+        intent_accuracy = category_intent[category] / category_total
+        safe_accuracy = category_safe[category] / category_total
+        category_diff[category] = {
+            "total": category_total,
+            "intent": category_intent[category],
+            "safe": category_safe[category],
+            "intent_accuracy": intent_accuracy,
+            "safe_accuracy": safe_accuracy,
+            "over_broad": category_over_broad[category],
+            "passed": bool(
+                category_total > 0
+                and intent_accuracy >= MIN_CATEGORY_ACCURACY
+                and safe_accuracy >= MIN_CATEGORY_ACCURACY
+                and category_over_broad[category] == 0
+                and category not in production_defect_categories
+            ),
+        }
+    categories_passed = bool(category_diff) and all(
+        item["passed"] for item in category_diff.values()
+    )
     report = {
         "total": total,
         "intent_candidate_accuracy": intent_exact / denominator,
@@ -190,23 +230,18 @@ def evaluate_cases(cases: list[dict[str, Any]]) -> dict[str, Any]:
         "auto_system_activation_rate": auto_system / denominator,
         "fallback_rate": fallback_count / denominator,
         "categories": dict(sorted(categories.items())),
-        "category_diff": {
-            category: {
-                "total": categories[category],
-                "intent": category_intent[category],
-                "safe": category_safe[category],
-                "intent_accuracy": category_intent[category] / categories[category],
-                "safe_accuracy": category_safe[category] / categories[category],
-            }
-            for category in sorted(categories)
-        },
+        "category_diff": category_diff,
+        "categories_passed": categories_passed,
+        "production_defects": production_defects,
         "errors": errors[:25],
         "passed": bool(
             total >= 200
-            and intent_exact / denominator >= 0.90
-            and activation_safe / denominator >= 0.90
+            and intent_exact / denominator >= MIN_CATEGORY_ACCURACY
+            and activation_safe / denominator >= MIN_CATEGORY_ACCURACY
             and over_broad == 0
             and auto_system == 0
+            and categories_passed
+            and not production_defects
         ),
     }
     return report

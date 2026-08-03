@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -23,6 +24,7 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
 
 def main() -> int:
     all_pass = True
+    os.environ["MEMORYGUARD_ADMIN"] = "1"
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
         store = AgentBindingStore(workspace)
@@ -80,16 +82,16 @@ def main() -> int:
                            f"status={active_check.get('status')}")
 
         print("\n=== 4. 解绑 ===")
-        unbound = api.unbind_agent(drift_binding["binding_id"], _admin_override=True)
+        unbound = api.unbind_agent(drift_binding["binding_id"])
         all_pass &= _check("解绑成功", unbound.get("binding", {}).get("status") == BindingStatus.INACTIVE.value)
         active_bindings = api.list_bindings(include_inactive=False).get("bindings", [])
         all_pass &= _check("active 列表不含已解绑", all(b["binding_id"] != drift_binding["binding_id"] for b in active_bindings))
 
         print("\n=== 5. 解散共享组 ===")
-        denied = api.dissolve_shared_group("team-alpha", confirmed=False, _admin_override=True)
+        denied = api.dissolve_shared_group("team-alpha", confirmed=False)
         all_pass &= _check("无确认拒绝解散", "error" in denied)
         dissolved = api.dissolve_shared_group(
-            "team-alpha", confirmed=True, archive_data=True, _admin_override=True,
+            "team-alpha", confirmed=True, archive_data=True,
         )
         all_pass &= _check("解散成功", dissolved.get("ok") is True, str(dissolved))
         all_pass &= _check("解绑数 >= 2", dissolved.get("unbound_count", 0) >= 2,

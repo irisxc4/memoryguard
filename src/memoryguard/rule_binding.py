@@ -182,7 +182,7 @@ def build_binding(
         binding_id=binding_id or stable_hash(
             "rule-binding", definition_id, share_group_id, target_type,
             target_id, canonical_project_ref(project_ref), provider,
-            runtime_role, effect,
+            runtime_role, effect, str(priority), owner_agent_id,
         ),
         definition_id=definition_id,
         share_group_id=share_group_id,

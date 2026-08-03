@@ -38,24 +38,27 @@ def test_rule_scope_options_only_expose_discovered_or_bound_targets(tmp_path: Pa
     assert {item["id"] for item in options["runtime_roles"]} >= {"root", "subagent"}
 
 
-def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(tmp_path: Path) -> None:
+def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     api, group_id = _prepare(tmp_path)
 
     rejected = api.update_rule_audience(
-        "rule-1", [], group_id, "always", confirmed=True, _admin_override=True,
+        "rule-1", [], group_id, "always", confirmed=True,
     )
     assert rejected["error"] == "always_rule_requires_include_audience"
     assert SharedMemoryStore(tmp_path, group_id).get_record("rule-1").injection_policy == "relevant"
 
     unknown = api.update_rule_audience(
         "rule-1", [{"target_type": "agent", "target_id": "invented-id"}],
-        group_id, "always", confirmed=True, _admin_override=True,
+        group_id, "always", confirmed=True,
     )
     assert unknown["error"] == "unknown_agent_target"
 
     changed = api.update_rule_audience(
         "rule-1", [{"target_type": "agent", "target_id": "agent-a"}],
-        group_id, "always", priority=50, confirmed=True, _admin_override=True,
+        group_id, "always", priority=50, confirmed=True,
     )
     assert changed["ok"] is True
     assert changed["assignments"][0]["target_id"] == "agent-a"
@@ -74,7 +77,7 @@ def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(tmp_path: Pat
         "rule-1", [
             {"target_type": "group", "target_id": group_id, "effect": "include"},
             {"target_type": "agent", "target_id": "agent-b", "effect": "exclude"},
-        ], group_id, "always", priority=50, confirmed=True, _admin_override=True,
+        ], group_id, "always", priority=50, confirmed=True,
     )
     assert excluded["ok"] is True
     preview_b = api.preview_effective_rules("agent-b", group_id)
@@ -83,7 +86,7 @@ def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(tmp_path: Pat
     # always -> relevant clears all assignments in the same store transaction;
     # it does not delete the memory body or its record.
     restored = api.update_rule_audience(
-        "rule-1", [], group_id, "relevant", confirmed=True, _admin_override=True,
+        "rule-1", [], group_id, "relevant", confirmed=True,
     )
     assert restored["ok"] is True
     store = SharedMemoryStore(tmp_path, group_id)
@@ -91,7 +94,10 @@ def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(tmp_path: Pat
     assert store.list_rule_assignments("rule-1") == []
 
 
-def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(tmp_path: Path) -> None:
+def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     api, group_id = _prepare(tmp_path)
     store = SharedMemoryStore(tmp_path, group_id)
     store.transition_injection_policy(
@@ -101,7 +107,7 @@ def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(tmp_pa
 
     before = store.get_record("rule-1").to_dict()
     denied = api.update_rule_audience(
-        "rule-1", [], group_id, "relevant", confirmed=False, _admin_override=True,
+        "rule-1", [], group_id, "relevant", confirmed=False,
     )
     assert denied["error"] == "confirmation_required"
     assert store.get_record("rule-1").to_dict() == before
@@ -118,12 +124,12 @@ def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(tmp_pa
     # new invented target is still rejected by the server-side option check.
     retained = api.update_rule_audience(
         "rule-1", [{"target_type": "agent", "target_id": "removed-agent"}],
-        group_id, "always", confirmed=True, _admin_override=True,
+        group_id, "always", confirmed=True,
     )
     assert retained["ok"] is True
     invented = api.update_rule_audience(
         "rule-1", [{"target_type": "agent", "target_id": "new-invented-agent"}],
-        group_id, "always", confirmed=True, _admin_override=True,
+        group_id, "always", confirmed=True,
     )
     assert invented["error"] == "unknown_agent_target"
 

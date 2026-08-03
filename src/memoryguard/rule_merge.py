@@ -42,6 +42,9 @@ from .rule_evidence import (
     build_negative_evidence,
     dedupe_evidence,
 )
+from .rule_evidence_ledger import build_contribution
+from .merge_governance_coordinator import MergeGovernanceCoordinator
+from .access_context import session_trust_is_valid
 from .rule_merge_policy import (
     AUTO_MERGE_MIN_AGENTS,
     AUTO_MERGE_MIN_EVIDENCE,
@@ -61,6 +64,7 @@ from .rule_merge_policy import (
     WEIGHTED_EVIDENCE_MIN,
     MergeAssessment,
     bayesian_accuracy,
+    build_maturity_snapshot,
     compute_layers,
     contradiction_score,
     days_between,
@@ -69,7 +73,6 @@ from .rule_merge_policy import (
     feedback_authority_score,
     largest_source_ratio,
     maturity_score,
-    merge_readiness_score,
     merge_match_kind,
     maturity_gate,
     negative_evidence_score,
@@ -79,7 +82,11 @@ from .rule_merge_policy import (
     recency_factor,
     weighted_evidence_score,
 )
-from .rule_merge_store import RuleMergeStore, iter_legacy_groups
+from .rule_merge_store import (
+    HUMAN_MERGE_MIN_SIMILARITY,
+    RuleMergeStore,
+    iter_legacy_groups,
+)
 from .schema_v3 import SharedMemoryRecord, SharedMemoryStatus, _now_iso, stable_hash
 
 # Actors that count as explicit human governance (bypass readiness/cooldown/
@@ -94,6 +101,8 @@ SCAN_TOP_K = 20
 SCAN_EXHAUSTIVE_GROUP_LIMIT = 64
 SCAN_POSTING_LIMIT = 64
 READINESS_DRIFT_TOLERANCE = 1e-4
+
+_ACTIVE_SOURCE_STATUS = SharedMemoryStatus.ACTIVE.value
 
 
 class RuleMergeService:
@@ -153,6 +162,17 @@ class RuleMergeService:
     def backfill_group(
         self, store: Any, group_id: str,
     ) -> dict[str, int]:
+        """Backfill one group as one RuleMergeStore transaction."""
+        with self.store._write_conn():
+            ledger = self._backfill_group_atomic(store, group_id)
+        # This pass reads the committed post-migration state and is itself
+        # fail-closed for unrecoverable legacy rows.
+        self._mark_orphan_v1_definitions()
+        return ledger
+
+    def _backfill_group_atomic(
+        self, store: Any, group_id: str,
+    ) -> dict[str, int]:
         """Migrate one group's governed rules into the P3 layer (PR6).
 
         Only ``always``-policy rules are migrated (``relevant`` rules are recall,
@@ -178,8 +198,7 @@ class RuleMergeService:
         records = store.list_records()
         governed_records = [
             record for record in records
-            if record.status != SharedMemoryStatus.DELETED
-            and str(record.injection_policy or "") == "always"
+            if str(record.injection_policy or "") == "always"
         ]
         # Preflight v1 identity collisions before the per-source pass.  A
         # surface-only v1 id can represent multiple v2 strengths; moving all
@@ -212,8 +231,6 @@ class RuleMergeService:
                 migrated_audiences[primary_id] = removed
 
         for record in records:
-            if record.status == SharedMemoryStatus.DELETED:
-                continue
             if str(record.injection_policy or "") != "always":
                 continue  # governed rules only
             ledger["records"] += 1
@@ -242,21 +259,37 @@ class RuleMergeService:
             # else: the source routes to a different canonical; leave the
             # merged/superseded lifecycle untouched.
 
+            if getattr(record.status, "value", record.status) != _ACTIVE_SOURCE_STATUS:
+                self.sync_rule(
+                    store, group_id, record,
+                    assignments=[], receipts=[], created_by="backfill",
+                )
+                continue
+
             legacy_id = self._legacy_definition_id(record)
             try:
                 assignments = store.list_rule_assignments(record.memory_id)
             except Exception:
                 assignments = []
-            for assignment in assignments:
-                ledger["assignments"] += 1
-                binding = self._binding_from_assignment(
-                    canonical_id, assignment, share_group_id=group_id,
-                    owner_agent_id=record.agent_instance_id,
-                    created_by="backfill",
-                    authorization="backfill",
-                )
-                self.store.upsert_binding(binding)
-                ledger["bindings"] += 1
+            ledger["assignments"] += len(assignments)
+            self.store.replace_source_contributions(
+                group_id,
+                record.memory_id,
+                [
+                    self._binding_from_assignment(
+                        canonical_id, assignment, share_group_id=group_id,
+                        owner_agent_id=record.agent_instance_id,
+                        created_by="backfill",
+                        authorization="backfill",
+                    )
+                    for assignment in assignments
+                ],
+                source_revision=(
+                    record.updated_at or record.created_at or ""
+                ),
+                owner_agent_id=record.agent_instance_id,
+            )
+            ledger["bindings"] += len(assignments)
             try:
                 receipts = store.list_rule_match_receipts(memory_id=record.memory_id)
             except Exception:
@@ -274,7 +307,11 @@ class RuleMergeService:
                     content=record.body,
                     confidence=receipt.confidence,
                     session_trusted=int(
-                        getattr(receipt, "session_trusted", False) is True
+                        session_trust_is_valid(
+                            getattr(receipt, "session_id", ""),
+                            getattr(receipt, "session_source", ""),
+                            getattr(receipt, "session_trusted", False),
+                        )
                     ),
                 )
                 self.store.upsert_evidence(evidence)
@@ -305,17 +342,30 @@ class RuleMergeService:
             removed = self.store.migrate_legacy_definition(
                 legacy_id, primary_id,
             )
-            if removed:
+            if removed and legacy_id not in collision_targets:
                 migrated_audiences.setdefault(primary_id, []).extend(removed)
         # Scope preservation: every audience removed by a v1->v2 migration must
         # have been recreated under the canonical definition by this pass.
         if migrated_audiences:
             for new_id, removed in migrated_audiences.items():
+                scope_definition_ids = {new_id}
+                # Collision migration preserves audience globally across the
+                # per-source target definitions; no target may inherit the
+                # other source's audience by default.
+                for mapping in collision_targets.values():
+                    if new_id in set(mapping.values()):
+                        scope_definition_ids.update(mapping.values())
+                conn = self.store._active_write_conn()
+                if conn is None:  # pragma: no cover - wrapper invariant
+                    raise RuntimeError("v1_migration_transaction_missing")
+                placeholders = ",".join("?" for _ in scope_definition_ids)
                 present = {
-                    binding_identity_key(b)
-                    for b in self.store.list_bindings(
-                        definition_id=new_id, status="active",
-                    )
+                    binding_identity_key(self.store._row_to_binding(row))
+                    for row in conn.execute(
+                        "SELECT * FROM rule_bindings WHERE status='active' "
+                        f"AND definition_id IN ({placeholders})",
+                        sorted(scope_definition_ids),
+                    ).fetchall()
                 }
                 for audience in removed:
                     if audience not in present:
@@ -323,7 +373,6 @@ class RuleMergeService:
                             "rule_migration_scope_change: an audience "
                             "disappeared during v1->v2 migration"
                         )
-        self._mark_orphan_v1_definitions()
         return ledger
 
     def sync_rule(
@@ -354,7 +403,55 @@ class RuleMergeService:
             canonical_id = self.store.resolve_canonical(
                 link["canonical_definition_id"],
             )
+        record_status = getattr(record.status, "value", record.status)
+        source_revision = (
+            getattr(record, "updated_at", "")
+            or getattr(record, "created_at", "")
+            or (link or {}).get("source_revision", "")
+            or ""
+        )
+        # A source contribution is owned by the source record, not by its
+        # current owner.  Every inactive or non-governed source must therefore
+        # retract only its own rows before the binding is materialized.
+        if record_status != _ACTIVE_SOURCE_STATUS or (
+            str(record.injection_policy or "") != "always"
+        ):
+            self.store.deactivate_source_contributions(
+                group_id, record.memory_id,
+                owner_agent_id=record.agent_instance_id,
+            )
+            self.store.deactivate_source_evidence(
+                record.memory_id, record.agent_instance_id,
+            )
+            if record_status != _ACTIVE_SOURCE_STATUS or link:
+                self.store.upsert_source_link(
+                    share_group_id=group_id,
+                    memory_id=record.memory_id,
+                    source_revision=source_revision,
+                    original_definition_id=(link or {}).get(
+                        "original_definition_id", new_id,
+                    ),
+                    canonical_definition_id=canonical_id,
+                    status=str(record_status or "deleted"),
+                )
+            return {
+                "definition_id": canonical_id,
+                "bindings": 0,
+                "evidence": 0,
+            }
+
         existing = self.store.get_definition(canonical_id)
+        if (
+            link
+            and str(link.get("status") or "active") == _ACTIVE_SOURCE_STATUS
+            and str(link.get("source_revision") or "")
+            and str(link.get("source_revision") or "") != source_revision
+        ):
+            # Source updates retract the previous source-owned evidence and
+            # runtime projection before the new revision is written.
+            self.store.deactivate_source_evidence(
+                record.memory_id, record.agent_instance_id,
+            )
         # A source link may point at an already-merged canonical whose body
         # is authoritative.  Refresh only the source's own definition; never
         # project the source text over the canonical core during sync.
@@ -362,25 +459,32 @@ class RuleMergeService:
             canonical_id == new_id and existing.status == "active"
         ):
             self.store.upsert_definition(definition)
-        bindings = 0
-        desired_binding_keys: set[str] = set()
-        for assignment in assignments or []:
-            binding = self._binding_from_assignment(
-                canonical_id, assignment, share_group_id=group_id,
-                owner_agent_id=record.agent_instance_id,
-                created_by=created_by,
-                authorization="dual-write",
-            )
-            self.store.upsert_binding(binding)
-            desired_binding_keys.add(binding_identity_key(binding))
-            bindings += 1
-        if replace_assignments:
-            self.store.revoke_stale_source_bindings(
-                canonical_id,
-                group_id,
-                record.agent_instance_id,
-                desired_binding_keys,
-            )
+        if assignments is None:
+            try:
+                assignments = store.list_rule_assignments(record.memory_id)
+            except Exception:
+                assignments = []
+        assignment_items = list(assignments)
+        bindings = len(assignment_items)
+        writer = (
+            self.store.replace_source_contributions
+            if replace_assignments else self.store.upsert_source_contributions
+        )
+        writer(
+            group_id,
+            record.memory_id,
+            [
+                self._binding_from_assignment(
+                    canonical_id, assignment, share_group_id=group_id,
+                    owner_agent_id=record.agent_instance_id,
+                    created_by=created_by,
+                    authorization="dual-write",
+                )
+                for assignment in assignment_items
+            ],
+            source_revision=source_revision,
+            owner_agent_id=record.agent_instance_id,
+        )
         evidence = 0
         for receipt in receipts or []:
             item = build_evidence(
@@ -394,16 +498,21 @@ class RuleMergeService:
                 content=record.body,
                 confidence=getattr(receipt, "confidence", 1.0),
                 session_trusted=int(
-                    getattr(receipt, "session_trusted", False) is True
+                    session_trust_is_valid(
+                        getattr(receipt, "session_id", ""),
+                        getattr(receipt, "session_source", ""),
+                        getattr(receipt, "session_trusted", False),
+                    )
                 ),
             )
             stored_item = self.store.upsert_evidence(item)
             evidence += 1
         self.store.upsert_source_link(
             share_group_id=group_id, memory_id=record.memory_id,
-            source_revision=getattr(record, "updated_at", "") or getattr(record, "created_at", "") or "",
+            source_revision=source_revision,
             original_definition_id=new_id,
             canonical_definition_id=canonical_id,
+            status=_ACTIVE_SOURCE_STATUS,
         )
         return {
             "definition_id": canonical_id,
@@ -416,7 +525,24 @@ class RuleMergeService:
     # ------------------------------------------------------------------
 
     def consume_outbox(
-        self, workspace: str | Path | None = None, *, only_group: str | None = None,
+        self,
+        workspace: str | Path | None = None,
+        *,
+        only_group: str | None = None,
+        only_groups: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Drain the legacy outbox under the shared workspace governance lock."""
+        with self.store.governance_lock():
+            return self._consume_outbox_locked(
+                workspace, only_group=only_group, only_groups=only_groups,
+            )
+
+    def _consume_outbox_locked(
+        self,
+        workspace: str | Path | None = None,
+        *,
+        only_group: str | None = None,
+        only_groups: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         """Project P2 feedback events into the rule-intelligence layer.
 
@@ -443,8 +569,14 @@ class RuleMergeService:
             "groups": 0, "events_seen": 0, "events_consumed": 0,
             "definitions_touched": 0,
         }
+        selected_groups = (
+            {str(group_id) for group_id in only_groups}
+            if only_groups is not None else None
+        )
+        if only_group is not None:
+            selected_groups = {str(only_group)}
         for group_id, _db_path in iter_legacy_groups(workspace):
-            if only_group and group_id != only_group:
+            if selected_groups is not None and group_id not in selected_groups:
                 continue
             legacy = SharedMemoryStore(workspace, group_id)
             events = legacy.list_unconsumed_rule_events()
@@ -550,7 +682,7 @@ class RuleMergeService:
         source = str(
             state.get("session_source") or event.get("session_source") or ""
         ).strip().casefold()
-        return int(bool(trusted and session_id and source not in {"", "absent"}))
+        return int(session_trust_is_valid(session_id, source, trusted))
 
     def _clear_feedback_projection(
         self, receipt_id: str, previous_feedback_id: str = "",
@@ -587,6 +719,77 @@ class RuleMergeService:
             self.store.recompute_runtime_stats(definition_id)
         return touched
 
+    @staticmethod
+    def _feedback_independence_key(
+        *,
+        share_group_id: str,
+        memory_id: str,
+        receipt_id: str,
+        agent_instance_id: str,
+        project_ref: str,
+        session_id: str,
+    ) -> str:
+        """Use one polarity-neutral group for a receipt's evidence history."""
+        return stable_hash(
+            "rule-feedback-independence", share_group_id, memory_id,
+            receipt_id, agent_instance_id, project_ref, session_id,
+        )
+
+    def _feedback_contribution(
+        self,
+        *,
+        definition_id: str,
+        memory_id: str,
+        record: SharedMemoryRecord,
+        state: dict[str, Any],
+        event: dict[str, Any],
+        receipt_id: str,
+        feedback_id: str,
+        share_group_id: str,
+        agent: str,
+        project: str,
+        session: str,
+        created_at: str,
+        authority: int,
+        confidence: float,
+        session_trusted: int,
+        polarity: str,
+        source_evidence_id: str,
+    ) -> Any:
+        independence_key = self._feedback_independence_key(
+            share_group_id=share_group_id, memory_id=memory_id,
+            receipt_id=receipt_id, agent_instance_id=agent,
+            project_ref=project, session_id=session,
+        )
+        return build_contribution(
+            contribution_id=stable_hash(
+                "rule-feedback-contribution", definition_id,
+                independence_key, feedback_id, polarity,
+            ),
+            definition_id=definition_id,
+            independence_key=independence_key,
+            kind="feedback",
+            polarity=polarity,
+            authority=authority,
+            confidence=confidence,
+            observed_at=created_at,
+            receipt_id=receipt_id,
+            feedback_id=feedback_id,
+            source_rule_id=memory_id,
+            source_evidence_id=source_evidence_id,
+            source_memory_id=memory_id,
+            source_ids={
+                "receipt_id": receipt_id,
+                "feedback_id": feedback_id,
+                "source_rule_id": memory_id,
+            },
+            agent_instance_id=agent,
+            project_ref=project,
+            share_group_id=share_group_id,
+            session_id=session,
+            session_trusted=bool(session_trusted),
+        )
+
     def _consume_lifecycle_event(
         self, legacy: Any, group_id: str, event: dict[str, Any],
     ) -> bool:
@@ -611,14 +814,12 @@ class RuleMergeService:
             elif value:
                 target_ids.append(str(value))
         target_ids = list(dict.fromkeys(item for item in target_ids if item))
-        replacing_assignments = event_type in {
-            "assignments_replaced", "assignment_changed", "exception_split",
-            "exception_revoked", "rule_narrowed", "rule_restored", "rule_undo",
-        }
         for memory_id in target_ids:
             record = legacy.get_record(memory_id)
             link = self.store.get_source_link(group_id, memory_id)
             if record is None or record.status == SharedMemoryStatus.DELETED:
+                self.store.deactivate_source_contributions(group_id, memory_id)
+                self.store.deactivate_source_evidence(memory_id)
                 canonical_id = self.store.resolve_canonical(
                     str(link.get("canonical_definition_id") or "")
                 ) if link else ""
@@ -626,7 +827,13 @@ class RuleMergeService:
                     self.store.upsert_source_link(
                         share_group_id=group_id,
                         memory_id=memory_id,
-                        source_revision=(link or {}).get("source_revision", ""),
+                        source_revision=(
+                            (
+                                record.updated_at or record.created_at
+                                if record is not None else ""
+                            )
+                            or (link or {}).get("source_revision", "")
+                        ),
                         original_definition_id=(link or {}).get(
                             "original_definition_id", ""
                         ),
@@ -634,21 +841,39 @@ class RuleMergeService:
                         status="deleted",
                     )
                 continue
-            if event_type in {
-                "rule_quarantined", "rule_conflicted", "rule_superseded",
-            } or (
-                event_type == "rule_restored"
-                and record.status != SharedMemoryStatus.ACTIVE
-            ):
-                if link:
-                    self.store.upsert_source_link(
-                        share_group_id=group_id,
-                        memory_id=memory_id,
-                        source_revision=record.updated_at or record.created_at,
-                        original_definition_id=link.get("original_definition_id", ""),
-                        canonical_definition_id=link.get("canonical_definition_id", ""),
-                        status=event_type.removeprefix("rule_") or "active",
+
+            record_status = getattr(record.status, "value", record.status)
+            if record_status != _ACTIVE_SOURCE_STATUS:
+                self.store.deactivate_source_contributions(
+                    group_id, memory_id,
+                    owner_agent_id=record.agent_instance_id,
+                )
+                self.store.deactivate_source_evidence(
+                    memory_id, record.agent_instance_id,
+                )
+                definition = self._definition_from_record(record)
+                canonical_id = (
+                    self.store.resolve_canonical(
+                        str(link.get("canonical_definition_id") or "")
                     )
+                    if link and link.get("canonical_definition_id")
+                    else definition.definition_id
+                )
+                if self.store.get_definition(canonical_id) is None:
+                    self.store.upsert_definition(definition)
+                self.store.upsert_source_link(
+                    share_group_id=group_id,
+                    memory_id=memory_id,
+                    source_revision=(
+                        record.updated_at or record.created_at
+                        or (link or {}).get("source_revision", "")
+                    ),
+                    original_definition_id=(link or {}).get(
+                        "original_definition_id", definition.definition_id,
+                    ),
+                    canonical_definition_id=canonical_id,
+                    status=str(record_status),
+                )
                 continue
             assignments = legacy.list_rule_assignments(memory_id)
             try:
@@ -662,7 +887,9 @@ class RuleMergeService:
                 assignments=assignments,
                 receipts=receipts,
                 created_by="outbox",
-                replace_assignments=replacing_assignments,
+                replace_assignments=event_type in {
+                    "assignments_replaced", "assignment_changed",
+                },
             )
         return True
 
@@ -738,6 +965,10 @@ class RuleMergeService:
                     effective_feedback_id="",
                     definition_id=canonical_id,
                     outcome="tombstone",
+                    session_id=str(
+                        current.get("session_id")
+                        or event.get("session_id") or ""
+                    ),
                     session_trusted=self._session_trusted_value(
                         current, event,
                     ),
@@ -790,12 +1021,21 @@ class RuleMergeService:
                 share_group_id=share_group_id, session_trusted=session_trusted,
                 feedback_id=feedback_id, feedback_authority=authority,
             )
-            stored_item = self.store.upsert_evidence(item)
+            contribution = self._feedback_contribution(
+                definition_id=canonical_id, memory_id=memory_id,
+                record=record, state=state, event=event,
+                receipt_id=receipt_id, feedback_id=feedback_id,
+                share_group_id=share_group_id, agent=agent, project=project,
+                session=session, created_at=created_at, authority=authority,
+                confidence=confidence, session_trusted=session_trusted,
+                polarity="positive", source_evidence_id=item.evidence_id,
+            )
+            stored_item = self.store.upsert_evidence_contribution(contribution)
             if (
                 str(getattr(stored_item, "receipt_id", "") or "") == receipt_id
                 and str(getattr(stored_item, "feedback_id", "") or "") == feedback_id
             ):
-                positive_evidence_id = stored_item.evidence_id
+                positive_evidence_id = stored_item.source_evidence_id
         elif outcome in {"not_applicable", "exception"}:
             item = build_negative_evidence(
                 definition_id=canonical_id, source_rule_id=memory_id,
@@ -805,12 +1045,21 @@ class RuleMergeService:
                 receipt_id=receipt_id, feedback_id=feedback_id,
                 feedback_authority=authority, session_trusted=session_trusted,
             )
-            stored_item = self.store.upsert_negative_evidence(item)
+            contribution = self._feedback_contribution(
+                definition_id=canonical_id, memory_id=memory_id,
+                record=record, state=state, event=event,
+                receipt_id=receipt_id, feedback_id=feedback_id,
+                share_group_id=share_group_id, agent=agent, project=project,
+                session=session, created_at=created_at, authority=authority,
+                confidence=confidence, session_trusted=session_trusted,
+                polarity="negative", source_evidence_id=item.evidence_id,
+            )
+            stored_item = self.store.upsert_evidence_contribution(contribution)
             if (
                 str(getattr(stored_item, "receipt_id", "") or "") == receipt_id
                 and str(getattr(stored_item, "feedback_id", "") or "") == feedback_id
             ):
-                negative_evidence_id = stored_item.evidence_id
+                negative_evidence_id = stored_item.source_evidence_id
         elif outcome == "corrected":
             lowered = evidence_text.casefold()
             if any(
@@ -826,12 +1075,21 @@ class RuleMergeService:
                     feedback_id=feedback_id, feedback_authority=authority,
                     session_trusted=session_trusted,
                 )
-                stored_item = self.store.upsert_negative_evidence(item)
+                contribution = self._feedback_contribution(
+                    definition_id=canonical_id, memory_id=memory_id,
+                    record=record, state=state, event=event,
+                    receipt_id=receipt_id, feedback_id=feedback_id,
+                    share_group_id=share_group_id, agent=agent, project=project,
+                    session=session, created_at=created_at, authority=authority,
+                    confidence=confidence, session_trusted=session_trusted,
+                    polarity="negative", source_evidence_id=item.evidence_id,
+                )
+                stored_item = self.store.upsert_evidence_contribution(contribution)
                 if (
                     str(getattr(stored_item, "receipt_id", "") or "") == receipt_id
                     and str(getattr(stored_item, "feedback_id", "") or "") == feedback_id
                 ):
-                    negative_evidence_id = stored_item.evidence_id
+                    negative_evidence_id = stored_item.source_evidence_id
         # Every observed outcome feeds the idempotent runtime-feedback ledger;
         # counters are derived in recompute_runtime_stats, never incremented.
         self.store.upsert_runtime_feedback(
@@ -851,6 +1109,7 @@ class RuleMergeService:
                 outcome=outcome,
                 positive_evidence_id=positive_evidence_id,
                 negative_evidence_id=negative_evidence_id,
+                session_id=session,
                 session_trusted=session_trusted,
                 session_source=session_source,
             )
@@ -890,7 +1149,14 @@ class RuleMergeService:
         # Project any pending P2 feedback before scanning so the evidence and
         # maturity snapshot is fresh.  Projection failures are deliberate
         # fail-closed errors: proposing against stale feedback is unsafe.
-        self.consume_outbox(self.store.workspace)
+        relevant_groups = (
+            self.store.groups_for_definitions(definition_ids)
+            if definition_ids is not None else None
+        )
+        self.consume_outbox(
+            self.store.workspace,
+            only_groups=relevant_groups,
+        )
         candidates = self.store.list_definitions(status="active")
         if definition_ids:
             wanted = set(definition_ids)
@@ -956,6 +1222,12 @@ class RuleMergeService:
                         contradiction_score=contradiction_score(a, b),
                         explanation="; ".join(assessment.reasons),
                         readiness_score=governance["readiness_score"],
+                        readiness_components=governance.get(
+                            "readiness_components", {}
+                        ),
+                        readiness_digest=governance.get(
+                            "readiness_digest", ""
+                        ),
                         governance_reasons="; ".join(
                             governance["governance_reasons"],
                         ),
@@ -1164,6 +1436,18 @@ class RuleMergeService:
             # evidence (P3-001 §5), polarity, parameters and contradiction —
             # still block even a human-approved merge.  An ``unknown`` strength
             # is likewise never mergeable.
+            current_layers = compute_layers(a, b, judge=judge)
+            if current_layers.duplicate_score < HUMAN_MERGE_MIN_SIMILARITY:
+                self.store.set_proposal_status(proposal_id, "rejected")
+                return {
+                    "ok": False,
+                    "blocked_reason": "merge_similarity_gate_failed",
+                    "conflict_type": "similarity",
+                    "assessment": {
+                        "duplicate_score": current_layers.duplicate_score,
+                        "reasons": ["similarity_below_human_threshold"],
+                    },
+                }
             strength_ok = (
                 str(a.rule_strength or "") == str(b.rule_strength or "")
                 and str(a.rule_strength or "") != STRENGTH_UNKNOWN
@@ -1245,6 +1529,8 @@ class RuleMergeService:
             self.store.update_proposal_governance(
                 proposal_id,
                 readiness_score=governance["readiness_score"],
+                readiness_components=governance.get("readiness_components", {}),
+                readiness_digest=governance.get("readiness_digest", ""),
                 governance_reasons="; ".join(governance["governance_reasons"]),
                 cooldown_until=governance["cooldown_until"],
                 negative_score=negative_score,
@@ -1263,10 +1549,13 @@ class RuleMergeService:
         self.store.update_proposal_governance(
             proposal_id,
             readiness_score=governance["readiness_score"],
+            readiness_components=governance.get("readiness_components", {}),
+            readiness_digest=governance.get("readiness_digest", ""),
             governance_reasons="; ".join(governance["governance_reasons"]),
             cooldown_until=governance["cooldown_until"],
             negative_score=negative_score,
         )
+        proposal = self.store.get_proposal(proposal_id) or proposal
         canonical, merged = self._pick_canonical(a, b)
         # For a human-approved merge, pin the merge to the exact state the
         # approver reviewed: definition revisions + evidence digest captured at
@@ -1329,20 +1618,64 @@ class RuleMergeService:
             "expected_negative_digest": proposal.get("negative_digest", ""),
             "expected_binding_digest": proposal.get("binding_digest", ""),
             "expected_runtime_digest": proposal.get("runtime_digest", ""),
+            "expected_readiness_digest": proposal.get("readiness_digest", ""),
             "expected_assessment_revision": (
                 int(proposal.get("assessment_revision") or 0) or None
             ),
             "expected_policy_version": proposal.get("policy_version", ""),
         }
-        # Keep compatibility with older Store implementations while using the
-        # current digest/execution-mode interface when available.
+        # Keep compatibility with older Store implementations while placing
+        # the actual merge behind the workspace drain/high-water barrier.
         supported = inspect.signature(self.store.execute_merge).parameters
-        decision = self.store.execute_merge(
-            **{
-                key: value for key, value in execute_kwargs.items()
-                if key in supported
-            }
+        merge_error: list[BaseException] = []
+
+        def execute_current_merge(_snapshot: Any = None) -> Any:
+            try:
+                return self.store.execute_merge(
+                    **{
+                        key: value for key, value in execute_kwargs.items()
+                        if key in supported
+                    }
+                )
+            except BaseException as exc:
+                merge_error.append(exc)
+                raise
+
+        def current_group_ids() -> set[str]:
+            return self.store.groups_for_definitions(definition_ids)
+
+        def current_legacy_stores() -> list[Any]:
+            from .shared_memory_store import SharedMemoryStore
+
+            legacy_paths = dict(iter_legacy_groups(self.store.workspace))
+            return [
+                SharedMemoryStore(
+                    self.store.workspace, group_id, must_exist=True,
+                )
+                for group_id in sorted(current_group_ids())
+                if group_id in legacy_paths
+            ]
+
+        coordinator = MergeGovernanceCoordinator(
+            self.store.workspace,
+            legacy_stores=current_legacy_stores,
+            drain_callback=lambda: self.consume_outbox(
+                self.store.workspace, only_groups=current_group_ids(),
+            ),
+            projection_status=lambda: self.store.projection_status(
+                group_ids=current_group_ids(),
+            ),
         )
+        barrier = coordinator.run_merge(execute_current_merge)
+        if merge_error:
+            raise merge_error[0]
+        if not barrier.ok:
+            return {
+                "ok": False,
+                "blocked_reason": barrier.error or "merge_projection_barrier_failed",
+                "barrier": barrier.to_dict(),
+            }
+        decision = barrier.merge_result
         decision = dict(decision)
         decision.update({
             "execution_mode": execution_mode,
@@ -1556,18 +1889,20 @@ class RuleMergeService:
             or len(projects) < AUTO_MERGE_MIN_PROJECTS
         ):
             return "observing"
-        stats = self.store.get_runtime_stats(definition.definition_id) or {}
-        followed = int(
-            stats.get("trusted_followed", stats.get("followed", 0)) or 0
+        runtime_rows = self.store.list_runtime_feedback(definition.definition_id)
+        maturity_snapshot = build_maturity_snapshot(
+            runtime={"events": runtime_rows},
         )
-        total_runtime = (
-            int(stats.get("trusted_total", 0) or 0)
-            if "trusted_total" in stats else (
-                followed
-                + int(stats.get("violated") or 0)
-                + int(stats.get("not_applicable") or 0)
-                + int(stats.get("exception_count") or 0)
-            )
+        trusted_rows = [
+            row for row in runtime_rows
+            if row.get("session_trusted")
+            and str(row.get("session_id") or "").strip()
+            and str(row.get("agent_instance_id") or "").strip()
+            and str(row.get("project_ref") or "").strip()
+        ]
+        total_runtime = int(maturity_snapshot["trusted_total"] or 0)
+        followed = sum(
+            1 for row in trusted_rows if row.get("outcome") == "followed"
         )
         if total_runtime <= 0:
             # Evidence exists but no execution feedback yet: candidate, never
@@ -1577,14 +1912,14 @@ class RuleMergeService:
         state = "candidate"
         if (
             not negative
+            and maturity_snapshot["state"] in {"validated", "trusted"}
             and total_runtime >= TRUSTED_MIN_SUCCESS_SAMPLES // 2
             and success_rate >= VALIDATED_SUCCESS_RATE
         ):
             state = "validated"
             if (
                 age >= TRUSTED_DAYS
-                and total_runtime >= TRUSTED_MIN_SUCCESS_SAMPLES
-                and len(projects) >= 3
+                and maturity_snapshot["state"] == "trusted"
             ):
                 state = "trusted"
         return state
@@ -1736,54 +2071,13 @@ class RuleMergeService:
         match_kind = merge_match_kind(layers)
         maturity_ok, maturity_reasons = maturity_gate(a, b, match_kind)
         weights = self._evidence_weights(evidence)
-        # Readiness is a rule-owned exam.  Agent reputation/project profiles
-        # may weight provenance elsewhere, but cannot supply this Definition's
-        # execution confidence.  Use only its own evidence confidence here.
-        confidence_values: list[float] = []
-        for ev in dedupe_evidence(evidence):
-            raw_confidence = getattr(ev, "confidence", None)
-            try:
-                confidence_values.append(
-                    max(0.0, min(
-                        1.0,
-                        float(1.0 if raw_confidence is None else raw_confidence),
-                    )),
-                )
-            except (TypeError, ValueError):
-                confidence_values.append(0.0)
-        evidence_confidence = min(
-            1.0, sum(confidence_values) / WEIGHTED_EVIDENCE_MIN,
-        )
-        maturity = min(
-            maturity_score(a.maturity_state),
-            maturity_score(b.maturity_state),
-        )
         success_a = self._execution_success(a)
         success_b = self._execution_success(b)
-        execution_success = (
-            (success_a if success_a is not None else 0.0)
-            + (success_b if success_b is not None else 0.0)
-        ) / 2.0
-        agents = {e.agent_instance_id for e in evidence if e.agent_instance_id}
-        projects = {
-            e.project_ref for e in evidence if (e.project_ref or "").strip()
-        }
-        source_diversity = min(1.0, (len(agents) + len(projects)) / 4.0)
-        stability = min(
-            1.0,
-            min(
-                days_between(a.created_at),
-                days_between(b.created_at),
-            ) / TRUSTED_DAYS,
+        # Store builds this from the exact SQLite rows later locked by execute_merge.
+        readiness_snapshot = self.store.build_readiness_snapshot(
+            [a.definition_id, b.definition_id],
         )
-        readiness = merge_readiness_score(
-            duplicate_score=layers.duplicate_score,
-            evidence_confidence=evidence_confidence,
-            maturity=maturity,
-            execution_success=execution_success,
-            source_diversity=source_diversity,
-            stability=stability,
-        )
+        readiness = float(readiness_snapshot["score"])
 
         cooldown_until = str((proposal or {}).get("cooldown_until") or "")
         cooldown_active = False
@@ -1830,6 +2124,9 @@ class RuleMergeService:
 
         return {
             "readiness_score": readiness,
+            "readiness_components": readiness_snapshot["components"],
+            "readiness_digest": readiness_snapshot["digest"],
+            "readiness_snapshot": readiness_snapshot,
             "cooldown_until": cooldown_until,
             "cooldown_active": cooldown_active,
             "first_merge": first_merge,

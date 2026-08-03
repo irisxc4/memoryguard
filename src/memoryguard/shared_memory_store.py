@@ -55,6 +55,7 @@ from .rule_scope import (
     canonical_project_ref,
     validate_automatic_assignment,
 )
+from .governance_lock import WorkspaceGovernanceLock
 
 
 _SCHEMA = """
@@ -528,6 +529,7 @@ class SharedMemoryStore:
         self._migration_fault_hook = None
         self.read_only = read_only
         self.must_exist = must_exist
+        self._governance_lock = WorkspaceGovernanceLock(self.workspace)
         # JSONL 备份路径
         self.records_bak_path = self.root / "records.jsonl"
         self.rule_assignments_bak_path = self.root / "rule_assignments.jsonl"
@@ -650,16 +652,42 @@ class SharedMemoryStore:
         finally:
             conn.close()
 
+    def governance_lock(
+        self,
+        *,
+        timeout: float | None = None,
+        poll_interval: float | None = None,
+    ) -> WorkspaceGovernanceLock:
+        """Return the workspace lock for external governance coordinators.
+
+        The default object is shared by this store; custom timing options still
+        resolve to the same process-wide lock state for this workspace.
+        """
+        if timeout is None and poll_interval is None:
+            return self._governance_lock
+        return WorkspaceGovernanceLock(
+            self.workspace,
+            timeout=(
+                self._governance_lock.timeout
+                if timeout is None else timeout
+            ),
+            poll_interval=(
+                self._governance_lock.poll_interval
+                if poll_interval is None else poll_interval
+            ),
+        )
+
     @contextlib.contextmanager
     def _tx(self):
-        """写事务连接：成功提交、异常回滚，用完即关。"""
-        self._assert_write_allowed()
-        conn = self._connect()
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        """One locked legacy transaction, including any transactional outbox."""
+        with self._governance_lock:
+            self._assert_write_allowed()
+            conn = self._connect()
+            try:
+                with conn:
+                    yield conn
+            finally:
+                conn.close()
 
     def _assert_write_allowed(self) -> None:
         if (
@@ -1979,8 +2007,7 @@ class SharedMemoryStore:
         )
         c_hash = self._canonical_hash(record.body)
         mutation_kind = "created"
-        conn = self._connect()
-        try:
+        with self._tx() as conn:
             conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT memory_id,provenance FROM records "
@@ -2030,13 +2057,7 @@ class SharedMemoryStore:
                     },
                     created_at=record.updated_at or _now_iso(),
                 )
-            conn.commit()
             return record
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def apply_rule_create_atomic(
         self,
@@ -3951,6 +3972,46 @@ class SharedMemoryStore:
                 "UPDATE rule_event_outbox SET consumed_at=? WHERE event_id=?",
                 (_now_iso(), event_id),
             )
+
+    def rule_event_high_water(self) -> dict[str, Any]:
+        """Return committed legacy-outbox high-water data.
+
+        This is a read-only observation of the already committed SQLite state.
+        Callers that need a stable barrier must hold :meth:`governance_lock`
+        while reading it and while performing the follow-up operation.
+        """
+        with self._governance_lock:
+            with self._db() as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total,
+                        COALESCE(MAX(rowid), 0) AS max_rowid,
+                        COALESCE(SUM(CASE WHEN consumed_at='' THEN 1 ELSE 0 END), 0)
+                            AS pending
+                    FROM rule_event_outbox
+                    """
+                ).fetchone()
+                latest = conn.execute(
+                    """
+                    SELECT event_id, created_at, rowid
+                    FROM rule_event_outbox
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+        return {
+            "share_group_id": self.group_id,
+            "total": int(row["total"] or 0),
+            "max_rowid": int(row["max_rowid"] or 0),
+            "pending": int(row["pending"] or 0),
+            "latest_event_id": str(latest["event_id"] or "") if latest else "",
+            "latest_created_at": str(latest["created_at"] or "") if latest else "",
+            "latest_rowid": int(latest["rowid"] or 0) if latest else 0,
+        }
+
+    # Public spelling for coordinators that use outbox terminology.
+    outbox_high_water = rule_event_high_water
 
     def list_rule_match_feedbacks(
         self,

@@ -31,8 +31,7 @@ def test_gui_edit_memory_secret_redacted():
         ))
         # 用 edit_memory 更新为含 secret 的内容
         secret_body = "api_key=sk-gui-edit-test123def456ghi789"
-        result = api.edit_memory("r1", secret_body, "edit-secret-group",
-                                 _admin_override=True)
+        result = api.edit_memory("r1", secret_body, "edit-secret-group")
         # 硬断言:SQLite 不含原始 secret
         db_path = Path(ws) / ".memoryguard" / "shared-memory" / "edit-secret-group" / "memory.db"
         conn = sqlite3.connect(str(db_path))
@@ -81,8 +80,8 @@ def test_gui_write_ops_require_admin():
         os.environ.update(old_env)
 
 
-def test_gui_write_ops_admin_override():
-    """GUI 写操作 admin_override 通过。"""
+def test_gui_write_ops_rejects_admin_override_forgery():
+    """GUI 写操作不能用请求参数伪造 admin capability。"""
     from memoryguard.gui import GovernanceApi
     from memoryguard.shared_memory_store import SharedMemoryStore
     from memoryguard.schema_v3 import SharedMemoryRecord, SharedMemoryStatus, MemoryKind
@@ -97,9 +96,13 @@ def test_gui_write_ops_admin_override():
                 memory_id="r1", body="test", kind=MemoryKind.FACT,
                 status=SharedMemoryStatus.ACTIVE,
             ))
-            # lock_memory with override
+            # A browser/local caller cannot turn the legacy keyword into admin.
             r = api.lock_memory("r1", "override-group", _admin_override=True)
-            assert r.get("ok") or "locked" in str(r).lower()
+            assert r == {
+                "ok": False,
+                "error": "admin capability required (set MEMORYGUARD_ADMIN=1)",
+            }
+            assert store.get_record("r1").status == SharedMemoryStatus.ACTIVE
     finally:
         os.environ.clear()
         os.environ.update(old_env)
@@ -146,8 +149,8 @@ if __name__ == "__main__":
     print("OK: GUI edit_memory secret redacted")
     test_gui_write_ops_require_admin()
     print("OK: GUI write ops require admin")
-    test_gui_write_ops_admin_override()
-    print("OK: GUI write ops admin override")
+    test_gui_write_ops_rejects_admin_override_forgery()
+    print("OK: GUI rejects forged admin override")
     test_gui_readonly_no_side_effects()
     print("OK: GUI readonly no side effects")
     test_gui_search_memory_readonly()

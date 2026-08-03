@@ -14,6 +14,26 @@ import os
 from dataclasses import dataclass
 
 
+TRUSTED_SESSION_SOURCES = frozenset({"host", "transport"})
+_SESSION_SOURCES = frozenset({
+    "host", "transport", "generated", "manual", "client", "absent",
+})
+
+
+def session_trust_is_valid(
+    session_id: object,
+    session_source: object,
+    session_trusted: object,
+) -> bool:
+    """Validate immutable session provenance at governance boundaries."""
+    source = str(session_source or "").strip().casefold()
+    return (
+        session_trusted is True
+        and bool(str(session_id or "").strip())
+        and source in TRUSTED_SESSION_SOURCES
+    )
+
+
 @dataclass(frozen=True)
 class AccessContext:
     """可信访问上下文,从环境变量派生,不由客户端自报。"""
@@ -21,6 +41,22 @@ class AccessContext:
     is_admin: bool         # 管理员权限(可创建 binding)
     strict_binding: bool   # 严格绑定模式(默认 True)
     allow_anon: bool       # 允许匿名(MEMORYGUARD_AGENT_ID 未设置时)
+    session_id: str = ""   # host/transport 注入的 session 身份
+    session_source: str = "absent"  # provenance source; never inferred from id alone
+    session_trusted: bool = False
+
+    def __post_init__(self) -> None:
+        session_id = str(self.session_id or "").strip()
+        source = str(self.session_source or "").strip().casefold()
+        if source not in _SESSION_SOURCES:
+            source = "absent"
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "session_source", source)
+        object.__setattr__(
+            self,
+            "session_trusted",
+            session_trust_is_valid(session_id, source, self.session_trusted),
+        )
 
     def resolve_agent(self, claimed_agent_id: str = "") -> tuple[str, str]:
         """解析本连接身份；可信环境变量为事实源，请求参数只做一致性校验。"""
@@ -51,6 +87,24 @@ class AccessContext:
             return (False, "admin capability required (set MEMORYGUARD_ADMIN=1)")
         return (True, "")
 
+    @property
+    def principal(self) -> str:
+        """Return the connection-owned principal used by server capabilities."""
+        return self.trusted_agent_id
+
+    def require_capability_issue(self) -> tuple[bool, str]:
+        """Require an admin context with a non-anonymous trusted principal."""
+        ok, error = self.require_admin()
+        if not ok:
+            return (False, error)
+        if not self.principal:
+            return (False, "trusted principal required for capability issuance")
+        if self.session_source != "absent" and not self.session_trusted:
+            return (False, "trusted session context required")
+        if self.session_id and not self.session_trusted:
+            return (False, "trusted session context required")
+        return (True, "")
+
 
 def load_access_context() -> AccessContext:
     """从环境变量加载 AccessContext。"""
@@ -61,6 +115,9 @@ def load_access_context() -> AccessContext:
         strict_binding=os.environ.get("MEMORYGUARD_STRICT_BINDING", "1") != "0",
         # 默认拒绝匿名;需显式 MEMORYGUARD_ALLOW_ANON=1 开启
         allow_anon=os.environ.get("MEMORYGUARD_ALLOW_ANON", "") == "1",
+        session_id=os.environ.get("MEMORYGUARD_SESSION_ID", ""),
+        session_source=os.environ.get("MEMORYGUARD_SESSION_SOURCE", "absent"),
+        session_trusted=True,
     )
 
 

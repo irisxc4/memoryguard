@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.rule_definition import RuleDefinition, normalize_rule_text
+from memoryguard.rule_binding import build_binding
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
 from memoryguard.schema_v3 import (
@@ -69,8 +71,11 @@ def _merge_synonym_pair(store: RuleMergeStore, service: RuleMergeService):
     cand = [p for p in candidates if p["status"] == "candidate"]
     assert cand, "synonym pair must be a merge candidate"
     pid = cand[0]["proposal_id"]
+    context = AccessContext("test-admin", True, True, False)
+    token = store.issue_merge_capability(pid, context)
     store.approve_proposal(
-        pid, approved_by="admin", capability_id="admin:test-suite",
+        pid, approved_by=context.principal,
+        capability_token=token, access_context=context,
     )
     result = service.merge_proposal(pid, actor="admin")
     assert result["ok"] is True
@@ -145,6 +150,118 @@ def test_v1_strength_collision_splits_existing_evidence_by_source(tmp_path):
     }
     assert not intel.list_evidence(definition_id=legacy_id)
     assert intel.get_definition(legacy_id).status == "alias"
+
+
+def test_v1_collision_routes_binding_runtime_and_source_links_per_source(tmp_path):
+    group = "g1"
+    must_body = "蹇呴』杩愯娴嬭瘯"
+    should_body = "搴旇杩愯娴嬭瘯"
+    legacy = SharedMemoryStore(tmp_path, group)
+    _seed_record(legacy, "must", must_body, agent="agent-must")
+    _seed_record(legacy, "should", should_body, agent="agent-should")
+
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+    service._legacy_definition_id = lambda record: "legacy-strength-collision"
+    must_definition = service._definition_from_record(legacy.get_record("must"))
+    should_definition = service._definition_from_record(legacy.get_record("should"))
+    legacy_id = "legacy-strength-collision"
+    intel.upsert_definition(RuleDefinition.from_dict({
+        **must_definition.to_dict(),
+        "definition_id": legacy_id,
+        "rule_strength": "observation",
+    }))
+    old_must = build_binding(
+        legacy_id, share_group_id=group, target_type="agent",
+        target_id="agent-must", owner_agent_id="agent-must",
+        created_by="backfill",
+    )
+    old_should = build_binding(
+        legacy_id, share_group_id=group, target_type="agent",
+        target_id="agent-should", owner_agent_id="agent-should",
+        created_by="backfill",
+    )
+    intel.replace_source_contributions(group, "must", [old_must])
+    intel.replace_source_contributions(group, "should", [old_should])
+    for source_id, body in (("must", must_body), ("should", should_body)):
+        intel.upsert_evidence(build_evidence(
+            definition_id=legacy_id, source_rule_id=source_id,
+            agent_instance_id=source_id, project_ref=f"p-{source_id}",
+            session_id=f"s-{source_id}", session_trusted=True, content=body,
+            receipt_id=f"receipt-{source_id}",
+            feedback_id=f"fb-{source_id}",
+        ))
+        intel.upsert_runtime_feedback(
+            feedback_id=f"fb-{source_id}", definition_id=legacy_id,
+            receipt_id=f"receipt-{source_id}", outcome="followed",
+            agent_instance_id=source_id, project_ref=f"p-{source_id}",
+            session_id=f"s-{source_id}", session_trusted=1,
+        )
+        intel.upsert_effective_feedback_projection(
+            receipt_id=f"receipt-{source_id}",
+            effective_feedback_id=f"fb-{source_id}",
+            definition_id=legacy_id, outcome="followed",
+        )
+
+    service.backfill_group(legacy, group)
+
+    assert {
+        row["source_memory_id"]: row["definition_id"]
+        for row in intel.list_binding_contributions(active=True)
+        if row["source_memory_id"] in {"must", "should"}
+    } == {
+        "must": must_definition.definition_id,
+        "should": should_definition.definition_id,
+    }
+    assert {
+        item.source_rule_id: item.definition_id
+        for item in intel.list_evidence()
+        if item.source_rule_id in {"must", "should"}
+    } == {
+        "must": must_definition.definition_id,
+        "should": should_definition.definition_id,
+    }
+    with intel._db() as conn:
+        runtime = {
+            row["feedback_id"]: row["definition_id"]
+            for row in conn.execute(
+                "SELECT feedback_id, definition_id FROM rule_runtime_feedback "
+                "WHERE feedback_id IN ('fb-must', 'fb-should')"
+            ).fetchall()
+        }
+    assert runtime == {
+        "fb-must": must_definition.definition_id,
+        "fb-should": should_definition.definition_id,
+    }
+    assert intel.get_source_link(group, "must")["canonical_definition_id"] == (
+        must_definition.definition_id
+    )
+    assert intel.get_source_link(group, "should")["canonical_definition_id"] == (
+        should_definition.definition_id
+    )
+
+
+def test_v1_backfill_fault_rolls_back_definitions_bindings_evidence_and_links(
+    tmp_path, monkeypatch,
+):
+    group = "g1"
+    legacy = SharedMemoryStore(tmp_path, group)
+    _seed_record(legacy, "m1", "run tests before submit")
+    intel = RuleMergeStore(tmp_path)
+    service = RuleMergeService(intel)
+
+    def fail_source_link(**_kwargs):
+        raise RuntimeError("source-link fault")
+
+    monkeypatch.setattr(intel, "upsert_source_link", fail_source_link)
+    with pytest.raises(RuntimeError, match="source-link fault"):
+        service.backfill_group(legacy, group)
+
+    assert intel.list_definitions() == []
+    assert intel.list_bindings(status=None) == []
+    assert intel.list_binding_contributions() == []
+    assert intel.list_evidence() == []
+    assert intel.get_source_link(group, "m1") is None
 
 
 def test_sync_after_merge_targets_canonical_definition(tmp_path):

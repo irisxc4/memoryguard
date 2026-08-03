@@ -264,6 +264,8 @@ class ScopeInferenceResult:
 
 
 _TEXT_SIGNALS: list[tuple[_re.Pattern[str], str, float, str]] = [
+    (_re.compile(r"当前\s+agent\s*\+\s*项目|current\s+agent\s*\+\s*project", _re.IGNORECASE),
+     "agent_project", 0.98, "text explicitly combines the current agent and project scopes"),
     (_re.compile(r"本项目|当前仓库|当前代码库|当前项目|本仓库|本代码库|这个项目|这个仓库|这个代码库", _re.IGNORECASE),
      "agent_project", 0.96, "text scopes the rule to the current project"),
     # ``infer_scope_from_text`` normalizes Latin text with ``casefold`` below;

@@ -373,17 +373,9 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
     api = GovernanceApi(workspace)
     session_token = generate_session_token()
     # 网页环境绑定 127.0.0.1,等价于本地 GUI
-    # 显式关闭沙箱模式(localhost 本地环境,写操作可直接执行)
-    import os as _os
-    _os.environ["MEMORYGUARD_SANDBOX"] = "0"
+    # 沙箱状态只读当前可信进程环境；GUI 不替调用方修改安全边界。
     is_sandbox = detect_sandbox_mode()
     request_queue = RequestQueue(workspace)
-
-    # 自动设 admin,让前端能调用写/治理操作(session_token + 白名单已保护)
-    if not _os.environ.get("MEMORYGUARD_ADMIN"):
-        _os.environ["MEMORYGUARD_ADMIN"] = "1"
-    if not _os.environ.get("MEMORYGUARD_ALLOW_ANON"):
-        _os.environ["MEMORYGUARD_ALLOW_ANON"] = "1"
 
     # 将 session_token 注入 HTML
     html = render_interactive_html()
@@ -524,13 +516,8 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 self._json_response(501, {"error": f"method not implemented: {method}"})
                 return
             try:
-                # 对有 _admin_override 参数的方法,自动注入 True(网页=本地环境)
-                import inspect as _inspect2
-                _sig2 = _inspect2.signature(fn)
-                _kwargs = {}
-                if "_admin_override" in _sig2.parameters:
-                    _kwargs["_admin_override"] = True
-                result = fn(*args, **_kwargs) if args else fn(**_kwargs)
+                # 授权由 API 自己从 AccessContext 派生；HTTP/浏览器参数不得注入。
+                result = fn(*args) if args else fn()
                 result = result if result is not None else {}
                 self._json_response(200, result)
             except Exception as e:
@@ -4012,7 +3999,7 @@ class GovernanceApi:
         """正式单 Agent 接管入口：未绑定才创建个人组，已有共享绑定保持不动。"""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .agent_binding import AgentBindingStore
@@ -4024,7 +4011,7 @@ class GovernanceApi:
         """显式退出共享组；个人库与共享库均保留，不做合并。"""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .agent_binding import AgentBindingStore
@@ -4038,13 +4025,12 @@ class GovernanceApi:
                    redirect_paths: list[str] | None = None,
                    *, _admin_override: bool = False) -> dict:
         # A2: GUI/桌面 bind_agent 与 MCP 对齐,非 admin 拒绝
-        # 本地 GUI 可通过 _admin_override=True 绕过(有文件系统权限的场景)
+        # GUI 与 MCP 使用同一 AccessContext 管理员校验。
         from .access_context import load_access_context
         ctx = load_access_context()
-        if not _admin_override:
-            ok, err = ctx.require_admin()
-            if not ok:
-                return {"ok": False, "error": err}
+        ok, err = ctx.require_admin()
+        if not ok:
+            return {"ok": False, "error": err}
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         binding = store.bind_agent(
@@ -4065,10 +4051,9 @@ class GovernanceApi:
         # A2: 与 bind_agent 对齐
         from .access_context import load_access_context
         ctx = load_access_context()
-        if not _admin_override:
-            ok, err = ctx.require_admin()
-            if not ok:
-                return {"ok": False, "error": err}
+        ok, err = ctx.require_admin()
+        if not ok:
+            return {"ok": False, "error": err}
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         return store.bind_agents_to_group(
@@ -4093,7 +4078,7 @@ class GovernanceApi:
         """
         if not confirmed:
             return {"error": "需要确认才能安装 MCP 重定向"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .agent_binding import AgentBindingStore
@@ -4253,7 +4238,7 @@ class GovernanceApi:
         """Switch enforce/observe/paused without deleting host configuration."""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .host_hooks import set_hook_mode
@@ -4278,7 +4263,7 @@ class GovernanceApi:
         """Remove only MemoryGuard-owned Hook handlers."""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .host_hooks import HostHookManager
@@ -4299,7 +4284,7 @@ class GovernanceApi:
         """从各 Agent 已授权原生记忆根导入共享组（正式接管的数据迁移）。"""
         if not confirmed:
             return {"error": "需要确认才能导入原生记忆"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         if not share_group_id:
@@ -4334,7 +4319,7 @@ class GovernanceApi:
         """共享组正式接管：对 SharedMemoryStore 打版本快照（面板重构/分类确认）。"""
         if not confirmed:
             return {"error": "需要确认才能提交共享记忆治理"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         if not share_group_id:
@@ -4373,7 +4358,7 @@ class GovernanceApi:
         }
 
     def unbind_agent(self, binding_id: str, *, _admin_override: bool = False) -> dict:
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .agent_binding import AgentBindingStore
@@ -4396,7 +4381,7 @@ class GovernanceApi:
             return {"error": "需要确认才能解散共享组"}
         if not share_group_id:
             return {"error": "share_group_id_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
 
@@ -4505,14 +4490,13 @@ class GovernanceApi:
     # MemoryApi（v3.2 §8.2）：记忆治理
     # ------------------------------------------------------------------
 
-    def _require_admin_or_override(self, _admin_override: bool = False) -> dict | None:
-        """校验 admin 权限。返回 error dict 或 None(通过)。"""
+    def _require_admin(self) -> dict | None:
+        """Require administrator state from the trusted process context."""
         from .access_context import load_access_context
         ctx = load_access_context()
-        if not _admin_override:
-            ok, err = ctx.require_admin()
-            if not ok:
-                return {"ok": False, "error": err}
+        ok, err = ctx.require_admin()
+        if not ok:
+            return {"ok": False, "error": err}
         return None
 
     def _open_store(
@@ -4896,7 +4880,7 @@ class GovernanceApi:
     ) -> dict:
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         store, open_err = self._open_store(
@@ -4917,7 +4901,7 @@ class GovernanceApi:
         """先导出，再清空当前组；保留 binding、MCP 配置和空数据库。"""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         store, open_err = self._open_store(
@@ -4961,7 +4945,7 @@ class GovernanceApi:
         """先导出，再解绑并归档整个个人/共享记忆层。"""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         store, open_err = self._open_store(
@@ -4977,7 +4961,6 @@ class GovernanceApi:
                 share_group_id,
                 confirmed=True,
                 archive_data=True,
-                _admin_override=True,
             )
         archived_marker = Path(archived.get("archived_to", "")) / ".maintenance"
         if archived.get("archived_to") and archived_marker.exists():
@@ -5101,7 +5084,7 @@ class GovernanceApi:
     def edit_memory(self, memory_id: str, body: str,
                     share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """编辑记忆正文。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5115,7 +5098,7 @@ class GovernanceApi:
 
     def lock_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """锁定记忆。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5125,7 +5108,7 @@ class GovernanceApi:
 
     def unlock_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """解锁记忆。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5143,7 +5126,7 @@ class GovernanceApi:
         _admin_override: bool = False,
     ) -> dict:
         """Toggle a governed memory between on-demand and mandatory injection."""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5156,7 +5139,7 @@ class GovernanceApi:
 
     def restore_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """恢复 shadowed 记忆为 active。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5166,7 +5149,7 @@ class GovernanceApi:
 
     def delete_memory(self, memory_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """软删除记忆。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5176,7 +5159,7 @@ class GovernanceApi:
 
     def rollback_memory(self, version_id: str, share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """回滚到指定版本。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .shared_memory_store import SharedMemoryStore
@@ -5389,7 +5372,7 @@ class GovernanceApi:
     def resolve_conflict(self, group_id: str, keep_memory_id: str,
                          share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """解决冲突：保留指定记忆，其他成员软删除。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5400,7 +5383,7 @@ class GovernanceApi:
     def release_quarantine(self, quarantine_id: str,
                            share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """释放隔离：恢复记忆为 active。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -5411,7 +5394,7 @@ class GovernanceApi:
     def delete_quarantine(self, quarantine_id: str,
                           share_group_id: str = "default", *, _admin_override: bool = False) -> dict:
         """软删除隔离记忆；历史与版本保留，可恢复。"""
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         from .governance_engine import GovernanceEngine
@@ -6445,7 +6428,7 @@ class GovernanceApi:
         """Confirmed local governance edit; assignment removal never deletes memory."""
         if not confirmed:
             return {"ok": False, "error": "confirmation_required"}
-        err = self._require_admin_or_override(_admin_override)
+        err = self._require_admin()
         if err:
             return err
         store, open_err = self._open_store(share_group_id, must_exist=True)
@@ -6563,14 +6546,18 @@ class GovernanceApi:
         installed; callers then expose a stable ``service_unavailable``
         response instead of breaking the existing GUI.
         """
+        # Never trust a caller-supplied boolean.  The service receives admin
+        # state only from the process AccessContext.
+        from .access_context import load_access_context
+        trusted_is_admin = load_access_context().is_admin
         try:
             from .rule_creation import RuleCreationService
         except (ImportError, ModuleNotFoundError):
             return None
         attempts = (
-            ((self.workspace, share_group_id), {"is_admin": bool(is_admin)}),
-            ((self.workspace,), {"share_group_id": share_group_id, "is_admin": bool(is_admin)}),
-            ((), {"workspace": self.workspace, "share_group_id": share_group_id, "is_admin": bool(is_admin)}),
+            ((self.workspace, share_group_id), {"is_admin": trusted_is_admin}),
+            ((self.workspace,), {"share_group_id": share_group_id, "is_admin": trusted_is_admin}),
+            ((), {"workspace": self.workspace, "share_group_id": share_group_id, "is_admin": trusted_is_admin}),
             ((self.workspace,), {}),
             ((), {"workspace": self.workspace}),
             ((), {}),
@@ -6862,7 +6849,7 @@ class GovernanceApi:
         ctx, error = self._trusted_rule_bridge_context()
         if error:
             return error
-        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
+        service = self._rule_bridge_service(ctx.share_group_id)
         if service is None:
             return {"ok": False, "error": "service_unavailable"}
         called, raw = self._rule_bridge_call(
@@ -6977,7 +6964,7 @@ class GovernanceApi:
         ctx, error = self._trusted_rule_bridge_context()
         if error:
             return error
-        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
+        service = self._rule_bridge_service(ctx.share_group_id)
         if service is None:
             return {"ok": False, "error": "service_unavailable"}
         # The real service contract is ``undo_rule_decision(decision_id,
@@ -6989,7 +6976,6 @@ class GovernanceApi:
             raw = undo_by_decision(
                 str(decision_id),
                 ctx,
-                is_admin=_admin_override,
             )
         else:
             # Compatibility path: only callers without the new contract may use
@@ -7003,7 +6989,6 @@ class GovernanceApi:
             raw = legacy_undo(
                 str(getattr(decision, "undo_id", "")),
                 ctx,
-                is_admin=_admin_override,
             )
         payload = self._rule_bridge_payload(raw)
         if payload.get("status") == "blocked" or payload.get("blocked_reason"):
@@ -7031,11 +7016,10 @@ class GovernanceApi:
         # Admins may proceed without a trusted Agent identity; everyone else
         # must resolve one or fail closed.
         ctx, error = self._trusted_rule_bridge_context()
-        if error and not _admin_override:
+        if error:
             return error
         service = self._rule_bridge_service(
             ctx.share_group_id if ctx is not None else share_group_id,
-            is_admin=_admin_override,
         )
         if service is None:
             return {"ok": False, "error": "atomic_rule_exception_service_required"}
@@ -7050,7 +7034,6 @@ class GovernanceApi:
         raw = revoke(
             str(exception_id),
             effective_context=ctx,
-            is_admin=_admin_override,
         )
         payload = self._rule_bridge_payload(raw)
         if payload.get("status") == "blocked" or payload.get("blocked_reason"):
@@ -7151,7 +7134,7 @@ class GovernanceApi:
         ctx, context_error = self._trusted_rule_bridge_context()
         if context_error:
             return context_error
-        service = self._rule_bridge_service(ctx.share_group_id, is_admin=_admin_override)
+        service = self._rule_bridge_service(ctx.share_group_id)
         if service is not None:
             called, raw = self._trusted_gui_feedback_call(
                 service, str(receipt_id), str(outcome), str(evidence or ""),
@@ -7982,9 +7965,8 @@ class SafeBridgeApi:
         if not is_mutation_method(method):
             return {"error": f"not a mutation method: {method}"}
 
-        # 沙箱模式：走请求队列，返回 deferred 标记
-        # 原生桌面 GUI（direct_mutations）不推迟——窗口本身就是确认端
-        if detect_sandbox_mode() and not self._direct_mutations:
+        # 沙箱模式：走请求队列，返回 deferred 标记。原生桌面窗口同样遵守真实沙箱状态。
+        if detect_sandbox_mode():
             result = self._inner.submit_request(method, args or [])
             return {
                 "ok": True,
@@ -8008,13 +7990,8 @@ class SafeBridgeApi:
                 while len(call_args) <= cidx:
                     call_args.append(sig.parameters[params[len(call_args)]].default)
                 call_args[cidx] = True
-            # `_admin_override` is an internal capability, never a frontend
-            # argument.  Only the native trusted bridge is the local execution
-            # endpoint that may pass it through after a confirmed mutation.
-            call_kwargs = {}
-            if self._direct_mutations and "_admin_override" in sig.parameters:
-                call_kwargs["_admin_override"] = True
-            result = fn(*call_args, **call_kwargs)
+            # Authorization is derived by target API from AccessContext/capability.
+            result = fn(*call_args)
             return result if result is not None else {}
         except Exception as e:
             return {"error": str(e)}
@@ -8025,9 +8002,12 @@ class SafeBridgeApi:
 
     def get_sandbox_status(self) -> dict:
         """返回沙箱状态。原生 GUI 直接执行时对外报告非沙箱。"""
-        if self._direct_mutations:
-            return {"sandbox": False, "direct_mutations": True}
-        return self._inner.get_sandbox_status()
+        from .security import detect_sandbox_mode
+
+        return {
+            "sandbox": detect_sandbox_mode(),
+            "direct_mutations": self._direct_mutations,
+        }
 
     def pick_path(self, for_files: bool = False) -> dict:
         """系统目录/文件选择器。"""
@@ -8045,15 +8025,12 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     """
     if not has_native_gui():
         return 3
-    import os
     import shutil
     import webview
     from .interactive import render_interactive_html
 
     _set_windows_app_user_model_id()
-    # 原生窗口即桌面执行端：显式关闭沙箱推迟，避免 Cursor/IDE 启发式导致构建只进队列不执行
-    os.environ["MEMORYGUARD_SANDBOX"] = "0"
-
+    # 原生窗口是本地执行端；是否排队仍由真实沙箱状态决定。
     api = SafeBridgeApi(workspace, direct_mutations=True)
     html = render_interactive_html()
     if "</head>" in html:

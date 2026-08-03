@@ -1196,6 +1196,23 @@ class EffectiveAgentContext:
     parent_agent_id: str = ""
     session_id: str = ""
     context_hash: str = ""
+    session_trusted: bool = False
+    session_source: str = "absent"
+
+    def __post_init__(self) -> None:
+        session_id = str(self.session_id or "").strip()
+        source = str(self.session_source or "").strip().casefold()
+        if source not in SESSION_SOURCES:
+            source = "absent"
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "session_source", source)
+        object.__setattr__(
+            self,
+            "session_trusted",
+            self.session_trusted is True
+            and bool(session_id)
+            and source != "absent",
+        )
 
 
 @dataclass(frozen=True)

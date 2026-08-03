@@ -196,15 +196,16 @@ def test_gui_and_mcp_mutations_delegate_to_engine(
     ):
         monkeypatch.setattr(GovernanceEngine, method, _spy(method))
 
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     api = GovernanceApi(str(tmp_path))
-    api.edit_memory("m", "body", "group-a", _admin_override=True)
-    api.lock_memory("m", "group-a", _admin_override=True)
-    api.unlock_memory("m", "group-a", _admin_override=True)
-    api.delete_memory("m", "group-a", _admin_override=True)
-    api.restore_memory("m", "group-a", _admin_override=True)
-    api.resolve_conflict("c", "m", "group-a", _admin_override=True)
-    api.release_quarantine("q", "group-a", _admin_override=True)
-    api.delete_quarantine("q", "group-a", _admin_override=True)
+    api.edit_memory("m", "body", "group-a")
+    api.lock_memory("m", "group-a")
+    api.unlock_memory("m", "group-a")
+    api.delete_memory("m", "group-a")
+    api.restore_memory("m", "group-a")
+    api.resolve_conflict("c", "m", "group-a")
+    api.release_quarantine("q", "group-a")
+    api.delete_quarantine("q", "group-a")
 
     AgentBindingStore(tmp_path).bind_agent("agent-a", "group-a")
     SharedMemoryStore(tmp_path, "group-a").update_record(
