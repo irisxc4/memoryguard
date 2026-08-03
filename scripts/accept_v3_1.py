@@ -63,14 +63,15 @@ def _check(label: str, ok: bool, detail: str = "") -> bool:
 def main() -> int:
     all_pass = True
     # 确定性 Agent Fixture：CI Runner 可能没有安装任何本地 Agent 产品。
-    # 在临时 HOME 中创建已知 surface 目录，使 Discovery 不依赖真实安装状态。
+    # Codex 的 %HOME%/.codex 既是声明的 surface 又是 strong install probe，
+    # 因此创建真实布局即可同时满足 Discovery 与 assess_lifecycle()。
     fixture_home = Path(tempfile.mkdtemp(prefix="mg-fixture-home-"))
-    (fixture_home / ".claude").mkdir(parents=True, exist_ok=True)
-    (fixture_home / ".claude" / "CLAUDE.md").write_text(
-        "# fixture\n", encoding="utf-8")
-    (fixture_home / ".claude" / "memory").mkdir(parents=True, exist_ok=True)
-    (fixture_home / ".claude" / "memory" / "preference.md").write_text(
+    codex_dir = fixture_home / ".codex"
+    (codex_dir / "memories").mkdir(parents=True, exist_ok=True)
+    (codex_dir / "memories" / "MEMORY.md").write_text(
         "# fixture memory\n", encoding="utf-8")
+    os.environ["HOME"] = str(fixture_home)
+    os.environ["USERPROFILE"] = str(fixture_home)
     os.environ["APPDATA"] = str(fixture_home / "AppData" / "Roaming")
     os.environ["LOCALAPPDATA"] = str(fixture_home / "AppData" / "Local")
     _orig_home = Path.home

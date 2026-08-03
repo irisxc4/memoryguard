@@ -369,7 +369,47 @@ class _ReadinessStore:
         return [SimpleNamespace(definition_id="definition-1")]
 
     def list_evidence(self, definition_id=None):
+        # Kept for compatibility; Evidence no longer establishes Source
+        # ownership — Source Links below are the canonical-map fact table.
         return [SimpleNamespace(source_rule_id="m1")]
+
+    def list_source_links(
+        self,
+        *,
+        share_group_id=None,
+        status=None,
+        canonical_definition_id=None,
+    ):
+        links = [{
+            "share_group_id": "g1",
+            "memory_id": "m1",
+            "original_definition_id": "definition-1",
+            "canonical_definition_id": "definition-1",
+            "status": "active",
+        }]
+        if share_group_id is not None:
+            links = [l for l in links if l["share_group_id"] == share_group_id]
+        if status is not None:
+            links = [l for l in links if l["status"] == status]
+        if canonical_definition_id is not None:
+            links = [
+                l for l in links
+                if l["canonical_definition_id"] == canonical_definition_id
+            ]
+        return links
+
+    def get_definition(self, definition_id):
+        if definition_id != "definition-1":
+            return None
+        return SimpleNamespace(
+            definition_id="definition-1",
+            status="active",
+            rule_strength="must",
+            maturity_state="validated",
+        )
+
+    def resolve_canonical(self, definition_id):
+        return definition_id
 
 
 def _readiness_reader(store):

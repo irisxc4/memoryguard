@@ -154,6 +154,35 @@ class _ScopedStore:
     def list_evidence(self, definition_id=None):
         return list(self.evidence_rows.get(definition_id, []))
 
+    def list_source_links(
+        self,
+        *,
+        share_group_id=None,
+        status=None,
+        canonical_definition_id=None,
+    ):
+        links = [
+            {
+                "share_group_id": group,
+                "memory_id": memory_id,
+                "original_definition_id": definition_id,
+                "canonical_definition_id": definition_id,
+                "status": "active",
+            }
+            for group, mapping in self.source_links.items()
+            for memory_id, definition_id in mapping.items()
+        ]
+        if share_group_id is not None:
+            links = [l for l in links if l["share_group_id"] == share_group_id]
+        if status is not None:
+            links = [l for l in links if l["status"] == status]
+        if canonical_definition_id is not None:
+            links = [
+                l for l in links
+                if l["canonical_definition_id"] == canonical_definition_id
+            ]
+        return links
+
     def get_source_link(self, share_group_id, memory_id):
         definition_id = self.source_links.get(share_group_id, {}).get(memory_id)
         if not definition_id:

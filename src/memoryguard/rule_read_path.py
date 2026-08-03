@@ -125,6 +125,20 @@ class RuleReadPath:
         if store is None:
             failures.append("store_unavailable")
         else:
+            # Wiring gate: the canonical map is built from Source Links, not
+            # Evidence, so readiness must not claim ``ready`` while the store
+            # sidecar lacks the APIs resolve_canonical_map() depends on.
+            for name in (
+                "list_source_links",
+                "get_definition",
+                "resolve_canonical",
+                "list_bindings",
+            ):
+                if not callable(getattr(store, name, None)):
+                    failures.append(f"{name}_unavailable")
+                    wiring_requirements.append(
+                        f"Store.{name}() is required for source-link canonical reads"
+                    )
             projection_status_fn = getattr(store, "projection_status", None)
             if not callable(projection_status_fn):
                 failures.append("projection_status_unavailable")
