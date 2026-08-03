@@ -2,7 +2,7 @@
   <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard desktop governance console with a navigable neuron graph, memory categories, risk signals, and governance controls" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.4.0</h1>
+<h1 align="center">MemoryGuard v0.5.0</h1>
 
 <p align="center">
   <strong>Shared memory for coding agents, without shared-memory chaos.</strong><br />
@@ -224,6 +224,14 @@ packages. The GUI can return a rule to on-demand, delete, or restore it.
 - **Later:** team and enterprise capabilities after proven demand. No committed date.
 
 ## Changelog
+
+### v0.5.0 (2026-08-04)
+
+- Add the P3 rule-merge intelligence layer: semantic judge, candidate
+  merge proposals, single-use capabilities, and Phase5 canonical read path.
+- Close the P3 governance acceptance gaps (P3-01..P3-06, PR1 review items).
+- Tighten `resolve_canonical_map` to prefer the `active` rule over `alias`.
+- Add `toml_compat` module and conditional `tomli` dependency for Python 3.10.
 
 ### v0.4.0 (2026-08-01)
 
