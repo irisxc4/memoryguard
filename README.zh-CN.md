@@ -2,7 +2,7 @@
   <img src="docs/assets/x-launch-real-gui-v3.png" alt="MemoryGuard 桌面治理台：可导航的神经图、记忆分类、风险信号和治理入口" width="960" />
 </p>
 
-<h1 align="center">MemoryGuard v0.4.0</h1>
+<h1 align="center">MemoryGuard v0.5.0</h1>
 
 <p align="center">
   <strong>多个编程 Agent 共享记忆，不共享混乱。</strong><br />
@@ -208,6 +208,13 @@ procedure 自动升为强制。`memoryguard_memory_update` 可切换策略。boo
 - **之后：** 在需求被验证后探索团队与企业能力；不承诺具体日期。
 
 ## 更新日志
+
+### v0.5.0（2026-08-04）
+
+- 新增 P3 规则合并智能层：语义判断器、候选合并提案、一次性能力与 Phase5 规范读取路径。
+- 完成 P3 治理验收缺口（P3-01 至 P3-06 及 PR1 审查项）。
+- 收紧 `resolve_canonical_map`：优先使用 `active` 规则而非 `alias`。
+- 新增 `toml_compat` 模块，并为 Python 3.10 添加条件依赖 `tomli`。
 
 ### v0.4.0（2026-08-01）
 
