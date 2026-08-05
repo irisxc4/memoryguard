@@ -126,7 +126,7 @@ def _augment_with_graph(store: KnowledgeStore, query: str,
         SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                c.text, c.summary, c.keywords, c.line_start, c.line_end,
                b.title AS book_title, b.root_path,
-               d.relative_path AS relative_path,
+               d.relative_path AS relative_path, d.content_role AS content_role,
                0.0 AS rank
         FROM chunk_entities ce
         JOIN chunks c ON c.chunk_id=ce.chunk_id

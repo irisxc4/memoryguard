@@ -18,7 +18,7 @@ from typing import Any
 from .data_home import resolve_data_home
 from .knowledge_ingestion import create_book, ingest_book
 from .knowledge_retriever import get_book_info, list_books, read_chunk, search
-from .knowledge_store import KnowledgeStore
+from .knowledge_store import KnowledgeStore, open_shared_knowledge_store
 
 # MCP 工具定义
 KNOWLEDGE_TOOL_DEFINITIONS = [
@@ -30,9 +30,7 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
-            },
+            "properties": {},
         },
     },
     {
@@ -48,7 +46,6 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
                 "query": {"type": "string", "description": "search query (supports Chinese and English)"},
                 "book_ids": {"type": "array", "items": {"type": "string"}, "description": "limit to specific books (empty = all)"},
                 "top_k": {"type": "integer", "description": "max results (default 6)", "default": 6},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
             },
             "required": ["query"],
         },
@@ -63,7 +60,6 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "chunk_id": {"type": "string", "description": "chunk id from search results"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
             },
             "required": ["chunk_id"],
         },
@@ -78,7 +74,6 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "book_id": {"type": "string", "description": "book id"},
-                "workspace": {"type": "string", "description": "workspace path (default: .)"},
             },
             "required": ["book_id"],
         },
@@ -86,25 +81,27 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
 ]
 
 
-def handle_knowledge_tool(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
-    """处理知识书库 MCP 工具调用。返回 None 表示工具名不匹配。"""
-    store = _get_store(workspace)
+def handle_knowledge_tool(name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+    """处理知识书库 MCP 工具调用。返回 None 表示工具名不匹配。
+
+    只读打开唯一的全局共享知识库；不缓存连接，避免二次调用拿到已关闭句柄。
+    """
+    store = open_shared_knowledge_store(read_only=True, must_exist=True)
     if store is None:
-        return _error("knowledge store unavailable")
+        return _text("知识库尚未初始化。请先在 GUI「知识书库」中添加一本书。")
 
     try:
-        if name == "memoryguard_knowledge_list":
-            return _handle_list(store)
-        if name == "memoryguard_knowledge_search":
-            return _handle_search(store, args)
-        if name == "memoryguard_knowledge_read":
-            return _handle_read(store, args)
-        if name == "memoryguard_knowledge_book":
-            return _handle_book(store, args)
+        with store:
+            if name == "memoryguard_knowledge_list":
+                return _handle_list(store)
+            if name == "memoryguard_knowledge_search":
+                return _handle_search(store, args)
+            if name == "memoryguard_knowledge_read":
+                return _handle_read(store, args)
+            if name == "memoryguard_knowledge_book":
+                return _handle_book(store, args)
     except Exception as e:
         return _error(str(e))
-    finally:
-        store.close()
 
     return None
 
@@ -199,12 +196,15 @@ def _handle_book(store: KnowledgeStore, args: dict[str, Any]) -> dict[str, Any]:
 # ---- 管理接口（仅 GUI 调用，不暴露给 MCP Agent） ----
 
 def add_book_gui(root_path: str, title: str = "", include_globs: str = "",
-                 exclude_globs: str = "", data_home: Path | None = None) -> dict[str, Any]:
-    """GUI 调用：添加一本书并立即索引。"""
-    store = KnowledgeStore(data_home)
+                 exclude_globs: str = "") -> dict[str, Any]:
+    """GUI 调用：添加一本书并立即索引（写入唯一全局知识库）。"""
+    store = open_shared_knowledge_store()
+    if store is None:
+        return {"ok": False, "error": "cannot open knowledge store"}
     try:
-        book = create_book(store, root_path, title, include_globs, exclude_globs)
-        result = ingest_book(store, book.book_id)
+        with store:
+            book = create_book(store, root_path, title, include_globs, exclude_globs)
+            result = ingest_book(store, book.book_id)
         return {
             "ok": True,
             "book_id": book.book_id,
@@ -219,33 +219,35 @@ def add_book_gui(root_path: str, title: str = "", include_globs: str = "",
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        store.close()
 
 
-def remove_book_gui(book_id: str, data_home: Path | None = None) -> dict[str, Any]:
+def remove_book_gui(book_id: str) -> dict[str, Any]:
     """GUI 调用：移除一本书（只删索引，不删原文件）。"""
-    store = KnowledgeStore(data_home)
+    store = open_shared_knowledge_store()
+    if store is None:
+        return {"ok": False, "error": "cannot open knowledge store"}
     try:
-        book = store.get_book(book_id)
-        if not book:
-            return {"ok": False, "error": "book not found"}
-        store.remove_book(book_id)
+        with store:
+            book = store.get_book(book_id)
+            if not book:
+                return {"ok": False, "error": "book not found"}
+            store.remove_book(book_id)
         return {"ok": True, "book_id": book_id, "title": book.title}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        store.close()
 
 
-def reindex_book_gui(book_id: str, data_home: Path | None = None) -> dict[str, Any]:
+def reindex_book_gui(book_id: str) -> dict[str, Any]:
     """GUI 调用：重新索引一本书。"""
-    store = KnowledgeStore(data_home)
+    store = open_shared_knowledge_store()
+    if store is None:
+        return {"ok": False, "error": "cannot open knowledge store"}
     try:
-        book = store.get_book(book_id)
-        if not book:
-            return {"ok": False, "error": "book not found"}
-        result = ingest_book(store, book_id)
+        with store:
+            book = store.get_book(book_id)
+            if not book:
+                return {"ok": False, "error": "book not found"}
+            result = ingest_book(store, book_id)
         return {
             "ok": True,
             "book_id": book_id,
@@ -260,27 +262,9 @@ def reindex_book_gui(book_id: str, data_home: Path | None = None) -> dict[str, A
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        store.close()
 
 
 # ---- 辅助 ----
-
-_store_cache: dict[str, KnowledgeStore] = {}
-
-
-def _get_store(workspace: Path) -> KnowledgeStore | None:
-    """获取或创建 KnowledgeStore（缓存在进程内）。"""
-    key = str(workspace)
-    if key in _store_cache:
-        return _store_cache[key]
-    try:
-        store = KnowledgeStore(workspace)
-        _store_cache[key] = store
-        return store
-    except Exception:
-        return None
-
 
 def _text(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}

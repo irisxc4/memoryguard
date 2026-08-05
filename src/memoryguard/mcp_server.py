@@ -904,7 +904,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
     # 知识书库工具（只读，不参与写操作预检）
     if name.startswith("memoryguard_knowledge_"):
-        return handle_knowledge_tool(name, args, workspace) or _mcp_error(f"unknown knowledge tool: {name}")
+        return handle_knowledge_tool(name, args) or _mcp_error(f"unknown knowledge tool: {name}")
 
     # 写操作：先做本地参数预检，再执行
     if name in _MUTATING_TOOLS:

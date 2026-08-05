@@ -87,7 +87,9 @@ def chunk_document(doc: ParsedDocument, book_id: str, document_id: str) -> list[
     # 3. 生成 Chunk 对象
     chunks: list[Chunk] = []
     for i, draft in enumerate(merged):
-        chunk_id = _stable_hash(document_id, str(i), draft.text[:100])
+        text_hash = _text_hash(draft.text)
+        # chunk_id 含完整 text_hash，避免只哈希前 100 字符导致内容变化后主键不变
+        chunk_id = _stable_hash("knowledge-chunk", document_id, str(i), text_hash)
         chunks.append(Chunk(
             chunk_id=chunk_id,
             document_id=document_id,
@@ -100,7 +102,7 @@ def chunk_document(doc: ParsedDocument, book_id: str, document_id: str) -> list[
             keywords="",  # KB3 由 organizer 填充
             line_start=draft.line_start,
             line_end=draft.line_end,
-            text_hash=_text_hash(draft.text),
+            text_hash=text_hash,
         ))
 
     return chunks

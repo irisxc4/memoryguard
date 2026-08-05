@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
-from .data_home import ensure_dirs, knowledge_db_path
+from .data_home import ensure_dirs, knowledge_db_path, resolve_data_home
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS books (
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS books (
     include_globs TEXT NOT NULL DEFAULT '',
     exclude_globs TEXT NOT NULL DEFAULT '',
     auto_extract_memory INTEGER NOT NULL DEFAULT 1,
-    vector_enabled TEXT NOT NULL DEFAULT 'auto'
+    vector_enabled TEXT NOT NULL DEFAULT 'auto',
+    remote_embedding_allowed INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -45,6 +46,8 @@ CREATE TABLE IF NOT EXISTS documents (
     media_type TEXT NOT NULL DEFAULT 'text/plain',
     content_hash TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
+    content_role TEXT NOT NULL DEFAULT 'knowledge',
+    sensitivity TEXT NOT NULL DEFAULT 'normal',
     updated_at TEXT NOT NULL,
     FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
 );
@@ -170,6 +173,27 @@ def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
+    """为已存在的旧 knowledge.db 补齐新增列（幂等）。"""
+    for table, column, ddl in (
+        ("documents", "content_role",
+         "ALTER TABLE documents ADD COLUMN content_role TEXT NOT NULL DEFAULT 'knowledge'"),
+        ("documents", "sensitivity",
+         "ALTER TABLE documents ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'"),
+        ("books", "remote_embedding_allowed",
+         "ALTER TABLE books ADD COLUMN remote_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
+    ):
+        try:
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        except sqlite3.Error:
+            continue
+        if column not in existing:
+            try:
+                conn.execute(ddl)
+            except sqlite3.Error:
+                pass
+
+
 @dataclass
 class Book:
     book_id: str
@@ -187,6 +211,7 @@ class Book:
     exclude_globs: str = ""
     auto_extract_memory: bool = True
     vector_enabled: str = "auto"
+    remote_embedding_allowed: bool = False
 
 
 @dataclass
@@ -209,21 +234,36 @@ class Chunk:
 class KnowledgeStore:
     """知识书库 SQLite 存储。线程安全单连接。"""
 
-    def __init__(self, data_home: Path | None = None):
+    def __init__(self, data_home: Path | None = None, read_only: bool = False):
         self._data_home = data_home
         self._db_path = knowledge_db_path(data_home)
-        ensure_dirs(data_home)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._read_only = bool(read_only)
+        self._closed = False
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
-            str(self._db_path),
-            check_same_thread=False,
-            isolation_level=None,  # autocommit
-        )
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(_SCHEMA)
+        if read_only:
+            # 只读：不创建目录、不执行 schema、不设 WAL。数据库不存在时抛错，
+            # 由调用方（open_shared_knowledge_store(must_exist=True)）提前判空。
+            uri = f"file:{self._db_path.as_posix()}?mode=ro"
+            self._conn = sqlite3.connect(
+                uri, uri=True,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys=ON")
+        else:
+            ensure_dirs(data_home)
+            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(
+                str(self._db_path),
+                check_same_thread=False,
+                isolation_level=None,  # autocommit
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.executescript(_SCHEMA)
+            _ensure_schema_compat(self._conn)
 
     @contextmanager
     def _tx(self) -> Generator[sqlite3.Connection, None, None]:
@@ -238,7 +278,15 @@ class KnowledgeStore:
                 raise
 
     def close(self) -> None:
-        self._conn.close()
+        if not self._closed:
+            self._closed = True
+            self._conn.close()
+
+    def __enter__(self) -> "KnowledgeStore":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # ---- books ----
 
@@ -247,12 +295,13 @@ class KnowledgeStore:
             conn.execute(
                 """INSERT INTO books (book_id, title, root_path, cover_style, description, status,
                    file_count, chapter_count, chunk_count, entity_count, last_indexed_at,
-                   created_at, updated_at, include_globs, exclude_globs, auto_extract_memory, vector_enabled)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   created_at, updated_at, include_globs, exclude_globs, auto_extract_memory, vector_enabled,
+                   remote_embedding_allowed)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (book.book_id, book.title, book.root_path, book.cover_style, book.description,
                  book.status, book.file_count, book.chapter_count, book.chunk_count, book.entity_count,
                  book.last_indexed_at, _now_iso(), _now_iso(), book.include_globs, book.exclude_globs,
-                 int(book.auto_extract_memory), book.vector_enabled),
+                 int(book.auto_extract_memory), book.vector_enabled, int(book.remote_embedding_allowed)),
             )
 
     def get_book(self, book_id: str) -> Book | None:
@@ -336,6 +385,45 @@ class KnowledgeStore:
                      c.text, c.summary, c.keywords, c.line_start, c.line_end, c.text_hash, _now_iso()),
                 )
 
+    def replace_document_revision(
+        self,
+        document_id: str,
+        book_id: str,
+        relative_path: str,
+        media_type: str,
+        content_hash: str,
+        chunks: list[Chunk],
+        content_role: str = "knowledge",
+    ) -> None:
+        """原子提交一个文档的新整版：内容哈希与 Chunk 替换在同一事务完成。
+
+        避免文档哈希先提交、Chunk 替换后失败导致"哈希已更新但旧 Chunk 永不重建"。
+        先 DELETE 旧 chunk（而非停用），再插入新 chunk，最后 upsert 文档行。
+        """
+        with self._tx() as conn:
+            # 先确保文档行存在（FK），再替换 chunks；整个事务一次性提交
+            conn.execute(
+                """INSERT INTO documents (document_id, book_id, relative_path, media_type, content_hash, status,
+                                          content_role, updated_at)
+                   VALUES (?,?,?,?,?,'active',?,?)
+                   ON CONFLICT(document_id) DO UPDATE SET
+                       content_hash=excluded.content_hash,
+                       status='active',
+                       content_role=excluded.content_role,
+                       updated_at=excluded.updated_at""",
+                (document_id, book_id, relative_path, media_type, content_hash,
+                 content_role, _now_iso()),
+            )
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
+            for c in chunks:
+                conn.execute(
+                    """INSERT INTO chunks (chunk_id, document_id, book_id, chapter, section, ordinal,
+                       text, summary, keywords, line_start, line_end, text_hash, active, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+                    (c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
+                     c.text, c.summary, c.keywords, c.line_start, c.line_end, c.text_hash, _now_iso()),
+                )
+
     def get_chunk(self, chunk_id: str) -> Chunk | None:
         row = self._conn.execute("SELECT * FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
         if not row:
@@ -376,7 +464,7 @@ class KnowledgeStore:
             SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                    c.text, c.summary, c.keywords, c.line_start, c.line_end,
                    b.title AS book_title, b.root_path,
-                   d.relative_path AS relative_path,
+                   d.relative_path AS relative_path, d.content_role AS content_role,
                    rank FROM chunks_fts f
             JOIN chunks c ON c.rowid = f.rowid
             JOIN books b ON b.book_id = c.book_id
@@ -408,7 +496,7 @@ class KnowledgeStore:
             SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                    c.text, c.summary, c.keywords, c.line_start, c.line_end,
                    b.title AS book_title, b.root_path,
-                   d.relative_path AS relative_path,
+                   d.relative_path AS relative_path, d.content_role AS content_role,
                    0.0 AS rank
             FROM chunks c
             JOIN books b ON b.book_id = c.book_id
@@ -505,7 +593,7 @@ class KnowledgeStore:
             "c.document_id, c.book_id, c.chapter, c.section, c.ordinal, "
             "c.text, c.summary, c.keywords, c.line_start, c.line_end, "
             "b.title AS book_title, b.root_path, "
-            "d.relative_path AS relative_path "
+            "d.relative_path AS relative_path, d.content_role AS content_role "
             "FROM embeddings e "
             "JOIN chunks c ON c.chunk_id=e.chunk_id "
             "JOIN books b ON b.book_id=c.book_id "
@@ -545,6 +633,9 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         last_indexed_at=row["last_indexed_at"], include_globs=row["include_globs"],
         exclude_globs=row["exclude_globs"], auto_extract_memory=bool(row["auto_extract_memory"]),
         vector_enabled=row["vector_enabled"],
+        remote_embedding_allowed=bool(
+            int(row["remote_embedding_allowed"]) if "remote_embedding_allowed" in row.keys() else 0
+        ),
     )
 
 
@@ -594,3 +685,22 @@ def _deserialize_vector(blob: bytes, dimension: int) -> list[float]:
         return list(struct.unpack(f"{dimension}f", blob))
     except struct.error:
         return []
+
+
+def open_shared_knowledge_store(
+    *,
+    read_only: bool = False,
+    must_exist: bool = False,
+) -> "KnowledgeStore | None":
+    """返回唯一的全局共享知识库 Store。
+
+    所有入口（GUI / MCP / Context Bootstrap）必须经此打开同一个数据库，
+    禁止把 workspace 传给 KnowledgeStore。全局库落 resolve_data_home()。
+    - read_only=True：不创建目录、不写库，SQLite 以 mode=ro 打开。
+    - must_exist=True：数据库不存在时返回 None（调用方按空书架处理）。
+    """
+    data_home = resolve_data_home()
+    db = knowledge_db_path(data_home)
+    if must_exist and not db.exists():
+        return None
+    return KnowledgeStore(data_home, read_only=read_only)

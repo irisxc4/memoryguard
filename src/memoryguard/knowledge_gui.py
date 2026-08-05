@@ -23,11 +23,12 @@ from typing import Any
 from .data_home import resolve_data_home
 from .knowledge_ingestion import create_book, ingest_book
 from .knowledge_retriever import get_book_info, list_books, read_chunk, search
-from .knowledge_store import KnowledgeStore
+from .knowledge_store import KnowledgeStore, open_shared_knowledge_store
 
 
-def _get_store() -> KnowledgeStore:
-    return KnowledgeStore(resolve_data_home())
+def _get_store(read_only: bool = False) -> KnowledgeStore | None:
+    """打开唯一全局共享知识库。"""
+    return open_shared_knowledge_store(read_only=read_only)
 
 
 def render_bookshelf_html() -> str:
@@ -110,7 +111,7 @@ def render_bookshelf_html() -> str:
 </div>
 
 <script>
-const TOKEN = window.SESSION_TOKEN || "";
+const TOKEN = window.__MG_SESSION__ || "";
 
 async function api(method, args) {
   const resp = await fetch("/api/" + method, {
@@ -192,8 +193,10 @@ loadBooks();
 
 def render_book_detail_html(book_id: str) -> str:
     """渲染书籍详情页 HTML。"""
-    store = _get_store()
-    try:
+    store = _get_store(read_only=True)
+    if store is None:
+        return "<html><body><h1>知识库未初始化</h1><p><a href='/knowledge'>返回书架</a></p></body></html>"
+    with store:
         info = get_book_info(store, book_id)
         if not info:
             return "<html><body><h1>书籍不存在</h1><p><a href='/knowledge'>返回书架</a></p></body></html>"
@@ -265,7 +268,7 @@ async function searchBook() {{
   if (!q) return;
   const resp = await fetch('/api/knowledge_search', {{
     method: 'POST',
-    headers: {{'Content-Type':'application/json', 'X-Session-Token': window.SESSION_TOKEN||''}},
+    headers: {{'Content-Type':'application/json', 'X-Session-Token': window.__MG_SESSION__||''}},
     body: JSON.stringify([q, {{"book_ids": ["{book_id}"]}}])
   }});
   const data = await resp.json();
@@ -284,8 +287,6 @@ async function searchBook() {{
 </body>
 </html>
 """
-    finally:
-        store.close()
 
 
 def handle_knowledge_api(method: str, args: list[Any],
@@ -293,15 +294,19 @@ def handle_knowledge_api(method: str, args: list[Any],
     """处理 knowledge_* API 调用（KB5）。
 
     方法：
-    - knowledge_list() : 列出所有书
-    - knowledge_search(query, opts?) : 搜索
-    - knowledge_add(path, title?) : 添加一本书并入库
-    - knowledge_read(chunk_id) : 读取单个 chunk
-    - knowledge_book(book_id) : 获取书籍详情
-    - knowledge_reingest(book_id) : 重新整理一本书
+    - knowledge_list() : 列出所有书（只读）
+    - knowledge_search(query, opts?) : 搜索（只读）
+    - knowledge_add(path, title?) : 添加一本书并入库（写）
+    - knowledge_read(chunk_id) : 读取单个 chunk（只读）
+    - knowledge_book(book_id) : 获取书籍详情（只读）
+    - knowledge_reingest(book_id) : 重新整理一本书（写）
     """
-    store = _get_store()
-    try:
+    write = method in {"knowledge_add", "knowledge_reingest"}
+    store = _get_store(read_only=not write)
+    if store is None:
+        return {"error": "不能打开知识库（未初始化）"}
+
+    with store:
         if method == "knowledge_list":
             books = list_books(store)
             return {"books": books, "total": len(books)}
@@ -324,7 +329,6 @@ def handle_knowledge_api(method: str, args: list[Any],
             if not Path(root_path).is_dir():
                 return {"error": f"path not found: {root_path}"}
             book = create_book(store, root_path, title=title)
-            # 后台入库（同步执行，小书库可接受）
             result = ingest_book(store, book.book_id)
             return {
                 "book_id": book.book_id,
@@ -357,9 +361,7 @@ def handle_knowledge_api(method: str, args: list[Any],
                 "error": result.error,
             }
 
-        return {"error": f"unknown knowledge method: {method}"}
-    finally:
-        store.close()
+    return {"error": f"unknown knowledge method: {method}"}
 
 
 def _escape(s: str) -> str:

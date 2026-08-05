@@ -48,33 +48,20 @@ from .schema import (
     sha256_text,
     stable_id,
 )
-from .data_home import (
-    ensure_project_dirs,
-    get_artifacts_dir,
-    detect_legacy_memoryguard,
-    migrate_legacy_memoryguard,
-    resolve_data_home,
-)
 
 
 # ---------------------------------------------------------------------------
-# 工件目录布局（KB6：集中到 data_home/projects/<hash>/）
+# .memoryguard/ 布局（spec §2）
 # ---------------------------------------------------------------------------
-# 旧的 target_workspace/.memoryguard/ 不再写入；保留 MG_DIR 常量仅用于
-# 检测和迁移旧目录。所有新工件落 data_home/projects/<hash>/<subdir>/。
 
-MG_DIR = ".memoryguard"  # 旧目录名，仅用于检测/迁移
-REPORTS_DIR = "reports"  # 子目录名（相对 artifacts dir）
-
-
-def mg_dir(workspace: Path, subdir: str = "") -> Path:
-    """返回 data_home 下目标项目的工件目录（KB6 替代 workspace/.memoryguard/）。"""
-    return get_artifacts_dir(workspace, subdir=subdir)
+MG_DIR = ".memoryguard"
+REPORTS_DIR = f"{MG_DIR}/reports"
 
 
 def ensure_layout(workspace: Path) -> None:
-    """创建工件目录布局（KB6：data_home/projects/<hash>/）。"""
-    ensure_project_dirs(workspace)
+    """创建 .memoryguard/ 布局（spec §2）。可完全删除，非事实源。"""
+    (workspace / MG_DIR).mkdir(exist_ok=True)
+    (workspace / REPORTS_DIR).mkdir(exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +123,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
     report = run_audit(workspace)
 
     # 写 JSON + HTML
-    json_path = mg_dir(workspace, "reports") / "report.json"
-    html_path = mg_dir(workspace, "reports") / "report.html"
+    json_path = workspace / REPORTS_DIR / "report.json"
+    html_path = workspace / REPORTS_DIR / "report.html"
     json_path.write_text(report.to_json(), encoding="utf-8")
     html_path.write_text(render_html_report(report), encoding="utf-8")
 
@@ -182,7 +169,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     interactive_html = render_interactive_html()
 
     if mode == "html":
-        ui_path = mg_dir(workspace, "ui") / "index.html"
+        ui_path = workspace / ".memoryguard" / "ui" / "index.html"
         ui_path.parent.mkdir(parents=True, exist_ok=True)
         ui_path.write_text(interactive_html, encoding="utf-8")
         return _open_static_html(ui_path)
@@ -208,7 +195,7 @@ def cmd_open(args: argparse.Namespace) -> int:
             return 0
 
     # 3. 静态 HTML 文件（webbrowser.open file://）
-    ui_path = mg_dir(workspace, "ui") / "index.html"
+    ui_path = workspace / ".memoryguard" / "ui" / "index.html"
     ui_path.parent.mkdir(parents=True, exist_ok=True)
     ui_path.write_text(interactive_html, encoding="utf-8")
     return _open_static_html(ui_path)
@@ -235,8 +222,8 @@ def _open_static_html(html_path: Path) -> int:
 
 
 def _load_report(workspace: Path) -> Report | None:
-    """从 data_home 工件目录加载最近报告（KB6）。"""
-    json_path = mg_dir(workspace, "reports") / "report.json"
+    """从 .memoryguard/reports/report.json 加载最近报告。"""
+    json_path = workspace / REPORTS_DIR / "report.json"
     if not json_path.exists():
         return None
     import json
@@ -275,9 +262,9 @@ def cmd_explain(args: argparse.Namespace) -> int:
 # plan / apply / verify / undo (spec §3.4, §9)
 # ---------------------------------------------------------------------------
 
-PLANS_DIR = "plans"  # 子目录名（相对 artifacts dir，KB6 集中存储）
-CHANGES_DIR = "changes"
-BACKUPS_DIR = "backups"
+PLANS_DIR = f"{MG_DIR}/plans"
+CHANGES_DIR = f"{MG_DIR}/changes"
+BACKUPS_DIR = f"{MG_DIR}/backups"
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -321,9 +308,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
         verification=[f.verification for f in target_findings],
         requires_approval=True,
     )
-    # 写 plan 到 data_home 工件目录（KB6）
-    (mg_dir(workspace, "plans")).mkdir(parents=True, exist_ok=True)
-    plan_path = mg_dir(workspace, "plans") / f"{plan.plan_id}.json"
+    # 写 plan 到 .memoryguard/plans/
+    (workspace / PLANS_DIR).mkdir(parents=True, exist_ok=True)
+    plan_path = workspace / PLANS_DIR / f"{plan.plan_id}.json"
     import json
 
     plan_path.write_text(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -361,7 +348,7 @@ def _generate_patch(finding: Finding) -> Patch | None:
 def cmd_apply(args: argparse.Namespace) -> int:
     """经批准应用 Plan：备份 + 补丁 + 重扫（spec §9）。"""
     workspace = Path(args.workspace).resolve()
-    plan_path = mg_dir(workspace, "plans") / f"{args.plan_id}.json"
+    plan_path = workspace / PLANS_DIR / f"{args.plan_id}.json"
     if not plan_path.exists():
         print(f"error: plan not found: {args.plan_id}", file=sys.stderr)
         return 1
@@ -402,13 +389,13 @@ def cmd_apply(args: argparse.Namespace) -> int:
             return 2
 
     # 备份 + 应用
-    (mg_dir(workspace, "backups")).mkdir(parents=True, exist_ok=True)
-    (mg_dir(workspace, "changes")).mkdir(parents=True, exist_ok=True)
+    (workspace / BACKUPS_DIR).mkdir(parents=True, exist_ok=True)
+    (workspace / CHANGES_DIR).mkdir(parents=True, exist_ok=True)
     backup_paths: list[str] = []
     changed_paths: list[str] = []
     for patch in plan.patches:
         src = Path(patch.path)
-        backup = mg_dir(workspace, "backups") / f"{src.name}.{stable_id('bak', patch.path)[:8]}"
+        backup = workspace / BACKUPS_DIR / f"{src.name}.{stable_id('bak', patch.path)[:8]}"
         backup.write_bytes(src.read_bytes())
         backup_paths.append(str(backup))
         if patch.operation == "delete":
@@ -422,7 +409,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
     # 重扫验证
     verify_report = run_audit(workspace)
-    verify_path = mg_dir(workspace, "reports") / "report.json"
+    verify_path = workspace / REPORTS_DIR / "report.json"
     # 验证 Finding 是否消失
     remaining = [f for f in verify_report.findings if f.id in plan.finding_ids]
     status = ChangeStatus.VERIFIED if not remaining else ChangeStatus.FAILED
@@ -436,7 +423,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
         status=status,
         verify_report=str(verify_path),
     )
-    change_path = mg_dir(workspace, "changes") / f"{change.change_id}.json"
+    change_path = workspace / CHANGES_DIR / f"{change.change_id}.json"
     change_path.write_text(json.dumps(change.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"applied: {change.change_id}")
@@ -452,7 +439,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 def cmd_undo(args: argparse.Namespace) -> int:
     """撤销 Change：从备份恢复 + 重扫验证（spec §9）。"""
     workspace = Path(args.workspace).resolve()
-    change_path = mg_dir(workspace, "changes") / f"{args.change_id}.json"
+    change_path = workspace / CHANGES_DIR / f"{args.change_id}.json"
     if not change_path.exists():
         print(f"error: change not found: {args.change_id}", file=sys.stderr)
         return 1
@@ -491,8 +478,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"  before: {len(report.findings)} findings, health {report.health_score}")
     print(f"  after:  {len(new_report.findings)} findings, health {new_report.health_score}")
     # 写新报告
-    json_path = mg_dir(workspace, "reports") / "report.json"
-    html_path = mg_dir(workspace, "reports") / "report.html"
+    json_path = workspace / REPORTS_DIR / "report.json"
+    html_path = workspace / REPORTS_DIR / "report.html"
     import json
 
     json_path.write_text(new_report.to_json(), encoding="utf-8")
@@ -559,7 +546,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     print(f"  read: {counts['read']}  unsupported: {counts['unsupported']}  unreadable: {counts['unreadable']}")
     print(f"  skipped_by_policy: {counts['skipped_by_policy']}  unaccounted: {counts['unaccounted_count']}")
     # 持久化快照
-    snap_dir = mg_dir(workspace) / "snapshots" / snap.snapshot_id
+    snap_dir = workspace / MG_DIR / "snapshots" / snap.snapshot_id
     snap_dir.mkdir(parents=True, exist_ok=True)
     (snap_dir / "sources.json").write_text(
         _json.dumps([o.to_dict() for o in snap.source_objects], ensure_ascii=False, indent=2),
@@ -602,7 +589,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"imported: conversations={len(convs)} memory_records={len(records)}")
         # 保存到 imports
         import_id = "imp-" + stable_id(bundle.name, str(len(records)))
-        imp_dir = mg_dir(workspace) / "imports" / import_id
+        imp_dir = workspace / MG_DIR / "imports" / import_id
         imp_dir.mkdir(parents=True, exist_ok=True)
         manifest = {
             "import_id": import_id, "provider": det.provider,
@@ -727,10 +714,10 @@ def cmd_memory(args: argparse.Namespace) -> int:
         target_path = derived.parent if derived.suffix else derived
         target = GenericMarkdownTarget()
         # 校验 release 绑定
-        release_path = mg_dir(workspace) / "releases" / f"{args.release_id}.json"
+        release_path = workspace / MG_DIR / "releases" / f"{args.release_id}.json"
         if not release_path.exists():
             # 兼容旧 changes/
-            release_path = mg_dir(workspace) / "changes" / f"{args.release_id}.json"
+            release_path = workspace / MG_DIR / "changes" / f"{args.release_id}.json"
         if not release_path.exists():
             print(f"error: release not found: {args.release_id}", file=sys.stderr)
             return 1
@@ -745,8 +732,8 @@ def cmd_memory(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        change_path = mg_dir(workspace) / "changes" / f"{args.release_id}.json"
-        plan_files = list((mg_dir(workspace) / "plans").glob("*.json"))
+        change_path = workspace / MG_DIR / "changes" / f"{args.release_id}.json"
+        plan_files = list((workspace / MG_DIR / "plans").glob("*.json"))
         manifest = data.get("manifest")
         if manifest is None and change_path.exists():
             cdata = _json.loads(change_path.read_text(encoding="utf-8"))
@@ -785,7 +772,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
         derived = derive_publish_target_file(root)
         target_path = derived.parent if derived.suffix else derived
         # 校验 release 绑定，禁止用错误目录删文件；无绑定则拒绝
-        release_path = mg_dir(workspace) / "releases" / f"{args.release_id}.json"
+        release_path = workspace / MG_DIR / "releases" / f"{args.release_id}.json"
         if not release_path.exists():
             print(f"error: release not found: {args.release_id}", file=sys.stderr)
             return 1
@@ -853,19 +840,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         lines.append(f"MCP server module: [error] ({e})")
         issues += 1
 
-    # 4. data_home 工件目录（KB6 集中存储）
-    from .data_home import resolve_data_home as _resolve_data_home
-    from .data_home import project_dir as _project_dir
-    from .data_home import detect_legacy_memoryguard as _detect_legacy
-    data_home = _resolve_data_home()
-    pdir = _project_dir(data_home, workspace)
-    if pdir.is_dir():
-        lines.append(f"Data home: [ok] ({pdir})")
+    # 4. 工作区 .memoryguard/ 目录
+    mg_dir = workspace / MG_DIR
+    if mg_dir.is_dir():
+        lines.append(f"Workspace .memoryguard/: [ok] (found at {mg_dir})")
     else:
-        lines.append(f"Data home: {pdir} (will be created on first audit)")
-    legacy = _detect_legacy(workspace)
-    if legacy:
-        lines.append(f"  legacy .memoryguard/ detected: {legacy} (run `memoryguard migrate` to migrate)")
+        lines.append(f"Workspace .memoryguard/: not found (run `memoryguard audit` to initialize)")
 
     # 5. 已绑定的 Agent
     try:
@@ -877,8 +857,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as e:
         lines.append(f"Agent bindings: error ({e})")
 
-    # 6. shared-memory 记录（KB6: 位于 data_home/shared-memory，全局共享）
-    sm_dir = _resolve_data_home() / "shared-memory"
+    # 6. shared-memory 记录
+    sm_dir = workspace / MG_DIR / "shared-memory"
     group_count = 0
     record_count = 0
     if sm_dir.is_dir():
@@ -957,8 +937,8 @@ def cmd_mcp_status(args: argparse.Namespace) -> int:
     lines.append("MCP server: not running (stdio mode, starts on demand)")
     lines.append("")
 
-    # 收集所有 share group（KB6: 位于 data_home/shared-memory）
-    sm_dir = resolve_data_home() / "shared-memory"
+    # 收集所有 share group
+    sm_dir = workspace / MG_DIR / "shared-memory"
     groups: list[tuple[str, dict]] = []
     if sm_dir.is_dir():
         try:
@@ -1145,7 +1125,7 @@ def cmd_hooks(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
-    """data_home 工件目录 GC：默认可重建物优先清的 dry-run 预览（KB6）。"""
+    """`.memoryguard/` GC：默认可重建物优先清的 dry-run 预览。"""
     from .gc import MemoryGuardGc
 
     workspace = Path(args.path).resolve()
@@ -1186,147 +1166,6 @@ def cmd_gc(args: argparse.Namespace) -> int:
     print(f"  applied:       {result.get('applied', 0)}")
     print(f"  history:       {result.get('history_path', '')}")
     return 0
-
-
-# ---------------------------------------------------------------------------
-# KB6 migrate / KB7 update
-# ---------------------------------------------------------------------------
-
-
-def cmd_migrate(args: argparse.Namespace) -> int:
-    """迁移旧 .memoryguard/ 到 data_home/projects/<hash>/（KB6）。"""
-    workspace = Path(args.path).resolve()
-    if not workspace.is_dir():
-        print(f"error: workspace not found: {workspace}", file=sys.stderr)
-        return 1
-    result = migrate_legacy_memoryguard(workspace, dry_run=args.dry_run)
-    if not result.get("ok"):
-        print(f"error: migration failed: {result}", file=sys.stderr)
-        return 1
-    if not result.get("migrated") and not result.get("skipped"):
-        print(f"no legacy .memoryguard/ found at {workspace}")
-        return 0
-    print(f"migration {'preview' if args.dry_run else 'complete'}:")
-    print(f"  legacy: {result.get('legacy_path')}")
-    print(f"  dest:   {result.get('dest_path')}")
-    migrated = result.get("migrated", [])
-    print(f"  migrated: {len(migrated)} items")
-    for item in migrated:
-        print(f"    + {item}")
-    skipped = result.get("skipped", [])
-    if skipped:
-        print(f"  skipped: {len(skipped)} items (already exist)")
-        for item in skipped:
-            print(f"    ~ {item}")
-    if result.get("cleanup_hint"):
-        print(f"  hint: {result['cleanup_hint']}")
-    return 0
-
-
-def cmd_update(args: argparse.Namespace) -> int:
-    """升级 memoryguard 到最新版本（KB7）。
-
-    --check : 只查询 PyPI 显示版本对比，不升级
-    --pre    : 升级到预发布版
-    """
-    import json as _json
-    import subprocess
-    import urllib.error
-    import urllib.request
-
-    current = __version__
-    pkg_name = "agent-memguard"
-    pypi_url = f"https://pypi.org/pypi/{pkg_name}/json"
-
-    print("MemoryGuard update")
-    print(f"  current: {current}")
-
-    # 1. 查询 PyPI
-    try:
-        req = urllib.request.Request(pypi_url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError) as e:
-        print(f"error: cannot reach PyPI: {e}", file=sys.stderr)
-        return 1
-    except (ValueError, KeyError) as e:
-        print(f"error: parse PyPI response failed: {e}", file=sys.stderr)
-        return 1
-
-    # 2. 选择目标版本
-    latest_stable = data.get("info", {}).get("version", "")
-    releases = data.get("releases", {})
-    all_versions = sorted(releases.keys())
-    if args.pre and all_versions:
-        target = all_versions[-1]
-    else:
-        target = latest_stable
-
-    if not target:
-        print("error: cannot determine latest version from PyPI", file=sys.stderr)
-        return 1
-    print(f"  latest:  {target}")
-
-    # 3. 版本对比
-    if _version_eq(current, target):
-        print("  already up to date.")
-        return 0
-    if args.check:
-        print("  (use without --check to upgrade)")
-        return 0
-
-    # 4. 识别安装方式
-    installer = _detect_installer()
-    print(f"  installer: {installer}")
-
-    # 5. 执行升级
-    cmd = _build_upgrade_command(installer, pkg_name, pre=args.pre)
-    print(f"  running: {' '.join(cmd)}")
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except (subprocess.SubprocessError, OSError) as e:
-        print(f"error: upgrade command failed: {e}", file=sys.stderr)
-        return 1
-    if result.returncode != 0:
-        print(f"error: upgrade failed (exit {result.returncode})", file=sys.stderr)
-        if result.stderr:
-            print(result.stderr, file=sys.stderr)
-        return 1
-    if result.stdout:
-        print(result.stdout)
-
-    # 6. 升级后 doctor 检查
-    print("running doctor check...")
-    doctor_args = argparse.Namespace(workspace=".")
-    return cmd_doctor(doctor_args)
-
-
-def _version_eq(a: str, b: str) -> bool:
-    """简单版本比较（去掉前缀 v）。"""
-    return (a or "").lstrip("v").strip() == (b or "").lstrip("v").strip()
-
-
-def _detect_installer() -> str:
-    """识别安装方式：pipx / uv tool / pip。"""
-    import shutil
-    if shutil.which("pipx"):
-        return "pipx"
-    if shutil.which("uv"):
-        return "uv"
-    return "pip"
-
-
-def _build_upgrade_command(installer: str, pkg: str, pre: bool = False) -> list[str]:
-    """构建升级命令。"""
-    if installer == "pipx":
-        return ["pipx", "upgrade", pkg]
-    if installer == "uv":
-        return ["uv", "tool", "upgrade", pkg]
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade"]
-    if pre:
-        cmd.append("--pre")
-    cmd.append(pkg)
-    return cmd
 
 
 def cmd_desktop(args: argparse.Namespace) -> int:
@@ -1457,41 +1296,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hooks.set_defaults(func=cmd_hooks)
 
-    p_gc = sub.add_parser("gc", help="garbage-collect data_home artifacts (default dry-run)")
+    p_gc = sub.add_parser("gc", help="garbage-collect .memoryguard/ artifacts (default dry-run)")
     p_gc.add_argument("path", nargs="?", default=".", help="workspace path (default: .)")
     p_gc.add_argument("--apply", action="store_true", help="execute the GC plan (default: dry-run)")
     p_gc.add_argument("--older-than-days", type=int, default=30, help="native release artifact age threshold")
     p_gc.add_argument("--keep-releases", type=int, default=20, help="reserved for future release pruning")
     p_gc.add_argument("--keep-snapshots", type=int, default=3, help="snapshots to retain")
     p_gc.set_defaults(func=cmd_gc)
-
-    p_migrate = sub.add_parser(
-        "migrate",
-        help="migrate legacy .memoryguard/ to data_home (KB6)",
-    )
-    p_migrate.add_argument(
-        "path", nargs="?", default=".",
-        help="workspace path with legacy .memoryguard/ (default: .)",
-    )
-    p_migrate.add_argument(
-        "--dry-run", action="store_true",
-        help="preview migration without copying",
-    )
-    p_migrate.set_defaults(func=cmd_migrate)
-
-    p_update = sub.add_parser(
-        "update",
-        help="update memoryguard to latest version (KB7)",
-    )
-    p_update.add_argument(
-        "--check", action="store_true",
-        help="only check version, no upgrade",
-    )
-    p_update.add_argument(
-        "--pre", action="store_true",
-        help="update to pre-release version",
-    )
-    p_update.set_defaults(func=cmd_update)
 
     p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
     p_desktop.add_argument("-w", "--workspace", default=".", help="workspace path")
@@ -1525,7 +1336,7 @@ def gui_main(argv: list[str] | None = None) -> int:
     if rc == 0:
         return 0
     report = run_audit(workspace)
-    out_dir = mg_dir(workspace, "reports")
+    out_dir = workspace / REPORTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     html_path = out_dir / "report.html"
     html_path.write_text(render_html_report(report), encoding="utf-8")

@@ -377,6 +377,16 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
     is_sandbox = detect_sandbox_mode()
     request_queue = RequestQueue(workspace)
 
+    def inject_runtime_context(html: str, *, session_token: str, sandbox: bool) -> str:
+        """把会话令牌与沙箱标记注入任意 HTML 页面（知识书库等独立路由）。"""
+        script = (
+            "<script>"
+            f"window.__MG_SESSION__={_json.dumps(session_token)};"
+            f"window.__MG_SANDBOX__={str(sandbox).lower()};"
+            "</script>"
+        )
+        return html.replace("</head>", script + "</head>")
+
     # 将 session_token 注入 HTML
     html = render_interactive_html()
     html = html.replace(
@@ -418,24 +428,28 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
             elif parsed.path == "/api/health":
                 self._json_response(200, {"ok": True, "sandbox": is_sandbox})
             elif parsed.path == "/knowledge":
-                # KB5 知识书库书架页
+                # KB5 知识书库书架页（注入会话令牌与沙箱标记）
                 from .knowledge_gui import render_bookshelf_html
-                html = render_bookshelf_html().encode("utf-8")
+                html = render_bookshelf_html()
+                html = inject_runtime_context(html, session_token=session_token, sandbox=is_sandbox)
+                html_bytes = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
+                self.send_header("Content-Length", str(len(html_bytes)))
                 self.end_headers()
-                self.wfile.write(html)
+                self.wfile.write(html_bytes)
             elif parsed.path.startswith("/knowledge/book/"):
                 # KB5 知识书库详情页
                 from .knowledge_gui import render_book_detail_html
                 book_id = unquote(parsed.path[len("/knowledge/book/"):])
-                html = render_book_detail_html(book_id).encode("utf-8")
+                html = render_book_detail_html(book_id)
+                html = inject_runtime_context(html, session_token=session_token, sandbox=is_sandbox)
+                html_bytes = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html)))
+                self.send_header("Content-Length", str(len(html_bytes)))
                 self.end_headers()
-                self.wfile.write(html)
+                self.wfile.write(html_bytes)
             else:
                 # 静态文件服务(cytoscape.min.js 等)
                 req_path = parsed.path.lstrip("/")
@@ -482,9 +496,18 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 self.send_error(400, str(e))
                 return
 
-            # KB5 知识书库 API 路由
+            # KB5 知识书库 API 路由（变更类在沙箱下进入请求队列，不单开特快通道）
             if is_knowledge:
-                from .knowledge_gui import handle_knowledge_api
+                from .knowledge_gui import handle_knowledge_api, is_knowledge_mutation
+                if is_knowledge_mutation(method) and is_sandbox:
+                    req = request_queue.submit(method, args)
+                    self._json_response(200, {
+                        "ok": True,
+                        "deferred": True,
+                        "request": req.to_dict(),
+                        "message": "请求已提交，等待桌面执行器确认",
+                    })
+                    return
                 try:
                     result = handle_knowledge_api(method, args, workspace)
                     self._json_response(200, result if result is not None else {})
