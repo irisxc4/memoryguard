@@ -123,6 +123,21 @@ CREATE TABLE IF NOT EXISTS embeddings (
     FOREIGN KEY (chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS memory_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL,
+    chunk_id TEXT,
+    content TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'knowledge',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_mc_status ON memory_candidates(status);
+
 CREATE TABLE IF NOT EXISTS index_jobs (
     job_id TEXT PRIMARY KEY,
     book_id TEXT NOT NULL,
@@ -217,6 +232,29 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
             )""")
         except sqlite3.Error:
             pass
+
+    # memory_candidates 表：旧库首次升级时创建
+    try:
+        mc_existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_candidates'"
+        ).fetchone()
+        if not mc_existing:
+            conn.execute("""CREATE TABLE memory_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                book_id TEXT NOT NULL,
+                chunk_id TEXT,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'knowledge',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mc_status ON memory_candidates(status)")
+    except sqlite3.Error:
+        pass
 
 
 @dataclass
@@ -570,6 +608,60 @@ class KnowledgeStore:
 
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM index_jobs WHERE job_id=?", (job_id,)).fetchone()
+
+    # ---- memory_candidates (P1-4) ----
+
+    def add_memory_candidate(self, book_id: str, content: str, source: str = "",
+                             category: str = "knowledge", confidence: float = 0.5,
+                             chunk_id: str | None = None) -> str:
+        """写入一条记忆候选（待审核）。返回 candidate_id。"""
+        candidate_id = _stable_hash("mc", book_id, content)
+        with self._tx() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO memory_candidates
+                   (candidate_id, book_id, chunk_id, content, source, category, confidence, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,'pending',?)""",
+                (candidate_id, book_id, chunk_id, content, source, category,
+                 confidence, _now_iso()),
+            )
+        return candidate_id
+
+    def list_memory_candidates(self, book_id: str | None = None,
+                               status: str = "pending") -> list[dict[str, Any]]:
+        """列出记忆候选（默认待审核）。"""
+        sql = ("SELECT candidate_id, book_id, chunk_id, content, source, category, "
+               "confidence, status, created_at, reviewed_at FROM memory_candidates")
+        params: list[Any] = []
+        conds: list[str] = []
+        if book_id:
+            conds.append("book_id=?")
+            params.append(book_id)
+        if status and status != "all":
+            conds.append("status=?")
+            params.append(status)
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY created_at DESC"
+        return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def review_memory_candidate(self, candidate_id: str, status: str) -> bool:
+        """审核记忆候选：approve / reject。仅在 pending 状态可审核（幂等）。"""
+        status = {"approve": "approved", "reject": "rejected"}.get(status, status)
+        if status not in {"approved", "rejected"}:
+            return False
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status=?, reviewed_at=? "
+                "WHERE candidate_id=? AND status='pending'",
+                (status, _now_iso(), candidate_id),
+            )
+            return cur.rowcount > 0
+
+    def count_memory_candidates(self, status: str = "pending") -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM memory_candidates WHERE status=?", (status,),
+        ).fetchone()
+        return int(row[0])
 
     # ---- embeddings (KB2) ----
 

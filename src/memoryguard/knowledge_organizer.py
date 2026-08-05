@@ -65,15 +65,90 @@ def organize_chunk(chunk: Chunk, book_title: str = "",
     """整理单个 chunk。
 
     无 provider 时规则化：摘要取首句/前 N 字，关键词词频，实体从结构提取。
-    有 provider 时调模型增强（KB3 §6.2，暂留接口）。
+    有 provider 时调模型增强（KB3 §6.2）：一次 chat 生成摘要/关键词/实体 JSON，
+    解析失败或超预算时回退规则化。
     """
     if provider is not None:
-        # KB3 §6.2 模型增强：未来实现
-        # result = provider.organize(chunk.text, book_title, chunk.chapter)
-        # return OrganizeResult(summary=result.summary, ...)
-        pass
+        try:
+            enhanced = _organize_via_model(chunk, book_title, provider)
+            if enhanced is not None:
+                return enhanced
+        except Exception:
+            pass  # 模型失败回退规则化
 
     return _organize_rule_based(chunk, book_title)
+
+
+def _organize_via_model(chunk: Chunk, book_title: str, provider: Any) -> OrganizeResult | None:
+    """调 provider 生成摘要/关键词/实体（KB3 §6.2 模型增强）。
+
+    要求模型返回 JSON：{"summary": "...", "keywords": ["..."], "entities": [{"name","type"}]}。
+    解析失败、缺关键字段、或文本过短时返回 None（调用方回退规则化）。
+    """
+    text = (chunk.text or "").strip()
+    if len(text) < 20:
+        return None  # 文本太短不值得调模型
+
+    system = (
+        "你是知识整理助手。从给定文本提取结构化知识，只返回 JSON，不要任何额外文字。"
+        '格式：{"summary": "一句话摘要(≤80字)", "keywords": ["2-5个关键词"], '
+        '"entities": [{"name": "实体名", "type": "concept|person|organization|technology|module|file|function|configuration"}]}'
+    )
+    user = f"书名：{book_title}\n章节：{chunk.chapter}\n文本：\n{text[:3000]}"
+    raw = provider.chat(system, user, max_tokens=400)
+
+    # 解析 JSON（容忍被 ```json 包裹）
+    parsed = _parse_model_json(raw)
+    if parsed is None:
+        return None
+
+    summary = str(parsed.get("summary", "")).strip()
+    keywords = parsed.get("keywords", [])
+    if not isinstance(keywords, list):
+        keywords = []
+    entities = parsed.get("entities", [])
+    if not isinstance(entities, list):
+        entities = []
+
+    if not summary:
+        return None
+
+    norm_entities: list[dict[str, str]] = []
+    for e in entities:
+        if not isinstance(e, dict):
+            continue
+        name = str(e.get("name", "")).strip()
+        if not name:
+            continue
+        etype = str(e.get("type", "concept")).strip()
+        if etype not in ENTITY_TYPES:
+            etype = "concept"
+        norm_entities.append({"name": name, "type": etype})
+
+    return OrganizeResult(
+        summary=summary[:300],
+        keywords=[str(k).strip() for k in keywords if str(k).strip()][:10],
+        entities=norm_entities[:20],
+    )
+
+
+def _parse_model_json(raw: str) -> dict[str, Any] | None:
+    """解析模型返回的 JSON（容忍 ```json 代码块与前后噪音）。"""
+    import json
+    if not raw:
+        return None
+    s = raw.strip()
+    # 提取第一个 { 到最后一个 }
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    s = s[start:end + 1]
+    try:
+        data = json.loads(s)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def organize_book(store: KnowledgeStore, book_id: str,
@@ -84,6 +159,7 @@ def organize_book(store: KnowledgeStore, book_id: str,
     """
     book = store.get_book(book_id)
     book_title = book.title if book else ""
+    auto_extract = bool(getattr(book, "auto_extract_memory", True))
 
     # 收集所有 chunk
     rows = store._conn.execute(
@@ -91,7 +167,8 @@ def organize_book(store: KnowledgeStore, book_id: str,
         (book_id,),
     ).fetchall()
 
-    stats = {"chunks_organized": 0, "entities_extracted": 0, "keywords_set": 0}
+    stats = {"chunks_organized": 0, "entities_extracted": 0, "keywords_set": 0,
+             "candidates_generated": 0}
 
     for row in rows:
         chunk = _row_to_chunk(row)
@@ -112,6 +189,20 @@ def organize_book(store: KnowledgeStore, book_id: str,
                     (chunk.chunk_id, entity_id, "mention"),
                 )
                 stats["entities_extracted"] += 1
+
+        # P1-4 记忆候选：有摘要且内容足够时提炼为待审核候选
+        if auto_extract and result.summary and len(chunk.text or "") >= 40:
+            source = _candidate_source(store, chunk)
+            confidence = _candidate_confidence(chunk, result)
+            store.add_memory_candidate(
+                book_id=book_id,
+                content=result.summary,
+                source=source,
+                category="knowledge",
+                confidence=confidence,
+                chunk_id=chunk.chunk_id,
+            )
+            stats["candidates_generated"] += 1
 
         stats["chunks_organized"] += 1
         stats["keywords_set"] += 1
@@ -264,3 +355,34 @@ def _row_to_chunk(row) -> Chunk:
     """sqlite3.Row 转 Chunk。"""
     from .knowledge_store import _row_to_chunk as _rc
     return _rc(row)
+
+
+def _candidate_source(store: KnowledgeStore, chunk: Chunk) -> str:
+    """候选来源：相对路径 + 章节。"""
+    try:
+        doc = store._conn.execute(
+            "SELECT relative_path FROM documents WHERE document_id=?",
+            (chunk.document_id,),
+        ).fetchone()
+        rel = doc["relative_path"] if doc else ""
+    except Exception:
+        rel = ""
+    parts = [p for p in (rel, chunk.chapter, chunk.section) if p]
+    return " / ".join(parts)
+
+
+def _candidate_confidence(chunk: Chunk, result: OrganizeResult) -> float:
+    """候选置信度：基于关键词/实体数量，0.4-0.9 之间。"""
+    base = 0.4
+    kw = len(result.keywords)
+    ent = len(result.entities)
+    if kw >= 3:
+        base += 0.2
+    elif kw >= 1:
+        base += 0.1
+    if ent >= 3:
+        base += 0.1
+    length = len(chunk.text or "")
+    if length >= 200:
+        base += 0.1
+    return round(min(base, 0.9), 2)

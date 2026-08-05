@@ -1,12 +1,13 @@
 """knowledge_mcp：MCP 工具定义和处理（KB1）。
 
-提供 4 个只读 MCP 工具：
+提供 5 个只读 MCP 工具：
 - memoryguard_knowledge_list
 - memoryguard_knowledge_search
 - memoryguard_knowledge_read
 - memoryguard_knowledge_book
+- memoryguard_knowledge_candidates
 
-管理操作（添加/删除文件夹）不暴露给 MCP Agent，只在 GUI 执行。
+管理操作（添加/删除文件夹、审核候选）不暴露给 MCP Agent，只在 GUI 执行。
 """
 
 from __future__ import annotations
@@ -78,6 +79,20 @@ KNOWLEDGE_TOOL_DEFINITIONS = [
             "required": ["book_id"],
         },
     },
+    {
+        "name": "memoryguard_knowledge_candidates",
+        "description": (
+            "List pending memory-review candidates distilled from the knowledge bookshelf. "
+            "Read-only; approval/rejection happens in the GUI."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "book_id": {"type": "string", "description": "limit to a book (empty = all)"},
+                "status": {"type": "string", "description": "pending|approved|rejected|all (default pending)"},
+            },
+        },
+    },
 ]
 
 
@@ -100,10 +115,28 @@ def handle_knowledge_tool(name: str, args: dict[str, Any]) -> dict[str, Any] | N
                 return _handle_read(store, args)
             if name == "memoryguard_knowledge_book":
                 return _handle_book(store, args)
+            if name == "memoryguard_knowledge_candidates":
+                return _handle_candidates(store, args)
     except Exception as e:
         return _error(str(e))
 
     return None
+
+
+def _handle_candidates(store: KnowledgeStore, args: dict[str, Any]) -> dict[str, Any]:
+    """列出记忆审核候选（只读）。"""
+    book_id = args.get("book_id") or None
+    status = str(args.get("status", "pending") or "pending")
+    candidates = store.list_memory_candidates(book_id=book_id, status=status)
+    if not candidates:
+        return _text("当前没有待审核的记忆候选。")
+    lines = [f"记忆候选（{status}）：共 {len(candidates)} 条\n"]
+    for c in candidates:
+        lines.append(
+            f"  [{c['confidence']:.2f}] {c['content']}\n"
+            f"      来源：{c['source']} | 候选ID：{c['candidate_id']}"
+        )
+    return _text("\n".join(lines))
 
 
 def _handle_list(store: KnowledgeStore) -> dict[str, Any]:

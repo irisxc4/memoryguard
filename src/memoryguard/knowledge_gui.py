@@ -67,9 +67,10 @@ def render_bookshelf_html() -> str:
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: #f5f3ee; color: #2c2620; padding: 24px; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
-  h1 { font-size: 24px; color: #5b4636; }
+         background: #efe9dd; color: #2c2620; padding: 28px;
+         background-image: radial-gradient(circle at 20% 10%, #f7f1e6 0%, #efe9dd 60%, #e6dcc9 100%); }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
+  h1 { font-size: 26px; color: #4a3520; letter-spacing: 1px; }
   .toolbar { display: flex; gap: 12px; align-items: center; }
   input[type="text"] { padding: 8px 12px; border: 1px solid #c9b8a0; border-radius: 4px;
                        min-width: 280px; background: #fff; }
@@ -78,23 +79,35 @@ def render_bookshelf_html() -> str:
   button:hover { background: #6b5236; }
   button.secondary { background: #c9b8a0; }
   button.secondary:hover { background: #a89576; }
-  .bookshelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-               gap: 20px; margin-top: 24px; }
-  .book-card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-               cursor: pointer; transition: transform 0.15s; border-left: 6px solid #8b6f47; }
-  .book-card:hover { transform: translateY(-3px); box-shadow: 0 4px 16px rgba(0,0,0,0.12); }
-  .book-card.add { border-left-color: #c9b8a0; display: flex; align-items: center; justify-content: center;
-                   min-height: 120px; color: #8b6f47; font-size: 14px; text-align: center; }
-  .book-title { font-size: 16px; font-weight: 600; margin-bottom: 8px; color: #2c2620; }
-  .book-meta { font-size: 12px; color: #8a7860; }
-  .book-status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
-                 margin-top: 8px; background: #e8dcc8; color: #5b4636; }
-  .book-status.ready { background: #d4edda; color: #155724; }
-  .book-status.indexing { background: #cce5ff; color: #004085; }
-  .book-status.failed { background: #f8d7da; color: #721c24; }
-  .search-results { margin-top: 24px; }
+  .bookshelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+               gap: 26px; margin-top: 28px; }
+  /* 书封：硬皮精装观感，侧边书脊 */
+  .book-card { position: relative; height: 240px; border-radius: 4px 10px 10px 4px;
+               cursor: pointer; transition: transform 0.18s, box-shadow 0.18s;
+               box-shadow: 2px 6px 14px rgba(74,53,32,0.28);
+               background: linear-gradient(160deg, #7a5a38, #5c4126);
+               color: #f5edde; display: flex; flex-direction: column;
+               justify-content: flex-end; padding: 16px 14px; overflow: hidden; }
+  .book-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 10px;
+                       background: rgba(0,0,0,0.28); border-radius: 4px 0 0 4px; }
+  .book-card::after { content: ""; position: absolute; inset: 0;
+                      background: radial-gradient(circle at 30% 15%, rgba(255,255,255,0.18), transparent 60%); }
+  .book-card:hover { transform: translateY(-6px) rotate(-0.5deg); box-shadow: 4px 12px 22px rgba(74,53,32,0.38); }
+  .book-card.add { background: repeating-linear-gradient(135deg, #d9cbb4, #d9cbb4 10px, #e2d5c0 10px, #e2d5c0 20px);
+                   color: #6b5236; align-items: center; justify-content: center;
+                   border: 2px dashed #b39a78; box-shadow: none; min-height: 240px; }
+  .book-card.add::before, .book-card.add::after { display: none; }
+  .book-title { font-size: 15px; font-weight: 700; line-height: 1.4; margin-bottom: 6px;
+                text-shadow: 0 1px 2px rgba(0,0,0,0.4); position: relative; z-index: 1; }
+  .book-meta { font-size: 11px; color: rgba(245,237,222,0.85); position: relative; z-index: 1; }
+  .book-status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px;
+                 margin-top: 8px; background: rgba(0,0,0,0.25); color: #f5edde; position: relative; z-index: 1; }
+  .book-status.ready { background: #3f7d4e; color: #fff; }
+  .book-status.indexing { background: #3a6ea5; color: #fff; }
+  .book-status.failed { background: #a53a3a; color: #fff; }
+  .search-results { margin-top: 28px; }
   .result-item { background: #fff; padding: 16px; border-radius: 6px; margin-bottom: 12px;
-                 border-left: 3px solid #8b6f47; }
+                 border-left: 3px solid #8b6f47; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
   .result-meta { font-size: 12px; color: #8a7860; margin-bottom: 8px; }
   .result-text { font-size: 14px; line-height: 1.6; }
   .result-method { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px;
@@ -106,6 +119,8 @@ def render_bookshelf_html() -> str:
   #addModal label { display: block; margin: 12px 0 4px; font-size: 13px; color: #5b4636; }
   #addModal input { width: 100%; padding: 8px; border: 1px solid #c9b8a0; border-radius: 4px; }
   .empty { text-align: center; padding: 60px 20px; color: #8a7860; }
+  .cand-badge { display: inline-block; margin-left: 10px; padding: 3px 10px; border-radius: 12px;
+                font-size: 12px; background: #3a6ea5; color: #fff; cursor: pointer; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -114,6 +129,7 @@ def render_bookshelf_html() -> str:
   <div class="toolbar">
     <input type="text" id="searchInput" placeholder="搜索全部书籍..." onkeydown="if(event.key==='Enter')doSearch()">
     <button onclick="doSearch()">搜索</button>
+    <button class="secondary" onclick="openCandidates()" id="candBtn">记忆候选</button>
     <button class="secondary" onclick="openAddModal()">+ 添加一本书</button>
   </div>
 </header>
@@ -147,6 +163,15 @@ async function api(method, args) {
   return resp.json();
 }
 
+const COVERS = [
+  "linear-gradient(160deg,#7a5a38,#5c4126)",
+  "linear-gradient(160deg,#3a6ea5,#2c5070)",
+  "linear-gradient(160deg,#3f7d4e,#2c5a37)",
+  "linear-gradient(160deg,#8b3f3f,#5f2a2a)",
+  "linear-gradient(160deg,#5f4a8b,#3f2f5c)",
+  "linear-gradient(160deg,#a06a3a,#6e4524)",
+];
+
 async function loadBooks() {
   const data = await api("knowledge_list", []);
   const shelf = document.getElementById("bookshelf");
@@ -157,15 +182,59 @@ async function loadBooks() {
     return;
   }
   let html = "";
-  for (const b of data.books) {
+  for (let i = 0; i < data.books.length; i++) {
+    const b = data.books[i];
     const statusClass = b.status || "ready";
-    html += `<div class="book-card" onclick="location.href='/knowledge/book/${b.book_id}'">
+    const cover = COVERS[i % COVERS.length];
+    html += `<div class="book-card" style="background:${cover}" onclick="location.href='/knowledge/book/${b.book_id}'">
       <div class="book-title">${escapeHtml(b.title)}</div>
       <div class="book-meta">${b.file_count||0} 文件 · ${b.chunk_count||0} 片段 · ${b.chapter_count||0} 章节</div>
       <span class="book-status ${statusClass}">${b.status||"ready"}</span>
     </div>`;
   }
+  html += '<div class="book-card add" onclick="openAddModal()">+ 添加一本书</div>';
   shelf.innerHTML = html;
+  refreshCandCount();
+}
+
+async function refreshCandCount() {
+  try {
+    const data = await api("knowledge_candidates_list", ["", "pending"]);
+    const n = data.total || 0;
+    const btn = document.getElementById("candBtn");
+    if (btn) btn.textContent = n > 0 ? "记忆候选 (" + n + ")" : "记忆候选";
+  } catch (e) {}
+}
+
+async function openCandidates() {
+  const data = await api("knowledge_candidates_list", ["", "pending"]);
+  const shelf = document.getElementById("bookshelf");
+  const results = document.getElementById("searchResults");
+  shelf.innerHTML = "";
+  if (!data.candidates || data.candidates.length === 0) {
+    results.innerHTML = '<div class="empty">暂无待审核的记忆候选</div>';
+    return;
+  }
+  let html = '<h3 style="margin-bottom:12px;color:#4a3520;">待审核记忆候选（' +
+             data.candidates.length + '）</h3>';
+  for (const c of data.candidates) {
+    html += `<div class="result-item">
+      <div class="result-meta">📌 ${c.source||""} · 置信度 ${c.confidence||0}
+        <span class="result-method">${c.category||"knowledge"}</span></div>
+      <div class="result-text">${escapeHtml(c.content||"")}</div>
+      <div style="margin-top:10px;display:flex;gap:8px;">
+        <button style="background:#3f7d4e" onclick="review('${c.candidate_id}','approve')">采纳</button>
+        <button class="secondary" onclick="review('${c.candidate_id}','reject')">忽略</button>
+      </div>
+    </div>`;
+  }
+  results.innerHTML = html;
+}
+
+async function review(id, decision) {
+  await api("knowledge_candidate_review", [id, decision]);
+  openCandidates();
+  refreshCandCount();
 }
 
 async function doSearch() {
@@ -239,7 +308,12 @@ def render_book_detail_html(book_id: str) -> str:
 <title>{_escape(info['title'])} - 知识书库</title>
 <style>
   body {{ font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: #f5f3ee; color: #2c2620; padding: 24px; }}
+         background: #e8dfd0; color: #3a2f23; padding: 28px; }}
+  .paper {{ background: #fdf9ef; border-radius: 6px; padding: 28px 32px;
+            box-shadow: 0 2px 10px rgba(74,53,32,0.18);
+            max-width: 860px; margin: 30px auto; line-height: 1.7;
+            background-image: linear-gradient(to bottom, rgba(0,0,0,0.02) 1px, transparent 1px);
+            background-size: 100% 28px; }}
   header {{ margin-bottom: 20px; }}
   h1 {{ color: #5b4636; font-size: 22px; }}
   .meta {{ color: #8a7860; font-size: 13px; margin: 8px 0; }}
@@ -259,6 +333,7 @@ def render_book_detail_html(book_id: str) -> str:
 </style>
 </head>
 <body>
+<div class="paper">
 <header>
   <a href="/knowledge">← 返回书架</a>
   <h1>📖 {_escape(info['title'])}</h1>
@@ -287,6 +362,7 @@ def render_book_detail_html(book_id: str) -> str:
   <ul>{docs_html or '<li class="status">暂无文档</li>'}</ul>
 </section>
 
+</div>
 <script>
 async function searchBook() {{
   const q = document.getElementById('q').value.trim();
@@ -326,7 +402,8 @@ def handle_knowledge_api(method: str, args: list[Any],
     - knowledge_book(book_id) : 获取书籍详情（只读）
     - knowledge_reingest(book_id) : 重新整理一本书（写）
     """
-    write = method in {"knowledge_add", "knowledge_reingest", "knowledge_remove"}
+    write = method in {"knowledge_add", "knowledge_reingest", "knowledge_remove",
+                   "knowledge_candidate_review"}
     store = _get_store(read_only=not write)
     if store is None:
         return {"error": "不能打开知识库（未初始化）"}
@@ -421,6 +498,22 @@ def handle_knowledge_api(method: str, args: list[Any],
             store.remove_book(book_id)
             return {"ok": True, "book_id": book_id, "title": book.title}
 
+        if method == "knowledge_candidates_list":
+            book_id = str(args[0]) if args and args[0] else None
+            status = str(args[1]) if len(args) > 1 and args[1] else "pending"
+            candidates = store.list_memory_candidates(book_id=book_id, status=status)
+            return {"candidates": candidates, "total": len(candidates)}
+
+        if method == "knowledge_candidate_review":
+            if len(args) < 2:
+                return {"error": "candidate_id and decision required"}
+            candidate_id = str(args[0])
+            decision = str(args[1])  # approve / reject
+            ok = store.review_memory_candidate(candidate_id, decision)
+            if not ok:
+                return {"error": "candidate not found or invalid decision"}
+            return {"ok": True, "candidate_id": candidate_id, "status": decision}
+
     return {"error": f"unknown knowledge method: {method}"}
 
 
@@ -443,6 +536,8 @@ KNOWLEDGE_API_METHODS = frozenset({
     "knowledge_reingest",
     "knowledge_job_status",
     "knowledge_remove",
+    "knowledge_candidates_list",
+    "knowledge_candidate_review",
 })
 
 
@@ -453,4 +548,5 @@ def is_knowledge_method(method: str) -> bool:
 
 def is_knowledge_mutation(method: str) -> bool:
     """判断是否为变更类知识 API（需确认）。"""
-    return method in {"knowledge_add", "knowledge_reingest", "knowledge_remove"}
+    return method in {"knowledge_add", "knowledge_reingest", "knowledge_remove",
+                      "knowledge_candidate_review"}

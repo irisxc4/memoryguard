@@ -22,81 +22,104 @@ def search(store: KnowledgeStore, query: str,
     每条结果包含：chunk_id, book_id, book_title, chapter, section,
     text, line_start, line_end, relative_path, retrieval_method。
 
-    检索流程（PRD §7.2）：
-    1. FTS5 全文召回（trigram 中文）
-    2. LIKE fallback（<3 字符短查询）
-    3. 向量召回（KB2，provider 可用时；失败静默降级）
-    4. 实体命中（entities.name LIKE query）
-    5. graph 关系扩展（最多两跳，最多 20 节点）
-    6. 重排 + 去重 + 每书/每文件限制
+    检索流程（PRD §7.2 + P1-2）：
+    1. FTS5 全文召回（trigram 中文），<3 字符短查询用 LIKE fallback
+    2. 向量召回（KB2，provider 可用时；失败静默降级）
+    3. 实体命中 + graph 关系扩展（最多两跳）
+    4. RRF（Reciprocal Rank Fusion）融合三路结果重排
+    5. 去重 + 每书/每文件限制
     """
     if not query.strip():
         return []
 
-    # 1. FTS5 优先
-    results = store.search_fts(query, book_ids=book_ids, limit=max(top_k * 5, 30))
+    # 三路独立检索，各自保持排序，供 RRF 融合用
+    fts = store.search_fts(query, book_ids=book_ids, limit=max(top_k * 10, 50))
+    if not fts:
+        fts = store.search_like(query, book_ids=book_ids, limit=max(top_k * 10, 50))
+        for r in fts:
+            r["retrieval_method"] = "like"
+    else:
+        for r in fts:
+            r["retrieval_method"] = "fts"
 
-    # 2. LIKE fallback
-    if not results:
-        results = store.search_like(query, book_ids=book_ids, limit=max(top_k * 5, 30))
-
-    # 标记检索方式
-    for r in results:
-        r.setdefault("retrieval_method", "fts" if r.get("rank", 1.0) != 0.0 else "like")
-
-    # 3. 向量召回（KB2）
+    vec: list[dict[str, Any]] = []
     if enable_vector:
-        _augment_with_vectors(store, query, results, book_ids, top_k)
+        vec = _vector_results(store, query, book_ids, top_k)
 
-    # 4. 实体命中 + 5. graph 关系扩展
-    if enable_graph and results:
-        _augment_with_graph(store, query, results, book_ids, top_k)
+    graph: list[dict[str, Any]] = []
+    if enable_graph:
+        graph = _graph_results(store, query, book_ids, top_k)
 
-    if not results:
+    # RRF 融合三路
+    fused = _rrf_fuse([fts, vec, graph])
+
+    if not fused:
         return []
 
-    # 6. 重排 + 去重 + 限制
-    ranked = _rank_results(results, query)
-    filtered = _apply_limits(ranked, max_per_book=4, max_per_file=2)
-
+    # 去重 + 每书/每文件限制
+    filtered = _apply_limits(fused, max_per_book=4, max_per_file=2)
     return filtered[:top_k]
 
 
-def _augment_with_vectors(store: KnowledgeStore, query: str,
-                          results: list[dict[str, Any]],
-                          book_ids: list[str] | None,
-                          top_k: int) -> None:
-    """向量召回（KB2）。provider 不可用或失败时静默跳过。"""
+def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion：按各检索路的排名倒数求和重排。
+
+    score(doc) = Σ_r 1/(k + rank_r)，k=60 为常见常数。
+    每路独立排名，避免不同检索方法分数量纲不一致。
+    """
+    scores: dict[str, float] = {}
+    methods: dict[str, str] = {}
+    order: dict[str, int] = {}
+    seq = 0
+    for lst in lists_ranked:
+        for rank, r in enumerate(lst):
+            cid = r["chunk_id"]
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
+            methods.setdefault(cid, r.get("retrieval_method", "fts"))
+            if cid not in order:
+                order[cid] = seq
+                seq += 1
+    by_id: dict[str, dict[str, Any]] = {}
+    for lst in lists_ranked:
+        for r in lst:
+            by_id.setdefault(r["chunk_id"], r)
+    fused = []
+    for cid, score in sorted(scores.items(), key=lambda x: (-x[1], order[x[0]])):
+        r = dict(by_id[cid])
+        r["retrieval_method"] = methods[cid]
+        r["_rrf_score"] = score
+        fused.append(r)
+    return fused
+
+
+def _vector_results(store: KnowledgeStore, query: str,
+                    book_ids: list[str] | None,
+                    top_k: int) -> list[dict[str, Any]]:
+    """向量召回（KB2）。provider 不可用或失败时返回空，不阻断 FTS。"""
     try:
         from .provider_api import get_provider
         backend = get_provider()
         if backend is None:
-            return
+            return []
         query_vec = backend.embed(query)
         if not query_vec:
-            return
-        vec_results = store.search_vectors(
-            query_vec, book_ids=book_ids, limit=max(top_k * 5, 30),
+            return []
+        return store.search_vectors(
+            query_vec, book_ids=book_ids, limit=max(top_k * 10, 50),
         )
-        existing_ids = {r["chunk_id"] for r in results}
-        for vr in vec_results:
-            if vr["chunk_id"] not in existing_ids:
-                results.append(vr)
-                existing_ids.add(vr["chunk_id"])
     except Exception:
         # 向量失败不影响 FTS 主流程（PRD §15：向量不可用时回退 FTS）
-        return
+        return []
 
 
-def _augment_with_graph(store: KnowledgeStore, query: str,
-                        results: list[dict[str, Any]],
-                        book_ids: list[str] | None,
-                        top_k: int) -> None:
-    """实体命中 + graph 关系扩展。直接追加到 results。"""
+def _graph_results(store: KnowledgeStore, query: str,
+                   book_ids: list[str] | None,
+                   top_k: int) -> list[dict[str, Any]]:
+    """实体命中 + graph 关系扩展（KB3）。返回独立结果列表。"""
     try:
         from .knowledge_graph import expand_relations
     except ImportError:
-        return
+        return []
 
     # 从 query 找种子实体
     pattern = f"%{query.strip()}%"
@@ -105,22 +128,20 @@ def _augment_with_graph(store: KnowledgeStore, query: str,
         (pattern,),
     ).fetchall()
     if not seed_rows:
-        return
+        return []
 
     seed_ids = [r["entity_id"] for r in seed_rows[:5]]  # 最多 5 个种子
 
     # 关系扩展
     expansion = expand_relations(store, seed_ids, max_hops=2, max_nodes=20)
 
-    # 收集扩展到的实体关联的 chunk
     expanded_entity_ids = set(seed_ids)
     for rel in expansion:
         expanded_entity_ids.add(rel["to_entity_id"])
 
     if not expanded_entity_ids:
-        return
+        return []
 
-    # 找这些实体关联的 chunk
     placeholders = ",".join("?" * len(expanded_entity_ids))
     sql = f"""
         SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
@@ -142,14 +163,12 @@ def _augment_with_graph(store: KnowledgeStore, query: str,
     sql += " LIMIT ?"
     params.append(top_k * 3)
 
-    existing_ids = {r["chunk_id"] for r in results}
+    results: list[dict[str, Any]] = []
     for row in store._conn.execute(sql, params).fetchall():
         d = dict(row)
-        if d["chunk_id"] in existing_ids:
-            continue
         d["retrieval_method"] = "graph"
         results.append(d)
-        existing_ids.add(d["chunk_id"])
+    return results
 
 
 def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:
@@ -243,24 +262,6 @@ def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
             for d in documents
         ],
     }
-
-
-def _rank_results(results: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
-    """简单重排：章节标题命中优先，然后 BM25 rank。"""
-    query_lower = query.lower().strip()
-    for r in results:
-        # 章节标题精确命中加分
-        chapter = (r.get("chapter") or "").lower()
-        section = (r.get("section") or "").lower()
-        score = 0.0
-        if query_lower in chapter:
-            score += 100
-        if query_lower in section:
-            score += 50
-        # BM25 rank（FTS5 rank 越小越好，取负）
-        score -= r.get("rank", 0.0)
-        r["_score"] = score
-    return sorted(results, key=lambda x: x["_score"], reverse=True)
 
 
 def _apply_limits(results: list[dict[str, Any]],

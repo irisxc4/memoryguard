@@ -567,3 +567,162 @@ class TestSharedKnowledge:
             books = [b.title for b in s.list_books()]
         assert "异步书" in books
 
+
+class TestP12RRF:
+    """P1-2 RRF 融合：三路结果融合重排。"""
+
+    def test_rrf_fts_and_graph_merged(self, store, tmp_book_dir):
+        """FTS + 图结果经 RRF 融合，两路都出现在 top_k。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_graph import build_structural_relations
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        # 构建图关系，让 graph 路线有种子实体
+        build_structural_relations(store, book.book_id)
+        results = search(store, "技能融合", top_k=6)
+        assert results, "RRF 融合后应返回结果"
+        methods = {r.get("retrieval_method") for r in results}
+        assert methods, "结果应带 retrieval_method 标记"
+
+    def test_rrf_returns_ranked_dedup(self, store, tmp_book_dir):
+        """同一 chunk 跨多路召回时只出现一次，且去重。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        results = search(store, "技能融合", top_k=6)
+        ids = [r["chunk_id"] for r in results]
+        assert len(ids) == len(set(ids)), "RRF 融合后 chunk 不应重复"
+
+    def test_rrf_fuse_ordering(self):
+        """RRF 分：跨多路命中的文档应排前。"""
+        from memoryguard.knowledge_retriever import _rrf_fuse
+        a = [{"chunk_id": "x", "retrieval_method": "fts"},
+             {"chunk_id": "y", "retrieval_method": "fts"}]
+        b = [{"chunk_id": "y", "retrieval_method": "vector"},
+             {"chunk_id": "z", "retrieval_method": "vector"}]
+        fused = _rrf_fuse([a, b])
+        # y 出现在两路，融合分应最高
+        assert fused[0]["chunk_id"] == "y"
+        assert fused[0]["_rrf_score"] > fused[1]["_rrf_score"]
+        # 标记保留第一路方法
+        assert set(r["chunk_id"] for r in fused) == {"x", "y", "z"}
+
+
+class TestP13ModelEnhance:
+    """P1-3 模型增强：provider 生成摘要/关键词/实体。"""
+
+    def test_organize_with_provider(self, store, tmp_book_dir, monkeypatch):
+        """provider 返回 JSON 时，摘要/关键词/实体用模型结果。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_organizer import organize_chunk
+        from memoryguard.knowledge_store import _row_to_chunk
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        row = store._conn.execute("SELECT * FROM chunks LIMIT 1").fetchone()
+        chunk = _row_to_chunk(row)
+
+        class FakeProvider:
+            def chat(self, system, user, max_tokens=500):
+                return ('{"summary": "模型生成的摘要", '
+                        '"keywords": ["技能", "融合"], '
+                        '"entities": [{"name": "技能融合系统", "type": "concept"}]}')
+
+        result = organize_chunk(chunk, "游戏设计", FakeProvider())
+        assert result.summary == "模型生成的摘要"
+        assert "技能" in result.keywords
+        assert any(e["name"] == "技能融合系统" for e in result.entities)
+
+    def test_organize_provider_bad_json_fallback(self, store, tmp_book_dir):
+        """provider 返回非法 JSON 时回退规则化。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_organizer import organize_chunk, _organize_rule_based
+        from memoryguard.knowledge_store import _row_to_chunk
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        row = store._conn.execute("SELECT * FROM chunks LIMIT 1").fetchone()
+        chunk = _row_to_chunk(row)
+
+        class BadProvider:
+            def chat(self, system, user, max_tokens=500):
+                return "no json here"
+
+        result = organize_chunk(chunk, "游戏设计", BadProvider())
+        rule = _organize_rule_based(chunk, "游戏设计")
+        assert result.summary == rule.summary  # 回退规则化
+
+    def test_organize_provider_short_text_skip(self, store, tmp_book_dir):
+        """文本过短时跳过模型，直接规则化。"""
+        from memoryguard.knowledge_organizer import organize_chunk, _organize_rule_based
+        from memoryguard.knowledge_store import Chunk
+        chunk = Chunk("c", "d", "b", "章", "节", 0, "短文本", "", "", 1, 2, "h", )
+        called = {"n": 0}
+
+        class FakeProvider:
+            def chat(self, system, user, max_tokens=500):
+                called["n"] += 1
+                return '{"summary":"x","keywords":[],"entities":[]}'
+
+        result = organize_chunk(chunk, "t", FakeProvider())
+        assert called["n"] == 0  # 未调模型
+        assert result.summary  # 规则化摘要
+
+
+class TestP14Candidates:
+    """P1-4 记忆候选持久表：提炼 + 审核 + MCP 只读。"""
+
+    def test_ingest_generates_candidates(self, store, tmp_book_dir):
+        """入库后自动提炼记忆候选（pending）。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        candidates = store.list_memory_candidates(book_id=book.book_id, status="pending")
+        assert len(candidates) > 0
+        assert all(c["status"] == "pending" for c in candidates)
+        assert all(c["content"] for c in candidates)
+
+    def test_review_approve_reject(self, store, tmp_book_dir):
+        """候选可审核采纳/忽略。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        cid = store.list_memory_candidates(book_id=book.book_id, status="pending")[0]["candidate_id"]
+        assert store.review_memory_candidate(cid, "approve") is True
+        assert store.review_memory_candidate(cid, "approve") is False  # 已不在 approved 集合
+        assert store.count_memory_candidates(status="approved") == 1
+        assert store.review_memory_candidate(cid, "reject") is False  # 已 approved，reject 无效
+
+    def test_mcp_candidates_readonly(self, store, tmp_book_dir, monkeypatch):
+        """MCP 记忆候选工具只读列出。"""
+        import memoryguard.knowledge_mcp as km
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        monkeypatch.setattr(km, "open_shared_knowledge_store", lambda **kw: store)
+        result = handle_knowledge_tool("memoryguard_knowledge_candidates", {})
+        assert result is not None and not result.get("isError")
+        assert "记忆候选" in result["content"][0]["text"]
+
+    def test_gui_candidate_review(self, tmp_path, monkeypatch):
+        """GUI 候选列表 + 审核 API。"""
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+        root = tmp_path / "candbook"
+        (root / "combat").mkdir(parents=True)
+        (root / "combat" / "a.md").write_text(
+            "# 战斗系统\n\n力量影响物理攻击，敏捷影响闪避，智力影响魔法。\n"
+            "这套属性系统驱动整个战斗循环。\n" * 3, encoding="utf-8",
+        )
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_store import open_shared_knowledge_store
+        from memoryguard.knowledge_gui import handle_knowledge_api
+        with open_shared_knowledge_store() as store:
+            book = create_book(store, str(root), title="战斗书")
+            ingest_book(store, book.book_id)
+        lst = handle_knowledge_api("knowledge_candidates_list", [], ".")
+        assert lst.get("total", 0) > 0
+        cid = lst["candidates"][0]["candidate_id"]
+        r = handle_knowledge_api("knowledge_candidate_review", [cid, "approve"], ".")
+        assert r.get("ok") is True
+        lst2 = handle_knowledge_api("knowledge_candidates_list", ["", "approved"], ".")
+        assert lst2.get("total", 0) >= 1
+

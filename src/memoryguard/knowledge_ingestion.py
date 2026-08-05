@@ -175,7 +175,9 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
         try:
             from .knowledge_organizer import organize_book
             from .knowledge_graph import build_structural_relations
-            organize_book(store, book_id)
+            # P1-3 模型增强：provider 可用且（本地或已授权远程）时用于生成摘要/关键词/实体
+            enhance_provider = _authorized_provider(book.remote_embedding_allowed)
+            organize_book(store, book_id, provider=enhance_provider)
             build_structural_relations(store, book_id)
         except Exception:
             # 整理失败不影响入库结果（KB1 核心已完成）
@@ -368,6 +370,22 @@ def _is_local_base(api_base: str) -> bool:
     """判断 provider base_url 是否为本地（localhost/127.0.0.1/::1）。"""
     base = (api_base or "").strip().lower()
     return any(host in base for host in ("localhost", "127.0.0.1", "::1", "host.docker.internal"))
+
+
+def _authorized_provider(remote_allowed: bool):
+    """返回可用的 provider；远程 provider 未授权时返回 None（原本地 provider 直接可用）。
+
+    既用于 KB2 embedding，也用于 P1-3 模型增强：远程 provider 必须经用户对每本书
+    显式授权，否则不把文档内容发往远程。
+    """
+    from .provider_api import ProviderConfig, _provider_config, get_provider
+    backend = get_provider()
+    if backend is None:
+        return None
+    cfg: ProviderConfig | None = _provider_config
+    if cfg is not None and not _is_local_base(cfg.api_base) and not remote_allowed:
+        return None
+    return backend
 
 
 def _book_stats(store: KnowledgeStore, book_id: str) -> dict[str, object]:
