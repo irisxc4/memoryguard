@@ -16,6 +16,8 @@ KB5 仅基础版：书架列表、搜索、详情、添加书。美化（书封/
 from __future__ import annotations
 
 import json as _json
+import threading
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -23,12 +25,35 @@ from typing import Any
 from .data_home import resolve_data_home
 from .knowledge_ingestion import create_book, ingest_book
 from .knowledge_retriever import get_book_info, list_books, read_chunk, search
-from .knowledge_store import KnowledgeStore, open_shared_knowledge_store
+from .knowledge_store import KnowledgeStore, _stable_hash, open_shared_knowledge_store
 
 
 def _get_store(read_only: bool = False) -> KnowledgeStore | None:
     """打开唯一全局共享知识库。"""
     return open_shared_knowledge_store(read_only=read_only)
+
+
+def _run_ingest_in_thread(root_path: str, book_id: str, job_id: str) -> None:
+    """后台线程执行入库，更新 job 状态。"""
+    store = open_shared_knowledge_store()
+    if store is None:
+        return
+    try:
+        with store:
+            store.update_job(job_id, "running", phase="indexing")
+            result = ingest_book(store, book_id)
+            store.update_job(
+                job_id, "done", phase="complete",
+                processed=result.files_processed,
+                error=result.error,
+            )
+    except Exception as e:
+        try:
+            store.update_job(job_id, "failed", phase="complete", error=str(e))
+        except Exception:
+            pass
+    finally:
+        store.close()
 
 
 def render_bookshelf_html() -> str:
@@ -301,7 +326,7 @@ def handle_knowledge_api(method: str, args: list[Any],
     - knowledge_book(book_id) : 获取书籍详情（只读）
     - knowledge_reingest(book_id) : 重新整理一本书（写）
     """
-    write = method in {"knowledge_add", "knowledge_reingest"}
+    write = method in {"knowledge_add", "knowledge_reingest", "knowledge_remove"}
     store = _get_store(read_only=not write)
     if store is None:
         return {"error": "不能打开知识库（未初始化）"}
@@ -329,14 +354,21 @@ def handle_knowledge_api(method: str, args: list[Any],
             if not Path(root_path).is_dir():
                 return {"error": f"path not found: {root_path}"}
             book = create_book(store, root_path, title=title)
-            result = ingest_book(store, book.book_id)
+            job_id = _stable_hash("gui-job", book.book_id, str(time.time()))
+            store.create_job(job_id, book.book_id, total_files=0)
+            # 后台线程入库，避免阻塞单线程 HTTP 请求（P0-5 同步阻塞门槛）
+            threading.Thread(
+                target=_run_ingest_in_thread,
+                args=(root_path, book.book_id, job_id),
+                daemon=True,
+            ).start()
             return {
+                "ok": True,
                 "book_id": book.book_id,
                 "title": book.title,
-                "files_processed": result.files_processed,
-                "chunks_created": result.chunks_created,
-                "chapters": sorted(result.chapters),
-                "error": result.error,
+                "job_id": job_id,
+                "status": "indexing",
+                "deferred": True,
             }
 
         if method == "knowledge_read":
@@ -354,12 +386,40 @@ def handle_knowledge_api(method: str, args: list[Any],
         if method == "knowledge_reingest":
             if not args:
                 return {"error": "book_id required"}
-            result = ingest_book(store, str(args[0]))
+            book_id = str(args[0])
+            job_id = _stable_hash("gui-job", book_id, str(time.time()))
+            store.create_job(job_id, book_id, total_files=0)
+            threading.Thread(
+                target=_run_ingest_in_thread,
+                args=(store.get_book(book_id).root_path, book_id, job_id),
+                daemon=True,
+            ).start()
+            return {"ok": True, "job_id": job_id, "status": "indexing", "deferred": True}
+
+        if method == "knowledge_job_status":
+            if not args:
+                return {"error": "job_id required"}
+            job = store.get_job(str(args[0]))
+            if not job:
+                return {"error": "job not found"}
             return {
-                "files_processed": result.files_processed,
-                "chunks_created": result.chunks_created,
-                "error": result.error,
+                "job_id": job["job_id"],
+                "status": job["status"],
+                "phase": job["phase"],
+                "processed": job["processed_files"],
+                "total": job["total_files"],
+                "error": job["error"],
             }
+
+        if method == "knowledge_remove":
+            if not args:
+                return {"error": "book_id required"}
+            book_id = str(args[0])
+            book = store.get_book(book_id)
+            if not book:
+                return {"error": "book not found"}
+            store.remove_book(book_id)
+            return {"ok": True, "book_id": book_id, "title": book.title}
 
     return {"error": f"unknown knowledge method: {method}"}
 
@@ -381,6 +441,8 @@ KNOWLEDGE_API_METHODS = frozenset({
     "knowledge_read",
     "knowledge_book",
     "knowledge_reingest",
+    "knowledge_job_status",
+    "knowledge_remove",
 })
 
 
@@ -391,4 +453,4 @@ def is_knowledge_method(method: str) -> bool:
 
 def is_knowledge_mutation(method: str) -> bool:
     """判断是否为变更类知识 API（需确认）。"""
-    return method in {"knowledge_add", "knowledge_reingest"}
+    return method in {"knowledge_add", "knowledge_reingest", "knowledge_remove"}

@@ -221,7 +221,7 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
     if cfg is not None and not _is_local_base(cfg.api_base) and not remote_allowed:
         return 0
 
-    # 确定 embedding_model 名称
+    # 确定 embedding_model 名称与空间 id（模型变化即产生新空间，避免混用）
     model_name = "unknown"
     try:
         if _provider_config is not None:
@@ -230,9 +230,10 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
                           or "unknown")
     except Exception:
         pass
+    embedding_space_id = f"model:{model_name}"
 
     # 列出需要 embedding 的 chunk（text_hash 变化则需重建）
-    rows = store.list_chunks_without_embedding(book_id, model_name)
+    rows = store.list_chunks_without_embedding(book_id, model_name, embedding_space_id)
     if not rows:
         return 0
 
@@ -270,6 +271,7 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
             dimension=len(vec),
             vector=vec,
             text_hash=th,
+            embedding_space_id=embedding_space_id,
         )
         count += 1
     return count

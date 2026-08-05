@@ -104,7 +104,7 @@ def test_gui_cannot_forge_admin_or_rewrite_security_environment(
             pass
 
     monkeypatch.setattr(gui, "_find_free_port", lambda: 43123)
-    monkeypatch.setattr(gui.http.server, "HTTPServer", FakeServer)
+    monkeypatch.setattr(gui.http.server, "ThreadingHTTPServer", FakeServer)
     monkeypatch.setattr(gui, "render_interactive_html", lambda: "<html></html>")
     monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
     monkeypatch.delenv("MEMORYGUARD_ALLOW_ANON", raising=False)

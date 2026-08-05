@@ -427,6 +427,36 @@ class TestKB2Vector:
         methods = {r.get("retrieval_method", "fts") for r in results}
         assert methods <= {"fts", "like"}
 
+    def test_embedding_space_isolation(self, store, tmp_book_dir):
+        """不同 embedding_space 不混用（P1-1）。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        cid = store._conn.execute("SELECT chunk_id FROM chunks LIMIT 1").fetchone()["chunk_id"]
+        # 写入两个不同 space 的向量
+        store.upsert_embedding(cid, "modelA", 4, [1, 0, 0, 0], "h1", "model:modelA")
+        store.upsert_embedding(cid, "modelB", 4, [0, 1, 0, 0], "h1", "model:modelB")
+        # 在 space A 检索只返回 A 的向量
+        rows = store.search_vectors([1, 0, 0, 0], embedding_space_id="model:modelA")
+        assert all(r["chunk_id"] == cid for r in rows)
+        # 空 space 返回空
+        assert store.search_vectors([1, 0, 0, 0], embedding_space_id="nonexistent") == []
+
+    def test_embedding_dimension_mismatch_skipped(self, store, tmp_book_dir):
+        """维度不一致的向量被跳过，不静默截断混用（P1-1）。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        rows = store._conn.execute(
+            "SELECT chunk_id FROM chunks LIMIT 2",
+        ).fetchall()
+        c1, c2 = rows[0]["chunk_id"], rows[1]["chunk_id"]
+        store.upsert_embedding(c1, "modelA", 4, [1, 0, 0, 0], "h1", "model:modelA")
+        store.upsert_embedding(c2, "modelA", 8, [1, 0, 0, 0, 0, 0, 0, 0], "h2", "model:modelA")
+        # 用 4 维查询，8 维的 c2 应被跳过
+        res = store.search_vectors([1, 0, 0, 0], embedding_space_id="model:modelA")
+        assert res and all(r["chunk_id"] == c1 for r in res)
+
 
 class TestSharedKnowledge:
     """共享知识书库闭环：GUI 添加 → MCP 连续搜索 → Bootstrap 召回同一库（P0-1/2/3）。"""
@@ -510,4 +540,30 @@ class TestSharedKnowledge:
         r = handle_knowledge_tool("memoryguard_knowledge_list", {})
         assert r is not None
         assert not db.exists(), "只读工具不得创建数据库"
+
+    def test_knowledge_add_async_and_job(self, tmp_path, monkeypatch):
+        """knowledge_add 后台入库并返回 job，不阻塞同步（P0-5 同步阻塞门槛）。"""
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+        root = self._make_book_dir(tmp_path)
+
+        from memoryguard.knowledge_gui import handle_knowledge_api
+        resp = handle_knowledge_api("knowledge_add", [str(root), "异步书"], ".")
+        assert resp.get("ok") is True
+        assert resp.get("deferred") is True
+        assert resp.get("job_id")
+        # 等待后台线程完成
+        import time as _t
+        from memoryguard.knowledge_store import open_shared_knowledge_store
+        for _ in range(50):
+            with open_shared_knowledge_store(read_only=True, must_exist=True) as s:
+                job = s.get_job(resp["job_id"])
+            if job and job["status"] in ("done", "failed"):
+                break
+            _t.sleep(0.1)
+        assert job is not None and job["status"] == "done"
+        # 书已入库
+        with open_shared_knowledge_store(read_only=True, must_exist=True) as s:
+            books = [b.title for b in s.list_books()]
+        assert "异步书" in books
 

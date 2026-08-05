@@ -593,7 +593,7 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
         def log_message(self, *args):  # 静默
             pass
 
-    server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"MemoryGuard GUI running at {url} (sandbox={is_sandbox})")
     if auto_open:
