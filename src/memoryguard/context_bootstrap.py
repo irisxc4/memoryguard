@@ -20,7 +20,11 @@ from .schema_v3 import (
     _now_iso,
     stable_hash,
 )
-from .rule_scope import effective_assignments, normalize_assignment
+from .rule_scope import (
+    effective_assignment_priority,
+    effective_assignments,
+    normalize_assignment,
+)
 from .rule_scope import canonical_project_ref
 from .rule_read_path import MODE_LEGACY, resolve_read_path_mode
 from .shared_memory_store import (
@@ -282,13 +286,9 @@ def build_context_packet(
                 })
             continue
         raw_mandatory.append(record)
-        overrides = [
-            item.priority_override for item in includes
-            if hasattr(item, "priority_override")
-            and item.priority_override is not None
-        ]
-        effective_priorities[record.memory_id] = (
-            max(overrides) if overrides else record.priority
+        effective_priorities[record.memory_id] = max(
+            effective_assignment_priority(item, record.priority)
+            for item in includes
         )
         for assignment in includes:
             if not hasattr(assignment, "target_type"):
@@ -568,6 +568,34 @@ def build_context_packet(
         if not _select(candidate, max_chars - used_chars):
             omitted["budget"] += 1
 
+    # Stage 3: KAG 知识书库检索（独立预算，不占记忆名额）
+    knowledge_items: list[dict[str, Any]] = []
+    try:
+        from .knowledge_retriever import search as _ksearch
+        from .knowledge_store import KnowledgeStore
+        kstore = KnowledgeStore(store.workspace)
+        k_results = _ksearch(kstore, task, top_k=6)
+        kstore.close()
+        k_chars = 0
+        for r in k_results:
+            text = r.get("text", "")
+            if k_chars + len(text) > 6000:
+                break
+            knowledge_items.append({
+                "chunk_id": r.get("chunk_id", ""),
+                "book_title": r.get("book_title", ""),
+                "chapter": r.get("chapter", ""),
+                "section": r.get("section", ""),
+                "relative_path": r.get("relative_path", ""),
+                "line_start": r.get("line_start", 0),
+                "line_end": r.get("line_end", 0),
+                "text": text,
+                "retrieval_method": "fts5",
+            })
+            k_chars += len(text)
+    except Exception:
+        pass  # 知识库不可用时不阻断 bootstrap
+
     return {
         "context_packet": {
             "scope": "long_term_memory_only",
@@ -576,6 +604,7 @@ def build_context_packet(
             "project_hint": (project_hint or "").strip(),
             "items": items,
             "mandatory_items": mandatory_items,
+            "knowledge_items": knowledge_items,
         },
         "share_group_id": store.group_id,
         "active_version": store.get_active_version_id(),
