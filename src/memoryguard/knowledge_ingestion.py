@@ -143,6 +143,18 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
         chapter_count=len(chapters),
         chunk_count=total_chunks,
     )
+
+    # KB3 基础整理：摘要/关键词/实体/结构化关系（无模型规则化，PRD §6.1 永远执行）
+    if processed > 0:
+        try:
+            from .knowledge_organizer import organize_book
+            from .knowledge_graph import build_structural_relations
+            organize_book(store, book_id)
+            build_structural_relations(store, book_id)
+        except Exception:
+            # 整理失败不影响入库结果（KB1 核心已完成）
+            pass
+
     store.update_job(job_id, "done", phase="complete", processed=processed)
 
     return IngestionResult(

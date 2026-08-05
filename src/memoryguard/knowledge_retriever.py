@@ -1,6 +1,8 @@
-"""knowledge_retriever：FTS5 全文检索（KB1）。
+"""knowledge_retriever：FTS5 全文检索 + 实体关系扩展（KB1+KB3）。
 
-KB1 只实现 FTS5 检索。KB2 将增加向量检索。KB3 将增加实体关系扩展。
+KB1: FTS5 检索 + LIKE fallback
+KB3: 实体命中 + graph 关系扩展（最多两跳）
+KB2: 向量检索（暂留接口，无 provider 时降级 FTS）
 """
 
 from __future__ import annotations
@@ -12,32 +14,110 @@ from .knowledge_store import KnowledgeStore
 
 def search(store: KnowledgeStore, query: str,
            book_ids: list[str] | None = None,
-           top_k: int = 6) -> list[dict[str, Any]]:
+           top_k: int = 6,
+           enable_graph: bool = True) -> list[dict[str, Any]]:
     """知识库搜索。返回 top_k 个结果。
 
     每条结果包含：chunk_id, book_id, book_title, chapter, section,
     text, line_start, line_end, relative_path, retrieval_method。
+
+    检索流程（PRD §7.2）：
+    1. FTS5 全文召回（trigram 中文）
+    2. LIKE fallback（<3 字符短查询）
+    3. 实体命中（entities.name LIKE query）
+    4. graph 关系扩展（最多两跳，最多 20 节点）
+    5. 重排 + 去重 + 每书/每文件限制
     """
     if not query.strip():
         return []
 
-    # KB1: FTS5 优先，短查询/无结果时 LIKE fallback
-    fts_results = store.search_fts(query, book_ids=book_ids, limit=max(top_k * 5, 30))
+    # 1. FTS5 优先
+    results = store.search_fts(query, book_ids=book_ids, limit=max(top_k * 5, 30))
 
-    if not fts_results:
-        # trigram 对 <3 字符查询无召回；LIKE 保证短中文查询可用
-        fts_results = store.search_like(query, book_ids=book_ids, limit=max(top_k * 5, 30))
+    # 2. LIKE fallback
+    if not results:
+        results = store.search_like(query, book_ids=book_ids, limit=max(top_k * 5, 30))
 
-    if not fts_results:
+    # 标记检索方式
+    for r in results:
+        r.setdefault("retrieval_method", "fts" if r.get("rank", 1.0) != 0.0 else "like")
+
+    # 3. 实体命中 + 4. graph 关系扩展
+    if enable_graph and results:
+        _augment_with_graph(store, query, results, book_ids, top_k)
+
+    if not results:
         return []
 
-    # 重排 + 去重 + 限制
-    ranked = _rank_results(fts_results, query)
-
-    # 每本书最多 4 个，每个文件最多 2 个
+    # 5. 重排 + 去重 + 限制
+    ranked = _rank_results(results, query)
     filtered = _apply_limits(ranked, max_per_book=4, max_per_file=2)
 
     return filtered[:top_k]
+
+
+def _augment_with_graph(store: KnowledgeStore, query: str,
+                        results: list[dict[str, Any]],
+                        book_ids: list[str] | None,
+                        top_k: int) -> None:
+    """实体命中 + graph 关系扩展。直接追加到 results。"""
+    try:
+        from .knowledge_graph import expand_relations
+    except ImportError:
+        return
+
+    # 从 query 找种子实体
+    pattern = f"%{query.strip()}%"
+    seed_rows = store._conn.execute(
+        "SELECT entity_id, name FROM entities WHERE active=1 AND name LIKE ?",
+        (pattern,),
+    ).fetchall()
+    if not seed_rows:
+        return
+
+    seed_ids = [r["entity_id"] for r in seed_rows[:5]]  # 最多 5 个种子
+
+    # 关系扩展
+    expansion = expand_relations(store, seed_ids, max_hops=2, max_nodes=20)
+
+    # 收集扩展到的实体关联的 chunk
+    expanded_entity_ids = set(seed_ids)
+    for rel in expansion:
+        expanded_entity_ids.add(rel["to_entity_id"])
+
+    if not expanded_entity_ids:
+        return
+
+    # 找这些实体关联的 chunk
+    placeholders = ",".join("?" * len(expanded_entity_ids))
+    sql = f"""
+        SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
+               c.text, c.summary, c.keywords, c.line_start, c.line_end,
+               b.title AS book_title, b.root_path,
+               d.relative_path AS relative_path,
+               0.0 AS rank
+        FROM chunk_entities ce
+        JOIN chunks c ON c.chunk_id=ce.chunk_id
+        JOIN books b ON b.book_id=c.book_id
+        JOIN documents d ON d.document_id=c.document_id
+        WHERE ce.entity_id IN ({placeholders}) AND c.active=1
+    """
+    params: list[Any] = list(expanded_entity_ids)
+    if book_ids:
+        ph = ",".join("?" * len(book_ids))
+        sql += f" AND c.book_id IN ({ph})"
+        params.extend(book_ids)
+    sql += " LIMIT ?"
+    params.append(top_k * 3)
+
+    existing_ids = {r["chunk_id"] for r in results}
+    for row in store._conn.execute(sql, params).fetchall():
+        d = dict(row)
+        if d["chunk_id"] in existing_ids:
+            continue
+        d["retrieval_method"] = "graph"
+        results.append(d)
+        existing_ids.add(d["chunk_id"])
 
 
 def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:

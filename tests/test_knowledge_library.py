@@ -249,3 +249,99 @@ class TestStoreCRUD:
         assert b.file_count == 10
         store.remove_book("test-1")
         assert store.get_book("test-1") is None
+
+
+class TestOrganizer:
+    """KB3 测试：摘要/关键词/实体整理。"""
+
+    def test_organize_book_generates_summary_keywords(self, store, tmp_book_dir):
+        """整理后 chunk 有 summary 和 keywords。"""
+        from memoryguard.knowledge_organizer import organize_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        stats = organize_book(store, book.book_id)
+        assert stats["chunks_organized"] > 0
+        # 检查 chunk 有 summary
+        rows = store._conn.execute(
+            "SELECT summary, keywords FROM chunks WHERE book_id=? AND active=1 LIMIT 3",
+            (book.book_id,),
+        ).fetchall()
+        assert any(r["summary"] for r in rows)
+        assert any(r["keywords"] for r in rows)
+
+    def test_organize_extracts_entities(self, store, tmp_book_dir):
+        """整理后实体入库。"""
+        from memoryguard.knowledge_organizer import organize_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        organize_book(store, book.book_id)
+        # 章节标题应作为实体
+        rows = store._conn.execute(
+            "SELECT name FROM entities WHERE active=1",
+        ).fetchall()
+        names = [r["name"] for r in rows]
+        assert any("技能" in n or "战斗" in n or "伤害" in n for n in names)
+
+
+class TestGraph:
+    """KB3 测试：结构化关系。"""
+
+    def test_build_structural_relations(self, store, tmp_book_dir):
+        """建立结构化关系。"""
+        from memoryguard.knowledge_graph import build_structural_relations
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        stats = build_structural_relations(store, book.book_id)
+        assert stats["relations_created"] > 0
+        # 验证 relations 表有记录
+        cnt = store._conn.execute(
+            "SELECT COUNT(*) FROM relations",
+        ).fetchone()[0]
+        assert cnt > 0
+
+    def test_expand_relations(self, store, tmp_book_dir):
+        """关系扩展不超过两跳。"""
+        from memoryguard.knowledge_graph import build_structural_relations, expand_relations
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        build_structural_relations(store, book.book_id)
+        # 取一个种子实体
+        row = store._conn.execute(
+            "SELECT entity_id FROM entities LIMIT 1",
+        ).fetchone()
+        if row:
+            expansion = expand_relations(store, [row["entity_id"]], max_hops=2, max_nodes=20)
+            # 扩展结果每条 hop <= 2
+            assert all(r["hop"] <= 2 for r in expansion)
+
+
+class TestDistill:
+    """KB4 测试：记忆候选萃取。"""
+
+    def test_distill_generates_candidates(self, store, tmp_book_dir):
+        """萃取生成记忆候选，含完整来源。"""
+        from memoryguard.knowledge_distill import distill_book, candidates_to_dict
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        result = distill_book(store, book.book_id)
+        assert len(result.candidates) > 0
+        # 每个候选有完整来源
+        for c in result.candidates:
+            assert c.body
+            assert c.book_id == book.book_id
+            assert c.chunk_id
+            assert c.relative_path
+        # 序列化
+        dicts = candidates_to_dict(result.candidates)
+        assert len(dicts) == len(result.candidates)
+        assert dicts[0]["source"]["chunk_id"]
+
+    def test_distill_no_auto_rule(self, store, tmp_book_dir):
+        """萃取候选 kind 只能是 fact/project/procedure/preference，不能是 always rule。"""
+        from memoryguard.knowledge_distill import distill_book, AUTO_SYNCABLE_KINDS
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        result = distill_book(store, book.book_id)
+        for c in result.candidates:
+            assert c.kind in AUTO_SYNCABLE_KINDS
+
