@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .data_home import resolve_data_home
 from .knowledge_chunker import chunk_document
-from .knowledge_parser import parse_file, SUPPORTED_EXTENSIONS, CODE_EXTENSIONS
+from .knowledge_parser import parse_content, SUPPORTED_EXTENSIONS, CODE_EXTENSIONS
 from .knowledge_store import Book, Chunk, KnowledgeStore, _stable_hash
+from .provider_api import _provider_config
 from .source_registry import (
     DEFAULT_PROJECT_EXCLUDE,
     INSTRUCTION_FILES,
@@ -34,6 +36,40 @@ KNOWLEDGE_SCAN_BUDGET = ScanBudget(
 # 控制面文件默认排除：指令文件可浏览，但不进入 KAG Bootstrap
 CONTROL_SURFACE_FILES = frozenset(INSTRUCTION_FILES)
 
+# 每本书的入库锁：阻止同一本书并发重建（P1-9）
+_book_locks: dict[str, threading.Lock] = {}
+_book_locks_guard = threading.Lock()
+
+
+def _book_lock(book_id: str) -> threading.Lock:
+    global _book_locks
+    with _book_locks_guard:
+        lock = _book_locks.get(book_id)
+        if lock is None:
+            lock = threading.Lock()
+            _book_locks[book_id] = lock
+        return lock
+
+
+@dataclass
+class ScanTruncation:
+    """一次扫描截断的原因。"""
+    reason: str  # max_files / max_total_size / max_single_file / timeout / depth
+    detail: str = ""
+
+
+@dataclass
+class KnowledgeScanResult:
+    """扫描结果：除了文件列表，还告知扫描是否完整及截断原因。
+
+    只有 complete=True 时才能推断"未扫到=已删除"，否则禁止删除旧文档（P0-1）。
+    """
+    files: list[Path] = field(default_factory=list)
+    complete: bool = True
+    truncations: list[ScanTruncation] = field(default_factory=list)
+    scanned_count: int = 0
+    total_size: int = 0
+
 
 @dataclass
 class IngestionResult:
@@ -46,6 +82,8 @@ class IngestionResult:
     chunks_created: int
     chapters: set[str]
     error: str = ""
+    status: str = "ready"  # ready / partial / failed
+    truncations: list[ScanTruncation] = field(default_factory=list)
 
 
 def create_book(store: KnowledgeStore, root_path: str, title: str = "",
@@ -74,6 +112,12 @@ def create_book(store: KnowledgeStore, root_path: str, title: str = "",
 
 
 def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
+    """扫描并入库一本书（每本书加锁，阻止并发重建 P1-9）。"""
+    with _book_lock(book_id):
+        return _ingest_book_unlocked(store, book_id)
+
+
+def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResult:
     """扫描并入库一本书。增量更新：只处理变化的文件。"""
     book = store.get_book(book_id)
     if not book:
@@ -91,10 +135,10 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
     job_id = _stable_hash("job", book_id, str(hashlib.sha256(str(root).encode()).hexdigest()[:8]))
 
     # 扫描文件（带预算：文件数/大小/深度/超时/符号链接与默认排除）
-    all_files, over_budget = _scan_files(
+    scan = _scan_files(
         root, book.include_globs, book.exclude_globs, budget=KNOWLEDGE_SCAN_BUDGET,
     )
-    store.create_job(job_id, book_id, len(all_files))
+    store.create_job(job_id, book_id, len(scan.files))
 
     # 检查已有文档
     existing_docs = {
@@ -106,7 +150,7 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
     skipped = 0
     chunks_created = 0
 
-    for file_path in all_files:
+    for file_path in scan.files:
         rel = str(file_path.relative_to(root)).replace("\\", "/")
         current_paths.add(rel)
 
@@ -115,7 +159,7 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
             before = file_path.stat()
             content = file_path.read_bytes()
             after = file_path.stat()
-            if before.st_size != after.st_size or before.st_mtime != after.st_mtime:
+            if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
                 skipped += 1
                 continue  # 读取过程中文件被修改，本轮跳过
             content_hash = hashlib.sha256(content).hexdigest()[:16]
@@ -123,14 +167,16 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
             skipped += 1
             continue
 
-        # 检查是否需要更新
+        # 检查是否需要更新（内容哈希未变则跳过）
         existing = existing_docs.get(rel)
         if existing and existing["content_hash"] == content_hash:
             skipped += 1
             continue
 
-        # 解析文件
-        parsed = parse_file(file_path, root)
+        # P0-2 索引一致性：哈希与解析基于同一份字节缓冲
+        ext = file_path.suffix.lower()
+        media_type = (SUPPORTED_EXTENSIONS.get(ext) or CODE_EXTENSIONS.get(ext) or "text/plain")
+        parsed = parse_content(content, relative_path=rel, media_type=media_type)
         if not parsed:
             skipped += 1
             continue
@@ -140,6 +186,9 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
         if Path(rel).name in CONTROL_SURFACE_FILES:
             content_role = "control_surface"
 
+        # P0-5 敏感内容检测：对同一份已读内容运行敏感模式，命中即标记 sensitive
+        sensitivity = "sensitive" if detect_sensitive_content(parsed_text_of(parsed)) else "normal"
+
         # 切片
         document_id = _stable_hash(book_id, rel)
         chunks = chunk_document(parsed, book_id, document_id)
@@ -148,23 +197,32 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
         store.replace_document_revision(
             document_id, book_id, rel, parsed.media_type,
             content_hash, chunks, content_role=content_role,
+            sensitivity=sensitivity,
         )
 
         chunks_created += len(chunks)
         processed += 1
         store.update_job(job_id, "running", phase="indexing", processed=processed)
 
-    # 检测已删除的文件
+    # 检测已删除的文件：仅当扫描完整时才推断"未扫到=已删除"（P0-1）
+    # 扫描被预算/超时截断时，未扫到的旧文档必须保留，否则会误删半本书。
     deleted = 0
-    for rel, doc_row in existing_docs.items():
-        if rel not in current_paths:
-            store.deactivate_document(doc_row["document_id"])
-            deleted += 1
+    if scan.complete:
+        for rel, doc_row in existing_docs.items():
+            if rel not in current_paths:
+                store.deactivate_document(doc_row["document_id"])
+                deleted += 1
 
     # 从数据库重新统计（不拿"本次处理了什么"冒充"书库目前有什么"）
     stats = _book_stats(store, book_id)
+
+    # 书籍状态：扫描不完整 → partial，并记录截断原因
+    if scan.complete:
+        status = "ready"
+    else:
+        status = "partial"
     store.update_book_status(
-        book_id, "ready",
+        book_id, status,
         file_count=stats["files"],
         chapter_count=stats["chapters"],
         chunk_count=stats["chunks"],
@@ -177,7 +235,10 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
             from .knowledge_graph import build_structural_relations
             # P1-3 模型增强：provider 可用且（本地或已授权远程）时用于生成摘要/关键词/实体
             enhance_provider = _authorized_provider(book.remote_embedding_allowed)
-            organize_book(store, book_id, provider=enhance_provider)
+            cfg = _provider_config
+            remote_enhance = bool(enhance_provider and cfg is not None
+                                  and not _is_local_base(cfg.api_base))
+            organize_book(store, book_id, provider=enhance_provider, remote=remote_enhance)
             build_structural_relations(store, book_id)
         except Exception:
             # 整理失败不影响入库结果（KB1 核心已完成）
@@ -193,15 +254,21 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
 
     store.update_job(job_id, "done", phase="complete", processed=processed)
 
+    error = ""
+    if scan.truncations:
+        error = "扫描不完整：" + "；".join(t.reason for t in scan.truncations)
+
     return IngestionResult(
         book_id=book_id,
-        files_total=len(all_files),
+        files_total=len(scan.files),
         files_processed=processed,
         files_skipped=skipped,
         files_deleted=deleted,
         chunks_created=chunks_created,
         chapters=set(stats["chapter_list"]),
-        error=("扫描超预算，部分文件未处理" if over_budget else ""),
+        error=error,
+        status=status,
+        truncations=scan.truncations,
     )
 
 
@@ -220,27 +287,32 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
 
     # 远程 provider 必须先经用户对每本书显式授权，否则不回传文档内容
     cfg: ProviderConfig | None = _provider_config
-    if cfg is not None and not _is_local_base(cfg.api_base) and not remote_allowed:
+    is_remote = cfg is not None and not _is_local_base(cfg.api_base)
+    if is_remote and not remote_allowed:
         return 0
 
-    # 确定 embedding_model 名称与空间 id（模型变化即产生新空间，避免混用）
-    model_name = "unknown"
-    try:
-        if _provider_config is not None:
-            model_name = (_provider_config.embedding_model
-                          or _provider_config.model
-                          or "unknown")
-    except Exception:
-        pass
-    embedding_space_id = f"model:{model_name}"
+    # 唯一向量空间 ID：入库与查询必须在同一空间（P0-3）
+    from .provider_api import current_embedding_space_id, describe_embedding_backend
+    space_id = current_embedding_space_id()
+    if not space_id:
+        return 0
+    descriptor = describe_embedding_backend(backend, cfg)
+    model_name = descriptor.embedding_model or descriptor.model
+    embedding_space_id = descriptor.space_id
 
     # 列出需要 embedding 的 chunk（text_hash 变化则需重建）
     rows = store.list_chunks_without_embedding(book_id, model_name, embedding_space_id)
     if not rows:
         return 0
 
+    # P0-5 隐私：远程 provider 永不接收敏感/控制面片段（即使整本书已授权远程）
+    if is_remote:
+        rows = _filter_out_sensitive(store, rows)
+
     chunk_ids = [r["chunk_id"] for r in rows]
     text_hashes = [r["text_hash"] for r in rows]
+    if not chunk_ids:
+        return 0
 
     # 获取 chunk 文本，拼装 embedding 输入
     # PRD §4.3: embedding 输入 = 书名 + 文件名 + 章节路径 + 正文
@@ -280,11 +352,12 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
 
 
 def _scan_files(root: Path, include_globs: str, exclude_globs: str,
-                budget: ScanBudget | None = None) -> tuple[list[Path], bool]:
+                budget: ScanBudget | None = None) -> KnowledgeScanResult:
     """扫描目录下所有支持的文件（带预算与安全边界）。
 
-    返回 (文件列表, 是否超预算)。复用 SourceRegistry 的默认排除与预算语义：
-    文件数、总大小、单文件大小、深度、超时、符号链接逃逸、默认排除目录。
+    返回 KnowledgeScanResult：含文件列表、是否完整、截断原因。
+    复用 SourceRegistry 的默认排除与预算语义：文件数、总大小、单文件大小、
+    深度、超时、符号链接逃逸、默认排除目录。
     """
     budget = budget or KNOWLEDGE_SCAN_BUDGET
     include_patterns = [g.strip() for g in include_globs.split(",") if g.strip()] if include_globs else []
@@ -293,7 +366,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
 
     all_supported = set(SUPPORTED_EXTENSIONS.keys()) | set(CODE_EXTENSIONS.keys())
     files: list[Path] = []
-    over_budget = False
+    truncations: list[ScanTruncation] = []
     total_size = 0
     start = time.time()
 
@@ -305,7 +378,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
 
     for dirpath, dirnames, filenames in os.walk(root):
         if time.time() - start > budget.timeout_seconds:
-            over_budget = True
+            truncations.append(ScanTruncation("timeout", "扫描超过预算时长，停止扫描"))
             break
         if _depth(Path(dirpath)) > budget.max_depth:
             dirnames[:] = []
@@ -321,7 +394,8 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             if fname.startswith("."):
                 continue
             if len(files) >= budget.max_files:
-                over_budget = True
+                truncations.append(ScanTruncation(
+                    "max_files", f"超过最大文件数 {budget.max_files}，停止扫描"))
                 break
             ext = Path(fname).suffix.lower()
             if ext not in all_supported:
@@ -336,10 +410,11 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             except OSError:
                 continue
             if size > budget.max_single_file:
-                over_budget = True
-                continue
+                continue  # 超单文件上限：跳过该文件，不视为整体截断
             if total_size + size > budget.max_total_size:
-                over_budget = True
+                truncations.append(ScanTruncation(
+                    "max_total_size",
+                    f"超过总大小上限 {budget.max_total_size}，停止扫描"))
                 break
             rel = str(file_path.relative_to(root)).replace("\\", "/")
 
@@ -354,7 +429,13 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             files.append(file_path)
             total_size += size
 
-    return sorted(files), over_budget
+    return KnowledgeScanResult(
+        files=sorted(files),
+        complete=not truncations,
+        truncations=truncations,
+        scanned_count=len(files),
+        total_size=total_size,
+    )
 
 
 def _dir_excluded(dirpath: str, dirname: str, exclude_patterns: list[str]) -> bool:
@@ -366,10 +447,70 @@ def _dir_excluded(dirpath: str, dirname: str, exclude_patterns: list[str]) -> bo
     return bool(full and any(_match_glob(full, p) for p in exclude_patterns))
 
 
+def detect_sensitive_content(text: str) -> bool:
+    """检测文本是否含敏感内容（密钥/令牌/私钥等）。
+
+    复用 auto_organizer.SECRET_PATTERNS。命中即标记 sensitive，用于：
+    - 远程 provider 永不接收敏感片段（P0-5 隐私）；
+    - Bootstrap 默认不注入敏感片段。
+    """
+    if not text:
+        return False
+    try:
+        from .auto_organizer import SECRET_PATTERNS
+        return any(p.search(text) for p in SECRET_PATTERNS)
+    except Exception:
+        return False
+
+
+def parsed_text_of(parsed) -> str:
+    """将解析后的文档块拼接为纯文本（用于敏感检测/摘要）。"""
+    try:
+        return "\n".join(b.text for b in parsed.blocks)
+    except Exception:
+        return ""
+
+
+def _filter_out_sensitive(store: KnowledgeStore, rows: list) -> list:
+    """从待 embedding 的 chunk 中剔除敏感/控制面片段（P0-5 隐私）。
+
+    仅用于远程 provider 路径：敏感片段绝不上传远端，即使整本书已授权远程。
+    """
+    if not rows:
+        return rows
+    chunk_ids = [r["chunk_id"] for r in rows]
+    placeholders = ",".join("?" * len(chunk_ids))
+    sens = {
+        row["chunk_id"]: row["sensitivity"]
+        for row in store._conn.execute(
+            f"SELECT chunk_id, sensitivity FROM chunks WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        ).fetchall()
+    }
+    # 控制面片段也一并排除远程上传
+    return [r for r in rows if sens.get(r["chunk_id"], "normal") == "normal"]
+
+
 def _is_local_base(api_base: str) -> bool:
-    """判断 provider base_url 是否为本地（localhost/127.0.0.1/::1）。"""
-    base = (api_base or "").strip().lower()
-    return any(host in base for host in ("localhost", "127.0.0.1", "::1", "host.docker.internal"))
+    """判断 provider base_url 是否为本地（localhost/回环 IP）。
+
+    用 urlparse 提取 hostname + ipaddress 判断回环，杜绝字符串包含被域名欺骗
+    （如 `https://localhost.attacker.example` 被误判为本地）（P1-1）。
+    """
+    from urllib.parse import urlparse
+    import ipaddress
+    try:
+        host = urlparse(api_base or "").hostname
+    except Exception:
+        host = None
+    if not host:
+        return False
+    if host.lower() in {"localhost", "host.docker.internal"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _authorized_provider(remote_allowed: bool):

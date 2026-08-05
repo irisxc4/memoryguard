@@ -126,6 +126,9 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     "update_rule_audience",
     "create_rule_from_text", "undo_rule_decision", "create_child_exception",
     "create_rule_exception", "submit_rule_feedback", "revoke_rule_exception",
+    # 知识书库（变更）
+    "knowledge_add", "knowledge_reingest", "knowledge_remove",
+    "knowledge_candidate_review",
 })
 
 # 所有允许的 API 方法

@@ -152,10 +152,11 @@ def _parse_model_json(raw: str) -> dict[str, Any] | None:
 
 
 def organize_book(store: KnowledgeStore, book_id: str,
-                  provider: Any = None) -> dict[str, int]:
+                  provider: Any = None, remote: bool = False) -> dict[str, int]:
     """整理一本书的所有 chunk。返回统计。
 
     无模型时：生成摘要/关键词/实体，写入 chunks 表和 entities/chunk_entities 表。
+    remote=True 表示 provider 为远程：敏感/控制面片段绝不上传（P0-5 隐私）。
     """
     book = store.get_book(book_id)
     book_title = book.title if book else ""
@@ -172,6 +173,11 @@ def organize_book(store: KnowledgeStore, book_id: str,
 
     for row in rows:
         chunk = _row_to_chunk(row)
+
+        # P0-5 隐私：远程 provider 永不接收敏感/控制面片段
+        if remote and getattr(chunk, "sensitivity", "normal") == "sensitive":
+            continue
+
         result = organize_chunk(chunk, book_title, provider)
 
         # 更新 chunk 摘要和关键词
@@ -201,6 +207,8 @@ def organize_book(store: KnowledgeStore, book_id: str,
                 category="knowledge",
                 confidence=confidence,
                 chunk_id=chunk.chunk_id,
+                document_id=chunk.document_id,
+                source_text_hash=chunk.text_hash,
             )
             stats["candidates_generated"] += 1
 

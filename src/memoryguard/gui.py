@@ -1101,6 +1101,30 @@ class GovernanceApi:
         return {"requests": [r.to_dict() for r in pending]}
 
     # ------------------------------------------------------------------
+    # 知识书库变更（P0-4 Desktop Executor 路由）
+    # ------------------------------------------------------------------
+
+    def knowledge_add(self, path: str, title: str = "") -> dict:
+        """添加知识书库文件夹并入库。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api("knowledge_add", [path, title], self.workspace)
+
+    def knowledge_reingest(self, book_id: str) -> dict:
+        """重新整理知识书库。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api("knowledge_reingest", [book_id], self.workspace)
+
+    def knowledge_remove(self, book_id: str) -> dict:
+        """删除知识书库。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api("knowledge_remove", [book_id], self.workspace)
+
+    def knowledge_candidate_review(self, candidate_id: str, decision: str) -> dict:
+        """审核记忆候选（批准/拒绝）。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api("knowledge_candidate_review", [candidate_id, decision], self.workspace)
+
+    # ------------------------------------------------------------------
     # 路径选择器（替代 prompt()）
     # ------------------------------------------------------------------
 

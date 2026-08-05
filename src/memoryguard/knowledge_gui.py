@@ -48,12 +48,17 @@ def _run_ingest_in_thread(root_path: str, book_id: str, job_id: str) -> None:
                 error=result.error,
             )
     except Exception as e:
+        # 异常时 store 已随上下文关闭，必须用新连接写回失败状态（P1-8）
         try:
-            store.update_job(job_id, "failed", phase="complete", error=str(e))
+            with open_shared_knowledge_store() as error_store:
+                error_store.update_job(job_id, "failed", phase="complete", error=str(e))
         except Exception:
             pass
     finally:
-        store.close()
+        try:
+            store.close()
+        except Exception:
+            pass
 
 
 def render_bookshelf_html() -> str:
@@ -512,9 +517,88 @@ def handle_knowledge_api(method: str, args: list[Any],
             ok = store.review_memory_candidate(candidate_id, decision)
             if not ok:
                 return {"error": "candidate not found or invalid decision"}
-            return {"ok": True, "candidate_id": candidate_id, "status": decision}
+            # P1-2 候选闭环：批准时同步到长期记忆，并记录 synced_memory_id
+            synced = None
+            if {"approve": "approved", "reject": "rejected"}.get(decision, decision) == "approved":
+                synced = _sync_candidate_to_memory(store, candidate_id, workspace)
+            return {
+                "ok": True,
+                "candidate_id": candidate_id,
+                "status": decision,
+                "synced_memory_id": synced,
+            }
 
     return {"error": f"unknown knowledge method: {method}"}
+
+
+def _sync_candidate_to_memory(store, candidate_id: str, workspace) -> str | None:
+    """把已批准的候选写入共享长期记忆，返回 memory_id（失败返回 None，不阻塞审核）。
+
+    P1-2 候选闭环：候选经 GovernanceEngine.auto_write 写入共享记忆层，
+    以 candidate_id 作幂等键避免重复写入。未配置共享组时回退个人组。
+    """
+    try:
+        cand = store.get_memory_candidate(candidate_id)
+        if not cand or not (cand.get("content") or "").strip():
+            return None
+        body = str(cand["content"]).strip()
+
+        from pathlib import Path
+        ws = Path(workspace) if workspace else Path.cwd()
+
+        # 解析目标共享组：优先活跃绑定，否则个人组
+        group_id = ""
+        try:
+            from .agent_binding import AgentBindingStore, BindingStatus, personal_group_id
+            binds = AgentBindingStore(ws).list_bindings(include_inactive=False)
+            active = [b for b in binds if getattr(b, "status", None) == BindingStatus.ACTIVE]
+            if active:
+                group_id = active[0].share_group_id
+            actor = active[0].agent_instance_id if active else ""
+        except Exception:
+            actor = ""
+        if not group_id:
+            try:
+                from .agent_binding import personal_group_id as _pg
+                group_id = _pg(actor or "knowledge")
+            except Exception:
+                group_id = "default"
+        if not actor:
+            actor = "knowledge"
+
+        from .governance_engine import GovernanceEngine
+        from .schema_v3 import MemoryEvent, stable_hash, _now_iso
+
+        event = MemoryEvent(
+            event_id=stable_hash("mc-event", candidate_id),
+            agent_instance_id=actor,
+            share_group_id=group_id,
+            raw_content=body,
+            metadata={
+                "source": cand.get("source", ""),
+                "category": cand.get("category", "knowledge"),
+                "confidence": float(cand.get("confidence", 0.5) or 0.5),
+                "knowledge_candidate_id": candidate_id,
+                "book_id": cand.get("book_id", ""),
+            },
+            auto_actions=[],
+            created_at=_now_iso(),
+        )
+        result = GovernanceEngine(ws, group_id).auto_write(
+            event,
+            kind_override="knowledge",
+            write_policy="auto_accept",
+            injection_policy="relevant",
+            idempotency_key=f"knowledge-candidate:{candidate_id}",
+        )
+        if not result.get("ok"):
+            return None
+        memory_id = result.get("memory_id", "")
+        if memory_id:
+            store.set_candidate_synced(candidate_id, memory_id)
+        return memory_id or None
+    except Exception:
+        return None
 
 
 def _escape(s: str) -> str:

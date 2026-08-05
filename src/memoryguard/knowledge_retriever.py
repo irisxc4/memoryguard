@@ -95,18 +95,29 @@ def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dic
 def _vector_results(store: KnowledgeStore, query: str,
                     book_ids: list[str] | None,
                     top_k: int) -> list[dict[str, Any]]:
-    """向量召回（KB2）。provider 不可用或失败时返回空，不阻断 FTS。"""
+    """向量召回（KB2）。provider 不可用或失败时返回空，不阻断 FTS。
+
+    查询必须使用与入库相同的 embedding_space_id（P0-3），否则向量检索接不上
+    存储空间的插头，永远返回空、系统只能靠 FTS。
+    """
     try:
-        from .provider_api import get_provider
+        from .provider_api import get_provider, current_embedding_space_id
         backend = get_provider()
         if backend is None:
+            return []
+        space_id = current_embedding_space_id()
+        if not space_id:
             return []
         query_vec = backend.embed(query)
         if not query_vec:
             return []
-        return store.search_vectors(
+        results = store.search_vectors(
             query_vec, book_ids=book_ids, limit=max(top_k * 10, 50),
+            embedding_space_id=space_id,
         )
+        for r in results:
+            r["embedding_space_id"] = space_id
+        return results
     except Exception:
         # 向量失败不影响 FTS 主流程（PRD §15：向量不可用时回退 FTS）
         return []

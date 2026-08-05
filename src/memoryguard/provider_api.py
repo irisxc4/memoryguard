@@ -139,6 +139,85 @@ class ProviderBackend(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class EmbeddingDescriptor:
+    """Embedding 后端的唯一描述，用于构造向量空间 ID（P0-3）。
+
+    入库与查询必须共用同一 descriptor.space_id，否则向量检索接不上插座。
+    space_id 包含 provider 类型、端点身份、模型、embedding 模型、维度、版本，
+    确保不同端点/模型各有独立向量空间。
+    """
+    provider_type: str = ""
+    endpoint_identity: str = ""
+    model: str = ""
+    embedding_model: str = ""
+    dimension: int = 0
+    version: str = "1"
+
+    @property
+    def space_id(self) -> str:
+        """向量空间 ID：只含确定的身份信息（provider/端点/模型）。
+
+        不包含维度——维度在首次 embed 前未知，写/查两侧无法从配置一致推导，
+        会把向量检索变成"插头插在错误插座"。维度校验在查询时按实际向量进行。
+        """
+        parts = [p for p in (
+            self.provider_type,
+            self.endpoint_identity,
+            self.embedding_model or self.model,
+        ) if p]
+        joined = "|".join(parts) if parts else "default"
+        return f"v{self.version}:{joined}"
+
+
+def _endpoint_identity(api_base: str) -> str:
+    """端点身份：host:port（与路径无关），避免同模型不同端点混空间。"""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(api_base)
+        host = u.hostname or ""
+        port = u.port or ""
+        return f"{host}:{port}" if host else (api_base or "unknown")
+    except Exception:
+        return (api_base or "unknown")
+
+
+def describe_embedding_backend(backend, config: ProviderConfig | None) -> EmbeddingDescriptor:
+    """从后端 + 配置构造 EmbeddingDescriptor。
+
+    入库与查询共同调用，保证 space_id 一致（P0-3）。
+    """
+    cfg = config or _provider_config
+    model = (cfg.model if cfg else "") or getattr(backend, "model", "") or "unknown"
+    emb_model = ((cfg.embedding_model if cfg else "") or model)
+    provider_type = (cfg.provider_type if cfg else "") or type(backend).__name__
+    endpoint = _endpoint_identity(cfg.api_base if cfg else "")
+    # 维度：从配置不可得时，用一个哈希占位（查询端再以实际查询向量维度为准）
+    dim = int(getattr(cfg, "embedding_dimension", 0) or 0) if cfg else 0
+    return EmbeddingDescriptor(
+        provider_type=provider_type,
+        endpoint_identity=endpoint,
+        model=model,
+        embedding_model=emb_model,
+        dimension=dim,
+        version="1",
+    )
+
+
+def current_embedding_space_id() -> str | None:
+    """返回当前配置 provider 的向量空间 ID；未配置时返回 None。
+
+    入库与查询共同调用，保证两侧 space_id 一致（P0-3）。
+    """
+    backend = get_provider()
+    if backend is None:
+        return None
+    try:
+        return describe_embedding_backend(backend, _provider_config).space_id
+    except Exception:
+        return None
+
+
 # ===========================================================================
 # OpenAICompatibleBackend:覆盖 OpenAI / Ollama / vLLM / LM Studio
 # ===========================================================================

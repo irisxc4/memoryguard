@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     line_start INTEGER NOT NULL DEFAULT 0,
     line_end INTEGER NOT NULL DEFAULT 0,
     text_hash TEXT NOT NULL,
+    sensitivity TEXT NOT NULL DEFAULT 'normal',
     active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE,
@@ -127,11 +128,14 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
     candidate_id TEXT PRIMARY KEY,
     book_id TEXT NOT NULL,
     chunk_id TEXT,
+    document_id TEXT NOT NULL DEFAULT '',
+    source_text_hash TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'knowledge',
     confidence REAL NOT NULL DEFAULT 0.5,
     status TEXT NOT NULL DEFAULT 'pending',
+    synced_memory_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     reviewed_at TEXT,
     FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
@@ -197,6 +201,8 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
          "ALTER TABLE documents ADD COLUMN content_role TEXT NOT NULL DEFAULT 'knowledge'"),
         ("documents", "sensitivity",
          "ALTER TABLE documents ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'"),
+        ("chunks", "sensitivity",
+         "ALTER TABLE chunks ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'"),
         ("books", "remote_embedding_allowed",
          "ALTER TABLE books ADD COLUMN remote_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
     ):
@@ -243,11 +249,14 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
                 candidate_id TEXT PRIMARY KEY,
                 book_id TEXT NOT NULL,
                 chunk_id TEXT,
+                document_id TEXT NOT NULL DEFAULT '',
+                source_text_hash TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT 'knowledge',
                 confidence REAL NOT NULL DEFAULT 0.5,
                 status TEXT NOT NULL DEFAULT 'pending',
+                synced_memory_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 reviewed_at TEXT,
                 FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
@@ -255,6 +264,22 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mc_status ON memory_candidates(status)")
     except sqlite3.Error:
         pass
+
+    # 旧 memory_candidates 表补齐 provenance 列（P1-4）
+    try:
+        mc_cols = {row["name"] for row in conn.execute("PRAGMA table_info(memory_candidates)")}
+    except sqlite3.Error:
+        mc_cols = set()
+    for col, ddl in (
+        ("document_id", "ALTER TABLE memory_candidates ADD COLUMN document_id TEXT NOT NULL DEFAULT ''"),
+        ("source_text_hash", "ALTER TABLE memory_candidates ADD COLUMN source_text_hash TEXT NOT NULL DEFAULT ''"),
+        ("synced_memory_id", "ALTER TABLE memory_candidates ADD COLUMN synced_memory_id TEXT NOT NULL DEFAULT ''"),
+    ):
+        if col not in mc_cols:
+            try:
+                conn.execute(ddl)
+            except sqlite3.Error:
+                pass
 
 
 @dataclass
@@ -291,6 +316,7 @@ class Chunk:
     line_start: int = 0
     line_end: int = 0
     text_hash: str = ""
+    sensitivity: str = "normal"
     active: bool = True
 
 
@@ -457,11 +483,13 @@ class KnowledgeStore:
         content_hash: str,
         chunks: list[Chunk],
         content_role: str = "knowledge",
+        sensitivity: str = "normal",
     ) -> None:
         """原子提交一个文档的新整版：内容哈希与 Chunk 替换在同一事务完成。
 
         避免文档哈希先提交、Chunk 替换后失败导致"哈希已更新但旧 Chunk 永不重建"。
         先 DELETE 旧 chunk（而非停用），再插入新 chunk，最后 upsert 文档行。
+        sensitivity 标记该文档片段是否含敏感内容（P0-5 隐私）。
         """
         with self._tx() as conn:
             # 先确保文档行存在（FK），再替换 chunks；整个事务一次性提交
@@ -481,10 +509,11 @@ class KnowledgeStore:
             for c in chunks:
                 conn.execute(
                     """INSERT INTO chunks (chunk_id, document_id, book_id, chapter, section, ordinal,
-                       text, summary, keywords, line_start, line_end, text_hash, active, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
+                       text, summary, keywords, line_start, line_end, text_hash, sensitivity, active, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
                     (c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
-                     c.text, c.summary, c.keywords, c.line_start, c.line_end, c.text_hash, _now_iso()),
+                     c.text, c.summary, c.keywords, c.line_start, c.line_end,
+                     c.text_hash, sensitivity, _now_iso()),
                 )
 
     def get_chunk(self, chunk_id: str) -> Chunk | None:
@@ -526,6 +555,7 @@ class KnowledgeStore:
         sql = """
             SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                    c.text, c.summary, c.keywords, c.line_start, c.line_end,
+                   c.sensitivity AS sensitivity,
                    b.title AS book_title, b.root_path,
                    d.relative_path AS relative_path, d.content_role AS content_role,
                    rank FROM chunks_fts f
@@ -558,6 +588,7 @@ class KnowledgeStore:
         sql = """
             SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                    c.text, c.summary, c.keywords, c.line_start, c.line_end,
+                   c.sensitivity AS sensitivity,
                    b.title AS book_title, b.root_path,
                    d.relative_path AS relative_path, d.content_role AS content_role,
                    0.0 AS rank
@@ -609,28 +640,65 @@ class KnowledgeStore:
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM index_jobs WHERE job_id=?", (job_id,)).fetchone()
 
+    def recover_orphan_jobs(self) -> int:
+        """把长期停留在 running/queued 的孤儿 Job 标记为 failed（P1-8）。
+
+        后台线程异常退出时 Job 可能永久 running；下次以写模式打开共享库时
+        清理这些孤儿，避免 UI 永久显示"索引中"。
+        """
+        import datetime as _dt
+        from datetime import timezone as _tz
+        cutoff = (_dt.datetime.now(_tz.utc) - _dt.timedelta(hours=1)).isoformat()
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE index_jobs SET status='failed', error='orphaned job recovered', "
+                "finished_at=? WHERE status IN ('queued','running') AND started_at < ?",
+                (_now_iso(), cutoff),
+            )
+            return cur.rowcount
+
     # ---- memory_candidates (P1-4) ----
 
     def add_memory_candidate(self, book_id: str, content: str, source: str = "",
                              category: str = "knowledge", confidence: float = 0.5,
-                             chunk_id: str | None = None) -> str:
-        """写入一条记忆候选（待审核）。返回 candidate_id。"""
+                             chunk_id: str | None = None,
+                             document_id: str = "", source_text_hash: str = "") -> str:
+        """写入一条记忆候选（待审核）。返回 candidate_id。
+
+        同一 content 重复写入时保留既有审核状态（INSERT ... DO UPDATE 而非
+        INSERT OR REPLACE），避免用户已审核的候选被重新置回 pending（P1-3）。
+        """
         candidate_id = _stable_hash("mc", book_id, content)
         with self._tx() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO memory_candidates
-                   (candidate_id, book_id, chunk_id, content, source, category, confidence, status, created_at)
-                   VALUES (?,?,?,?,?,?,?,'pending',?)""",
-                (candidate_id, book_id, chunk_id, content, source, category,
-                 confidence, _now_iso()),
+                """INSERT INTO memory_candidates
+                   (candidate_id, book_id, chunk_id, document_id, source_text_hash,
+                    content, source, category, confidence, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,'pending',?)
+                   ON CONFLICT(candidate_id) DO UPDATE SET
+                       chunk_id=excluded.chunk_id,
+                       document_id=excluded.document_id,
+                       source_text_hash=excluded.source_text_hash,
+                       source=excluded.source,
+                       category=excluded.category,
+                       confidence=excluded.confidence""",
+                (candidate_id, book_id, chunk_id, document_id, source_text_hash,
+                 content, source, category, confidence, _now_iso()),
             )
         return candidate_id
+
+    def get_memory_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM memory_candidates WHERE candidate_id=?", (candidate_id,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def list_memory_candidates(self, book_id: str | None = None,
                                status: str = "pending") -> list[dict[str, Any]]:
         """列出记忆候选（默认待审核）。"""
-        sql = ("SELECT candidate_id, book_id, chunk_id, content, source, category, "
-               "confidence, status, created_at, reviewed_at FROM memory_candidates")
+        sql = ("SELECT candidate_id, book_id, chunk_id, document_id, source_text_hash, "
+               "content, source, category, confidence, status, synced_memory_id, "
+               "created_at, reviewed_at FROM memory_candidates")
         params: list[Any] = []
         conds: list[str] = []
         if book_id:
@@ -656,6 +724,14 @@ class KnowledgeStore:
                 (status, _now_iso(), candidate_id),
             )
             return cur.rowcount > 0
+
+    def set_candidate_synced(self, candidate_id: str, memory_id: str) -> None:
+        """记录候选已同步的长期记忆 ID（P1-2）。"""
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE memory_candidates SET synced_memory_id=? WHERE candidate_id=?",
+                (memory_id, candidate_id),
+            )
 
     def count_memory_candidates(self, status: str = "pending") -> int:
         row = self._conn.execute(
@@ -718,6 +794,7 @@ class KnowledgeStore:
             "SELECT e.chunk_id, e.vector, e.dimension, e.text_hash, "
             "c.document_id, c.book_id, c.chapter, c.section, c.ordinal, "
             "c.text, c.summary, c.keywords, c.line_start, c.line_end, "
+            "c.sensitivity AS sensitivity, "
             "b.title AS book_title, b.root_path, "
             "d.relative_path AS relative_path, d.content_role AS content_role "
             "FROM embeddings e "
@@ -775,6 +852,7 @@ def _row_to_chunk(row: sqlite3.Row) -> Chunk:
         text=row["text"], summary=row["summary"], keywords=row["keywords"],
         line_start=row["line_start"], line_end=row["line_end"],
         text_hash=row["text_hash"], active=bool(row["active"]),
+        sensitivity=row["sensitivity"] if "sensitivity" in row.keys() else "normal",
     )
 
 
@@ -832,4 +910,10 @@ def open_shared_knowledge_store(
     db = knowledge_db_path(data_home)
     if must_exist and not db.exists():
         return None
-    return KnowledgeStore(data_home, read_only=read_only)
+    store = KnowledgeStore(data_home, read_only=read_only)
+    if not read_only:
+        try:
+            store.recover_orphan_jobs()
+        except Exception:
+            pass
+    return store

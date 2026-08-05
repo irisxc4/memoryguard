@@ -582,6 +582,9 @@ def build_context_packet(
                 # 非控制面文件才进入普通 KAG Bootstrap（指令文件可浏览但不可注入）
                 if r.get("content_role") == "control_surface":
                     continue
+                # P0-5 隐私：敏感片段默认不注入 Bootstrap（远程/密钥内容不外泄）
+                if r.get("sensitivity") == "sensitive":
+                    continue
                 text = r.get("text", "")
                 if k_chars + len(text) > 6000:
                     break

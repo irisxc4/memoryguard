@@ -102,6 +102,17 @@ class TestSecurityModule:
         assert not is_mutation_method("purge_agent_dir")
         assert not is_mutation_method("get_audit")
 
+    def test_knowledge_mutations_are_gated(self):
+        """P0-4 知识变更方法必须走权限/请求队列门控。"""
+        from memoryguard.security import is_mutation_method, is_allowed_method
+        for m in ("knowledge_add", "knowledge_reingest",
+                  "knowledge_remove", "knowledge_candidate_review"):
+            assert is_mutation_method(m), f"{m} 应为 mutation"
+            assert is_allowed_method(m), f"{m} 应允许"
+        # 只读知识方法不进入变更门控
+        assert not is_mutation_method("knowledge_search")
+        assert not is_mutation_method("knowledge_list")
+
     def test_sandbox_detection(self):
         from memoryguard.security import detect_sandbox_mode
         # 在测试环境中可能为 True（IDE 启动）或 False

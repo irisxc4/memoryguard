@@ -59,7 +59,11 @@ class ParsedDocument:
 
 
 def parse_file(file_path: Path, root: Path) -> ParsedDocument | None:
-    """解析文件，返回 ParsedDocument。不支持的类型返回 None。"""
+    """解析文件，返回 ParsedDocument。不支持的类型返回 None。
+
+    仅供独立使用/测试；入库路径优先用 parse_content 消费已读取的同一字节缓冲，
+    避免哈希与解析基于不同的文件内容（索引一致性）。
+    """
     rel = str(file_path.relative_to(root)).replace("\\", "/")
     ext = file_path.suffix.lower()
 
@@ -72,18 +76,45 @@ def parse_file(file_path: Path, root: Path) -> ParsedDocument | None:
     except OSError:
         return None
 
+    return parse_content(content, relative_path=rel, media_type=media_type)
+
+
+def parse_content(
+    content: bytes | str,
+    *,
+    relative_path: str,
+    media_type: str,
+) -> ParsedDocument | None:
+    """从已读取的内容字节/文本解析文档（P0-2 索引一致性）。
+
+    入库时传入同一份读取字节，保证 content_hash 与 chunk 文本来自同一份内容，
+    避免两次读取之间文件被改动导致哈希/正文错位。
+    """
+    if isinstance(content, bytes):
+        text = content.decode("utf-8", errors="replace")
+    else:
+        text = content
+
+    ext = _ext_of(relative_path)
     if ext in (".md", ".markdown"):
-        return _parse_markdown(rel, media_type, content)
+        return _parse_markdown(relative_path, media_type, text)
     if ext in (".json", ".jsonl"):
-        return _parse_structured(rel, media_type, content)
+        return _parse_structured(relative_path, media_type, text)
     if ext in (".yaml", ".yml"):
-        return _parse_structured(rel, media_type, content)
+        return _parse_structured(relative_path, media_type, text)
     if ext in (".toml",):
-        return _parse_structured(rel, media_type, content)
+        return _parse_structured(relative_path, media_type, text)
     if ext in CODE_EXTENSIONS:
-        return _parse_code(rel, media_type, content)
+        return _parse_code(relative_path, media_type, text)
     # 默认纯文本
-    return _parse_text(rel, media_type, content)
+    return _parse_text(relative_path, media_type, text)
+
+
+def _ext_of(relative_path: str) -> str:
+    try:
+        return Path(relative_path).suffix.lower()
+    except Exception:
+        return ""
 
 
 def _parse_markdown(rel: str, media_type: str, content: str) -> ParsedDocument:

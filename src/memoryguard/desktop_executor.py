@@ -62,6 +62,10 @@ class RequestExecutor:
         "bind_agents_to_shared_group": "批量绑定 Agent 到共享组",
         "unbind_agent": "解除 Agent 绑定",
         "import_external_mcp_entries": "导入外部 MCP 条目",
+        "knowledge_add": "添加知识书库文件夹并入库",
+        "knowledge_reingest": "重新整理知识书库",
+        "knowledge_remove": "删除知识书库",
+        "knowledge_candidate_review": "审核记忆候选（批准/拒绝）",
     }
 
     # 高风险方法（需要额外警告）
