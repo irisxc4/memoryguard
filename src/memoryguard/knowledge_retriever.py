@@ -7,6 +7,7 @@ KB3: 实体命中 + graph 关系扩展（最多两跳）
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .knowledge_store import KnowledgeStore
@@ -68,14 +69,14 @@ def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dic
     每路独立排名，避免不同检索方法分数量纲不一致。
     """
     scores: dict[str, float] = {}
-    methods: dict[str, str] = {}
+    methods: dict[str, list[str]] = {}
     order: dict[str, int] = {}
     seq = 0
     for lst in lists_ranked:
         for rank, r in enumerate(lst):
             cid = r["chunk_id"]
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
-            methods.setdefault(cid, r.get("retrieval_method", "fts"))
+            methods.setdefault(cid, []).append(r.get("retrieval_method", "fts"))
             if cid not in order:
                 order[cid] = seq
                 seq += 1
@@ -86,7 +87,10 @@ def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dic
     fused = []
     for cid, score in sorted(scores.items(), key=lambda x: (-x[1], order[x[0]])):
         r = dict(by_id[cid])
-        r["retrieval_method"] = methods[cid]
+        matched = list(dict.fromkeys(methods.get(cid, [])))  # 去重保序
+        # P1-1 matched_by：完整记录该 chunk 命中的所有检索方法
+        r["matched_by"] = matched
+        r["retrieval_method"] = matched[0] if matched else "fts"
         r["_rrf_score"] = score
         fused.append(r)
     return fused
@@ -132,15 +136,28 @@ def _graph_results(store: KnowledgeStore, query: str,
     except ImportError:
         return []
 
-    # 从 query 找种子实体
-    pattern = f"%{query.strip()}%"
+    # 从 query 找种子实体（P1-7：分词匹配，非整串 LIKE）
+    tokens = _query_tokens(query)
+    if not tokens:
+        return []
+    conds = ["active=1"]
+    params: list[str] = []
+    for tok in tokens:
+        conds.append("name LIKE ?")
+        params.append(f"%{tok}%")
     seed_rows = store._conn.execute(
-        "SELECT entity_id, name FROM entities WHERE active=1 AND name LIKE ?",
-        (pattern,),
+        "SELECT entity_id, name FROM entities WHERE " + " AND ".join(conds),
+        params,
     ).fetchall()
     if not seed_rows:
         return []
 
+    # 命中的实体按相关度优先：整串精确命中 > 前缀 > 其他 token 命中
+    q = query.strip()
+    seed_rows.sort(key=lambda r: (
+        0 if r["name"] == q else 1 if r["name"].startswith(q) else 2,
+        len(r["name"]),
+    ))
     seed_ids = [r["entity_id"] for r in seed_rows[:5]]  # 最多 5 个种子
 
     # 关系扩展
@@ -180,6 +197,40 @@ def _graph_results(store: KnowledgeStore, query: str,
         d["retrieval_method"] = "graph"
         results.append(d)
     return results
+
+
+def _query_tokens(query: str) -> list[str]:
+    """把查询切分为实体匹配 token（P1-7）。
+
+    - 英文单词按词切分
+    - 中文用 bigram 切分（无分词器依赖）
+    - 去重、保序、过滤太短 token
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    tokens: list[str] = []
+    seen: set[str] = set()
+    # 英文单词
+    for w in re.findall(r"[A-Za-z_][A-Za-z0-9_-]{2,}", q):
+        if w not in seen:
+            seen.add(w)
+            tokens.append(w)
+    # 中文 bigram
+    cn = re.sub(r"[A-Za-z0-9_\-\s]", "", q)
+    cn = cn.strip()
+    if len(cn) >= 2:
+        for i in range(len(cn) - 1):
+            bg = cn[i:i + 2]
+            if bg not in seen:
+                seen.add(bg)
+                tokens.append(bg)
+    elif len(cn) == 1 and cn not in seen:
+        tokens.append(cn)
+    # 整串作为兜底 token（英文短语/专名）
+    if q not in seen:
+        tokens.append(q)
+    return tokens
 
 
 def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:

@@ -710,6 +710,10 @@ tbody tr:last-child td { border-bottom: 0; }
       <div class="nav-section-label">操作</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="governance" onclick="switchTab('governance')">治理台</div>
     </nav>
+    <div class="nav-section-label" style="margin:0 10px 6px">知识库</div>
+    <div class="nav-item" role="tab" tabindex="0" onclick="openKnowledge()">知识书库
+      <span class="count" id="knowledge-count"></span>
+    </div>
     <div class="sidebar-footer">
       <div class="reader-toggle">
         <div class="reader-toggle-label">阅读语言</div>
@@ -868,6 +872,26 @@ async function callApi(method, ...args) {
   return result;
 }
 
+// 知识书库入口：跳转到书架页（localhost / pywebview 均可用）。
+// pywebview 下用 window.location 切到 /knowledge；localhost 下同样导航。
+async function openKnowledge() {
+  try {
+    window.location.href = '/knowledge';
+  } catch (_) {
+    // 极端情况：原地刷新
+    window.location.reload();
+  }
+}
+
+async function refreshKnowledgeCount() {
+  try {
+    const data = await callApi('knowledge_candidates_list', '', 'pending');
+    const n = (data && data.total) || 0;
+    const el = document.getElementById('knowledge-count');
+    if (el) el.textContent = n > 0 ? String(n) : '';
+  } catch (_) { /* 知识库未初始化时静默 */ }
+}
+
 // Optional lifecycle endpoints are intentionally feature-detected so an older
 // GUI can still browse the existing rules page while the rule cockpit service
 // is being rolled out.  Mutations still go through callApi (and therefore the
@@ -951,6 +975,7 @@ async function init() {
       renderAll();
     }
   }
+  refreshKnowledgeCount();
 }
 
 async function runAudit() {

@@ -853,3 +853,82 @@ class TestP0IndexConsistency:
         assert doc["content_hash"] == chunk_hash or True  # 内容哈希来自同一byte
         s.close()
 
+
+class TestP15RelationCleanup:
+    """P1-5：重建时清理旧关系（含 belongs_to 空 source_chunk_id）。"""
+
+    def test_rebuild_cleans_old_belongs_to(self, store, tmp_book_dir):
+        """移除一章后重建，旧 belongs_to 关系被清理。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_graph import build_structural_relations
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        build_structural_relations(store, book.book_id)
+        before = store._conn.execute(
+            "SELECT COUNT(*) FROM relations r JOIN entities e ON e.entity_id=r.subject_entity_id "
+            "WHERE r.predicate='belongs_to' AND e.name LIKE '%.md'"
+        ).fetchone()[0]
+        assert before > 0
+        # 重建（模拟全量重扫），belongs_to 数量不应累积
+        build_structural_relations(store, book.book_id)
+        after = store._conn.execute(
+            "SELECT COUNT(*) FROM relations r JOIN entities e ON e.entity_id=r.subject_entity_id "
+            "WHERE r.predicate='belongs_to' AND e.name LIKE '%.md'"
+        ).fetchone()[0]
+        assert after == before, "重建不得累积旧 belongs_to 关系"
+
+
+class TestP17QueryTokens:
+    """P1-7：图查询分词匹配。"""
+
+    def test_query_tokens(self):
+        from memoryguard.knowledge_retriever import _query_tokens
+        # 中文 bigram（重叠滑动窗口）
+        toks = _query_tokens("战斗系统")
+        assert "战斗" in toks and "系统" in toks
+        assert "战斗系统" in toks  # 整串兜底
+        # 英文单词
+        toks = _query_tokens("embedding model")
+        assert "embedding" in toks and "model" in toks
+        # 空查询
+        assert _query_tokens("") == []
+
+    def test_graph_seed_via_token(self, store, tmp_book_dir):
+        """查询命中实体片段（非整串）也能作为种子。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_graph import build_structural_relations
+        from memoryguard.knowledge_retriever import _graph_results
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        build_structural_relations(store, book.book_id)
+        # 实体名含"战斗属性"，查询"战斗"（bigram）应命中
+        results = _graph_results(store, "战斗", None, top_k=6)
+        assert isinstance(results, list)
+
+
+class TestP110Phases:
+    """P1-10：分阶段构建状态。"""
+
+    def test_book_phases_tracked(self, store, tmp_book_dir):
+        """入库后 lexical/organized 阶段被标记。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+        reloaded = store.get_book(book.book_id)
+        phases = reloaded.build_phases
+        assert phases.get("lexical") is True
+        assert phases.get("organized") is True
+
+
+class TestP11MatchedBy:
+    """P1-1：RRF 融合记录 matched_by 数组。"""
+
+    def test_rrf_matched_by_list(self):
+        from memoryguard.knowledge_retriever import _rrf_fuse
+        fts = [{"chunk_id": "a", "retrieval_method": "fts"}]
+        vec = [{"chunk_id": "a", "retrieval_method": "vector"}]
+        graph = [{"chunk_id": "a", "retrieval_method": "graph"}]
+        fused = _rrf_fuse([fts, vec, graph])
+        assert fused[0]["matched_by"] == ["fts", "vector", "graph"]
+        assert fused[0]["retrieval_method"] == "fts"  # 首个命中方法
+

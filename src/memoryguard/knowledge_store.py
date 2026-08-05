@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS books (
     exclude_globs TEXT NOT NULL DEFAULT '',
     auto_extract_memory INTEGER NOT NULL DEFAULT 1,
     vector_enabled TEXT NOT NULL DEFAULT 'auto',
-    remote_embedding_allowed INTEGER NOT NULL DEFAULT 0
+    remote_embedding_allowed INTEGER NOT NULL DEFAULT 0,
+    build_phases TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS documents (
@@ -205,6 +206,8 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
          "ALTER TABLE chunks ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'"),
         ("books", "remote_embedding_allowed",
          "ALTER TABLE books ADD COLUMN remote_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
+        ("books", "build_phases",
+         "ALTER TABLE books ADD COLUMN build_phases TEXT NOT NULL DEFAULT '{}'"),
     ):
         try:
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -300,6 +303,7 @@ class Book:
     auto_extract_memory: bool = True
     vector_enabled: str = "auto"
     remote_embedding_allowed: bool = False
+    build_phases: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -380,17 +384,19 @@ class KnowledgeStore:
     # ---- books ----
 
     def add_book(self, book: Book) -> None:
+        import json
         with self._tx() as conn:
             conn.execute(
                 """INSERT INTO books (book_id, title, root_path, cover_style, description, status,
                    file_count, chapter_count, chunk_count, entity_count, last_indexed_at,
                    created_at, updated_at, include_globs, exclude_globs, auto_extract_memory, vector_enabled,
-                   remote_embedding_allowed)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   remote_embedding_allowed, build_phases)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (book.book_id, book.title, book.root_path, book.cover_style, book.description,
                  book.status, book.file_count, book.chapter_count, book.chunk_count, book.entity_count,
                  book.last_indexed_at, _now_iso(), _now_iso(), book.include_globs, book.exclude_globs,
-                 int(book.auto_extract_memory), book.vector_enabled, int(book.remote_embedding_allowed)),
+                 int(book.auto_extract_memory), book.vector_enabled, int(book.remote_embedding_allowed),
+                 json.dumps(book.build_phases, ensure_ascii=False)),
             )
 
     def get_book(self, book_id: str) -> Book | None:
@@ -403,13 +409,17 @@ class KnowledgeStore:
         rows = self._conn.execute("SELECT * FROM books ORDER BY updated_at DESC").fetchall()
         return [_row_to_book(r) for r in rows]
 
-    def update_book_status(self, book_id: str, status: str, **counts: int) -> None:
+    def update_book_status(self, book_id: str, status: str, **counts: Any) -> None:
+        import json
         sets = ["status=?", "updated_at=?"]
         vals: list[Any] = [status, _now_iso()]
         for k in ("file_count", "chapter_count", "chunk_count", "entity_count", "last_indexed_at"):
             if k in counts:
                 sets.append(f"{k}=?")
                 vals.append(counts[k] if k != "last_indexed_at" else _now_iso())
+        if "build_phases" in counts and isinstance(counts["build_phases"], dict):
+            sets.append("build_phases=?")
+            vals.append(json.dumps(counts["build_phases"], ensure_ascii=False))
         vals.append(book_id)
         with self._tx() as conn:
             conn.execute(f"UPDATE books SET {', '.join(sets)} WHERE book_id=?", vals)
@@ -842,7 +852,20 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         remote_embedding_allowed=bool(
             int(row["remote_embedding_allowed"]) if "remote_embedding_allowed" in row.keys() else 0
         ),
+        build_phases=_parse_phases(row["build_phases"]) if "build_phases" in row.keys() else {},
     )
+
+
+def _parse_phases(raw: str) -> dict[str, bool]:
+    """解析 build_phases JSON，损坏时回退空 dict。"""
+    if not raw:
+        return {}
+    try:
+        import json
+        data = json.loads(raw)
+        return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _row_to_chunk(row: sqlite3.Row) -> Chunk:

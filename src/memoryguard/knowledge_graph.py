@@ -34,7 +34,10 @@ def build_structural_relations(store: KnowledgeStore, book_id: str) -> dict[str,
     """
     stats = {"relations_created": 0}
 
-    # 清理旧的结构化关系（只清理本书 source_chunk_id 关联的）
+    # 清理旧的结构化关系（P1-5）：
+    # 1) 以本书 chunk 为 source 的 mentioned_in/defined_in 关系
+    # 2) 本书文件实体为 subject 的 belongs_to 关系（source_chunk_id 为 NULL，
+    #    仅靠 source_chunk_id 过滤会漏掉，导致重建后残留旧 belongs_to）
     chunk_ids = [
         r["chunk_id"] for r in store._conn.execute(
             "SELECT chunk_id FROM chunks WHERE book_id=? AND active=1",
@@ -47,6 +50,14 @@ def build_structural_relations(store: KnowledgeStore, book_id: str) -> dict[str,
             f"DELETE FROM relations WHERE source_chunk_id IN ({placeholders})",
             chunk_ids,
         )
+    store._conn.execute(
+        """DELETE FROM relations WHERE predicate='belongs_to' AND subject_entity_id IN (
+               SELECT e.entity_id FROM entities e
+               JOIN documents d ON d.relative_path=e.name
+               WHERE d.book_id=? AND d.status='active'
+           )""",
+        (book_id,),
+    )
 
     # 文件 -> belongs_to -> 章节（通过 chunk 的 chapter 字段聚合）
     rows = store._conn.execute(
@@ -133,12 +144,69 @@ def expand_relations(store: KnowledgeStore, entity_ids: list[str],
 
 
 def extract_semantic_relations(store: KnowledgeStore, book_id: str,
-                               provider: Any = None) -> dict[str, int]:
-    """有模型时语义关系抽取（KB3 §6.2，暂留接口）。"""
+                               provider: Any = None,
+                               remote: bool = False) -> dict[str, int]:
+    """有模型时语义关系抽取（KB3 §6.2）。
+
+    对活跃 chunk 调 provider 抽取语义关系，要求返回 JSON：
+    {"relations": [{"subject": "...", "predicate": "...", "object": "..."}]}。
+    以 chunk 为 source 写入 relations 表；抽取失败/无 provider 时返回 0。
+    remote=True 时跳过敏感 chunk（P0-5 隐私）。
+    """
     if provider is None:
         return {"relations_created": 0}
-    # TODO: KB3 §6.2 调 provider 抽取语义关系
-    return {"relations_created": 0}
+
+    rows = store._conn.execute(
+        "SELECT * FROM chunks WHERE book_id=? AND active=1 ORDER BY document_id, ordinal",
+        (book_id,),
+    ).fetchall()
+    if not rows:
+        return {"relations_created": 0}
+
+    from .knowledge_ingestion import parsed_text_of
+    from .knowledge_store import _row_to_chunk
+    from .knowledge_organizer import _parse_model_json
+
+    stats = {"relations_created": 0}
+    for row in rows:
+        chunk = _row_to_chunk(row)
+        if remote and getattr(chunk, "sensitivity", "normal") == "sensitive":
+            continue
+        text = (chunk.text or "").strip()
+        if len(text) < 20:
+            continue
+        system = (
+            "你是知识图谱抽取助手。从给定文本抽取实体间语义关系，只返回 JSON，不要额外文字。"
+            '格式：{"relations": [{"subject": "主语实体", "predicate": "关系(英文动词或短词)", '
+            '"object": "宾语实体"}]}。抽取 0-8 条最有信息量的关系。'
+        )
+        user = f"章节：{chunk.chapter}\n文本：\n{text[:2000]}"
+        try:
+            raw = provider.chat(system, user, max_tokens=300)
+        except Exception:
+            continue
+        parsed = _parse_model_json(raw)
+        if not parsed:
+            continue
+        rels = parsed.get("relations", [])
+        if not isinstance(rels, list):
+            continue
+        for rel in rels:
+            if not isinstance(rel, dict):
+                continue
+            subject = str(rel.get("subject", "")).strip()
+            predicate = str(rel.get("predicate", "")).strip()
+            obj = str(rel.get("object", "")).strip()
+            if not subject or not predicate or not obj:
+                continue
+            subj_id = _ensure_entity(store, subject, "concept")
+            obj_id = _ensure_entity(store, obj, "concept")
+            if not subj_id or not obj_id:
+                continue
+            _add_relation(store, subj_id, predicate, obj_id, chunk.chunk_id,
+                          confidence=0.8)
+            stats["relations_created"] += 1
+    return stats
 
 
 def _ensure_file_entity(store: KnowledgeStore, document_id: str, book_id: str) -> str | None:

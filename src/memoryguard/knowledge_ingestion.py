@@ -221,18 +221,22 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         status = "ready"
     else:
         status = "partial"
+    # P1-10 分阶段状态：lexical(切片) / organized(整理) / vector(向量)
+    phases = dict(book.build_phases or {})
+    phases["lexical"] = True
     store.update_book_status(
         book_id, status,
         file_count=stats["files"],
         chapter_count=stats["chapters"],
         chunk_count=stats["chunks"],
+        build_phases=phases,
     )
 
     # KB3 基础整理：摘要/关键词/实体/结构化关系（无模型规则化，PRD §6.1 永远执行）
     if processed > 0:
         try:
             from .knowledge_organizer import organize_book
-            from .knowledge_graph import build_structural_relations
+            from .knowledge_graph import build_structural_relations, extract_semantic_relations
             # P1-3 模型增强：provider 可用且（本地或已授权远程）时用于生成摘要/关键词/实体
             enhance_provider = _authorized_provider(book.remote_embedding_allowed)
             cfg = _provider_config
@@ -240,17 +244,25 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
                                   and not _is_local_base(cfg.api_base))
             organize_book(store, book_id, provider=enhance_provider, remote=remote_enhance)
             build_structural_relations(store, book_id)
+            # P1-6 语义关系抽取：有 provider 时从 chunk 抽取实体间语义关系
+            extract_semantic_relations(store, book_id, provider=enhance_provider,
+                                       remote=remote_enhance)
+            phases["organized"] = True
+            store.update_book_status(book_id, status, build_phases=phases)
         except Exception:
             # 整理失败不影响入库结果（KB1 核心已完成）
-            pass
+            phases["organized"] = False
+            store.update_book_status(book_id, status, build_phases=phases)
 
     # KB2 向量索引：provider 可用且（本地或已授权远程）时为 chunk 生成 embedding
     if processed > 0 and book.vector_enabled != "off":
         try:
             generate_embeddings(store, book.book_id, book.remote_embedding_allowed)
+            phases["vector"] = True
         except Exception:
             # embedding 失败不影响入库（FTS 仍可用）
-            pass
+            phases["vector"] = False
+        store.update_book_status(book_id, status, build_phases=phases)
 
     store.update_job(job_id, "done", phase="complete", processed=processed)
 
