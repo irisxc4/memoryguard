@@ -163,20 +163,13 @@ TOOLS = [
                 "kind": {"type": "string", "description": "override kind (default: auto-classify). Valid: preference|fact|project|procedure|episode|correction"},
                 "injection_policy": {"type": "string", "enum": ["relevant", "always"], "default": "relevant", "description": "relevant participates in task recall; always is a mandatory rule"},
                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0, "description": "stable ordering within the mandatory rule package"},
-                "audience": {"type": "array", "minItems": 1, "description": "explicit mandatory-rule assignments; required when injection_policy=always", "items": {"type": "object"}},
+                "audience": {"type": "array", "description": "mandatory-rule assignments; omitted always defaults to the trusted current agent", "items": {"type": "object"}},
                 "write_policy": {"type": "string", "description": "write policy: auto_accept (default) | auto_quarantine_on_risk | propose_only. propose_only creates a low_confidence candidate without modifying existing memories"},
                 "metadata": {"type": "object", "description": "optional metadata from agent"},
                 "idempotency_key": {"type": "string", "description": "optional retry key bound to content, metadata, kind and policy"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["body"],
-            "allOf": [{
-                "if": {
-                    "properties": {"injection_policy": {"const": "always"}},
-                    "required": ["injection_policy"],
-                },
-                "then": {"required": ["audience"]},
-            }],
         },
     },
     {
@@ -191,18 +184,11 @@ TOOLS = [
                 "status": {"type": "string", "description": "new status"},
                 "injection_policy": {"type": "string", "enum": ["relevant", "always"], "description": "new injection policy"},
                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "new priority"},
-                "audience": {"type": "array", "minItems": 1, "description": "explicit mandatory-rule assignments; required when transitioning to injection_policy=always", "items": {"type": "object"}},
+                "audience": {"type": "array", "description": "replace mandatory-rule assignments; only allowed for always records", "items": {"type": "object"}},
                 "idempotency_key": {"type": "string", "description": "optional retry key bound to this target and payload"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
             "required": ["memory_id"],
-            "allOf": [{
-                "if": {
-                    "properties": {"injection_policy": {"const": "always"}},
-                    "required": ["injection_policy"],
-                },
-                "then": {"required": ["audience"]},
-            }],
         },
     },
     {
@@ -585,7 +571,7 @@ TOOLS = [
     # --- v3.3 host AI enrichment tools ---
     {
         "name": "memoryguard_list_pending_enrichments",
-        "description": "List pending memory enrichment tasks. For mandatory rules, first group tasks by the exact assignments in input.assignments: produce one consolidated scope bundle, keep every independent constraint, remove inherited/semantic duplicates, and mark replaced tasks with supersedes_task_ids. True conflicts stay separate. Then call apply_enrichments — do not ask the user to pick a CLI.",
+        "description": "List pending memory enrichment tasks. Skill path: after build_and_enrich returns host_action_required, YOU (host agent) must classify+translate each task and call apply_enrichments — do not ask the user to pick a CLI.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -598,7 +584,7 @@ TOOLS = [
     },
     {
         "name": "memoryguard_apply_enrichments",
-        "description": "Apply host-agent enrichment results to Memory IR / SharedMemoryStore. Ordinary result: task_id, kind, title, body, confidence. A consolidated mandatory scope bundle additionally supplies supersedes_task_ids and matching supersedes_memory_ids; application atomically replaces/shadows those old rules. After applying, call memoryguard_build_and_enrich again.",
+        "description": "Apply host-agent enrichment results to Memory IR / SharedMemoryStore. Each result: task_id, kind, title, body, confidence. After YOU enrich pending tasks, call this then memoryguard_build_and_enrich again to refresh the graph.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -615,16 +601,6 @@ TOOLS = [
                             "body": {"type": "string", "description": "translated/organized body"},
                             "confidence": {"type": "number", "description": "0.0-1.0"},
                             "rationale": {"type": "string"},
-                            "supersedes_task_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "pending tasks atomically replaced by this same-scope bundle",
-                            },
-                            "supersedes_memory_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "memory IDs corresponding exactly to supersedes_task_ids",
-                            },
                         },
                         "required": ["task_id", "kind", "title", "body"],
                     },
@@ -650,7 +626,7 @@ TOOLS = [
     # --- v3.3 build projection + auto enrich ---
     {
         "name": "memoryguard_build_and_enrich",
-        "description": "Build memory projection. Default enrich_mode=host: YOU are the LLM. If pending_tasks / host_action_required, classify and organize ordinary memories; consolidate mandatory rules into one versioned bundle per exact scope, then call apply_enrichments and build again. Multi-agent GUI may pass enrich_mode=cli with a chosen Agent CLI.",
+        "description": "Build memory projection. Default enrich_mode=host: YOU are the LLM. If pending_tasks / host_action_required, immediately classify+translate, call apply_enrichments, then call this again. Multi-agent GUI may pass enrich_mode=cli with a chosen Agent CLI. Do not require a separate AI-整理 button.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1278,12 +1254,12 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "memory_id": t["memory_id"],
                 "ops": t["ops"],
                 "input": t["input"],
-                "hint": "ordinary memory: classify/translate. mandatory rules: group identical input.assignments into one versioned bundle; keep all independent constraints, remove duplicates, and return supersedes_task_ids + supersedes_memory_ids for replaced tasks; never auto-resolve a true conflict",
+                "hint": "classify kind + translate title/body to user's language; return task_id, kind, title_zh, body_zh, confidence",
             })
         result = {
             "pending_count": len(simplified),
             "tasks": simplified,
-            "next_step": "consolidate mandatory rules per exact scope, classify/translate ordinary memories, then call memoryguard_apply_enrichments",
+            "next_step": "classify/translate then call memoryguard_apply_enrichments",
         }
         return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
@@ -1298,19 +1274,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             workspace, results,
             agent_instance_id=agent_id, share_group_id=share_group_id,
         )
-        if stats.get("build_status") == "reconciliation_failed":
-            stats["next_step"] = "统一收敛失败；保持候选状态，禁止宣称 canonical_ready"
-        elif stats.get("rebuild_suggested"):
+        if stats.get("rebuild_suggested"):
             stats["next_step"] = "call build_projection / memoryguard_build_and_enrich to refresh graph"
-        response = {
-            "content": [{
-                "type": "text",
-                "text": json.dumps(stats, ensure_ascii=False, indent=2),
-            }],
-        }
-        if stats.get("build_status") == "reconciliation_failed":
-            response["isError"] = True
-        return response
+        return {"content": [{"type": "text", "text": json.dumps(stats, ensure_ascii=False, indent=2)}]}
 
     if name == "memoryguard_enrichment_status":
         from .host_enrichment import get_status
@@ -1342,30 +1308,12 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             llm_cli=llm_cli,
         )
         if "error" in result:
-            if result.get("build_status") == "reconciliation_failed":
-                failure = {
-                    "projection_built": False,
-                    "build_status": result.get("build_status"),
-                    "reconciliation": result.get("reconciliation"),
-                    "enrichment": result.get("enrichment", {}),
-                    "error": result.get("error", "rule reconciliation failed"),
-                }
-                return {
-                    "content": [{
-                        "type": "text",
-                        "text": json.dumps(failure, ensure_ascii=False, indent=2),
-                    }],
-                    "isError": True,
-                }
             return _mcp_error(result["error"])
         enr = result.get("enrichment", {}) or {}
         pending_tasks = enr.get("pending_tasks") or []
         host_needed = bool(enr.get("host_action_required") or pending_tasks)
-        build_status = result.get("build_status") or enr.get("build_status", "")
         summary = {
-            "projection_built": build_status != "reconciliation_failed",
-            "build_status": build_status,
-            "reconciliation": result.get("reconciliation") or enr.get("reconciliation"),
+            "projection_built": True,
             "node_count": len(result.get("nodes", [])),
             "scoped_record_count": result.get("scoped_record_count", 0),
             "enrichment": {
@@ -1376,7 +1324,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             "host_protocol": {
                 "you_are_the_llm": True,
                 "steps": [
-                    "If host_action_required: organize ordinary memories and consolidate mandatory rules per exact scope (one bundle + supersedes lists)",
+                    "If host_action_required: classify+translate each pending_task yourself (kind/title/body/confidence)",
                     "Call memoryguard_apply_enrichments with results",
                     "Call memoryguard_build_and_enrich again to refresh the neuron graph",
                 ],
@@ -1384,8 +1332,6 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             "next_step": (
                 "HOST ACTION REQUIRED: you are the enricher. Apply enrichments then rebuild."
                 if host_needed
-                else "规则候选待统一收敛；不得显示为 canonical_ready。"
-                if build_status == "rule_candidates_pending"
                 else f"构建完成；已整理 {enr.get('auto_applied', 0)} 条。"
             ),
         }
@@ -1707,20 +1653,12 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
             return {"content": [{"type": "text", "text": f"error: invalid kind '{kind_override}'. Valid: {sorted(_VALID_KINDS)}"}], "isError": True}
     try:
         injection_policy, priority = validate_injection_settings(injection_policy, priority)
-        if injection_policy == "always" and not audience:
-            raise ValueError(
-                "injection_policy=always requires a non-empty explicit audience"
-            )
         if audience is not None and injection_policy != "always":
             raise ValueError("audience is only valid for injection_policy=always")
         requested_audience = (
             _authorized_audience(audience, memory_id="pending", actor_agent_id=args["agent_instance_id"], is_admin=bool(access_ctx and access_ctx.is_admin))
             if audience is not None else []
         )
-        if injection_policy == "always" and not requested_audience:
-            raise ValueError(
-                "injection_policy=always requires a non-empty explicit audience"
-            )
     except ValueError as exc:
         return _mcp_error(str(exc))
 
@@ -1747,7 +1685,11 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
         injection_policy=injection_policy,
         priority=priority,
         rule_assignments=(
-            requested_audience if injection_policy == "always" else []
+            requested_audience or ([{
+                "target_type": "agent",
+                "target_id": args["agent_instance_id"],
+                "effect": "include",
+            }] if injection_policy == "always" else [])
         ),
         idempotency_key=str(args.get("idempotency_key", "") or ""),
     )
@@ -1784,7 +1726,6 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
     kind = args.get("kind")
     status = args.get("status")
     injection_policy = args.get("injection_policy")
-    injection_policy_explicit = injection_policy is not None
     priority = args.get("priority")
     audience = args.get("audience")
     decision_actor = f"agent:{args.get('agent_instance_id', '') or 'unknown'}"
@@ -1825,10 +1766,6 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
             )
         except ValueError as exc:
             return _mcp_error(str(exc))
-        if not prepared_audience:
-            return _mcp_error(
-                "injection_policy=always requires a non-empty explicit audience"
-            )
 
     if any(value is not None for value in (injection_policy, priority, audience)):
         if any(value is not None for value in (body, kind, status)):
@@ -1839,25 +1776,14 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
         target_priority = (
             priority if priority is not None else current.priority
         )
-        transition_idempotency_key = str(
-            args.get("idempotency_key", "") or ""
-        ).strip()
         target_audience = prepared_audience
-        if (
-            target_policy == "always"
-            and target_audience is None
-            and not injection_policy_explicit
-        ):
-            # A priority-only update does not redefine policy or audience.
-            # Preserve the already-authorized assignment set.  Explicitly
-            # declaring ``injection_policy=always`` still requires the caller
-            # to restate a non-empty audience and therefore fails closed.
+        if target_policy == "always" and target_audience is None:
             existing = engine.store.list_rule_assignments(memory_id)
-            target_audience = [item.to_dict() for item in existing]
-        if target_policy == "always" and not target_audience:
-            return _mcp_error(
-                "injection_policy=always requires a non-empty explicit audience"
-            )
+            target_audience = [item.to_dict() for item in existing] or [{
+                "target_type": "agent",
+                "target_id": args["agent_instance_id"],
+                "effect": "include",
+            }]
         transition_at = _now_iso()
         audience_summary = sorted(
             (
@@ -1872,8 +1798,7 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
             event_id=stable_hash(
                 "mcp-rule-transition", memory_id,
                 args["agent_instance_id"], target_policy,
-                str(target_priority),
-                transition_idempotency_key or transition_at,
+                str(target_priority), transition_at,
             ),
             actor=decision_actor,
             action="agent_rule_transition",
@@ -1888,32 +1813,20 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
             created_at=transition_at,
         )
         try:
-            transition_result = (
+            updated_record, updated_assignments = (
                 engine.store.transition_injection_policy(
                     memory_id, target_policy, target_priority,
                     assignments=target_audience or [],
                     decision=transition_decision,
-                    idempotency_key=transition_idempotency_key,
-                    return_result=True,
                 )
             )
-            updated_record, updated_assignments, atomic = transition_result
-        except (TypeError, ValueError, RuntimeError) as exc:
+        except ValueError as exc:
             return _mcp_error(str(exc))
         payload = {
             "ok": True, "record": updated_record.to_dict(),
             "assignments": [
                 item.to_dict() for item in updated_assignments
             ],
-            "decision_id": (
-                atomic.get("decision", {}).get("decision_id", "")
-                if isinstance(atomic, dict) else ""
-            ),
-            "event_id": atomic.get("event_id", "") if isinstance(atomic, dict) else "",
-            "idempotency_key": transition_idempotency_key,
-            "idempotent_replay": bool(
-                atomic.get("idempotent_replay", False)
-            ) if isinstance(atomic, dict) else False,
         }
         return {"content": [{"type": "text", "text": json.dumps(
             payload, ensure_ascii=False, indent=2,
@@ -2091,27 +2004,13 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         return _mcp_error(str(exc))
     # Project the feedback into the rule-intelligence layer now.  The outbox
-    # row was written atomically with the feedback, so a failure is safe to
-    # defer to the next scan, but it must remain visible to the MCP caller.
-    projection: dict[str, Any]
+    # row was written atomically with the feedback, and consumption is
+    # idempotent, so a failure here is safe to defer to the next scan.
     try:
         from .rule_merge import RuleMergeService, RuleMergeStore
-        projection_summary = RuleMergeService(
-            RuleMergeStore(workspace)
-        ).consume_outbox(workspace)
-        projection = {
-            "status": "projected",
-            "error": "",
-            "summary": projection_summary,
-            "outbox_recovery": "available",
-        }
-    except Exception as exc:
-        projection = {
-            "status": "pending",
-            "error": f"{type(exc).__name__}: {exc}",
-            "summary": {},
-            "outbox_recovery": "available",
-        }
+        RuleMergeService(RuleMergeStore(workspace)).consume_outbox(workspace)
+    except Exception:
+        pass
     payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
     # Keep the original feedback fields at the top-level for existing MCP
     # clients while exposing the lifecycle decision/narrowing result.
@@ -2128,15 +2027,6 @@ def _handle_rule_feedback(args: dict[str, Any]) -> dict[str, Any]:
     payload["outcome"] = outcome
     payload["actor"] = actor
     payload["evidence"] = evidence
-    payload["projection"] = projection
-    if projection["status"] == "pending":
-        return {
-            "content": [{
-                "type": "text",
-                "text": json.dumps(payload, ensure_ascii=False, indent=2),
-            }],
-            "isError": True,
-        }
     if getattr(result, "status", None) == "blocked" or (
         isinstance(result, dict) and result.get("status") == "blocked"
     ):
