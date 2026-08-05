@@ -155,6 +155,14 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
             # 整理失败不影响入库结果（KB1 核心已完成）
             pass
 
+    # KB2 向量索引：provider 可用时为 chunk 生成 embedding
+    if processed > 0 and book.vector_enabled != "off":
+        try:
+            generate_embeddings(store, book_id)
+        except Exception:
+            # embedding 失败不影响入库（FTS 仍可用）
+            pass
+
     store.update_job(job_id, "done", phase="complete", processed=processed)
 
     return IngestionResult(
@@ -166,6 +174,73 @@ def ingest_book(store: KnowledgeStore, book_id: str) -> IngestionResult:
         chunks_created=chunks_created,
         chapters=chapters,
     )
+
+
+def generate_embeddings(store: KnowledgeStore, book_id: str) -> int:
+    """为缺少 embedding 的 chunk 批量生成向量（KB2）。
+
+    返回生成的 embedding 数量。provider 不可用时返回 0。
+    可单独调用，便于 GUI "重新智能整理" 触发。
+    """
+    from .provider_api import get_provider
+
+    backend = get_provider()
+    if backend is None:
+        return 0
+
+    # 确定 embedding_model 名称
+    model_name = "unknown"
+    try:
+        from .provider_api import _provider_config
+        if _provider_config is not None:
+            model_name = (_provider_config.embedding_model
+                          or _provider_config.model
+                          or "unknown")
+    except Exception:
+        pass
+
+    # 列出需要 embedding 的 chunk（text_hash 变化则需重建）
+    rows = store.list_chunks_without_embedding(book_id, model_name)
+    if not rows:
+        return 0
+
+    chunk_ids = [r["chunk_id"] for r in rows]
+    text_hashes = [r["text_hash"] for r in rows]
+
+    # 获取 chunk 文本，拼装 embedding 输入
+    # PRD §4.3: embedding 输入 = 书名 + 文件名 + 章节路径 + 正文
+    book = store.get_book(book_id)
+    book_title = book.title if book else ""
+    texts: list[str] = []
+    for cid in chunk_ids:
+        chunk = store.get_chunk(cid)
+        if chunk:
+            text = f"{book_title} {chunk.chapter} {chunk.section}\n{chunk.text}"
+            texts.append(text)
+        else:
+            texts.append("")
+
+    try:
+        vectors = backend.embed_many(texts)
+    except Exception:
+        return 0
+
+    if len(vectors) != len(chunk_ids):
+        return 0
+
+    count = 0
+    for cid, vec, th in zip(chunk_ids, vectors, text_hashes):
+        if not vec:
+            continue
+        store.upsert_embedding(
+            chunk_id=cid,
+            embedding_model=model_name,
+            dimension=len(vec),
+            vector=vec,
+            text_hash=th,
+        )
+        count += 1
+    return count
 
 
 def _scan_files(root: Path, include_globs: str, exclude_globs: str) -> list[Path]:

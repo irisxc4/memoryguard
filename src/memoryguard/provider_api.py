@@ -134,6 +134,10 @@ class ProviderBackend(Protocol):
         """生成文本 embedding 向量。"""
         ...
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """批量生成 embedding（KB2）。默认实现循环调用 embed。"""
+        ...
+
 
 # ===========================================================================
 # OpenAICompatibleBackend:覆盖 OpenAI / Ollama / vLLM / LM Studio
@@ -179,6 +183,19 @@ class OpenAICompatibleBackend:
         )
         return resp["data"][0]["embedding"]
 
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """批量 embedding（KB2）。OpenAI /embeddings 原生支持 input 为 list。"""
+        if not texts:
+            return []
+        model = self.config.embedding_model or self.config.model
+        body = {"model": model, "input": texts}
+        resp = _http_post_json(
+            f"{self.base}/embeddings", body, self.headers, self.config.timeout,
+        )
+        # 按 index 排序确保顺序与输入一致
+        data = sorted(resp["data"], key=lambda d: d.get("index", 0))
+        return [d["embedding"] for d in data]
+
 
 # ===========================================================================
 # AnthropicBackend:Anthropic Claude
@@ -217,6 +234,12 @@ class AnthropicBackend:
         # Anthropic 暂无 embedding API,回退 HashBackend
         from .semantic_dedup import HashBackend
         return HashBackend().embed_text(text)
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        """批量 embedding（KB2）：Anthropic 无 embedding API，逐个回退 HashBackend。"""
+        from .semantic_dedup import HashBackend
+        backend = HashBackend()
+        return [backend.embed_text(t) for t in texts]
 
 
 # ===========================================================================

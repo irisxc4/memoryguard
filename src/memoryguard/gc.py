@@ -1,4 +1,4 @@
-"""`.memoryguard/` garbage collection with reconstructable-first retention.
+"""data_home 工件目录 garbage collection with reconstructable-first retention.
 
 Default behaviour is dry-run: callers must explicitly confirm before deletion.
 Never touches ``cleanup/archived-agents/``, ``ir/current.json``, or ``ir/distilled.json``.
@@ -14,10 +14,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .data_home import get_artifacts_dir
 from .schema_v3 import _now_iso
 
-MG_DIR = ".memoryguard"
-GC_HISTORY_DIR = f"{MG_DIR}/gc-history"
+MG_DIR = ".memoryguard"  # 旧目录名，保留仅用于历史路径检测
+GC_HISTORY_DIR = "gc-history"  # 相对 artifacts dir（KB6）
 
 PLAN_RETENTION_DAYS = 7
 DECISIONS_ROTATE_BYTES = 10 * 1024 * 1024
@@ -134,7 +135,8 @@ class MemoryGuardGc:
         plan_retention_days: int = PLAN_RETENTION_DAYS,
     ) -> None:
         self.workspace = Path(workspace).resolve()
-        self.mg_dir = self.workspace / MG_DIR
+        # KB6: 工件目录在 data_home/projects/<hash>/，不再用 workspace/.memoryguard/
+        self.mg_dir = get_artifacts_dir(self.workspace)
         self.older_than_days = older_than_days
         self.keep_releases = keep_releases
         self.keep_snapshots = keep_snapshots
@@ -161,7 +163,7 @@ class MemoryGuardGc:
         if plan.dry_run:
             return {"ok": False, "error": "apply refused: plan is dry_run"}
 
-        history_dir = self.workspace / GC_HISTORY_DIR
+        history_dir = self.mg_dir / GC_HISTORY_DIR
         history_dir.mkdir(parents=True, exist_ok=True)
         ts = _now_iso().replace(":", "-")
         history_path = history_dir / f"{ts}.json"

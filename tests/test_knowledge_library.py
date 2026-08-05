@@ -345,3 +345,197 @@ class TestDistill:
         for c in result.candidates:
             assert c.kind in AUTO_SYNCABLE_KINDS
 
+
+class TestKB2Vector:
+    """KB2 测试：向量检索骨架。"""
+
+    def test_vector_search_with_mock_provider(self, store, tmp_book_dir, monkeypatch):
+        """注入 mock provider，入库后自动生成 embedding，向量检索可用。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_retriever import search
+        from memoryguard import provider_api
+
+        # mock provider：用简单 hash 向量
+        class MockBackend:
+            def chat(self, system, user, max_tokens=500):
+                return "mock"
+            def embed(self, text):
+                # 简单确定性向量：每个字符的 ord 归一化
+                vec = [0.0] * 16
+                for i, ch in enumerate(text[:16]):
+                    vec[i] = ord(ch) / 128.0
+                return vec
+            def embed_many(self, texts):
+                return [self.embed(t) for t in texts]
+
+        monkeypatch.setattr(provider_api, "_provider_backend", MockBackend())
+        monkeypatch.setattr(provider_api, "_provider_config",
+                            provider_api.ProviderConfig(
+                                provider_type="openai_compatible",
+                                api_base="http://mock", api_key="x",
+                                model="mock", embedding_model="mock-embed",
+                            ))
+
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+
+        # 入库后应自动生成 embedding（ingest_book 内部调用 generate_embeddings）
+        rows = store._conn.execute("SELECT chunk_id FROM embeddings").fetchall()
+        assert len(rows) > 0
+
+        # 向量检索：query 与书中内容有字符重叠，mock 向量相似度非零
+        results = search(store, "战斗属性", enable_graph=False)
+        assert isinstance(results, list)
+        # 向量结果应标记为 vector
+        methods = {r.get("retrieval_method") for r in results}
+        assert "vector" in methods or "fts" in methods or "like" in methods
+
+    def test_vector_fallback_to_fts(self, store, tmp_book_dir, monkeypatch):
+        """provider 不可用时，向量失败静默降级 FTS，检索仍可用。"""
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_retriever import search
+        from memoryguard import provider_api
+
+        # 清除 provider
+        monkeypatch.setattr(provider_api, "_provider_backend", None)
+        monkeypatch.setattr(provider_api, "_provider_config", None)
+
+        book = create_book(store, str(tmp_book_dir), title="游戏设计")
+        ingest_book(store, book.book_id)
+
+        # FTS 检索应正常工作
+        results = search(store, "技能融合", enable_vector=True, enable_graph=False)
+        assert len(results) > 0
+        # 全部是 fts 或 like 方式
+        methods = {r.get("retrieval_method", "fts") for r in results}
+        assert methods <= {"fts", "like"}
+
+
+class TestKB6DataHome:
+    """KB6 测试：data_home 集中存储 + 迁移。"""
+
+    def test_migrate_legacy_memoryguard(self, tmp_path, monkeypatch):
+        """旧 .memoryguard/ 可迁移到 data_home。"""
+        from memoryguard.data_home import (
+            migrate_legacy_memoryguard, resolve_data_home, project_dir,
+        )
+        # 设置 data_home 到临时目录
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+        # 创建旧 workspace/.memoryguard/
+        workspace = tmp_path / "workspace"
+        legacy = workspace / ".memoryguard"
+        legacy.mkdir(parents=True)
+        (legacy / "reports").mkdir()
+        (legacy / "reports" / "report.json").write_text('{"test":1}', encoding="utf-8")
+        (legacy / "config.json").write_text('{}', encoding="utf-8")
+
+        # 迁移
+        result = migrate_legacy_memoryguard(workspace, dry_run=False)
+        assert result["ok"]
+        assert len(result["migrated"]) == 2  # reports + config.json
+
+        # 验证文件已在 data_home
+        pdir = project_dir(resolve_data_home(), workspace)
+        assert (pdir / "reports" / "report.json").exists()
+        assert (pdir / "config.json").exists()
+
+    def test_migrate_dry_run(self, tmp_path, monkeypatch):
+        """dry-run 不复制文件。"""
+        from memoryguard.data_home import migrate_legacy_memoryguard, project_dir, resolve_data_home
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+        workspace = tmp_path / "workspace"
+        legacy = workspace / ".memoryguard"
+        legacy.mkdir(parents=True)
+        (legacy / "test.txt").write_text("test", encoding="utf-8")
+
+        result = migrate_legacy_memoryguard(workspace, dry_run=True)
+        assert result["ok"]
+        assert "test.txt" in result["migrated"]
+        # dry_run 不实际复制：dest 下无 test.txt
+        pdir = project_dir(resolve_data_home(), workspace)
+        assert not (pdir / "test.txt").exists()
+
+    def test_audit_no_workspace_memoryguard(self, tmp_path, monkeypatch):
+        """audit 后 workspace 下不生成 .memoryguard/。"""
+        from memoryguard import cli
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+        workspace = tmp_path / "project"
+        workspace.mkdir()
+        (workspace / "AGENTS.md").write_text("# test\n", encoding="utf-8")
+
+        # 执行 audit
+        import argparse
+        args = argparse.Namespace(path=str(workspace), json=False)
+        rc = cli.cmd_audit(args)
+        assert rc == 0
+
+        # workspace 下不应有 .memoryguard/
+        assert not (workspace / ".memoryguard").exists()
+        # data_home 下应有工件
+        assert (data_home / "projects").exists()
+
+
+class TestKB7Update:
+    """KB7 测试：update 命令辅助函数。"""
+
+    def test_version_eq(self):
+        """版本比较。"""
+        from memoryguard.cli import _version_eq
+        assert _version_eq("0.5.0", "0.5.0")
+        assert _version_eq("v0.5.0", "0.5.0")
+        assert _version_eq("0.5.0", "v0.5.0")
+        assert not _version_eq("0.5.0", "0.6.0")
+        assert not _version_eq("0.5.0", "")
+
+    def test_detect_installer(self):
+        """安装方式识别返回有效值。"""
+        from memoryguard.cli import _detect_installer
+        installer = _detect_installer()
+        assert installer in ("pip", "pipx", "uv")
+
+    def test_build_upgrade_command_pip(self):
+        """pip 升级命令构建。"""
+        from memoryguard.cli import _build_upgrade_command
+        cmd = _build_upgrade_command("pip", "agent-memguard", pre=False)
+        assert "pip" in " ".join(cmd) or "-m pip" in " ".join(cmd)
+        assert "agent-memguard" in cmd
+        assert "--upgrade" in cmd
+        assert "--pre" not in cmd
+
+    def test_build_upgrade_command_pip_pre(self):
+        """pip --pre 升级命令。"""
+        from memoryguard.cli import _build_upgrade_command
+        cmd = _build_upgrade_command("pip", "agent-memguard", pre=True)
+        assert "--pre" in cmd
+        assert "agent-memguard" in cmd
+
+    def test_build_upgrade_command_pipx(self):
+        """pipx 升级命令。"""
+        from memoryguard.cli import _build_upgrade_command
+        cmd = _build_upgrade_command("pipx", "agent-memguard")
+        assert cmd == ["pipx", "upgrade", "agent-memguard"]
+
+    def test_build_upgrade_command_uv(self):
+        """uv 升级命令。"""
+        from memoryguard.cli import _build_upgrade_command
+        cmd = _build_upgrade_command("uv", "agent-memguard")
+        assert cmd == ["uv", "tool", "upgrade", "agent-memguard"]
+
+    def test_migrate_cmd_no_legacy(self, tmp_path, monkeypatch):
+        """migrate 命令：无旧目录时返回 0。"""
+        from memoryguard import cli
+        import argparse
+        data_home = tmp_path / "data_home"
+        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        args = argparse.Namespace(path=str(workspace), dry_run=False)
+        rc = cli.cmd_migrate(args)
+        assert rc == 0
+

@@ -111,7 +111,7 @@ def open_native_window(html_content: str, title: str = "MemoryGuard") -> int:
 # ---------------------------------------------------------------------------
 
 import json as _json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from .interactive import render_interactive_html
 
 
@@ -417,6 +417,25 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 self.wfile.write(html_bytes)
             elif parsed.path == "/api/health":
                 self._json_response(200, {"ok": True, "sandbox": is_sandbox})
+            elif parsed.path == "/knowledge":
+                # KB5 知识书库书架页
+                from .knowledge_gui import render_bookshelf_html
+                html = render_bookshelf_html().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+            elif parsed.path.startswith("/knowledge/book/"):
+                # KB5 知识书库详情页
+                from .knowledge_gui import render_book_detail_html
+                book_id = unquote(parsed.path[len("/knowledge/book/"):])
+                html = render_book_detail_html(book_id).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
             else:
                 # 静态文件服务(cytoscape.min.js 等)
                 req_path = parsed.path.lstrip("/")
@@ -448,8 +467,10 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 self._json_response(403, {"error": "invalid_session_token"})
                 return
 
-            # 验证方法白名单
-            if not is_allowed_method(method):
+            # 验证方法白名单（KB5 知识书库 API 走单独路由，跳过白名单）
+            from .knowledge_gui import is_knowledge_method
+            is_knowledge = is_knowledge_method(method)
+            if not is_allowed_method(method) and not is_knowledge:
                 self._json_response(501, {"error": f"unknown method: {method}"})
                 return
 
@@ -459,6 +480,16 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
                 args = _json.loads(body.decode("utf-8")) if body else []
             except Exception as e:
                 self.send_error(400, str(e))
+                return
+
+            # KB5 知识书库 API 路由
+            if is_knowledge:
+                from .knowledge_gui import handle_knowledge_api
+                try:
+                    result = handle_knowledge_api(method, args, workspace)
+                    self._json_response(200, result if result is not None else {})
+                except Exception as e:
+                    self._json_response(500, {"error": str(e)})
                 return
 
             # 特殊方法：请求队列管理

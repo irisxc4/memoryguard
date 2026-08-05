@@ -458,6 +458,83 @@ class KnowledgeStore:
     def get_job(self, job_id: str) -> sqlite3.Row | None:
         return self._conn.execute("SELECT * FROM index_jobs WHERE job_id=?", (job_id,)).fetchone()
 
+    # ---- embeddings (KB2) ----
+
+    def upsert_embedding(self, chunk_id: str, embedding_model: str,
+                         dimension: int, vector: list[float],
+                         text_hash: str) -> None:
+        """存储或更新 chunk 的 embedding（KB2）。vector 为 float 列表。"""
+        import struct
+        blob = struct.pack(f"{len(vector)}f", *vector) if vector else b""
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings "
+                "(chunk_id, embedding_model, dimension, vector, text_hash, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (chunk_id, embedding_model, dimension, blob, text_hash, _now_iso()),
+            )
+
+    def get_embedding(self, chunk_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM embeddings WHERE chunk_id=?", (chunk_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_chunks_without_embedding(self, book_id: str,
+                                      embedding_model: str) -> list[sqlite3.Row]:
+        """列出需要生成 embedding 的 chunk（KB2，text_hash 变化则需重建）。"""
+        return self._conn.execute(
+            "SELECT c.chunk_id, c.text_hash FROM chunks c "
+            "WHERE c.book_id=? AND c.active=1 "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM embeddings e WHERE e.chunk_id=c.chunk_id "
+            "  AND e.embedding_model=? AND e.text_hash=c.text_hash"
+            ")",
+            (book_id, embedding_model),
+        ).fetchall()
+
+    def search_vectors(self, query_vec: list[float],
+                       book_ids: list[str] | None = None,
+                       limit: int = 30) -> list[dict[str, Any]]:
+        """Python cosine 相似度向量检索（KB2，无 sqlite-vec 依赖）。"""
+        q_norm = _vector_norm(query_vec)
+        if q_norm == 0.0:
+            return []
+        sql = (
+            "SELECT e.chunk_id, e.vector, e.dimension, e.text_hash, "
+            "c.document_id, c.book_id, c.chapter, c.section, c.ordinal, "
+            "c.text, c.summary, c.keywords, c.line_start, c.line_end, "
+            "b.title AS book_title, b.root_path, "
+            "d.relative_path AS relative_path "
+            "FROM embeddings e "
+            "JOIN chunks c ON c.chunk_id=e.chunk_id "
+            "JOIN books b ON b.book_id=c.book_id "
+            "JOIN documents d ON d.document_id=c.document_id "
+            "WHERE c.active=1"
+        )
+        params: list[Any] = []
+        if book_ids:
+            placeholders = ",".join("?" * len(book_ids))
+            sql += f" AND c.book_id IN ({placeholders})"
+            params.extend(book_ids)
+        rows = self._conn.execute(sql, params).fetchall()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in rows:
+            vec = _deserialize_vector(row["vector"], row["dimension"])
+            v_norm = _vector_norm(vec)
+            if v_norm == 0.0:
+                continue
+            dot = sum(a * b for a, b in zip(query_vec, vec))
+            sim = dot / (q_norm * v_norm)
+            d = dict(row)
+            d.pop("vector", None)
+            d.pop("dimension", None)
+            d["rank"] = -sim  # 与 FTS5 rank 一致：越小越好
+            d["retrieval_method"] = "vector"
+            scored.append((sim, d))
+        scored.sort(key=lambda x: -x[0])
+        return [d for _, d in scored[:limit]]
+
 
 def _row_to_book(row: sqlite3.Row) -> Book:
     return Book(
@@ -501,3 +578,19 @@ def _sanitize_fts_query(query: str) -> str:
         else:
             tokens.append(f'"{part}"*')
     return " OR ".join(tokens)
+
+
+def _vector_norm(vec: list[float]) -> float:
+    """向量 L2 范数。"""
+    return sum(x * x for x in vec) ** 0.5
+
+
+def _deserialize_vector(blob: bytes, dimension: int) -> list[float]:
+    """从 BLOB 反序列化 float 向量。"""
+    import struct
+    if not blob or dimension <= 0:
+        return []
+    try:
+        return list(struct.unpack(f"{dimension}f", blob))
+    except struct.error:
+        return []

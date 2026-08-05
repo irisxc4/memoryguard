@@ -1,8 +1,8 @@
-"""knowledge_retriever：FTS5 全文检索 + 实体关系扩展（KB1+KB3）。
+"""knowledge_retriever：FTS5 + 向量 + 实体关系混合召回（KB1+KB2+KB3）。
 
 KB1: FTS5 检索 + LIKE fallback
+KB2: 向量检索（provider 可用时），失败静默降级 FTS
 KB3: 实体命中 + graph 关系扩展（最多两跳）
-KB2: 向量检索（暂留接口，无 provider 时降级 FTS）
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from .knowledge_store import KnowledgeStore
 def search(store: KnowledgeStore, query: str,
            book_ids: list[str] | None = None,
            top_k: int = 6,
-           enable_graph: bool = True) -> list[dict[str, Any]]:
+           enable_graph: bool = True,
+           enable_vector: bool = True) -> list[dict[str, Any]]:
     """知识库搜索。返回 top_k 个结果。
 
     每条结果包含：chunk_id, book_id, book_title, chapter, section,
@@ -24,9 +25,10 @@ def search(store: KnowledgeStore, query: str,
     检索流程（PRD §7.2）：
     1. FTS5 全文召回（trigram 中文）
     2. LIKE fallback（<3 字符短查询）
-    3. 实体命中（entities.name LIKE query）
-    4. graph 关系扩展（最多两跳，最多 20 节点）
-    5. 重排 + 去重 + 每书/每文件限制
+    3. 向量召回（KB2，provider 可用时；失败静默降级）
+    4. 实体命中（entities.name LIKE query）
+    5. graph 关系扩展（最多两跳，最多 20 节点）
+    6. 重排 + 去重 + 每书/每文件限制
     """
     if not query.strip():
         return []
@@ -42,18 +44,48 @@ def search(store: KnowledgeStore, query: str,
     for r in results:
         r.setdefault("retrieval_method", "fts" if r.get("rank", 1.0) != 0.0 else "like")
 
-    # 3. 实体命中 + 4. graph 关系扩展
+    # 3. 向量召回（KB2）
+    if enable_vector:
+        _augment_with_vectors(store, query, results, book_ids, top_k)
+
+    # 4. 实体命中 + 5. graph 关系扩展
     if enable_graph and results:
         _augment_with_graph(store, query, results, book_ids, top_k)
 
     if not results:
         return []
 
-    # 5. 重排 + 去重 + 限制
+    # 6. 重排 + 去重 + 限制
     ranked = _rank_results(results, query)
     filtered = _apply_limits(ranked, max_per_book=4, max_per_file=2)
 
     return filtered[:top_k]
+
+
+def _augment_with_vectors(store: KnowledgeStore, query: str,
+                          results: list[dict[str, Any]],
+                          book_ids: list[str] | None,
+                          top_k: int) -> None:
+    """向量召回（KB2）。provider 不可用或失败时静默跳过。"""
+    try:
+        from .provider_api import get_provider
+        backend = get_provider()
+        if backend is None:
+            return
+        query_vec = backend.embed(query)
+        if not query_vec:
+            return
+        vec_results = store.search_vectors(
+            query_vec, book_ids=book_ids, limit=max(top_k * 5, 30),
+        )
+        existing_ids = {r["chunk_id"] for r in results}
+        for vr in vec_results:
+            if vr["chunk_id"] not in existing_ids:
+                results.append(vr)
+                existing_ids.add(vr["chunk_id"])
+    except Exception:
+        # 向量失败不影响 FTS 主流程（PRD §15：向量不可用时回退 FTS）
+        return
 
 
 def _augment_with_graph(store: KnowledgeStore, query: str,
