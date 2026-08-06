@@ -38,3 +38,7 @@ jobs:
 
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # 幂等发布：同名同哈希文件已存在时跳过而非失败。
+          # 避免重复触发（如 release 重建/重跑）导致 PyPI 400 File already exists。
+          skip-existing: true
