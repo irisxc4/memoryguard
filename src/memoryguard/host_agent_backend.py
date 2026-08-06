@@ -788,7 +788,9 @@ def batch_bundle_via_cli(
 
     def fallback_heuristic() -> dict[str, Any]:
         facade = _LegacyFacade(records, assignments_by_memory_id)
-        plan = build_bundles(None, facade, "", records)
+        plan = build_bundles(
+            None, facade, "", records, workspace=workspace or "",
+        )
         validate_bundles(plan, source_ids)
         return {
             "bundles": [_to_bundle_dict(b) for b in plan.get("bundles", [])],

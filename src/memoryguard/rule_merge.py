@@ -367,6 +367,7 @@ class RuleMergeService:
                         owner_agent_id=record.agent_instance_id,
                         created_by="backfill",
                         authorization="backfill",
+                        record_priority=int(record.priority or 0),
                     )
                     for assignment in assignments
                 ],
@@ -576,6 +577,7 @@ class RuleMergeService:
                     owner_agent_id=record.agent_instance_id,
                     created_by=created_by,
                     authorization="dual-write",
+                    record_priority=int(record.priority or 0),
                 )
                 for assignment in assignment_items
             ],
@@ -2098,6 +2100,7 @@ class RuleMergeService:
         owner_agent_id: str,
         created_by: str,
         authorization: str,
+        record_priority: int = 0,
     ) -> RuleBinding:
         target_type = str(getattr(assignment, "target_type", "agent") or "agent")
         source = created_by
@@ -2122,6 +2125,10 @@ class RuleMergeService:
                 "source_revision": "1",
                 "created_by": created_by or "backfill",
             }, ensure_ascii=False, sort_keys=True)
+        override = getattr(assignment, "priority_override", None)
+        priority = int(
+            override if override is not None else record_priority
+        )
         return build_binding(
             definition_id,
             share_group_id=share_group_id,
@@ -2131,7 +2138,7 @@ class RuleMergeService:
             provider=getattr(assignment, "provider", ""),
             runtime_role=getattr(assignment, "runtime_role", ""),
             effect=getattr(assignment, "effect", "include"),
-            priority=getattr(assignment, "priority_override", 0) or 0,
+            priority=priority,
             owner_agent_id=owner_agent_id,
             created_by=source,
             authorization=auth,

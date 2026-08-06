@@ -905,6 +905,12 @@ class SharedMemoryStore:
         ).fetchall()
         changes: list[tuple[str, str]] = []
         for row in records:
+            existing_domain = str(row["dedup_domain"] or "relevant")
+            # Canonical records carry an explicit generated-output domain.
+            # Recomputation from their assignments would silently turn them
+            # into source input for the next reconciliation generation.
+            if existing_domain.startswith("canonical:"):
+                continue
             assignments = self._list_rule_assignments_conn(
                 conn, row["memory_id"],
             )
@@ -913,7 +919,7 @@ class SharedMemoryStore:
                 writer_id=row["agent_instance_id"] or "",
                 memory_id=row["memory_id"],
             )
-            if (row["dedup_domain"] or "relevant") != domain:
+            if existing_domain != domain:
                 changes.append((domain, row["memory_id"]))
         if changes:
             # External-content FTS update triggers can be malformed on a
@@ -1589,7 +1595,10 @@ class SharedMemoryStore:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
-        return SharedMemoryRecord.from_dict(d)
+        record = SharedMemoryRecord.from_dict(d)
+        if "dedup_domain" in columns:
+            record.dedup_domain = str(row["dedup_domain"] or "relevant")
+        return record
 
     @staticmethod
     def _safe_json_list(value: Any) -> list[Any]:
@@ -4829,10 +4838,19 @@ class SharedMemoryStore:
                 record, assignments=assignments, conn=conn,
                 replacing_id=record.memory_id,
             )
-            domain = self._dedup_domain(
-                record.injection_policy, assignments,
-                writer_id=record.agent_instance_id,
-                memory_id=record.memory_id,
+            row = conn.execute(
+                "SELECT dedup_domain FROM records WHERE memory_id=?",
+                (record.memory_id,),
+            ).fetchone()
+            domain = (
+                str(row["dedup_domain"])
+                if row is not None
+                and str(row["dedup_domain"] or "").startswith("canonical:")
+                else self._dedup_domain(
+                    record.injection_policy, assignments,
+                    writer_id=record.agent_instance_id,
+                    memory_id=record.memory_id,
+                )
             )
             self._insert_record(conn, record, dedup_domain=domain)
             self._insert_assignments(conn, record.memory_id, assignments)

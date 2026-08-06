@@ -29,6 +29,8 @@ from memoryguard.mcp_server import (
     _governance_diagnostics_state,
     execute_tool,
     governance_degraded,
+    governance_global_read_degraded,
+    governance_write_degraded,
 )
 
 EXPECTED_BLOCK = {"ok": False, "error": "governance_degraded", "degraded": True}
@@ -104,7 +106,7 @@ def test_whitelist_is_exactly_the_four_diagnostics():
 
 
 # ---------------------------------------------------------------------------
-# gate: mutations + normal tools blocked, whitelist allowed
+# gate: lock broken blocks reads+writes, write-only degradation blocks writes
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +119,7 @@ def test_degraded_blocks_mutating_tool_exact_shape(tmp_path, monkeypatch):
         assert execute_tool(name, args) == EXPECTED_BLOCK, name
 
 
-def test_degraded_blocks_normal_read_tool(tmp_path, monkeypatch):
+def test_broken_lock_blocks_normal_read_tool(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
     res = execute_tool(
         "memoryguard_memory_read",
@@ -129,6 +131,72 @@ def test_degraded_blocks_normal_read_tool(tmp_path, monkeypatch):
         {"query": "anything", "workspace": str(tmp_path)},
     )
     assert res2.get("error") == "governance_degraded"
+
+
+def _outbox_degraded_state(*_args, **_kwargs):
+    return {
+        "lock": {"acquirable": True, "error": ""},
+        "canonical": {
+            "canonical_ready": False, "outbox_pending": 3,
+            "projection_error": "", "reconciliation_in_flight": 1,
+        },
+    }
+
+
+def test_outbox_backlog_blocks_writes_but_not_reads(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        mcp_server, "_governance_diagnostics_state", _outbox_degraded_state,
+    )
+    ws = _make_workspace(tmp_path)
+    write = execute_tool(
+        "memoryguard_memory_write",
+        {"body": "x", "workspace": str(ws)},
+    )
+    assert write == EXPECTED_BLOCK
+    read = execute_tool(
+        "memoryguard_memory_read",
+        {"memory_id": "m1", "workspace": str(ws)},
+    )
+    assert read.get("error") != "governance_degraded"
+
+
+def test_canonical_status_error_blocks_writes_but_not_reads(tmp_path, monkeypatch):
+    def _error_state(*_args, **_kwargs):
+        return {
+            "lock": {"acquirable": True, "error": ""},
+            "canonical": {"error": "ValueError: cannot read canonical status"},
+        }
+
+    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _error_state)
+    ws = _make_workspace(tmp_path)
+    write = execute_tool(
+        "memoryguard_memory_write",
+        {"body": "x", "workspace": str(ws)},
+    )
+    assert write == EXPECTED_BLOCK
+    read = execute_tool(
+        "memoryguard_memory_read",
+        {"memory_id": "m1", "workspace": str(ws)},
+    )
+    assert read.get("error") != "governance_degraded"
+
+
+def test_split_degraded_predicates():
+    healthy = {
+        "lock": {"acquirable": True},
+        "canonical": {"outbox_pending": 0, "projection_error": ""},
+    }
+    assert governance_write_degraded(healthy) is False
+    assert governance_global_read_degraded(healthy) is False
+    outbox = {
+        "lock": {"acquirable": True},
+        "canonical": {"outbox_pending": 3, "projection_error": ""},
+    }
+    assert governance_write_degraded(outbox) is True
+    assert governance_global_read_degraded(outbox) is False
+    broken = {"lock": {"acquirable": False}, "canonical": None}
+    assert governance_write_degraded(broken) is True
+    assert governance_global_read_degraded(broken) is True
 
 
 def test_degraded_allows_four_read_only_diagnostics(tmp_path, monkeypatch):
@@ -296,7 +364,8 @@ def test_diagnostics_snapshot_reports_uninitialized_store(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_canonical_status_group_missing_is_readonly_error(tmp_path):
+def test_canonical_status_group_missing_is_readonly_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     ws = _make_workspace(tmp_path)  # rule-intelligence store exists, no other group
     result = execute_tool(
         "memoryguard_canonical_status",
@@ -324,7 +393,8 @@ def test_projection_status_structure(tmp_path):
     assert isinstance(payload["scopes"], list)
 
 
-def test_runtime_processes_readonly_fields(tmp_path):
+def test_runtime_processes_readonly_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     ws = _make_workspace(tmp_path)
     result = execute_tool("memoryguard_runtime_processes", {"workspace": str(ws)})
     assert result.get("isError") is not True
@@ -334,6 +404,17 @@ def test_runtime_processes_readonly_fields(tmp_path):
     assert payload["memoryguard_version"]
     assert payload["control_workspace"] == str(ws.resolve())
     assert any("rule-intelligence" in p for p in payload["database_paths"])
+
+
+def test_runtime_processes_redacts_paths_for_non_admin(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+    ws = _make_workspace(tmp_path)
+    result = execute_tool("memoryguard_runtime_processes", {"workspace": str(ws)})
+    assert result.get("isError") is not True
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["control_workspace"] == "<redacted>"
+    assert payload["database_paths"] == []
 
 
 def test_diagnostics_tools_are_registered_in_tools_list():

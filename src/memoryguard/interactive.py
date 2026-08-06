@@ -700,6 +700,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .raw-file-row:hover { transform: translateX(2px); border-color: var(--line-strong); background: rgba(16,39,32,.72); }
 .raw-file-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .raw-file-path code { font-size: 11px; }
+.folder-group { margin: 2px 0; border: 1px solid var(--line); border-radius: 8px; background: rgba(10,26,21,.34); }
+.folder-group > .folder-children { padding: 4px 6px 6px 14px; display: grid; gap: 4px; border-top: 1px solid var(--line); }
+.folder-row { display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 6px 10px; cursor: pointer; list-style: none; user-select: none; }
+.folder-row::-webkit-details-marker { display: none; }
+.folder-row::marker { content: ""; }
+.folder-caret { width: 0; height: 0; border-left: 5px solid var(--accent); border-top: 4px solid transparent; border-bottom: 4px solid transparent; transition: transform .15s ease; }
+.folder-group[open] > .folder-row .folder-caret { transform: rotate(90deg); }
+.folder-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); font-size: 11px; font-weight: 600; }
+.folder-count { color: var(--faint); font-size: 10px; }
 
 .raw-file-content {
   margin: 0; padding: 16px; border: 1px solid var(--line); border-radius: 10px;
@@ -1487,24 +1496,42 @@ function neuronNodePositions(nodes) {
     children[parent].push(node);
   });
   positions.main = { x: 0, y: 0 };
-  const topics = (children.main || []).filter(n => n.node_kind === 'topic' || n.node_kind === 'virtual_category');
-  topics.forEach((node, index) => {
-    const angle = index * 2.399963 + neuronHashUnit(node.id) * .8;
-    const radius = 230 + neuronHashUnit(node.id + ':r') * 110;
+  const directMain = children.main || [];
+  directMain.forEach((node, index) => {
+    const total = Math.max(1, directMain.length);
+    const angle = (index / total) * Math.PI * 2 + neuronHashUnit(node.id) * .14;
+    const radius = 285 + neuronHashUnit(node.id + ':r') * 105;
     positions[node.id] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
   });
-  nodes.forEach(node => {
-    if (positions[node.id]) return;
+  const placeNode = (node) => {
     const parent = positions[node.parent_id || 'main'] || positions.main;
     const siblings = children[node.parent_id || ''] || [];
     const index = Math.max(0, siblings.findIndex(s => s.id === node.id));
-    const angle = index * 2.399963 + neuronHashUnit(node.id) * 1.7;
-    const radius = 70 + neuronHashUnit(node.id + ':leaf') * 260;
+    const siblingCount = Math.max(1, siblings.length);
+    const angle = (index / siblingCount) * Math.PI * 2 + neuronHashUnit(node.id) * .18;
+    const radius = 72 + Math.min(170, index * 9 + neuronHashUnit(node.id + ':leaf') * 56);
     positions[node.id] = {
-      x: parent.x + Math.cos(angle) * radius + (neuronHashUnit(node.id + ':x') - .5) * 90,
-      y: parent.y + Math.sin(angle) * radius + (neuronHashUnit(node.id + ':y') - .5) * 90,
+      x: parent.x + Math.cos(angle) * radius + (neuronHashUnit(node.id + ':x') - .5) * 42,
+      y: parent.y + Math.sin(angle) * radius + (neuronHashUnit(node.id + ':y') - .5) * 42,
     };
-  });
+  };
+  const pending = [];
+  for (const node of nodes) {
+    if (positions[node.id]) continue;
+    if (!positions[node.parent_id || 'main']) { pending.push(node); continue; }
+    placeNode(node);
+  }
+  for (let pass = 0; pass < 6 && pending.length; pass++) {
+    const next = [];
+    for (const node of pending) {
+      if (positions[node.id]) continue;
+      if (!positions[node.parent_id || 'main']) { next.push(node); continue; }
+      placeNode(node);
+    }
+    pending.length = 0;
+    pending.push(...next);
+  }
+  pending.forEach(placeNode);
   // 轻量级排斥后处理，减少高密度叠点。仅用于可视化舒适度，不影响语义。
   const radii = {};
   const nodeKinds = new Set(nodes.map(n => n.node_kind));
@@ -1523,7 +1550,7 @@ function neuronNodePositions(nodes) {
   });
   if ((nodeKinds.has('virtual_category') || nodeKinds.has('virtual_bucket') || nodes.length > 45) && Object.keys(positions).length) {
     const ids = nodes.map(item => item.id).filter(id => positions[id]);
-    for (let iter = 0; iter < 70; iter++) {
+    for (let iter = 0; iter < 55; iter++) {
       let moved = false;
       for (let i = 0; i < ids.length; i++) {
         const idA = ids[i];
@@ -1537,12 +1564,12 @@ function neuronNodePositions(nodes) {
           const dx = posB.x - posA.x;
           const dy = posB.y - posA.y;
           const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-          const req = (radii[idA] || 20) + (radii[idB] || 20) + 5;
+          const req = (radii[idA] || 20) + (radii[idB] || 20) + 7;
           if (dist >= req) continue;
           const gap = req - dist;
           const nx = dx / dist;
           const ny = dy / dist;
-          const force = gap / 2 * (1 - iter / 70);
+          const force = gap / 2 * (1 - iter / 55);
           posA.x -= nx * force;
           posA.y -= ny * force;
           posB.x += nx * force;
@@ -1597,11 +1624,26 @@ function graphElements(graph) {
       opacity: 0.85,
     }, position: positions[node.id] || { x: 0, y: 0 }});
   }
+  const edgeKeys = new Set();
   for (const edge of graph.edges || []) {
+    const source = String(edge.source || '');
+    const target = String(edge.target || '');
+    edgeKeys.add(`${source}:${target}`);
     elements.push({ data: {
-      id: edge.id, source: edge.source, target: edge.target,
+      id: edge.id, source, target,
       etype: edge.edge_type || 'derived_from',
       strength: EDGE_STRENGTH[edge.edge_type] || 0.4,
+    }});
+  }
+  for (const node of graph.nodes || []) {
+    const parentId = String(node.parent_id || '');
+    const nodeId = String(node.id || '');
+    if (!parentId || !nodeId || parentId === nodeId || edgeKeys.has(`${parentId}:${nodeId}`)) continue;
+    // 有些旧投影/虚拟叠加只写了 parent_id，忘了落边；这里补出树形连线，主光点到分类不会悬空。
+    edgeKeys.add(`${parentId}:${nodeId}`);
+    elements.push({ data: {
+      id: `parent-bridge:${parentId}:${nodeId}`, source: parentId, target: nodeId,
+      etype: 'derived_from', strength: 0.52,
     }});
   }
   return elements;
@@ -2050,26 +2092,25 @@ function isSignalNeuronEdge(edge) {
   return !!edge && edge.length > 0;
 }
 
-function buildNeuronSignalPath(cy, leaf) {
-  if (!cy || !leaf || !leaf.length) return null;
-  const pathNodes = [];
+function buildNeuronSignalPath(cy, start) {
+  if (!cy || !start || !start.length) return null;
+  const pathNodes = [start];
   const pathEdges = [];
-  let cur = leaf;
+  let cur = start;
   const seen = new Set();
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
-    pathNodes.unshift(cur);
-    const incomers = cur.incomers('edge').filter(isSignalNeuronEdge).sort((a, b) =>
+    const outgoers = cur.outgoers('edge').filter(isSignalNeuronEdge).sort((a, b) =>
       String(a.id()).localeCompare(String(b.id()))
     );
-    if (!incomers.length) break;
-    const edge = incomers[0];
-    pathEdges.unshift(edge);
-    cur = edge.source();
-    if (cur.data('kind') === 'root') {
-      pathNodes.unshift(cur);
-      break;
-    }
+    if (!outgoers.length) break;
+    const leafEdge = outgoers.find(edge =>
+      edge.target().outgoers('edge').filter(isSignalNeuronEdge).length === 0
+    );
+    const edge = leafEdge || outgoers[Math.floor(neuronHashUnit(cur.id() + ':' + pathEdges.length) * outgoers.length)];
+    pathEdges.push(edge);
+    cur = edge.target();
+    if (cur && cur.length) pathNodes.push(cur);
   }
   if (!pathEdges.length) return null;
   return { nodes: pathNodes, edges: pathEdges };
@@ -2077,41 +2118,34 @@ function buildNeuronSignalPath(cy, leaf) {
 
 function collectNeuronSignalPaths(cy, limit = 6, waveIndex = 0) {
   if (!cy || limit < 1) return [];
-  const leaves = cy.nodes().filter(n => {
+  const starters = cy.nodes().filter(n => {
     if (!n || !n.length || n.data('kind') === 'root') return false;
-    const incoming = n.incomers('edge').filter(isSignalNeuronEdge);
-    const outgoing = n.outgoers('edge').filter(isSignalNeuronEdge);
-    return incoming.length > 0 && outgoing.length === 0;
-  });
-  const anchors = leaves.filter(n => {
-    const kind = n.data('kind');
-    return kind === 'claim_anchor' || kind === 'duplicate_cluster';
-  });
-  const candidates = (anchors.length ? anchors : leaves).sort((a, b) =>
-    String(a.id()).localeCompare(String(b.id()))
-  );
-  const start = candidates.length ? Math.abs(waveIndex) % candidates.length : 0;
-  const paths = [];
-  const signatures = new Set();
-  for (let offset = 0; offset < candidates.length; offset++) {
-    const leaf = candidates[(start + offset) % candidates.length];
-    const path = buildNeuronSignalPath(cy, leaf);
-    if (!path) continue;
-    const signature = path.edges.map(edge => edge.id()).join('>');
-    if (!signature || signatures.has(signature)) continue;
-    signatures.add(signature);
-    paths.push(path);
-    if (paths.length >= limit) break;
-  }
-  if (!paths.length) {
-    const edges = [];
-    cy.edges().filter(isSignalNeuronEdge).forEach(edge => edges.push(edge));
-    edges.sort((a, b) => String(a.id()).localeCompare(String(b.id())));
-    const edgeStart = edges.length ? Math.abs(waveIndex) % edges.length : 0;
-    for (let offset = 0; offset < Math.min(limit, edges.length); offset++) {
-      const edge = edges[(edgeStart + offset) % edges.length];
-      paths.push({ nodes: [edge.source(), edge.target()], edges: [edge] });
+    return n.outgoers('edge').filter(isSignalNeuronEdge).length > 0;
+  }).sort((a, b) => String(a.id()).localeCompare(String(b.id())));
+  if (starters.length) {
+    const start = Math.abs(waveIndex) % starters.length;
+    const paths = [];
+    const signatures = new Set();
+    for (let offset = 0; offset < starters.length; offset++) {
+      const starter = starters[(start + offset) % starters.length];
+      const path = buildNeuronSignalPath(cy, starter);
+      if (!path) continue;
+      const signature = path.edges.map(edge => edge.id()).join('>');
+      if (!signature || signatures.has(signature)) continue;
+      signatures.add(signature);
+      paths.push(path);
+      if (paths.length >= limit) break;
     }
+    if (paths.length) return paths;
+  }
+  const edges = [];
+  cy.edges().filter(isSignalNeuronEdge).forEach(edge => edges.push(edge));
+  edges.sort((a, b) => String(a.id()).localeCompare(String(b.id())));
+  const edgeStart = edges.length ? Math.abs(waveIndex) % edges.length : 0;
+  const paths = [];
+  for (let offset = 0; offset < Math.min(limit, edges.length); offset++) {
+    const edge = edges[(edgeStart + offset) % edges.length];
+    paths.push({ nodes: [edge.source(), edge.target()], edges: [edge] });
   }
   return paths;
 }
@@ -2122,7 +2156,7 @@ function pickNeuronSignalPath(cy) {
 
 function runNeuronSignalPulse(cy, path) {
   if (!cy || !path || !path.edges.length) return;
-  // One continuous light travels root -> leaf across the whole path.
+  // One continuous light travels branch -> leaf across the whole path.
   const perEdgeMs = 520;
   const totalMs = Math.max(900, path.edges.length * perEdgeMs);
   try {
@@ -2290,7 +2324,7 @@ function startNeuronSignalPulses(cy) {
   };
   const spark = () => {
     if (!cyInstance || cyInstance !== cy) return;
-    const candidates = cy.nodes('node[kind = "claim_anchor"], node[kind = "history_session"], node[kind = "virtual_bucket"]');
+    const candidates = cy.nodes('node[kind = "virtual_category"], node[kind = "topic"], node[kind = "source_hub"], node[kind = "virtual_bucket"], node[kind = "history_project"], node[kind = "history_agent"], node[kind = "claim_anchor"]');
     if (!candidates || !candidates.length) return;
     const count = Math.min(2, candidates.length);
     const sparkIndex = Number(window.__neuronSparkIndex || 0);
@@ -3235,20 +3269,47 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
     unknown: '其他', project_memory: '项目记忆',
   };
   const scopeLabels = {user: '全局/用户', project: '项目', unknown: '未归属'};
-  const renderFiles = (files) => `<div class="raw-file-list">
-    ${(files || []).map(f => {
-      const canOpen = !!f.root_id && f.authorized !== false && f.read_status !== 'discovered';
-      // JSON string keeps arbitrary local filenames out of executable HTML.
-      const viewArgs = escapeHtml(JSON.stringify([String(f.root_id || ''), String(f.relative_path || '')]));
-      const clickAttr = canOpen ? ` onclick="viewSourceFile(...${viewArgs})"` : '';
-      const statusText = canOpen ? (f.read_status || '') : '仅发现，需先授权';
-      return `<div class="raw-file-row"${clickAttr} style="${canOpen ? '' : 'cursor:default;opacity:.72'}">
-        <span class="raw-file-path"><code>${escapeHtml(f.relative_path || '').replaceAll('\\', '/')}</code></span>
-        <span class="chip chip-${canOpen && f.read_status === 'read' ? 'confirmed' : 'medium'}">${escapeHtml(statusText)}</span>
-        <span style="color:var(--faint);font-size:10px">${escapeHtml(f.media_type || '')}</span>
-      </div>`;
-    }).join('')}
-  </div>`;
+  const renderFileRow = (f) => {
+    const canOpen = !!f.root_id && f.authorized !== false && f.read_status !== 'discovered';
+    // JSON string keeps arbitrary local filenames out of executable HTML.
+    const viewArgs = escapeHtml(JSON.stringify([String(f.root_id || ''), String(f.relative_path || '')]));
+    const clickAttr = canOpen ? ` onclick="viewSourceFile(...${viewArgs})"` : '';
+    const statusText = canOpen ? (f.read_status || '') : '仅发现，需先授权';
+    const displayPath = String(f.relative_path || f.path || f.display_name || '未命名文件').replaceAll('\\', '/');
+    return `<div class="raw-file-row"${clickAttr} style="${canOpen ? '' : 'cursor:default;opacity:.72'}">
+      <span class="raw-file-path"><code>${escapeHtml(displayPath)}</code></span>
+      <span class="chip chip-${canOpen && f.read_status === 'read' ? 'confirmed' : 'medium'}">${escapeHtml(statusText)}</span>
+      <span style="color:var(--faint);font-size:10px">${escapeHtml(f.media_type || '')}</span>
+    </div>`;
+  };
+  const buildFileTree = (files) => {
+    const root = { dirs: new Map(), files: [] };
+    for (const f of files || []) {
+      const parts = String(f.relative_path || f.path || f.display_name || '未命名文件')
+        .replaceAll('\\', '/').split('/').filter(Boolean);
+      if (!parts.length) { root.files.push(f); continue; }
+      let node = root;
+      parts.slice(0, -1).forEach(part => {
+        if (!node.dirs.has(part)) node.dirs.set(part, { name: part, dirs: new Map(), files: [] });
+        node = node.dirs.get(part);
+      });
+      node.files.push(f);
+    }
+    return root;
+  };
+  const countTreeFiles = (node) => node.files.length + [...node.dirs.values()].reduce((sum, child) => sum + countTreeFiles(child), 0);
+  const renderFileTree = (node, depth = 0) => {
+    const dirHtml = [...node.dirs.values()].map(child => {
+      const count = countTreeFiles(child);
+      return `<details class="folder-group" ${depth === 0 ? 'open' : ''} style="--folder-depth:${Math.min(depth, 8)}">
+        <summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${escapeHtml(child.name)}</span><span class="folder-count">${count} 个文件</span></summary>
+        <div class="folder-children">${renderFileTree(child, depth + 1)}</div>
+      </details>`;
+    }).join('');
+    const rows = (node.files || []).map(renderFileRow).join('');
+    return dirHtml + rows;
+  };
+  const renderFiles = (files) => `<div class="raw-file-list">${renderFileTree(buildFileTree(files))}</div>`;
   const knowledgeTypes = new Set(['selected_directory', 'selected_file', 'obsidian_vault']);
   const nonKnowledgeCategories = new Set([
     'native_memory', 'project_memory', 'control_surface', 'skill_surface',
@@ -4073,11 +4134,15 @@ function renderHistoryGrouped(data) {
     const meta = group.meta;
     const status = meta.project_status === 'removed' ? ' · 路径已移除' : '';
     const parent = meta.project_parent ? ` · ${meta.project_parent}` : '';
+    const sessionCount = [...group.agents.values()].reduce((n, sessions) => n + sessions.length, 0);
     const agents = [...group.agents.entries()].map(([owner, sessions]) => {
       const canDelete = !!activeAgentInstanceId && owner === activeAgentInstanceId;
       return `<section class="history-agent-group"><h3>${escapeHtml(owner)}</h3>${sessions.map(s => `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(historySessionTitle(s))}</strong><span class="chip">${escapeHtml(s.provider || 'local')}</span></div><p>${escapeHtml(s.summary || '尚无摘要')}</p><div class="muted">${escapeHtml(s.created_at || s.imported_at || '')} · ${s.turn_count || 0} 条 · ${s.evidence_count || 0} 条已萃取证据</div><div class="finding-actions"><button class="btn" data-mg-action="history-read-session" data-session-id="${escapeHtml(s.session_id)}">阅读原文</button><button class="btn" data-mg-action="history-extract" data-session-id="${escapeHtml(s.session_id)}">萃取预览</button><button class="btn" data-mg-action="history-export" data-session-id="${escapeHtml(s.session_id)}">导出</button>${canDelete ? `<button class="btn" data-mg-action="history-delete" data-session-id="${escapeHtml(s.session_id)}">删除历史</button>` : '<span class="muted">仅会话 owner 可删除</span>'}</div></article>`).join('')}</section>`;
     }).join('');
-    return `<section class="card history-project-group"><h2>${escapeHtml(meta.project_label || '未识别项目')}${escapeHtml(status + parent)}</h2>${agents}</section>`;
+    return `<details class="card history-project-group folder-group" open>
+      <summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${escapeHtml(meta.project_label || '未识别项目')}${escapeHtml(status + parent)}</span><span class="folder-count">${sessionCount} 个会话</span></summary>
+      <div class="folder-children">${agents}</div>
+    </details>`;
   }).join('');
 }
 

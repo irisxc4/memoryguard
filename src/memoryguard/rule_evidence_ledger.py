@@ -432,6 +432,27 @@ def upsert_contribution(
             item.updated_at or item.observed_at,
         ),
     )
+    # A contribution can move to a new Definition when a canonical generation
+    # rebuilds with the same evidence_id but a changed merged body.  Its old
+    # effective-projection row is stale and would violate the global
+    # winner_contribution_id uniqueness on the next rebuild.
+    conn.execute(
+        """
+        DELETE FROM rule_evidence_effective
+        WHERE winner_contribution_id=?
+          AND (
+              definition_id<>?
+              OR independence_key<>?
+              OR kind<>?
+          )
+        """,
+        (
+            item.contribution_id,
+            item.definition_id,
+            item.independence_key,
+            item.kind,
+        ),
+    )
     return item
 
 

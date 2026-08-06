@@ -67,18 +67,24 @@ _DEGRADED_WHITELIST = frozenset({
 # snapshot accepts no arbitrary SQL and no arbitrary file paths.
 _DIAGNOSTIC_JOBS_BY_STATUS_SQL = (
     "SELECT status AS status, COUNT(*) AS count "
-    "FROM rule_reconciliation_jobs GROUP BY status ORDER BY status"
+    "FROM rule_reconciliation_jobs WHERE share_group_id = ? "
+    "GROUP BY status ORDER BY status"
 )
 _DIAGNOSTIC_CANONICAL_STATE_SQL = (
     "SELECT share_group_id, activation_status, canonical_digest, read_path, "
-    "activated_at, updated_at FROM rule_canonical_state ORDER BY share_group_id"
+    "activated_at, updated_at FROM rule_canonical_state "
+    "WHERE share_group_id = ? ORDER BY share_group_id"
 )
 _DIAGNOSTIC_PROJECTION_SQL = (
     "SELECT scope_id, projection_lag, projection_error "
-    "FROM rule_projection_state ORDER BY scope_id"
+    "FROM rule_projection_state WHERE scope_id = ? ORDER BY scope_id"
 )
-_DIAGNOSTIC_SOURCE_LINKS_SQL = "SELECT COUNT(*) AS count FROM rule_source_links"
-_DIAGNOSTIC_BINDINGS_SQL = "SELECT COUNT(*) AS count FROM rule_bindings"
+_DIAGNOSTIC_SOURCE_LINKS_SQL = (
+    "SELECT COUNT(*) AS count FROM rule_source_links WHERE share_group_id = ?"
+)
+_DIAGNOSTIC_BINDINGS_SQL = (
+    "SELECT COUNT(*) AS count FROM rule_bindings WHERE share_group_id = ?"
+)
 
 # Lock probe deadline: short enough not to stall the MCP loop, long enough to
 # distinguish real contention from a transient filesystem hiccup.
@@ -978,14 +984,21 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         else _resolve_workspace(args)
     )
 
-    # Req9: governance-degraded gate.  When governance is degraded, only the
-    # four read-only diagnostics pass; every other tool (read or mutation) is
-    # refused with a structured result -- never a raised exception, so the MCP
-    # response shape stays intact.
+    # Req9: split governance-degraded gates.  Only a broken workspace lock
+    # blocks ordinary reads.  Mutations additionally fail closed on canonical
+    # read errors, outbox backlog and projection errors.  The four diagnostics
+    # remain whitelisted so the operator can always see why the gate tripped.
     if name not in _DEGRADED_WHITELIST:
         _diag_group, _diag_err = _diag_share_group_id(args, workspace)
-        _diag_state = _governance_diagnostics_state(workspace, _diag_group)
-        if governance_degraded(_diag_state):
+        _diag_state = _governance_diagnostics_state(
+            workspace, _diag_group,
+        )
+        if governance_global_read_degraded(_diag_state):
+            return {"ok": False, "error": "governance_degraded", "degraded": True}
+        if (
+            name in _MUTATING_TOOLS
+            and governance_write_degraded(_diag_state)
+        ):
             return {"ok": False, "error": "governance_degraded", "degraded": True}
 
     # Req9 read-only diagnostics dispatch (whitelisted, always allowed).
@@ -1002,8 +1015,11 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name.startswith("memoryguard_knowledge_"):
         return handle_knowledge_tool(name, args) or _mcp_error(f"unknown knowledge tool: {name}")
 
-    # 写操作：先做本地参数预检，再执行
+    # 写操作：runtime lease + 本地参数预检，再执行
     if name in _MUTATING_TOOLS:
+        lease_err = _runtime_lease_guard(name, args, workspace)
+        if lease_err is not None:
+            return lease_err
         preflight_err = _preflight_mutating_tool(name, args, workspace)
         if preflight_err is not None:
             return preflight_err
@@ -2395,15 +2411,13 @@ def _handle_history(args: dict[str, Any], name: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def governance_degraded(state: dict[str, Any]) -> bool:
-    """Conservative governance-degraded predicate (Req9).
+def governance_write_degraded(state: dict[str, Any]) -> bool:
+    """Fail-closed predicate for governance mutations (Req9).
 
-    True only on hard evidence that the governance layer is not safely
-    writable: the workspace governance lock cannot be acquired, the canonical
-    reconciliation outbox is not drained (``outbox_pending > 0``), or the
-    projection is reporting an error.  A pending model job, unlinked sources
-    or a fresh workspace never trip the gate -- prefer letting read-only
-    diagnostics through over locking down a healthy path.
+    Writes require both a usable governance lock and a readable canonical
+    state with a drained outbox.  A short outbox backlog must not disable
+    normal reads, but it does mean no new writes can safely land while the
+    reconciliation projection is unfinished.
     """
     if not isinstance(state, dict):
         return False
@@ -2413,6 +2427,8 @@ def governance_degraded(state: dict[str, Any]) -> bool:
     canonical = state.get("canonical")
     if not isinstance(canonical, dict):
         return False
+    if str(canonical.get("error", "") or ""):
+        return True
     if int(canonical.get("outbox_pending", 0) or 0) > 0:
         return True
     if str(canonical.get("projection_error", "") or ""):
@@ -2420,28 +2436,54 @@ def governance_degraded(state: dict[str, Any]) -> bool:
     return False
 
 
+def governance_global_read_degraded(state: dict[str, Any]) -> bool:
+    """Global read-only lockout: only an unusable governance lock.
+
+    Projection lag/outbox backlog and canonical-read fallback must not take
+    down normal memory/history/knowledge/neuron reads.  When the lock cannot
+    be probed, no consistency guarantee is available for any read.
+    """
+    if not isinstance(state, dict):
+        return False
+    lock = state.get("lock") if isinstance(state.get("lock"), dict) else {}
+    return bool(lock.get("acquirable") is False)
+
+
+def governance_degraded(state: dict[str, Any]) -> bool:
+    """Compatibility alias: write-path degraded predicate."""
+    return governance_write_degraded(state)
+
+
 def _diag_share_group_id(
     args: dict[str, Any], workspace: Path,
 ) -> tuple[str, str | None]:
-    """Resolve the share_group_id for the read-only diagnostics.
+    """Resolve the share_group_id for read-only diagnostics.
 
-    An explicit ``share_group_id`` argument is honored (read-only tools only);
-    otherwise the trusted binding is used, falling back to ``default``.
+    Non-admin agents can only see their own trusted binding; an explicit
+    ``share_group_id`` argument is honored only for admin connections.
+    Diagnostics never create a group, and they never fall back to a
+    caller-chosen group on behalf of an unbound agent.
     """
+    from .access_context import load_access_context
+    from .shared_memory_store import _validate_group_id
+    ctx = load_access_context()
     explicit = str(args.get("share_group_id", "") or "").strip()
-    if explicit:
+    if explicit and ctx.is_admin:
         try:
-            from .shared_memory_store import _validate_group_id
             return _validate_group_id(explicit), None
         except ValueError as exc:
             return "", str(exc)
     try:
-        group_id, err = _get_share_group_id(args, workspace)
+        if ctx.trusted_agent_id:
+            args["agent_instance_id"] = ctx.trusted_agent_id
+        group_id, err = _get_share_group_id(
+            args, workspace, strict=ctx.strict_binding,
+        )
         if err:
-            return "default", None
-        return group_id or "default", None
-    except Exception:  # noqa: BLE001 - diagnostics must never fail the gate
-        return "default", None
+            return "", err
+        return group_id or ("default" if ctx.allow_anon else ""), None
+    except Exception as exc:  # noqa: BLE001 - never expose an internal trace
+        return "", f"diagnostics_group_resolution_failed: {exc}"
 
 
 def _rule_intelligence_db_exists(workspace: Path) -> bool:
@@ -2555,7 +2597,9 @@ def _build_diagnostics_snapshot(
             mem.row_factory = sqlite3.Row
             jobs = [
                 dict(row)
-                for row in mem.execute(_DIAGNOSTIC_JOBS_BY_STATUS_SQL).fetchall()
+                for row in mem.execute(
+                    _DIAGNOSTIC_JOBS_BY_STATUS_SQL, (share_group_id,),
+                ).fetchall()
             ]
             jobs_by_status = {
                 str(row.get("status") or "unknown"): int(row.get("count") or 0)
@@ -2563,17 +2607,25 @@ def _build_diagnostics_snapshot(
             }
             canonical_activation = [
                 dict(row)
-                for row in mem.execute(_DIAGNOSTIC_CANONICAL_STATE_SQL).fetchall()
+                for row in mem.execute(
+                    _DIAGNOSTIC_CANONICAL_STATE_SQL, (share_group_id,),
+                ).fetchall()
             ]
             projection_rows = [
                 dict(row)
-                for row in mem.execute(_DIAGNOSTIC_PROJECTION_SQL).fetchall()
+                for row in mem.execute(
+                    _DIAGNOSTIC_PROJECTION_SQL, (share_group_id,),
+                ).fetchall()
             ]
             source_links = int(
-                mem.execute(_DIAGNOSTIC_SOURCE_LINKS_SQL).fetchone()["count"]
+                mem.execute(
+                    _DIAGNOSTIC_SOURCE_LINKS_SQL, (share_group_id,),
+                ).fetchone()["count"]
             )
             bindings = int(
-                mem.execute(_DIAGNOSTIC_BINDINGS_SQL).fetchone()["count"]
+                mem.execute(
+                    _DIAGNOSTIC_BINDINGS_SQL, (share_group_id,),
+                ).fetchone()["count"]
             )
         finally:
             mem.close()
@@ -2677,7 +2729,9 @@ def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
     """Read-only runtime process facts (Req9), referencing the Req10 runtime
     lease when present.  Missing fields are reported empty, never invented."""
     import os as _os
+    from .access_context import load_access_context
     workspace = _resolve_memory_workspace(args)
+    is_admin = load_access_context().is_admin
     try:
         from .runtime_lease import (
             compute_code_fingerprint,
@@ -2694,11 +2748,11 @@ def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             version = ""
         try:
-            db_paths = default_database_paths(workspace)
+            db_paths = default_database_paths(workspace) if is_admin else []
         except Exception:  # noqa: BLE001
             db_paths = []
         try:
-            lease = runtime_lease_status(workspace)
+            lease = runtime_lease_status(workspace) if is_admin else None
         except Exception:  # noqa: BLE001
             lease = {}
         return _governance_json_response({
@@ -2706,7 +2760,7 @@ def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
             "pid": _os.getpid(),
             "memoryguard_version": str(version or "") or SERVER_VERSION,
             "code_fingerprint": code_fingerprint,
-            "control_workspace": str(Path(workspace)),
+            "control_workspace": str(Path(workspace)) if is_admin else "<redacted>",
             "database_paths": db_paths,
             "runtime_lease": lease or None,
         })
@@ -2716,7 +2770,7 @@ def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
             "pid": _os.getpid(),
             "memoryguard_version": SERVER_VERSION,
             "code_fingerprint": "",
-            "control_workspace": str(Path(workspace)),
+            "control_workspace": str(Path(workspace)) if is_admin else "<redacted>",
             "database_paths": [],
             "runtime_lease": None,
             "runtime_lease_error": f"{type(exc).__name__}: {exc}",
@@ -2807,46 +2861,6 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def serve_stdio() -> int:
-    """MCP stdio 主循环。从 stdin 读 JSON-RPC，向 stdout 写响应。"""
-    # MCP stdio 协议固定使用 UTF-8。Windows 中文系统的管道默认可能是
-    # GBK；工具描述或记忆正文含中文时会让宿主无法解码整条 JSON-RPC。
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            reconfigure(encoding="utf-8", errors="strict")
-    # A3: 启动预检,打印身份与权限态
-    from .access_context import preflight_check
-    preflight_check()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            request = json.loads(line)
-        except json.JSONDecodeError as e:
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"parse error: {e}"}}
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
-            continue
-        response = handle_request(request)
-        if response is not None:
-            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(serve_stdio())
-
-
-# ---------------------------------------------------------------------------
-# Req10: runtime split-brain guard.  Standalone wiring point -- the Req9 MCP
-# hardening layer calls this before mutating tools; it does NOT change the
-# existing execute_tool flow here.
-# ---------------------------------------------------------------------------
-
-
 def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
     """Fail-closed runtime split-brain guard for mutating tools (Req10).
 
@@ -2880,3 +2894,51 @@ def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> di
         "content": [{"type": "text", "text": f"error: {text}"}],
         "isError": True,
     }
+
+
+def serve_stdio() -> int:
+    """MCP stdio 主循环。从 stdin 读 JSON-RPC，向 stdout 写响应。"""
+    # MCP stdio 协议固定使用 UTF-8。Windows 中文系统的管道默认可能是
+    # GBK；工具描述或记忆正文含中文时会让宿主无法解码整条 JSON-RPC。
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="strict")
+    # A3: 启动预检,打印身份与权限态
+    from .access_context import preflight_check
+    preflight_check()
+    configured_workspace = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+    if configured_workspace:
+        from .runtime_lease import check_runtime_lease
+        lease = check_runtime_lease(
+            Path(configured_workspace).resolve(), pid=os.getpid(),
+        )
+        if not lease.get("granted"):
+            conflicting = lease.get("conflicting", [])
+            pids = sorted(str(item.get("pid", "")) for item in conflicting)
+            print(
+                "[memoryguard] Fatal: runtime split-brain at startup; "
+                f"restart_required=true; conflicting_pids={pids}",
+                file=sys.stderr,
+            )
+            return 1
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as e:
+            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"parse error: {e}"}}
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
+            continue
+        response = handle_request(request)
+        if response is not None:
+            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(serve_stdio())

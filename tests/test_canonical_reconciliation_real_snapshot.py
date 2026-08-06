@@ -43,9 +43,13 @@ second job row.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 
+import pytest
+
+from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.host_enrichment import _pending_path
 from memoryguard.rule_binding import RuleBinding
 from memoryguard.rule_merge import RuleMergeService
@@ -54,6 +58,7 @@ from memoryguard.rule_reconciliation import (
     REASON_LEGACY_HEURISTIC,
     RuleReconciliationService,
     _active_mandatory,
+    _plan_mandatory,
     build_bundles,
     canonical_reconciliation_status,
     ensure_reconciliation_job,
@@ -187,6 +192,9 @@ def _seed_baseline(src_ws: Path) -> None:
             assignments=[{"target_type": "agent", "target_id": agent}],
         )
     _seed_outbox(legacy, OUTBOX_PENDING)
+    AgentBindingStore(src_ws).bind_agents_to_group(
+        AGENTS, GROUP, allow_empty_group_creation=True,
+    )
 
 
 def _seed_outbox(legacy: SharedMemoryStore, count: int) -> None:
@@ -269,6 +277,13 @@ def _build_isolated_run(src_ws: Path, run_ws: Path) -> None:
         ri_dir / "memory.db",
         run_ws / ".memoryguard" / "rule-intelligence" / "memory.db",
     )
+    src_bindings = src_ws / ".memoryguard" / "agent-bindings"
+    if src_bindings.exists():
+        shutil.copytree(
+            src_bindings,
+            run_ws / ".memoryguard" / "agent-bindings",
+            dirs_exist_ok=True,
+        )
 
 
 def _shadowed_ids(legacy: SharedMemoryStore) -> set[str]:
@@ -515,3 +530,249 @@ def test_resume_from_retryable_failed_phase(tmp_path):
     assert len(service.jobs.list_jobs(share_group_id=GROUP)) == 1
     status = canonical_reconciliation_status(run_ws, GROUP, store=store)
     assert status["canonical_ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# Req5 fault-injection: every retryable phase resumes with the same job row.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("phase,fail_target", [
+    ("backfill_p3", "backfill_p3"),
+    ("write_canonical", "write_canonical"),
+    ("verify_source_links", "verify_source_links"),
+    ("shadow_legacy", "shadow_legacy"),
+    ("drain_outbox", "drain_outbox"),
+    ("build_projection", "build_projection"),
+    ("activate_canonical", "activate_canonical"),
+    ("verify_readiness", "verify_readiness"),
+    ("retire_previous", "retire_previous"),
+])
+def test_resume_from_every_retryable_phase(
+    tmp_path, monkeypatch, phase, fail_target,
+):
+    from memoryguard import rule_merge as rule_merge_module
+    from memoryguard import rule_reconciliation as recon_module
+    from memoryguard.rule_reconciliation import RuleReconciliationStore
+
+    run_ws = tmp_path / phase
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+
+    message = f"injected-{fail_target}-failure"
+
+    # Fail exactly once; every later invocation delegates to the real method.
+    fail_active = {"active": True}
+    original = None
+
+    def boom(*_args, **_kwargs):
+        if fail_active["active"]:
+            fail_active["active"] = False
+            raise RuntimeError(message)
+        if original is not None:
+            return original(*_args, **_kwargs)
+        return None
+
+    if fail_target == "backfill_p3":
+        original = rule_merge_module.RuleMergeService.backfill_group
+        monkeypatch.setattr(
+            rule_merge_module.RuleMergeService, "backfill_group", boom,
+        )
+    elif fail_target == "write_canonical":
+        original = service._write_canonical
+        monkeypatch.setattr(service, "_write_canonical", boom)
+    elif fail_target == "verify_source_links":
+        original = service._verify_source_links
+        monkeypatch.setattr(service, "_verify_source_links", boom)
+    elif fail_target == "shadow_legacy":
+        original = service._shadow_legacy
+        monkeypatch.setattr(service, "_shadow_legacy", boom)
+    elif fail_target == "drain_outbox":
+        original = rule_merge_module.RuleMergeService.consume_outbox
+        monkeypatch.setattr(
+            rule_merge_module.RuleMergeService, "consume_outbox", boom,
+        )
+    elif fail_target == "build_projection":
+        original = service._build_projection
+        monkeypatch.setattr(service, "_build_projection", boom)
+    elif fail_target == "activate_canonical":
+        original = RuleReconciliationStore.set_canonical_activation
+        monkeypatch.setattr(
+            RuleReconciliationStore, "set_canonical_activation", boom,
+        )
+    elif fail_target == "verify_readiness":
+        original = recon_module.canonical_reconciliation_status
+        monkeypatch.setattr(
+            recon_module, "canonical_reconciliation_status", boom,
+        )
+    elif fail_target == "retire_previous":
+        original = service._retire_previous_canonical
+        monkeypatch.setattr(service, "_retire_previous_canonical", boom)
+
+    with pytest.raises(RuntimeError, match=message):
+        service.run(GROUP, bundle_plan=plan, model_mode="scripted")
+
+    failed = service.jobs.latest_job(GROUP)
+    assert failed["status"] == "retryable_failed"
+    assert failed["phase"] == phase, (phase, failed["phase"])
+    assert message in failed["last_error"]
+    job_id = failed["job_id"]
+
+    # Restoring the target lets the same generation resume in-place.  The
+    # persisted plan is reused; no second job row is created.
+    job2 = service.run(GROUP, bundle_plan=plan, model_mode="scripted")
+    assert job2["status"] == "canonical_ready"
+    assert job2["job_id"] == job_id
+    assert len(service.jobs.list_jobs(share_group_id=GROUP)) == 1
+    status = canonical_reconciliation_status(run_ws, GROUP, store=store)
+    assert status["canonical_ready"] is True, status["failures"]
+
+
+def test_source_change_after_ready_creates_new_generation(tmp_path):
+    """A canonical_ready group must re-converge when a new source appears."""
+    run_ws = tmp_path / "run"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan1 = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+    job1 = service.run(GROUP, bundle_plan=plan1, model_mode="scripted")
+    assert job1["status"] == "canonical_ready"
+
+    _seed_record(
+        legacy,
+        "src-new-codex",
+        "new codex policy",
+        priority=30,
+        agent=CODEX,
+        assignments=[{"target_type": "agent", "target_id": CODEX}],
+    )
+    links = store.list_source_links(share_group_id=GROUP, status="active")
+    plan2 = build_bundles(
+        store, legacy, GROUP, _plan_mandatory(
+            legacy, {link["memory_id"] for link in links},
+        ),
+    )
+    assert any("src-new-codex" in b.source_memory_ids for b in plan2["bundles"])
+
+    job2 = service.run(GROUP, bundle_plan=plan2, model_mode="scripted")
+    assert job2["status"] == "canonical_ready"
+    assert job2["job_id"] != job1["job_id"]
+
+    jobs = service.jobs.list_jobs(share_group_id=GROUP)
+    by_id = {job["job_id"]: job for job in jobs}
+    assert by_id[job1["job_id"]]["status"] == "superseded"
+    assert by_id[job2["job_id"]]["status"] == "canonical_ready"
+    status = canonical_reconciliation_status(run_ws, GROUP, store=store)
+    assert status["canonical_ready"] is True, status["failures"]
+    # The old canonical record is retired, not deleted.
+    shadowed = _shadowed_ids(legacy)
+    assert any(
+        str(record.dedup_domain or "").startswith("canonical:")
+        and record.memory_id in shadowed
+        for record in legacy.list_records()
+    )
+
+
+def test_scope_bundle_model_path_drives_saga(tmp_path, monkeypatch):
+    """The production model entry is wired into ``run()``.
+
+    A scope_bundle result returned by ``batch_bundle_via_cli`` is validated by
+    the saga and may contain a semantic merged body; it must not be rejected by
+    the deterministic-safe heuristic gate.
+    """
+    from memoryguard import host_agent_backend as hab
+
+    run_ws = tmp_path / "run"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    calls = {"count": 0}
+
+    def fake_batch(records, assignments_by_memory_id=None, workspace=None, **kwargs):
+        calls["count"] += 1
+        plan = build_bundles(
+            store, legacy, GROUP, list(records), workspace=workspace,
+        )
+        return {
+            "bundles": [bundle.to_dict() for bundle in plan["bundles"]],
+            "kept_separate": plan["kept_separate"],
+            "model_mode": "scope_bundle",
+        }
+
+    monkeypatch.setattr(hab, "batch_bundle_via_cli", fake_batch)
+    job = service.run(GROUP, model_mode="scope_bundle")
+    assert calls["count"] == 1
+    assert job["status"] == "canonical_ready", job
+    assert job["model_mode"] == "scope_bundle", job
+    status = canonical_reconciliation_status(run_ws, GROUP, store=store)
+    assert status["canonical_ready"] is True, status["failures"]
+
+
+def test_heuristic_rejects_semantic_merge_and_allows_identical_dedupe(tmp_path):
+    """Heuristic plans may only fold byte-identical sources."""
+    run_ws = tmp_path / "run"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+    # The snapshot baseline folds different bodies -> heuristic must refuse.
+    rejected = service.run(
+        GROUP, bundle_plan=plan, model_mode="heuristic",
+    )
+    assert rejected["status"] == "retryable_failed"
+    assert "model_bundle_required" in rejected["last_error"]
+
+    identical_ws = tmp_path / "identical"
+    legacy2 = SharedMemoryStore(identical_ws, GROUP)
+    for i, agent in enumerate(AGENTS[:2]):
+        _seed_record(
+            legacy2, f"same-{i}", "same body", priority=10,
+            agent=agent,
+            assignments=[{"target_type": "agent", "target_id": a} for a in AGENTS[:2]],
+        )
+    AgentBindingStore(identical_ws).bind_agents_to_group(
+        AGENTS[:2], GROUP, allow_empty_group_creation=True,
+    )
+    store2 = RuleMergeStore(identical_ws)
+    service2 = RuleReconciliationService(store2, workspace=identical_ws)
+    plan2 = build_bundles(
+        store2, legacy2, GROUP, _active_mandatory(legacy2),
+    )
+    job = service2.run(
+        GROUP, bundle_plan=plan2, model_mode="heuristic",
+    )
+    assert job["status"] == "canonical_ready", job
+
+
+def test_authoritative_plan_rejects_widened_audience_and_priority(tmp_path):
+    """Saga validation refuses plans that widen or reweight persisted scope."""
+    run_ws = tmp_path / "run"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+    overlay = plan["bundles"][1]
+    assert overlay.bundle_kind == "agent_overlay"
+    # Widen the Codex overlay to another agent that has no source assignment.
+    overlay.bundle_kind = "shared_baseline"
+    with pytest.raises(ValueError, match="shared_baseline_member_mismatch"):
+        service.run(GROUP, bundle_plan=plan, model_mode="scripted")
+
+    plan2 = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+    overlay2 = plan2["bundles"][1]
+    overlay2.priority = 5  # source max is 100
+    with pytest.raises(ValueError, match="bundle_priority_not_source_max"):
+        service.run(GROUP, bundle_plan=plan2, model_mode="scripted")
+
+    plan3 = build_bundles(store, legacy, GROUP, _active_mandatory(legacy))
+    baseline3 = plan3["bundles"][0]
+    baseline3.provider = "claude"  # no source has a provider assignment
+    with pytest.raises(ValueError, match="shared_baseline_widens_audience"):
+        service.run(GROUP, bundle_plan=plan3, model_mode="scripted")

@@ -443,8 +443,26 @@ class LightGraphManager:
                 d["last_used_at"] = max((c.last_used_at for c in anchors), default=0)
                 d["decay_score"] = self._compute_decay(d["last_used_at"], d["use_count"])
                 nodes.append(d)
-        edges = [e.to_dict() for e in self._edges.values()
-                 if e.from_node_id in alive and e.to_node_id in alive]
+        edges_by_key: set[tuple[str, str]] = set()
+        edges = []
+        for e in self._edges.values():
+            if e.from_node_id in alive and e.to_node_id in alive:
+                edges_by_key.add((e.from_node_id, e.to_node_id))
+                edges.append(e.to_dict())
+        for n in nodes:
+            parent_id = str(n.get("parent_id") or "")
+            node_id = str(n.get("light_id") or "")
+            if not parent_id or not node_id or parent_id == node_id:
+                continue
+            if (parent_id, node_id) in edges_by_key:
+                continue
+            edges_by_key.add((parent_id, node_id))
+            edges.append(LightEdge(
+                edge_id=f"parent-bridge:{parent_id}:{node_id}",
+                from_node_id=parent_id, to_node_id=node_id,
+                edge_type="derived_from", directed=True,
+                strength=0.6, confidence=1.0, evidence="parent linkage",
+            ).to_dict())
         return {
             "nodes": nodes, "edges": edges,
             "anchor_claim_ids": anchor_claim_ids,

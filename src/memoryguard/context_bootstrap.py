@@ -221,19 +221,24 @@ def build_context_packet(
             canonical_definitions = 0
             fallback_reason = "evaluation_failed"
         if gate_pass:
-            effective_read_path = "rule-intelligence"
             try:
                 from .rule_read_path import RuleReadPath
 
                 read = RuleReadPath(store.workspace, store.group_id)
-                if read.has_intelligence():
-                    canonical_mapping = read.resolve_canonical_map(
-                        known_memory_ids={r.memory_id for r in all_records},
-                        legacy_store=store,
-                        context=effective_context,
-                    )
+                if not read.has_intelligence():
+                    raise RuntimeError("intelligence projection missing")
+                canonical_mapping = read.resolve_canonical_map(
+                    known_memory_ids={r.memory_id for r in all_records},
+                    legacy_store=store,
+                    context=effective_context,
+                )
+                if not isinstance(canonical_mapping, dict):
+                    raise RuntimeError("canonical mapping did not resolve")
+                effective_read_path = "rule-intelligence"
             except Exception:
                 canonical_mapping = None  # keep the legacy path; canonical is advisory
+                effective_read_path = "legacy"
+                fallback_reason = "canonical_mapping_unavailable"
     omitted = {
         "non_active": 0,
         "sensitive": 0,

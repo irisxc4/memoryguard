@@ -225,8 +225,10 @@ def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     assert "'shape': 'ellipse'" in html
     assert "round-rectangle" not in html
     assert "粒子层异常不能影响 Cytoscape 边/节点脉冲" in html
-    assert "const anchors = leaves.filter" in html
+    assert "const starters = cy.nodes().filter" in html
+    assert "const leafEdge = outgoers.find" in html
     assert "collectNeuronSignalPaths" in html
+    assert "One continuous light travels branch -> leaf" in html
     assert "Always launch 3–4 concurrent full-path pulses" in html
     assert "const delay = index * 260" in html
     assert "underlay-opacity': 0" in html
@@ -327,3 +329,29 @@ def test_history_ui_hides_cross_owner_delete_action() -> None:
     assert "当前共享组成员可查，仅 owner 可删" in html
     assert "meta.project_status === 'unknown' ? ' · 未识别项目'" not in html
     assert "meta.project_status === 'removed' ? ' · 路径已移除' : ''" in html
+
+
+def test_data_sources_render_as_folder_tree() -> None:
+    html = render_interactive_html()
+
+    assert "const buildFileTree" in html
+    assert 'class="folder-group"' in html
+    assert 'class="folder-row"' in html
+    assert "${count} 个文件" in html
+    assert '<div class="folder-children">${renderFileTree(child, depth + 1)}</div>' in html
+
+
+def test_history_projects_render_as_collapsible_folders() -> None:
+    html = render_interactive_html()
+
+    assert 'class="card history-project-group folder-group"' in html
+    assert "${sessionCount} 个会话" in html
+    assert '<div class="folder-children">${agents}</div>' in html
+
+
+def test_neuron_graph_bridges_missing_parent_edges() -> None:
+    html = render_interactive_html()
+
+    assert "const edgeKeys = new Set();" in html
+    assert "parent-bridge:" in html
+    assert "主光点到分类不会悬空" in html

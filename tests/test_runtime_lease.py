@@ -9,15 +9,18 @@ Covers the four required scenarios:
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from memoryguard.runtime_lease import (
     RuntimeLeaseStore,
     _pid_alive,
     check_runtime_lease,
+    default_database_paths,
     release_runtime_lease,
 )
 
@@ -45,6 +48,10 @@ def test_same_build_multiple_acquires_coexist(tmp_path):
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else 0
+        ),
     )
     try:
         assert _pid_alive(proc.pid)
@@ -148,6 +155,127 @@ def test_release_idempotent(tmp_path):
     # second release removes nothing -> False (idempotent)
     assert release_runtime_lease(tmp_path, pid=os.getpid()) is False
     assert RuntimeLeaseStore(tmp_path).load() == []
+
+
+
+
+def _mcp_call(workspace, requests, extra_env):
+    """Run one real stdio MCP subprocess and return parsed response objects."""
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
+    env.update(extra_env)
+    env.setdefault("MEMORYGUARD_AGENT_ID", "test-agent")
+    env.setdefault("MEMORYGUARD_ADMIN", "1")
+    env.setdefault("MEMORYGUARD_STRICT_BINDING", "0")
+    env.setdefault("MEMORYGUARD_ALLOW_ANON", "1")
+    payload = "".join(json.dumps(req, ensure_ascii=False) + "\n" for req in requests)
+    proc = subprocess.run(
+        [
+            sys.executable, "-c",
+            "from memoryguard.mcp_server import serve_stdio; "
+            "raise SystemExit(serve_stdio())",
+        ],
+        input=payload,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        capture_output=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+        timeout=60,
+    )
+    responses = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            responses.append(json.loads(line))
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f"non-JSON MCP stdout line: {line!r}; stderr={proc.stderr[-1000:]}"
+            )
+    return responses, proc
+
+
+def _write_request(workspace):
+    return {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "memoryguard_memory_write",
+            "arguments": {
+                "workspace": str(workspace),
+                "body": "runtime lease subprocess write",
+            },
+        },
+    }
+
+
+def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
+    """The mutating-tool lease guard must be wired into execute_tool(), not
+    only into runtime_lease unit checks.  A live conflicting build is rejected
+    by a real ``serve_stdio()`` subprocess without killing the other process."""
+    store = RuntimeLeaseStore(tmp_path)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP") else 0
+        ),
+    )
+    try:
+        assert _pid_alive(proc.pid)
+        store.upsert({
+            "pid": proc.pid,
+            "process_started_at": "2026-08-07T00:00:00+00:00",
+            "memoryguard_version": "9.9.9",
+            "code_fingerprint": "f" * 64,
+            "control_workspace": str(tmp_path.resolve()),
+            "database_paths": default_database_paths(tmp_path),
+        })
+        responses, run = _mcp_call(
+            tmp_path, [_write_request(tmp_path)],
+            {"MEMORYGUARD_WORKSPACE": ""},
+        )
+        assert run.returncode == 0, run.stderr[-2000:]
+        assert len(responses) == 1, (responses, run.stderr[-2000:])
+        result = responses[0]["result"]
+        assert result.get("error") == "runtime_split_brain", result
+        assert result.get("restart_required") is True
+        pids = [str(item.get("pid", "")) for item in result.get("conflicting", [])]
+        assert str(proc.pid) in pids
+        assert _pid_alive(proc.pid)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_execute_tool_acquires_lease_and_writes_in_real_mcp_subprocess(tmp_path):
+    """With no conflict, a real MCP subprocess write passes the guard, takes
+    its lease, and persists the memory through the normal tool handler."""
+    responses, run = _mcp_call(
+        tmp_path, [_write_request(tmp_path)],
+        {
+            "MEMORYGUARD_WORKSPACE": "",
+            "MEMORYGUARD_AGENT_ID": "",
+            "MEMORYGUARD_ALLOW_ANON": "1",
+        },
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert len(responses) == 1, (responses, run.stderr[-2000:])
+    result = responses[0]["result"]
+    assert result.get("isError") is not True, result
+    leases = RuntimeLeaseStore(tmp_path).load()
+    assert len(leases) == 1
+    assert str(leases[0]["control_workspace"]) == str(tmp_path.resolve())
 
 
 def test_lease_file_has_required_fields(tmp_path):

@@ -627,6 +627,7 @@ class RuleReadPath:
         share_group_id: str,
         *,
         priority_field: str,
+        priority: int | None = None,
     ) -> tuple[str, str, str, str, str, str, int, str] | None:
         """Normalize one legacy assignment or P3 binding audience.
 
@@ -652,11 +653,14 @@ class RuleReadPath:
         effect = str(
             cls._shadow_value(value, "effect", "include") or "include"
         )
-        raw_priority = cls._shadow_value(value, priority_field, 0)
-        try:
-            priority = int(raw_priority or 0)
-        except (TypeError, ValueError):
-            return None
+        if priority is None:
+            raw_priority = cls._shadow_value(value, priority_field, 0)
+            try:
+                priority = int(raw_priority or 0)
+            except (TypeError, ValueError):
+                return None
+        else:
+            priority = int(priority)
 
         if target_type == "project":
             if not project_ref:
@@ -822,7 +826,7 @@ class RuleReadPath:
             return None
         try:
             legacy_records = [
-                (r.memory_id, legacy_store.list_rule_assignments(r.memory_id))
+                (r, legacy_store.list_rule_assignments(r.memory_id))
                 for r in legacy_store.list_records()
             ]
         except Exception:
@@ -844,7 +848,9 @@ class RuleReadPath:
 
         legacy_matched: set[str] = set()
         legacy_audiences: Counter[tuple[Any, ...]] = Counter()
-        for memory_id, assignments in legacy_records:
+        for record, assignments in legacy_records:
+            memory_id = str(getattr(record, "memory_id", "") or "")
+            legacy_priority = int(getattr(record, "priority", 0) or 0)
             for assignment in assignments:
                 try:
                     normalized = normalize_assignment(assignment)
@@ -857,12 +863,16 @@ class RuleReadPath:
                     normalized,
                     context.share_group_id,
                     priority_field="priority_override",
+                    priority=legacy_priority,
                 )
                 if audience is None:
                     return None
                 legacy_audiences[audience] += 1
 
-        legacy_ids = {memory_id for memory_id, _ in legacy_records}
+        legacy_ids = {
+            str(getattr(record, "memory_id", "") or "")
+            for record, _ in legacy_records
+        }
         new_matched: set[str] = set()
         new_audiences: Counter[tuple[Any, ...]] = Counter()
         for binding in bindings:

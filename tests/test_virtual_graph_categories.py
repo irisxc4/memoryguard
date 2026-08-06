@@ -148,3 +148,13 @@ def test_virtual_nodes_stay_in_graph_and_expose_safe_governance_actions() -> Non
     assert 'data-mg-action="neuron-history-read"' in html
     assert "openNeuronHistorySession(sessionId)" in html
     assert "原文不会进入长期记忆或 bootstrap" in html
+
+
+def test_virtual_categories_have_main_light_edges(tmp_path: Path) -> None:
+    graph = _api_with_agent(tmp_path).get_neuron_graph(
+        scope={"mode": "agent", "agent_instance_id": "agent-a"},
+    )
+    edges = {(edge["source"], edge["target"]) for edge in graph["edges"]}
+
+    assert ("main", "virtual-rules-habits") in edges
+    assert ("main", "virtual-conversation-history") in edges
