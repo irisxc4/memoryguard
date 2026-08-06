@@ -21,8 +21,15 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .rule_reconciliation import (
+    ScopeBundle,
+    build_bundles,
+    validate_bundles,
+)
 
 
 def _hidden_subprocess_kwargs() -> dict[str, Any]:
@@ -548,3 +555,316 @@ def batch_enrich_via_cli(
             })
 
     return all_results
+
+
+# ---------------------------------------------------------------------------
+# Req3: scope-bundle 分桶计划 (batch_bundle_via_cli)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BindingInfo:
+    """Normalized view of one full binding.
+
+    ``rule_reconciliation`` helpers read bindings through ``getattr``; this
+    dataclass is the single adapter for dict / dataclass / RuleBinding inputs
+    so both the model prompt and the offline heuristic share one shape.
+    """
+
+    target_type: str = "agent"
+    target_id: str = ""
+    project_ref: str = ""
+    provider: str = ""
+    runtime_role: str = ""
+    effect: str = "include"
+    priority_override: int | None = None
+
+    @classmethod
+    def from_any(cls, raw: Any) -> "_BindingInfo":
+        if isinstance(raw, dict):
+            get = lambda key, default: raw.get(key, default)  # noqa: E731
+        else:
+            get = lambda key, default: getattr(raw, key, default)  # noqa: E731
+        return cls(
+            target_type=str(get("target_type", "agent") or "agent"),
+            target_id=str(get("target_id", "") or ""),
+            project_ref=str(get("project_ref", "") or ""),
+            provider=str(get("provider", "") or ""),
+            runtime_role=str(get("runtime_role", "") or ""),
+            effect=str(get("effect", "include") or "include"),
+            priority_override=get("priority_override", None),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "project_ref": self.project_ref,
+            "provider": self.provider,
+            "runtime_role": self.runtime_role,
+            "effect": self.effect,
+            "priority_override": self.priority_override,
+        }
+
+
+class _LegacyFacade:
+    """Minimal in-memory reader that satisfies ``rule_reconciliation``'s legacy
+    interface (``list_records`` / ``list_rule_assignments``) so the offline
+    heuristic fallback can run without a persisted SharedMemoryStore."""
+
+    def __init__(
+        self,
+        records: list[Any],
+        assignments_by_memory_id: dict[str, list[Any]] | None,
+    ):
+        self._records = list(records)
+        self._assignments = {
+            str(k): [_BindingInfo.from_any(b) for b in (v or [])]
+            for k, v in (assignments_by_memory_id or {}).items()
+        }
+
+    def list_records(self) -> list[Any]:
+        return list(self._records)
+
+    def list_rule_assignments(self, memory_id: str) -> list[Any]:
+        return list(self._assignments.get(str(memory_id), []))
+
+
+def _extract_bundle_plan(data: Any) -> dict[str, Any] | None:
+    """Normalize raw LLM output into the ``{"bundles", "kept_separate"}`` plan
+    shape.  Returns None when the output cannot be read as a plan (fallback)."""
+    if isinstance(data, dict):
+        if "bundles" not in data:
+            return None
+        return {
+            "bundles": data.get("bundles", []),
+            "kept_separate": [str(x) for x in data.get("kept_separate", [])],
+        }
+    if isinstance(data, list):
+        return {"bundles": data, "kept_separate": []}
+    return None
+
+
+def _to_bundle_dict(bundle: Any) -> dict[str, Any]:
+    if isinstance(bundle, ScopeBundle):
+        return bundle.to_dict()
+    return ScopeBundle.from_dict(bundle).to_dict()
+
+
+def _validate_model_scope_bundle(
+    plan: dict[str, Any],
+    source_index: dict[str, dict[str, Any]],
+) -> None:
+    """Strict model-plan checks beyond ``validate_bundles`` (Req3): no cross
+    project_ref merge, no cross effect merge, no audience widening, and
+    bundle priority == max of its sources.  Violations raise ValueError."""
+    bundles = [
+        bundle if isinstance(bundle, ScopeBundle)
+        else ScopeBundle.from_dict(bundle)
+        for bundle in plan.get("bundles", [])
+    ]
+    for bundle in bundles:
+        source_ids = [str(x) for x in bundle.source_memory_ids]
+        present = [sid for sid in source_ids if sid in source_index]
+        project_refs: set[str] = set()
+        providers: set[str] = set()
+        effects: set[str] = set()
+        agent_scoped = True
+        for sid in present:
+            src = source_index[sid]
+            src_bindings = src.get("bindings") or []
+            for binding in src_bindings:
+                if binding.project_ref:
+                    project_refs.add(binding.project_ref)
+                if binding.provider:
+                    providers.add(binding.provider)
+                effects.add(binding.effect or "include")
+            if not any(
+                str(b.target_type) == "agent" and str(b.target_id or "")
+                for b in src_bindings
+            ):
+                agent_scoped = False
+
+        if len(project_refs) > 1:
+            raise ValueError(
+                f"cross_project_ref_merge: {sorted(project_refs)}"
+            )
+        if len(effects) > 1:
+            raise ValueError(
+                f"cross_effect_merge: {sorted(effects)}"
+            )
+        single_effect = next(iter(effects)) if effects else "include"
+        if str(bundle.effect or "include") != single_effect:
+            raise ValueError(f"bundle_effect_mismatch: {source_ids}")
+
+        if bundle.bundle_kind == "project_overlay":
+            if len(project_refs) != 1 or bundle.project_ref not in project_refs:
+                raise ValueError(
+                    f"project_overlay_scope_mismatch: {source_ids}"
+                )
+        elif bundle.bundle_kind == "agent_overlay":
+            if project_refs:
+                raise ValueError(
+                    f"agent_overlay_widens_to_project: {source_ids}"
+                )
+            if providers:
+                if len(providers) != 1 or bundle.provider not in providers:
+                    raise ValueError(
+                        f"agent_overlay_provider_mismatch: {source_ids}"
+                    )
+            elif not agent_scoped:
+                raise ValueError(
+                    f"agent_overlay_widens_audience: {source_ids}"
+                )
+        else:  # shared_baseline
+            if project_refs or providers:
+                raise ValueError(
+                    f"shared_baseline_widens_audience: {source_ids}"
+                )
+
+        max_priority = max(
+            (int(source_index[sid].get("priority") or 0) for sid in present),
+            default=0,
+        )
+        if int(bundle.priority or 0) != max_priority:
+            raise ValueError(
+                f"bundle_priority_not_source_max: {source_ids}"
+            )
+
+
+def batch_bundle_via_cli(
+    records: list[Any],
+    assignments_by_memory_id: dict[str, list[Any]] | None = None,
+    agent: str = "",
+    cli_path: str = "",
+    workspace: str | Path | None = None,
+) -> dict[str, Any]:
+    """为整组共享组生成 scope-bundle 分桶计划（Req3）。
+
+    输入:
+      records                -- 每个 active mandatory 的记录
+                                (memory_id / body / priority / owner_agent_id)
+      assignments_by_memory_id -- memory_id -> 该记录的完整 bindings；每条 binding
+                                带 target_type/target_id/project_ref/provider/
+                                runtime_role/effect（dict 或对象均可）。
+
+    输出:
+      {"bundles": [{"bundle_kind","source_memory_ids","priority","body",
+                    "project_ref","provider","effect"}],
+       "kept_separate": [...],
+       "model_mode": "scope_bundle"}
+
+    校验（启发式结果永远不被当作 scope_bundle 计划接受）:
+      - 每个 source_id 恰好出现在一个 bundle 或 kept_separate
+      - 不得跨 project_ref / effect 合并
+      - 不得扩大受众（shared_baseline 无 project/provider；project_overlay 只能含
+        同一 project_ref；agent_overlay 只能含同一 provider 或同一 agent 受众）
+      - bundle priority == 各来源 priority 的最大值
+      任一违反 -> ValueError("invalid_scope_bundle: ...")。
+
+    LLM 返回为空 / 超时 / 不可解析时回退 :func:`build_bundles` 启发式计划，
+    并把 model_mode 标为 "heuristic"。
+    """
+    records = list(records or [])
+    assignments_by_memory_id = assignments_by_memory_id or {}
+    source_ids = [str(record.memory_id) for record in records]
+    if not source_ids:
+        return {"bundles": [], "kept_separate": [], "model_mode": "heuristic"}
+
+    sources: list[dict[str, Any]] = []
+    for record in records:
+        bindings = [
+            _BindingInfo.from_any(b)
+            for b in assignments_by_memory_id.get(record.memory_id, [])
+        ]
+        sources.append({
+            "memory_id": str(record.memory_id),
+            "body": str(getattr(record, "body", "") or "")[:2000],
+            "priority": int(getattr(record, "priority", 0) or 0),
+            "owner_agent_id": str(getattr(record, "agent_instance_id", "") or ""),
+            "bindings": bindings,
+        })
+    source_index = {s["memory_id"]: s for s in sources}
+
+    def fallback_heuristic() -> dict[str, Any]:
+        facade = _LegacyFacade(records, assignments_by_memory_id)
+        plan = build_bundles(None, facade, "", records)
+        validate_bundles(plan, source_ids)
+        return {
+            "bundles": [_to_bundle_dict(b) for b in plan.get("bundles", [])],
+            "kept_separate": [
+                str(x) for x in plan.get("kept_separate", [])
+            ],
+            "model_mode": "heuristic",
+        }
+
+    if not agent or not cli_path:
+        selected = select_agent_for_llm(workspace=workspace)
+        if selected is None:
+            return fallback_heuristic()
+        agent = selected["agent"]
+        cli_path = selected["cli"]
+
+    system = (
+        "你是共享记忆规则分桶助手。给定一组 mandatory 规则的来源（source）及其"
+        "绑定（bindings），把它们折叠为 scope-bundle 分桶计划。\n\n"
+        "分桶语义：\n"
+        "- shared_baseline：整组共享的基线规则，受众覆盖整个共享组；\n"
+        "- agent_overlay：按 provider/agent 的覆盖规则，只属于特定 provider 或"
+        "特定 agent；\n"
+        "- project_overlay：按项目的覆盖规则，绑定一个 project_ref；\n"
+        "- kept_separate：无法安全折叠、需单独保留 active 定义的来源。\n\n"
+        "硬性约束：\n"
+        "1. 每个 source_id 必须恰好出现在一个 bundle 的 source_memory_ids 或"
+        "kept_separate 中；\n"
+        "2. 不得把 project_ref 不同的来源合并进同一个 bundle；\n"
+        "3. 不得把 effect 不同的来源合并进同一个 bundle；\n"
+        "4. 不得扩大受众：shared_baseline 只能含无 project_ref、无 provider 的来源；"
+        "agent_overlay 只能含同一 provider（或无 provider 但受众为特定 agent）且"
+        "无 project_ref 的来源；project_overlay 只能含同一 project_ref 的来源；\n"
+        "5. bundle 的 priority 必须等于其来源 priority 的最大值；\n"
+        "6. bundle 的 body 由来源正文拼接（多条时用 [n] 前缀分行）。\n\n"
+        '输出格式：严格 JSON 对象 {"bundles": [{"bundle_kind":"...",'
+        '"source_memory_ids":[...],"priority":0,"body":"...","project_ref":"",'
+        '"provider":"","effect":"include"}], "kept_separate":[...]}。'
+        "只返回 JSON，不要其他内容。"
+    )
+    user = json.dumps(
+        {
+            "sources": [
+                {
+                    "memory_id": s["memory_id"],
+                    "body": s["body"],
+                    "priority": s["priority"],
+                    "owner_agent_id": s["owner_agent_id"],
+                    "bindings": [b.to_dict() for b in s["bindings"]],
+                }
+                for s in sources
+            ]
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    data = _call_llm_json(agent, cli_path, system, user, timeout=120,
+                          expect_array=True)
+    if not data:
+        return fallback_heuristic()
+    plan = _extract_bundle_plan(data)
+    if plan is None:
+        return fallback_heuristic()
+
+    # 无论 LLM 返回什么，返回前都强制校验；失败抛 invalid_scope_bundle。
+    try:
+        validate_bundles(plan, source_ids)
+        _validate_model_scope_bundle(plan, source_index)
+    except ValueError as exc:
+        raise ValueError(f"invalid_scope_bundle: {exc}") from exc
+
+    return {
+        "bundles": [_to_bundle_dict(b) for b in plan.get("bundles", [])],
+        "kept_separate": [
+            str(x) for x in plan.get("kept_separate", [])
+        ],
+        "model_mode": "scope_bundle",
+    }

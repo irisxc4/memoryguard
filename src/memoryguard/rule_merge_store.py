@@ -408,6 +408,33 @@ CREATE TABLE IF NOT EXISTS rule_projection_state (
     projection_error TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS rule_reconciliation_jobs (
+    job_id TEXT PRIMARY KEY,
+    share_group_id TEXT NOT NULL,
+    source_digest TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending_model',
+    phase TEXT NOT NULL DEFAULT 'model',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    model_mode TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '',
+    canonical_digest_before TEXT NOT NULL DEFAULT '',
+    canonical_digest_after TEXT NOT NULL DEFAULT '',
+    projection_version TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_reconciliation_jobs_group
+    ON rule_reconciliation_jobs(share_group_id, status);
+CREATE TABLE IF NOT EXISTS rule_canonical_state (
+    share_group_id TEXT PRIMARY KEY,
+    activation_status TEXT NOT NULL DEFAULT '',
+    canonical_digest TEXT NOT NULL DEFAULT '',
+    read_path TEXT NOT NULL DEFAULT 'legacy',
+    activated_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 """
 
 # Fresh RuleMergeStore databases must have the same append-only evidence ledger
@@ -1032,6 +1059,46 @@ class RuleMergeStore:
                 last_projected_event_id TEXT NOT NULL DEFAULT '',
                 projection_lag INTEGER NOT NULL DEFAULT 0,
                 projection_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        # Durable canonical-reconciliation jobs + group-level activation marker.
+        # CREATE IF NOT EXISTS is safe inside the caller transaction for both
+        # fresh and upgraded databases.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rule_reconciliation_jobs (
+                job_id TEXT PRIMARY KEY,
+                share_group_id TEXT NOT NULL,
+                source_digest TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending_model',
+                phase TEXT NOT NULL DEFAULT 'model',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                model_mode TEXT NOT NULL DEFAULT '',
+                result_json TEXT NOT NULL DEFAULT '',
+                canonical_digest_before TEXT NOT NULL DEFAULT '',
+                canonical_digest_after TEXT NOT NULL DEFAULT '',
+                projection_version TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_reconciliation_jobs_group "
+            "ON rule_reconciliation_jobs(share_group_id, status)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rule_canonical_state (
+                share_group_id TEXT PRIMARY KEY,
+                activation_status TEXT NOT NULL DEFAULT '',
+                canonical_digest TEXT NOT NULL DEFAULT '',
+                read_path TEXT NOT NULL DEFAULT 'legacy',
+                activated_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
             """

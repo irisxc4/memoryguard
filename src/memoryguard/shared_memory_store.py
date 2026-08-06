@@ -4904,6 +4904,32 @@ class SharedMemoryStore:
         )
         self.append_decision(decision)
 
+    def shadow_record(
+        self, memory_id: str, reason: str, *, actor: str = "auto",
+    ) -> None:
+        """Canonical reconciliation: fold one source into a canonical record.
+
+        A pure status flip: the source stays fully recoverable as a shadow,
+        with **no** lifecycle outbox event and **no** DecisionEvent.  The
+        reconciliation job itself is the audit trail; a per-record decision
+        would churn the outbox and inflate the decision ledger on every
+        idempotent re-run.  Idempotent -- an already-shadowed record is left
+        untouched.
+        """
+        now = _now_iso()
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT status FROM records WHERE memory_id=?", (memory_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("memory_not_found")
+            if str(row["status"] or "") == SharedMemoryStatus.SHADOWED.value:
+                return
+            conn.execute(
+                "UPDATE records SET status=?, updated_at=? WHERE memory_id=?",
+                (SharedMemoryStatus.SHADOWED.value, now, memory_id),
+            )
+
     def quarantine_memory(
         self,
         memory_id: str,
