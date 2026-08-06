@@ -222,34 +222,46 @@ class HistoryAccessResolver:
         self.workspace = Path(workspace).resolve()
 
     def resolve(self, trusted_agent_id: str, requested: dict[str, Any] | None = None) -> HistoryScope:
-        from .agent_binding import AgentBindingStore, is_personal_group_id
+        from .agent_binding import is_personal_group_id
+        from .governance_scope import resolve_active_scope
 
-        request = requested or {}
-        base = HistoryScope.trusted(request, trusted_agent_id)
-        bindings = AgentBindingStore(self.workspace).find_by_agent(base.agent_instance_id, include_inactive=False)
-        if len(bindings) != 1:
-            raise PermissionError("history_active_binding_required")
-        binding = bindings[0]
-        claimed_group = base.share_group_id
-        if claimed_group and claimed_group != binding.share_group_id:
-            raise PermissionError("trusted_share_group_scope_required")
-        # A live shared binding is the sharing policy.  Clients may omit a
-        # scope entirely, but cannot opt into another group by claiming one.
-        # Personal bindings always remain an exact one-owner scope.
-        shared = not is_personal_group_id(binding.share_group_id)
-        if shared:
-            members = AgentBindingStore(self.workspace).find_by_group(
-                binding.share_group_id, include_inactive=False,
+        request = dict(requested or {})
+        if not request and trusted_agent_id:
+            request = {
+                "mode": "agent",
+                "agent_instance_id": trusted_agent_id,
+            }
+        resolution = resolve_active_scope(
+            self.workspace,
+            request,
+            trusted_agent_id=trusted_agent_id,
+        )
+        if not resolution.ok:
+            # Keep the stable history error contract while routing all
+            # binding checks through the shared runtime scope resolver.
+            if resolution.error in {
+                "trusted_agent_scope_required",
+                "trusted_share_group_scope_required",
+            }:
+                raise PermissionError(resolution.error)
+            raise PermissionError(
+                "history_active_binding_required"
+                if resolution.error in {"active_binding_required", "multiple_active_bindings"}
+                else resolution.error or "history_scope_required"
             )
-            authorized = tuple(sorted({item.agent_instance_id for item in members if item.agent_instance_id}))
-            if base.agent_instance_id not in authorized:
-                raise PermissionError("history_active_group_membership_required")
-        else:
-            authorized = (base.agent_instance_id,)
-        return replace(
-            base,
-            share_group_id=binding.share_group_id if shared else "",
-            authorized_agent_ids=authorized,
+
+        scope = resolution.scope
+        assert scope is not None
+        shared = (
+            scope.mode == "share_group"
+            and not is_personal_group_id(scope.share_group_id)
+        )
+        return HistoryScope(
+            agent_instance_id=resolution.principal_agent_id,
+            project_ref=str(request.get("project_ref") or ""),
+            provider=str(request.get("provider") or ""),
+            share_group_id=scope.share_group_id if shared else "",
+            authorized_agent_ids=resolution.authorized_agent_ids,
             shared_read=shared,
         )
 

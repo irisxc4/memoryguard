@@ -1069,6 +1069,12 @@ class GovernanceApi:
             return None, err or "missing_governance_scope"
         return ok.to_dict(), ""
 
+    def _trusted_agent_id(self) -> str:
+        from .access_context import load_access_context
+
+        access = self._trusted_access_context or load_access_context()
+        return str(getattr(access, "trusted_agent_id", "") or "").strip()
+
     def get_governance_scope(self) -> dict:
         """读取 UI 偏好 scope（非授权依据）。"""
         from .governance_scope import load_scope_preference
@@ -1076,6 +1082,31 @@ class GovernanceApi:
         if pref is None:
             return {"empty": True, "reason": "no_preference"}
         return {"empty": False, "scope": pref.to_dict()}
+
+    def get_governance_scope_state(self) -> dict:
+        """Return the preference plus its binding-backed runtime state."""
+        from .governance_scope import (
+            list_active_scope_options,
+            load_scope_preference,
+            resolve_active_scope,
+        )
+
+        trusted_agent_id = self._trusted_agent_id()
+        preference = load_scope_preference(self.workspace)
+        resolution = resolve_active_scope(
+            self.workspace,
+            preference,
+            trusted_agent_id=trusted_agent_id,
+        )
+        return {
+            **resolution.to_dict(),
+            "preference": preference.to_dict() if preference else None,
+            "trusted_agent_instance_id": trusted_agent_id,
+            "options": list_active_scope_options(
+                self.workspace,
+                trusted_agent_id=trusted_agent_id,
+            ),
+        }
 
     def set_governance_scope(self, scope: dict | None = None, *,
                              agent_instance_id: str = "",
@@ -2519,9 +2550,19 @@ class GovernanceApi:
                 agent_id = str(members[0].agent_instance_id) if members else ""
             if not agent_id:
                 raise PermissionError("history_active_binding_required")
+            history_request = (
+                {
+                    "mode": "share_group",
+                    "share_group_id": requested_group,
+                }
+                if requested_group
+                else {
+                    "mode": "agent",
+                    "agent_instance_id": agent_id,
+                }
+            )
             history_scope = HistoryAccessResolver(self.workspace).resolve(agent_id, {
-                "agent_instance_id": agent_id,
-                "share_group_id": requested_group,
+                **history_request,
             })
             history = ConversationHistoryStore(self.workspace).list_sessions(
                 history_scope, limit=51, offset=0,
@@ -6182,10 +6223,26 @@ class GovernanceApi:
                 convs = ad.parse(bundle)
                 # Import is evidence-only.  Raw messages never become
                 # SharedMemoryRecord candidates without an explicit extract.
-                agent_id = agent_instance_id or "local-default"
+                requested_scope = {}
+                if share_group_id:
+                    requested_scope = {
+                        "mode": "share_group",
+                        "share_group_id": share_group_id,
+                    }
+                elif agent_instance_id:
+                    requested_scope = {
+                        "mode": "agent",
+                        "agent_instance_id": agent_instance_id,
+                    }
+                try:
+                    history_scope = self._history_scope(requested_scope)
+                except PermissionError as exc:
+                    return {"error": str(exc)}
+                agent_id = history_scope.agent_instance_id
                 archived = ad.archive_history(
                     convs, workspace=self.workspace, agent_instance_id=agent_id,
-                    project_ref=project_ref, share_group_id=share_group_id,
+                    project_ref=project_ref,
+                    share_group_id=history_scope.share_group_id,
                 )
                 return {"provider": d.provider,
                         "conversation_count": archived["conversation_count"],
@@ -6203,21 +6260,21 @@ class GovernanceApi:
 
     def _history_scope(self, scope: dict | None = None) -> "HistoryScope":
         from .conversation_history import HistoryAccessResolver
-        scope = scope or {}
-        agent_id = str(scope.get("agent_instance_id") or "local-default")
-        group_id = str(scope.get("share_group_id") or "")
-        if agent_id == "local-default" and group_id:
-            from .agent_binding import AgentBindingStore
-            members = AgentBindingStore(self.workspace).find_by_group(group_id, include_inactive=False)
-            agent_id = str(members[0].agent_instance_id) if members else agent_id
+        from .governance_scope import load_scope_preference
+
+        requested = dict(scope or {})
+        trusted_agent_id = self._trusted_agent_id()
+        if not requested:
+            preference = load_scope_preference(self.workspace)
+            requested = preference.to_dict() if preference else {}
+        if not requested and trusted_agent_id:
+            requested = {
+                "mode": "agent",
+                "agent_instance_id": trusted_agent_id,
+            }
         return HistoryAccessResolver(self.workspace).resolve(
-            agent_id,
-            {
-                "agent_instance_id": agent_id,
-                "project_ref": str(scope.get("project_ref") or ""),
-                "provider": str(scope.get("provider") or ""),
-                "share_group_id": group_id,
-            },
+            trusted_agent_id,
+            requested,
         )
 
     def list_history_sessions(self, scope: dict | None = None, limit: int = 50,

@@ -937,14 +937,23 @@ function waitForPywebview(timeoutMs) {
 
 async function loadGovernanceScopePreference() {
   try {
-    const pref = await callApi('get_governance_scope');
-    if (pref && !pref.empty && pref.scope) {
-      if (pref.scope.mode === 'share_group' && pref.scope.share_group_id) {
-        activeShareGroupId = pref.scope.share_group_id;
+    const runtime = await callApi('get_governance_scope_state');
+    if (runtime && runtime.ok && runtime.scope) {
+      if (runtime.scope.mode === 'share_group' && runtime.scope.share_group_id) {
+        activeShareGroupId = runtime.scope.share_group_id;
+        activeAgentInstanceId = runtime.principal_agent_instance_id || '';
         dataPageMode = 'multi_agent_shared_mcp';
-      } else if (pref.scope.agent_instance_id) {
-        activeAgentInstanceId = pref.scope.agent_instance_id;
+      } else if (runtime.scope.agent_instance_id) {
+        activeAgentInstanceId = runtime.scope.agent_instance_id;
+        activeShareGroupId = '';
+        dataPageMode = 'single_agent';
+      } else {
+        activeAgentInstanceId = '';
+        activeShareGroupId = '';
       }
+    } else {
+      activeAgentInstanceId = '';
+      activeShareGroupId = '';
     }
   } catch (_) {}
 }
@@ -1304,27 +1313,29 @@ function renderContent() {
 }
 
 async function ensureGovernanceScope() {
-  if (isShareGroupScope()) return true;
-  if (activeAgentInstanceId) {
-    try {
-      await callApi('set_governance_scope', {
-        mode: 'agent',
-        agent_instance_id: activeAgentInstanceId,
-      });
-    } catch (_) {}
-    return true;
-  }
   try {
-    const agents = agentCardsData || await callApi('list_agents');
-    agentCardsData = agents;
-    const list = (agents && agents.agents) || [];
-    if (list.length) {
-      activeAgentInstanceId = list[0].instance_id;
-      await callApi('set_governance_scope', {
-        mode: 'agent',
-        agent_instance_id: activeAgentInstanceId,
-      });
+    const runtime = await callApi('get_governance_scope_state');
+    if (runtime && runtime.ok && runtime.scope) {
+      if (runtime.scope.mode === 'share_group') {
+        activeShareGroupId = runtime.scope.share_group_id || '';
+        activeAgentInstanceId = runtime.principal_agent_instance_id || '';
+        dataPageMode = 'multi_agent_shared_mcp';
+      } else {
+        activeAgentInstanceId = runtime.scope.agent_instance_id || '';
+        activeShareGroupId = '';
+        dataPageMode = 'single_agent';
+      }
       return true;
+    }
+    // A single active binding is safe to select automatically; multiple
+    // bindings require an explicit user choice.
+    const options = (runtime && runtime.options) || {};
+    const agents = options.agents || [];
+    if (agents.length === 1 && !(options.share_groups || []).length) {
+      activeAgentInstanceId = agents[0].agent_instance_id || '';
+      activeShareGroupId = '';
+      dataPageMode = 'single_agent';
+      return !!activeAgentInstanceId;
     }
   } catch (_) {}
   return false;
@@ -3302,7 +3313,26 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
 }
 
 function historyScope() {
-  return {agent_instance_id: activeAgentInstanceId || '', share_group_id: activeShareGroupId || ''};
+  if (isShareGroupScope()) {
+    return {mode: 'share_group', share_group_id: activeShareGroupId};
+  }
+  if (activeAgentInstanceId) {
+    return {mode: 'agent', agent_instance_id: activeAgentInstanceId};
+  }
+  return {};
+}
+
+function renderHistoryScopeGate() {
+  return `<section class="card empty-state">
+    <div>
+      <div class="empty-orb"></div>
+      <h2>需要有效治理范围</h2>
+      <p>对话历史只允许读取当前 Agent 的 active binding。请先在数据源页选择已绑定的 Agent 或共享组。</p>
+      <div class="finding-actions">
+        <button class="btn btn-primary" type="button" onclick="switchTab('sources')">去数据源选择</button>
+      </div>
+    </div>
+  </section>`;
 }
 
 let ruleScopeOptions = null;
@@ -3896,8 +3926,9 @@ async function renderHistory() {
     setContent(`<div class="card empty-state"><p>旧会话扫描失败：${escapeHtml(e.message || e)}</p></div>`);
     return;
   }
-  if (!activeAgentInstanceId && !isShareGroupScope()) {
-    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引可显示在神经图；原文不会进入长期记忆或 bootstrap。</p></div></div>${renderHistoryBackfillPanel(inventory)}<div class="card empty-state"><p>请先在数据源页选择一个 Agent，再查看它的独立对话历史。</p></div>`);
+  const scopeReady = await ensureGovernanceScope();
+  if (!scopeReady) {
+    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引可显示在神经图；原文不会进入长期记忆或 bootstrap。</p></div></div>${renderHistoryBackfillPanel(inventory)}${renderHistoryScopeGate()}`);
     return;
   }
   try {
@@ -4699,7 +4730,7 @@ async function confirmImport(path) {
   if (!confirm('确认解析此导出包？\n· 会话只作为证据/萃取来源\n· 不直接写入长期记忆\n· 原始文件不被修改')) return;
   showToast('正在解析…');
   try {
-    const result = await callApi('create_import', path, true, activeAgentInstanceId || 'local-default', '', activeShareGroupId || '');
+    const result = await callApi('create_import', path, true, activeAgentInstanceId || '', '', activeShareGroupId || '');
     if (result.error) {
       showToast(result.error, 'error');
       return;

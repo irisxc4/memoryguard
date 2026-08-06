@@ -59,6 +59,207 @@ class GovernanceScope:
         )
 
 
+@dataclass(frozen=True)
+class ActiveScopeResolution:
+    """Binding-backed runtime scope.
+
+    ``GovernanceScope`` is only a user-selected scope shape.  This result is
+    the runtime contract after the selection has been checked against the
+    active binding ledger.
+    """
+
+    scope: GovernanceScope | None
+    principal_agent_id: str = ""
+    authorized_agent_ids: tuple[str, ...] = ()
+    binding_ids: tuple[str, ...] = ()
+    status: str = "invalid"
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "active" and self.scope is not None and not self.error
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "status": self.status,
+            "error": self.error,
+            "scope": self.scope.to_dict() if self.scope else None,
+            "principal_agent_instance_id": self.principal_agent_id,
+            "authorized_agent_ids": list(self.authorized_agent_ids),
+            "binding_ids": list(self.binding_ids),
+        }
+
+
+def resolve_active_scope(
+    workspace: str | Path,
+    scope: GovernanceScope | dict[str, Any] | None,
+    *,
+    trusted_agent_id: str = "",
+) -> ActiveScopeResolution:
+    """Resolve a selected scope against the active binding ledger.
+
+    The persisted governance scope is a UI preference only.  Every runtime
+    reader must call this function before touching scoped evidence or stores.
+    ``trusted_agent_id`` is authoritative when supplied; a desktop GUI may
+    leave it empty and select one of the active bindings explicitly.
+    """
+    normalized_scope = scope
+    if isinstance(scope, dict) and not str(scope.get("mode") or "").strip():
+        # Legacy GUI callers sent only one of the two IDs.  Normalize that
+        # shape at the boundary so every runtime path uses the same contract.
+        normalized_scope = dict(scope)
+        normalized_scope["mode"] = (
+            "share_group" if normalized_scope.get("share_group_id")
+            else "agent"
+        )
+    parsed, error = validate_scope(normalized_scope)
+    if parsed is None:
+        return ActiveScopeResolution(
+            scope=None,
+            status="missing_selection" if error == "missing_governance_scope" else "invalid",
+            error=error,
+        )
+
+    trusted = str(trusted_agent_id or "").strip()
+    from .agent_binding import AgentBindingStore, is_personal_group_id
+
+    bindings = AgentBindingStore(workspace)
+    if parsed.mode == "agent":
+        if trusted and parsed.agent_instance_id != trusted:
+            return ActiveScopeResolution(
+                scope=parsed, status="forbidden",
+                error="trusted_agent_scope_required",
+            )
+        active = bindings.find_by_agent(parsed.agent_instance_id, include_inactive=False)
+        if len(active) == 0:
+            return ActiveScopeResolution(
+                scope=parsed, status="stale_selection",
+                error="active_binding_required",
+            )
+        if len(active) != 1:
+            return ActiveScopeResolution(
+                scope=parsed, status="invalid_binding",
+                error="multiple_active_bindings",
+                binding_ids=tuple(sorted(b.binding_id for b in active)),
+            )
+        binding = active[0]
+        if not is_personal_group_id(binding.share_group_id):
+            group_active = bindings.find_by_group(
+                binding.share_group_id,
+                include_inactive=False,
+            )
+            authorized = tuple(sorted({
+                str(member.agent_instance_id)
+                for member in group_active
+                if str(member.agent_instance_id or "").strip()
+            }))
+            if trusted and trusted not in authorized:
+                return ActiveScopeResolution(
+                    scope=parsed,
+                    status="forbidden",
+                    error="trusted_share_group_scope_required",
+                    authorized_agent_ids=authorized,
+                    binding_ids=tuple(sorted(
+                        member.binding_id for member in group_active
+                    )),
+                )
+            return ActiveScopeResolution(
+                scope=GovernanceScope(
+                    mode="share_group",
+                    share_group_id=binding.share_group_id,
+                ),
+                principal_agent_id=parsed.agent_instance_id,
+                authorized_agent_ids=authorized,
+                binding_ids=tuple(sorted(
+                    member.binding_id for member in group_active
+                )),
+                status="active",
+            )
+        return ActiveScopeResolution(
+            scope=parsed,
+            principal_agent_id=parsed.agent_instance_id,
+            authorized_agent_ids=(parsed.agent_instance_id,),
+            binding_ids=(binding.binding_id,),
+            status="active",
+        )
+
+    active = bindings.find_by_group(parsed.share_group_id, include_inactive=False)
+    authorized = tuple(sorted({
+        str(binding.agent_instance_id)
+        for binding in active if str(binding.agent_instance_id or "").strip()
+    }))
+    if trusted and trusted not in authorized:
+        return ActiveScopeResolution(
+            scope=parsed,
+            status="forbidden",
+            error="trusted_share_group_scope_required",
+            authorized_agent_ids=authorized,
+            binding_ids=tuple(sorted(b.binding_id for b in active)),
+        )
+    if not active:
+        return ActiveScopeResolution(
+            scope=parsed, status="stale_selection",
+            error="active_binding_required",
+        )
+    principal = trusted or authorized[0]
+    principal_bindings = [
+        binding for binding in active
+        if binding.agent_instance_id == principal
+    ]
+    if len(principal_bindings) != 1:
+        return ActiveScopeResolution(
+            scope=parsed, status="invalid_binding",
+            error="multiple_active_bindings",
+            authorized_agent_ids=authorized,
+            binding_ids=tuple(sorted(b.binding_id for b in active)),
+        )
+    return ActiveScopeResolution(
+        scope=parsed,
+        principal_agent_id=principal,
+        authorized_agent_ids=authorized,
+        binding_ids=tuple(sorted(b.binding_id for b in active)),
+        status="active",
+    )
+
+
+def list_active_scope_options(
+    workspace: str | Path,
+    *,
+    trusted_agent_id: str = "",
+) -> dict[str, list[dict[str, Any]]]:
+    """Return selectable active agents/groups for the desktop scope picker."""
+    from .agent_binding import AgentBindingStore, is_personal_group_id
+
+    trusted = str(trusted_agent_id or "").strip()
+    active = AgentBindingStore(workspace).list_bindings(include_inactive=False)
+    if trusted:
+        active = [binding for binding in active if binding.agent_instance_id == trusted]
+    agents = sorted({
+        str(binding.agent_instance_id)
+        for binding in active if str(binding.agent_instance_id or "").strip()
+    })
+    groups: dict[str, set[str]] = {}
+    for binding in active:
+        group_id = str(binding.share_group_id or "").strip()
+        agent_id = str(binding.agent_instance_id or "").strip()
+        if group_id and agent_id and not is_personal_group_id(group_id):
+            groups.setdefault(group_id, set()).add(agent_id)
+    return {
+        "agents": [
+            {"agent_instance_id": agent_id}
+            for agent_id in agents
+        ],
+        "share_groups": [
+            {
+                "share_group_id": group_id,
+                "agent_instance_ids": sorted(member_ids),
+            }
+            for group_id, member_ids in sorted(groups.items())
+        ],
+    }
+
+
 def _validate_id(value: str, *, kind: str) -> str:
     text = value.strip()
     if not text:

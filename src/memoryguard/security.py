@@ -29,6 +29,7 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     "discover_agents", "get_selection_tree", "get_agent_data",
     # 神经元图（只读）
     "get_neuron_graph", "get_projection_source_map", "get_governance_scope",
+    "get_governance_scope_state",
     "list_native_memory_releases", "list_publish_targets", "choose_publish_target_path",
     # 来源管理（只读）
     "list_sources", "preview_source", "scan_sources",
