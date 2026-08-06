@@ -17,8 +17,8 @@ jobs:
         run: |
           fail=0
 
-          # SQLite 运行文件（豁免 tests/fixtures 与 docs/assets 下的产品资产）
-          if git ls-files --cached | grep -E '\.(db|sqlite|db-wal|db-shm|sqlite-wal|sqlite-shm)$' | grep -v '^docs/assets/' | grep -v '^tests/fixtures/' > /tmp/sqlite.txt; then
+          # SQLite 运行文件（db/db3/sqlite/sqlite3/vscdb + 任意 -wal/-shm/-journal 侧边文件；豁免 tests/fixtures 与 docs/assets 下的产品资产）
+          if git ls-files --cached | grep -E '\.(db|db3|sqlite|sqlite3|vscdb)(-(wal|shm|journal))?$' | grep -v '^docs/assets/' | grep -v '^tests/fixtures/' > /tmp/sqlite.txt; then
             echo "::error::Forbidden SQLite file tracked:"
             cat /tmp/sqlite.txt
             fail=1
@@ -52,8 +52,8 @@ jobs:
             fail=1
           fi
 
-          # 本地密钥配置（允许 .env.example）
-          if git ls-files --cached | grep -E '^\.env$|\.env\.[^-]' | grep -v '\.env\.example$' > /tmp/env.txt; then
+          # 本地密钥配置：任意目录深度的 .env / .env.* 都拦截（git add -f 也逃不掉），允许任意目录的 .env.example
+          if git ls-files --cached | grep -E '(^|/)\.env($|\.)' | grep -Ev '(^|/)\.env\.example$' > /tmp/env.txt; then
             echo "::error::Forbidden env config tracked:"
             cat /tmp/env.txt
             fail=1

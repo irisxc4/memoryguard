@@ -15,13 +15,17 @@ dist/
 .venv/
 venv/
 
-# SQLite 运行文件
+# SQLite 运行文件（db/db3/sqlite/sqlite3/vscdb + -wal/-shm/-journal 侧边文件）
 *.db
-*.db-shm
-*.db-wal
+*.db-*
+*.db3
+*.db3-*
 *.sqlite
-*.sqlite-shm
-*.sqlite-wal
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.vscdb
+*.vscdb-*
 
 # Coverage
 .coverage
@@ -68,3 +72,10 @@ graphify-out/
 # OS
 .DS_Store
 Thumbs.db
+
+# 数据库 Fixture 例外（与 CI repo-hygiene 的 tests/fixtures 豁免保持一致）
+!tests/fixtures/**/*.db
+!tests/fixtures/**/*.db3
+!tests/fixtures/**/*.sqlite
+!tests/fixtures/**/*.sqlite3
+!tests/fixtures/**/*.vscdb
