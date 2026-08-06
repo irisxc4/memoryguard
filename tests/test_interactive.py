@@ -206,6 +206,9 @@ def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     assert "renderedPosition()" in html
     assert "control-point-distances" in html
     assert "Math.atan2" in html
+    assert "粒子层异常不能影响 Cytoscape 边/节点脉冲" in html
+    assert "const anchors = leaves.filter" in html
+    assert "const initialWave = setTimeout(fireWave, 720)" in html
     assert "neuron-particle-travel" not in html
 
 

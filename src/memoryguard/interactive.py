@@ -1939,9 +1939,23 @@ function _releaseSignal(cy, eleId, cls) {
 }
 
 function pickNeuronSignalPath(cy) {
-  const leaves = cy.nodes().filter(n => n.data('kind') === 'claim_anchor');
+  const derivedEdges = edge => {
+    const type = edge.data('etype');
+    return !type || type === 'derived_from';
+  };
+  const leaves = cy.nodes().filter(n => {
+    if (!n || !n.length || n.data('kind') === 'root') return false;
+    const incoming = n.incomers('edge').filter(derivedEdges);
+    const outgoing = n.outgoers('edge').filter(derivedEdges);
+    return incoming.length > 0 && outgoing.length === 0;
+  });
   if (!leaves.length) return null;
-  const leaf = leaves[Math.floor(Math.random() * leaves.length)];
+  const anchors = leaves.filter(n => {
+    const kind = n.data('kind');
+    return kind === 'claim_anchor' || kind === 'duplicate_cluster';
+  });
+  const candidates = anchors.length ? anchors : leaves;
+  const leaf = candidates[Math.floor(Math.random() * candidates.length)];
   const pathNodes = [];
   const pathEdges = [];
   let cur = leaf;
@@ -1949,10 +1963,7 @@ function pickNeuronSignalPath(cy) {
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
     pathNodes.unshift(cur);
-    const incomers = cur.incomers('edge').filter(e => {
-      const t = e.data('etype');
-      return !t || t === 'derived_from';
-    });
+    const incomers = cur.incomers('edge').filter(derivedEdges);
     if (!incomers.length) break;
     const edge = incomers[Math.floor(Math.random() * Math.min(incomers.length, 2))];
     pathEdges.unshift(edge);
@@ -1962,24 +1973,33 @@ function pickNeuronSignalPath(cy) {
       break;
     }
   }
-  if (pathEdges.length < 1) return null;
+  if (pathEdges.length < 1) {
+    const edges = cy.edges().filter(derivedEdges);
+    if (!edges.length) return null;
+    const edge = edges[Math.floor(Math.random() * edges.length)];
+    return { nodes: [edge.source(), edge.target()], edges: [edge] };
+  }
   return { nodes: pathNodes, edges: pathEdges };
 }
 
 function runNeuronSignalPulse(cy, path) {
   if (!cy || !path || !path.edges.length) return;
   const stepMs = 120;
-  const holdMs = 220;
+  const holdMs = 520;
   path.edges.forEach((edge, index) => {
-    const tid = setTimeout(() => {
-      if (!cyInstance || cyInstance !== cy) return;
-      animateNeuronEdgeParticle(cy, edge, 420);
-      _acquireSignal(cy, edge.id(), 'signal');
-      const src = edge.source();
-      const tgt = edge.target();
-      if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
-      if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
-      const releaseId = setTimeout(() => {
+      const tid = setTimeout(() => {
+        if (!cyInstance || cyInstance !== cy) return;
+        _acquireSignal(cy, edge.id(), 'signal');
+        const src = edge.source();
+        const tgt = edge.target();
+        if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
+        if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
+        try {
+          animateNeuronEdgeParticle(cy, edge, 620);
+        } catch (_) {
+          // 粒子层异常不能影响 Cytoscape 边/节点脉冲。
+        }
+        const releaseId = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         _releaseSignal(cy, edge.id(), 'signal');
         _acquireSignal(cy, edge.id(), 'signal-trail');
@@ -2019,32 +2039,42 @@ function animateNeuronEdgeParticle(cy, edge, duration = 420) {
       cleanup();
       return;
     }
-    const source = edge.source().renderedPosition();
-    const target = edge.target().renderedPosition();
-    const raw = Math.min(1, (performance.now() - started) / duration);
-    const eased = raw * raw * (3 - 2 * raw);
-    const dx = target.x - source.x;
-    const dy = target.y - source.y;
-    const length = Math.hypot(dx, dy) || 1;
-    const weight = Number.parseFloat(edge.style('control-point-weights')) || .5;
-    const distance = Number.parseFloat(edge.style('control-point-distances')) || 0;
-    const control = {
-      x: source.x + dx * weight - (dy / length) * distance,
-      y: source.y + dy * weight + (dx / length) * distance,
-    };
-    const inverse = 1 - eased;
-    const x = inverse * inverse * source.x + 2 * inverse * eased * control.x + eased * eased * target.x - 3.5;
-    const y = inverse * inverse * source.y + 2 * inverse * eased * control.y + eased * eased * target.y - 3.5;
-    const tangentX = 2 * inverse * (control.x - source.x) + 2 * eased * (target.x - control.x);
-    const tangentY = 2 * inverse * (control.y - source.y) + 2 * eased * (target.y - control.y);
-    particle.style.setProperty('--particle-angle', `${Math.atan2(tangentY, tangentX)}rad`);
-    particle.style.opacity = String(raw < .08 ? raw / .08 : (raw > .88 ? (1 - raw) / .12 : 1));
-    particle.style.transform = `translate3d(${x}px,${y}px,0)`;
-    if (raw < 1) {
-      frameId = requestAnimationFrame(frame);
-      const frames = window.__neuronSignalFrames || (window.__neuronSignalFrames = new Set());
-      frames.add(frameId);
-    } else {
+    try {
+      const source = edge.source().renderedPosition();
+      const target = edge.target().renderedPosition();
+      if (!source || !target || !Number.isFinite(source.x) || !Number.isFinite(source.y)
+          || !Number.isFinite(target.x) || !Number.isFinite(target.y)) {
+        cleanup();
+        return;
+      }
+      const raw = Math.min(1, (performance.now() - started) / duration);
+      const eased = raw * raw * (3 - 2 * raw);
+      const dx = target.x - source.x;
+      const dy = target.y - source.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const styleValue = name => (typeof edge.style === 'function' ? edge.style(name) : null);
+      const weight = Number.parseFloat(styleValue('control-point-weights')) || .5;
+      const distance = Number.parseFloat(styleValue('control-point-distances')) || 0;
+      const control = {
+        x: source.x + dx * weight - (dy / length) * distance,
+        y: source.y + dy * weight + (dx / length) * distance,
+      };
+      const inverse = 1 - eased;
+      const x = inverse * inverse * source.x + 2 * inverse * eased * control.x + eased * eased * target.x - 3.5;
+      const y = inverse * inverse * source.y + 2 * inverse * eased * control.y + eased * eased * target.y - 3.5;
+      const tangentX = 2 * inverse * (control.x - source.x) + 2 * eased * (target.x - control.x);
+      const tangentY = 2 * inverse * (control.y - source.y) + 2 * eased * (target.y - control.y);
+      particle.style.setProperty('--particle-angle', `${Math.atan2(tangentY, tangentX)}rad`);
+      particle.style.opacity = String(raw < .08 ? raw / .08 : (raw > .88 ? (1 - raw) / .12 : 1));
+      particle.style.transform = `translate3d(${x}px,${y}px,0)`;
+      if (raw < 1) {
+        frameId = requestAnimationFrame(frame);
+        const frames = window.__neuronSignalFrames || (window.__neuronSignalFrames = new Set());
+        frames.add(frameId);
+      } else {
+        cleanup();
+      }
+    } catch (_) {
       cleanup();
     }
   };
@@ -2095,8 +2125,9 @@ function startNeuronSignalPulses(cy) {
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
     }
   };
-  fireWave();
-  window.__neuronSignalTimer = setInterval(fireWave, 1600);
+  const initialWave = setTimeout(fireWave, 720);
+  (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(initialWave);
+  window.__neuronSignalTimer = setInterval(fireWave, 1800);
 }
 
 function fitNeuronGraph() {
