@@ -975,6 +975,104 @@ class TestP0IndexConsistency:
         assert "正文内容" in "\n".join(row["text"] for row in rows)
         s.close()
 
+    def test_regular_file_replaced_by_symlink_deactivates_old_document(self, tmp_path):
+        """普通文件被符号链接替换后，旧索引必须停用（P1 策略跳过）。
+
+        不同于临时不可读：symlink 是明确策略禁止，旧知识不得继续被搜索。
+        """
+        from memoryguard.knowledge_ingestion import (
+            _ingest_book_unlocked,
+            create_book,
+            ingest_book,
+        )
+        from memoryguard.knowledge_store import KnowledgeStore
+
+        root = tmp_path / "symlink-book"
+        root.mkdir()
+        target = tmp_path / "outside-target.md"
+        target.write_text("# 外部目标\n\n不该再被索引。\n", encoding="utf-8")
+        document = root / "notes.md"
+        document.write_text("# 原始笔记\n\n这段旧知识入库后应被停用。\n", encoding="utf-8")
+
+        store = KnowledgeStore(tmp_path / "symlink-idx")
+        book = create_book(store, str(root), title="符号链接替换")
+        ingest_book(store, book.book_id)
+        document_id = store.get_document_by_path(book.book_id, "notes.md")["document_id"]
+        assert store.list_documents(book.book_id)
+
+        document.unlink()
+        try:
+            document.symlink_to(target)
+        except OSError:
+            pytest.skip("Cannot create symlinks on this platform")
+
+        result = _ingest_book_unlocked(store, book.book_id)
+        assert result.status == "ready"
+        assert result.files_deleted == 1
+
+        row = store._conn.execute(
+            "SELECT status FROM documents WHERE document_id=?", (document_id,)
+        ).fetchone()
+        assert row["status"] == "deleted"
+        chunk = store._conn.execute(
+            "SELECT active FROM chunks WHERE document_id=?", (document_id,)
+        ).fetchone()
+        assert chunk is None or chunk["active"] == 0
+        assert store.list_documents(book.book_id) == []
+        store.close()
+
+    def test_file_growing_over_size_limit_deactivates_or_marks_policy_skipped(
+        self, tmp_path, monkeypatch,
+    ):
+        """文件长大超过单文件上限后，旧索引必须停用（P1 策略跳过）。"""
+        from memoryguard.knowledge_ingestion import (
+            KNOWLEDGE_SCAN_BUDGET,
+            _ingest_book_unlocked,
+            create_book,
+            ingest_book,
+        )
+        from memoryguard.knowledge_store import KnowledgeStore
+        from memoryguard.source_registry import ScanBudget as SB
+
+        root = tmp_path / "size-book"
+        root.mkdir()
+        document = root / "growing.md"
+        document.write_text("# 小文件\n\n初始内容足够短，可以入库。\n", encoding="utf-8")
+
+        store = KnowledgeStore(tmp_path / "size-idx")
+        book = create_book(store, str(root), title="超大文件")
+        ingest_book(store, book.book_id)
+        document_id = store.get_document_by_path(book.book_id, "growing.md")["document_id"]
+        assert store.list_documents(book.book_id)
+
+        # 长大到超过新预算；策略跳过不得再靠 seen_paths 保活旧索引
+        document.write_text("# 变大\n\n" + ("x" * 500) + "\n", encoding="utf-8")
+        tight = SB(
+            max_files=KNOWLEDGE_SCAN_BUDGET.max_files,
+            max_total_size=KNOWLEDGE_SCAN_BUDGET.max_total_size,
+            max_single_file=64,
+            max_depth=KNOWLEDGE_SCAN_BUDGET.max_depth,
+            timeout_seconds=KNOWLEDGE_SCAN_BUDGET.timeout_seconds,
+        )
+        monkeypatch.setattr(
+            "memoryguard.knowledge_ingestion.KNOWLEDGE_SCAN_BUDGET", tight,
+        )
+
+        result = _ingest_book_unlocked(store, book.book_id)
+        assert result.status == "ready"
+        assert result.files_deleted == 1
+
+        row = store._conn.execute(
+            "SELECT status FROM documents WHERE document_id=?", (document_id,)
+        ).fetchone()
+        assert row["status"] == "deleted"
+        chunk = store._conn.execute(
+            "SELECT active FROM chunks WHERE document_id=?", (document_id,)
+        ).fetchone()
+        assert chunk is None or chunk["active"] == 0
+        assert store.list_documents(book.book_id) == []
+        store.close()
+
 
 class TestP15RelationCleanup:
     """P1-5：重建时清理旧关系（含 belongs_to 空 source_chunk_id）。"""

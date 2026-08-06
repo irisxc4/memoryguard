@@ -62,13 +62,19 @@ class KnowledgeScanResult:
     """扫描结果：除了文件列表，还告知扫描是否完整及截断原因。
 
     只有 complete=True 时才能推断"未扫到=已删除"，否则禁止删除旧文档（P0-1）。
+
+    删除真相只用 ``files``（本轮可扫描的真实文件）。``seen_paths`` 仅诊断：
+    可能包含随后被明确策略跳过的路径（符号链接 / 超大文件 / containment 逃逸），
+    这些路径不应保护旧 Document/Chunk。暂时不可读走 ``unreadable_entries``，
+    并把 ``complete=False``，整轮不删。
     """
     files: list[Path] = field(default_factory=list)
     complete: bool = True
     truncations: list[ScanTruncation] = field(default_factory=list)
     scanned_count: int = 0
     total_size: int = 0
-    # 已通过扩展名和 include/exclude 过滤、且在目录遍历中出现过的路径。
+    # 诊断用：扩展名+include/exclude 通过后、策略检查前的候选路径。
+    # 不可直接当删除真相（可能含 symlink / 超大 / 逃逸跳过项）。
     seen_paths: set[str] = field(default_factory=set)
     # 暂时不可读取的文件或目录，必须阻止删除对应旧索引。
     unreadable_entries: list[ScanTruncation] = field(default_factory=list)
@@ -155,7 +161,13 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         row["relative_path"]: row
         for row in store.list_documents(book_id)
     }
-    current_paths = set(scan.seen_paths)
+    # 删除真相 = 本轮可扫描真实文件（scan.files），不是 seen_paths。
+    # 明确策略跳过（symlink / 超大 / containment）不在 files 中：完整扫描应停用旧索引。
+    # 暂时不可读会 complete=False，整轮不删（P0-1）；seen_paths 仅诊断。
+    current_paths = {
+        str(file_path.relative_to(root)).replace("\\", "/")
+        for file_path in scan.files
+    }
     processed = 0
     skipped = 0
     chunks_created = 0
@@ -164,7 +176,6 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
 
     for file_path in scan.files:
         rel = str(file_path.relative_to(root)).replace("\\", "/")
-        current_paths.add(rel)
 
         # 计算 content_hash（稳定读取：stat 前/后 + 只读一次）
         try:
@@ -655,20 +666,21 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             if include_patterns and not any(_match_glob(rel, p) for p in include_patterns):
                 continue
 
-            # 先记录目录遍历中出现的候选路径，再尝试读取元数据；这样瞬时
-            # stat/read 失败时仍不会把已有文档误判为已删除。
+            # seen_paths 仅诊断：候选出现过。删除真相用 files。
+            # 瞬时 stat 失败走 unreadable → complete=False，整轮不删旧索引。
+            # 明确策略跳过（symlink / 超大 / containment）不进 files，完整扫描应停用旧索引。
             seen_paths.add(rel)
             try:
                 if file_path.is_symlink():
-                    continue  # 符号链接文件不扫描
+                    continue  # 符号链接：明确策略跳过，不保护旧索引
                 if not str(file_path.resolve()).startswith(str(real_root)):
-                    continue  # 逃逸出根目录
+                    continue  # containment 逃逸：明确策略跳过
                 size = file_path.stat().st_size
             except OSError:
                 _record_unreadable("unreadable_file", rel)
                 continue
             if size > budget.max_single_file:
-                continue  # 超单文件上限：跳过该文件，不视为整体截断
+                continue  # 超单文件上限：明确策略跳过，不视为整体截断
             if total_size + size > budget.max_total_size:
                 truncations.append(ScanTruncation(
                     "max_total_size",
