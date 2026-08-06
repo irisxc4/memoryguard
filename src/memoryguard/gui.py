@@ -346,7 +346,13 @@ def _enrich_with_enricher(tasks: list[dict], enricher, source: str = "model") ->
     return results
 
 
-def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[int, str]:
+def open_localhost_window(
+    workspace: str,
+    *,
+    auto_open: bool = True,
+    native_webview: bool = False,
+    native_title: str = "MemoryGuard 治理面板",
+) -> tuple[int, str]:
     """启动临时本地 HTTP server + JSON API，返回 (退出码, URL)。
 
     安全加固：
@@ -596,6 +602,34 @@ def open_localhost_window(workspace: str, *, auto_open: bool = True) -> tuple[in
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"MemoryGuard GUI running at {url} (sandbox={is_sandbox})")
+    if native_webview:
+        if not has_native_gui():
+            server.server_close()
+            return 3, ""
+        import threading as _threading
+        import webview
+
+        server_thread = _threading.Thread(
+            target=server.serve_forever,
+            name="memoryguard-localhost",
+            daemon=True,
+        )
+        server_thread.start()
+        try:
+            _set_windows_app_user_model_id()
+            webview.create_window(
+                native_title,
+                url=url,
+                width=1440,
+                height=900,
+                min_size=(800, 600),
+            )
+            _start_webview(webview)
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=5)
+        return 0, url
     if auto_open:
         try:
             webbrowser.open(url)
@@ -631,30 +665,9 @@ def open_report_window(html_content: str, *, title: str = "MemoryGuard") -> int:
 # 交互式治理面板（参考 merakagent Tab 布局，非平面报告）
 # ---------------------------------------------------------------------------
 
-# 敏感内容正则模式（用于 _mask_content）
-import re as _re
+from .sensitive_content import NAMED_SENSITIVE_PATTERNS
 
-_SENSITIVE_PATTERNS: list[tuple[str, _re.Pattern]] = [
-    ("aws_access_key", _re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("aws_secret_key", _re.compile(r'(?i)aws_secret_access_key["\']?\s*[:=]\s*["\']?[A-Za-z0-9/+=]{40}')),
-    ("generic_api_key", _re.compile(r'(?i)(api[_-]?key|apikey|token|secret|password|passwd|pwd)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
-    ("bearer_token", _re.compile(r'(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*')),
-    ("private_key", _re.compile(r'-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----')),
-    ("connection_string", _re.compile(r'(?i)(mongodb|postgres|postgresql|redis|amqp)://[^\s"\']+')),
-    ("jwt", _re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
-]
-
-# 隔离规则匹配的模式（与 SharedMemoryStore 隔离规则保持一致）
-_QUARANTINE_PATTERNS: list[tuple[str, _re.Pattern]] = [
-    ("aws_key", _re.compile(r'AKIA[0-9A-Z]{16}')),
-    ("private_key", _re.compile(r'-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----')),
-    ("api_key", _re.compile(r'(?i)(api[_-]?key|apikey)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
-    ("password", _re.compile(r'(?i)(password|passwd|pwd)["\']?\s*[:=]\s*["\']?[^\s"\']{8,}')),
-    ("token", _re.compile(r'(?i)(token|secret)["\']?\s*[:=]\s*["\']?[A-Za-z0-9+/=_\-]{16,}')),
-    ("bearer", _re.compile(r'(?i)bearer\s+[A-Za-z0-9\-._~+/]+=*')),
-    ("connection_string", _re.compile(r'(?i)(mongodb|postgres|postgresql|redis|amqp)://[^\s"\']+')),
-    ("jwt", _re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
-]
+_SENSITIVE_PATTERNS = list(NAMED_SENSITIVE_PATTERNS)
 
 
 def _mask_content(content: str, max_len: int = 120) -> str:
@@ -1119,10 +1132,19 @@ class GovernanceApi:
         from .knowledge_gui import handle_knowledge_api
         return handle_knowledge_api("knowledge_remove", [book_id], self.workspace)
 
-    def knowledge_candidate_review(self, candidate_id: str, decision: str) -> dict:
+    def knowledge_candidate_review(
+        self,
+        candidate_id: str,
+        decision: str,
+        target_group_id: str = "",
+    ) -> dict:
         """审核记忆候选（批准/拒绝）。"""
         from .knowledge_gui import handle_knowledge_api
-        return handle_knowledge_api("knowledge_candidate_review", [candidate_id, decision], self.workspace)
+        return handle_knowledge_api(
+            "knowledge_candidate_review",
+            [candidate_id, decision, target_group_id],
+            self.workspace,
+        )
 
     # ------------------------------------------------------------------
     # 路径选择器（替代 prompt()）
@@ -8103,40 +8125,10 @@ def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面�
     """
     if not has_native_gui():
         return 3
-    import shutil
-    import webview
-    from .interactive import render_interactive_html
-
-    _set_windows_app_user_model_id()
-    # 原生窗口是本地执行端；是否排队仍由真实沙箱状态决定。
-    api = SafeBridgeApi(workspace, direct_mutations=True)
-    html = render_interactive_html()
-    if "</head>" in html:
-        html = html.replace(
-            "</head>",
-            '<script>window.__MG_SANDBOX__=false;</script></head>',
-            1,
-        )
-
-    # 写 HTML + cytoscape.js 到 .memoryguard/ui/ 目录，用 url= 加载本地文件
-    ui_dir = Path(workspace) / ".memoryguard" / "ui"
-    ui_dir.mkdir(parents=True, exist_ok=True)
-    # 复制 cytoscape.js
-    static_src = Path(__file__).parent / "static" / "cytoscape.min.js"
-    if static_src.exists():
-        shutil.copy2(static_src, ui_dir / "cytoscape.min.js")
-    icon_src = Path(__file__).parent / "static" / "memoryguard-icon.png"
-    if icon_src.exists():
-        shutil.copy2(icon_src, ui_dir / "memoryguard-icon.png")
-    # 写 HTML
-    html_path = ui_dir / "index.html"
-    html_path.write_text(html, encoding="utf-8")
-
-    window = webview.create_window(
-        title, url=str(html_path), js_api=api,
-        width=1440, height=900, min_size=(800, 600),
+    rc, _ = open_localhost_window(
+        workspace,
+        auto_open=False,
+        native_webview=True,
+        native_title=title,
     )
-    # v3.1：注入 window 引用，使 pick_path 能调用 create_file_dialog
-    api._set_window(window)
-    _start_webview(webview)
-    return 0
+    return rc

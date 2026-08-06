@@ -26,7 +26,11 @@ PRED_MENTIONED_IN = "mentioned_in"
 PRED_DEFINED_IN = "defined_in"
 
 
-def build_structural_relations(store: KnowledgeStore, book_id: str) -> dict[str, int]:
+def build_structural_relations(
+    store: KnowledgeStore,
+    book_id: str,
+    document_ids: list[str] | None = None,
+) -> dict[str, int]:
     """为一本书建立结构化关系（无模型）。
 
     扫描 chunks/documents/entities，生成 belongs_to/contains/mentioned_in/
@@ -38,37 +42,48 @@ def build_structural_relations(store: KnowledgeStore, book_id: str) -> dict[str,
     # 1) 以本书 chunk 为 source 的 mentioned_in/defined_in 关系
     # 2) 本书文件实体为 subject 的 belongs_to 关系（source_chunk_id 为 NULL，
     #    仅靠 source_chunk_id 过滤会漏掉，导致重建后残留旧 belongs_to）
+    scope_docs = document_ids or [
+        r["document_id"] for r in store._conn.execute(
+            "SELECT document_id FROM documents WHERE book_id=? AND status='active'",
+            (book_id,),
+        ).fetchall()
+    ]
+    doc_placeholders = ",".join("?" * len(scope_docs)) if scope_docs else ""
     chunk_ids = [
         r["chunk_id"] for r in store._conn.execute(
-            "SELECT chunk_id FROM chunks WHERE book_id=? AND active=1",
-            (book_id,),
+            f"SELECT chunk_id FROM chunks WHERE book_id=? AND active=1"
+            f"{' AND document_id IN (' + doc_placeholders + ')' if doc_placeholders else ''}",
+            [book_id, *scope_docs],
         ).fetchall()
     ]
     if chunk_ids:
         placeholders = ",".join("?" * len(chunk_ids))
         store._conn.execute(
-            f"DELETE FROM relations WHERE source_chunk_id IN ({placeholders})",
+            f"DELETE FROM relations WHERE relation_source='structural' "
+            f"AND source_chunk_id IN ({placeholders})",
             chunk_ids,
         )
-    store._conn.execute(
-        """DELETE FROM relations WHERE predicate='belongs_to' AND subject_entity_id IN (
-               SELECT e.entity_id FROM entities e
-               JOIN documents d ON d.relative_path=e.name
-               WHERE d.book_id=? AND d.status='active'
-           )""",
-        (book_id,),
-    )
+    if doc_placeholders:
+        store._conn.execute(
+            f"DELETE FROM relations WHERE relation_source='structural' "
+            f"AND book_id=? AND document_id IN ({doc_placeholders})",
+            [book_id, *scope_docs],
+        )
 
     # 文件 -> belongs_to -> 章节（通过 chunk 的 chapter 字段聚合）
     rows = store._conn.execute(
-        "SELECT DISTINCT document_id, chapter FROM chunks WHERE book_id=? AND active=1 AND chapter!=''",
-        (book_id,),
+        f"SELECT DISTINCT document_id, chapter FROM chunks WHERE book_id=? AND active=1 "
+        f"AND chapter!=''{' AND document_id IN (' + doc_placeholders + ')' if doc_placeholders else ''}",
+        [book_id, *scope_docs],
     ).fetchall()
     for row in rows:
         doc_entity = _ensure_file_entity(store, row["document_id"], book_id)
         ch_entity = _ensure_chapter_entity(store, row["chapter"], book_id)
         if doc_entity and ch_entity:
-            _add_relation(store, doc_entity, PRED_BELONGS_TO, ch_entity, None)
+            _add_relation(
+                store, doc_entity, PRED_BELONGS_TO, ch_entity, None,
+                book_id=book_id, document_id=row["document_id"],
+            )
             stats["relations_created"] += 1
 
     # 章节 -> contains -> Chunk（chunk 作为虚拟实体，用 chunk_id 标识）
@@ -76,13 +91,18 @@ def build_structural_relations(store: KnowledgeStore, book_id: str) -> dict[str,
     rows = store._conn.execute(
         """SELECT ce.entity_id, c.chunk_id FROM chunk_entities ce
            JOIN chunks c ON c.chunk_id=ce.chunk_id
-           WHERE c.book_id=? AND c.active=1""",
-        (book_id,),
+           WHERE c.book_id=? AND c.active=1"""
+        + (f" AND c.document_id IN ({doc_placeholders})" if doc_placeholders else ""),
+        [book_id, *scope_docs],
     ).fetchall()
     for row in rows:
         # entity mentioned_in chunk（source_chunk_id 作为关系来源）
-        _add_relation(store, row["entity_id"], PRED_MENTIONED_IN,
-                      None, row["chunk_id"], confidence=1.0)
+        _add_relation(
+            store, row["entity_id"], PRED_MENTIONED_IN,
+            None, row["chunk_id"], confidence=1.0, book_id=book_id,
+            document_id=store.get_chunk(row["chunk_id"]).document_id
+            if store.get_chunk(row["chunk_id"]) else "",
+        )
         stats["relations_created"] += 1
 
     return stats
@@ -145,7 +165,8 @@ def expand_relations(store: KnowledgeStore, entity_ids: list[str],
 
 def extract_semantic_relations(store: KnowledgeStore, book_id: str,
                                provider: Any = None,
-                               remote: bool = False) -> dict[str, int]:
+                               remote: bool = False,
+                               chunk_ids: list[str] | None = None) -> dict[str, int]:
     """有模型时语义关系抽取（KB3 §6.2）。
 
     对活跃 chunk 调 provider 抽取语义关系，要求返回 JSON：
@@ -156,21 +177,31 @@ def extract_semantic_relations(store: KnowledgeStore, book_id: str,
     if provider is None:
         return {"relations_created": 0}
 
-    rows = store._conn.execute(
-        "SELECT * FROM chunks WHERE book_id=? AND active=1 ORDER BY document_id, ordinal",
-        (book_id,),
-    ).fetchall()
+    sql = (
+        "SELECT c.*, d.content_role FROM chunks c "
+        "JOIN documents d ON d.document_id=c.document_id "
+        "WHERE c.book_id=? AND c.active=1"
+    )
+    params: list[Any] = [book_id]
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        sql += f" AND c.chunk_id IN ({placeholders})"
+        params.extend(chunk_ids)
+    sql += " ORDER BY c.document_id, c.ordinal"
+    rows = store._conn.execute(sql, params).fetchall()
     if not rows:
         return {"relations_created": 0}
 
-    from .knowledge_ingestion import parsed_text_of
     from .knowledge_store import _row_to_chunk
     from .knowledge_organizer import _parse_model_json
 
     stats = {"relations_created": 0}
     for row in rows:
         chunk = _row_to_chunk(row)
-        if remote and getattr(chunk, "sensitivity", "normal") == "sensitive":
+        if (
+            row["content_role"] == "control_surface"
+            or getattr(chunk, "sensitivity", "normal") == "sensitive"
+        ):
             continue
         text = (chunk.text or "").strip()
         if len(text) < 20:
@@ -203,8 +234,11 @@ def extract_semantic_relations(store: KnowledgeStore, book_id: str,
             obj_id = _ensure_entity(store, obj, "concept")
             if not subj_id or not obj_id:
                 continue
-            _add_relation(store, subj_id, predicate, obj_id, chunk.chunk_id,
-                          confidence=0.8)
+            _add_relation(
+                store, subj_id, predicate, obj_id, chunk.chunk_id,
+                confidence=0.8, book_id=book_id, document_id=chunk.document_id,
+                relation_source="semantic",
+            )
             stats["relations_created"] += 1
     return stats
 
@@ -218,12 +252,36 @@ def _ensure_file_entity(store: KnowledgeStore, document_id: str, book_id: str) -
     if not row:
         return None
     name = row["relative_path"]
-    return _ensure_entity(store, name, "file")
+    return _ensure_scoped_entity(store, book_id, name, "file")
 
 
 def _ensure_chapter_entity(store: KnowledgeStore, chapter: str, book_id: str) -> str | None:
     """章节作为 entity。"""
-    return _ensure_entity(store, chapter, "concept")
+    return _ensure_scoped_entity(store, book_id, chapter, "concept")
+
+
+def _ensure_scoped_entity(
+    store: KnowledgeStore, book_id: str, name: str, entity_type: str,
+) -> str | None:
+    """为文件/章节创建按书隔离的实体，避免同名跨书串图。"""
+    if not name or not name.strip():
+        return None
+    normalized = name.strip().casefold()
+    entity_id = _stable_hash("ent", book_id, entity_type, normalized)
+    row = store._conn.execute(
+        "SELECT entity_id FROM entities WHERE entity_id=?", (entity_id,),
+    ).fetchone()
+    if row:
+        return row["entity_id"]
+    try:
+        store._conn.execute(
+            "INSERT INTO entities(entity_id, name, normalized_name, entity_type, description, aliases, active, created_at) "
+            "VALUES(?,?,?,?,?,?,1,?)",
+            (entity_id, name.strip(), normalized, entity_type, "", "", _now_iso()),
+        )
+        return entity_id
+    except Exception:
+        return None
 
 
 def _ensure_entity(store: KnowledgeStore, name: str, entity_type: str) -> str | None:
@@ -251,7 +309,8 @@ def _ensure_entity(store: KnowledgeStore, name: str, entity_type: str) -> str | 
 
 def _add_relation(store: KnowledgeStore, subject_id: str, predicate: str,
                   object_id: str | None, source_chunk_id: str | None,
-                  confidence: float = 1.0) -> None:
+                  confidence: float = 1.0, book_id: str = "",
+                  document_id: str = "", relation_source: str = "structural") -> None:
     """添加关系。object_id 为空时用 source_chunk_id 作为虚拟 object。"""
     if not subject_id:
         return
@@ -260,18 +319,24 @@ def _add_relation(store: KnowledgeStore, subject_id: str, predicate: str,
         # chunk 不作为 entity，但关系需要 object_entity_id
         # 用 source_chunk_id 派生稳定 id，并在 entities 表占位
         chunk_entity_name = f"chunk:{source_chunk_id}"
-        object_id = _ensure_entity(store, chunk_entity_name, "concept")
+        object_id = _ensure_scoped_entity(
+            store, book_id or "legacy", chunk_entity_name, "chunk",
+        )
         if not object_id:
             return
     if not object_id:
         return
-    rel_id = _stable_hash("rel", subject_id, predicate, object_id, source_chunk_id or "")
+    rel_id = _stable_hash(
+        "rel", book_id, document_id, subject_id, predicate, object_id,
+        source_chunk_id or "",
+    )
     try:
         store._conn.execute(
             "INSERT OR IGNORE INTO relations(relation_id, subject_entity_id, predicate, "
-            "object_entity_id, source_chunk_id, confidence, created_at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (rel_id, subject_id, predicate, object_id, source_chunk_id, confidence, _now_iso()),
+            "object_entity_id, source_chunk_id, book_id, document_id, relation_source, "
+            "confidence, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (rel_id, subject_id, predicate, object_id, source_chunk_id, book_id,
+             document_id, relation_source, confidence, _now_iso()),
         )
     except Exception:
         pass

@@ -3,6 +3,7 @@
 验证：添加文件夹 → 自动分章 → 切片 → FTS5 检索 → MCP 工具。
 """
 
+import hashlib
 import tempfile
 from pathlib import Path
 
@@ -146,10 +147,10 @@ class TestIngestion:
 
     def test_original_files_unchanged(self, store, tmp_book_dir):
         """原始文件零修改。"""
-        original_content = (tmp_book_dir / "combat" / "attributes.md").read_text()
+        original_content = (tmp_book_dir / "combat" / "attributes.md").read_text(encoding="utf-8")
         book = create_book(store, str(tmp_book_dir))
         ingest_book(store, book.book_id)
-        assert (tmp_book_dir / "combat" / "attributes.md").read_text() == original_content
+        assert (tmp_book_dir / "combat" / "attributes.md").read_text(encoding="utf-8") == original_content
 
 
 class TestSearch:
@@ -401,11 +402,12 @@ class TestKB2Vector:
         assert len(rows) > 0
 
         # 向量检索：query 与书中内容有字符重叠，mock 向量相似度非零
-        results = search(store, "战斗属性", enable_graph=False)
-        assert isinstance(results, list)
-        # 向量结果应标记为 vector
-        methods = {r.get("retrieval_method") for r in results}
-        assert "vector" in methods or "fts" in methods or "like" in methods
+        from memoryguard.knowledge_retriever import _vector_results
+        vector_results = _vector_results(
+            store, "战斗属性", [book.book_id], top_k=6,
+        )
+        assert vector_results, "vector-only retrieval must return indexed chunks"
+        assert all(r.get("retrieval_method") == "vector" for r in vector_results)
 
     def test_vector_fallback_to_fts(self, store, tmp_book_dir, monkeypatch):
         """provider 不可用时，向量失败静默降级 FTS，检索仍可用。"""
@@ -755,7 +757,17 @@ class TestP14Candidates:
         lst = handle_knowledge_api("knowledge_candidates_list", [], ".")
         assert lst.get("total", 0) > 0
         cid = lst["candidates"][0]["candidate_id"]
-        r = handle_knowledge_api("knowledge_candidate_review", [cid, "approve"], ".")
+        from memoryguard.agent_binding import AgentBindingStore
+        control_workspace = tmp_path / "control"
+        control_workspace.mkdir()
+        target_group = AgentBindingStore(
+            control_workspace,
+        ).ensure_personal_memory_group("candidate-test-agent")["group_id"]
+        r = handle_knowledge_api(
+            "knowledge_candidate_review",
+            [cid, "approve", target_group],
+            control_workspace,
+        )
         assert r.get("ok") is True
         lst2 = handle_knowledge_api("knowledge_candidates_list", ["", "approved"], ".")
         assert lst2.get("total", 0) >= 1
@@ -835,22 +847,19 @@ class TestP0IndexConsistency:
         f = root / "a.md" / "doc.md"
         f.write_text("# 标题\n\n正文内容。\n", encoding="utf-8")
 
-        # 模拟读取后、解析前文件被改动：通过 monkeypatch read_bytes 返回固定内容，
-        # 但文件已存在则正常运行。这里直接验证 chunk.text 哈希 == document.content_hash。
+        expected_bytes = f.read_bytes()
+        expected_hash = hashlib.sha256(expected_bytes).hexdigest()[:16]
         s = KnowledgeStore(tmp_path / "dh2")
         book = create_book(s, str(root), title="单文件")
         _ingest_book_unlocked(s, book.book_id)
 
         doc = s.get_document_by_path(book.book_id, "a.md/doc.md")
-        row = s._conn.execute(
-            "SELECT text FROM chunks WHERE book_id=? LIMIT 1", (book.book_id,)
-        ).fetchone()
-        import hashlib
-        chunk_hash = hashlib.sha256(row["text"].encode("utf-8")).hexdigest()[:16]
-        # document.content_hash 是对整个文件字节哈希；chunk.text 是正文。
-        # 二者来源必须为同一读入内容（此处验证 chunk 可被解析、哈希一致语义成立）。
-        assert len(row["text"]) > 0
-        assert doc["content_hash"] == chunk_hash or True  # 内容哈希来自同一byte
+        rows = s._conn.execute(
+            "SELECT text FROM chunks WHERE book_id=? ORDER BY ordinal",
+            (book.book_id,),
+        ).fetchall()
+        assert doc["content_hash"] == expected_hash
+        assert "正文内容" in "\n".join(row["text"] for row in rows)
         s.close()
 
 
@@ -903,7 +912,11 @@ class TestP17QueryTokens:
         build_structural_relations(store, book.book_id)
         # 实体名含"战斗属性"，查询"战斗"（bigram）应命中
         results = _graph_results(store, "战斗", None, top_k=6)
-        assert isinstance(results, list)
+        assert results
+        assert any(
+            "战斗" in (r.get("chapter", "") + r.get("section", "") + r.get("text", ""))
+            for r in results
+        )
 
 
 class TestP110Phases:
@@ -916,8 +929,9 @@ class TestP110Phases:
         ingest_book(store, book.book_id)
         reloaded = store.get_book(book.book_id)
         phases = reloaded.build_phases
-        assert phases.get("lexical") is True
-        assert phases.get("organized") is True
+        assert phases.get("lexical", {}).get("status") == "ready"
+        assert phases.get("lexical", {}).get("indexed") == reloaded.chunk_count
+        assert phases.get("organized", {}).get("status") == "ready"
 
 
 class TestP11MatchedBy:

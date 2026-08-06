@@ -42,6 +42,10 @@ _CODE_DEF_PATTERN = re.compile(
 )
 _CONFIG_KEY_PATTERN = re.compile(r'^\s*"?([A-Za-z_][\w.-]*)"?\s*[:=]', re.MULTILINE)
 
+MAX_AI_CHUNKS_PER_JOB = 500
+MAX_REMOTE_CHARS_PER_JOB = 200_000
+MAX_MODEL_CALLS_PER_JOB = 500
+
 
 @dataclass
 class OrganizeResult:
@@ -49,6 +53,7 @@ class OrganizeResult:
     summary: str = ""
     keywords: list[str] = field(default_factory=list)
     entities: list[dict[str, str]] = field(default_factory=list)
+    relations: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -92,7 +97,8 @@ def _organize_via_model(chunk: Chunk, book_title: str, provider: Any) -> Organiz
     system = (
         "你是知识整理助手。从给定文本提取结构化知识，只返回 JSON，不要任何额外文字。"
         '格式：{"summary": "一句话摘要(≤80字)", "keywords": ["2-5个关键词"], '
-        '"entities": [{"name": "实体名", "type": "concept|person|organization|technology|module|file|function|configuration"}]}'
+        '"entities": [{"name": "实体名", "type": "concept|person|organization|technology|module|file|function|configuration"}], '
+        '"relations": [{"subject": "主语实体", "predicate": "英文关系短词", "object": "宾语实体"}]}'
     )
     user = f"书名：{book_title}\n章节：{chunk.chapter}\n文本：\n{text[:3000]}"
     raw = provider.chat(system, user, max_tokens=400)
@@ -109,6 +115,9 @@ def _organize_via_model(chunk: Chunk, book_title: str, provider: Any) -> Organiz
     entities = parsed.get("entities", [])
     if not isinstance(entities, list):
         entities = []
+    relations = parsed.get("relations", [])
+    if not isinstance(relations, list):
+        relations = []
 
     if not summary:
         return None
@@ -125,10 +134,25 @@ def _organize_via_model(chunk: Chunk, book_title: str, provider: Any) -> Organiz
             etype = "concept"
         norm_entities.append({"name": name, "type": etype})
 
+    norm_relations: list[dict[str, str]] = []
+    for rel in relations:
+        if not isinstance(rel, dict):
+            continue
+        subject = str(rel.get("subject", "")).strip()
+        predicate = str(rel.get("predicate", "")).strip()
+        obj = str(rel.get("object", "")).strip()
+        if subject and predicate and obj:
+            norm_relations.append({
+                "subject": subject,
+                "predicate": predicate,
+                "object": obj,
+            })
+
     return OrganizeResult(
         summary=summary[:300],
         keywords=[str(k).strip() for k in keywords if str(k).strip()][:10],
         entities=norm_entities[:20],
+        relations=norm_relations[:8],
     )
 
 
@@ -152,7 +176,11 @@ def _parse_model_json(raw: str) -> dict[str, Any] | None:
 
 
 def organize_book(store: KnowledgeStore, book_id: str,
-                  provider: Any = None, remote: bool = False) -> dict[str, int]:
+                  provider: Any = None, remote: bool = False,
+                  chunk_ids: list[str] | None = None,
+                  max_ai_chunks: int = MAX_AI_CHUNKS_PER_JOB,
+                  max_remote_chars: int = MAX_REMOTE_CHARS_PER_JOB,
+                  max_model_calls: int = MAX_MODEL_CALLS_PER_JOB) -> dict[str, int]:
     """整理一本书的所有 chunk。返回统计。
 
     无模型时：生成摘要/关键词/实体，写入 chunks 表和 entities/chunk_entities 表。
@@ -163,22 +191,62 @@ def organize_book(store: KnowledgeStore, book_id: str,
     auto_extract = bool(getattr(book, "auto_extract_memory", True))
 
     # 收集所有 chunk
-    rows = store._conn.execute(
-        "SELECT * FROM chunks WHERE book_id=? AND active=1 ORDER BY document_id, ordinal",
-        (book_id,),
-    ).fetchall()
+    sql = (
+        "SELECT c.*, d.content_role FROM chunks c "
+        "JOIN documents d ON d.document_id=c.document_id "
+        "WHERE c.book_id=? AND c.active=1"
+    )
+    params: list[Any] = [book_id]
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        sql += f" AND c.chunk_id IN ({placeholders})"
+        params.extend(chunk_ids)
+    sql += " ORDER BY c.document_id, c.ordinal"
+    rows = store._conn.execute(sql, params).fetchall()
 
-    stats = {"chunks_organized": 0, "entities_extracted": 0, "keywords_set": 0,
-             "candidates_generated": 0}
+    stats = {
+        "chunks_organized": 0,
+        "entities_extracted": 0,
+        "keywords_set": 0,
+        "relations_created": 0,
+        "candidates_generated": 0,
+        "model_calls": 0,
+        "budget_exhausted": 0,
+    }
+    remote_chars = 0
+    ai_chunks = 0
 
     for row in rows:
         chunk = _row_to_chunk(row)
 
-        # P0-5 隐私：远程 provider 永不接收敏感/控制面片段
-        if remote and getattr(chunk, "sensitivity", "normal") == "sensitive":
+        content_role = str(row["content_role"] or "knowledge")
+        # Remote models must never receive either class of restricted source.
+        if remote and (
+            content_role == "control_surface"
+            or getattr(chunk, "sensitivity", "normal") == "sensitive"
+        ):
             continue
 
-        result = organize_chunk(chunk, book_title, provider)
+        chunk_provider = None
+        model_eligible = provider is not None and len((chunk.text or "").strip()) >= 20
+        if model_eligible:
+            chunk_chars = len(chunk.text or "")
+            over_budget = (
+                ai_chunks >= max_ai_chunks
+                or stats["model_calls"] >= max_model_calls
+                or (remote and remote_chars + chunk_chars > max_remote_chars)
+            )
+            if over_budget:
+                chunk_provider = None
+                stats["budget_exhausted"] = 1
+            else:
+                chunk_provider = provider
+                ai_chunks += 1
+                stats["model_calls"] += 1
+                if remote:
+                    remote_chars += chunk_chars
+
+        result = organize_chunk(chunk, book_title, chunk_provider)
 
         # 更新 chunk 摘要和关键词
         store._conn.execute(
@@ -196,15 +264,59 @@ def organize_book(store: KnowledgeStore, book_id: str,
                 )
                 stats["entities_extracted"] += 1
 
+        # Model output includes semantic relations in the same call used for
+        # summary/keywords/entities. Persist both endpoints as chunk links so
+        # graph retrieval can find the original evidence.
+        if result.relations:
+            from .knowledge_graph import _add_relation
+            for rel in result.relations:
+                subject_id = _ensure_entity(store, rel["subject"], "concept")
+                object_id = _ensure_entity(store, rel["object"], "concept")
+                if not subject_id or not object_id:
+                    continue
+                store._conn.execute(
+                    "INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id, role) "
+                    "VALUES(?,?,?)",
+                    (chunk.chunk_id, subject_id, "subject"),
+                )
+                store._conn.execute(
+                    "INSERT OR IGNORE INTO chunk_entities(chunk_id, entity_id, role) "
+                    "VALUES(?,?,?)",
+                    (chunk.chunk_id, object_id, "object"),
+                )
+                _add_relation(
+                    store,
+                    subject_id,
+                    rel["predicate"],
+                    object_id,
+                    chunk.chunk_id,
+                    confidence=0.8,
+                    book_id=book_id,
+                    document_id=chunk.document_id,
+                    relation_source="semantic",
+                )
+                stats["relations_created"] += 1
+
         # P1-4 记忆候选：有摘要且内容足够时提炼为待审核候选
-        if auto_extract and result.summary and len(chunk.text or "") >= 40:
+        # Restricted content is never distilled into long-term memory,
+        # including when a local heuristic provider is used.
+        if (
+            auto_extract
+            and content_role == "knowledge"
+            and getattr(chunk, "sensitivity", "normal") != "sensitive"
+            and result.summary
+            and len(chunk.text or "") >= 40
+        ):
             source = _candidate_source(store, chunk)
             confidence = _candidate_confidence(chunk, result)
+            from .knowledge_distill import _guess_kind
+            kind = _guess_kind(result.summary, chunk)
             store.add_memory_candidate(
                 book_id=book_id,
                 content=result.summary,
                 source=source,
                 category="knowledge",
+                kind=kind,
                 confidence=confidence,
                 chunk_id=chunk.chunk_id,
                 document_id=chunk.document_id,

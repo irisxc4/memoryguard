@@ -209,11 +209,11 @@ def current_embedding_space_id() -> str | None:
 
     入库与查询共同调用，保证两侧 space_id 一致（P0-3）。
     """
-    backend = get_provider()
+    backend, config = get_provider_state()
     if backend is None:
         return None
     try:
-        return describe_embedding_backend(backend, _provider_config).space_id
+        return describe_embedding_backend(backend, config).space_id
     except Exception:
         return None
 
@@ -330,10 +330,58 @@ _provider_backend: ProviderBackend | None = None
 _provider_config: ProviderConfig | None = None
 
 
-def set_provider(backend: ProviderBackend | None) -> None:
-    """注入 provider backend。传 None 清除。"""
-    global _provider_backend
+def get_provider_state(
+    workspace: str | Path | None = None,
+) -> tuple[ProviderBackend | None, ProviderConfig | None]:
+    """返回已初始化的 Provider 与其真实配置。
+
+    ``get_provider()`` 可能在首次调用时才从环境变量加载配置。调用方不得
+    通过 ``from ... import _provider_config`` 捕获一个旧对象，否则首次远程
+    初始化会被误判为未配置。
+    """
+    backend = get_provider(workspace)
+    return backend, _provider_config
+
+
+def is_local_provider_url(api_base: str) -> bool:
+    """判断 Provider 端点是否为本机回环地址。"""
+    from urllib.parse import urlparse
+    import ipaddress
+
+    try:
+        host = urlparse(api_base or "").hostname
+    except Exception:
+        host = None
+    if not host:
+        return False
+    if host.lower() in {"localhost", "host.docker.internal"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_remote_provider_config(config: ProviderConfig | None) -> bool:
+    """返回配置是否需要按远程 Provider 执行授权检查。
+
+    自定义注入 Backend 若没有配套描述，知识链路无法证明其为本地，必须
+    fail closed。调用方可通过 ``set_provider(backend, config=...)`` 明确
+    提供本地回环端点。
+    """
+    if config is None or not config.is_configured():
+        return True
+    return not is_local_provider_url(config.api_base)
+
+
+def set_provider(
+    backend: ProviderBackend | None,
+    config: ProviderConfig | None = None,
+) -> None:
+    """注入 Provider Backend 及可选描述；传 None 清除。"""
+    global _provider_backend, _provider_config
     _provider_backend = backend
+    _provider_config = config if backend is not None else None
 
 
 def get_provider(workspace: str | Path | None = None) -> ProviderBackend | None:

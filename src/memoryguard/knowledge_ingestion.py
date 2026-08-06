@@ -13,11 +13,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .data_home import resolve_data_home
 from .knowledge_chunker import chunk_document
 from .knowledge_parser import parse_content, SUPPORTED_EXTENSIONS, CODE_EXTENSIONS
 from .knowledge_store import Book, Chunk, KnowledgeStore, _stable_hash
-from .provider_api import _provider_config
+from .knowledge_policy import KnowledgeAccessPolicy
 from .source_registry import (
     DEFAULT_PROJECT_EXCLUDE,
     INSTRUCTION_FILES,
@@ -149,6 +148,8 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
     processed = 0
     skipped = 0
     chunks_created = 0
+    changed_chunk_ids: list[str] = []
+    changed_document_ids: list[str] = []
 
     for file_path in scan.files:
         rel = str(file_path.relative_to(root)).replace("\\", "/")
@@ -201,6 +202,8 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         )
 
         chunks_created += len(chunks)
+        changed_document_ids.append(document_id)
+        changed_chunk_ids.extend(c.chunk_id for c in chunks)
         processed += 1
         store.update_job(job_id, "running", phase="indexing", processed=processed)
 
@@ -223,7 +226,13 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         status = "partial"
     # P1-10 分阶段状态：lexical(切片) / organized(整理) / vector(向量)
     phases = dict(book.build_phases or {})
-    phases["lexical"] = True
+    phases["lexical"] = {
+        "status": "ready" if scan.complete else "partial",
+        "indexed": stats["chunks"],
+        "processed": processed,
+        "skipped": skipped,
+        "deleted": deleted,
+    }
     store.update_book_status(
         book_id, status,
         file_count=stats["files"],
@@ -236,32 +245,58 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
     if processed > 0:
         try:
             from .knowledge_organizer import organize_book
-            from .knowledge_graph import build_structural_relations, extract_semantic_relations
+            from .knowledge_graph import build_structural_relations
             # P1-3 模型增强：provider 可用且（本地或已授权远程）时用于生成摘要/关键词/实体
             enhance_provider = _authorized_provider(book.remote_embedding_allowed)
-            cfg = _provider_config
-            remote_enhance = bool(enhance_provider and cfg is not None
-                                  and not _is_local_base(cfg.api_base))
-            organize_book(store, book_id, provider=enhance_provider, remote=remote_enhance)
-            build_structural_relations(store, book_id)
-            # P1-6 语义关系抽取：有 provider 时从 chunk 抽取实体间语义关系
-            extract_semantic_relations(store, book_id, provider=enhance_provider,
-                                       remote=remote_enhance)
-            phases["organized"] = True
+            from . import provider_api
+            _, cfg = provider_api.get_provider_state()
+            remote_enhance = bool(
+                enhance_provider and provider_api.is_remote_provider_config(cfg)
+            )
+            organize_stats = organize_book(
+                store, book_id, provider=enhance_provider, remote=remote_enhance,
+                chunk_ids=changed_chunk_ids,
+            )
+            build_structural_relations(
+                store, book_id, document_ids=changed_document_ids,
+            )
+            phases["organized"] = {
+                "status": (
+                    "partial" if organize_stats.get("budget_exhausted") else "ready"
+                ),
+                "processed": organize_stats.get("chunks_organized", 0),
+                "failed": 0,
+                "model_calls": organize_stats.get("model_calls", 0),
+                "relations": organize_stats.get("relations_created", 0),
+            }
+            if organize_stats.get("budget_exhausted"):
+                status = "partial"
             store.update_book_status(book_id, status, build_phases=phases)
         except Exception:
             # 整理失败不影响入库结果（KB1 核心已完成）
-            phases["organized"] = False
+            phases["organized"] = {
+                "status": "failed",
+                "processed": 0,
+                "failed": len(changed_chunk_ids),
+            }
             store.update_book_status(book_id, status, build_phases=phases)
 
     # KB2 向量索引：provider 可用且（本地或已授权远程）时为 chunk 生成 embedding
-    if processed > 0 and book.vector_enabled != "off":
+    if book.vector_enabled == "off":
+        phases["vector"] = {"status": "disabled", "indexed": 0}
+        store.update_book_status(book_id, status, build_phases=phases)
+    elif processed > 0:
         try:
-            generate_embeddings(store, book.book_id, book.remote_embedding_allowed)
-            phases["vector"] = True
+            embedded = generate_embeddings(
+                store, book.book_id, book.remote_embedding_allowed,
+            )
+            phases["vector"] = {
+                "status": "ready" if embedded > 0 else "unavailable",
+                "indexed": embedded,
+            }
         except Exception:
             # embedding 失败不影响入库（FTS 仍可用）
-            phases["vector"] = False
+            phases["vector"] = {"status": "failed", "indexed": 0}
         store.update_book_status(book_id, status, build_phases=phases)
 
     store.update_job(job_id, "done", phase="complete", processed=processed)
@@ -291,15 +326,14 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
     返回生成的 embedding 数量。provider 不可用、或远程 provider 未授权时返回 0。
     可单独调用，便于 GUI "重新智能整理" 触发。
     """
-    from .provider_api import ProviderConfig, get_provider, _provider_config
+    from . import provider_api
 
-    backend = get_provider()
+    backend, cfg = provider_api.get_provider_state()
     if backend is None:
         return 0
 
     # 远程 provider 必须先经用户对每本书显式授权，否则不回传文档内容
-    cfg: ProviderConfig | None = _provider_config
-    is_remote = cfg is not None and not _is_local_base(cfg.api_base)
+    is_remote = provider_api.is_remote_provider_config(cfg)
     if is_remote and not remote_allowed:
         return 0
 
@@ -468,11 +502,8 @@ def detect_sensitive_content(text: str) -> bool:
     """
     if not text:
         return False
-    try:
-        from .auto_organizer import SECRET_PATTERNS
-        return any(p.search(text) for p in SECRET_PATTERNS)
-    except Exception:
-        return False
+    from .sensitive_content import contains_sensitive_content
+    return contains_sensitive_content(text)
 
 
 def parsed_text_of(parsed) -> str:
@@ -492,15 +523,23 @@ def _filter_out_sensitive(store: KnowledgeStore, rows: list) -> list:
         return rows
     chunk_ids = [r["chunk_id"] for r in rows]
     placeholders = ",".join("?" * len(chunk_ids))
-    sens = {
-        row["chunk_id"]: row["sensitivity"]
+    metadata = {
+        row["chunk_id"]: (row["sensitivity"], row["content_role"])
         for row in store._conn.execute(
-            f"SELECT chunk_id, sensitivity FROM chunks WHERE chunk_id IN ({placeholders})",
+            f"SELECT c.chunk_id, c.sensitivity, d.content_role "
+            f"FROM chunks c JOIN documents d ON d.document_id=c.document_id "
+            f"WHERE c.chunk_id IN ({placeholders})",
             chunk_ids,
         ).fetchall()
     }
-    # 控制面片段也一并排除远程上传
-    return [r for r in rows if sens.get(r["chunk_id"], "normal") == "normal"]
+    policy = KnowledgeAccessPolicy()
+    return [
+        r for r in rows
+        if policy.allows({
+            "sensitivity": metadata.get(r["chunk_id"], ("normal", "knowledge"))[0],
+            "content_role": metadata.get(r["chunk_id"], ("normal", "knowledge"))[1],
+        })
+    ]
 
 
 def _is_local_base(api_base: str) -> bool:
@@ -509,20 +548,8 @@ def _is_local_base(api_base: str) -> bool:
     用 urlparse 提取 hostname + ipaddress 判断回环，杜绝字符串包含被域名欺骗
     （如 `https://localhost.attacker.example` 被误判为本地）（P1-1）。
     """
-    from urllib.parse import urlparse
-    import ipaddress
-    try:
-        host = urlparse(api_base or "").hostname
-    except Exception:
-        host = None
-    if not host:
-        return False
-    if host.lower() in {"localhost", "host.docker.internal"}:
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    from .provider_api import is_local_provider_url
+    return is_local_provider_url(api_base)
 
 
 def _authorized_provider(remote_allowed: bool):
@@ -531,12 +558,11 @@ def _authorized_provider(remote_allowed: bool):
     既用于 KB2 embedding，也用于 P1-3 模型增强：远程 provider 必须经用户对每本书
     显式授权，否则不把文档内容发往远程。
     """
-    from .provider_api import ProviderConfig, _provider_config, get_provider
-    backend = get_provider()
+    from . import provider_api
+    backend, cfg = provider_api.get_provider_state()
     if backend is None:
         return None
-    cfg: ProviderConfig | None = _provider_config
-    if cfg is not None and not _is_local_base(cfg.api_base) and not remote_allowed:
+    if provider_api.is_remote_provider_config(cfg) and not remote_allowed:
         return None
     return backend
 

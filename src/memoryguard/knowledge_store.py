@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Generator
 
 from .data_home import ensure_dirs, knowledge_db_path, resolve_data_home
+from .knowledge_policy import KnowledgeAccessPolicy, policy_sql
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS books (
@@ -95,6 +96,9 @@ CREATE TABLE IF NOT EXISTS relations (
     predicate TEXT NOT NULL,
     object_entity_id TEXT NOT NULL,
     source_chunk_id TEXT,
+    book_id TEXT NOT NULL DEFAULT '',
+    document_id TEXT NOT NULL DEFAULT '',
+    relation_source TEXT NOT NULL DEFAULT 'structural',
     confidence REAL NOT NULL DEFAULT 1.0,
     created_at TEXT NOT NULL,
     FOREIGN KEY (subject_entity_id) REFERENCES entities(entity_id) ON DELETE CASCADE,
@@ -134,8 +138,10 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
     content TEXT NOT NULL,
     source TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'knowledge',
+    kind TEXT NOT NULL DEFAULT 'fact',
     confidence REAL NOT NULL DEFAULT 0.5,
     status TEXT NOT NULL DEFAULT 'pending',
+    sync_error TEXT NOT NULL DEFAULT '',
     synced_memory_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     reviewed_at TEXT,
@@ -208,6 +214,16 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
          "ALTER TABLE books ADD COLUMN remote_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
         ("books", "build_phases",
          "ALTER TABLE books ADD COLUMN build_phases TEXT NOT NULL DEFAULT '{}'"),
+        ("relations", "book_id",
+         "ALTER TABLE relations ADD COLUMN book_id TEXT NOT NULL DEFAULT ''"),
+        ("relations", "document_id",
+         "ALTER TABLE relations ADD COLUMN document_id TEXT NOT NULL DEFAULT ''"),
+        ("relations", "relation_source",
+         "ALTER TABLE relations ADD COLUMN relation_source TEXT NOT NULL DEFAULT 'structural'"),
+        ("memory_candidates", "kind",
+         "ALTER TABLE memory_candidates ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"),
+        ("memory_candidates", "sync_error",
+         "ALTER TABLE memory_candidates ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -277,6 +293,8 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
         ("document_id", "ALTER TABLE memory_candidates ADD COLUMN document_id TEXT NOT NULL DEFAULT ''"),
         ("source_text_hash", "ALTER TABLE memory_candidates ADD COLUMN source_text_hash TEXT NOT NULL DEFAULT ''"),
         ("synced_memory_id", "ALTER TABLE memory_candidates ADD COLUMN synced_memory_id TEXT NOT NULL DEFAULT ''"),
+        ("kind", "ALTER TABLE memory_candidates ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"),
+        ("sync_error", "ALTER TABLE memory_candidates ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''"),
     ):
         if col not in mc_cols:
             try:
@@ -303,7 +321,7 @@ class Book:
     auto_extract_memory: bool = True
     vector_enabled: str = "auto"
     remote_embedding_allowed: bool = False
-    build_phases: dict[str, bool] = field(default_factory=dict)
+    build_phases: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -502,18 +520,41 @@ class KnowledgeStore:
         sensitivity 标记该文档片段是否含敏感内容（P0-5 隐私）。
         """
         with self._tx() as conn:
+            new_hashes = sorted({c.text_hash for c in chunks if c.text_hash})
+            if new_hashes:
+                placeholders = ",".join("?" * len(new_hashes))
+                conn.execute(
+                    f"UPDATE memory_candidates SET status='stale', sync_error='source changed' "
+                    f"WHERE document_id=? AND status IN ('pending','sync_failed') "
+                    f"AND source_text_hash NOT IN ({placeholders})",
+                    [document_id, *new_hashes],
+                )
+            else:
+                conn.execute(
+                    "UPDATE memory_candidates SET status='stale', sync_error='source removed' "
+                    "WHERE document_id=? AND status IN ('pending','sync_failed')",
+                    (document_id,),
+                )
             # 先确保文档行存在（FK），再替换 chunks；整个事务一次性提交
             conn.execute(
                 """INSERT INTO documents (document_id, book_id, relative_path, media_type, content_hash, status,
-                                          content_role, updated_at)
-                   VALUES (?,?,?,?,?,'active',?,?)
+                                          content_role, sensitivity, updated_at)
+                   VALUES (?,?,?,?,?,'active',?,?,?)
                    ON CONFLICT(document_id) DO UPDATE SET
                        content_hash=excluded.content_hash,
                        status='active',
                        content_role=excluded.content_role,
+                       sensitivity=excluded.sensitivity,
                        updated_at=excluded.updated_at""",
                 (document_id, book_id, relative_path, media_type, content_hash,
-                 content_role, _now_iso()),
+                 content_role, sensitivity, _now_iso()),
+            )
+            # Relation sources are not a foreign key because historical rows
+            # may outlive a replaced chunk. Remove them before the chunk swap.
+            conn.execute(
+                "DELETE FROM relations WHERE document_id=? OR source_chunk_id IN "
+                "(SELECT chunk_id FROM chunks WHERE document_id=?)",
+                (document_id, document_id),
             )
             conn.execute("DELETE FROM chunks WHERE document_id=?", (document_id,))
             for c in chunks:
@@ -556,7 +597,8 @@ class KnowledgeStore:
     # ---- FTS5 检索 ----
 
     def search_fts(self, query: str, book_ids: list[str] | None = None,
-                   limit: int = 30) -> list[dict[str, Any]]:
+                   limit: int = 30,
+                   policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
         """FTS5 全文检索。返回 chunk + book_title。"""
         # FTS5 MATCH 查询需要转义特殊字符
         safe_query = _sanitize_fts_query(query)
@@ -575,6 +617,10 @@ class KnowledgeStore:
             WHERE chunks_fts MATCH ? AND c.active=1
         """
         params: list[Any] = [safe_query]
+        access_sql, access_params = policy_sql(policy)
+        if access_sql:
+            sql += " AND " + access_sql
+            params.extend(access_params)
         if book_ids:
             placeholders = ",".join("?" * len(book_ids))
             sql += f" AND c.book_id IN ({placeholders})"
@@ -585,7 +631,8 @@ class KnowledgeStore:
         return [dict(r) for r in rows]
 
     def search_like(self, query: str, book_ids: list[str] | None = None,
-                    limit: int = 30) -> list[dict[str, Any]]:
+                    limit: int = 30,
+                    policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
         """LIKE 子串检索 fallback。
 
         trigram tokenizer 要求查询 ≥3 字符；短查询（如中文 2 字"属性""伤害"）
@@ -608,6 +655,10 @@ class KnowledgeStore:
             WHERE c.active=1 AND (c.text LIKE ? OR c.chapter LIKE ? OR c.section LIKE ?)
         """
         params: list[Any] = [pattern, pattern, pattern]
+        access_sql, access_params = policy_sql(policy)
+        if access_sql:
+            sql += " AND " + access_sql
+            params.extend(access_params)
         if book_ids:
             placeholders = ",".join("?" * len(book_ids))
             sql += f" AND c.book_id IN ({placeholders})"
@@ -672,28 +723,37 @@ class KnowledgeStore:
     def add_memory_candidate(self, book_id: str, content: str, source: str = "",
                              category: str = "knowledge", confidence: float = 0.5,
                              chunk_id: str | None = None,
-                             document_id: str = "", source_text_hash: str = "") -> str:
+                             document_id: str = "", source_text_hash: str = "",
+                             kind: str = "fact") -> str:
         """写入一条记忆候选（待审核）。返回 candidate_id。
 
         同一 content 重复写入时保留既有审核状态（INSERT ... DO UPDATE 而非
         INSERT OR REPLACE），避免用户已审核的候选被重新置回 pending（P1-3）。
         """
+        valid_kinds = {"fact", "project", "procedure", "preference"}
+        if kind not in valid_kinds:
+            raise ValueError(f"invalid candidate kind: {kind}")
         candidate_id = _stable_hash("mc", book_id, content)
         with self._tx() as conn:
             conn.execute(
                 """INSERT INTO memory_candidates
                    (candidate_id, book_id, chunk_id, document_id, source_text_hash,
-                    content, source, category, confidence, status, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,'pending',?)
+                    content, source, category, kind, confidence, status, sync_error, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,'pending','',?)
                    ON CONFLICT(candidate_id) DO UPDATE SET
                        chunk_id=excluded.chunk_id,
                        document_id=excluded.document_id,
                        source_text_hash=excluded.source_text_hash,
                        source=excluded.source,
                        category=excluded.category,
-                       confidence=excluded.confidence""",
+                       kind=excluded.kind,
+                       confidence=excluded.confidence,
+                       status=CASE WHEN memory_candidates.status='stale'
+                                   THEN 'pending' ELSE memory_candidates.status END,
+                       sync_error=CASE WHEN memory_candidates.status='stale'
+                                       THEN '' ELSE memory_candidates.sync_error END""",
                 (candidate_id, book_id, chunk_id, document_id, source_text_hash,
-                 content, source, category, confidence, _now_iso()),
+                 content, source, category, kind, confidence, _now_iso()),
             )
         return candidate_id
 
@@ -707,16 +767,23 @@ class KnowledgeStore:
                                status: str = "pending") -> list[dict[str, Any]]:
         """列出记忆候选（默认待审核）。"""
         sql = ("SELECT candidate_id, book_id, chunk_id, document_id, source_text_hash, "
-               "content, source, category, confidence, status, synced_memory_id, "
-               "created_at, reviewed_at FROM memory_candidates")
+               "content, source, category, kind, confidence, status, synced_memory_id, "
+               "sync_error, created_at, reviewed_at FROM memory_candidates")
         params: list[Any] = []
         conds: list[str] = []
         if book_id:
             conds.append("book_id=?")
             params.append(book_id)
         if status and status != "all":
-            conds.append("status=?")
-            params.append(status)
+            if status == "approved":
+                # Synced is a successful approved candidate and remains visible
+                # to existing callers that ask for approved items.
+                conds.append("status IN ('approved','synced')")
+            elif status == "actionable":
+                conds.append("status IN ('pending','sync_failed')")
+            else:
+                conds.append("status=?")
+                params.append(status)
         if conds:
             sql += " WHERE " + " AND ".join(conds)
         sql += " ORDER BY created_at DESC"
@@ -730,8 +797,43 @@ class KnowledgeStore:
         with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE memory_candidates SET status=?, reviewed_at=? "
-                "WHERE candidate_id=? AND status='pending'",
+                "WHERE candidate_id=? AND status IN ('pending','sync_failed')",
                 (status, _now_iso(), candidate_id),
+            )
+            return cur.rowcount > 0
+
+    def keep_memory_candidate(self, candidate_id: str) -> bool:
+        """保留候选但不执行同步；失败候选恢复为可处理的 pending。"""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status='pending', sync_error='', "
+                "reviewed_at=NULL WHERE candidate_id=? "
+                "AND status IN ('pending','sync_failed')",
+                (candidate_id,),
+            )
+            return cur.rowcount > 0
+
+    def mark_candidate_synced(self, candidate_id: str, memory_id: str) -> bool:
+        """在长期记忆写入成功后原子标记候选已同步。"""
+        if not memory_id:
+            return False
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status='synced', synced_memory_id=?, "
+                "sync_error='', reviewed_at=? WHERE candidate_id=? "
+                "AND status IN ('pending','sync_failed','approved')",
+                (memory_id, _now_iso(), candidate_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_candidate_sync_failed(self, candidate_id: str, error: str) -> bool:
+        """记录同步失败但保留候选，使用户可以重试。"""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status='sync_failed', sync_error=?, "
+                "reviewed_at=? WHERE candidate_id=? "
+                "AND status IN ('pending','approved','sync_failed')",
+                (str(error)[:1000], _now_iso(), candidate_id),
             )
             return cur.rowcount > 0
 
@@ -739,14 +841,21 @@ class KnowledgeStore:
         """记录候选已同步的长期记忆 ID（P1-2）。"""
         with self._tx() as conn:
             conn.execute(
-                "UPDATE memory_candidates SET synced_memory_id=? WHERE candidate_id=?",
+                "UPDATE memory_candidates SET synced_memory_id=?, status='synced', "
+                "sync_error='' WHERE candidate_id=?",
                 (memory_id, candidate_id),
             )
 
     def count_memory_candidates(self, status: str = "pending") -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM memory_candidates WHERE status=?", (status,),
-        ).fetchone()
+        if status == "approved":
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_candidates "
+                "WHERE status IN ('approved','synced')",
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM memory_candidates WHERE status=?", (status,),
+            ).fetchone()
         return int(row[0])
 
     # ---- embeddings (KB2) ----
@@ -790,7 +899,8 @@ class KnowledgeStore:
     def search_vectors(self, query_vec: list[float],
                        book_ids: list[str] | None = None,
                        limit: int = 30,
-                       embedding_space_id: str = "default") -> list[dict[str, Any]]:
+                       embedding_space_id: str = "default",
+                       policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
         """Python cosine 相似度向量检索（KB2，无 sqlite-vec 依赖）。
 
         强制按 embedding_space_id 过滤，并在比对时校验维度一致，
@@ -814,6 +924,10 @@ class KnowledgeStore:
             "WHERE c.active=1 AND e.embedding_space_id=?"
         )
         params: list[Any] = [embedding_space_id]
+        access_sql, access_params = policy_sql(policy)
+        if access_sql:
+            sql += " AND " + access_sql
+            params.extend(access_params)
         if book_ids:
             placeholders = ",".join("?" * len(book_ids))
             sql += f" AND c.book_id IN ({placeholders})"
@@ -856,7 +970,7 @@ def _row_to_book(row: sqlite3.Row) -> Book:
     )
 
 
-def _parse_phases(raw: str) -> dict[str, bool]:
+def _parse_phases(raw: str) -> dict[str, Any]:
     """解析 build_phases JSON，损坏时回退空 dict。"""
     if not raw:
         return {}

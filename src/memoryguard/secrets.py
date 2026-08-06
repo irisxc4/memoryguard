@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .auto_organizer import SECRET_PATTERNS
+from .sensitive_content import NAMED_SENSITIVE_PATTERNS
 
 # Full PEM private-key block for redaction (BEGIN-only pattern stays in SECRET_PATTERNS
 # so AutoOrganizer quarantine still triggers on the BEGIN line).
@@ -24,12 +24,10 @@ _INCOMPLETE_PEM_PRIVATE_KEY = re.compile(
 )
 
 _REDACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (SECRET_PATTERNS[0], "credential"),
-    (SECRET_PATTERNS[1], "aws_key"),
-    (SECRET_PATTERNS[2], "github_pat"),
-    (SECRET_PATTERNS[3], "github_oauth"),
-    (SECRET_PATTERNS[4], "openai_key"),
-    (SECRET_PATTERNS[5], "slack_token"),
+    (pattern, name) for name, pattern in NAMED_SENSITIVE_PATTERNS
+    if name != "private_key"
+]
+_REDACT_PATTERNS += [
     (_PEM_PRIVATE_KEY_BLOCK, "private_key"),
     (_INCOMPLETE_PEM_PRIVATE_KEY, "private_key"),
 ]
@@ -43,21 +41,14 @@ def labels_in_redacted_text(text: str) -> list[str]:
     if not text:
         return []
     return sorted(set(_REDACTED_LABEL.findall(text)))
-    """Detect secret-like substrings in *text* using shared SECRET_PATTERNS."""
+
+
+def detect_secrets(text: str) -> list[dict[str, Any]]:
+    """Detect secret-like substrings using the shared named patterns."""
     if not text:
         return []
-    labels = (
-        "credential",
-        "aws_key",
-        "github_pat",
-        "github_oauth",
-        "openai_key",
-        "slack_token",
-        "private_key",
-    )
     matches: list[dict[str, Any]] = []
-    for index, pattern in enumerate(SECRET_PATTERNS):
-        label = labels[index] if index < len(labels) else f"secret_{index}"
+    for label, pattern in NAMED_SENSITIVE_PATTERNS:
         for match in pattern.finditer(text):
             matches.append({
                 "pattern": pattern.pattern[:80],

@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,18 +26,11 @@ from .schema_v3 import (
 from .semantic_dedup import SemanticDedup
 from .shared_memory_store import SharedMemoryStore
 from .governance_scope import share_file_source_key
+from .sensitive_content import SENSITIVE_PATTERNS
 
 
-# Secret 检测正则
-SECRET_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(?i)(api[_-]?key|secret|token|password|passwd|pwd)\s*[=:]\s*\S+"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),               # AWS Access Key
-    re.compile(r"ghp_[A-Za-z0-9]{36}"),             # GitHub PAT
-    re.compile(r"gho_[A-Za-z0-9]{36}"),             # GitHub OAuth
-    re.compile(r"sk-[A-Za-z0-9]{20,}"),             # OpenAI API Key
-    re.compile(r"xox[baprs]-[A-Za-z0-9-]+"),        # Slack Token
-    re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),  # Private Key
-]
+# Backward-compatible public name used by policies/tests.
+SECRET_PATTERNS = list(SENSITIVE_PATTERNS)
 
 
 class AutoOrganizer:

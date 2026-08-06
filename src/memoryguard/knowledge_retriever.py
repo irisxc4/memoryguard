@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .knowledge_policy import KnowledgeAccessPolicy, policy_sql
 from .knowledge_store import KnowledgeStore
 
 
@@ -33,10 +34,15 @@ def search(store: KnowledgeStore, query: str,
     if not query.strip():
         return []
 
+    policy = KnowledgeAccessPolicy()
     # 三路独立检索，各自保持排序，供 RRF 融合用
-    fts = store.search_fts(query, book_ids=book_ids, limit=max(top_k * 10, 50))
+    fts = store.search_fts(
+        query, book_ids=book_ids, limit=max(top_k * 10, 50), policy=policy,
+    )
     if not fts:
-        fts = store.search_like(query, book_ids=book_ids, limit=max(top_k * 10, 50))
+        fts = store.search_like(
+            query, book_ids=book_ids, limit=max(top_k * 10, 50), policy=policy,
+        )
         for r in fts:
             r["retrieval_method"] = "like"
     else:
@@ -45,11 +51,11 @@ def search(store: KnowledgeStore, query: str,
 
     vec: list[dict[str, Any]] = []
     if enable_vector:
-        vec = _vector_results(store, query, book_ids, top_k)
+        vec = _vector_results(store, query, book_ids, top_k, policy)
 
     graph: list[dict[str, Any]] = []
     if enable_graph:
-        graph = _graph_results(store, query, book_ids, top_k)
+        graph = _graph_results(store, query, book_ids, top_k, policy)
 
     # RRF 融合三路
     fused = _rrf_fuse([fts, vec, graph])
@@ -98,7 +104,8 @@ def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dic
 
 def _vector_results(store: KnowledgeStore, query: str,
                     book_ids: list[str] | None,
-                    top_k: int) -> list[dict[str, Any]]:
+                    top_k: int,
+                    policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
     """向量召回（KB2）。provider 不可用或失败时返回空，不阻断 FTS。
 
     查询必须使用与入库相同的 embedding_space_id（P0-3），否则向量检索接不上
@@ -118,6 +125,7 @@ def _vector_results(store: KnowledgeStore, query: str,
         results = store.search_vectors(
             query_vec, book_ids=book_ids, limit=max(top_k * 10, 50),
             embedding_space_id=space_id,
+            policy=policy,
         )
         for r in results:
             r["embedding_space_id"] = space_id
@@ -129,7 +137,8 @@ def _vector_results(store: KnowledgeStore, query: str,
 
 def _graph_results(store: KnowledgeStore, query: str,
                    book_ids: list[str] | None,
-                   top_k: int) -> list[dict[str, Any]]:
+                   top_k: int,
+                   policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
     """实体命中 + graph 关系扩展（KB3）。返回独立结果列表。"""
     try:
         from .knowledge_graph import expand_relations
@@ -140,24 +149,33 @@ def _graph_results(store: KnowledgeStore, query: str,
     tokens = _query_tokens(query)
     if not tokens:
         return []
-    conds = ["active=1"]
     params: list[str] = []
     for tok in tokens:
-        conds.append("name LIKE ?")
         params.append(f"%{tok}%")
     seed_rows = store._conn.execute(
-        "SELECT entity_id, name FROM entities WHERE " + " AND ".join(conds),
+        "SELECT entity_id, name, aliases FROM entities WHERE active=1 AND ("
+        + " OR ".join("name LIKE ?" for _ in tokens) + ")",
         params,
     ).fetchall()
     if not seed_rows:
         return []
 
     # 命中的实体按相关度优先：整串精确命中 > 前缀 > 其他 token 命中
-    q = query.strip()
-    seed_rows.sort(key=lambda r: (
-        0 if r["name"] == q else 1 if r["name"].startswith(q) else 2,
-        len(r["name"]),
-    ))
+    q = _normalize_query(query)
+
+    def _seed_score(row: Any) -> tuple[int, int]:
+        name = str(row["name"] or "")
+        aliases = str(row["aliases"] or "")
+        if name == q:
+            return (1000, len(name))
+        if q and name.startswith(q):
+            return (800, len(name))
+        if q and q in name:
+            return (700, len(name))
+        hits = [tok for tok in tokens if tok and (tok in name or tok in aliases)]
+        return (len(hits) * 20 + max((len(tok) for tok in hits), default=0), len(name))
+
+    seed_rows.sort(key=lambda r: (-_seed_score(r)[0], _seed_score(r)[1]))
     seed_ids = [r["entity_id"] for r in seed_rows[:5]]  # 最多 5 个种子
 
     # 关系扩展
@@ -174,6 +192,7 @@ def _graph_results(store: KnowledgeStore, query: str,
     sql = f"""
         SELECT c.chunk_id, c.document_id, c.book_id, c.chapter, c.section, c.ordinal,
                c.text, c.summary, c.keywords, c.line_start, c.line_end,
+               c.sensitivity AS sensitivity,
                b.title AS book_title, b.root_path,
                d.relative_path AS relative_path, d.content_role AS content_role,
                0.0 AS rank
@@ -188,6 +207,10 @@ def _graph_results(store: KnowledgeStore, query: str,
         ph = ",".join("?" * len(book_ids))
         sql += f" AND c.book_id IN ({ph})"
         params.extend(book_ids)
+    access_sql, access_params = policy_sql(policy)
+    if access_sql:
+        sql += " AND " + access_sql
+        params.extend(access_params)
     sql += " LIMIT ?"
     params.append(top_k * 3)
 
@@ -206,7 +229,7 @@ def _query_tokens(query: str) -> list[str]:
     - 中文用 bigram 切分（无分词器依赖）
     - 去重、保序、过滤太短 token
     """
-    q = (query or "").strip()
+    q = _normalize_query(query)
     if not q:
         return []
     tokens: list[str] = []
@@ -216,21 +239,32 @@ def _query_tokens(query: str) -> list[str]:
         if w not in seen:
             seen.add(w)
             tokens.append(w)
-    # 中文 bigram
-    cn = re.sub(r"[A-Za-z0-9_\-\s]", "", q)
-    cn = cn.strip()
-    if len(cn) >= 2:
-        for i in range(len(cn) - 1):
-            bg = cn[i:i + 2]
-            if bg not in seen:
-                seen.add(bg)
-                tokens.append(bg)
-    elif len(cn) == 1 and cn not in seen:
-        tokens.append(cn)
+    # 中文 bigram + complete run. Punctuation is removed before tokenizing.
+    for cn in re.findall(r"[\u4e00-\u9fff]+", q):
+        if len(cn) >= 2:
+            for i in range(len(cn) - 1):
+                bg = cn[i:i + 2]
+                if bg not in seen:
+                    seen.add(bg)
+                    tokens.append(bg)
+            if cn not in seen:
+                seen.add(cn)
+                tokens.append(cn)
+        elif cn and cn not in seen:
+            seen.add(cn)
+            tokens.append(cn)
     # 整串作为兜底 token（英文短语/专名）
     if q not in seen:
         tokens.append(q)
     return tokens
+
+
+def _normalize_query(query: str) -> str:
+    """移除问号、逗号等标点，避免它们成为图种子 token。"""
+    return re.sub(
+        r"[^\w\u4e00-\u9fff\s-]", " ", (query or "").strip(),
+        flags=re.UNICODE,
+    ).strip()
 
 
 def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:
@@ -241,9 +275,14 @@ def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:
 
     # 获取文档信息
     doc_row = store._conn.execute(
-        "SELECT relative_path FROM documents WHERE document_id=?",
+        "SELECT relative_path, content_role FROM documents WHERE document_id=?",
         (chunk.document_id,),
     ).fetchone()
+    if not KnowledgeAccessPolicy().allows({
+        "sensitivity": chunk.sensitivity,
+        "content_role": doc_row["content_role"] if doc_row else "knowledge",
+    }):
+        return None
     relative_path = doc_row["relative_path"] if doc_row else ""
 
     # 获取书籍信息
@@ -265,6 +304,8 @@ def read_chunk(store: KnowledgeStore, chunk_id: str) -> dict[str, Any] | None:
         "line_start": chunk.line_start,
         "line_end": chunk.line_end,
         "relative_path": relative_path,
+        "sensitivity": chunk.sensitivity,
+        "content_role": doc_row["content_role"] if doc_row else "knowledge",
         "prev_chunk_id": prev_chunk.chunk_id if prev_chunk else None,
         "prev_text": prev_chunk.text if prev_chunk else None,
         "next_chunk_id": next_chunk.chunk_id if next_chunk else None,
@@ -297,12 +338,66 @@ def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
     if not book:
         return None
 
-    documents = store.list_documents(book_id)
-    # 获取章节列表
+    document_rows = store._conn.execute(
+        """SELECT d.relative_path, d.status, COUNT(c.chunk_id) AS chunk_count
+           FROM documents d
+           LEFT JOIN chunks c
+             ON c.document_id=d.document_id AND c.active=1
+           WHERE d.book_id=?
+           GROUP BY d.document_id, d.relative_path, d.status
+           ORDER BY d.relative_path""",
+        (book_id,),
+    ).fetchall()
     chapter_rows = store._conn.execute(
-        """SELECT DISTINCT chapter FROM chunks
+        """SELECT chapter, COUNT(*) AS chunk_count
+           FROM chunks
            WHERE book_id=? AND active=1 AND chapter != ''
+           GROUP BY chapter
            ORDER BY chapter""",
+        (book_id,),
+    ).fetchall()
+    entity_rows = store._conn.execute(
+        """SELECT e.entity_id, e.name, e.entity_type,
+                  COUNT(DISTINCT ce.chunk_id) AS mention_count
+           FROM entities e
+           JOIN chunk_entities ce ON ce.entity_id=e.entity_id
+           JOIN chunks c ON c.chunk_id=ce.chunk_id AND c.active=1
+           JOIN documents d ON d.document_id=c.document_id
+           WHERE c.book_id=? AND c.sensitivity='normal'
+             AND d.content_role='knowledge'
+           GROUP BY e.entity_id, e.name, e.entity_type
+           ORDER BY mention_count DESC, e.name
+           LIMIT 24""",
+        (book_id,),
+    ).fetchall()
+    relation_rows = store._conn.execute(
+        """SELECT se.name AS subject, r.predicate,
+                  CASE
+                    WHEN oe.name LIKE 'chunk:%'
+                    THEN COALESCE(NULLIF(c.chapter, ''), NULLIF(c.section, ''), d.relative_path)
+                    ELSE oe.name
+                  END AS object,
+                  r.relation_source, r.confidence, d.relative_path
+           FROM relations r
+           JOIN entities se ON se.entity_id=r.subject_entity_id
+           JOIN entities oe ON oe.entity_id=r.object_entity_id
+           JOIN documents d ON d.document_id=r.document_id
+           LEFT JOIN chunks c ON c.chunk_id=r.source_chunk_id
+           WHERE r.book_id=? AND d.content_role='knowledge'
+             AND (c.chunk_id IS NULL OR c.sensitivity='normal')
+           ORDER BY r.confidence DESC, se.name, r.predicate, oe.name
+           LIMIT 24""",
+        (book_id,),
+    ).fetchall()
+    fragment_rows = store._conn.execute(
+        """SELECT c.chunk_id, c.chapter, c.section, c.summary, c.text,
+                  c.line_start, c.line_end, d.relative_path
+           FROM chunks c
+           JOIN documents d ON d.document_id=c.document_id
+           WHERE c.book_id=? AND c.active=1 AND c.sensitivity='normal'
+             AND d.content_role='knowledge'
+           ORDER BY c.document_id, c.ordinal
+           LIMIT 8""",
         (book_id,),
     ).fetchall()
     chapters = [r["chapter"] for r in chapter_rows]
@@ -318,11 +413,23 @@ def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
         "chunk_count": book.chunk_count,
         "entity_count": book.entity_count,
         "last_indexed_at": book.last_indexed_at or "",
+        "vector_enabled": book.vector_enabled,
+        "remote_embedding_allowed": book.remote_embedding_allowed,
+        "auto_extract_memory": book.auto_extract_memory,
+        "build_phases": book.build_phases,
         "chapters": chapters,
+        "chapter_items": [dict(row) for row in chapter_rows],
         "documents": [
-            {"relative_path": d["relative_path"], "status": d["status"]}
-            for d in documents
+            {
+                "relative_path": row["relative_path"],
+                "status": row["status"],
+                "chunk_count": row["chunk_count"],
+            }
+            for row in document_rows
         ],
+        "entities": [dict(row) for row in entity_rows],
+        "relations": [dict(row) for row in relation_rows],
+        "fragments": [dict(row) for row in fragment_rows],
     }
 
 

@@ -19,6 +19,7 @@ import json as _json
 import threading
 import time
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,8 @@ def render_bookshelf_html() -> str:
                      margin: 80px auto; }
   #addModal label { display: block; margin: 12px 0 4px; font-size: 13px; color: #5b4636; }
   #addModal input { width: 100%; padding: 8px; border: 1px solid #c9b8a0; border-radius: 4px; }
+  .path-row { display: flex; gap: 8px; }
+  .path-row input { flex: 1; }
   .empty { text-align: center; padding: 60px 20px; color: #8a7860; }
   .cand-badge { display: inline-block; margin-left: 10px; padding: 3px 10px; border-radius: 12px;
                 font-size: 12px; background: #3a6ea5; color: #fff; cursor: pointer; vertical-align: middle; }
@@ -146,7 +149,10 @@ def render_bookshelf_html() -> str:
   <div class="modal">
     <h3 style="margin-bottom:16px;color:#5b4636;">添加一本书</h3>
     <label>文件夹路径</label>
-    <input type="text" id="bookPath" placeholder="D:\\docs\\my-project">
+    <div class="path-row">
+      <input type="text" id="bookPath" placeholder="请选择文件夹" readonly>
+      <button type="button" class="secondary" onclick="pickBookFolder()">选择</button>
+    </div>
     <label>书名（可选）</label>
     <input type="text" id="bookTitle" placeholder="留空使用文件夹名">
     <div style="margin-top:20px;display:flex;gap:8px;justify-content:flex-end;">
@@ -204,7 +210,7 @@ async function loadBooks() {
 
 async function refreshCandCount() {
   try {
-    const data = await api("knowledge_candidates_list", ["", "pending"]);
+    const data = await api("knowledge_candidates_list", ["", "actionable"]);
     const n = data.total || 0;
     const btn = document.getElementById("candBtn");
     if (btn) btn.textContent = n > 0 ? "记忆候选 (" + n + ")" : "记忆候选";
@@ -212,7 +218,10 @@ async function refreshCandCount() {
 }
 
 async function openCandidates() {
-  const data = await api("knowledge_candidates_list", ["", "pending"]);
+  const [data, targets] = await Promise.all([
+    api("knowledge_candidates_list", ["", "actionable"]),
+    api("knowledge_candidate_targets", []),
+  ]);
   const shelf = document.getElementById("bookshelf");
   const results = document.getElementById("searchResults");
   shelf.innerHTML = "";
@@ -222,13 +231,25 @@ async function openCandidates() {
   }
   let html = '<h3 style="margin-bottom:12px;color:#4a3520;">待审核记忆候选（' +
              data.candidates.length + '）</h3>';
+  const groups = targets.groups || [];
+  if (groups.length > 0) {
+    html += '<div class="result-item"><div class="result-meta">同步目标</div>' +
+      '<select id="candidateTarget" style="width:100%;padding:8px">' +
+      groups.map(g => `<option value="${escapeHtml(g.share_group_id)}">${escapeHtml(g.label)}</option>`).join('') +
+      '</select></div>';
+  }
   for (const c of data.candidates) {
+    const syncError = c.sync_error
+      ? `<div class="result-meta" style="color:#a53a3a;margin-top:6px;">上次同步失败：${escapeHtml(c.sync_error)}</div>`
+      : "";
     html += `<div class="result-item">
-      <div class="result-meta">📌 ${c.source||""} · 置信度 ${c.confidence||0}
-        <span class="result-method">${c.category||"knowledge"}</span></div>
+      <div class="result-meta">📌 ${escapeHtml(c.source||"")} · 置信度 ${c.confidence||0}
+        <span class="result-method">${escapeHtml(c.status||"pending")}</span></div>
       <div class="result-text">${escapeHtml(c.content||"")}</div>
+      ${syncError}
       <div style="margin-top:10px;display:flex;gap:8px;">
         <button style="background:#3f7d4e" onclick="review('${c.candidate_id}','approve')">采纳</button>
+        <button class="secondary" onclick="review('${c.candidate_id}','keep')">暂不处理</button>
         <button class="secondary" onclick="review('${c.candidate_id}','reject')">忽略</button>
       </div>
     </div>`;
@@ -237,7 +258,18 @@ async function openCandidates() {
 }
 
 async function review(id, decision) {
-  await api("knowledge_candidate_review", [id, decision]);
+  const target = document.getElementById("candidateTarget");
+  const result = await api(
+    "knowledge_candidate_review",
+    [id, decision, target ? target.value : ""],
+  );
+  if (result.error) {
+    alert(result.error);
+  }
+  if (decision === "keep" && !result.error) {
+    loadBooks();
+    return;
+  }
   openCandidates();
   refreshCandCount();
 }
@@ -267,6 +299,11 @@ async function doSearch() {
 
 function openAddModal() { document.getElementById("addModal").style.display = "block"; }
 function closeAddModal() { document.getElementById("addModal").style.display = "none"; }
+
+async function pickBookFolder() {
+  const result = await api("pick_path", [false]);
+  if (result.path) document.getElementById("bookPath").value = result.path;
+}
 
 async function addBook() {
   const path = document.getElementById("bookPath").value.trim();
@@ -299,93 +336,328 @@ def render_book_detail_html(book_id: str) -> str:
         info = get_book_info(store, book_id)
         if not info:
             return "<html><body><h1>书籍不存在</h1><p><a href='/knowledge'>返回书架</a></p></body></html>"
-        chapters = info.get("chapters", [])
+        chapter_items = info.get("chapter_items", [])
         documents = info.get("documents", [])
-        chapters_html = "".join(f"<li>{_escape(c)}</li>" for c in chapters)
+        entities = info.get("entities", [])
+        relations = info.get("relations", [])
+        fragments = info.get("fragments", [])
+        chapters_html = "".join(
+            "<article class='chapter-card'>"
+            f"<h3>{_escape(item.get('chapter', ''))}</h3>"
+            f"<span>{int(item.get('chunk_count', 0) or 0)} 个片段</span>"
+            "</article>"
+            for item in chapter_items
+        )
         docs_html = "".join(
-            f"<li>{_escape(d['relative_path'])} <span class='status'>({_escape(d['status'])})</span></li>"
-            for d in documents
+            "<article class='document-card'>"
+            f"<div class='document-path'>{_escape(item.get('relative_path', ''))}</div>"
+            f"<div class='document-meta'>{int(item.get('chunk_count', 0) or 0)} 个片段"
+            f"<span class='dot'>·</span>{_escape(item.get('status', ''))}</div>"
+            "</article>"
+            for item in documents
+        )
+        entities_html = "".join(
+            "<article class='entity-card'>"
+            f"<div class='entity-type'>{_escape(item.get('entity_type', 'concept'))}</div>"
+            f"<h3>{_escape(item.get('name', ''))}</h3>"
+            f"<span>{int(item.get('mention_count', 0) or 0)} 次关联</span>"
+            "</article>"
+            for item in entities
+        )
+        relations_html = "".join(
+            "<article class='relation-row'>"
+            f"<strong>{_escape(item.get('subject', ''))}</strong>"
+            f"<span class='predicate'>{_escape(item.get('predicate', 'related_to'))}</span>"
+            f"<strong>{_escape(item.get('object', ''))}</strong>"
+            f"<small>{_escape(item.get('relation_source', 'structural'))}"
+            f"<span class='dot'>·</span>{_escape(item.get('relative_path', ''))}</small>"
+            "</article>"
+            for item in relations
+        )
+        fragments_html = "".join(
+            "<article class='fragment-card'>"
+            f"<div class='fragment-meta'>{_escape(item.get('chapter', '') or '未分章')}"
+            f"<span class='dot'>·</span>{_escape(item.get('relative_path', ''))}"
+            f"<span class='dot'>·</span>{int(item.get('line_start', 0) or 0)}"
+            f"-{int(item.get('line_end', 0) or 0)}</div>"
+            f"<p>{_escape(item.get('summary') or item.get('text', ''))[:360]}</p>"
+            "</article>"
+            for item in fragments
+        )
+
+        phase_labels = (
+            ("lexical", "文本索引"),
+            ("organized", "知识整理"),
+            ("vector", "向量索引"),
+        )
+        phase_cards = []
+        build_phases = info.get("build_phases", {})
+        for key, label in phase_labels:
+            phase = build_phases.get(key)
+            if isinstance(phase, dict):
+                phase_status = str(phase.get("status", "unavailable"))
+                details = []
+                for field, field_label in (
+                    ("indexed", "已索引"),
+                    ("processed", "已处理"),
+                    ("model_calls", "模型调用"),
+                    ("relations", "关系"),
+                ):
+                    if field in phase:
+                        details.append(f"{field_label} {phase.get(field, 0)}")
+                phase_detail = " · ".join(details) or "暂无统计"
+            elif phase is True:
+                phase_status = "ready"
+                phase_detail = "已完成"
+            else:
+                phase_status = "unavailable"
+                phase_detail = "尚不可用"
+            status_class = (
+                phase_status
+                if phase_status in {
+                    "ready", "partial", "failed", "unavailable", "disabled",
+                }
+                else "unavailable"
+            )
+            phase_cards.append(
+                "<article class='phase-card'>"
+                f"<div><span>{label}</span><strong class='phase-status {status_class}'>"
+                f"{_escape(phase_status)}</strong></div>"
+                f"<small>{_escape(phase_detail)}</small>"
+                "</article>"
+            )
+        phases_html = "".join(phase_cards)
+        book_ids_json = _json.dumps([book_id], ensure_ascii=False)
+        book_status = str(info.get("status", ""))
+        status_class = (
+            book_status
+            if book_status in {"ready", "partial", "failed", "indexing"}
+            else "partial"
         )
         return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{_escape(info['title'])} - 知识书库</title>
 <style>
-  body {{ font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: #e8dfd0; color: #3a2f23; padding: 28px; }}
-  .paper {{ background: #fdf9ef; border-radius: 6px; padding: 28px 32px;
-            box-shadow: 0 2px 10px rgba(74,53,32,0.18);
-            max-width: 860px; margin: 30px auto; line-height: 1.7;
-            background-image: linear-gradient(to bottom, rgba(0,0,0,0.02) 1px, transparent 1px);
-            background-size: 100% 28px; }}
-  header {{ margin-bottom: 20px; }}
-  h1 {{ color: #5b4636; font-size: 22px; }}
-  .meta {{ color: #8a7860; font-size: 13px; margin: 8px 0; }}
-  section {{ background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 16px;
-             box-shadow: 0 1px 4px rgba(0,0,0,0.06); }}
-  h2 {{ font-size: 16px; color: #5b4636; margin-bottom: 12px; }}
-  ul {{ list-style: none; padding: 0; }}
-  li {{ padding: 6px 0; border-bottom: 1px solid #f0ebe2; font-size: 14px; }}
-  .status {{ color: #8a7860; font-size: 12px; }}
-  .search-bar {{ display: flex; gap: 8px; margin-bottom: 12px; }}
-  input {{ flex: 1; padding: 8px; border: 1px solid #c9b8a0; border-radius: 4px; }}
-  button {{ padding: 8px 16px; background: #8b6f47; color: #fff; border: none;
-           border-radius: 4px; cursor: pointer; }}
-  .result {{ background: #faf7f0; padding: 12px; border-radius: 4px; margin-top: 8px;
-             border-left: 3px solid #8b6f47; }}
-  a {{ color: #8b6f47; text-decoration: none; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+          background: #f4f5f2; color: #20231f; line-height: 1.55; }}
+  a {{ color: inherit; text-decoration: none; }}
+  .masthead {{ background: #202b26; color: #f7faf8; padding: 26px 32px 34px; }}
+  .masthead-inner {{ max-width: 1180px; margin: 0 auto; }}
+  .back {{ display: inline-flex; align-items: center; gap: 8px; color: #b9cac1;
+           font-size: 13px; margin-bottom: 22px; }}
+  .title-row {{ display: flex; align-items: flex-end; justify-content: space-between;
+                gap: 24px; }}
+  h1 {{ margin: 0; font-size: 30px; line-height: 1.2; letter-spacing: 0; overflow-wrap: anywhere; }}
+  .description {{ max-width: 760px; color: #cfd9d4; margin: 10px 0 0; }}
+  .book-status {{ display: inline-flex; align-items: center; min-height: 30px; padding: 5px 10px;
+                  border-radius: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
+  .book-status.ready {{ background: #2f7d55; color: #fff; }}
+  .book-status.partial, .book-status.indexing {{ background: #d9a441; color: #20231f; }}
+  .book-status.failed {{ background: #b84843; color: #fff; }}
+  .stats {{ max-width: 1180px; margin: -18px auto 0; padding: 0 24px;
+            display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }}
+  .stat {{ min-height: 76px; background: #fff; border: 1px solid #d8ddd9; border-radius: 6px;
+           padding: 14px 16px; }}
+  .stat strong {{ display: block; font-size: 22px; color: #202b26; }}
+  .stat span {{ color: #68716c; font-size: 12px; }}
+  .layout {{ max-width: 1180px; margin: 26px auto 60px; padding: 0 24px;
+             display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 34px; }}
+  section {{ padding: 24px 0; border-bottom: 1px solid #d8ddd9; }}
+  section:first-child {{ padding-top: 0; }}
+  .section-head {{ display: flex; justify-content: space-between; align-items: center;
+                   gap: 16px; margin-bottom: 14px; }}
+  h2 {{ margin: 0; font-size: 17px; color: #202b26; letter-spacing: 0; }}
+  .section-note {{ color: #7a827e; font-size: 12px; }}
+  .search-bar {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }}
+  input {{ width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid #b8c1bc;
+           border-radius: 5px; background: #fff; color: #20231f; font: inherit; }}
+  button, .button {{ display: inline-flex; align-items: center; justify-content: center;
+                     min-height: 40px; padding: 9px 15px; border: 1px solid #245f46;
+                     border-radius: 5px; background: #245f46; color: #fff; cursor: pointer;
+                     font: inherit; font-weight: 650; }}
+  .button.ghost {{ background: #fff; color: #245f46; }}
+  .chapter-grid, .entity-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+                                gap: 10px; }}
+  .chapter-card, .entity-card, .fragment-card, .document-card, .phase-card {{
+    min-width: 0; border: 1px solid #d8ddd9; border-radius: 6px; background: #fff;
+  }}
+  .chapter-card, .entity-card {{ min-height: 104px; padding: 14px; }}
+  .chapter-card h3, .entity-card h3 {{ margin: 0 0 14px; font-size: 14px;
+                                      overflow-wrap: anywhere; }}
+  .chapter-card span, .entity-card span {{ color: #7a827e; font-size: 12px; }}
+  .entity-card {{ border-top: 3px solid #3f6f92; }}
+  .entity-type {{ color: #3f6f92; font-size: 10px; font-weight: 750;
+                  text-transform: uppercase; margin-bottom: 7px; }}
+  .relation-list, .fragment-list, .document-list, .phase-list {{
+    display: grid; gap: 8px;
+  }}
+  .relation-row {{ display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+                   align-items: center; gap: 10px; padding: 11px 12px; border-left: 3px solid #bd5a48;
+                   background: #fff; border-radius: 0 6px 6px 0; }}
+  .relation-row strong {{ font-size: 13px; overflow-wrap: anywhere; }}
+  .relation-row small {{ grid-column: 1 / -1; color: #7a827e; font-size: 11px; }}
+  .predicate {{ color: #9a4436; font-size: 11px; font-weight: 700; }}
+  .fragment-card {{ padding: 14px 15px; }}
+  .fragment-card p {{ margin: 8px 0 0; color: #3f4541; overflow-wrap: anywhere; }}
+  .fragment-meta, .document-meta {{ color: #7a827e; font-size: 11px; }}
+  .document-card, .phase-card {{ padding: 12px 13px; }}
+  .document-path {{ font-size: 13px; font-weight: 650; overflow-wrap: anywhere; margin-bottom: 5px; }}
+  .phase-card > div {{ display: flex; justify-content: space-between; gap: 10px; }}
+  .phase-card small {{ display: block; margin-top: 6px; color: #7a827e; }}
+  .phase-status {{ font-size: 10px; text-transform: uppercase; }}
+  .phase-status.ready {{ color: #2f7d55; }}
+  .phase-status.partial {{ color: #9b6a0d; }}
+  .phase-status.failed {{ color: #b84843; }}
+  .phase-status.unavailable, .phase-status.disabled {{ color: #7a827e; }}
+  .settings {{ border: 1px solid #cbd2ce; border-radius: 6px; background: #e9eeeb;
+               padding: 16px; }}
+  .settings dl {{ margin: 14px 0 0; display: grid; gap: 10px; }}
+  .settings div {{ display: grid; gap: 2px; }}
+  .settings dt {{ color: #6d7671; font-size: 11px; }}
+  .settings dd {{ margin: 0; font-size: 13px; overflow-wrap: anywhere; }}
+  .rail section {{ padding-top: 0; }}
+  .empty {{ color: #7a827e; padding: 14px 0; }}
+  .result {{ background: #fff; padding: 13px 14px; border-radius: 6px; margin-top: 8px;
+             border-left: 3px solid #3f6f92; }}
+  .result p {{ margin: 7px 0 0; overflow-wrap: anywhere; }}
+  .dot {{ padding: 0 5px; }}
+  @media (max-width: 900px) {{
+    .layout {{ grid-template-columns: 1fr; }}
+    .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .chapter-grid, .entity-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .title-row {{ align-items: flex-start; flex-direction: column; }}
+  }}
+  @media (max-width: 560px) {{
+    .masthead {{ padding: 22px 18px 30px; }}
+    .stats, .layout {{ padding-left: 14px; padding-right: 14px; }}
+    .chapter-grid, .entity-grid {{ grid-template-columns: 1fr; }}
+    .relation-row {{ grid-template-columns: 1fr; }}
+    .relation-row small {{ grid-column: auto; }}
+    .search-bar {{ grid-template-columns: 1fr; }}
+  }}
 </style>
 </head>
 <body>
-<div class="paper">
-<header>
-  <a href="/knowledge">← 返回书架</a>
-  <h1>📖 {_escape(info['title'])}</h1>
-  <div class="meta">{info.get('file_count',0)} 文件 · {info.get('chunk_count',0)} 片段
-      · {info.get('chapter_count',0)} 章节 · {info.get('entity_count',0)} 知识点
-      · 状态: {_escape(info.get('status',''))}</div>
-  {f'<div class="meta">{_escape(info.get("description",""))}</div>' if info.get('description') else ''}
+<header class="masthead">
+  <div class="masthead-inner">
+    <a class="back" href="/knowledge">← 返回书架</a>
+    <div class="title-row">
+      <div>
+        <h1>{_escape(info['title'])}</h1>
+        <p class="description">{_escape(info.get("description") or "已纳入 MemoryGuard 的本地只读知识来源。")}</p>
+      </div>
+      <span class="book-status {status_class}">{_escape(book_status)}</span>
+    </div>
+  </div>
 </header>
 
-<section>
-  <h2>搜索本书</h2>
-  <div class="search-bar">
-    <input type="text" id="q" placeholder="输入关键词搜索本书内容..." onkeydown="if(event.key==='Enter')searchBook()">
-    <button onclick="searchBook()">搜索</button>
-  </div>
-  <div id="results"></div>
-</section>
-
-<section>
-  <h2>章节目录</h2>
-  <ul>{chapters_html or '<li class="status">暂无章节</li>'}</ul>
-</section>
-
-<section>
-  <h2>文档列表</h2>
-  <ul>{docs_html or '<li class="status">暂无文档</li>'}</ul>
-</section>
-
+<div class="stats">
+  <article class="stat"><strong>{int(info.get('file_count', 0) or 0)}</strong><span>文件</span></article>
+  <article class="stat"><strong>{int(info.get('chapter_count', 0) or 0)}</strong><span>章节</span></article>
+  <article class="stat"><strong>{int(info.get('chunk_count', 0) or 0)}</strong><span>知识片段</span></article>
+  <article class="stat"><strong>{int(info.get('entity_count', 0) or 0)}</strong><span>实体</span></article>
 </div>
+
+<main class="layout">
+  <div class="content">
+    <section>
+      <div class="section-head">
+        <h2>搜索本书</h2>
+        <span class="section-note">FTS、向量与图关系融合检索</span>
+      </div>
+      <div class="search-bar">
+        <input type="text" id="q" placeholder="输入关键词" onkeydown="if(event.key==='Enter')searchBook()">
+        <button type="button" onclick="searchBook()">搜索</button>
+      </div>
+      <div id="results"></div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>章节</h2><span class="section-note">按活跃片段统计</span></div>
+      <div class="chapter-grid">{chapters_html or '<p class="empty">暂无章节</p>'}</div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>知识片段</h2><span class="section-note">仅显示可访问内容</span></div>
+      <div class="fragment-list">{fragments_html or '<p class="empty">暂无可展示片段</p>'}</div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>实体</h2><span class="section-note">按片段关联次数排序</span></div>
+      <div class="entity-grid">{entities_html or '<p class="empty">暂无实体</p>'}</div>
+    </section>
+
+    <section>
+      <div class="section-head">
+        <h2>关系</h2>
+        <a class="button ghost" href="/">打开主图谱</a>
+      </div>
+      <div class="relation-list">{relations_html or '<p class="empty">暂无关系</p>'}</div>
+    </section>
+  </div>
+
+  <aside class="rail">
+    <section>
+      <div class="section-head"><h2>构建状态</h2></div>
+      <div class="phase-list">{phases_html}</div>
+    </section>
+
+    <section>
+      <div class="section-head"><h2>文档</h2></div>
+      <div class="document-list">{docs_html or '<p class="empty">暂无文档</p>'}</div>
+    </section>
+
+    <section>
+      <div class="settings">
+        <div class="section-head"><h2>书籍设置</h2></div>
+        <dl>
+          <div><dt>根目录</dt><dd>{_escape(info.get('root_path', ''))}</dd></div>
+          <div><dt>向量策略</dt><dd>{_escape(info.get('vector_enabled', 'auto'))}</dd></div>
+          <div><dt>远程 Embedding</dt><dd>{"已授权" if info.get('remote_embedding_allowed') else "未授权"}</dd></div>
+          <div><dt>记忆候选</dt><dd>{"自动提取" if info.get('auto_extract_memory') else "已关闭"}</dd></div>
+          <div><dt>最近索引</dt><dd>{_escape(info.get('last_indexed_at') or '尚未完成')}</dd></div>
+        </dl>
+      </div>
+    </section>
+  </aside>
+</main>
 <script>
+const BOOK_IDS = {book_ids_json};
+
+function escapeHtml(value) {{
+  return String(value || "").replace(/[&<>"']/g, ch => (
+    {{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[ch]
+  ));
+}}
+
 async function searchBook() {{
   const q = document.getElementById('q').value.trim();
   if (!q) return;
+  const box = document.getElementById('results');
+  box.innerHTML = '<p class="empty">正在检索...</p>';
   const resp = await fetch('/api/knowledge_search', {{
     method: 'POST',
     headers: {{'Content-Type':'application/json', 'X-Session-Token': window.__MG_SESSION__||''}},
-    body: JSON.stringify([q, {{"book_ids": ["{book_id}"]}}])
+    body: JSON.stringify([q, {{"book_ids": BOOK_IDS}}])
   }});
   const data = await resp.json();
-  const box = document.getElementById('results');
   if (!data.results || !data.results.length) {{
-    box.innerHTML = '<p class="status">未找到匹配片段</p>';
+    box.innerHTML = '<p class="empty">未找到匹配片段</p>';
     return;
   }}
   let html = '';
   for (const r of data.results) {{
-    html += `<div class="result"><div class="meta">${{r.chapter||''}} · ${{r.relative_path||''}} : ${{r.line_start||0}}-${{r.line_end||0}}</div><div>${{(r.text||'').slice(0,400)}}...</div></div>`;
+    html += `<article class="result">
+      <div class="fragment-meta">${{escapeHtml(r.chapter || '未分章')}}
+        <span class="dot">·</span>${{escapeHtml(r.relative_path || '')}}
+        <span class="dot">·</span>${{r.line_start || 0}}-${{r.line_end || 0}}
+        <span class="dot">·</span>${{escapeHtml(r.retrieval_method || '')}}</div>
+      <p>${{escapeHtml((r.text || '').slice(0, 400))}}</p>
+    </article>`;
   }}
   box.innerHTML = html;
 }}
@@ -509,30 +781,110 @@ def handle_knowledge_api(method: str, args: list[Any],
             candidates = store.list_memory_candidates(book_id=book_id, status=status)
             return {"candidates": candidates, "total": len(candidates)}
 
+        if method == "knowledge_candidate_targets":
+            try:
+                from .agent_binding import AgentBindingStore, BindingStatus
+                active = [
+                    b for b in AgentBindingStore(Path(workspace)).list_bindings(
+                        include_inactive=False,
+                    )
+                    if getattr(b, "status", None) == BindingStatus.ACTIVE
+                ]
+                grouped: dict[str, list[str]] = {}
+                for binding in active:
+                    grouped.setdefault(binding.share_group_id, []).append(
+                        binding.agent_instance_id,
+                    )
+                groups = [
+                    {
+                        "share_group_id": group_id,
+                        "members": members,
+                        "label": (
+                            f"{group_id} ({', '.join(members)})"
+                            if members else group_id
+                        ),
+                    }
+                    for group_id, members in sorted(grouped.items())
+                ]
+                return {"groups": groups, "total": len(groups)}
+            except Exception as exc:
+                return {"groups": [], "total": 0, "error": str(exc)}
+
         if method == "knowledge_candidate_review":
             if len(args) < 2:
                 return {"error": "candidate_id and decision required"}
             candidate_id = str(args[0])
             decision = str(args[1])  # approve / reject
-            ok = store.review_memory_candidate(candidate_id, decision)
-            if not ok:
-                return {"error": "candidate not found or invalid decision"}
-            # P1-2 候选闭环：批准时同步到长期记忆，并记录 synced_memory_id
-            synced = None
-            if {"approve": "approved", "reject": "rejected"}.get(decision, decision) == "approved":
-                synced = _sync_candidate_to_memory(store, candidate_id, workspace)
+            normalized = {"approve": "approved", "reject": "rejected"}.get(
+                decision, decision,
+            )
+            if decision == "keep":
+                normalized = "pending"
+            if normalized == "pending":
+                if not store.keep_memory_candidate(candidate_id):
+                    return {"error": "candidate not found or cannot be retained"}
+                return {
+                    "ok": True,
+                    "candidate_id": candidate_id,
+                    "status": "pending",
+                    "synced_memory_id": "",
+                }
+            if normalized == "rejected":
+                if not store.review_memory_candidate(candidate_id, decision):
+                    return {"error": "candidate not found or invalid decision"}
+                return {
+                    "ok": True,
+                    "candidate_id": candidate_id,
+                    "status": "rejected",
+                    "synced_memory_id": "",
+                }
+            if normalized != "approved":
+                return {"error": "invalid decision"}
+
+            # Approval is committed only after the governed memory write
+            # succeeds. A failure leaves a retryable sync_failed candidate.
+            target_group_id = str(args[2]).strip() if len(args) > 2 and args[2] else ""
+            sync = _sync_candidate_to_memory(
+                store, candidate_id, workspace, target_group_id=target_group_id,
+            )
+            if not sync.ok:
+                store.mark_candidate_sync_failed(candidate_id, sync.error)
+                return {
+                    "ok": False,
+                    "candidate_id": candidate_id,
+                    "status": "sync_failed",
+                    "error": sync.error,
+                    "synced_memory_id": "",
+                }
+            if not store.mark_candidate_synced(candidate_id, sync.memory_id):
+                return {
+                    "ok": False,
+                    "candidate_id": candidate_id,
+                    "status": "sync_failed",
+                    "error": "candidate state changed before sync commit",
+                    "synced_memory_id": "",
+                }
             return {
                 "ok": True,
                 "candidate_id": candidate_id,
-                "status": decision,
-                "synced_memory_id": synced,
+                "status": "synced",
+                "synced_memory_id": sync.memory_id,
             }
 
     return {"error": f"unknown knowledge method: {method}"}
 
 
-def _sync_candidate_to_memory(store, candidate_id: str, workspace) -> str | None:
-    """把已批准的候选写入共享长期记忆，返回 memory_id（失败返回 None，不阻塞审核）。
+@dataclass(frozen=True)
+class CandidateSyncResult:
+    ok: bool
+    memory_id: str = ""
+    error: str = ""
+
+
+def _sync_candidate_to_memory(
+    store, candidate_id: str, workspace, *, target_group_id: str = "",
+) -> CandidateSyncResult:
+    """把候选写入共享长期记忆；失败时不改变候选为已批准。
 
     P1-2 候选闭环：候选经 GovernanceEngine.auto_write 写入共享记忆层，
     以 candidate_id 作幂等键避免重复写入。未配置共享组时回退个人组。
@@ -540,23 +892,41 @@ def _sync_candidate_to_memory(store, candidate_id: str, workspace) -> str | None
     try:
         cand = store.get_memory_candidate(candidate_id)
         if not cand or not (cand.get("content") or "").strip():
-            return None
+            return CandidateSyncResult(False, error="candidate not found or empty")
         body = str(cand["content"]).strip()
+        kind = str(cand.get("kind") or "").strip()
+        if kind not in {"fact", "project", "procedure", "preference"}:
+            return CandidateSyncResult(False, error=f"invalid memory kind: {kind}")
 
-        from pathlib import Path
         ws = Path(workspace) if workspace else Path.cwd()
 
-        # 解析目标共享组：优先活跃绑定，否则个人组
-        group_id = ""
+        # A multi-binding workspace must name the intended target explicitly.
+        group_id = target_group_id
+        actor = ""
         try:
-            from .agent_binding import AgentBindingStore, BindingStatus, personal_group_id
+            from .agent_binding import AgentBindingStore, BindingStatus
             binds = AgentBindingStore(ws).list_bindings(include_inactive=False)
             active = [b for b in binds if getattr(b, "status", None) == BindingStatus.ACTIVE]
-            if active:
+            if group_id:
+                matching = [b for b in active if b.share_group_id == group_id]
+                if not matching:
+                    return CandidateSyncResult(
+                        False, error="target share group is not an active binding",
+                    )
+                # The group is the user-selected target. Use a deterministic
+                # active member only as provenance actor; shared groups may
+                # legitimately contain multiple bindings.
+                actor = sorted(b.agent_instance_id for b in matching)[0]
+            elif len(active) == 1:
                 group_id = active[0].share_group_id
-            actor = active[0].agent_instance_id if active else ""
+                actor = active[0].agent_instance_id
+            elif len(active) > 1:
+                return CandidateSyncResult(
+                    False, error="multiple active bindings; target share group required",
+                )
         except Exception:
-            actor = ""
+            if group_id:
+                return CandidateSyncResult(False, error="cannot resolve target binding")
         if not group_id:
             try:
                 from .agent_binding import personal_group_id as _pg
@@ -586,19 +956,26 @@ def _sync_candidate_to_memory(store, candidate_id: str, workspace) -> str | None
         )
         result = GovernanceEngine(ws, group_id).auto_write(
             event,
-            kind_override="knowledge",
+            kind_override=kind,
             write_policy="auto_accept",
             injection_policy="relevant",
             idempotency_key=f"knowledge-candidate:{candidate_id}",
         )
         if not result.get("ok"):
-            return None
+            return CandidateSyncResult(
+                False,
+                error=str(
+                    result.get("blocked_reason")
+                    or result.get("error")
+                    or "governance write blocked"
+                ),
+            )
         memory_id = result.get("memory_id", "")
-        if memory_id:
-            store.set_candidate_synced(candidate_id, memory_id)
-        return memory_id or None
-    except Exception:
-        return None
+        if not memory_id:
+            return CandidateSyncResult(False, error="governance write returned no memory_id")
+        return CandidateSyncResult(True, memory_id=memory_id)
+    except Exception as exc:
+        return CandidateSyncResult(False, error=str(exc))
 
 
 def _escape(s: str) -> str:
@@ -621,6 +998,7 @@ KNOWLEDGE_API_METHODS = frozenset({
     "knowledge_job_status",
     "knowledge_remove",
     "knowledge_candidates_list",
+    "knowledge_candidate_targets",
     "knowledge_candidate_review",
 })
 
