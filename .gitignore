@@ -8,10 +8,38 @@ build/
 dist/
 .eggs/
 .pytest_cache/
-.coverage
-htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
 .venv/
 venv/
+
+# SQLite 运行文件
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# 本地日志
+*.log
+logs/
+tmp/
+temp/
 
 # MemoryGuard 运行时产物（可完全删除，非事实源）
 .memoryguard/
@@ -20,8 +48,18 @@ venv/
 /.codex/
 /.cursor/
 /.trae/
+/.claude/
+/.windsurf/
+/.learnings/
+graphify-out/
+
+# 命令入口按用户调整
 /AGENTS.md
-/graphify-out/
+
+# 本机配置
+.env
+.env.*
+!.env.example
 
 # IDE
 .vscode/

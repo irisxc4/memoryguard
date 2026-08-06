@@ -1,0 +1,65 @@
+name: Repo Hygiene
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  hygiene:
+    name: Forbidden artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check forbidden artifacts
+        run: |
+          fail=0
+
+          # SQLite 运行文件（豁免 tests/fixtures 与 docs/assets 下的产品资产）
+          if git ls-files --cached | grep -E '\.(db|sqlite|db-wal|db-shm|sqlite-wal|sqlite-shm)$' | grep -v '^docs/assets/' | grep -v '^tests/fixtures/' > /tmp/sqlite.txt; then
+            echo "::error::Forbidden SQLite file tracked:"
+            cat /tmp/sqlite.txt
+            fail=1
+          fi
+
+          # MemoryGuard 运行时目录（允许 docs/assets 下的 gif 等产品资产）
+          if git ls-files --cached | grep -E '(^|/)(\.memoryguard|\.learnings|\.codex|\.cursor|\.claude|\.windsurf)(/|$)' | grep -v '^docs/assets/' | grep -v '^tests/fixtures/' > /tmp/mg.txt; then
+            echo "::error::Forbidden agent runtime dir tracked:"
+            cat /tmp/mg.txt
+            fail=1
+          fi
+
+          # Python 字节码
+          if git ls-files --cached | grep -E '__pycache__|\.pyc$|\.pyo$' > /tmp/pyc.txt; then
+            echo "::error::Forbidden python bytecode tracked:"
+            cat /tmp/pyc.txt
+            fail=1
+          fi
+
+          # 日志
+          if git ls-files --cached | grep -E '\.log$|(^|/)logs/' > /tmp/log.txt; then
+            echo "::error::Forbidden log file tracked:"
+            cat /tmp/log.txt
+            fail=1
+          fi
+
+          # 临时 / 备份
+          if git ls-files --cached | grep -E '\.(tmp|temp|bak|swp)$|~$' > /tmp/tmp.txt; then
+            echo "::error::Forbidden temp/backup tracked:"
+            cat /tmp/tmp.txt
+            fail=1
+          fi
+
+          # 本地密钥配置（允许 .env.example）
+          if git ls-files --cached | grep -E '^\.env$|\.env\.[^-]' | grep -v '\.env\.example$' > /tmp/env.txt; then
+            echo "::error::Forbidden env config tracked:"
+            cat /tmp/env.txt
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo "repo-hygiene: clean"
