@@ -1795,11 +1795,12 @@ function renderNeuronGraph() {
       { selector: 'edge[etype = "shared_source"]', style: { 'line-style': 'dashed', 'line-color': '#63b3ed', 'line-opacity': .34 }},
       { selector: 'edge[etype = "duplicate"]', style: { 'line-style': 'dashed', 'line-color': '#f6ad55', 'line-opacity': .28 }},
       { selector: 'edge.signal', style: {
-        'line-opacity': .95, 'width': 3.6, 'line-color': '#e6fff6',
-        'shadow-blur': 18, 'shadow-color': '#6ee7c4', 'shadow-opacity': .7,
+        'line-opacity': 1, 'width': 'mapData(strength, 0, 1, 3.6, 6.4)', 'line-color': '#effff9',
+        'shadow-blur': 30, 'shadow-color': '#6ee7c4', 'shadow-opacity': .92,
       }},
       { selector: 'edge.signal-trail', style: {
-        'line-opacity': .55, 'width': 2.4, 'line-color': '#98f5d0',
+        'line-opacity': .72, 'width': 'mapData(strength, 0, 1, 2.2, 4.2)', 'line-color': '#98f5d0',
+        'shadow-blur': 18, 'shadow-color': '#6ee7c4', 'shadow-opacity': .55,
       }},
       { selector: 'node.signal', style: {
         'border-width': 4, 'border-color': '#ffffff',
@@ -1938,24 +1939,13 @@ function _releaseSignal(cy, eleId, cls) {
   if (ele && ele.length) ele.removeClass(cls);
 }
 
-function pickNeuronSignalPath(cy) {
-  const derivedEdges = edge => {
-    const type = edge.data('etype');
-    return !type || type === 'derived_from';
-  };
-  const leaves = cy.nodes().filter(n => {
-    if (!n || !n.length || n.data('kind') === 'root') return false;
-    const incoming = n.incomers('edge').filter(derivedEdges);
-    const outgoing = n.outgoers('edge').filter(derivedEdges);
-    return incoming.length > 0 && outgoing.length === 0;
-  });
-  if (!leaves.length) return null;
-  const anchors = leaves.filter(n => {
-    const kind = n.data('kind');
-    return kind === 'claim_anchor' || kind === 'duplicate_cluster';
-  });
-  const candidates = anchors.length ? anchors : leaves;
-  const leaf = candidates[Math.floor(Math.random() * candidates.length)];
+function isDerivedNeuronEdge(edge) {
+  const type = edge.data('etype');
+  return !type || type === 'derived_from';
+}
+
+function buildNeuronSignalPath(cy, leaf) {
+  if (!cy || !leaf || !leaf.length) return null;
   const pathNodes = [];
   const pathEdges = [];
   let cur = leaf;
@@ -1963,7 +1953,7 @@ function pickNeuronSignalPath(cy) {
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
     pathNodes.unshift(cur);
-    const incomers = cur.incomers('edge').filter(derivedEdges);
+    const incomers = cur.incomers('edge').filter(isDerivedNeuronEdge);
     if (!incomers.length) break;
     const edge = incomers[Math.floor(Math.random() * Math.min(incomers.length, 2))];
     pathEdges.unshift(edge);
@@ -1973,13 +1963,56 @@ function pickNeuronSignalPath(cy) {
       break;
     }
   }
-  if (pathEdges.length < 1) {
-    const edges = cy.edges().filter(derivedEdges);
-    if (!edges.length) return null;
-    const edge = edges[Math.floor(Math.random() * edges.length)];
-    return { nodes: [edge.source(), edge.target()], edges: [edge] };
-  }
+  if (!pathEdges.length) return null;
   return { nodes: pathNodes, edges: pathEdges };
+}
+
+function collectNeuronSignalPaths(cy, limit = 6) {
+  if (!cy || limit < 1) return [];
+  const leaves = cy.nodes().filter(n => {
+    if (!n || !n.length || n.data('kind') === 'root') return false;
+    const incoming = n.incomers('edge').filter(isDerivedNeuronEdge);
+    const outgoing = n.outgoers('edge').filter(isDerivedNeuronEdge);
+    return incoming.length > 0 && outgoing.length === 0;
+  });
+  const anchors = leaves.filter(n => {
+    const kind = n.data('kind');
+    return kind === 'claim_anchor' || kind === 'duplicate_cluster';
+  });
+  const candidates = anchors.length ? anchors : leaves;
+  const pool = [];
+  candidates.forEach(node => pool.push(node));
+  for (let i = pool.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  const paths = [];
+  const signatures = new Set();
+  for (const leaf of pool) {
+    const path = buildNeuronSignalPath(cy, leaf);
+    if (!path) continue;
+    const signature = path.edges.map(edge => edge.id()).join('>');
+    if (!signature || signatures.has(signature)) continue;
+    signatures.add(signature);
+    paths.push(path);
+    if (paths.length >= limit) break;
+  }
+  if (!paths.length) {
+    const edges = [];
+    cy.edges().filter(isDerivedNeuronEdge).forEach(edge => edges.push(edge));
+    for (let i = edges.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [edges[i], edges[j]] = [edges[j], edges[i]];
+    }
+    for (const edge of edges.slice(0, limit)) {
+      paths.push({ nodes: [edge.source(), edge.target()], edges: [edge] });
+    }
+  }
+  return paths;
+}
+
+function pickNeuronSignalPath(cy) {
+  return collectNeuronSignalPaths(cy, 1)[0] || null;
 }
 
 function runNeuronSignalPulse(cy, path) {
@@ -1987,19 +2020,19 @@ function runNeuronSignalPulse(cy, path) {
   const stepMs = 120;
   const holdMs = 520;
   path.edges.forEach((edge, index) => {
-      const tid = setTimeout(() => {
-        if (!cyInstance || cyInstance !== cy) return;
-        _acquireSignal(cy, edge.id(), 'signal');
-        const src = edge.source();
-        const tgt = edge.target();
-        if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
-        if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
-        try {
-          animateNeuronEdgeParticle(cy, edge, 620);
-        } catch (_) {
-          // 粒子层异常不能影响 Cytoscape 边/节点脉冲。
-        }
-        const releaseId = setTimeout(() => {
+    const tid = setTimeout(() => {
+      if (!cyInstance || cyInstance !== cy) return;
+      _acquireSignal(cy, edge.id(), 'signal');
+      const src = edge.source();
+      const tgt = edge.target();
+      if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
+      if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
+      try {
+        animateNeuronEdgeParticle(cy, edge, 620);
+      } catch (_) {
+        // 粒子层异常不能影响 Cytoscape 边/节点脉冲。
+      }
+      const releaseId = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         _releaseSignal(cy, edge.id(), 'signal');
         _acquireSignal(cy, edge.id(), 'signal-trail');
@@ -2114,16 +2147,16 @@ function startNeuronSignalPulses(cy) {
   window.__neuronSparkPulse = setInterval(spark, 5200);
   const fireWave = () => {
     if (!cyInstance || cyInstance !== cy) return;
-    const count = 3 + Math.floor(Math.random() * 4); // 3-6
-    for (let i = 0; i < count; i++) {
-      const delay = Math.floor(Math.random() * 280);
+    const desired = Math.min(8, Math.max(4, Math.ceil(Math.sqrt(cy.nodes().length))));
+    const paths = collectNeuronSignalPaths(cy, desired);
+    paths.forEach((path, index) => {
+      const delay = index * 85 + Math.floor(Math.random() * 70);
       const tid = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
-        const path = pickNeuronSignalPath(cy);
-        if (path) runNeuronSignalPulse(cy, path);
+        runNeuronSignalPulse(cy, path);
       }, delay);
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
-    }
+    });
   };
   const initialWave = setTimeout(fireWave, 720);
   (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(initialWave);

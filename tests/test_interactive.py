@@ -58,6 +58,8 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "startNeuronSignalPulses" in html
     assert "pickNeuronSignalPath" in html
     assert "edge.signal" in html
+    assert "mapData(strength, 0, 1, 3.6, 6.4)" in html
+    assert "mapData(strength, 0, 1, 2.2, 4.2)" in html
     assert "相关连线（点击跳转）" in html
     assert "突触末梢（点击跳转）" in html
     assert "selectNeuronByMemory" in html
@@ -208,6 +210,9 @@ def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     assert "Math.atan2" in html
     assert "粒子层异常不能影响 Cytoscape 边/节点脉冲" in html
     assert "const anchors = leaves.filter" in html
+    assert "collectNeuronSignalPaths" in html
+    assert "const desired = Math.min(8, Math.max(4" in html
+    assert "index * 85 + Math.floor(Math.random() * 70)" in html
     assert "const initialWave = setTimeout(fireWave, 720)" in html
     assert "neuron-particle-travel" not in html
 
