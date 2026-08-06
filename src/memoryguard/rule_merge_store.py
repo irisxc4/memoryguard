@@ -491,6 +491,30 @@ class RuleMergeStore:
     def _active_write_conn(self) -> sqlite3.Connection | None:
         return getattr(self._write_state, "conn", None)
 
+    @contextmanager
+    def _read_conn(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection for reads that is safe inside an open write txn.
+
+        A read on a *second* connection while the same thread holds ``BEGIN
+        IMMEDIATE`` on the active write connection can raise
+        ``OperationalError: database is locked`` against our own transaction —
+        a self-lock, not external contention.  Reads that may run inside
+        ``_write_conn()`` (backfill, sync, outbox, reconciliation) therefore
+        reuse the active write connection; only when no write transaction is
+        active is an independent read connection opened.  The DB is
+        rollback-journal (not WAL), so opening a second connection here is
+        never a workaround — this reuse is the fix.
+        """
+        active = getattr(self._write_state, "conn", None)
+        if active is not None:
+            yield active
+            return
+        conn = self._db()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
     def governance_lock(
         self, *, timeout: float | None = None, poll_interval: float | None = None,
     ) -> WorkspaceGovernanceLock:
@@ -1931,22 +1955,22 @@ class RuleMergeStore:
             "status": status or "active",
         }
 
-    def get_source_link(
-        self, share_group_id: str, memory_id: str,
+    def _get_source_link_conn(
+        self, conn: sqlite3.Connection, share_group_id: str, memory_id: str,
     ) -> dict[str, Any] | None:
-        """Return the persisted source link, or None.
+        """Query one source link on an explicitly provided connection.
 
-        This is a pure read: it never derives a Definition, never opens the
-        legacy store and never writes.  Source ownership recovery is an
-        explicit mutation performed by backfill/sync/outbox consumers under
-        the workspace governance lock, never by a read path.
+        This is the query core of :meth:`get_source_link`.  Callers that
+        already hold a connection (a backfill/sync/reconciliation write
+        transaction) pass it explicitly so the read never opens a second
+        connection to the same database file while ``BEGIN IMMEDIATE`` is
+        active.
         """
-        with self._db() as conn:
-            row = conn.execute(
-                "SELECT * FROM rule_source_links "
-                "WHERE share_group_id=? AND memory_id=?",
-                (share_group_id, memory_id),
-            ).fetchone()
+        row = conn.execute(
+            "SELECT * FROM rule_source_links "
+            "WHERE share_group_id=? AND memory_id=?",
+            (share_group_id, memory_id),
+        ).fetchone()
         if row is None:
             return None
         return {
@@ -1958,6 +1982,24 @@ class RuleMergeStore:
             "status": row["status"] or "active",
         }
 
+    def get_source_link(
+        self, share_group_id: str, memory_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the persisted source link, or None.
+
+        This is a pure read: it never derives a Definition, never opens the
+        legacy store and never writes.  Source ownership recovery is an
+        explicit mutation performed by backfill/sync/outbox consumers under
+        the workspace governance lock, never by a read path.
+
+        The read goes through ``_read_conn()`` so it reuses an in-flight
+        write transaction on this thread instead of opening a second
+        connection (a second connection would self-lock against the active
+        ``BEGIN IMMEDIATE``).
+        """
+        with self._read_conn() as conn:
+            return self._get_source_link_conn(conn, share_group_id, memory_id)
+
     def list_source_links(
         self,
         *,
@@ -1968,7 +2010,9 @@ class RuleMergeStore:
         """Pure-read listing of persisted source links.
 
         Source links are the fact table for Source -> canonical Definition
-        ownership.  Evidence only carries belief, never ownership.
+        ownership.  Evidence only carries belief, never ownership.  Reads via
+        ``_read_conn()`` so a caller inside a write transaction never opens a
+        second connection against the same database file.
         """
         sql = "SELECT * FROM rule_source_links WHERE 1=1"
         params: list[Any] = []
@@ -1982,7 +2026,7 @@ class RuleMergeStore:
             sql += " AND canonical_definition_id=?"
             params.append(canonical_definition_id)
         sql += " ORDER BY share_group_id, memory_id"
-        with self._db() as conn:
+        with self._read_conn() as conn:
             return [
                 dict(row)
                 for row in conn.execute(sql, params).fetchall()

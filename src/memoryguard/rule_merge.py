@@ -280,6 +280,13 @@ class RuleMergeService:
                 primary_id = sorted(set(mapping.values()))[0]
                 migrated_audiences[primary_id] = removed
 
+        # ``backfill_group`` always runs this body inside one ``_write_conn()``
+        # transaction.  Pass that transaction's connection explicitly to every
+        # in-transaction read so no second connection is ever opened against
+        # the same database file (a second connection would self-lock against
+        # the active ``BEGIN IMMEDIATE``).
+        txn_conn = self.store._active_write_conn()
+
         for record in records:
             if str(record.injection_policy or "") != "always":
                 continue  # governed rules only
@@ -289,7 +296,14 @@ class RuleMergeService:
             # Resolve the current canonical for this source (source link then
             # alias/merged chain) BEFORE touching any row, so a merged rule is
             # never resurrected by a re-run.
-            link = self.store.get_source_link(group_id, record.memory_id)
+            if txn_conn is not None:
+                link = self.store._get_source_link_conn(
+                    txn_conn, group_id, record.memory_id,
+                )
+            else:  # pragma: no cover - wrapper invariant; see backfill_group
+                link = self.store.get_source_link(
+                    group_id, record.memory_id,
+                )
             record_status = getattr(record.status, "value", record.status)
             canonical_id = self.store.resolve_canonical(
                 str((link or {}).get("canonical_definition_id") or new_id)
