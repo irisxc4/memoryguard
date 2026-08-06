@@ -22,6 +22,7 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#upgrade">Upgrade</a> ·
+  <a href="#knowledge-library">Knowledge Library</a> ·
   <a href="#system-architecture">Architecture</a> ·
   <a href="#supported-hosts">Supported hosts</a> ·
   <a href="#privacy-and-safety">Privacy and safety</a>
@@ -182,6 +183,27 @@ python -m pip install --upgrade "agent-memguard[gui]"
 There is no separate `memoryguard update` self-update command yet. The package
 manager is the authoritative upgrade path, while MemoryGuard's schema
 migrations run when the upgraded application opens its local stores.
+
+## Knowledge Library
+
+The desktop console can turn a selected folder into one governed local
+knowledge library. Source files remain where they are; MemoryGuard stores the
+searchable index in its user data home instead of copying a runtime database
+into every source project.
+
+| Capability | Current behavior |
+|---|---|
+| Folder ingestion | Add a folder as a book and ingest supported files as documents |
+| Structure | Parse documents, preserve chapter/section context, and create traceable chunks |
+| Retrieval | Full-text search, optional embeddings, and a layered knowledge graph |
+| Natural synchronization | Re-ingest changed files; a partial or failed scan does not silently remove previously indexed content |
+| Lifecycle | Move a book to the library trash, restore it, or explicitly purge its recovery snapshot |
+| Memory candidates | Preview evidence-backed candidates before accepting them into governed long-term memory |
+
+Open the desktop console and choose **Knowledge Library**. Remote embedding or
+model-backed indexing is opt-in and requires explicit authorization; local
+full-text retrieval remains available without sending source text to a remote
+provider.
 
 ## Write and governance lifecycle
 
@@ -352,8 +374,14 @@ traceable without being treated as automatically trusted memory.
 ## Privacy and safety
 
 - MemoryGuard runs as a local MCP stdio server.
-- Shared memory and conversation history are stored locally under
-  `.memoryguard/`.
+- All governed data stays local unless you explicitly authorize a remote model
+  or embedding operation.
+- The Knowledge Library database uses `MEMORYGUARD_HOME` or the platform user
+  data directory, so a selected source folder does not receive its own
+  knowledge database.
+- Some shared-memory, conversation-history, audit, and recovery artifacts still
+  use an authorized workspace's `.memoryguard/` directory in the current
+  release. Storage is therefore local, but not yet fully centralized.
 - Source scanning is read-only by default.
 - Mutating governance paths use validation, explicit scope, provenance, and
   reversible state.
@@ -409,6 +437,7 @@ the installed version.
 
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
+- [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Contributor License Agreement](CLA.md)
 - [Issue tracker](https://github.com/irisxc4/memoryguard/issues)
@@ -416,9 +445,11 @@ the installed version.
 ## Roadmap
 
 - **Current:** local MCP memory, automatic organization, scoped rules,
-  conversation evidence, provider adapters, governance UI, and rollback.
-- **Next:** stronger automatic lifecycle governance, including decay,
-  derivation, consolidation, and clearer governance reports.
+  conversation evidence, Knowledge Library, provider adapters, governance UI,
+  and rollback.
+- **Next:** content-addressed deduplication, natural source synchronization,
+  delta/checkpoint storage, derived-index maintenance, and clearer governance
+  reports. Long-term records are not retired merely because they are old.
 - **Later:** team and enterprise capabilities only after validated demand.
 
 ## Contributing
