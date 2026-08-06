@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -31,6 +30,13 @@ jobs:
 
       - name: Run full test suite
         run: python -m pytest tests/ -q
+
+      - name: Run knowledge library acceptance
+        run: >-
+          python -m pytest
+          tests/test_knowledge_library.py
+          tests/test_knowledge_acceptance.py
+          -q
 
       - name: Run rule lifecycle acceptance script
         run: python scripts/accept_rule_lifecycle.py

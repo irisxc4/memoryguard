@@ -64,7 +64,11 @@ class RequestExecutor:
         "import_external_mcp_entries": "导入外部 MCP 条目",
         "knowledge_add": "添加知识书库文件夹并入库",
         "knowledge_reingest": "重新整理知识书库",
-        "knowledge_remove": "删除知识书库",
+        "knowledge_rebuild_smart": "重建知识书库智能索引",
+        "knowledge_remove": "移入知识书库回收站",
+        "knowledge_restore": "恢复已删除知识书库",
+        "knowledge_purge_deleted": "永久清理知识书库恢复快照",
+        "knowledge_update_settings": "更新知识书库设置",
         "knowledge_candidate_review": "审核记忆候选（批准/拒绝）",
     }
 
@@ -72,6 +76,7 @@ class RequestExecutor:
     HIGH_RISK_METHODS = frozenset({
         "delete_archived_agent",
         "delete_projection",
+        "knowledge_purge_deleted",
     })
 
     DISABLED_METHODS = frozenset({"purge_agent_dir"})

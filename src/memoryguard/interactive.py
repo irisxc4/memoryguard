@@ -903,11 +903,15 @@ async function callApiOptional(method, fallback, ...args) {
 
 function waitForPywebview(timeoutMs) {
   return new Promise((resolve) => {
-    if (window.pywebview && window.pywebview.api) return resolve(true);
+    // localhost pages do not expose pywebview; the server-issued session
+    // token is the trusted signal that the HTTP bridge is ready.
+    if ((window.pywebview && window.pywebview.api) || window.__MG_SESSION__) return resolve(true);
     let elapsed = 0;
     const interval = setInterval(() => {
       elapsed += 100;
-      if (window.pywebview && window.pywebview.api) { clearInterval(interval); resolve(true); }
+      if ((window.pywebview && window.pywebview.api) || window.__MG_SESSION__) {
+        clearInterval(interval); resolve(true);
+      }
       else if (elapsed >= timeoutMs) { clearInterval(interval); resolve(false); }
     }, 100);
   });
@@ -1657,9 +1661,6 @@ function renderNeuronGraph() {
     ? `<span class="chip chip-info">待整理残留 · ${enrichPending}</span>`
       + (enrichInfo.auto_applied ? `<span class="chip chip-confirmed">本次整理 · ${enrichInfo.auto_applied}</span>` : '')
     : '';
-  const baseEmptyNotice = graph.base_empty
-    ? `<section class="card projection-gate" style="margin-bottom:14px"><div class="gate-body"><h3>基础投影尚未构建</h3><p class="gate-reason">规则与习惯、对话历史索引仍可浏览；构建投影后会显示受治理记忆的完整关系。</p><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="buildProjection()">构建基础投影</button></div></div></section>`
-    : '';
   const suggestions = [];
   selectedNeuronId = null;
   selectedNeuronNode = null;
@@ -1672,7 +1673,6 @@ function renderNeuronGraph() {
     ${metaBar}
     ${modeControls}
     ${sourceMapPanel}
-    ${baseEmptyNotice}
     <section class="neuron-shell">
     <div class="neuron-toolbar">
       <div class="neuron-title"><span class="eyebrow">Cognition map</span><h2>可读神经图</h2>
@@ -5275,7 +5275,9 @@ function showToast(message, type) {
 }
 
 window.addEventListener('pywebviewready', init);
-setTimeout(() => { if (!state.report && window.pywebview && window.pywebview.api) init(); }, 2000);
+setTimeout(() => {
+  if (!state.report && (window.__MG_SESSION__ || (window.pywebview && window.pywebview.api))) init();
+}, 2000);
 </script>
 </body>
 </html>"""

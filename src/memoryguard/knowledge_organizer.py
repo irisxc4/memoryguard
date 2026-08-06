@@ -45,6 +45,7 @@ _CONFIG_KEY_PATTERN = re.compile(r'^\s*"?([A-Za-z_][\w.-]*)"?\s*[:=]', re.MULTIL
 MAX_AI_CHUNKS_PER_JOB = 500
 MAX_REMOTE_CHARS_PER_JOB = 200_000
 MAX_MODEL_CALLS_PER_JOB = 500
+ORGANIZER_VERSION = "2"
 
 
 @dataclass

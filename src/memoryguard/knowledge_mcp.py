@@ -168,7 +168,13 @@ def _handle_search(store: KnowledgeStore, args: dict[str, Any]) -> dict[str, Any
     if not 1 <= top_k <= 30:
         top_k = 6
 
-    results = search(store, query, book_ids=book_ids or None, top_k=top_k)
+    results = search(
+        store,
+        query,
+        book_ids=book_ids or None,
+        top_k=top_k,
+        allow_remote_vector_query=True,
+    )
     if not results:
         return _text(f"未找到与「{query}」相关的知识片段。")
 

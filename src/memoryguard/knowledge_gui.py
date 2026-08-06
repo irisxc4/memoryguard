@@ -19,12 +19,13 @@ import json as _json
 import threading
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .data_home import resolve_data_home
-from .knowledge_ingestion import create_book, ingest_book
+from .knowledge_ingestion import create_book, ingest_book, rebuild_smart_indexes
 from .knowledge_retriever import get_book_info, list_books, read_chunk, search
 from .knowledge_store import KnowledgeStore, _stable_hash, open_shared_knowledge_store
 
@@ -71,26 +72,71 @@ def render_bookshelf_html() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>MemoryGuard 知识书库</title>
 <style>
+  :root {
+    color-scheme: dark;
+    --bg: #040b09;
+    --panel: rgba(10, 25, 21, 0.88);
+    --panel-solid: #0b1a16;
+    --panel-bright: #10251f;
+    --fg: #e4f5ef;
+    --muted: #78988d;
+    --faint: #48685e;
+    --line: rgba(110, 231, 196, 0.16);
+    --line-strong: rgba(110, 231, 196, 0.34);
+    --accent: #6ee7c4;
+    --accent-bright: #bcffeb;
+    --red: #ff7d88;
+    --orange: #e9bb64;
+    --shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-         background: #efe9dd; color: #2c2620; padding: 28px;
-         background-image: radial-gradient(circle at 20% 10%, #f7f1e6 0%, #efe9dd 60%, #e6dcc9 100%); }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 28px; }
-  h1 { font-size: 26px; color: #4a3520; letter-spacing: 1px; }
-  .toolbar { display: flex; gap: 12px; align-items: center; }
-  input[type="text"] { padding: 8px 12px; border: 1px solid #c9b8a0; border-radius: 4px;
-                       min-width: 280px; background: #fff; }
-  button { padding: 8px 16px; background: #8b6f47; color: #fff; border: none;
-           border-radius: 4px; cursor: pointer; font-size: 14px; }
-  button:hover { background: #6b5236; }
-  button.secondary { background: #c9b8a0; }
-  button.secondary:hover { background: #a89576; }
+  html { min-height: 100%; }
+  body { position: relative; min-height: 100dvh; padding: 28px;
+         font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background:
+           radial-gradient(circle at 14% 12%, rgba(48, 170, 133, 0.10), transparent 30rem),
+           radial-gradient(circle at 84% 82%, rgba(78, 150, 125, 0.07), transparent 34rem),
+           var(--bg);
+         color: var(--fg); line-height: 1.55; }
+  body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .42;
+                 background-image: linear-gradient(var(--line) 1px, transparent 1px),
+                                   linear-gradient(90deg, var(--line) 1px, transparent 1px);
+                 background-size: 56px 56px;
+                 mask-image: radial-gradient(circle at center, black 0, transparent 78%); }
+  header { display: flex; justify-content: space-between; align-items: center;
+           gap: 24px; flex-wrap: wrap; max-width: 1240px; margin: 0 auto 28px;
+           padding-bottom: 22px; border-bottom: 1px solid var(--line); }
+  .page-title { min-width: min(100%, 270px); }
+  .back-link { display: inline-flex; align-items: center; min-height: 32px; margin-bottom: 12px;
+               color: var(--muted); text-decoration: none; font-size: 12px;
+               transition: color .16s ease, transform .16s ease; }
+  .back-link:hover { color: var(--accent-bright); transform: translateX(-2px); }
+  h1 { font-size: 28px; color: var(--fg); font-weight: 650; letter-spacing: 0; }
+  .subtitle { max-width: 46rem; margin-top: 6px; color: var(--muted); font-size: 13px; }
+  .toolbar { display: flex; flex: 1 1 680px; min-width: 0; gap: 12px;
+             align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+  input[type="text"] { min-width: min(280px, 100%); flex: 1 1 280px; min-height: 38px;
+                       padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: 7px;
+                       background: rgba(4, 13, 10, .82); color: var(--fg); outline: none; }
+  input[type="text"]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(110, 231, 196, .09); }
+  button { min-height: 38px; padding: 8px 15px; border: 1px solid var(--accent);
+           border-radius: 7px; background: var(--accent); color: #062019;
+           cursor: pointer; font-size: 13px; font-weight: 700;
+           transition: transform .16s ease, border-color .16s ease, background .16s ease; }
+  button:hover { transform: translateY(-1px); background: var(--accent-bright); }
+  button:active { transform: translateY(0); }
+  button:focus-visible, .back-link:focus-visible, .book-card:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 3px;
+  }
+  button.secondary { border-color: var(--line-strong); background: rgba(110, 231, 196, .04); color: var(--fg); }
+  button.secondary:hover { border-color: rgba(110, 231, 196, .62); background: rgba(110, 231, 196, .10); }
   .bookshelf { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-               gap: 26px; margin-top: 28px; }
+               gap: 22px; max-width: 1240px; margin: 28px auto 0; }
   /* 书封：硬皮精装观感，侧边书脊 */
-  .book-card { position: relative; height: 240px; border-radius: 4px 10px 10px 4px;
+  .book-card { position: relative; height: 240px; border: 1px solid rgba(188, 255, 235, .13);
+               border-radius: 4px 8px 8px 4px;
                cursor: pointer; transition: transform 0.18s, box-shadow 0.18s;
-               box-shadow: 2px 6px 14px rgba(74,53,32,0.28);
+               box-shadow: 2px 8px 22px rgba(0, 0, 0, .28);
                background: linear-gradient(160deg, #7a5a38, #5c4126);
                color: #f5edde; display: flex; flex-direction: column;
                justify-content: flex-end; padding: 16px 14px; overflow: hidden; }
@@ -98,46 +144,66 @@ def render_bookshelf_html() -> str:
                        background: rgba(0,0,0,0.28); border-radius: 4px 0 0 4px; }
   .book-card::after { content: ""; position: absolute; inset: 0;
                       background: radial-gradient(circle at 30% 15%, rgba(255,255,255,0.18), transparent 60%); }
-  .book-card:hover { transform: translateY(-6px) rotate(-0.5deg); box-shadow: 4px 12px 22px rgba(74,53,32,0.38); }
-  .book-card.add { background: repeating-linear-gradient(135deg, #d9cbb4, #d9cbb4 10px, #e2d5c0 10px, #e2d5c0 20px);
-                   color: #6b5236; align-items: center; justify-content: center;
-                   border: 2px dashed #b39a78; box-shadow: none; min-height: 240px; }
+  .book-card:hover { transform: translateY(-5px); box-shadow: 4px 16px 32px rgba(0, 0, 0, .38); }
+  .book-card.add { background: rgba(110, 231, 196, .035);
+                   color: var(--accent-bright); align-items: center; justify-content: center;
+                   border: 1px dashed var(--line-strong); box-shadow: none; min-height: 240px; }
   .book-card.add::before, .book-card.add::after { display: none; }
   .book-title { font-size: 15px; font-weight: 700; line-height: 1.4; margin-bottom: 6px;
                 text-shadow: 0 1px 2px rgba(0,0,0,0.4); position: relative; z-index: 1; }
   .book-meta { font-size: 11px; color: rgba(245,237,222,0.85); position: relative; z-index: 1; }
   .book-status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 10px;
                  margin-top: 8px; background: rgba(0,0,0,0.25); color: #f5edde; position: relative; z-index: 1; }
-  .book-status.ready { background: #3f7d4e; color: #fff; }
-  .book-status.indexing { background: #3a6ea5; color: #fff; }
-  .book-status.failed { background: #a53a3a; color: #fff; }
-  .search-results { margin-top: 28px; }
-  .result-item { background: #fff; padding: 16px; border-radius: 6px; margin-bottom: 12px;
-                 border-left: 3px solid #8b6f47; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-  .result-meta { font-size: 12px; color: #8a7860; margin-bottom: 8px; }
+  .book-status.ready { background: rgba(110, 231, 196, .2); color: var(--accent-bright); }
+  .book-status.indexing { background: rgba(233, 187, 100, .24); color: #ffe6b2; }
+  .book-status.failed { background: rgba(255, 125, 136, .22); color: #ffd4d8; }
+  .search-results { max-width: 1240px; margin: 28px auto 0; }
+  .search-results h3 { color: var(--fg) !important; }
+  .result-item { background: var(--panel); padding: 16px; border: 1px solid var(--line);
+                 border-left: 3px solid var(--accent); border-radius: 6px; margin-bottom: 12px;
+                 box-shadow: 0 12px 34px rgba(0, 0, 0, .18); }
+  .result-meta { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
   .result-text { font-size: 14px; line-height: 1.6; }
   .result-method { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px;
-                   background: #e8dcc8; margin-left: 8px; }
+                   background: rgba(110, 231, 196, .10); color: var(--accent-bright); margin-left: 8px; }
   #addModal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-              background: rgba(0,0,0,0.4); z-index: 100; }
-  #addModal .modal { background: #fff; padding: 24px; border-radius: 8px; max-width: 480px;
-                     margin: 80px auto; }
-  #addModal label { display: block; margin: 12px 0 4px; font-size: 13px; color: #5b4636; }
-  #addModal input { width: 100%; padding: 8px; border: 1px solid #c9b8a0; border-radius: 4px; }
+              background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); z-index: 100; }
+  #addModal .modal { background: var(--panel-solid); padding: 24px; border: 1px solid var(--line-strong);
+                     border-radius: 8px; max-width: 480px; margin: 80px auto; box-shadow: var(--shadow); }
+  #addModal .modal h3 { color: var(--fg) !important; }
+  #addModal label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted); }
+  #addModal input { width: 100%; padding: 8px; border: 1px solid var(--line-strong);
+                    border-radius: 6px; background: rgba(4, 13, 10, .82); color: var(--fg); }
   .path-row { display: flex; gap: 8px; }
   .path-row input { flex: 1; }
-  .empty { text-align: center; padding: 60px 20px; color: #8a7860; }
+  .empty { text-align: center; padding: 60px 20px; color: var(--muted); }
   .cand-badge { display: inline-block; margin-left: 10px; padding: 3px 10px; border-radius: 12px;
-                font-size: 12px; background: #3a6ea5; color: #fff; cursor: pointer; vertical-align: middle; }
+                font-size: 12px; background: rgba(110, 231, 196, .14); color: var(--accent-bright);
+                cursor: pointer; vertical-align: middle; }
+  @media (max-width: 760px) {
+    body { padding: 18px 14px; }
+    header { align-items: stretch; gap: 14px; }
+    h1 { font-size: 23px; }
+    .toolbar { flex-basis: 100%; justify-content: stretch; gap: 8px; }
+    .toolbar input { flex-basis: 100%; }
+    .toolbar button { flex: 1 1 132px; padding-left: 10px; padding-right: 10px; }
+    .bookshelf { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
+    .book-card { height: 218px; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>📚 知识书库</h1>
+  <div class="page-title">
+    <a class="back-link" href="/">← 返回主面板</a>
+    <h1>知识书库</h1>
+    <p class="subtitle">统一管理本地书籍、检索索引、知识关系与长期记忆候选。</p>
+  </div>
   <div class="toolbar">
     <input type="text" id="searchInput" placeholder="搜索全部书籍..." onkeydown="if(event.key==='Enter')doSearch()">
     <button onclick="doSearch()">搜索</button>
     <button class="secondary" onclick="openCandidates()" id="candBtn">记忆候选</button>
+    <button class="secondary" onclick="openDeletedBooks()">最近删除</button>
     <button class="secondary" onclick="openAddModal()">+ 添加一本书</button>
   </div>
 </header>
@@ -175,12 +241,12 @@ async function api(method, args) {
 }
 
 const COVERS = [
-  "linear-gradient(160deg,#7a5a38,#5c4126)",
-  "linear-gradient(160deg,#3a6ea5,#2c5070)",
-  "linear-gradient(160deg,#3f7d4e,#2c5a37)",
-  "linear-gradient(160deg,#8b3f3f,#5f2a2a)",
-  "linear-gradient(160deg,#5f4a8b,#3f2f5c)",
-  "linear-gradient(160deg,#a06a3a,#6e4524)",
+  "linear-gradient(160deg,#245f46,#123c2c)",
+  "linear-gradient(160deg,#365f73,#203d4a)",
+  "linear-gradient(160deg,#62643a,#3d4024)",
+  "linear-gradient(160deg,#75494d,#482b2e)",
+  "linear-gradient(160deg,#505b72,#303747)",
+  "linear-gradient(160deg,#476b5c,#294238)",
 ];
 
 async function loadBooks() {
@@ -255,6 +321,44 @@ async function openCandidates() {
     </div>`;
   }
   results.innerHTML = html;
+}
+
+async function openDeletedBooks() {
+  const data = await api("knowledge_deleted_list", []);
+  const shelf = document.getElementById("bookshelf");
+  const results = document.getElementById("searchResults");
+  shelf.innerHTML = "";
+  if (!data.deleted_books || data.deleted_books.length === 0) {
+    results.innerHTML = '<div class="empty">最近没有已删除书籍</div>';
+    return;
+  }
+  let html = '<h3 style="margin-bottom:12px;color:#4a3520;">最近删除</h3>';
+  for (const item of data.deleted_books) {
+    html += `<div class="result-item">
+      <div class="result-meta">${escapeHtml(item.deleted_at || "")}</div>
+      <div class="result-text"><strong>${escapeHtml(item.title || "")}</strong><br>${escapeHtml(item.root_path || "")}</div>
+      <div style="margin-top:10px;display:flex;gap:8px;">
+        <button onclick="restoreDeletedBook('${item.deletion_id}')">恢复</button>
+        <button class="secondary" onclick="purgeDeletedBook('${item.deletion_id}')">永久清理</button>
+      </div>
+    </div>`;
+  }
+  results.innerHTML = html;
+}
+
+async function restoreDeletedBook(deletionId) {
+  const result = await api("knowledge_restore", [deletionId]);
+  if (result.error) { alert(result.error); return; }
+  if (result.deferred) { alert("恢复请求已提交"); return; }
+  loadBooks();
+}
+
+async function purgeDeletedBook(deletionId) {
+  if (!confirm("永久清理后无法恢复，是否继续？")) return;
+  const result = await api("knowledge_purge_deleted", [deletionId]);
+  if (result.error) { alert(result.error); return; }
+  if (result.deferred) { alert("永久清理请求已提交"); return; }
+  openDeletedBooks();
 }
 
 async function review(id, decision) {
@@ -441,88 +545,128 @@ def render_book_detail_html(book_id: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{_escape(info['title'])} - 知识书库</title>
 <style>
+  :root {{
+    color-scheme: dark;
+    --bg: #040b09;
+    --panel: rgba(10, 25, 21, 0.88);
+    --panel-solid: #0b1a16;
+    --panel-bright: #10251f;
+    --fg: #e4f5ef;
+    --muted: #78988d;
+    --faint: #48685e;
+    --line: rgba(110, 231, 196, 0.16);
+    --line-strong: rgba(110, 231, 196, 0.34);
+    --accent: #6ee7c4;
+    --accent-bright: #bcffeb;
+    --red: #ff7d88;
+    --orange: #e9bb64;
+    --shadow: 0 24px 70px rgba(0, 0, 0, 0.32);
+  }}
   * {{ box-sizing: border-box; }}
-  body {{ margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-          background: #f4f5f2; color: #20231f; line-height: 1.55; }}
+  html {{ min-height: 100%; }}
+  body {{ position: relative; min-height: 100dvh; margin: 0;
+          font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+          background:
+            radial-gradient(circle at 14% 12%, rgba(48, 170, 133, 0.10), transparent 30rem),
+            radial-gradient(circle at 84% 82%, rgba(78, 150, 125, 0.07), transparent 34rem),
+            var(--bg);
+          color: var(--fg); line-height: 1.55; }}
+  body::before {{ content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .42;
+                  background-image: linear-gradient(var(--line) 1px, transparent 1px),
+                                    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+                  background-size: 56px 56px;
+                  mask-image: radial-gradient(circle at center, black 0, transparent 78%); }}
   a {{ color: inherit; text-decoration: none; }}
-  .masthead {{ background: #202b26; color: #f7faf8; padding: 26px 32px 34px; }}
+  .masthead {{ position: relative; border-bottom: 1px solid var(--line);
+               background: rgba(4, 11, 9, .72); color: var(--fg); padding: 26px 32px 34px;
+               backdrop-filter: blur(14px); }}
   .masthead-inner {{ max-width: 1180px; margin: 0 auto; }}
-  .back {{ display: inline-flex; align-items: center; gap: 8px; color: #b9cac1;
-           font-size: 13px; margin-bottom: 22px; }}
+  .back {{ display: inline-flex; align-items: center; gap: 8px; color: var(--muted);
+           font-size: 13px; margin-bottom: 22px; transition: color .16s ease, transform .16s ease; }}
+  .back:hover {{ color: var(--accent-bright); transform: translateX(-2px); }}
   .title-row {{ display: flex; align-items: flex-end; justify-content: space-between;
                 gap: 24px; }}
   h1 {{ margin: 0; font-size: 30px; line-height: 1.2; letter-spacing: 0; overflow-wrap: anywhere; }}
-  .description {{ max-width: 760px; color: #cfd9d4; margin: 10px 0 0; }}
+  .description {{ max-width: 760px; color: var(--muted); margin: 10px 0 0; }}
   .book-status {{ display: inline-flex; align-items: center; min-height: 30px; padding: 5px 10px;
                   border-radius: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; }}
-  .book-status.ready {{ background: #2f7d55; color: #fff; }}
-  .book-status.partial, .book-status.indexing {{ background: #d9a441; color: #20231f; }}
-  .book-status.failed {{ background: #b84843; color: #fff; }}
-  .stats {{ max-width: 1180px; margin: -18px auto 0; padding: 0 24px;
+  .book-status.ready {{ background: rgba(110, 231, 196, .2); color: var(--accent-bright); }}
+  .book-status.partial, .book-status.indexing {{ background: rgba(233, 187, 100, .24); color: #ffe6b2; }}
+  .book-status.failed {{ background: rgba(255, 125, 136, .22); color: #ffd4d8; }}
+  .stats {{ position: relative; max-width: 1180px; margin: 18px auto 0; padding: 0 24px;
             display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }}
-  .stat {{ min-height: 76px; background: #fff; border: 1px solid #d8ddd9; border-radius: 6px;
-           padding: 14px 16px; }}
-  .stat strong {{ display: block; font-size: 22px; color: #202b26; }}
-  .stat span {{ color: #68716c; font-size: 12px; }}
-  .layout {{ max-width: 1180px; margin: 26px auto 60px; padding: 0 24px;
+  .stat {{ min-height: 76px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+           padding: 14px 16px; box-shadow: 0 12px 34px rgba(0, 0, 0, .16); }}
+  .stat strong {{ display: block; font-size: 22px; color: var(--accent-bright); }}
+  .stat span {{ color: var(--muted); font-size: 12px; }}
+  .layout {{ position: relative; max-width: 1180px; margin: 26px auto 60px; padding: 0 24px;
              display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 34px; }}
-  section {{ padding: 24px 0; border-bottom: 1px solid #d8ddd9; }}
+  section {{ padding: 24px 0; border-bottom: 1px solid var(--line); }}
   section:first-child {{ padding-top: 0; }}
   .section-head {{ display: flex; justify-content: space-between; align-items: center;
                    gap: 16px; margin-bottom: 14px; }}
-  h2 {{ margin: 0; font-size: 17px; color: #202b26; letter-spacing: 0; }}
-  .section-note {{ color: #7a827e; font-size: 12px; }}
+  h2 {{ margin: 0; font-size: 17px; color: var(--fg); letter-spacing: 0; }}
+  .section-note {{ color: var(--muted); font-size: 12px; }}
   .search-bar {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }}
-  input {{ width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid #b8c1bc;
-           border-radius: 5px; background: #fff; color: #20231f; font: inherit; }}
+  input {{ width: 100%; min-height: 40px; padding: 9px 11px; border: 1px solid var(--line-strong);
+           border-radius: 5px; background: rgba(4, 13, 10, .82); color: var(--fg); font: inherit; }}
+  input:focus {{ border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgba(110, 231, 196, .09); }}
   button, .button {{ display: inline-flex; align-items: center; justify-content: center;
-                     min-height: 40px; padding: 9px 15px; border: 1px solid #245f46;
-                     border-radius: 5px; background: #245f46; color: #fff; cursor: pointer;
+                     min-height: 40px; padding: 9px 15px; border: 1px solid var(--accent);
+                     border-radius: 5px; background: var(--accent); color: #062019; cursor: pointer;
                      font: inherit; font-weight: 650; }}
-  .button.ghost {{ background: #fff; color: #245f46; }}
+  button:hover, .button:hover {{ background: var(--accent-bright); }}
+  button:focus-visible, .button:focus-visible, .back:focus-visible {{
+    outline: 2px solid var(--accent); outline-offset: 3px;
+  }}
+  .button.ghost, button.secondary {{ border-color: var(--line-strong); background: rgba(110, 231, 196, .04); color: var(--fg); }}
+  .button.ghost:hover, button.secondary:hover {{ background: rgba(110, 231, 196, .10); }}
+  button.danger {{ border-color: rgba(255, 125, 136, .55); background: rgba(255, 125, 136, .10); color: var(--red); }}
+  button.danger:hover {{ background: rgba(255, 125, 136, .18); }}
   .chapter-grid, .entity-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
                                 gap: 10px; }}
   .chapter-card, .entity-card, .fragment-card, .document-card, .phase-card {{
-    min-width: 0; border: 1px solid #d8ddd9; border-radius: 6px; background: #fff;
+    min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
   }}
   .chapter-card, .entity-card {{ min-height: 104px; padding: 14px; }}
   .chapter-card h3, .entity-card h3 {{ margin: 0 0 14px; font-size: 14px;
                                       overflow-wrap: anywhere; }}
-  .chapter-card span, .entity-card span {{ color: #7a827e; font-size: 12px; }}
-  .entity-card {{ border-top: 3px solid #3f6f92; }}
-  .entity-type {{ color: #3f6f92; font-size: 10px; font-weight: 750;
+  .chapter-card span, .entity-card span {{ color: var(--muted); font-size: 12px; }}
+  .entity-card {{ border-top: 3px solid var(--accent); }}
+  .entity-type {{ color: var(--accent); font-size: 10px; font-weight: 750;
                   text-transform: uppercase; margin-bottom: 7px; }}
   .relation-list, .fragment-list, .document-list, .phase-list {{
     display: grid; gap: 8px;
   }}
   .relation-row {{ display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-                   align-items: center; gap: 10px; padding: 11px 12px; border-left: 3px solid #bd5a48;
-                   background: #fff; border-radius: 0 6px 6px 0; }}
+                   align-items: center; gap: 10px; padding: 11px 12px; border: 1px solid var(--line);
+                   border-left: 3px solid var(--orange); background: var(--panel); border-radius: 0 6px 6px 0; }}
   .relation-row strong {{ font-size: 13px; overflow-wrap: anywhere; }}
-  .relation-row small {{ grid-column: 1 / -1; color: #7a827e; font-size: 11px; }}
-  .predicate {{ color: #9a4436; font-size: 11px; font-weight: 700; }}
+  .relation-row small {{ grid-column: 1 / -1; color: var(--muted); font-size: 11px; }}
+  .predicate {{ color: var(--orange); font-size: 11px; font-weight: 700; }}
   .fragment-card {{ padding: 14px 15px; }}
-  .fragment-card p {{ margin: 8px 0 0; color: #3f4541; overflow-wrap: anywhere; }}
-  .fragment-meta, .document-meta {{ color: #7a827e; font-size: 11px; }}
+  .fragment-card p {{ margin: 8px 0 0; color: var(--fg); overflow-wrap: anywhere; }}
+  .fragment-meta, .document-meta {{ color: var(--muted); font-size: 11px; }}
   .document-card, .phase-card {{ padding: 12px 13px; }}
   .document-path {{ font-size: 13px; font-weight: 650; overflow-wrap: anywhere; margin-bottom: 5px; }}
   .phase-card > div {{ display: flex; justify-content: space-between; gap: 10px; }}
-  .phase-card small {{ display: block; margin-top: 6px; color: #7a827e; }}
+  .phase-card small {{ display: block; margin-top: 6px; color: var(--muted); }}
   .phase-status {{ font-size: 10px; text-transform: uppercase; }}
-  .phase-status.ready {{ color: #2f7d55; }}
-  .phase-status.partial {{ color: #9b6a0d; }}
-  .phase-status.failed {{ color: #b84843; }}
-  .phase-status.unavailable, .phase-status.disabled {{ color: #7a827e; }}
-  .settings {{ border: 1px solid #cbd2ce; border-radius: 6px; background: #e9eeeb;
+  .phase-status.ready {{ color: var(--accent); }}
+  .phase-status.partial {{ color: var(--orange); }}
+  .phase-status.failed {{ color: var(--red); }}
+  .phase-status.unavailable, .phase-status.disabled {{ color: var(--muted); }}
+  .settings {{ border: 1px solid var(--line-strong); border-radius: 6px; background: var(--panel-bright);
                padding: 16px; }}
   .settings dl {{ margin: 14px 0 0; display: grid; gap: 10px; }}
   .settings div {{ display: grid; gap: 2px; }}
-  .settings dt {{ color: #6d7671; font-size: 11px; }}
+  .settings dt {{ color: var(--muted); font-size: 11px; }}
   .settings dd {{ margin: 0; font-size: 13px; overflow-wrap: anywhere; }}
+  .settings-actions {{ display: grid; gap: 8px; margin-top: 16px; }}
   .rail section {{ padding-top: 0; }}
-  .empty {{ color: #7a827e; padding: 14px 0; }}
-  .result {{ background: #fff; padding: 13px 14px; border-radius: 6px; margin-top: 8px;
-             border-left: 3px solid #3f6f92; }}
+  .empty {{ color: var(--muted); padding: 14px 0; }}
+  .result {{ background: var(--panel); padding: 13px 14px; border: 1px solid var(--line);
+             border-left: 3px solid var(--accent); border-radius: 6px; margin-top: 8px; }}
   .result p {{ margin: 7px 0 0; overflow-wrap: anywhere; }}
   .dot {{ padding: 0 5px; }}
   @media (max-width: 900px) {{
@@ -618,20 +762,77 @@ def render_book_detail_html(book_id: str) -> str:
           <div><dt>根目录</dt><dd>{_escape(info.get('root_path', ''))}</dd></div>
           <div><dt>向量策略</dt><dd>{_escape(info.get('vector_enabled', 'auto'))}</dd></div>
           <div><dt>远程 Embedding</dt><dd>{"已授权" if info.get('remote_embedding_allowed') else "未授权"}</dd></div>
+          <div><dt>远程查询向量</dt><dd>{"已授权" if info.get('remote_query_embedding_allowed') else "未授权"}</dd></div>
           <div><dt>记忆候选</dt><dd>{"自动提取" if info.get('auto_extract_memory') else "已关闭"}</dd></div>
           <div><dt>最近索引</dt><dd>{_escape(info.get('last_indexed_at') or '尚未完成')}</dd></div>
         </dl>
+        <div class="settings-actions">
+          <button class="secondary" type="button" onclick="toggleRemoteEmbedding()">
+            {"关闭远程文档处理" if info.get('remote_embedding_allowed') else "授权远程文档处理"}
+          </button>
+          <button class="secondary" type="button" onclick="toggleRemoteQuery()">
+            {"关闭远程查询向量" if info.get('remote_query_embedding_allowed') else "授权远程查询向量"}
+          </button>
+          <button class="secondary" type="button" onclick="rebuildSmart()">重建智能索引</button>
+          <button class="danger" type="button" onclick="removeBook()">移入回收站</button>
+        </div>
       </div>
     </section>
   </aside>
 </main>
 <script>
 const BOOK_IDS = {book_ids_json};
+const BOOK_ID = BOOK_IDS[0];
+const REMOTE_EMBEDDING_ALLOWED = {_json.dumps(bool(info.get('remote_embedding_allowed')))};
+const REMOTE_QUERY_ALLOWED = {_json.dumps(bool(info.get('remote_query_embedding_allowed')))};
 
 function escapeHtml(value) {{
   return String(value || "").replace(/[&<>"']/g, ch => (
     {{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}}[ch]
   ));
+}}
+
+async function detailApi(method, args) {{
+  const resp = await fetch('/api/' + method, {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json', 'X-Session-Token': window.__MG_SESSION__||''}},
+    body: JSON.stringify(args || [])
+  }});
+  return resp.json();
+}}
+
+async function applySetting(settings) {{
+  const data = await detailApi('knowledge_update_settings', [BOOK_ID, settings]);
+  if (data.error) {{ alert(data.error); return; }}
+  if (data.deferred) {{ alert('设置请求已提交'); return; }}
+  location.reload();
+}}
+
+function toggleRemoteEmbedding() {{
+  applySetting({{remote_embedding_allowed: !REMOTE_EMBEDDING_ALLOWED}});
+}}
+
+function toggleRemoteQuery() {{
+  if (!REMOTE_QUERY_ALLOWED && !REMOTE_EMBEDDING_ALLOWED) {{
+    alert('请先授权远程文档处理并重建智能索引');
+    return;
+  }}
+  applySetting({{remote_query_embedding_allowed: !REMOTE_QUERY_ALLOWED}});
+}}
+
+async function rebuildSmart() {{
+  const data = await detailApi('knowledge_rebuild_smart', [BOOK_ID]);
+  if (data.error) {{ alert(data.error); return; }}
+  if (data.deferred) {{ alert('智能索引重建请求已提交'); return; }}
+  location.reload();
+}}
+
+async function removeBook() {{
+  if (!confirm('书籍将移入回收站，原始文件夹不会被删除。是否继续？')) return;
+  const data = await detailApi('knowledge_remove', [BOOK_ID]);
+  if (data.error) {{ alert(data.error); return; }}
+  if (data.deferred) {{ alert('删除请求已提交'); return; }}
+  location.href = '/knowledge';
 }}
 
 async function searchBook() {{
@@ -679,8 +880,16 @@ def handle_knowledge_api(method: str, args: list[Any],
     - knowledge_book(book_id) : 获取书籍详情（只读）
     - knowledge_reingest(book_id) : 重新整理一本书（写）
     """
-    write = method in {"knowledge_add", "knowledge_reingest", "knowledge_remove",
-                   "knowledge_candidate_review"}
+    write = method in {
+        "knowledge_add",
+        "knowledge_reingest",
+        "knowledge_rebuild_smart",
+        "knowledge_remove",
+        "knowledge_restore",
+        "knowledge_purge_deleted",
+        "knowledge_update_settings",
+        "knowledge_candidate_review",
+    }
     store = _get_store(read_only=not write)
     if store is None:
         return {"error": "不能打开知识库（未初始化）"}
@@ -690,6 +899,10 @@ def handle_knowledge_api(method: str, args: list[Any],
             books = list_books(store)
             return {"books": books, "total": len(books)}
 
+        if method == "knowledge_deleted_list":
+            deleted = store.list_deleted_books()
+            return {"deleted_books": deleted, "total": len(deleted)}
+
         if method == "knowledge_search":
             if not args:
                 return {"error": "query required"}
@@ -697,7 +910,13 @@ def handle_knowledge_api(method: str, args: list[Any],
             opts = args[1] if len(args) > 1 and isinstance(args[1], dict) else {}
             book_ids = opts.get("book_ids")
             top_k = int(opts.get("top_k", 6))
-            results = search(store, query, book_ids=book_ids, top_k=top_k)
+            results = search(
+                store,
+                query,
+                book_ids=book_ids,
+                top_k=top_k,
+                allow_remote_vector_query=True,
+            )
             return {"results": results, "total": len(results), "query": query}
 
         if method == "knowledge_add":
@@ -750,6 +969,35 @@ def handle_knowledge_api(method: str, args: list[Any],
             ).start()
             return {"ok": True, "job_id": job_id, "status": "indexing", "deferred": True}
 
+        if method == "knowledge_rebuild_smart":
+            if not args:
+                return {"error": "book_id required"}
+            return rebuild_smart_indexes(store, str(args[0]))
+
+        if method == "knowledge_update_settings":
+            if len(args) < 2 or not isinstance(args[1], dict):
+                return {"error": "book_id and settings required"}
+            book_id = str(args[0])
+            settings = args[1]
+            allowed = {
+                "remote_embedding_allowed",
+                "remote_query_embedding_allowed",
+                "auto_extract_memory",
+                "vector_enabled",
+            }
+            unknown = set(settings) - allowed
+            if unknown:
+                return {
+                    "error": "unknown settings: " + ", ".join(sorted(unknown)),
+                }
+            if not store.update_book_settings(book_id, **settings):
+                return {"error": "book not found"}
+            return {
+                "ok": True,
+                "book_id": book_id,
+                "settings": settings,
+            }
+
         if method == "knowledge_job_status":
             if not args:
                 return {"error": "job_id required"}
@@ -772,8 +1020,20 @@ def handle_knowledge_api(method: str, args: list[Any],
             book = store.get_book(book_id)
             if not book:
                 return {"error": "book not found"}
-            store.remove_book(book_id)
-            return {"ok": True, "book_id": book_id, "title": book.title}
+            return store.remove_book(book_id)
+
+        if method == "knowledge_restore":
+            if not args:
+                return {"error": "deletion_id required"}
+            return store.restore_book(str(args[0]))
+
+        if method == "knowledge_purge_deleted":
+            if not args:
+                return {"error": "deletion_id required"}
+            deletion_id = str(args[0])
+            if not store.purge_deleted_book(deletion_id):
+                return {"error": "deleted book not found"}
+            return {"ok": True, "deletion_id": deletion_id}
 
         if method == "knowledge_candidates_list":
             book_id = str(args[0]) if args and args[0] else None
@@ -822,7 +1082,10 @@ def handle_knowledge_api(method: str, args: list[Any],
                 normalized = "pending"
             if normalized == "pending":
                 if not store.keep_memory_candidate(candidate_id):
-                    return {"error": "candidate not found or cannot be retained"}
+                    return {
+                        "ok": False,
+                        "error": "candidate not found or cannot be retained",
+                    }
                 return {
                     "ok": True,
                     "candidate_id": candidate_id,
@@ -831,7 +1094,10 @@ def handle_knowledge_api(method: str, args: list[Any],
                 }
             if normalized == "rejected":
                 if not store.review_memory_candidate(candidate_id, decision):
-                    return {"error": "candidate not found or invalid decision"}
+                    return {
+                        "ok": False,
+                        "error": "candidate not found or invalid decision",
+                    }
                 return {
                     "ok": True,
                     "candidate_id": candidate_id,
@@ -841,14 +1107,52 @@ def handle_knowledge_api(method: str, args: list[Any],
             if normalized != "approved":
                 return {"error": "invalid decision"}
 
-            # Approval is committed only after the governed memory write
-            # succeeds. A failure leaves a retryable sync_failed candidate.
             target_group_id = str(args[2]).strip() if len(args) > 2 and args[2] else ""
+            target = _resolve_candidate_target(workspace, target_group_id)
+            if not target.ok:
+                return {
+                    "ok": False,
+                    "candidate_id": candidate_id,
+                    "status": "sync_failed",
+                    "error": target.error,
+                    "synced_memory_id": "",
+                }
+            sync_attempt_id = uuid.uuid4().hex
+            claim = store.begin_candidate_sync(
+                candidate_id,
+                target.group_id,
+                sync_attempt_id,
+            )
+            if not claim.get("ok"):
+                return {
+                    "ok": False,
+                    "candidate_id": candidate_id,
+                    "status": claim.get("status", "sync_failed"),
+                    "error": claim.get("error", "candidate sync claim failed"),
+                    "synced_memory_id": "",
+                }
+            if claim.get("state") == "already_synced":
+                return {
+                    "ok": True,
+                    "candidate_id": candidate_id,
+                    "status": "synced",
+                    "synced_memory_id": claim.get("memory_id", ""),
+                }
+
             sync = _sync_candidate_to_memory(
-                store, candidate_id, workspace, target_group_id=target_group_id,
+                store,
+                candidate_id,
+                workspace,
+                target_group_id=target.group_id,
+                actor=target.actor,
             )
             if not sync.ok:
-                store.mark_candidate_sync_failed(candidate_id, sync.error)
+                store.fail_candidate_sync(
+                    candidate_id,
+                    sync.error,
+                    target.group_id,
+                    sync_attempt_id,
+                )
                 return {
                     "ok": False,
                     "candidate_id": candidate_id,
@@ -856,7 +1160,12 @@ def handle_knowledge_api(method: str, args: list[Any],
                     "error": sync.error,
                     "synced_memory_id": "",
                 }
-            if not store.mark_candidate_synced(candidate_id, sync.memory_id):
+            if not store.complete_candidate_sync(
+                candidate_id,
+                sync.memory_id,
+                target.group_id,
+                sync_attempt_id,
+            ):
                 return {
                     "ok": False,
                     "candidate_id": candidate_id,
@@ -881,8 +1190,75 @@ class CandidateSyncResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class CandidateSyncTarget:
+    ok: bool
+    group_id: str = ""
+    actor: str = ""
+    error: str = ""
+
+
+def _resolve_candidate_target(
+    workspace: str | Path,
+    target_group_id: str = "",
+) -> CandidateSyncTarget:
+    """Resolve an active target group without inventing an unreachable group."""
+    ws = Path(workspace) if workspace else Path.cwd()
+    try:
+        from .agent_binding import AgentBindingStore, BindingStatus
+
+        active = [
+            binding
+            for binding in AgentBindingStore(ws).list_bindings(
+                include_inactive=False,
+            )
+            if getattr(binding, "status", None) == BindingStatus.ACTIVE
+        ]
+    except Exception as exc:
+        return CandidateSyncTarget(
+            False,
+            error=f"cannot resolve target binding: {exc}",
+        )
+
+    groups: dict[str, list[str]] = {}
+    for binding in active:
+        groups.setdefault(binding.share_group_id, []).append(
+            binding.agent_instance_id,
+        )
+    group_id = str(target_group_id or "").strip()
+    if group_id:
+        members = groups.get(group_id, [])
+        if not members:
+            return CandidateSyncTarget(
+                False,
+                error="target share group is not an active binding",
+            )
+    elif len(groups) == 1:
+        group_id, members = next(iter(groups.items()))
+    elif not groups:
+        return CandidateSyncTarget(
+            False,
+            error="no active binding; create an agent binding first",
+        )
+    else:
+        return CandidateSyncTarget(
+            False,
+            error="multiple active share groups; target share group required",
+        )
+    return CandidateSyncTarget(
+        True,
+        group_id=group_id,
+        actor=sorted(members)[0],
+    )
+
+
 def _sync_candidate_to_memory(
-    store, candidate_id: str, workspace, *, target_group_id: str = "",
+    store,
+    candidate_id: str,
+    workspace,
+    *,
+    target_group_id: str = "",
+    actor: str = "",
 ) -> CandidateSyncResult:
     """把候选写入共享长期记忆；失败时不改变候选为已批准。
 
@@ -899,42 +1275,13 @@ def _sync_candidate_to_memory(
             return CandidateSyncResult(False, error=f"invalid memory kind: {kind}")
 
         ws = Path(workspace) if workspace else Path.cwd()
-
-        # A multi-binding workspace must name the intended target explicitly.
-        group_id = target_group_id
-        actor = ""
-        try:
-            from .agent_binding import AgentBindingStore, BindingStatus
-            binds = AgentBindingStore(ws).list_bindings(include_inactive=False)
-            active = [b for b in binds if getattr(b, "status", None) == BindingStatus.ACTIVE]
-            if group_id:
-                matching = [b for b in active if b.share_group_id == group_id]
-                if not matching:
-                    return CandidateSyncResult(
-                        False, error="target share group is not an active binding",
-                    )
-                # The group is the user-selected target. Use a deterministic
-                # active member only as provenance actor; shared groups may
-                # legitimately contain multiple bindings.
-                actor = sorted(b.agent_instance_id for b in matching)[0]
-            elif len(active) == 1:
-                group_id = active[0].share_group_id
-                actor = active[0].agent_instance_id
-            elif len(active) > 1:
-                return CandidateSyncResult(
-                    False, error="multiple active bindings; target share group required",
-                )
-        except Exception:
-            if group_id:
-                return CandidateSyncResult(False, error="cannot resolve target binding")
-        if not group_id:
-            try:
-                from .agent_binding import personal_group_id as _pg
-                group_id = _pg(actor or "knowledge")
-            except Exception:
-                group_id = "default"
-        if not actor:
-            actor = "knowledge"
+        group_id = str(target_group_id or "").strip()
+        if not group_id or not actor:
+            target = _resolve_candidate_target(ws, group_id)
+            if not target.ok:
+                return CandidateSyncResult(False, error=target.error)
+            group_id = target.group_id
+            actor = target.actor
 
         from .governance_engine import GovernanceEngine
         from .schema_v3 import MemoryEvent, stable_hash, _now_iso
@@ -990,13 +1337,18 @@ def _escape(s: str) -> str:
 
 KNOWLEDGE_API_METHODS = frozenset({
     "knowledge_list",
+    "knowledge_deleted_list",
     "knowledge_search",
     "knowledge_add",
     "knowledge_read",
     "knowledge_book",
     "knowledge_reingest",
+    "knowledge_rebuild_smart",
     "knowledge_job_status",
     "knowledge_remove",
+    "knowledge_restore",
+    "knowledge_purge_deleted",
+    "knowledge_update_settings",
     "knowledge_candidates_list",
     "knowledge_candidate_targets",
     "knowledge_candidate_review",
@@ -1010,5 +1362,13 @@ def is_knowledge_method(method: str) -> bool:
 
 def is_knowledge_mutation(method: str) -> bool:
     """判断是否为变更类知识 API（需确认）。"""
-    return method in {"knowledge_add", "knowledge_reingest", "knowledge_remove",
-                      "knowledge_candidate_review"}
+    return method in {
+        "knowledge_add",
+        "knowledge_reingest",
+        "knowledge_rebuild_smart",
+        "knowledge_remove",
+        "knowledge_restore",
+        "knowledge_purge_deleted",
+        "knowledge_update_settings",
+        "knowledge_candidate_review",
+    }

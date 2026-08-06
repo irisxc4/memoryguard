@@ -105,13 +105,22 @@ class TestSecurityModule:
     def test_knowledge_mutations_are_gated(self):
         """P0-4 知识变更方法必须走权限/请求队列门控。"""
         from memoryguard.security import is_mutation_method, is_allowed_method
-        for m in ("knowledge_add", "knowledge_reingest",
-                  "knowledge_remove", "knowledge_candidate_review"):
+        for m in (
+            "knowledge_add",
+            "knowledge_reingest",
+            "knowledge_rebuild_smart",
+            "knowledge_remove",
+            "knowledge_restore",
+            "knowledge_purge_deleted",
+            "knowledge_update_settings",
+            "knowledge_candidate_review",
+        ):
             assert is_mutation_method(m), f"{m} 应为 mutation"
             assert is_allowed_method(m), f"{m} 应允许"
         # 只读知识方法不进入变更门控
         assert not is_mutation_method("knowledge_search")
         assert not is_mutation_method("knowledge_list")
+        assert is_allowed_method("knowledge_deleted_list")
 
     def test_sandbox_detection(self):
         from memoryguard.security import detect_sandbox_mode
@@ -823,6 +832,37 @@ class TestSafeBridgeApi:
         result = bridge.request_mutation("build_projection", [])
         assert result == {"ok": True}
         assert seen == {"confirmed": True}
+
+    def test_server_owned_local_ui_context_can_create_shared_binding(
+        self, tmp_path, monkeypatch,
+    ):
+        """localhost 会话可管理绑定，但权限必须由服务端上下文注入。"""
+        from memoryguard.access_context import AccessContext
+        from memoryguard.gui import GovernanceApi
+
+        monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+        denied = GovernanceApi(str(tmp_path)).bind_agents_to_shared_group(
+            ["codex-a", "claude-b"],
+        )
+        assert denied["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
+
+        local_ui_context = AccessContext(
+            trusted_agent_id="",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="local-ui-session",
+            session_source="transport",
+            session_trusted=True,
+        )
+        result = GovernanceApi(
+            str(tmp_path),
+            _trusted_access_context=local_ui_context,
+        ).bind_agents_to_shared_group(["codex-a", "claude-b"])
+
+        assert result["ok"] is True
+        assert result["share_group_id"]
+        assert len(result["bindings"]) == 2
 
 
 class TestUriWakeup:

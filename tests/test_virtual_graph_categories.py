@@ -115,9 +115,11 @@ def test_virtual_graph_and_history_ui_route_without_inline_untrusted_ids() -> No
     assert "discover_local_history_sources" in html
     assert "backfill_local_history" in html
     assert "renderHistoryBackfillPanel" in html
-    assert "graph.base_empty" in html
     assert "graph.empty && !graph.virtual_overlay_available" in html
-    assert "构建基础投影" in html
+    assert "构建基础投影" not in html
+    assert "基础投影尚未构建" not in html
+    assert "window.__MG_SESSION__ || (window.pywebview && window.pywebview.api)" in html
+    assert "the server-issued session" in html
     assert 'node[record_kind = "rules_habits"]' in html
     assert 'node[record_kind = "conversation_history"]' in html
     assert "source.status === 'importable'" in html

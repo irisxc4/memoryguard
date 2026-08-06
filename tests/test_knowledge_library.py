@@ -838,6 +838,31 @@ class TestP0IndexConsistency:
         assert any(t.reason == "max_files" for t in scan.truncations)
         assert len(scan.files) <= 2
 
+    def test_max_depth_truncation_records_reason(self, tmp_path):
+        """Directories beyond max_depth make the scan explicitly incomplete."""
+        from memoryguard.knowledge_ingestion import _scan_files
+        from memoryguard.source_registry import ScanBudget as SB
+
+        root = tmp_path / "deep"
+        deep = root / "one" / "two" / "three"
+        deep.mkdir(parents=True)
+        (root / "top.md").write_text("# Top\n\nVisible.\n", encoding="utf-8")
+        (deep / "hidden.md").write_text("# Hidden\n\nToo deep.\n", encoding="utf-8")
+        budget = SB(
+            max_files=20,
+            max_total_size=10**9,
+            max_single_file=10**7,
+            max_depth=1,
+            timeout_seconds=60,
+        )
+
+        scan = _scan_files(root, "", "", budget=budget)
+
+        assert not scan.complete
+        assert any(t.reason == "max_depth" for t in scan.truncations)
+        assert root / "top.md" in scan.files
+        assert deep / "hidden.md" not in scan.files
+
     def test_hash_and_parse_same_buffer(self, tmp_path, monkeypatch):
         """P0-2：content_hash 与 chunk 文本来自同一份读取字节。"""
         from memoryguard.knowledge_ingestion import _ingest_book_unlocked, create_book
@@ -932,6 +957,81 @@ class TestP110Phases:
         assert phases.get("lexical", {}).get("status") == "ready"
         assert phases.get("lexical", {}).get("indexed") == reloaded.chunk_count
         assert phases.get("organized", {}).get("status") == "ready"
+
+    def test_provider_model_change_rebuilds_unchanged_smart_indexes(
+        self, tmp_path, monkeypatch,
+    ):
+        from memoryguard import provider_api
+        from memoryguard.knowledge_ingestion import create_book, ingest_book
+        from memoryguard.knowledge_store import KnowledgeStore
+
+        class Provider:
+            def __init__(self):
+                self.chat_inputs = []
+                self.embedding_inputs = []
+
+            def chat(self, system, user, max_tokens=500):
+                self.chat_inputs.append(user)
+                return '{"summary":"summary","keywords":["index"],"entities":[]}'
+
+            def embed(self, text):
+                self.embedding_inputs.append(text)
+                return [1.0, 0.0]
+
+            def embed_many(self, texts):
+                self.embedding_inputs.extend(texts)
+                return [[1.0, 0.0] for _ in texts]
+
+        root = tmp_path / "model-change-book"
+        root.mkdir()
+        (root / "README.md").write_text(
+            "# Model change\n\n"
+            "The unchanged document must be rebuilt when the configured model changes.\n",
+            encoding="utf-8",
+        )
+        store = KnowledgeStore(tmp_path / "model-change-data")
+        try:
+            first = Provider()
+            provider_api.set_provider(
+                first,
+                config=provider_api.ProviderConfig(
+                    provider_type="openai_compatible",
+                    api_base="http://localhost:11434/v1",
+                    model="chat-a",
+                    embedding_model="embed-a",
+                ),
+            )
+            book = create_book(store, str(root))
+            ingest_book(store, book.book_id)
+            first_space = provider_api.current_embedding_space_id()
+            assert first_space
+
+            second = Provider()
+            provider_api.set_provider(
+                second,
+                config=provider_api.ProviderConfig(
+                    provider_type="openai_compatible",
+                    api_base="http://localhost:11434/v1",
+                    model="chat-b",
+                    embedding_model="embed-b",
+                ),
+            )
+            result = ingest_book(store, book.book_id)
+            second_space = provider_api.current_embedding_space_id()
+
+            assert result.files_processed == 0
+            assert second.chat_inputs
+            assert second.embedding_inputs
+            assert second_space != first_space
+            assert store._conn.execute(
+                "SELECT COUNT(*) FROM embeddings e "
+                "JOIN chunks c ON c.chunk_id=e.chunk_id "
+                "WHERE c.book_id=? AND e.embedding_space_id=?",
+                (book.book_id, second_space),
+            ).fetchone()[0] > 0
+        finally:
+            store.close()
+            provider_api.clear_provider()
 
 
 class TestP11MatchedBy:

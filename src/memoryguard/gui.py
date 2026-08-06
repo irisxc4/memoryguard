@@ -376,8 +376,20 @@ def open_localhost_window(
     if port == 0:
         return 3, ""
 
-    api = GovernanceApi(workspace)
     session_token = generate_session_token()
+    from .access_context import AccessContext
+    api = GovernanceApi(
+        workspace,
+        _trusted_access_context=AccessContext(
+            trusted_agent_id="",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=session_token,
+            session_source="transport",
+            session_trusted=True,
+        ),
+    )
     # 网页环境绑定 127.0.0.1,等价于本地 GUI
     # 沙箱状态只读当前可信进程环境；GUI 不替调用方修改安全边界。
     is_sandbox = detect_sandbox_mode()
@@ -438,24 +450,24 @@ def open_localhost_window(
                 from .knowledge_gui import render_bookshelf_html
                 html = render_bookshelf_html()
                 html = inject_runtime_context(html, session_token=session_token, sandbox=is_sandbox)
-                html_bytes = html.encode("utf-8")
+                page_bytes = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html_bytes)))
+                self.send_header("Content-Length", str(len(page_bytes)))
                 self.end_headers()
-                self.wfile.write(html_bytes)
+                self.wfile.write(page_bytes)
             elif parsed.path.startswith("/knowledge/book/"):
                 # KB5 知识书库详情页
                 from .knowledge_gui import render_book_detail_html
                 book_id = unquote(parsed.path[len("/knowledge/book/"):])
                 html = render_book_detail_html(book_id)
                 html = inject_runtime_context(html, session_token=session_token, sandbox=is_sandbox)
-                html_bytes = html.encode("utf-8")
+                page_bytes = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(html_bytes)))
+                self.send_header("Content-Length", str(len(page_bytes)))
                 self.end_headers()
-                self.wfile.write(html_bytes)
+                self.wfile.write(page_bytes)
             else:
                 # 静态文件服务(cytoscape.min.js 等)
                 req_path = parsed.path.lstrip("/")
@@ -1017,8 +1029,12 @@ class GovernanceApi:
     - 神经图投影 meta：Agent 实例 / Profile / 规范版本 / Release / 接管状态 / 覆盖状态 / 漂移
     """
 
-    def __init__(self, workspace: str):
+    def __init__(self, workspace: str, *, _trusted_access_context=None):
         self.workspace = workspace
+        # Only the localhost/native UI server injects this server-owned
+        # context after issuing its random session token. Browser arguments
+        # are never accepted as authorization input.
+        self._trusted_access_context = _trusted_access_context
         self._report = None
         self._window = None  # pywebview window 引用，由 open_interactive_window 注入
         self._build_jobs: dict[str, dict] = {}
@@ -1127,10 +1143,50 @@ class GovernanceApi:
         from .knowledge_gui import handle_knowledge_api
         return handle_knowledge_api("knowledge_reingest", [book_id], self.workspace)
 
+    def knowledge_rebuild_smart(self, book_id: str) -> dict:
+        """不重读源文件，重建整理、关系和向量索引。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api(
+            "knowledge_rebuild_smart",
+            [book_id],
+            self.workspace,
+        )
+
     def knowledge_remove(self, book_id: str) -> dict:
-        """删除知识书库。"""
+        """把知识书库移入可恢复回收站。"""
         from .knowledge_gui import handle_knowledge_api
         return handle_knowledge_api("knowledge_remove", [book_id], self.workspace)
+
+    def knowledge_restore(self, deletion_id: str) -> dict:
+        """恢复已删除知识书库。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api(
+            "knowledge_restore",
+            [deletion_id],
+            self.workspace,
+        )
+
+    def knowledge_purge_deleted(self, deletion_id: str) -> dict:
+        """永久清理知识书库恢复快照。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api(
+            "knowledge_purge_deleted",
+            [deletion_id],
+            self.workspace,
+        )
+
+    def knowledge_update_settings(
+        self,
+        book_id: str,
+        settings: dict,
+    ) -> dict:
+        """更新知识书库远程处理和候选设置。"""
+        from .knowledge_gui import handle_knowledge_api
+        return handle_knowledge_api(
+            "knowledge_update_settings",
+            [book_id, settings],
+            self.workspace,
+        )
 
     def knowledge_candidate_review(
         self,
@@ -4126,11 +4182,9 @@ class GovernanceApi:
                    *, _admin_override: bool = False) -> dict:
         # A2: GUI/桌面 bind_agent 与 MCP 对齐,非 admin 拒绝
         # GUI 与 MCP 使用同一 AccessContext 管理员校验。
-        from .access_context import load_access_context
-        ctx = load_access_context()
-        ok, err = ctx.require_admin()
-        if not ok:
-            return {"ok": False, "error": err}
+        admin_error = self._require_admin()
+        if admin_error:
+            return admin_error
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         binding = store.bind_agent(
@@ -4149,11 +4203,9 @@ class GovernanceApi:
                                     redirect_paths: dict[str, list[str]] | None = None,
                                     *, _admin_override: bool = False) -> dict:
         # A2: 与 bind_agent 对齐
-        from .access_context import load_access_context
-        ctx = load_access_context()
-        ok, err = ctx.require_admin()
-        if not ok:
-            return {"ok": False, "error": err}
+        admin_error = self._require_admin()
+        if admin_error:
+            return admin_error
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
         return store.bind_agents_to_group(
@@ -4593,7 +4645,7 @@ class GovernanceApi:
     def _require_admin(self) -> dict | None:
         """Require administrator state from the trusted process context."""
         from .access_context import load_access_context
-        ctx = load_access_context()
+        ctx = self._trusted_access_context or load_access_context()
         ok, err = ctx.require_admin()
         if not ok:
             return {"ok": False, "error": err}

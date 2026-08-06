@@ -135,7 +135,8 @@ def expand_relations(store: KnowledgeStore, entity_ids: list[str],
                    FROM relations r
                    LEFT JOIN entities se ON se.entity_id=r.subject_entity_id
                    LEFT JOIN entities oe ON oe.entity_id=r.object_entity_id
-                   WHERE r.subject_entity_id=? OR r.object_entity_id=?""",
+                   WHERE r.book_id!='' AND r.document_id!=''
+                     AND (r.subject_entity_id=? OR r.object_entity_id=?)""",
                 (eid, eid),
             ).fetchall()
             for row in rel_rows:
@@ -312,7 +313,7 @@ def _add_relation(store: KnowledgeStore, subject_id: str, predicate: str,
                   confidence: float = 1.0, book_id: str = "",
                   document_id: str = "", relation_source: str = "structural") -> None:
     """添加关系。object_id 为空时用 source_chunk_id 作为虚拟 object。"""
-    if not subject_id:
+    if not subject_id or not book_id or not document_id:
         return
     # object_id 为空时，用一个稳定的虚拟 entity_id 代表 chunk
     if not object_id and source_chunk_id:

@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Generator
 
@@ -38,6 +41,7 @@ CREATE TABLE IF NOT EXISTS books (
     auto_extract_memory INTEGER NOT NULL DEFAULT 1,
     vector_enabled TEXT NOT NULL DEFAULT 'auto',
     remote_embedding_allowed INTEGER NOT NULL DEFAULT 0,
+    remote_query_embedding_allowed INTEGER NOT NULL DEFAULT 0,
     build_phases TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -143,11 +147,27 @@ CREATE TABLE IF NOT EXISTS memory_candidates (
     status TEXT NOT NULL DEFAULT 'pending',
     sync_error TEXT NOT NULL DEFAULT '',
     synced_memory_id TEXT NOT NULL DEFAULT '',
+    target_group_id TEXT NOT NULL DEFAULT '',
+    sync_started_at TEXT NOT NULL DEFAULT '',
+    sync_attempt_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     reviewed_at TEXT,
     FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_mc_status ON memory_candidates(status);
+
+CREATE TABLE IF NOT EXISTS deleted_books (
+    deletion_id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    root_path TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'deleted',
+    deleted_at TEXT NOT NULL,
+    restored_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_deleted_books_status
+    ON deleted_books(status, deleted_at);
 
 CREATE TABLE IF NOT EXISTS index_jobs (
     job_id TEXT PRIMARY KEY,
@@ -212,6 +232,8 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
          "ALTER TABLE chunks ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'"),
         ("books", "remote_embedding_allowed",
          "ALTER TABLE books ADD COLUMN remote_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
+        ("books", "remote_query_embedding_allowed",
+         "ALTER TABLE books ADD COLUMN remote_query_embedding_allowed INTEGER NOT NULL DEFAULT 0"),
         ("books", "build_phases",
          "ALTER TABLE books ADD COLUMN build_phases TEXT NOT NULL DEFAULT '{}'"),
         ("relations", "book_id",
@@ -224,6 +246,12 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
          "ALTER TABLE memory_candidates ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"),
         ("memory_candidates", "sync_error",
          "ALTER TABLE memory_candidates ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''"),
+        ("memory_candidates", "target_group_id",
+         "ALTER TABLE memory_candidates ADD COLUMN target_group_id TEXT NOT NULL DEFAULT ''"),
+        ("memory_candidates", "sync_started_at",
+         "ALTER TABLE memory_candidates ADD COLUMN sync_started_at TEXT NOT NULL DEFAULT ''"),
+        ("memory_candidates", "sync_attempt_id",
+         "ALTER TABLE memory_candidates ADD COLUMN sync_attempt_id TEXT NOT NULL DEFAULT ''"),
     ):
         try:
             existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -275,7 +303,11 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
                 category TEXT NOT NULL DEFAULT 'knowledge',
                 confidence REAL NOT NULL DEFAULT 0.5,
                 status TEXT NOT NULL DEFAULT 'pending',
+                sync_error TEXT NOT NULL DEFAULT '',
                 synced_memory_id TEXT NOT NULL DEFAULT '',
+                target_group_id TEXT NOT NULL DEFAULT '',
+                sync_started_at TEXT NOT NULL DEFAULT '',
+                sync_attempt_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 reviewed_at TEXT,
                 FOREIGN KEY (book_id) REFERENCES books(book_id) ON DELETE CASCADE
@@ -295,12 +327,269 @@ def _ensure_schema_compat(conn: sqlite3.Connection) -> None:
         ("synced_memory_id", "ALTER TABLE memory_candidates ADD COLUMN synced_memory_id TEXT NOT NULL DEFAULT ''"),
         ("kind", "ALTER TABLE memory_candidates ADD COLUMN kind TEXT NOT NULL DEFAULT 'fact'"),
         ("sync_error", "ALTER TABLE memory_candidates ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''"),
+        ("target_group_id", "ALTER TABLE memory_candidates ADD COLUMN target_group_id TEXT NOT NULL DEFAULT ''"),
+        ("sync_started_at", "ALTER TABLE memory_candidates ADD COLUMN sync_started_at TEXT NOT NULL DEFAULT ''"),
+        ("sync_attempt_id", "ALTER TABLE memory_candidates ADD COLUMN sync_attempt_id TEXT NOT NULL DEFAULT ''"),
     ):
         if col not in mc_cols:
             try:
                 conn.execute(ddl)
             except sqlite3.Error:
                 pass
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS deleted_books (
+            deletion_id TEXT PRIMARY KEY,
+            book_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'deleted',
+            deleted_at TEXT NOT NULL,
+            restored_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_deleted_books_status
+            ON deleted_books(status, deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_relations_book ON relations(book_id);
+        CREATE INDEX IF NOT EXISTS idx_relations_document ON relations(document_id);
+        """
+    )
+    _migrate_relation_scope(conn)
+
+
+def _migrate_relation_scope(conn: sqlite3.Connection) -> None:
+    """Backfill scoped legacy relations and remove rows that cannot be scoped."""
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            UPDATE relations
+               SET book_id = COALESCE(
+                       NULLIF(book_id, ''),
+                       (SELECT c.book_id FROM chunks c
+                         WHERE c.chunk_id=relations.source_chunk_id)
+                   ),
+                   document_id = COALESCE(
+                       NULLIF(document_id, ''),
+                       (SELECT c.document_id FROM chunks c
+                         WHERE c.chunk_id=relations.source_chunk_id)
+                   )
+             WHERE (book_id='' OR document_id='')
+               AND source_chunk_id IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM chunks c
+                    WHERE c.chunk_id=relations.source_chunk_id
+               )
+            """
+        )
+        conn.execute(
+            "DELETE FROM relations WHERE book_id='' OR document_id=''"
+        )
+        conn.execute("COMMIT")
+    except sqlite3.Error:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+
+
+def _encode_snapshot_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {
+            "__memoryguard_type__": "bytes",
+            "base64": base64.b64encode(value).decode("ascii"),
+        }
+    return value
+
+
+def _decode_snapshot_value(value: Any) -> Any:
+    if (
+        isinstance(value, dict)
+        and value.get("__memoryguard_type__") == "bytes"
+    ):
+        return base64.b64decode(str(value.get("base64", "")))
+    return value
+
+
+def _snapshot_rows(
+    conn: sqlite3.Connection,
+    sql: str,
+    params: list[Any] | tuple[Any, ...] = (),
+) -> list[dict[str, Any]]:
+    return [
+        {key: _encode_snapshot_value(row[key]) for key in row.keys()}
+        for row in conn.execute(sql, params).fetchall()
+    ]
+
+
+def _capture_book_snapshot(
+    conn: sqlite3.Connection,
+    book_id: str,
+) -> dict[str, Any]:
+    documents = _snapshot_rows(
+        conn, "SELECT * FROM documents WHERE book_id=?", (book_id,),
+    )
+    document_ids = [row["document_id"] for row in documents]
+    chunks = _snapshot_rows(
+        conn, "SELECT * FROM chunks WHERE book_id=?", (book_id,),
+    )
+    chunk_ids = [row["chunk_id"] for row in chunks]
+
+    relations_sql = "SELECT * FROM relations WHERE book_id=?"
+    relation_params: list[Any] = [book_id]
+    if document_ids:
+        placeholders = ",".join("?" * len(document_ids))
+        relations_sql += f" OR document_id IN ({placeholders})"
+        relation_params.extend(document_ids)
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        relations_sql += f" OR source_chunk_id IN ({placeholders})"
+        relation_params.extend(chunk_ids)
+    relations = _snapshot_rows(conn, relations_sql, relation_params)
+
+    chunk_entities: list[dict[str, Any]] = []
+    embeddings: list[dict[str, Any]] = []
+    if chunk_ids:
+        placeholders = ",".join("?" * len(chunk_ids))
+        chunk_entities = _snapshot_rows(
+            conn,
+            f"SELECT * FROM chunk_entities WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        )
+        embeddings = _snapshot_rows(
+            conn,
+            f"SELECT * FROM embeddings WHERE chunk_id IN ({placeholders})",
+            chunk_ids,
+        )
+
+    entity_ids = {
+        row["entity_id"] for row in chunk_entities
+    }
+    for relation in relations:
+        entity_ids.add(relation["subject_entity_id"])
+        entity_ids.add(relation["object_entity_id"])
+    entities: list[dict[str, Any]] = []
+    if entity_ids:
+        ordered_ids = sorted(entity_ids)
+        placeholders = ",".join("?" * len(ordered_ids))
+        entities = _snapshot_rows(
+            conn,
+            f"SELECT * FROM entities WHERE entity_id IN ({placeholders})",
+            ordered_ids,
+        )
+
+    return {
+        "snapshot_version": 1,
+        "book_id": book_id,
+        "created_at": _now_iso(),
+        "tables": {
+            "books": _snapshot_rows(
+                conn, "SELECT * FROM books WHERE book_id=?", (book_id,),
+            ),
+            "documents": documents,
+            "chunks": chunks,
+            "entities": entities,
+            "chunk_entities": chunk_entities,
+            "embeddings": embeddings,
+            "relations": relations,
+            "memory_candidates": _snapshot_rows(
+                conn,
+                "SELECT * FROM memory_candidates WHERE book_id=?",
+                (book_id,),
+            ),
+            "index_jobs": _snapshot_rows(
+                conn,
+                "SELECT * FROM index_jobs WHERE book_id=?",
+                (book_id,),
+            ),
+        },
+    }
+
+
+def _insert_snapshot_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    rows: list[dict[str, Any]],
+    *,
+    ignore_conflicts: bool = False,
+) -> None:
+    verb = "INSERT OR IGNORE" if ignore_conflicts else "INSERT"
+    for encoded in rows:
+        row = {
+            key: _decode_snapshot_value(value)
+            for key, value in encoded.items()
+        }
+        columns = list(row)
+        placeholders = ",".join("?" * len(columns))
+        conn.execute(
+            f"{verb} INTO {table} ({','.join(columns)}) "
+            f"VALUES ({placeholders})",
+            [row[column] for column in columns],
+        )
+
+
+def _restore_book_snapshot(
+    conn: sqlite3.Connection,
+    snapshot: dict[str, Any],
+) -> None:
+    if int(snapshot.get("snapshot_version", 0)) != 1:
+        raise ValueError("unsupported deleted book snapshot")
+    tables = snapshot.get("tables")
+    if not isinstance(tables, dict) or not tables.get("books"):
+        raise ValueError("invalid deleted book snapshot")
+    _insert_snapshot_rows(conn, "books", tables["books"])
+    _insert_snapshot_rows(conn, "documents", tables.get("documents", []))
+    _insert_snapshot_rows(conn, "chunks", tables.get("chunks", []))
+    _insert_snapshot_rows(
+        conn, "entities", tables.get("entities", []), ignore_conflicts=True,
+    )
+    _insert_snapshot_rows(
+        conn, "chunk_entities", tables.get("chunk_entities", []),
+        ignore_conflicts=True,
+    )
+    _insert_snapshot_rows(
+        conn, "embeddings", tables.get("embeddings", []),
+        ignore_conflicts=True,
+    )
+    _insert_snapshot_rows(
+        conn, "relations", tables.get("relations", []),
+        ignore_conflicts=True,
+    )
+    _insert_snapshot_rows(
+        conn, "memory_candidates", tables.get("memory_candidates", []),
+        ignore_conflicts=True,
+    )
+    _insert_snapshot_rows(
+        conn, "index_jobs", tables.get("index_jobs", []),
+        ignore_conflicts=True,
+    )
+
+
+def _delete_orphan_entities(
+    conn: sqlite3.Connection,
+    entity_ids: list[str],
+) -> None:
+    if not entity_ids:
+        return
+    placeholders = ",".join("?" * len(entity_ids))
+    conn.execute(
+        f"""
+        DELETE FROM entities
+         WHERE entity_id IN ({placeholders})
+           AND NOT EXISTS (
+               SELECT 1 FROM chunk_entities ce
+                WHERE ce.entity_id=entities.entity_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM relations r
+                WHERE r.subject_entity_id=entities.entity_id
+                   OR r.object_entity_id=entities.entity_id
+           )
+        """,
+        entity_ids,
+    )
 
 
 @dataclass
@@ -321,6 +610,7 @@ class Book:
     auto_extract_memory: bool = True
     vector_enabled: str = "auto"
     remote_embedding_allowed: bool = False
+    remote_query_embedding_allowed: bool = False
     build_phases: dict[str, Any] = field(default_factory=dict)
 
 
@@ -408,12 +698,13 @@ class KnowledgeStore:
                 """INSERT INTO books (book_id, title, root_path, cover_style, description, status,
                    file_count, chapter_count, chunk_count, entity_count, last_indexed_at,
                    created_at, updated_at, include_globs, exclude_globs, auto_extract_memory, vector_enabled,
-                   remote_embedding_allowed, build_phases)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   remote_embedding_allowed, remote_query_embedding_allowed, build_phases)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (book.book_id, book.title, book.root_path, book.cover_style, book.description,
                  book.status, book.file_count, book.chapter_count, book.chunk_count, book.entity_count,
                  book.last_indexed_at, _now_iso(), _now_iso(), book.include_globs, book.exclude_globs,
                  int(book.auto_extract_memory), book.vector_enabled, int(book.remote_embedding_allowed),
+                 int(book.remote_query_embedding_allowed),
                  json.dumps(book.build_phases, ensure_ascii=False)),
             )
 
@@ -442,9 +733,165 @@ class KnowledgeStore:
         with self._tx() as conn:
             conn.execute(f"UPDATE books SET {', '.join(sets)} WHERE book_id=?", vals)
 
-    def remove_book(self, book_id: str) -> None:
+    def update_book_settings(
+        self,
+        book_id: str,
+        *,
+        remote_embedding_allowed: bool | None = None,
+        remote_query_embedding_allowed: bool | None = None,
+        auto_extract_memory: bool | None = None,
+        vector_enabled: str | None = None,
+    ) -> bool:
+        if remote_embedding_allowed is False:
+            remote_query_embedding_allowed = False
+        sets = ["updated_at=?"]
+        values: list[Any] = [_now_iso()]
+        if remote_embedding_allowed is not None:
+            sets.append("remote_embedding_allowed=?")
+            values.append(int(remote_embedding_allowed))
+        if remote_query_embedding_allowed is not None:
+            sets.append("remote_query_embedding_allowed=?")
+            values.append(int(remote_query_embedding_allowed))
+        if auto_extract_memory is not None:
+            sets.append("auto_extract_memory=?")
+            values.append(int(auto_extract_memory))
+        if vector_enabled is not None:
+            if vector_enabled not in {"auto", "on", "off"}:
+                raise ValueError("invalid vector_enabled")
+            sets.append("vector_enabled=?")
+            values.append(vector_enabled)
+        values.append(book_id)
         with self._tx() as conn:
+            cur = conn.execute(
+                f"UPDATE books SET {', '.join(sets)} WHERE book_id=?",
+                values,
+            )
+            return cur.rowcount == 1
+
+    def remove_book(self, book_id: str) -> dict[str, Any]:
+        """Move a book into recoverable trash and remove all derived rows."""
+        with self._tx() as conn:
+            book = conn.execute(
+                "SELECT * FROM books WHERE book_id=?",
+                (book_id,),
+            ).fetchone()
+            if not book:
+                raise ValueError("book not found")
+            if conn.execute(
+                "SELECT 1 FROM index_jobs WHERE book_id=? "
+                "AND status IN ('queued','running') LIMIT 1",
+                (book_id,),
+            ).fetchone():
+                raise ValueError("book has an active index job")
+            if conn.execute(
+                "SELECT 1 FROM memory_candidates WHERE book_id=? "
+                "AND status='syncing' LIMIT 1",
+                (book_id,),
+            ).fetchone():
+                raise ValueError("book has a candidate sync in progress")
+            snapshot = _capture_book_snapshot(conn, book_id)
+            deletion_id = uuid.uuid4().hex
+            deleted_at = _now_iso()
+            conn.execute(
+                """INSERT INTO deleted_books
+                   (deletion_id, book_id, title, root_path, snapshot_json,
+                    status, deleted_at, restored_at)
+                   VALUES (?,?,?,?,?,'deleted',?,'')""",
+                (
+                    deletion_id,
+                    book_id,
+                    book["title"],
+                    book["root_path"],
+                    json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+                    deleted_at,
+                ),
+            )
+            relation_ids = [
+                row["relation_id"] for row in snapshot["tables"]["relations"]
+            ]
+            if relation_ids:
+                placeholders = ",".join("?" * len(relation_ids))
+                conn.execute(
+                    f"DELETE FROM relations WHERE relation_id IN ({placeholders})",
+                    relation_ids,
+                )
             conn.execute("DELETE FROM books WHERE book_id=?", (book_id,))
+            entity_ids = [
+                row["entity_id"] for row in snapshot["tables"]["entities"]
+            ]
+            _delete_orphan_entities(conn, entity_ids)
+            counts = {
+                table: len(rows)
+                for table, rows in snapshot["tables"].items()
+                if table != "books"
+            }
+            return {
+                "ok": True,
+                "deletion_id": deletion_id,
+                "book_id": book_id,
+                "title": book["title"],
+                "deleted_at": deleted_at,
+                "cleanup_counts": counts,
+                "source_files_removed": False,
+            }
+
+    def list_deleted_books(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT deletion_id, book_id, title, root_path, status,
+                      deleted_at, restored_at
+                 FROM deleted_books
+                WHERE status='deleted'
+                ORDER BY deleted_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def restore_book(self, deletion_id: str) -> dict[str, Any]:
+        with self._tx() as conn:
+            deleted = conn.execute(
+                "SELECT * FROM deleted_books WHERE deletion_id=? AND status='deleted'",
+                (deletion_id,),
+            ).fetchone()
+            if not deleted:
+                return {
+                    "ok": False,
+                    "deletion_id": deletion_id,
+                    "error": "deleted book not found",
+                }
+            if conn.execute(
+                "SELECT 1 FROM books WHERE book_id=?",
+                (deleted["book_id"],),
+            ).fetchone():
+                return {
+                    "ok": False,
+                    "deletion_id": deletion_id,
+                    "book_id": deleted["book_id"],
+                    "error": "book already exists",
+                }
+            snapshot = json.loads(deleted["snapshot_json"])
+            _restore_book_snapshot(conn, snapshot)
+            restored_at = _now_iso()
+            conn.execute(
+                "UPDATE deleted_books SET status='restored', restored_at=?, "
+                "snapshot_json='' "
+                "WHERE deletion_id=? AND status='deleted'",
+                (restored_at, deletion_id),
+            )
+            return {
+                "ok": True,
+                "deletion_id": deletion_id,
+                "book_id": deleted["book_id"],
+                "title": deleted["title"],
+                "restored_at": restored_at,
+            }
+
+    def purge_deleted_book(self, deletion_id: str) -> bool:
+        """Permanently delete a recovery snapshot; source files stay untouched."""
+        with self._tx() as conn:
+            cur = conn.execute(
+                "DELETE FROM deleted_books WHERE deletion_id=? AND status='deleted'",
+                (deletion_id,),
+            )
+            return cur.rowcount == 1
 
     # ---- documents ----
 
@@ -768,7 +1215,8 @@ class KnowledgeStore:
         """列出记忆候选（默认待审核）。"""
         sql = ("SELECT candidate_id, book_id, chunk_id, document_id, source_text_hash, "
                "content, source, category, kind, confidence, status, synced_memory_id, "
-               "sync_error, created_at, reviewed_at FROM memory_candidates")
+               "sync_error, target_group_id, sync_started_at, sync_attempt_id, "
+               "created_at, reviewed_at FROM memory_candidates")
         params: list[Any] = []
         conds: list[str] = []
         if book_id:
@@ -813,6 +1261,147 @@ class KnowledgeStore:
             )
             return cur.rowcount > 0
 
+    def begin_candidate_sync(
+        self,
+        candidate_id: str,
+        target_group_id: str,
+        sync_attempt_id: str,
+        *,
+        stale_after_seconds: int = 600,
+    ) -> dict[str, Any]:
+        """Atomically claim a candidate before any governed memory write."""
+        if not target_group_id or not sync_attempt_id:
+            return {"ok": False, "error": "candidate_sync_target_required"}
+        now = _now_iso()
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=max(1, stale_after_seconds))
+        ).isoformat()
+        with self._tx() as conn:
+            cur = conn.execute(
+                """
+                UPDATE memory_candidates
+                   SET status='syncing',
+                       target_group_id=CASE
+                           WHEN target_group_id='' THEN ?
+                           ELSE target_group_id
+                       END,
+                       sync_started_at=?,
+                       sync_attempt_id=?,
+                       sync_error='',
+                       reviewed_at=?
+                 WHERE candidate_id=?
+                   AND (
+                       (
+                           status IN ('pending','sync_failed','approved')
+                           AND (target_group_id='' OR target_group_id=?)
+                       )
+                       OR (
+                           status='syncing'
+                           AND target_group_id=?
+                           AND sync_started_at < ?
+                       )
+                   )
+                """,
+                (
+                    target_group_id,
+                    now,
+                    sync_attempt_id,
+                    now,
+                    candidate_id,
+                    target_group_id,
+                    target_group_id,
+                    cutoff,
+                ),
+            )
+            if cur.rowcount == 1:
+                return {
+                    "ok": True,
+                    "state": "claimed",
+                    "target_group_id": target_group_id,
+                    "sync_attempt_id": sync_attempt_id,
+                }
+            row = conn.execute(
+                "SELECT status, target_group_id, synced_memory_id "
+                "FROM memory_candidates WHERE candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            if not row:
+                return {"ok": False, "error": "candidate_not_found"}
+            current_group = str(row["target_group_id"] or "")
+            if current_group and current_group != target_group_id:
+                return {
+                    "ok": False,
+                    "error": "candidate_already_targeted_to_other_group",
+                    "target_group_id": current_group,
+                }
+            if row["status"] == "synced":
+                return {
+                    "ok": True,
+                    "state": "already_synced",
+                    "target_group_id": current_group or target_group_id,
+                    "memory_id": str(row["synced_memory_id"] or ""),
+                }
+            if row["status"] == "syncing":
+                return {
+                    "ok": False,
+                    "error": "candidate_sync_in_progress",
+                    "target_group_id": current_group,
+                }
+            return {
+                "ok": False,
+                "error": "candidate_not_actionable",
+                "status": str(row["status"] or ""),
+            }
+
+    def complete_candidate_sync(
+        self,
+        candidate_id: str,
+        memory_id: str,
+        target_group_id: str,
+        sync_attempt_id: str,
+    ) -> bool:
+        if not memory_id:
+            return False
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status='synced', synced_memory_id=?, "
+                "sync_error='', sync_started_at='', reviewed_at=? "
+                "WHERE candidate_id=? AND status='syncing' "
+                "AND target_group_id=? AND sync_attempt_id=?",
+                (
+                    memory_id,
+                    _now_iso(),
+                    candidate_id,
+                    target_group_id,
+                    sync_attempt_id,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def fail_candidate_sync(
+        self,
+        candidate_id: str,
+        error: str,
+        target_group_id: str,
+        sync_attempt_id: str,
+    ) -> bool:
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE memory_candidates SET status='sync_failed', sync_error=?, "
+                "sync_started_at='', reviewed_at=? "
+                "WHERE candidate_id=? AND status='syncing' "
+                "AND target_group_id=? AND sync_attempt_id=?",
+                (
+                    str(error)[:1000],
+                    _now_iso(),
+                    candidate_id,
+                    target_group_id,
+                    sync_attempt_id,
+                ),
+            )
+            return cur.rowcount == 1
+
     def mark_candidate_synced(self, candidate_id: str, memory_id: str) -> bool:
         """在长期记忆写入成功后原子标记候选已同步。"""
         if not memory_id:
@@ -820,7 +1409,7 @@ class KnowledgeStore:
         with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE memory_candidates SET status='synced', synced_memory_id=?, "
-                "sync_error='', reviewed_at=? WHERE candidate_id=? "
+                "sync_error='', sync_started_at='', reviewed_at=? WHERE candidate_id=? "
                 "AND status IN ('pending','sync_failed','approved')",
                 (memory_id, _now_iso(), candidate_id),
             )
@@ -831,8 +1420,8 @@ class KnowledgeStore:
         with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE memory_candidates SET status='sync_failed', sync_error=?, "
-                "reviewed_at=? WHERE candidate_id=? "
-                "AND status IN ('pending','approved','sync_failed')",
+                "sync_started_at='', reviewed_at=? WHERE candidate_id=? "
+                "AND status IN ('pending','approved','sync_failed','syncing')",
                 (str(error)[:1000], _now_iso(), candidate_id),
             )
             return cur.rowcount > 0
@@ -895,6 +1484,63 @@ class KnowledgeStore:
             ")",
             (book_id, embedding_space_id, embedding_model),
         ).fetchall()
+
+    def list_remote_query_authorized_book_ids(
+        self,
+        book_ids: list[str] | None = None,
+    ) -> list[str]:
+        sql = (
+            "SELECT book_id FROM books "
+            "WHERE remote_embedding_allowed=1 "
+            "AND remote_query_embedding_allowed=1"
+        )
+        params: list[Any] = []
+        if book_ids:
+            placeholders = ",".join("?" * len(book_ids))
+            sql += f" AND book_id IN ({placeholders})"
+            params.extend(book_ids)
+        sql += " ORDER BY book_id"
+        return [
+            str(row["book_id"])
+            for row in self._conn.execute(sql, params).fetchall()
+        ]
+
+    def has_searchable_embeddings(
+        self,
+        embedding_space_id: str,
+        book_ids: list[str] | None = None,
+        policy: KnowledgeAccessPolicy | None = None,
+    ) -> bool:
+        sql = (
+            "SELECT 1 FROM embeddings e "
+            "JOIN chunks c ON c.chunk_id=e.chunk_id "
+            "JOIN documents d ON d.document_id=c.document_id "
+            "WHERE e.embedding_space_id=? AND c.active=1"
+        )
+        params: list[Any] = [embedding_space_id]
+        access_sql, access_params = policy_sql(policy)
+        if access_sql:
+            sql += " AND " + access_sql
+            params.extend(access_params)
+        if book_ids:
+            placeholders = ",".join("?" * len(book_ids))
+            sql += f" AND c.book_id IN ({placeholders})"
+            params.extend(book_ids)
+        sql += " LIMIT 1"
+        return self._conn.execute(sql, params).fetchone() is not None
+
+    def count_embeddings(
+        self,
+        book_id: str,
+        embedding_space_id: str,
+    ) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM embeddings e "
+            "JOIN chunks c ON c.chunk_id=e.chunk_id "
+            "WHERE c.book_id=? AND c.active=1 AND e.embedding_space_id=?",
+            (book_id, embedding_space_id),
+        ).fetchone()
+        return int(row[0] if row else 0)
 
     def search_vectors(self, query_vec: list[float],
                        book_ids: list[str] | None = None,
@@ -965,6 +1611,11 @@ def _row_to_book(row: sqlite3.Row) -> Book:
         vector_enabled=row["vector_enabled"],
         remote_embedding_allowed=bool(
             int(row["remote_embedding_allowed"]) if "remote_embedding_allowed" in row.keys() else 0
+        ),
+        remote_query_embedding_allowed=bool(
+            int(row["remote_query_embedding_allowed"])
+            if "remote_query_embedding_allowed" in row.keys()
+            else 0
         ),
         build_phases=_parse_phases(row["build_phases"]) if "build_phases" in row.keys() else {},
     )

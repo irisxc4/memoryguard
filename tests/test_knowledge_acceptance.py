@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+import threading
 from pathlib import Path
 
 from memoryguard.agent_binding import AgentBindingStore
@@ -503,5 +505,363 @@ def test_book_detail_is_layered_and_never_renders_restricted_content(
 
     for heading in ("知识片段", "实体", "关系", "构建状态", "书籍设置"):
         assert heading in html
+    assert "--bg: #040b09" in html
+    assert "--accent: #6ee7c4" in html
     assert "postgres://user:password" not in html
     assert "上传到远程服务" not in html
+
+
+def test_bookshelf_matches_main_panel_and_has_back_navigation() -> None:
+    from memoryguard.knowledge_gui import render_bookshelf_html
+
+    html = render_bookshelf_html()
+
+    assert 'class="back-link" href="/"' in html
+    assert "返回主面板" in html
+    assert "--bg: #040b09" in html
+    assert "--accent: #6ee7c4" in html
+    assert "#efe9dd" not in html
+
+
+def test_remote_search_query_requires_authorization_and_existing_vectors(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from memoryguard import provider_api
+
+    backend = RecordingProvider()
+    config = provider_api.ProviderConfig(
+        provider_type="openai_compatible",
+        api_base="https://api.example.com/v1",
+        api_key="unused",
+        model="remote-model",
+        embedding_model="remote-embed",
+    )
+    provider_api.set_provider(backend, config=config)
+    store = KnowledgeStore(tmp_path / "remote-query-data")
+    try:
+        book = create_book(store, str(_book_root(tmp_path)))
+        store.update_book_settings(
+            book.book_id,
+            remote_embedding_allowed=True,
+            remote_query_embedding_allowed=False,
+        )
+        ingest_book(store, book.book_id)
+        backend.embedding_inputs.clear()
+
+        search(
+            store,
+            "private task query",
+            book_ids=[book.book_id],
+            allow_remote_vector_query=True,
+        )
+        assert backend.embedding_inputs == []
+
+        store.update_book_settings(
+            book.book_id,
+            remote_query_embedding_allowed=True,
+        )
+        search(
+            store,
+            "authorized query",
+            book_ids=[book.book_id],
+            allow_remote_vector_query=True,
+        )
+        assert backend.embedding_inputs == ["authorized query"]
+
+        backend.embedding_inputs.clear()
+        empty_root = tmp_path / "empty-vector-book"
+        empty_root.mkdir()
+        (empty_root / "README.md").write_text(
+            "# Empty vector\n\nThis book has no vector rows yet.\n",
+            encoding="utf-8",
+        )
+        empty_book = create_book(store, str(empty_root))
+        store.update_book_settings(
+            empty_book.book_id,
+            remote_embedding_allowed=True,
+            remote_query_embedding_allowed=True,
+        )
+        search(
+            store,
+            "must not leave the machine",
+            book_ids=[empty_book.book_id],
+            allow_remote_vector_query=True,
+        )
+        assert backend.embedding_inputs == []
+    finally:
+        store.close()
+        provider_api.clear_provider()
+
+
+def test_bootstrap_and_unknown_provider_never_send_query_text(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from memoryguard import provider_api
+    from memoryguard.context_bootstrap import build_context_packet
+    from memoryguard.knowledge_store import open_shared_knowledge_store
+    from memoryguard.schema_v3 import EffectiveAgentContext
+
+    data_home = tmp_path / "bootstrap-data"
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+    backend = RecordingProvider()
+    config = provider_api.ProviderConfig(
+        provider_type="openai_compatible",
+        api_base="https://api.example.com/v1",
+        api_key="unused",
+        model="remote-model",
+        embedding_model="remote-embed",
+    )
+    provider_api.set_provider(backend, config=config)
+    with open_shared_knowledge_store() as store:
+        book = create_book(store, str(_book_root(tmp_path)))
+        store.update_book_settings(
+            book.book_id,
+            remote_embedding_allowed=True,
+            remote_query_embedding_allowed=True,
+        )
+        ingest_book(store, book.book_id)
+    backend.embedding_inputs.clear()
+
+    memory_store = SharedMemoryStore(tmp_path / "memory", "default")
+    build_context_packet(
+        memory_store,
+        task="TOP SECRET bootstrap task",
+        effective_context=EffectiveAgentContext("agent-1", "default"),
+    )
+    assert backend.embedding_inputs == []
+
+    provider_api.set_provider(backend)
+    with open_shared_knowledge_store(read_only=True, must_exist=True) as store:
+        search(
+            store,
+            "UNKNOWN PROVIDER QUERY",
+            allow_remote_vector_query=True,
+        )
+    assert backend.embedding_inputs == []
+    provider_api.clear_provider()
+
+
+def test_candidate_sync_is_single_group_cas_and_reject_fails_closed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import memoryguard.knowledge_gui as knowledge_gui
+
+    workspace = tmp_path / "candidate-cas-workspace"
+    workspace.mkdir()
+    bindings = AgentBindingStore(workspace)
+    group_a = bindings.bind_agents_to_group(
+        ["candidate-agent-a1", "candidate-agent-a2"],
+        share_group_id="candidate-group-a",
+    )["share_group_id"]
+    group_b = bindings.bind_agents_to_group(
+        ["candidate-agent-b1", "candidate-agent-b2"],
+        share_group_id="candidate-group-b",
+    )["share_group_id"]
+    data_home = tmp_path / "candidate-cas-data"
+    with KnowledgeStore(data_home) as store:
+        book = create_book(store, str(_book_root(tmp_path)))
+        candidate_id = store.add_memory_candidate(
+            book.book_id,
+            "A candidate may be synchronized to exactly one share group.",
+            kind="project",
+            source="normal.md",
+        )
+
+    monkeypatch.setattr(
+        knowledge_gui,
+        "open_shared_knowledge_store",
+        lambda **kwargs: KnowledgeStore(data_home),
+    )
+    original_sync = knowledge_gui._sync_candidate_to_memory
+    claimed = threading.Event()
+    release = threading.Event()
+
+    def _paused_sync(*args, **kwargs):
+        claimed.set()
+        assert release.wait(5)
+        return original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(knowledge_gui, "_sync_candidate_to_memory", _paused_sync)
+    first_result: dict[str, object] = {}
+
+    def _approve_first() -> None:
+        first_result.update(handle_knowledge_api(
+            "knowledge_candidate_review",
+            [candidate_id, "approve", group_a],
+            workspace,
+        ))
+
+    worker = threading.Thread(target=_approve_first)
+    worker.start()
+    assert claimed.wait(5)
+
+    cross_group = handle_knowledge_api(
+        "knowledge_candidate_review",
+        [candidate_id, "approve", group_b],
+        workspace,
+    )
+    rejected = handle_knowledge_api(
+        "knowledge_candidate_review",
+        [candidate_id, "reject", group_a],
+        workspace,
+    )
+    release.set()
+    worker.join(10)
+
+    assert first_result["ok"] is True
+    assert cross_group["ok"] is False
+    assert cross_group["error"] == "candidate_already_targeted_to_other_group"
+    assert rejected["ok"] is False
+    assert rejected["error"] == "candidate not found or invalid decision"
+
+    same_group = handle_knowledge_api(
+        "knowledge_candidate_review",
+        [candidate_id, "approve", group_a],
+        workspace,
+    )
+    assert same_group["ok"] is True
+    assert same_group["synced_memory_id"] == first_result["synced_memory_id"]
+
+    records_a = SharedMemoryStore(workspace, group_a, read_only=True).list_records()
+    records_b = SharedMemoryStore(workspace, group_b, read_only=True).list_records()
+    candidate_records = [
+        record
+        for record in [*records_a, *records_b]
+        if record.body == "A candidate may be synchronized to exactly one share group."
+    ]
+    assert len(candidate_records) == 1
+
+
+def test_mcp_book_hides_restricted_filenames_and_headings(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import memoryguard.knowledge_mcp as knowledge_mcp
+
+    data_home = tmp_path / "metadata-policy-data"
+    with KnowledgeStore(data_home) as store:
+        book = create_book(store, str(_book_root(tmp_path)))
+        ingest_book(store, book.book_id)
+
+    monkeypatch.setattr(
+        knowledge_mcp,
+        "open_shared_knowledge_store",
+        lambda **kwargs: KnowledgeStore(data_home, read_only=True),
+    )
+    result = handle_knowledge_tool(
+        "memoryguard_knowledge_book",
+        {"book_id": book.book_id},
+    )
+    assert result and not result.get("isError")
+    text = result["content"][0]["text"]
+    for restricted in ("AGENTS.md", "secret.md", "控制指令", "数据库"):
+        assert restricted not in text
+
+
+def test_legacy_relation_scope_is_migrated_or_removed(
+    tmp_path: Path,
+) -> None:
+    data_home = tmp_path / "legacy-relation-data"
+    with KnowledgeStore(data_home) as store:
+        book = create_book(store, str(_book_root(tmp_path)))
+        ingest_book(store, book.book_id)
+        scoped = store._conn.execute(
+            "SELECT relation_id, subject_entity_id, predicate, object_entity_id, "
+            "source_chunk_id, confidence, created_at "
+            "FROM relations WHERE source_chunk_id IS NOT NULL LIMIT 1",
+        ).fetchone()
+        assert scoped is not None
+        dangling = store._conn.execute(
+            "SELECT subject_entity_id, object_entity_id FROM relations LIMIT 1",
+        ).fetchone()
+        db_path = store._db_path
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            ALTER TABLE relations RENAME TO relations_current;
+            CREATE TABLE relations (
+                relation_id TEXT PRIMARY KEY,
+                subject_entity_id TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                object_entity_id TEXT NOT NULL,
+                source_chunk_id TEXT,
+                confidence REAL NOT NULL DEFAULT 1.0,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO relations VALUES(?,?,?,?,?,?,?)",
+            tuple(scoped),
+        )
+        conn.execute(
+            "INSERT INTO relations VALUES(?,?,?,?,?,?,?)",
+            (
+                "legacy-null-scope",
+                dangling["subject_entity_id"],
+                "belongs_to",
+                dangling["object_entity_id"],
+                None,
+                1.0,
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        conn.execute("DROP TABLE relations_current")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with KnowledgeStore(data_home) as migrated:
+        row = migrated._conn.execute(
+            "SELECT book_id, document_id FROM relations WHERE relation_id=?",
+            (scoped["relation_id"],),
+        ).fetchone()
+        assert row["book_id"] == book.book_id
+        assert row["document_id"]
+        assert migrated._conn.execute(
+            "SELECT COUNT(*) FROM relations "
+            "WHERE book_id='' OR document_id=''",
+        ).fetchone()[0] == 0
+        assert migrated._conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE relation_id='legacy-null-scope'",
+        ).fetchone()[0] == 0
+
+
+def test_delete_cleanup_restore_and_purge_book(
+    tmp_path: Path,
+) -> None:
+    root = _book_root(tmp_path)
+    store = KnowledgeStore(tmp_path / "delete-data")
+    try:
+        book = create_book(store, str(root), title="Recoverable book")
+        ingest_book(store, book.book_id)
+        expected_chunks = store.count_chunks(book.book_id)
+        expected_docs = len(store.list_documents(book.book_id))
+
+        deleted = store.remove_book(book.book_id)
+        deletion_id = deleted["deletion_id"]
+        assert store.get_book(book.book_id) is None
+        assert store.count_chunks(book.book_id) == 0
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE book_id=?",
+            (book.book_id,),
+        ).fetchone()[0] == 0
+        assert root.exists()
+
+        trash = store.list_deleted_books()
+        assert any(item["deletion_id"] == deletion_id for item in trash)
+        restored = store.restore_book(deletion_id)
+        assert restored["ok"] is True
+        assert store.get_book(book.book_id) is not None
+        assert len(store.list_documents(book.book_id)) == expected_docs
+        assert store.count_chunks(book.book_id) == expected_chunks
+        assert search(store, "普通知识", book_ids=[book.book_id])
+
+        deleted_again = store.remove_book(book.book_id)
+        purge_id = deleted_again["deletion_id"]
+        assert store.purge_deleted_book(purge_id) is True
+        assert store.restore_book(purge_id)["ok"] is False
+        assert store.get_book(book.book_id) is None
+    finally:
+        store.close()

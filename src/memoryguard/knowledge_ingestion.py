@@ -241,58 +241,100 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         build_phases=phases,
     )
 
-    # KB3 基础整理：摘要/关键词/实体/结构化关系（无模型规则化，PRD §6.1 永远执行）
-    if processed > 0:
-        try:
-            from .knowledge_organizer import organize_book
-            from .knowledge_graph import build_structural_relations
-            # P1-3 模型增强：provider 可用且（本地或已授权远程）时用于生成摘要/关键词/实体
-            enhance_provider = _authorized_provider(book.remote_embedding_allowed)
-            from . import provider_api
-            _, cfg = provider_api.get_provider_state()
-            remote_enhance = bool(
-                enhance_provider and provider_api.is_remote_provider_config(cfg)
+    # KB3 smart indexes are independently versioned from lexical ingestion.
+    # A provider/model change rebuilds unchanged chunks; otherwise only changed
+    # chunks are organized.
+    try:
+        from .knowledge_organizer import ORGANIZER_VERSION, organize_book
+        from .knowledge_graph import build_structural_relations
+        from . import provider_api
+
+        enhance_provider = _authorized_provider(book.remote_embedding_allowed)
+        _, cfg = provider_api.get_provider_state()
+        remote_enhance = bool(
+            enhance_provider and provider_api.is_remote_provider_config(cfg)
+        )
+        previous_organized = phases.get("organized", {})
+        previous_organizer_id = (
+            str(previous_organized.get("organizer_id", ""))
+            if isinstance(previous_organized, dict)
+            else ""
+        )
+        if enhance_provider is not None:
+            descriptor = provider_api.describe_embedding_backend(
+                enhance_provider,
+                cfg,
             )
+            organizer_id = (
+                f"v{ORGANIZER_VERSION}:"
+                f"{descriptor.provider_type}|{descriptor.endpoint_identity}|"
+                f"{descriptor.model}"
+            )
+        else:
+            organizer_id = previous_organizer_id or f"rule:v{ORGANIZER_VERSION}"
+        full_smart_rebuild = organizer_id != previous_organizer_id
+        organize_chunk_ids = None if full_smart_rebuild else changed_chunk_ids
+        if changed_chunk_ids or full_smart_rebuild:
             organize_stats = organize_book(
                 store, book_id, provider=enhance_provider, remote=remote_enhance,
-                chunk_ids=changed_chunk_ids,
+                chunk_ids=organize_chunk_ids,
             )
             build_structural_relations(
-                store, book_id, document_ids=changed_document_ids,
+                store,
+                book_id,
+                document_ids=None if full_smart_rebuild else changed_document_ids,
             )
-            phases["organized"] = {
-                "status": (
-                    "partial" if organize_stats.get("budget_exhausted") else "ready"
-                ),
-                "processed": organize_stats.get("chunks_organized", 0),
-                "failed": 0,
-                "model_calls": organize_stats.get("model_calls", 0),
-                "relations": organize_stats.get("relations_created", 0),
+        else:
+            organize_stats = {
+                "chunks_organized": 0,
+                "model_calls": 0,
+                "relations_created": 0,
+                "budget_exhausted": 0,
             }
-            if organize_stats.get("budget_exhausted"):
-                status = "partial"
-            store.update_book_status(book_id, status, build_phases=phases)
-        except Exception:
-            # 整理失败不影响入库结果（KB1 核心已完成）
-            phases["organized"] = {
-                "status": "failed",
-                "processed": 0,
-                "failed": len(changed_chunk_ids),
-            }
-            store.update_book_status(book_id, status, build_phases=phases)
+        phases["organized"] = {
+            "status": (
+                "partial" if organize_stats.get("budget_exhausted") else "ready"
+            ),
+            "processed": organize_stats.get("chunks_organized", 0),
+            "failed": 0,
+            "model_calls": organize_stats.get("model_calls", 0),
+            "relations": organize_stats.get("relations_created", 0),
+            "organizer_id": organizer_id,
+            "full_rebuild": full_smart_rebuild,
+        }
+        if organize_stats.get("budget_exhausted"):
+            status = "partial"
+        store.update_book_status(book_id, status, build_phases=phases)
+    except Exception:
+        # Smart-index failure does not invalidate the lexical index.
+        phases["organized"] = {
+            "status": "failed",
+            "processed": 0,
+            "failed": len(changed_chunk_ids),
+        }
+        store.update_book_status(book_id, status, build_phases=phases)
 
     # KB2 向量索引：provider 可用且（本地或已授权远程）时为 chunk 生成 embedding
     if book.vector_enabled == "off":
         phases["vector"] = {"status": "disabled", "indexed": 0}
         store.update_book_status(book_id, status, build_phases=phases)
-    elif processed > 0:
+    else:
         try:
             embedded = generate_embeddings(
                 store, book.book_id, book.remote_embedding_allowed,
             )
+            from .provider_api import current_embedding_space_id
+            embedding_space_id = current_embedding_space_id() or ""
+            indexed = (
+                store.count_embeddings(book.book_id, embedding_space_id)
+                if embedding_space_id
+                else 0
+            )
             phases["vector"] = {
-                "status": "ready" if embedded > 0 else "unavailable",
-                "indexed": embedded,
+                "status": "ready" if indexed > 0 else "unavailable",
+                "indexed": indexed,
+                "generated": embedded,
+                "embedding_space_id": embedding_space_id,
             }
         except Exception:
             # embedding 失败不影响入库（FTS 仍可用）
@@ -397,6 +439,118 @@ def generate_embeddings(store: KnowledgeStore, book_id: str,
     return count
 
 
+def rebuild_smart_indexes(
+    store: KnowledgeStore,
+    book_id: str,
+) -> dict[str, object]:
+    """Rebuild organizer, graph, and embeddings without reparsing source files."""
+    with _book_lock(book_id):
+        book = store.get_book(book_id)
+        if not book:
+            return {"ok": False, "book_id": book_id, "error": "book not found"}
+
+        from . import provider_api
+        from .knowledge_graph import build_structural_relations
+        from .knowledge_organizer import ORGANIZER_VERSION, organize_book
+
+        phases = dict(book.build_phases or {})
+        enhance_provider = _authorized_provider(book.remote_embedding_allowed)
+        _, cfg = provider_api.get_provider_state()
+        remote_enhance = bool(
+            enhance_provider and provider_api.is_remote_provider_config(cfg)
+        )
+        if enhance_provider is not None:
+            descriptor = provider_api.describe_embedding_backend(
+                enhance_provider,
+                cfg,
+            )
+            organizer_id = (
+                f"v{ORGANIZER_VERSION}:"
+                f"{descriptor.provider_type}|{descriptor.endpoint_identity}|"
+                f"{descriptor.model}"
+            )
+        else:
+            organizer_id = f"rule:v{ORGANIZER_VERSION}"
+
+        organize_stats = organize_book(
+            store,
+            book_id,
+            provider=enhance_provider,
+            remote=remote_enhance,
+            chunk_ids=None,
+        )
+        relation_stats = build_structural_relations(
+            store,
+            book_id,
+            document_ids=None,
+        )
+        phases["organized"] = {
+            "status": (
+                "partial" if organize_stats.get("budget_exhausted") else "ready"
+            ),
+            "processed": organize_stats.get("chunks_organized", 0),
+            "failed": 0,
+            "model_calls": organize_stats.get("model_calls", 0),
+            "relations": (
+                organize_stats.get("relations_created", 0)
+                + relation_stats.get("relations_created", 0)
+            ),
+            "organizer_id": organizer_id,
+            "full_rebuild": True,
+        }
+
+        if book.vector_enabled == "off":
+            phases["vector"] = {"status": "disabled", "indexed": 0}
+        else:
+            embedding_provider = _authorized_provider(
+                book.remote_embedding_allowed,
+            )
+            embedding_space_id = (
+                provider_api.current_embedding_space_id()
+                if embedding_provider is not None
+                else ""
+            ) or ""
+            if embedding_space_id:
+                with store._tx() as conn:
+                    conn.execute(
+                        "DELETE FROM embeddings WHERE embedding_space_id=? "
+                        "AND chunk_id IN "
+                        "(SELECT chunk_id FROM chunks WHERE book_id=?)",
+                        (embedding_space_id, book_id),
+                    )
+            generated = generate_embeddings(
+                store,
+                book_id,
+                book.remote_embedding_allowed,
+            )
+            indexed = (
+                store.count_embeddings(book_id, embedding_space_id)
+                if embedding_space_id
+                else 0
+            )
+            phases["vector"] = {
+                "status": "ready" if indexed > 0 else "unavailable",
+                "indexed": indexed,
+                "generated": generated,
+                "embedding_space_id": embedding_space_id,
+                "full_rebuild": True,
+            }
+
+        status = (
+            "partial"
+            if organize_stats.get("budget_exhausted")
+            else book.status
+        )
+        store.update_book_status(book_id, status, build_phases=phases)
+        return {
+            "ok": True,
+            "book_id": book_id,
+            "status": status,
+            "organized": phases["organized"],
+            "vector": phases["vector"],
+        }
+
+
 def _scan_files(root: Path, include_globs: str, exclude_globs: str,
                 budget: ScanBudget | None = None) -> KnowledgeScanResult:
     """扫描目录下所有支持的文件（带预算与安全边界）。
@@ -415,6 +569,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
     truncations: list[ScanTruncation] = []
     total_size = 0
     start = time.time()
+    stop_scan = False
 
     # 解析并缓存真实根路径，用于符号链接逃逸检测
     real_root = root.resolve()
@@ -426,15 +581,19 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
         if time.time() - start > budget.timeout_seconds:
             truncations.append(ScanTruncation("timeout", "扫描超过预算时长，停止扫描"))
             break
-        if _depth(Path(dirpath)) > budget.max_depth:
-            dirnames[:] = []
-            continue
         # 跳过符号链接目录（防逃逸）与排除目录
         dirnames[:] = [
             d for d in dirnames
             if not d.startswith(".")
             and not _dir_excluded(dirpath, d, exclude_patterns)
         ]
+        depth = _depth(Path(dirpath))
+        if depth >= budget.max_depth and dirnames:
+            relative_dir = str(
+                Path(dirpath).relative_to(root),
+            ).replace("\\", "/") or "."
+            truncations.append(ScanTruncation("max_depth", relative_dir))
+            dirnames[:] = []
         # 符号链接目录不进入（os.walk 默认不跟随 symlink dir，但显式防护）
         for fname in filenames:
             if fname.startswith("."):
@@ -442,6 +601,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             if len(files) >= budget.max_files:
                 truncations.append(ScanTruncation(
                     "max_files", f"超过最大文件数 {budget.max_files}，停止扫描"))
+                stop_scan = True
                 break
             ext = Path(fname).suffix.lower()
             if ext not in all_supported:
@@ -461,6 +621,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
                 truncations.append(ScanTruncation(
                     "max_total_size",
                     f"超过总大小上限 {budget.max_total_size}，停止扫描"))
+                stop_scan = True
                 break
             rel = str(file_path.relative_to(root)).replace("\\", "/")
 
@@ -474,6 +635,8 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
 
             files.append(file_path)
             total_size += size
+        if stop_scan:
+            break
 
     return KnowledgeScanResult(
         files=sorted(files),

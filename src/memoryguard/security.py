@@ -76,6 +76,10 @@ READONLY_API_METHODS: frozenset[str] = frozenset({
     # the normal localhost confirmation/admin capability path.
     "list_rule_cockpit", "list_rule_decisions", "read_rule_decision",
     "get_rule_auto_scope_metrics", "list_rule_match_receipts", "list_rule_exceptions",
+    # Knowledge bookshelf reads.
+    "knowledge_list", "knowledge_deleted_list", "knowledge_search",
+    "knowledge_read", "knowledge_book", "knowledge_job_status",
+    "knowledge_candidates_list", "knowledge_candidate_targets",
 })
 
 # 变更 API：修改文件、删除目录、归档、绑定、记忆治理等
@@ -127,8 +131,9 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
     "create_rule_from_text", "undo_rule_decision", "create_child_exception",
     "create_rule_exception", "submit_rule_feedback", "revoke_rule_exception",
     # 知识书库（变更）
-    "knowledge_add", "knowledge_reingest", "knowledge_remove",
-    "knowledge_candidate_review",
+    "knowledge_add", "knowledge_reingest", "knowledge_rebuild_smart",
+    "knowledge_remove", "knowledge_restore", "knowledge_purge_deleted",
+    "knowledge_update_settings", "knowledge_candidate_review",
 })
 
 # 所有允许的 API 方法

@@ -18,7 +18,8 @@ def search(store: KnowledgeStore, query: str,
            book_ids: list[str] | None = None,
            top_k: int = 6,
            enable_graph: bool = True,
-           enable_vector: bool = True) -> list[dict[str, Any]]:
+           enable_vector: bool = True,
+           allow_remote_vector_query: bool = False) -> list[dict[str, Any]]:
     """知识库搜索。返回 top_k 个结果。
 
     每条结果包含：chunk_id, book_id, book_title, chapter, section,
@@ -51,7 +52,14 @@ def search(store: KnowledgeStore, query: str,
 
     vec: list[dict[str, Any]] = []
     if enable_vector:
-        vec = _vector_results(store, query, book_ids, top_k, policy)
+        vec = _vector_results(
+            store,
+            query,
+            book_ids,
+            top_k,
+            policy,
+            allow_remote_vector_query=allow_remote_vector_query,
+        )
 
     graph: list[dict[str, Any]] = []
     if enable_graph:
@@ -105,19 +113,45 @@ def _rrf_fuse(lists_ranked: list[list[dict[str, Any]]], k: int = 60) -> list[dic
 def _vector_results(store: KnowledgeStore, query: str,
                     book_ids: list[str] | None,
                     top_k: int,
-                    policy: KnowledgeAccessPolicy | None = None) -> list[dict[str, Any]]:
+                    policy: KnowledgeAccessPolicy | None = None,
+                    *,
+                    allow_remote_vector_query: bool = False) -> list[dict[str, Any]]:
     """向量召回（KB2）。provider 不可用或失败时返回空，不阻断 FTS。
 
     查询必须使用与入库相同的 embedding_space_id（P0-3），否则向量检索接不上
     存储空间的插头，永远返回空、系统只能靠 FTS。
     """
     try:
-        from .provider_api import get_provider, current_embedding_space_id
-        backend = get_provider()
+        from . import provider_api
+
+        backend, config = provider_api.get_provider_state()
         if backend is None:
             return []
-        space_id = current_embedding_space_id()
+        is_remote = provider_api.is_remote_provider_config(config)
+        if is_remote:
+            # Unknown injected backends are treated as remote and cannot be
+            # authorized without a concrete descriptor.
+            if config is None or not config.is_configured():
+                return []
+            if not allow_remote_vector_query:
+                return []
+            allowed_book_ids = store.list_remote_query_authorized_book_ids(
+                book_ids,
+            )
+            if not allowed_book_ids:
+                return []
+            book_ids = allowed_book_ids
+
+        space_id = provider_api.current_embedding_space_id()
         if not space_id:
+            return []
+        # Never send a query to any provider when the selected vector space
+        # has no locally searchable rows.
+        if not store.has_searchable_embeddings(
+            space_id,
+            book_ids=book_ids,
+            policy=policy,
+        ):
             return []
         query_vec = backend.embed(query)
         if not query_vec:
@@ -332,45 +366,77 @@ def list_books(store: KnowledgeStore) -> list[dict[str, Any]]:
     ]
 
 
-def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
+def get_book_info(
+    store: KnowledgeStore,
+    book_id: str,
+    policy: KnowledgeAccessPolicy | None = None,
+) -> dict[str, Any] | None:
     """获取一本书的详细信息：目录、摘要、章节。"""
     book = store.get_book(book_id)
     if not book:
         return None
+    policy = policy or KnowledgeAccessPolicy()
 
-    document_rows = store._conn.execute(
+    document_sql = (
         """SELECT d.relative_path, d.status, COUNT(c.chunk_id) AS chunk_count
            FROM documents d
            LEFT JOIN chunks c
              ON c.document_id=d.document_id AND c.active=1
-           WHERE d.book_id=?
-           GROUP BY d.document_id, d.relative_path, d.status
-           ORDER BY d.relative_path""",
-        (book_id,),
+           WHERE d.book_id=?"""
+    )
+    document_params: list[Any] = [book_id]
+    if not policy.allow_control_surface:
+        document_sql += " AND d.content_role=?"
+        document_params.append("knowledge")
+    if not policy.allow_sensitive:
+        document_sql += " AND d.sensitivity=?"
+        document_params.append("normal")
+    document_sql += (
+        " GROUP BY d.document_id, d.relative_path, d.status "
+        "ORDER BY d.relative_path"
+    )
+    document_rows = store._conn.execute(
+        document_sql, document_params,
     ).fetchall()
+
+    chapter_sql = (
+        """SELECT c.chapter, COUNT(*) AS chunk_count
+           FROM chunks c
+           JOIN documents d ON d.document_id=c.document_id
+           WHERE c.book_id=? AND c.active=1 AND c.chapter != ''"""
+    )
+    chapter_params: list[Any] = [book_id]
+    access_sql, access_params = policy_sql(policy)
+    if access_sql:
+        chapter_sql += " AND " + access_sql
+        chapter_params.extend(access_params)
+    chapter_sql += " GROUP BY c.chapter ORDER BY c.chapter"
     chapter_rows = store._conn.execute(
-        """SELECT chapter, COUNT(*) AS chunk_count
-           FROM chunks
-           WHERE book_id=? AND active=1 AND chapter != ''
-           GROUP BY chapter
-           ORDER BY chapter""",
-        (book_id,),
+        chapter_sql, chapter_params,
     ).fetchall()
-    entity_rows = store._conn.execute(
+
+    entity_sql = (
         """SELECT e.entity_id, e.name, e.entity_type,
                   COUNT(DISTINCT ce.chunk_id) AS mention_count
            FROM entities e
            JOIN chunk_entities ce ON ce.entity_id=e.entity_id
            JOIN chunks c ON c.chunk_id=ce.chunk_id AND c.active=1
            JOIN documents d ON d.document_id=c.document_id
-           WHERE c.book_id=? AND c.sensitivity='normal'
-             AND d.content_role='knowledge'
-           GROUP BY e.entity_id, e.name, e.entity_type
-           ORDER BY mention_count DESC, e.name
-           LIMIT 24""",
-        (book_id,),
+           WHERE c.book_id=?"""
+    )
+    entity_params: list[Any] = [book_id]
+    if access_sql:
+        entity_sql += " AND " + access_sql
+        entity_params.extend(access_params)
+    entity_sql += (
+        " GROUP BY e.entity_id, e.name, e.entity_type "
+        "ORDER BY mention_count DESC, e.name LIMIT 24"
+    )
+    entity_rows = store._conn.execute(
+        entity_sql, entity_params,
     ).fetchall()
-    relation_rows = store._conn.execute(
+
+    relation_sql = (
         """SELECT se.name AS subject, r.predicate,
                   CASE
                     WHEN oe.name LIKE 'chunk:%'
@@ -383,22 +449,37 @@ def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
            JOIN entities oe ON oe.entity_id=r.object_entity_id
            JOIN documents d ON d.document_id=r.document_id
            LEFT JOIN chunks c ON c.chunk_id=r.source_chunk_id
-           WHERE r.book_id=? AND d.content_role='knowledge'
-             AND (c.chunk_id IS NULL OR c.sensitivity='normal')
-           ORDER BY r.confidence DESC, se.name, r.predicate, oe.name
-           LIMIT 24""",
-        (book_id,),
+           WHERE r.book_id=?"""
+    )
+    relation_params: list[Any] = [book_id]
+    if not policy.allow_control_surface:
+        relation_sql += " AND d.content_role=?"
+        relation_params.append("knowledge")
+    if not policy.allow_sensitive:
+        relation_sql += " AND (c.chunk_id IS NULL OR c.sensitivity=?)"
+        relation_params.append("normal")
+    relation_sql += (
+        " ORDER BY r.confidence DESC, se.name, r.predicate, oe.name "
+        "LIMIT 24"
+    )
+    relation_rows = store._conn.execute(
+        relation_sql, relation_params,
     ).fetchall()
-    fragment_rows = store._conn.execute(
+
+    fragment_sql = (
         """SELECT c.chunk_id, c.chapter, c.section, c.summary, c.text,
                   c.line_start, c.line_end, d.relative_path
            FROM chunks c
            JOIN documents d ON d.document_id=c.document_id
-           WHERE c.book_id=? AND c.active=1 AND c.sensitivity='normal'
-             AND d.content_role='knowledge'
-           ORDER BY c.document_id, c.ordinal
-           LIMIT 8""",
-        (book_id,),
+           WHERE c.book_id=? AND c.active=1"""
+    )
+    fragment_params: list[Any] = [book_id]
+    if access_sql:
+        fragment_sql += " AND " + access_sql
+        fragment_params.extend(access_params)
+    fragment_sql += " ORDER BY c.document_id, c.ordinal LIMIT 8"
+    fragment_rows = store._conn.execute(
+        fragment_sql, fragment_params,
     ).fetchall()
     chapters = [r["chapter"] for r in chapter_rows]
 
@@ -415,6 +496,7 @@ def get_book_info(store: KnowledgeStore, book_id: str) -> dict[str, Any] | None:
         "last_indexed_at": book.last_indexed_at or "",
         "vector_enabled": book.vector_enabled,
         "remote_embedding_allowed": book.remote_embedding_allowed,
+        "remote_query_embedding_allowed": book.remote_query_embedding_allowed,
         "auto_extract_memory": book.auto_extract_memory,
         "build_phases": book.build_phases,
         "chapters": chapters,
