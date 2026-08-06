@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -1190,7 +1191,7 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
 def cmd_gui(args: argparse.Namespace) -> int:
     """从可见终端启动交互式治理台。"""
-    return gui_main([args.workspace])
+    return gui_main([args.workspace] if args.workspace else [])
 
 
 # ---------------------------------------------------------------------------
@@ -1311,7 +1312,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.set_defaults(func=cmd_gc)
 
     p_gui = sub.add_parser("gui", help="launch the interactive governance console")
-    p_gui.add_argument("workspace", nargs="?", default=".", help="workspace path (default: .)")
+    p_gui.add_argument("workspace", nargs="?", default="", help="workspace path (auto-detected when omitted)")
     p_gui.set_defaults(func=cmd_gui)
 
     p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
@@ -1326,10 +1327,85 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _gui_state_path() -> Path:
+    from .data_home import resolve_data_home
+
+    return resolve_data_home() / "gui-state.json"
+
+
+def _load_last_gui_workspace() -> Path | None:
+    try:
+        data = json.loads(_gui_state_path().read_text(encoding="utf-8"))
+        path = Path(str(data.get("workspace", ""))).expanduser().resolve()
+        return path if path.is_dir() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _choose_gui_workspace() -> Path | None:
+    """让无上下文启动的 GUI 选择一次项目目录。"""
+    try:
+        import tkinter
+        from tkinter import filedialog
+
+        root = tkinter.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            title="选择要打开的 MemoryGuard 项目文件夹",
+            mustexist=True,
+        )
+        root.destroy()
+        return Path(selected).resolve() if selected else None
+    except Exception as exc:
+        print(f"error: cannot open the workspace picker: {exc}", file=sys.stderr)
+        return None
+
+
+def _remember_gui_workspace(workspace: Path) -> None:
+    try:
+        state_path = _gui_state_path()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"workspace": str(workspace)}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _resolve_gui_workspace(argv: list[str]) -> Path | None:
+    if argv:
+        return Path(argv[0]).expanduser().resolve()
+
+    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+
+    last = _load_last_gui_workspace()
+    if last is not None:
+        return last
+
+    cwd = Path.cwd().resolve()
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+    if cwd.is_dir() and cwd != system_root and system_root not in cwd.parents:
+        return cwd
+
+    return _choose_gui_workspace()
+
+
 def gui_main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    raw_workspace = argv[0] if argv else os.environ.get("MEMORYGUARD_WORKSPACE", ".")
-    workspace = Path(raw_workspace).expanduser().resolve()
+    workspace = _resolve_gui_workspace(argv)
+    if workspace is None:
+        print(
+            "error: no workspace selected. Run `memoryguard gui <project-path>` "
+            "or set MEMORYGUARD_WORKSPACE.",
+            file=sys.stderr,
+        )
+        return 2
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
     if workspace == system_root or system_root in workspace.parents:
         print(
@@ -1343,6 +1419,7 @@ def gui_main(argv: list[str] | None = None) -> int:
     if not workspace.is_dir():
         print(f"error: GUI workspace does not exist or is not a directory: {workspace}", file=sys.stderr)
         return 2
+    _remember_gui_workspace(workspace)
     from .gui import (
         has_native_gui,
         open_interactive_window,

@@ -123,3 +123,10 @@ def test_gui_main_rejects_windows_system_directory(monkeypatch, capsys) -> None:
 
     assert result == 2
     assert "refusing to use a Windows system directory" in capsys.readouterr().err
+
+
+def test_gui_workspace_prefers_environment(monkeypatch, tmp_path) -> None:
+    from memoryguard.cli import _resolve_gui_workspace
+
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
+    assert _resolve_gui_workspace([]) == tmp_path.resolve()

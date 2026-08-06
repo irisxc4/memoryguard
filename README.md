@@ -155,11 +155,13 @@ memoryguard hooks status --provider all
 Launch the desktop console:
 
 ```bash
-memoryguard gui .
+memoryguard gui
 ```
 
 `memoryguard-gui .` remains available for desktop shortcuts. In PowerShell and
 other terminals, use `memoryguard gui .` so startup errors remain visible.
+With no path, MemoryGuard uses `MEMORYGUARD_WORKSPACE`, the last opened project,
+or the current directory; if none is usable, it opens a folder picker.
 
 Provider-specific setup and behavior:
 
