@@ -231,6 +231,32 @@ def _seed_rule(
     return store
 
 
+def _reconcile_group(workspace: Path, group_id: str) -> dict[str, Any]:
+    """Drive a group through the real reconciliation saga.
+
+    Req8 gates the canonical read on group-level canonical activation AND
+    ``canonical_reconciliation_status(...).canonical_ready``.  A backfill-only
+    group therefore falls back to legacy by design; the read-path checks must
+    first establish the full canonical state so the explicitly requested
+    canonical read genuinely engages (PR7).
+    """
+    from memoryguard.rule_reconciliation import (  # noqa: PLC0415
+        RuleReconciliationService,
+        _active_mandatory,
+        build_bundles,
+    )
+    store = RuleMergeStore(workspace)
+    legacy = SharedMemoryStore(workspace, group_id)
+    active = _active_mandatory(legacy)
+    if not active:
+        raise RuntimeError(
+            f"no active mandatory records to reconcile for {group_id}"
+        )
+    plan = build_bundles(store, legacy, group_id, active)
+    service = RuleReconciliationService(store, workspace=workspace)
+    return service.run(group_id, bundle_plan=plan, model_mode="scripted")
+
+
 def _binding_source_projection_diff(store: RuleMergeStore) -> int:
     bindings = {
         (item.binding_id, item.definition_id)
@@ -373,6 +399,10 @@ def _evidence_fallback_loss() -> int:
     intel = RuleMergeStore(workspace)
     service = RuleMergeService(intel)
     service.backfill_group(legacy, group_id)
+    # Req8: the canonical read only engages after group-level canonical
+    # activation + readiness.  Establish it via the real saga, so a canonical
+    # read that resolves every known source is what this metric observes.
+    _reconcile_group(workspace, group_id)
     context = EffectiveAgentContext(
         agent_instance_id=agent_id,
         share_group_id=group_id,
@@ -2114,6 +2144,10 @@ def evaluate() -> dict[str, object]:
     read_path_mode = "legacy"
     read_path_dedup = 0
     try:
+        # Req8: group-level canonical activation + readiness gate the canonical
+        # read.  Establish team-a's canonical state via the real saga so the
+        # explicitly requested canonical read engages (PR7), then resolve.
+        _reconcile_group(workspace, "team-a")
         legacy = SharedMemoryStore(workspace, "team-a")
         packet = build_context_packet(
             legacy,

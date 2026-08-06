@@ -17,12 +17,18 @@ These tests assert:
 """
 from __future__ import annotations
 
+import json as _json
 from types import SimpleNamespace
 
 import pytest
 
 from memoryguard.access_context import AccessContext
 from memoryguard.context_bootstrap import build_context_packet
+from memoryguard.governance_scope import (
+    GovernanceScope,
+    build_shared_memory_graph,
+    share_group_projection_path,
+)
 from memoryguard.rule_definition import build_definition, normalize_rule_text
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
@@ -34,6 +40,7 @@ from memoryguard.rule_read_path import (
     dedupe_records,
     resolve_read_path_mode,
 )
+from memoryguard.rule_reconciliation import RuleReconciliationStore
 from memoryguard.schema_v3 import (
     EffectiveAgentContext,
     MemoryKind,
@@ -64,6 +71,64 @@ def _seed_record(store: SharedMemoryStore, body: str, *, memory_id: str,
 
 def _context(agent_id="agent-1", group_id="g1") -> EffectiveAgentContext:
     return EffectiveAgentContext(agent_id, group_id)
+
+
+def _activate_canonical(tmp_path, group, intel, legacy):
+    """Persist group-level canonical activation + full readiness (Req8 gate).
+
+    The Req8 gate only switches ``effective_read_path`` to
+    ``rule-intelligence`` when ``rule_canonical_state`` activation is active
+    *and* ``canonical_reconciliation_status`` reports ``canonical_ready``.
+    This helper writes both: it normalizes every active mandatory source link
+    to its resolved active, group-bound Definition (mirrors the post-saga
+    state, so the group-level shadow diff is zero even after a canonical
+    merge), builds the projection graph, and records the activation row.
+    """
+    bound = {
+        binding.definition_id
+        for binding in intel.list_bindings(share_group_id=group, status="active")
+    }
+    for record in legacy.list_records():
+        if record.injection_policy != "always":
+            continue
+        if str(
+            getattr(record.status, "value", record.status)
+        ) != SharedMemoryStatus.ACTIVE.value:
+            continue
+        link = intel.get_source_link(group, record.memory_id)
+        if not link:
+            continue
+        target = str(link.get("canonical_definition_id") or "")
+        if target in bound:
+            continue
+        resolved = intel.resolve_canonical(target) if target else ""
+        definition = intel.get_definition(resolved) if resolved else None
+        if (
+            definition is not None
+            and str(
+                getattr(definition.status, "value", definition.status)
+            ) == SharedMemoryStatus.ACTIVE.value
+            and resolved in bound
+        ):
+            intel.upsert_source_link(
+                share_group_id=group, memory_id=record.memory_id,
+                source_revision=link.get("source_revision", ""),
+                original_definition_id=link.get("original_definition_id", ""),
+                canonical_definition_id=resolved,
+            )
+    scope = GovernanceScope(mode="share_group", share_group_id=group)
+    out_path = share_group_projection_path(tmp_path, scope)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        _json.dumps(
+            build_shared_memory_graph(tmp_path, group), ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    RuleReconciliationStore(intel).set_canonical_activation(
+        group, activation_status="active",
+        canonical_digest="test-digest", read_path="rule-intelligence",
+    )
 
 
 @pytest.fixture
@@ -242,11 +307,13 @@ def test_bootstrap_injects_merged_rule_once(
     tmp_path, canonical_readiness_ready,
 ):
     legacy, intel = _seed_intelligence_pair(tmp_path, merge=True)
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=_context(group_id="g1"),
         read_path=MODE_RULE_INTELLIGENCE,
     )
+    assert packet["effective_read_path"] == MODE_RULE_INTELLIGENCE
     assert packet["read_path"]["mode"] == MODE_RULE_INTELLIGENCE
     assert packet["read_path"]["deduplicated"] >= 1
     bodies = [
@@ -524,12 +591,13 @@ def test_canonical_read_cross_agent_keeps_each_agents_rule(
     # Two agents share one canonical rule (identical wording).  A global dedup
     # would prefer m1 (agent-1) and starve agent-2; the post-audience dedup
     # must keep each agent's own matched record.
-    legacy, _ = _seed_cross(tmp_path, "g1", [
+    legacy, intel = _seed_cross(tmp_path, "g1", [
         {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
          "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
         {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-2",
          "assignments": [{"target_type": "agent", "target_id": "agent-2"}]},
     ])
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     for agent_id in ("agent-1", "agent-2"):
         packet = build_context_packet(
             legacy, task="写测试",
@@ -542,7 +610,7 @@ def test_canonical_read_cross_agent_keeps_each_agents_rule(
 def test_canonical_read_cross_project_keeps_each_projects_rule(
     tmp_path, canonical_readiness_ready,
 ):
-    legacy, _ = _seed_cross(tmp_path, "g1", [
+    legacy, intel = _seed_cross(tmp_path, "g1", [
         {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
          "assignments": [{"target_type": "agent_project", "target_id": "agent-1",
                           "project_ref": "/proj/x"}]},
@@ -550,6 +618,7 @@ def test_canonical_read_cross_project_keeps_each_projects_rule(
          "assignments": [{"target_type": "agent_project", "target_id": "agent-2",
                           "project_ref": "/proj/y"}]},
     ])
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=EffectiveAgentContext(
@@ -565,7 +634,7 @@ def test_canonical_read_applies_exclude_before_dedupe(
 ):
     # m2 is the stronger record (higher priority, locked) but is *excluded* for
     # agent-1.  The canonical collapse must not let m2 delete m1's injection.
-    legacy, _ = _seed_cross(tmp_path, "g1", [
+    legacy, intel = _seed_cross(tmp_path, "g1", [
         {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
          "priority": 10,
          "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
@@ -574,6 +643,7 @@ def test_canonical_read_applies_exclude_before_dedupe(
          "assignments": [{"target_type": "agent", "target_id": "agent-1",
                           "effect": "exclude"}]},
     ])
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=_context("agent-1", "g1"),
@@ -587,7 +657,7 @@ def test_shadowed_record_never_replaces_active_representative(
 ):
     # m2 is shadowed but the strongest by raw priority/locked; the active/
     # status filter must run before canonical dedup so m1 (active) survives.
-    legacy, _ = _seed_cross(tmp_path, "g1", [
+    legacy, intel = _seed_cross(tmp_path, "g1", [
         {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
          "priority": 10,
          "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
@@ -596,6 +666,7 @@ def test_shadowed_record_never_replaces_active_representative(
          "status": SharedMemoryStatus.SHADOWED,
          "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
     ])
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=_context("agent-1", "g1"),

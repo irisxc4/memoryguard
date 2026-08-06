@@ -9,11 +9,19 @@ engage.
 """
 from __future__ import annotations
 
+import json as _json
+
 from memoryguard.context_bootstrap import build_context_packet
+from memoryguard.governance_scope import (
+    GovernanceScope,
+    build_shared_memory_graph,
+    share_group_projection_path,
+)
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_evidence import build_evidence
 from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
 from memoryguard.rule_read_path import RuleReadPath
+from memoryguard.rule_reconciliation import RuleReconciliationStore
 from memoryguard.schema_v3 import (
     EffectiveAgentContext,
     MemoryKind,
@@ -41,6 +49,30 @@ def _backfill(tmp_path, group="g1", bodies=("提交代码前必须运行测试",
     service = RuleMergeService(intel)
     service.backfill_group(legacy, group)
     return legacy, intel, service
+
+
+def _activate_canonical(tmp_path, group, intel, legacy):
+    """Persist group-level canonical activation + full readiness (Req8 gate).
+
+    The Req8 gate only switches ``effective_read_path`` to
+    ``rule-intelligence`` when ``rule_canonical_state`` activation is active
+    *and* ``canonical_reconciliation_status`` reports ``canonical_ready``.
+    This writes the projection graph and the activation row so the canonical
+    read can actually engage (its source links are already backfilled).
+    """
+    scope = GovernanceScope(mode="share_group", share_group_id=group)
+    out_path = share_group_projection_path(tmp_path, scope)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        _json.dumps(
+            build_shared_memory_graph(tmp_path, group), ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    RuleReconciliationStore(intel).set_canonical_activation(
+        group, activation_status="active",
+        canonical_digest="test-digest", read_path="rule-intelligence",
+    )
 
 
 def test_governance_acceptance_zero_on_clean_state(tmp_path):
@@ -125,6 +157,7 @@ def test_canonical_read_engages_when_intelligence_exists(tmp_path):
             agent_instance_id="a0", project_ref="p0", session_id="s0",
             content=d.canonical_text,
         ))
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=EffectiveAgentContext("agent-1", "g1"),
@@ -155,9 +188,11 @@ def test_real_store_readiness_is_complete_without_monkeypatch(tmp_path):
 
 def test_acceptance_fails_when_canonical_read_falls_back(tmp_path):
     legacy, intel, _ = _backfill(tmp_path)
-    # No evidence anchored to real memory ids: the canonical read cannot resolve
-    # and must fall back to legacy — an acceptance gate that requires canonical
+    # The group is canonical-activated (Req8 gate passes), but no evidence is
+    # anchored to real memory ids: the canonical read cannot resolve and must
+    # fall back to legacy — an acceptance gate that requires canonical
     # engagement must fail here, not silently pass.
+    _activate_canonical(tmp_path, "g1", intel, legacy)
     packet = build_context_packet(
         legacy, task="写测试",
         effective_context=EffectiveAgentContext("agent-1", "g1"),

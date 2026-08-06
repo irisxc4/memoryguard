@@ -114,10 +114,15 @@ def build_context_packet(
 
     ``read_path`` controls the Phase5 canonical read path.  It is shadow by
     default: ``legacy`` (the default and the env fallback) forces the old
-    byte-for-byte path; ``auto`` / ``rule-intelligence`` prefer the canonical
-    layer when it has data for this group (falling back to legacy when it does
-    not), deduplicating merged duplicates only *after* the active/audience/
-    exclude match so a collapse can never under-expose a rule.
+    byte-for-byte path.  ``auto`` / ``rule-intelligence`` never switch the
+    group to canonical by themselves (Req8): the canonical layer only engages
+    when the group-level canonical activation is persisted
+    (``rule_canonical_state`` ``activation_status == "active"``) *and*
+    ``canonical_reconciliation_status`` reports ``canonical_ready``.  Any other
+    outcome keeps ``effective_read_path`` on ``legacy`` and records why in
+    ``fallback_reason``.  When canonical does engage, merged duplicates are
+    deduplicated only *after* the active/audience/exclude match so a collapse
+    can never under-expose a rule.
     """
     task = (task or "").strip()
     if not task:
@@ -160,6 +165,16 @@ def build_context_packet(
     # to the current Agent/project.  Body text still comes from the legacy
     # record; old tables are untouched.
     canonical_mapping: dict[str, Any] | None = None
+    # Req8 canonical gate.  ``requested_read_path`` is the caller's raw value;
+    # ``effective_read_path`` only becomes "rule-intelligence" when the
+    # group-level canonical activation is persisted AND reconciliation
+    # readiness passes.  Any other outcome stays on legacy with
+    # ``fallback_reason`` recording why (a legacy request is not a fallback).
+    requested_read_path = read_path
+    effective_read_path = "legacy"
+    fallback_reason = ""
+    canonical_definitions = 0
+    canonical_ready = False
     read_path_summary: dict[str, Any] = {
         "mode": MODE_LEGACY,
         "canonical_definitions": 0,
@@ -168,18 +183,57 @@ def build_context_packet(
         "deduplicated": 0,
     }
     if resolve_read_path_mode(read_path) != MODE_LEGACY:
+        gate_pass = False
         try:
-            from .rule_read_path import RuleReadPath
+            from .rule_merge_store import RuleMergeStore
+            from .rule_reconciliation import (
+                RuleReconciliationStore,
+                canonical_reconciliation_status,
+            )
 
-            read = RuleReadPath(store.workspace, store.group_id)
-            if read.has_intelligence():
-                canonical_mapping = read.resolve_canonical_map(
-                    known_memory_ids={r.memory_id for r in all_records},
-                    legacy_store=store,
-                    context=effective_context,
+            rms = RuleMergeStore(store.workspace)
+            activation = RuleReconciliationStore(rms).canonical_activation(
+                store.group_id,
+            )
+            status = canonical_reconciliation_status(
+                store.workspace, store.group_id, store=rms,
+            )
+            canonical_definitions = int(
+                status.get("checks", {}).get("canonical_definitions", 0) or 0
+            )
+            canonical_ready = bool(status.get("canonical_ready", False))
+            if (
+                activation
+                and str(activation.get("activation_status", "") or "") == "active"
+                and canonical_ready
+            ):
+                gate_pass = True
+            elif not activation or str(
+                activation.get("activation_status", "") or ""
+            ) != "active":
+                fallback_reason = "canonical_not_activated"
+            else:
+                fallback_reason = "readiness_failed:" + ",".join(
+                    status.get("failures") or []
                 )
         except Exception:
-            canonical_mapping = None  # keep the legacy path; canonical is advisory
+            canonical_ready = False
+            canonical_definitions = 0
+            fallback_reason = "evaluation_failed"
+        if gate_pass:
+            effective_read_path = "rule-intelligence"
+            try:
+                from .rule_read_path import RuleReadPath
+
+                read = RuleReadPath(store.workspace, store.group_id)
+                if read.has_intelligence():
+                    canonical_mapping = read.resolve_canonical_map(
+                        known_memory_ids={r.memory_id for r in all_records},
+                        legacy_store=store,
+                        context=effective_context,
+                    )
+            except Exception:
+                canonical_mapping = None  # keep the legacy path; canonical is advisory
     omitted = {
         "non_active": 0,
         "sensitive": 0,
@@ -510,6 +564,9 @@ def build_context_packet(
             int(read_path_summary["records_before"]),
             int(read_path_summary["records_after"]),
         )
+    # Req8: the summary reports the real group-level canonical definition count
+    # (from reconciliation status), not only the definitions this packet mapped.
+    read_path_summary["canonical_definitions"] = canonical_definitions
 
     preferences = [
         item for item in unique if item.record.kind == MemoryKind.PREFERENCE
@@ -643,6 +700,11 @@ def build_context_packet(
         "assignment_receipt": assignment_receipt,
         "legacy_unscoped_rule_ids": legacy_unscoped,
         "read_path": read_path_summary,
+        "requested_read_path": requested_read_path,
+        "effective_read_path": effective_read_path,
+        "fallback_reason": fallback_reason,
+        "canonical_definitions": canonical_definitions,
+        "canonical_ready": canonical_ready,
         "recalled_memory_ids": [item["memory_id"] for item in items],
         "mandatory_overflow": mandatory_overflow,
         "mandatory_invalid_reason": mandatory_error,
