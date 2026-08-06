@@ -645,8 +645,6 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             if ext not in all_supported:
                 continue
             file_path = Path(dirpath) / fname
-            if file_path.is_symlink():
-                continue  # 符号链接文件不扫描
             rel = str(file_path.relative_to(root)).replace("\\", "/")
 
             # 应用 exclude
@@ -661,6 +659,8 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             # stat/read 失败时仍不会把已有文档误判为已删除。
             seen_paths.add(rel)
             try:
+                if file_path.is_symlink():
+                    continue  # 符号链接文件不扫描
                 if not str(file_path.resolve()).startswith(str(real_root)):
                     continue  # 逃逸出根目录
                 size = file_path.stat().st_size
