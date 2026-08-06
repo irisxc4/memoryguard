@@ -144,6 +144,7 @@ memoryguard gui
 `memoryguard gui .`，这样启动失败时可以直接看到错误信息。
 不传路径时，MemoryGuard 会依次使用 `MEMORYGUARD_WORKSPACE`、上次打开的项目和当前目录；
 都不可用时自动弹出文件夹选择器。
+在 Windows 上，`memoryguard gui` 会把原生窗口独立到后台进程，关闭 PowerShell 不会关闭 GUI。
 
 详细说明：[Claude Code](docs/install-claude-code.md) ·
 [Codex](docs/install-codex.md) · [Cursor](docs/install-cursor.md)

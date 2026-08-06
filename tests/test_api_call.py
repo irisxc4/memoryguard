@@ -41,6 +41,25 @@ def test_pyproject_declares_windowed_gui_entry() -> None:
     assert 'memoryguard = ["static/*.js", "static/*.png", "static/*.ico"]' in pyproject
 
 
+def test_safe_bridge_preserves_trusted_gui_context(tmp_path) -> None:
+    from memoryguard.access_context import AccessContext
+    from memoryguard.gui import SafeBridgeApi
+
+    context = AccessContext(
+        trusted_agent_id="gui",
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id="session",
+        session_source="transport",
+        session_trusted=True,
+    )
+    bridge = SafeBridgeApi(str(tmp_path), _trusted_access_context=context)
+
+    assert bridge._inner._trusted_access_context is context
+    assert bridge._inner._trusted_access_context.require_admin() == (True, "")
+
+
 def test_native_window_uses_packaged_brand_icon(monkeypatch) -> None:
     from memoryguard import gui
 

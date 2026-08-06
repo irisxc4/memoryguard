@@ -162,6 +162,8 @@ memoryguard gui
 other terminals, use `memoryguard gui .` so startup errors remain visible.
 With no path, MemoryGuard uses `MEMORYGUARD_WORKSPACE`, the last opened project,
 or the current directory; if none is usable, it opens a folder picker.
+On Windows, `memoryguard gui` detaches the native window from the terminal, so
+closing PowerShell does not close the GUI.
 
 Provider-specific setup and behavior:
 

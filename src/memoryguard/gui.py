@@ -629,7 +629,11 @@ def open_localhost_window(
         server_thread.start()
         try:
             _set_windows_app_user_model_id()
-            bridge = SafeBridgeApi(workspace, direct_mutations=True)
+            bridge = SafeBridgeApi(
+                workspace,
+                direct_mutations=True,
+                _trusted_access_context=api._trusted_access_context,
+            )
             window = webview.create_window(
                 native_title,
                 url=url,
@@ -8081,8 +8085,17 @@ class SafeBridgeApi:
     前端统一通过这两个方法调用，不再直接访问 method 属性。
     """
 
-    def __init__(self, workspace: str, *, direct_mutations: bool = False):
-        self._inner = GovernanceApi(workspace)
+    def __init__(
+        self,
+        workspace: str,
+        *,
+        direct_mutations: bool = False,
+        _trusted_access_context=None,
+    ):
+        self._inner = GovernanceApi(
+            workspace,
+            _trusted_access_context=_trusted_access_context,
+        )
         self._workspace = workspace
         # 原生桌面窗口本身即执行端，变更应直接执行，不被 IDE 沙箱启发式推迟
         self._direct_mutations = bool(direct_mutations)
@@ -8121,7 +8134,7 @@ class SafeBridgeApi:
             return {"error": f"not a mutation method: {method}"}
 
         # 沙箱模式：走请求队列，返回 deferred 标记。原生桌面窗口同样遵守真实沙箱状态。
-        if detect_sandbox_mode():
+        if detect_sandbox_mode() and not self._direct_mutations:
             result = self._inner.submit_request(method, args or [])
             return {
                 "ok": True,

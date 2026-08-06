@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import webbrowser
@@ -1191,7 +1192,29 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
 def cmd_gui(args: argparse.Namespace) -> int:
     """从可见终端启动交互式治理台。"""
-    return gui_main([args.workspace] if args.workspace else [])
+    workspace_args = [args.workspace] if args.workspace else []
+    if os.name == "nt" and os.environ.get("_MEMORYGUARD_GUI_CHILD") != "1":
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if not pythonw.exists():
+            pythonw = Path(sys.executable)
+        env = os.environ.copy()
+        env["_MEMORYGUARD_GUI_CHILD"] = "1"
+        creation_flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        subprocess.Popen(
+            [str(pythonw), "-m", "memoryguard.cli", "gui", *workspace_args],
+            cwd=str(Path.cwd()),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creation_flags,
+        )
+        return 0
+    return gui_main(workspace_args)
 
 
 # ---------------------------------------------------------------------------
