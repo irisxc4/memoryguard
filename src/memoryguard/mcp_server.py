@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,41 @@ _MUTATING_TOOLS = {
     "memoryguard_rule_merge_acknowledge",
     "memoryguard_rule_merge_cooldown_clear",
 }
+
+
+# ---------------------------------------------------------------------------
+# Req9: governance-degraded read-only diagnostics
+# ---------------------------------------------------------------------------
+# When governance is degraded the MCP layer blocks every tool except these
+# four read-only diagnostics; mutations and normal tools get a structured
+# refusal (never a raised exception, so the MCP response shape stays intact).
+_DEGRADED_WHITELIST = frozenset({
+    "memoryguard_canonical_status",
+    "memoryguard_diagnostics_snapshot",
+    "memoryguard_projection_status",
+    "memoryguard_runtime_processes",
+})
+
+# Fixed read-only SQL for the diagnostics snapshot.  Never user-supplied; the
+# snapshot accepts no arbitrary SQL and no arbitrary file paths.
+_DIAGNOSTIC_JOBS_BY_STATUS_SQL = (
+    "SELECT status AS status, COUNT(*) AS count "
+    "FROM rule_reconciliation_jobs GROUP BY status ORDER BY status"
+)
+_DIAGNOSTIC_CANONICAL_STATE_SQL = (
+    "SELECT share_group_id, activation_status, canonical_digest, read_path, "
+    "activated_at, updated_at FROM rule_canonical_state ORDER BY share_group_id"
+)
+_DIAGNOSTIC_PROJECTION_SQL = (
+    "SELECT scope_id, projection_lag, projection_error "
+    "FROM rule_projection_state ORDER BY scope_id"
+)
+_DIAGNOSTIC_SOURCE_LINKS_SQL = "SELECT COUNT(*) AS count FROM rule_source_links"
+_DIAGNOSTIC_BINDINGS_SQL = "SELECT COUNT(*) AS count FROM rule_bindings"
+
+# Lock probe deadline: short enough not to stall the MCP loop, long enough to
+# distinguish real contention from a transient filesystem hiccup.
+_LOCK_PROBE_TIMEOUT = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +676,70 @@ TOOLS = [
             },
         },
     },
+    # --- Req9: governance-degraded read-only diagnostics ---
+    {
+        "name": "memoryguard_canonical_status",
+        "description": (
+            "Read-only canonical reconciliation status for a share_group_id: "
+            "canonical_ready, failures, checks, read_path. Always allowed, "
+            "even when governance is degraded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_diagnostics_snapshot",
+        "description": (
+            "Read-only governance diagnostics snapshot JSON: reconciliation jobs by status, "
+            "canonical activation, projection, source links, bindings. Snapshot uses "
+            "sqlite3.Connection.backup(); never copies DB/WAL files and accepts no "
+            "arbitrary SQL or file paths. Always allowed, even when governance is degraded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_projection_status",
+        "description": (
+            "Read-only projection status (projection_lag / projection_error / scopes) "
+            "for a group. Always allowed, even when governance is degraded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "share_group_id": {"type": "string", "description": "share group ID (default: resolved binding or default)"},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_runtime_processes",
+        "description": (
+            "Read-only runtime process facts: current pid, memoryguard_version, "
+            "code_fingerprint, control_workspace, database_paths, runtime lease status. "
+            "Always allowed, even when governance is degraded."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 # Raw history uses a physically separate SQLite archive.  Keep its MCP
@@ -877,6 +977,26 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
         else _resolve_workspace(args)
     )
+
+    # Req9: governance-degraded gate.  When governance is degraded, only the
+    # four read-only diagnostics pass; every other tool (read or mutation) is
+    # refused with a structured result -- never a raised exception, so the MCP
+    # response shape stays intact.
+    if name not in _DEGRADED_WHITELIST:
+        _diag_group, _diag_err = _diag_share_group_id(args, workspace)
+        _diag_state = _governance_diagnostics_state(workspace, _diag_group)
+        if governance_degraded(_diag_state):
+            return {"ok": False, "error": "governance_degraded", "degraded": True}
+
+    # Req9 read-only diagnostics dispatch (whitelisted, always allowed).
+    if name == "memoryguard_canonical_status":
+        return _handle_canonical_status(args)
+    if name == "memoryguard_diagnostics_snapshot":
+        return _handle_diagnostics_snapshot(args)
+    if name == "memoryguard_projection_status":
+        return _handle_projection_status(args)
+    if name == "memoryguard_runtime_processes":
+        return _handle_runtime_processes(args)
 
     # 知识书库工具（只读，不参与写操作预检）
     if name.startswith("memoryguard_knowledge_"):
@@ -2271,6 +2391,339 @@ def _handle_history(args: dict[str, Any], name: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Req9: governance-degraded read-only diagnostics
+# ---------------------------------------------------------------------------
+
+
+def governance_degraded(state: dict[str, Any]) -> bool:
+    """Conservative governance-degraded predicate (Req9).
+
+    True only on hard evidence that the governance layer is not safely
+    writable: the workspace governance lock cannot be acquired, the canonical
+    reconciliation outbox is not drained (``outbox_pending > 0``), or the
+    projection is reporting an error.  A pending model job, unlinked sources
+    or a fresh workspace never trip the gate -- prefer letting read-only
+    diagnostics through over locking down a healthy path.
+    """
+    if not isinstance(state, dict):
+        return False
+    lock = state.get("lock") if isinstance(state.get("lock"), dict) else {}
+    if lock.get("acquirable") is False:
+        return True
+    canonical = state.get("canonical")
+    if not isinstance(canonical, dict):
+        return False
+    if int(canonical.get("outbox_pending", 0) or 0) > 0:
+        return True
+    if str(canonical.get("projection_error", "") or ""):
+        return True
+    return False
+
+
+def _diag_share_group_id(
+    args: dict[str, Any], workspace: Path,
+) -> tuple[str, str | None]:
+    """Resolve the share_group_id for the read-only diagnostics.
+
+    An explicit ``share_group_id`` argument is honored (read-only tools only);
+    otherwise the trusted binding is used, falling back to ``default``.
+    """
+    explicit = str(args.get("share_group_id", "") or "").strip()
+    if explicit:
+        try:
+            from .shared_memory_store import _validate_group_id
+            return _validate_group_id(explicit), None
+        except ValueError as exc:
+            return "", str(exc)
+    try:
+        group_id, err = _get_share_group_id(args, workspace)
+        if err:
+            return "default", None
+        return group_id or "default", None
+    except Exception:  # noqa: BLE001 - diagnostics must never fail the gate
+        return "default", None
+
+
+def _rule_intelligence_db_exists(workspace: Path) -> bool:
+    return (workspace / ".memoryguard" / "rule-intelligence" / "memory.db").exists()
+
+
+def _group_store_exists(workspace: Path, share_group_id: str) -> bool:
+    """Both stores must already exist; diagnostics never create a group."""
+    if not _rule_intelligence_db_exists(workspace):
+        return False
+    try:
+        from .shared_memory_store import _validate_group_id
+        gid = _validate_group_id(share_group_id)
+    except ValueError:
+        return False
+    return (
+        workspace / ".memoryguard" / "shared-memory" / gid / "memory.db"
+    ).exists()
+
+
+def _governance_diagnostics_state(
+    workspace: str | Path, share_group_id: str,
+) -> dict[str, Any]:
+    """Best-effort, read-only governance state used by the degraded gate.
+
+    Lock health is probed first; a lock that cannot be acquired short-circuits
+    before the (more expensive) canonical check.  Canonical checks only run
+    when both stores already exist, so this function never creates a group or
+    schema and is safe to run before every MCP tool call.
+    """
+    workspace = Path(workspace).resolve()
+    state: dict[str, Any] = {
+        "lock": {"acquirable": True, "error": ""},
+        "canonical": None,
+    }
+
+    lock_path = workspace / ".memoryguard" / "governance.lock"
+    if lock_path.exists():
+        try:
+            from .governance_lock import (
+                GovernanceLockError,
+                GovernanceLockTimeout,
+                WorkspaceGovernanceLock,
+            )
+            lock = WorkspaceGovernanceLock(workspace, timeout=_LOCK_PROBE_TIMEOUT)
+            lock.acquire()
+            lock.release()
+        except (GovernanceLockTimeout, GovernanceLockError, OSError) as exc:
+            state["lock"]["acquirable"] = False
+            state["lock"]["error"] = f"{type(exc).__name__}: {exc}"
+            return state  # already degraded; skip the expensive canonical check
+
+    if not _group_store_exists(workspace, share_group_id):
+        return state
+    try:
+        from .rule_reconciliation import canonical_reconciliation_status
+        status = canonical_reconciliation_status(workspace, share_group_id)
+        checks = (
+            status.get("checks")
+            if isinstance(status.get("checks"), dict)
+            else {}
+        )
+        state["canonical"] = {
+            "canonical_ready": bool(status.get("canonical_ready")),
+            "failures": status.get("failures", []),
+            "outbox_pending": int(checks.get("outbox_pending", 0) or 0),
+            "projection_error": str(checks.get("projection_error", "") or ""),
+            "projection_lag": int(checks.get("projection_lag", 0) or 0),
+            "reconciliation_in_flight": int(
+                checks.get("reconciliation_in_flight", 0) or 0
+            ),
+            "read_path": str(status.get("read_path", "legacy") or "legacy"),
+        }
+    except Exception as exc:  # noqa: BLE001 - cannot confirm degraded from canonical
+        state["canonical"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return state
+
+
+def _build_diagnostics_snapshot(
+    workspace: Path, share_group_id: str,
+) -> dict[str, Any]:
+    """Predefined read-only diagnostics snapshot (Req9).
+
+    Never copies ``memory.db`` or any WAL file.  A consistent view is taken
+    through ``sqlite3.Connection.backup()`` into an in-memory database and read
+    back with fixed, hard-coded queries only.
+    """
+    if not _rule_intelligence_db_exists(workspace):
+        return {
+            "ok": True,
+            "initialized": False,
+            "reason": "rule_intelligence_store_not_initialized",
+            "jobs_by_status": {},
+            "canonical_activation": [],
+            "projection": {"projection_lag": 0, "projection_error": "", "scopes": []},
+            "source_links": 0,
+            "bindings": 0,
+        }
+    try:
+        from .rule_merge_store import RuleMergeStore
+        store = RuleMergeStore(workspace)
+        mem = sqlite3.connect(":memory:")
+        try:
+            src = store._db()
+            try:
+                # Online backup via sqlite3.Connection.backup(); the on-disk
+                # DB/WAL files are never touched by a raw copy.
+                src.backup(mem)
+            finally:
+                src.close()
+            mem.row_factory = sqlite3.Row
+            jobs = [
+                dict(row)
+                for row in mem.execute(_DIAGNOSTIC_JOBS_BY_STATUS_SQL).fetchall()
+            ]
+            jobs_by_status = {
+                str(row.get("status") or "unknown"): int(row.get("count") or 0)
+                for row in jobs
+            }
+            canonical_activation = [
+                dict(row)
+                for row in mem.execute(_DIAGNOSTIC_CANONICAL_STATE_SQL).fetchall()
+            ]
+            projection_rows = [
+                dict(row)
+                for row in mem.execute(_DIAGNOSTIC_PROJECTION_SQL).fetchall()
+            ]
+            source_links = int(
+                mem.execute(_DIAGNOSTIC_SOURCE_LINKS_SQL).fetchone()["count"]
+            )
+            bindings = int(
+                mem.execute(_DIAGNOSTIC_BINDINGS_SQL).fetchone()["count"]
+            )
+        finally:
+            mem.close()
+        from .schema_v3 import _now_iso
+        return {
+            "ok": True,
+            "initialized": True,
+            "generated_at": _now_iso(),
+            "share_group_id": share_group_id,
+            "jobs_by_status": jobs_by_status,
+            "canonical_activation": canonical_activation,
+            "projection": {
+                "projection_lag": sum(
+                    int(row.get("projection_lag", 0) or 0)
+                    for row in projection_rows
+                ),
+                "projection_error": next(
+                    (
+                        str(row.get("projection_error") or "")
+                        for row in projection_rows
+                        if row.get("projection_error")
+                    ),
+                    "",
+                ),
+                "scopes": [
+                    str(row.get("scope_id") or "") for row in projection_rows
+                ],
+            },
+            "source_links": source_links,
+            "bindings": bindings,
+        }
+    except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+        return {"ok": False, "error": f"diagnostics_snapshot_failed: {exc}"}
+
+
+def _handle_canonical_status(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    group_id, err = _diag_share_group_id(args, workspace)
+    if err:
+        return _mcp_error(err)
+    if not _group_store_exists(workspace, group_id):
+        return _governance_json_response({
+            "ok": False,
+            "share_group_id": group_id,
+            "error": "group_not_found",
+            "canonical_ready": False,
+        })
+    try:
+        from .rule_reconciliation import canonical_reconciliation_status
+        status = canonical_reconciliation_status(workspace, group_id)
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return _mcp_error(f"canonical_status_failed: {exc}")
+    return _governance_json_response({
+        "ok": True,
+        "share_group_id": group_id,
+        "canonical_ready": bool(status.get("canonical_ready")),
+        "failures": status.get("failures", []),
+        "checks": status.get("checks", {}),
+        "read_path": str(status.get("read_path", "legacy") or "legacy"),
+    })
+
+
+def _handle_diagnostics_snapshot(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    group_id, err = _diag_share_group_id(args, workspace)
+    if err:
+        return _mcp_error(err)
+    return _governance_json_response(
+        _build_diagnostics_snapshot(workspace, group_id)
+    )
+
+
+def _handle_projection_status(args: dict[str, Any]) -> dict[str, Any]:
+    workspace = _resolve_memory_workspace(args)
+    group_id, err = _diag_share_group_id(args, workspace)
+    if err:
+        return _mcp_error(err)
+    if not _rule_intelligence_db_exists(workspace):
+        return _governance_json_response({
+            "ok": False,
+            "reason": "rule_intelligence_store_not_initialized",
+            "projection_lag": 0,
+            "projection_error": "",
+            "scopes": [],
+        })
+    try:
+        from .rule_merge_store import RuleMergeStore
+        proj = RuleMergeStore(workspace).projection_status(group_ids=[group_id])
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        return _mcp_error(f"projection_status_failed: {exc}")
+    return _governance_json_response({
+        "ok": True,
+        "share_group_id": group_id,
+        "projection_lag": int(proj.get("projection_lag", 0) or 0),
+        "projection_error": str(proj.get("projection_error", "") or ""),
+        "scopes": proj.get("scopes", []),
+    })
+
+
+def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only runtime process facts (Req9), referencing the Req10 runtime
+    lease when present.  Missing fields are reported empty, never invented."""
+    import os as _os
+    workspace = _resolve_memory_workspace(args)
+    try:
+        from .runtime_lease import (
+            compute_code_fingerprint,
+            default_database_paths,
+            memoryguard_version,
+            runtime_lease_status,
+        )
+        try:
+            code_fingerprint = compute_code_fingerprint()
+        except Exception:  # noqa: BLE001
+            code_fingerprint = ""
+        try:
+            version = memoryguard_version()
+        except Exception:  # noqa: BLE001
+            version = ""
+        try:
+            db_paths = default_database_paths(workspace)
+        except Exception:  # noqa: BLE001
+            db_paths = []
+        try:
+            lease = runtime_lease_status(workspace)
+        except Exception:  # noqa: BLE001
+            lease = {}
+        return _governance_json_response({
+            "ok": True,
+            "pid": _os.getpid(),
+            "memoryguard_version": str(version or "") or SERVER_VERSION,
+            "code_fingerprint": code_fingerprint,
+            "control_workspace": str(Path(workspace)),
+            "database_paths": db_paths,
+            "runtime_lease": lease or None,
+        })
+    except Exception as exc:  # noqa: BLE001 - never fail a read-only diagnostic
+        return _governance_json_response({
+            "ok": True,
+            "pid": _os.getpid(),
+            "memoryguard_version": SERVER_VERSION,
+            "code_fingerprint": "",
+            "control_workspace": str(Path(workspace)),
+            "database_paths": [],
+            "runtime_lease": None,
+            "runtime_lease_error": f"{type(exc).__name__}: {exc}",
+        })
+
+
+# ---------------------------------------------------------------------------
 # GovernanceApi 缓存（同一 workspace 复用，避免每次 tool call 重建神经树）
 # ---------------------------------------------------------------------------
 
@@ -2385,3 +2838,45 @@ def serve_stdio() -> int:
 
 if __name__ == "__main__":
     sys.exit(serve_stdio())
+
+
+# ---------------------------------------------------------------------------
+# Req10: runtime split-brain guard.  Standalone wiring point -- the Req9 MCP
+# hardening layer calls this before mutating tools; it does NOT change the
+# existing execute_tool flow here.
+# ---------------------------------------------------------------------------
+
+
+def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
+    """Fail-closed runtime split-brain guard for mutating tools (Req10).
+
+    Read-only tools return ``None`` immediately.  For a mutating tool the
+    workspace's runtime lease is checked -- the first mutating call also
+    acquires this process's lease.  When a live process already holds the same
+    database set with a different memoryguard version / code fingerprint, the
+    call is rejected with ``runtime_split_brain`` and ``restart_required=True``;
+    the conflicting process is never killed.  Returns ``None`` when the lease
+    is granted.
+    """
+    if name not in _MUTATING_TOOLS:
+        return None
+    from .runtime_lease import check_runtime_lease
+
+    result = check_runtime_lease(workspace, pid=os.getpid())
+    if result.get("granted"):
+        return None
+    conflicting = result.get("conflicting", [])
+    pids = sorted(str(c.get("pid", "")) for c in conflicting)
+    text = (
+        "runtime_split_brain: another live process holds this workspace with "
+        "a different build; refusing to write. "
+        f"restart_required=true; conflicting_pids={pids}"
+    )
+    return {
+        "ok": False,
+        "error": "runtime_split_brain",
+        "restart_required": True,
+        "conflicting": conflicting,
+        "content": [{"type": "text", "text": f"error: {text}"}],
+        "isError": True,
+    }
