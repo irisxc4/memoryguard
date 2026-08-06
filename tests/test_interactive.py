@@ -190,6 +190,14 @@ def test_governance_actions_use_choices_and_explicit_scope() -> None:
     assert "callApi('list_memory_versions', activeShareGroupId)" in html
 
 
+def test_pywebview_bridge_falls_back_when_legacy_api_is_incomplete() -> None:
+    html = render_interactive_html()
+
+    assert "typeof bridge.call_readonly === 'function'" in html
+    assert "typeof bridge.request_mutation === 'function'" in html
+    assert "return await bridge.call_readonly(method, args)" in html
+
+
 def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
     """不可自动修复的风险也必须有明确处理出口，并要求修复后复扫。"""
     html = render_interactive_html()

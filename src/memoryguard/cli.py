@@ -1187,6 +1187,11 @@ def cmd_desktop(args: argparse.Namespace) -> int:
     return desktop_main(argv)
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    """从可见终端启动交互式治理台。"""
+    return gui_main([args.workspace])
+
+
 # ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
@@ -1303,6 +1308,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--keep-releases", type=int, default=20, help="reserved for future release pruning")
     p_gc.add_argument("--keep-snapshots", type=int, default=3, help="snapshots to retain")
     p_gc.set_defaults(func=cmd_gc)
+
+    p_gui = sub.add_parser("gui", help="launch the interactive governance console")
+    p_gui.add_argument("workspace", nargs="?", default=".", help="workspace path (default: .)")
+    p_gui.set_defaults(func=cmd_gui)
 
     p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
     p_desktop.add_argument("-w", "--workspace", default=".", help="workspace path")

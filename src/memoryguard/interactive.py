@@ -844,18 +844,20 @@ async function callApiRaw(method, ...args) {
 
 async function callApi(method, ...args) {
   // pywebview 模式：通过 call_readonly / request_mutation 桥接
-  if (window.pywebview && window.pywebview.api) {
+  const bridge = window.pywebview && window.pywebview.api;
+  if (bridge && typeof bridge.call_readonly === 'function'
+      && typeof bridge.request_mutation === 'function') {
     const mutMethods = await getMutationMethods();
     if (mutMethods.has(method)) {
       // 变更方法：走 request_mutation 桥接
-      const result = await window.pywebview.api.request_mutation(method, args);
+      const result = await bridge.request_mutation(method, args);
       if (result && result.deferred) {
         showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
       }
       return result;
     }
     // 只读方法：走 call_readonly 桥接
-    return await window.pywebview.api.call_readonly(method, args);
+    return await bridge.call_readonly(method, args);
   }
   // localhost 模式
   const headers = {'Content-Type': 'application/json'};

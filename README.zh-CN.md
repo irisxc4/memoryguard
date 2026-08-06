@@ -137,8 +137,11 @@ memoryguard hooks status --provider all
 启动桌面治理台：
 
 ```bash
-memoryguard-gui .
+memoryguard gui .
 ```
+
+`memoryguard-gui .` 仍可用于桌面快捷方式。PowerShell 和其他终端推荐使用
+`memoryguard gui .`，这样启动失败时可以直接看到错误信息。
 
 详细说明：[Claude Code](docs/install-claude-code.md) ·
 [Codex](docs/install-codex.md) · [Cursor](docs/install-cursor.md)
@@ -247,6 +250,7 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 | `mcp-status` | 查看本地共享记忆组 |
 | `hooks <action>` | 安装、检查、暂停、修复或移除宿主 Hook |
 | `gc [path]` | 预览或执行可重建产物清理 |
+| `gui [path]` | 启动交互式治理台 |
 | `desktop` | 启动可信桌面执行器 |
 
 以 `memoryguard --help` 和 `memoryguard <command> --help` 为当前安装版本的命令真相源。

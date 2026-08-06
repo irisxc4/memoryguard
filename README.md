@@ -155,8 +155,11 @@ memoryguard hooks status --provider all
 Launch the desktop console:
 
 ```bash
-memoryguard-gui .
+memoryguard gui .
 ```
+
+`memoryguard-gui .` remains available for desktop shortcuts. In PowerShell and
+other terminals, use `memoryguard gui .` so startup errors remain visible.
 
 Provider-specific setup and behavior:
 
@@ -410,6 +413,7 @@ The installed `memoryguard` command exposes these top-level operations:
 | `mcp-status` | Inspect local shared-memory groups |
 | `hooks <action>` | Install, inspect, pause, repair, or remove host Hooks |
 | `gc [path]` | Preview or apply garbage collection for rebuildable artifacts |
+| `gui [path]` | Launch the interactive governance console |
 | `desktop` | Launch the trusted desktop executor |
 
 Run `memoryguard --help` or `memoryguard <command> --help` for the live command

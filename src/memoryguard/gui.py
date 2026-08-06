@@ -629,13 +629,16 @@ def open_localhost_window(
         server_thread.start()
         try:
             _set_windows_app_user_model_id()
-            webview.create_window(
+            bridge = SafeBridgeApi(workspace, direct_mutations=True)
+            window = webview.create_window(
                 native_title,
                 url=url,
+                js_api=bridge,
                 width=1440,
                 height=900,
                 min_size=(800, 600),
             )
+            bridge._set_window(window)
             _start_webview(webview)
         finally:
             server.shutdown()
