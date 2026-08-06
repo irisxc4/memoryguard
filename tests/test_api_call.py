@@ -1,6 +1,9 @@
 """GovernanceApi smoke tests."""
+import os
 from pathlib import Path
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -134,6 +137,10 @@ def test_gui_main_falls_back_to_interactive_localhost(monkeypatch, tmp_path) -> 
     }
 
 
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="Windows path semantics: C:\\Windows does not exist on POSIX runners",
+)
 def test_gui_main_rejects_windows_system_directory(monkeypatch, capsys) -> None:
     from memoryguard import cli
 
