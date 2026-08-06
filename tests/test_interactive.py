@@ -198,12 +198,15 @@ def test_pywebview_bridge_falls_back_when_legacy_api_is_incomplete() -> None:
     assert "return await bridge.call_readonly(method, args)" in html
 
 
-def test_neuron_graph_keeps_visible_signal_field() -> None:
+def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     html = render_interactive_html()
 
-    assert 'class="neuron-signal-field"' in html
-    assert "neuron-particle-travel" in html
-    assert "neuron-signal s2" in html
+    assert 'id="neuron-particles"' in html
+    assert "animateNeuronEdgeParticle" in html
+    assert "renderedPosition()" in html
+    assert "control-point-distances" in html
+    assert "Math.atan2" in html
+    assert "neuron-particle-travel" not in html
 
 
 def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
