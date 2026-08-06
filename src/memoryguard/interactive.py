@@ -461,6 +461,25 @@ tbody tr:last-child td { border-bottom: 0; }
 .neuron-title p { margin-top: 4px; color: var(--muted); font-size: 11px; }
 .canvas-actions { display: flex; gap: 8px; }
 .neuron-canvas { position: absolute; inset: 0; z-index: 5; }
+.neuron-signal-field {
+  position: absolute; inset: 0; z-index: 6; pointer-events: none;
+  overflow: hidden; opacity: .88; mix-blend-mode: screen;
+}
+.neuron-signal {
+  position: absolute; width: 5px; height: 5px; border-radius: 50%;
+  background: #effff9; box-shadow: 0 0 8px 2px rgba(110,231,196,.92), 0 0 22px 6px rgba(110,231,196,.32);
+  animation: neuron-particle-travel 6.8s linear infinite;
+}
+.neuron-signal::after {
+  content: ""; position: absolute; width: 34px; height: 2px; right: 2px; top: 2px;
+  transform-origin: right center; transform: rotate(-16deg);
+  background: linear-gradient(90deg, transparent, rgba(188,255,235,.72));
+  filter: blur(.5px);
+}
+.neuron-signal.s2 { animation-name: neuron-particle-travel-2; animation-duration: 8.2s; }
+.neuron-signal.s3 { animation-name: neuron-particle-travel-3; animation-duration: 7.4s; }
+.neuron-signal.s4 { animation-name: neuron-particle-travel-2; animation-duration: 9.1s; }
+.neuron-signal.s5 { animation-name: neuron-particle-travel-3; animation-duration: 6.1s; }
 .neuron-stats {
   position: absolute; z-index: 11; left: 18px; bottom: 18px; max-width: calc(100% - 390px);
   display: flex; flex-wrap: wrap; gap: 8px; padding: 8px;
@@ -565,6 +584,25 @@ tbody tr:last-child td { border-bottom: 0; }
 @keyframes neuron-popover-glow {
   0%, 100% { border-color: rgba(110,231,196,.42); box-shadow: 0 24px 64px rgba(0,0,0,.46), 0 0 30px rgba(110,231,196,.09); }
   50% { border-color: rgba(188,255,235,.65); box-shadow: 0 30px 82px rgba(0,0,0,.52), 0 0 44px rgba(110,231,196,.24); }
+}
+@keyframes neuron-particle-travel {
+  0% { transform: translate3d(-40px, 18px, 0) scale(.35); opacity: 0; }
+  10% { opacity: .9; }
+  52% { transform: translate3d(38vw, -8vh, 0) scale(1); opacity: 1; }
+  88% { opacity: .72; }
+  100% { transform: translate3d(82vw, 18vh, 0) scale(.22); opacity: 0; }
+}
+@keyframes neuron-particle-travel-2 {
+  0% { transform: translate3d(18px, 34px, 0) scale(.25); opacity: 0; }
+  14% { opacity: .82; }
+  50% { transform: translate3d(26vw, 20vh, 0) scale(1); opacity: .95; }
+  100% { transform: translate3d(76vw, -10vh, 0) scale(.18); opacity: 0; }
+}
+@keyframes neuron-particle-travel-3 {
+  0% { transform: translate3d(-12px, 12px, 0) scale(.2); opacity: 0; }
+  12% { opacity: .8; }
+  56% { transform: translate3d(30vw, -18vh, 0) scale(.9); opacity: 1; }
+  100% { transform: translate3d(70vw, 10vh, 0) scale(.16); opacity: 0; }
 }
 @keyframes pulse-spin { to { transform: rotate(360deg); } }
 
@@ -1691,6 +1729,14 @@ function renderNeuronGraph() {
       <div class="neuron-canvas-haze" aria-hidden="true"></div>
       <div class="neuron-noise-layer" aria-hidden="true"></div>
       <div class="neuron-canvas" id="cy" aria-label="本地记忆神经图画布"></div>
+      <div class="neuron-signal-field" aria-hidden="true">
+        <i class="neuron-signal" style="left:8%;top:38%;animation-delay:-1.2s"></i>
+        <i class="neuron-signal s2" style="left:18%;top:62%;animation-delay:-4.8s"></i>
+        <i class="neuron-signal s3" style="left:35%;top:28%;animation-delay:-2.6s"></i>
+        <i class="neuron-signal s4" style="left:52%;top:72%;animation-delay:-6.1s"></i>
+        <i class="neuron-signal s5" style="left:68%;top:42%;animation-delay:-3.7s"></i>
+        <i class="neuron-signal s2" style="left:76%;top:24%;animation-delay:-7.2s"></i>
+      </div>
       <div class="neuron-legend">
         <div class="legend-item"><span class="legend-node soma"></span>记忆胞体</div>
         <div class="legend-item"><span class="legend-node"></span>来源/类型主题</div>

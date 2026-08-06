@@ -198,6 +198,14 @@ def test_pywebview_bridge_falls_back_when_legacy_api_is_incomplete() -> None:
     assert "return await bridge.call_readonly(method, args)" in html
 
 
+def test_neuron_graph_keeps_visible_signal_field() -> None:
+    html = render_interactive_html()
+
+    assert 'class="neuron-signal-field"' in html
+    assert "neuron-particle-travel" in html
+    assert "neuron-signal s2" in html
+
+
 def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
     """不可自动修复的风险也必须有明确处理出口，并要求修复后复扫。"""
     html = render_interactive_html()
