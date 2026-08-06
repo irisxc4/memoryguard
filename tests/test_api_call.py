@@ -113,3 +113,13 @@ def test_gui_main_falls_back_to_interactive_localhost(monkeypatch, tmp_path) -> 
         "workspace": str(tmp_path.resolve()),
         "auto_open": True,
     }
+
+
+def test_gui_main_rejects_windows_system_directory(monkeypatch, capsys) -> None:
+    from memoryguard import cli
+
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    result = cli.gui_main([r"C:\Windows\System32"])
+
+    assert result == 2
+    assert "refusing to use a Windows system directory" in capsys.readouterr().err

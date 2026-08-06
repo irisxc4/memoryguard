@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 import webbrowser
@@ -1327,7 +1328,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def gui_main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    workspace = Path(argv[0] if argv else ".").resolve()
+    raw_workspace = argv[0] if argv else os.environ.get("MEMORYGUARD_WORKSPACE", ".")
+    workspace = Path(raw_workspace).expanduser().resolve()
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+    if workspace == system_root or system_root in workspace.parents:
+        print(
+            "error: refusing to use a Windows system directory as the workspace.\n"
+            f"  resolved path: {workspace}\n"
+            "  run from your project directory or pass its path explicitly, for example:\n"
+            r"  memoryguard gui H:\ai\workspace\工具项目\memoryguard",
+            file=sys.stderr,
+        )
+        return 2
+    if not workspace.is_dir():
+        print(f"error: GUI workspace does not exist or is not a directory: {workspace}", file=sys.stderr)
+        return 2
     from .gui import (
         has_native_gui,
         open_interactive_window,
