@@ -112,6 +112,27 @@ class RuleBinding:
             self.priority,
         )
 
+    def bundle_scope_identity(self) -> tuple[Any, ...]:
+        """Scope identity for canonical *bundling*: same boundary, any priority.
+
+        ``audience_identity()`` includes ``priority`` because during a merge
+        ``before == after`` must compare the exact permission including its
+        weight.  Bundling is the opposite: two governed rules with the same
+        audience boundary belong in one canonical bundle even when their
+        priorities differ (100/20/10 all express "this audience" and must
+        collapse to one overlay, carrying the max priority).  Priority is
+        therefore deliberately excluded here.
+        """
+        return (
+            self.share_group_id,
+            self.target_type,
+            canonical_project_ref(self.project_ref),
+            self.target_id,
+            self.provider.casefold(),
+            self.runtime_role.casefold(),
+            self.effect,
+        )
+
     def with_definition(self, definition_id: str) -> "RuleBinding":
         return replace(
             self,
