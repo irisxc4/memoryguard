@@ -466,16 +466,42 @@ tbody tr:last-child td { border-bottom: 0; }
   overflow: hidden; mix-blend-mode: screen;
 }
 .neuron-edge-particle {
-  position: absolute; left: 0; top: 0; width: 7px; height: 7px;
-  border-radius: 50%; background: #effff9;
-  box-shadow: 0 0 8px 2px rgba(110,231,196,.98), 0 0 24px 7px rgba(110,231,196,.36);
+  display: block; position: absolute; left: 0; top: 0;
+  width: 10px; height: 10px; margin: 0; padding: 0; border: 0;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    #ffffff 0 18%,
+    #d8fff4 28%,
+    rgba(110,231,196,.65) 48%,
+    rgba(110,231,196,.18) 68%,
+    transparent 78%);
+  box-shadow:
+    0 0 6px 1px rgba(255,255,255,.55),
+    0 0 14px 4px rgba(110,231,196,.35);
   will-change: transform, opacity;
+  transform: translate3d(-9999px, -9999px, 0);
+  pointer-events: none;
 }
-.neuron-edge-particle::after {
-  content: ""; position: absolute; width: 42px; height: 2px; right: 3px; top: 3px;
-  transform-origin: right center; transform: rotate(var(--particle-angle, 0rad));
-  background: linear-gradient(90deg, transparent, rgba(188,255,235,.78));
-  filter: blur(.55px);
+.neuron-edge-particle-core {
+  position: absolute; left: 50%; top: 50%;
+  width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 4px 1px rgba(255,255,255,.8);
+}
+.neuron-edge-particle-trail {
+  position: absolute; left: 50%; top: 50%;
+  width: 18px; height: 3px; margin: -1.5px 0 0 -2px;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at right center,
+    rgba(255,255,255,.75) 0%,
+    rgba(110,231,196,.45) 40%,
+    transparent 75%);
+  transform: rotate(var(--particle-angle, 0rad));
+  transform-origin: 2px 50%;
+  filter: blur(.8px);
+  opacity: .85;
+  pointer-events: none;
 }
 .neuron-stats {
   position: absolute; z-index: 11; left: 18px; bottom: 18px; max-width: calc(100% - 390px);
@@ -493,10 +519,10 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .legend-item { display: flex; align-items: center; gap: 7px; margin: 5px 0; }
 .legend-node { width: 7px; height: 7px; border: 1px solid var(--accent); border-radius: 50%; box-shadow: 0 0 7px rgba(110,231,196,.48); }
-.legend-node.soma { width: 10px; height: 10px; background: rgba(110,231,196,.18); }
-.legend-node.hub { width: 10px; height: 7px; border-radius: 3px; border-style: dashed; border-color: #7dd3fc; box-shadow: none; }
+.legend-node.soma { width: 10px; height: 10px; background: rgba(110,231,196,.18); box-shadow: 0 0 12px rgba(110,231,196,.35); }
+.legend-node.hub { width: 9px; height: 9px; border-radius: 50%; border-style: dashed; border-color: #7dd3fc; box-shadow: 0 0 10px rgba(125,211,252,.28); }
 .legend-node.tentative { border-style: dashed; border-color: var(--orange); box-shadow: none; }
-.legend-node.anchor { width: 4px; height: 4px; border: 0; background: rgba(110,231,196,.56); }
+.legend-node.anchor { width: 5px; height: 5px; border: 0; border-radius: 50%; background: rgba(110,231,196,.72); box-shadow: 0 0 8px rgba(110,231,196,.55); }
 .legend-edge { width: 16px; height: 0; border-top: 1.5px solid rgba(110,231,196,.55); }
 .legend-edge.related { border-top-style: dashed; border-top-color: rgba(110,231,196,.4); }
 .legend-edge.shared { border-top-style: dashed; border-top-color: rgba(99,179,237,.7); }
@@ -890,6 +916,50 @@ async function callApi(method, ...args) {
   return result;
 }
 
+function sleepMs(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForMutation(result, label = '操作', timeoutMs = 120000) {
+  if (!result || !result.deferred) return result || {};
+  const request = result.request || {};
+  const requestId = request.request_id || result.request_id || '';
+  if (!requestId) {
+    return {ok: false, error: `${label}未返回可追踪的桌面请求编号`};
+  }
+  const deadline = Date.now() + timeoutMs;
+  let latest = request;
+  while (Date.now() < deadline) {
+    try {
+      latest = await callApi('get_request_status', requestId);
+    } catch (error) {
+      return {ok: false, error: `${label}状态查询失败：${error}`, request: latest};
+    }
+    const status = String(latest && latest.status || '').toLowerCase();
+    if (status === 'done') {
+      const payload = latest && latest.result && typeof latest.result === 'object'
+        ? latest.result : {};
+      return {...payload, request_id: requestId, execution_status: status};
+    }
+    if (['failed', 'rejected', 'expired'].includes(status)) {
+      return {
+        ok: false,
+        error: latest.error || `${label}${status === 'rejected' ? '已拒绝' : '未完成（' + status + '）'}`,
+        request: latest,
+        execution_status: status,
+      };
+    }
+    await sleepMs(300);
+  }
+  return {
+    ok: false,
+    pending: true,
+    error: `${label}等待桌面确认超时，请查看桌面执行器`,
+    request: latest,
+    execution_status: String(latest && latest.status || 'pending'),
+  };
+}
+
 // 知识书库入口：跳转到书架页（localhost / pywebview 均可用）。
 // pywebview 下用 window.location 切到 /knowledge；localhost 下同样导航。
 async function openKnowledge() {
@@ -981,11 +1051,21 @@ function scopeApiArgs() {
 }
 
 async function setActiveShareGroup(groupId) {
-  activeShareGroupId = groupId || '';
-  if (groupId) {
-    dataPageMode = 'multi_agent_shared_mcp';
-    await callApi('set_governance_scope', { mode: 'share_group', share_group_id: groupId });
+  const normalized = String(groupId || '').trim();
+  if (!normalized) return {ok: false, error: 'share_group_id_required'};
+  const result = await waitForMutation(
+    await callApi('set_governance_scope', {
+      mode: 'share_group',
+      share_group_id: normalized,
+    }),
+    '切换治理范围',
+  );
+  if (!result || result.error || result.ok === false) {
+    throw new Error((result && result.error) || '治理范围保存失败');
   }
+  activeShareGroupId = normalized;
+  dataPageMode = 'multi_agent_shared_mcp';
+  return result;
 }
 
 async function init() {
@@ -1754,27 +1834,33 @@ function renderNeuronGraph() {
     elements: graphElements(graph),
     style: [
       { selector: 'node', style: {
+        'shape': 'ellipse',
         'width': 'data(size)', 'height': 'data(size)', 'background-color': 'data(bg)',
-        'background-opacity': 'data(opacity)', 'border-width': 1.4, 'border-color': '#6ee7c4',
+        'background-opacity': 'data(opacity)', 'border-width': 1.2, 'border-color': '#6ee7c4',
+        'border-opacity': .9,
+        'underlay-opacity': 0, 'underlay-padding': 0, 'overlay-opacity': 0,
         'label': 'data(label)', 'color': '#cce5dc', 'font-size': 9.5,
         'font-family': 'Segoe UI, PingFang SC, sans-serif', 'font-weight': 500,
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 8,
         'text-outline-width': 2, 'text-outline-color': '#040b09', 'text-wrap': 'wrap', 'text-max-width': 92,
-        'transition-property': 'border-width, border-color, background-color, opacity, background-opacity, underlay-opacity, overlay-opacity',
-        'transition-duration': '180ms',
+        'transition-property': 'border-width, border-color, background-color, opacity, background-opacity',
+        'transition-duration': '220ms',
       }},
       { selector: 'node[kind = "root"]', style: {
-        'background-color': '#6ee7c4', 'background-opacity': .24, 'border-width': 2.5,
+        'shape': 'ellipse',
+        'background-color': '#6ee7c4', 'background-opacity': .32, 'border-width': 2.8,
         'border-color': '#bcffeb', 'font-size': 11,
-        'underlay-color': '#9ff0d6', 'underlay-opacity': .5, 'underlay-padding': 8,
       }},
       { selector: 'node[kind = "claim_anchor"]', style: {
-        'background-opacity': .68, 'border-width': 0, 'label': '',
+        'shape': 'ellipse',
+        'background-opacity': .95, 'border-width': 1.0, 'border-color': 'data(bg)',
+        'border-opacity': .55, 'label': '',
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
       { selector: 'node[kind = "source_hub"]', style: {
         'background-opacity': .42, 'border-width': 2.0,
         'border-color': '#7dd3fc', 'border-style': 'dashed',
-        'font-size': 9, 'shape': 'round-rectangle',
+        'font-size': 9, 'shape': 'ellipse',
       }},
       { selector: 'node[kind = "duplicate_cluster"]', style: {
         'background-opacity': .78, 'border-width': 1.8,
@@ -1782,12 +1868,12 @@ function renderNeuronGraph() {
       }},
       { selector: 'node[record_kind = "rules_habits"]', style: {
         'background-color': '#f6ad55', 'background-opacity': .3,
-        'border-width': 2.4, 'border-color': '#ffe3a1', 'shape': 'round-rectangle',
+        'border-width': 2.2, 'border-color': '#ffe3a1', 'shape': 'ellipse',
         'font-size': 10.5,
       }},
       { selector: 'node[record_kind = "conversation_history"]', style: {
         'background-color': '#7dd3fc', 'background-opacity': .28,
-        'border-width': 2.4, 'border-color': '#c5efff', 'shape': 'round-rectangle',
+        'border-width': 2.2, 'border-color': '#c5efff', 'shape': 'ellipse',
         'font-size': 10.5,
       }},
       { selector: 'node[kind = "history_session"]', style: {
@@ -1810,38 +1896,34 @@ function renderNeuronGraph() {
       { selector: 'edge[etype = "shared_source"]', style: { 'line-style': 'dashed', 'line-color': '#63b3ed', 'line-opacity': .34 }},
       { selector: 'edge[etype = "duplicate"]', style: { 'line-style': 'dashed', 'line-color': '#f6ad55', 'line-opacity': .28 }},
       { selector: 'edge.signal', style: {
-        'line-opacity': 1, 'width': 'mapData(strength, 0, 1, 3.6, 6.4)', 'line-color': '#effff9',
-        'underlay-color': '#6ee7c4', 'underlay-opacity': .92, 'underlay-padding': 8,
-        'overlay-color': '#effff9', 'overlay-opacity': .78, 'overlay-padding': 2,
+        'width': 'mapData(strength, 0, 1, 2.4, 4.8)',
+        'line-opacity': .82,
       }},
       { selector: 'edge.signal-trail', style: {
-        'line-opacity': .72, 'width': 'mapData(strength, 0, 1, 2.2, 4.2)', 'line-color': '#98f5d0',
-        'underlay-color': '#6ee7c4', 'underlay-opacity': .55, 'underlay-padding': 5,
+        'width': 'mapData(strength, 0, 1, 1.5, 3.0)',
+        'line-opacity': .44,
       }},
       { selector: 'node.signal', style: {
-        'border-width': 4, 'border-color': '#ffffff',
-        'underlay-color': '#bcffeb', 'underlay-opacity': .8, 'underlay-padding': 9,
-        'overlay-color': '#ffffff', 'overlay-opacity': .82, 'overlay-padding': 2,
+        'border-width': 3.2, 'border-color': '#ffffff', 'border-opacity': 1,
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
       { selector: 'node.hover', style: {
-        'border-width': 3.4, 'border-color': '#fff3a3',
-        'underlay-color': '#fff3a3', 'underlay-opacity': .58, 'underlay-padding': 8,
+        'border-width': 3.0, 'border-color': '#fff3a3', 'border-opacity': 1,
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
       { selector: 'node.focusPulse', style: {
-        'border-width': 4.5, 'border-color': '#ffffff',
-        'underlay-color': '#ffffff', 'underlay-opacity': .95, 'underlay-padding': 10,
-        'overlay-color': '#ffffff', 'overlay-opacity': .76, 'overlay-padding': 2,
+        'border-width': 3.6, 'border-color': '#ffffff', 'border-opacity': 1,
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
-      { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.5 }},
+      { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.4 }},
       { selector: 'node:selected', style: {
-        'border-width': 3, 'border-color': '#fff6c7',
-        'underlay-color': '#fff3a3', 'underlay-opacity': .46, 'underlay-padding': 7,
+        'border-width': 3.0, 'border-color': '#fff6c7', 'border-opacity': 1,
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
       { selector: 'node.pulse', style: {
-        'border-width': 4, 'border-color': '#ffffff',
-        'underlay-color': '#ffffff', 'underlay-opacity': .62, 'underlay-padding': 9,
-        'overlay-color': '#ffffff', 'overlay-opacity': .7, 'overlay-padding': 2,
+        'border-width': 3.4, 'border-color': '#ffffff', 'border-opacity': 1,
+        'underlay-opacity': 0, 'underlay-padding': 0,
       }},
     ],
     layout: {
@@ -1926,6 +2008,8 @@ function stopNeuronSignalPulses() {
   const frames = window.__neuronSignalFrames || new Set();
   frames.forEach(id => cancelAnimationFrame(id));
   window.__neuronSignalFrames = new Set();
+  window.__neuronSignalWaveIndex = 0;
+  window.__neuronSparkIndex = 0;
   const particles = document.querySelectorAll('.neuron-edge-particle');
   particles.forEach(particle => particle.remove());
   window.__neuronSignalRefs = {};
@@ -1975,9 +2059,11 @@ function buildNeuronSignalPath(cy, leaf) {
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
     pathNodes.unshift(cur);
-    const incomers = cur.incomers('edge').filter(isSignalNeuronEdge);
+    const incomers = cur.incomers('edge').filter(isSignalNeuronEdge).sort((a, b) =>
+      String(a.id()).localeCompare(String(b.id()))
+    );
     if (!incomers.length) break;
-    const edge = incomers[Math.floor(Math.random() * Math.min(incomers.length, 2))];
+    const edge = incomers[0];
     pathEdges.unshift(edge);
     cur = edge.source();
     if (cur.data('kind') === 'root') {
@@ -1989,7 +2075,7 @@ function buildNeuronSignalPath(cy, leaf) {
   return { nodes: pathNodes, edges: pathEdges };
 }
 
-function collectNeuronSignalPaths(cy, limit = 6) {
+function collectNeuronSignalPaths(cy, limit = 6, waveIndex = 0) {
   if (!cy || limit < 1) return [];
   const leaves = cy.nodes().filter(n => {
     if (!n || !n.length || n.data('kind') === 'root') return false;
@@ -2001,16 +2087,14 @@ function collectNeuronSignalPaths(cy, limit = 6) {
     const kind = n.data('kind');
     return kind === 'claim_anchor' || kind === 'duplicate_cluster';
   });
-  const candidates = anchors.length ? anchors : leaves;
-  const pool = [];
-  candidates.forEach(node => pool.push(node));
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
-  }
+  const candidates = (anchors.length ? anchors : leaves).sort((a, b) =>
+    String(a.id()).localeCompare(String(b.id()))
+  );
+  const start = candidates.length ? Math.abs(waveIndex) % candidates.length : 0;
   const paths = [];
   const signatures = new Set();
-  for (const leaf of pool) {
+  for (let offset = 0; offset < candidates.length; offset++) {
+    const leaf = candidates[(start + offset) % candidates.length];
     const path = buildNeuronSignalPath(cy, leaf);
     if (!path) continue;
     const signature = path.edges.map(edge => edge.id()).join('>');
@@ -2022,11 +2106,10 @@ function collectNeuronSignalPaths(cy, limit = 6) {
   if (!paths.length) {
     const edges = [];
     cy.edges().filter(isSignalNeuronEdge).forEach(edge => edges.push(edge));
-    for (let i = edges.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [edges[i], edges[j]] = [edges[j], edges[i]];
-    }
-    for (const edge of edges.slice(0, limit)) {
+    edges.sort((a, b) => String(a.id()).localeCompare(String(b.id())));
+    const edgeStart = edges.length ? Math.abs(waveIndex) % edges.length : 0;
+    for (let offset = 0; offset < Math.min(limit, edges.length); offset++) {
+      const edge = edges[(edgeStart + offset) % edges.length];
       paths.push({ nodes: [edge.source(), edge.target()], edges: [edge] });
     }
   }
@@ -2039,9 +2122,16 @@ function pickNeuronSignalPath(cy) {
 
 function runNeuronSignalPulse(cy, path) {
   if (!cy || !path || !path.edges.length) return;
-  const stepMs = 120;
-  const holdMs = 520;
+  // One continuous light travels root -> leaf across the whole path.
+  const perEdgeMs = 520;
+  const totalMs = Math.max(900, path.edges.length * perEdgeMs);
+  try {
+    animateNeuronPathParticle(cy, path, totalMs);
+  } catch (_) {
+    // 粒子层异常不能影响 Cytoscape 边/节点脉冲。
+  }
   path.edges.forEach((edge, index) => {
+    const startAt = Math.floor(index * perEdgeMs);
     const tid = setTimeout(() => {
       if (!cyInstance || cyInstance !== cy) return;
       _acquireSignal(cy, edge.id(), 'signal');
@@ -2049,35 +2139,84 @@ function runNeuronSignalPulse(cy, path) {
       const tgt = edge.target();
       if (src && src.length) _acquireSignal(cy, src.id(), 'signal');
       if (tgt && tgt.length) _acquireSignal(cy, tgt.id(), 'signal');
-      try {
-        animateNeuronEdgeParticle(cy, edge, 620);
-      } catch (_) {
-        // 粒子层异常不能影响 Cytoscape 边/节点脉冲。
-      }
       const releaseId = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         _releaseSignal(cy, edge.id(), 'signal');
         _acquireSignal(cy, edge.id(), 'signal-trail');
         if (src && src.length) _releaseSignal(cy, src.id(), 'signal');
-        if (tgt && tgt.length) _releaseSignal(cy, tgt.id(), 'signal');
+        // Keep leaf lit until the path particle arrives.
+        if (tgt && tgt.length && index < path.edges.length - 1) {
+          _releaseSignal(cy, tgt.id(), 'signal');
+        }
         const trailId = setTimeout(() => {
           if (!cyInstance || cyInstance !== cy) return;
           _releaseSignal(cy, edge.id(), 'signal-trail');
-        }, holdMs + 180);
+          if (tgt && tgt.length && index === path.edges.length - 1) {
+            _releaseSignal(cy, tgt.id(), 'signal');
+            if (tgt.flashClass) tgt.flashClass('pulse', 700);
+          }
+        }, 220);
         (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(trailId);
-      }, holdMs);
+      }, perEdgeMs);
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(releaseId);
-    }, index * stepMs);
+    }, startAt);
     (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
   });
 }
 
-function animateNeuronEdgeParticle(cy, edge, duration = 420) {
-  const layer = document.getElementById('neuron-particles');
-  if (!layer || !cy || !edge || !edge.length) return;
-  const particle = document.createElement('i');
+function _neuronEdgeBezier(edge, offsetX, offsetY) {
+  const sourcePosition = edge.source().renderedPosition();
+  const targetPosition = edge.target().renderedPosition();
+  const source = { x: sourcePosition.x + offsetX, y: sourcePosition.y + offsetY };
+  const target = { x: targetPosition.x + offsetX, y: targetPosition.y + offsetY };
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const length = Math.hypot(dx, dy) || 1;
+  const styleValue = name => (typeof edge.style === 'function' ? edge.style(name) : null);
+  const weight = Number.parseFloat(styleValue('control-point-weights')) || .5;
+  const distance = Number.parseFloat(styleValue('control-point-distances')) || 0;
+  const control = {
+    x: source.x + dx * weight - (dy / length) * distance,
+    y: source.y + dy * weight + (dx / length) * distance,
+  };
+  return { source, target, control };
+}
+
+function _neuronBezierPoint(source, control, target, t) {
+  const eased = t * t * (3 - 2 * t);
+  const inverse = 1 - eased;
+  const x = inverse * inverse * source.x + 2 * inverse * eased * control.x + eased * eased * target.x;
+  const y = inverse * inverse * source.y + 2 * inverse * eased * control.y + eased * eased * target.y;
+  const tangentX = 2 * inverse * (control.x - source.x) + 2 * eased * (target.x - control.x);
+  const tangentY = 2 * inverse * (control.y - source.y) + 2 * eased * (target.y - control.y);
+  return { x, y, angle: Math.atan2(tangentY, tangentX) };
+}
+
+function _spawnNeuronParticle() {
+  const particle = document.createElement('span');
   particle.className = 'neuron-edge-particle';
+  const core = document.createElement('span');
+  core.className = 'neuron-edge-particle-core';
+  const trail = document.createElement('span');
+  trail.className = 'neuron-edge-particle-trail';
+  particle.appendChild(trail);
+  particle.appendChild(core);
+  return particle;
+}
+
+function animateNeuronEdgeParticle(cy, edge, duration = 520) {
+  if (!cy || !edge || !edge.length) return;
+  animateNeuronPathParticle(cy, { edges: [edge], nodes: [edge.source(), edge.target()] }, duration);
+}
+
+function animateNeuronPathParticle(cy, path, duration = 900) {
+  const layer = document.getElementById('neuron-particles');
+  if (!layer || !cy || !path || !path.edges || !path.edges.length) return;
+  const edges = path.edges.filter(edge => edge && edge.length);
+  if (!edges.length) return;
+  const particle = _spawnNeuronParticle();
   layer.appendChild(particle);
+  const size = 10;
   const started = performance.now();
   let frameId = null;
   const cleanup = () => {
@@ -2090,37 +2229,37 @@ function animateNeuronEdgeParticle(cy, edge, duration = 420) {
     particle.remove();
   };
   const frame = () => {
-    if (!cyInstance || cyInstance !== cy || !edge.length) {
+    if (!cyInstance || cyInstance !== cy) {
       cleanup();
       return;
     }
     try {
-      const source = edge.source().renderedPosition();
-      const target = edge.target().renderedPosition();
-      if (!source || !target || !Number.isFinite(source.x) || !Number.isFinite(source.y)
-          || !Number.isFinite(target.x) || !Number.isFinite(target.y)) {
+      const cyRect = cy.container().getBoundingClientRect();
+      const layerRect = layer.getBoundingClientRect();
+      const offsetX = cyRect.left - layerRect.left;
+      const offsetY = cyRect.top - layerRect.top;
+      const raw = Math.min(1, (performance.now() - started) / duration);
+      // Map progress across the whole path so the light reaches the leaf end.
+      const scaled = raw * edges.length;
+      const idx = Math.min(edges.length - 1, Math.floor(scaled));
+      const local = (idx === edges.length - 1)
+        ? Math.min(1, scaled - idx)
+        : (scaled - idx);
+      const edge = edges[idx];
+      if (!edge || !edge.length) {
         cleanup();
         return;
       }
-      const raw = Math.min(1, (performance.now() - started) / duration);
-      const eased = raw * raw * (3 - 2 * raw);
-      const dx = target.x - source.x;
-      const dy = target.y - source.y;
-      const length = Math.hypot(dx, dy) || 1;
-      const styleValue = name => (typeof edge.style === 'function' ? edge.style(name) : null);
-      const weight = Number.parseFloat(styleValue('control-point-weights')) || .5;
-      const distance = Number.parseFloat(styleValue('control-point-distances')) || 0;
-      const control = {
-        x: source.x + dx * weight - (dy / length) * distance,
-        y: source.y + dy * weight + (dx / length) * distance,
-      };
-      const inverse = 1 - eased;
-      const x = inverse * inverse * source.x + 2 * inverse * eased * control.x + eased * eased * target.x - 3.5;
-      const y = inverse * inverse * source.y + 2 * inverse * eased * control.y + eased * eased * target.y - 3.5;
-      const tangentX = 2 * inverse * (control.x - source.x) + 2 * eased * (target.x - control.x);
-      const tangentY = 2 * inverse * (control.y - source.y) + 2 * eased * (target.y - control.y);
-      particle.style.setProperty('--particle-angle', `${Math.atan2(tangentY, tangentX)}rad`);
-      particle.style.opacity = String(raw < .08 ? raw / .08 : (raw > .88 ? (1 - raw) / .12 : 1));
+      const curve = _neuronEdgeBezier(edge, offsetX, offsetY);
+      if (!Number.isFinite(curve.source.x) || !Number.isFinite(curve.target.x)) {
+        cleanup();
+        return;
+      }
+      const point = _neuronBezierPoint(curve.source, curve.control, curve.target, local);
+      const x = point.x - size / 2;
+      const y = point.y - size / 2;
+      particle.style.setProperty('--particle-angle', `${point.angle}rad`);
+      particle.style.opacity = String(raw < .04 ? raw / .04 : (raw > .96 ? (1 - raw) / .04 : 1));
       particle.style.transform = `translate3d(${x}px,${y}px,0)`;
       if (raw < 1) {
         frameId = requestAnimationFrame(frame);
@@ -2144,8 +2283,8 @@ function startNeuronSignalPulses(cy) {
     try {
       const root = cy.$('node[kind = "root"]');
       if (root && root.length) {
-        root.flashClass('pulse', 900);
-        root.flashClass('focusPulse', 480);
+        root.flashClass('pulse', 1100);
+        root.flashClass('focusPulse', 720);
       }
     } catch (e) { /* ignore */ }
   };
@@ -2154,13 +2293,15 @@ function startNeuronSignalPulses(cy) {
     const candidates = cy.nodes('node[kind = "claim_anchor"], node[kind = "history_session"], node[kind = "virtual_bucket"]');
     if (!candidates || !candidates.length) return;
     const count = Math.min(2, candidates.length);
+    const sparkIndex = Number(window.__neuronSparkIndex || 0);
+    window.__neuronSparkIndex = sparkIndex + count;
     for (let i = 0; i < count; i++) {
-      const n = candidates[Math.floor(Math.random() * candidates.length)];
-      if (n && n.flashClass) n.flashClass('pulse', 650);
+      const n = candidates[(sparkIndex + i) % candidates.length];
+      if (n && n.flashClass) n.flashClass('pulse', 900);
     }
     try {
       const root = cy.$('node[kind = "root"]');
-      if (root && root.length) root.flashClass('focusPulse', 560);
+      if (root && root.length) root.flashClass('focusPulse', 780);
     } catch (_) { /* ignore */ }
   };
   rootPulse();
@@ -2169,10 +2310,13 @@ function startNeuronSignalPulses(cy) {
   window.__neuronSparkPulse = setInterval(spark, 5200);
   const fireWave = () => {
     if (!cyInstance || cyInstance !== cy) return;
-    const desired = Math.min(8, Math.max(4, Math.ceil(Math.sqrt(cy.nodes().length))));
-    const paths = collectNeuronSignalPaths(cy, desired);
+    // Always launch 3–4 concurrent full-path pulses for a denser, cooler look.
+    const desired = Math.min(4, Math.max(3, Math.min(4, cy.edges().length || 3)));
+    const waveIndex = Number(window.__neuronSignalWaveIndex || 0);
+    window.__neuronSignalWaveIndex = waveIndex + 1;
+    const paths = collectNeuronSignalPaths(cy, desired, waveIndex);
     paths.forEach((path, index) => {
-      const delay = index * 85 + Math.floor(Math.random() * 70);
+      const delay = index * 260;
       const tid = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         runNeuronSignalPulse(cy, path);
@@ -2182,7 +2326,7 @@ function startNeuronSignalPulses(cy) {
   };
   const initialWave = setTimeout(fireWave, 720);
   (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(initialWave);
-  window.__neuronSignalTimer = setInterval(fireWave, 1800);
+  window.__neuronSignalTimer = setInterval(fireWave, 2400);
 }
 
 function fitNeuronGraph() {
@@ -3021,16 +3165,26 @@ async function renderSources() {
   }
 }
 
-function selectAgentCard(instanceId) {
-  activeAgentInstanceId = instanceId;
-  dataPageMode = 'single_agent';
-  activeShareGroupId = '';
-  callApi('set_governance_scope', {
-    mode: 'agent',
-    agent_instance_id: instanceId,
-  }).catch(() => {});
-  if (state.activeTab === 'history') renderHistory();
-  else renderSources();
+async function selectAgentCard(instanceId) {
+  try {
+    const result = await waitForMutation(
+      await callApi('set_governance_scope', {
+        mode: 'agent',
+        agent_instance_id: instanceId,
+      }),
+      '切换 Agent 治理范围',
+    );
+    if (!result || result.error || result.ok === false) {
+      return showToast((result && result.error) || '治理范围保存失败', 'error');
+    }
+    activeAgentInstanceId = instanceId;
+    dataPageMode = 'single_agent';
+    activeShareGroupId = '';
+    if (state.activeTab === 'history') renderHistory();
+    else renderSources();
+  } catch (error) {
+    showToast('切换 Agent 失败：' + error, 'error');
+  }
 }
 
 function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) {
@@ -4067,11 +4221,25 @@ async function createSharedBinding() {
   if (!confirm(`确认创建共享组绑定？\n\n· ${agentIds.length} 个 Agent 通过 MemoryGuard MCP 共享同一组记忆\n· 原生记忆模式默认为 redirected（MCP 接管）\n· 创建后建议：导入原生记忆 → 安装 MCP 重定向 → 构建投影 → 确认正式接管\n\n继续？`)) return;
   showToast('正在创建绑定…');
   try {
-    const result = await callApi('bind_agents_to_shared_group', agentIds);
+    const result = await waitForMutation(
+      await callApi('bind_agents_to_shared_group', agentIds),
+      '创建共享组绑定',
+    );
     if (result.error) return showToast(result.error, 'error');
-    await setActiveShareGroup(result.share_group_id);
+    const groupId = result.share_group_id
+      || (result.scope && result.scope.share_group_id)
+      || '';
+    if (!groupId) {
+      return showToast('绑定已返回，但没有共享组 ID；请刷新绑定列表确认结果', 'error');
+    }
+    if (result.scope_persisted) {
+      activeShareGroupId = groupId;
+      dataPageMode = 'multi_agent_shared_mcp';
+    } else {
+      await setActiveShareGroup(groupId);
+    }
     showToast(`已创建共享组，绑定 ${agentIds.length} 个 Agent`, 'success');
-    showSharedGroupPreview(result.share_group_id, result.preview);
+    showSharedGroupPreview(groupId, result.preview);
   } catch (e) { showToast('创建失败：' + e, 'error'); }
 }
 
@@ -4145,15 +4313,21 @@ async function dissolveSharedGroup(groupId) {
 }
 
 async function exitMultiAgentMode() {
-  dataPageMode = 'single_agent';
-  activeShareGroupId = '';
   try {
     if (activeAgentInstanceId) {
-      await callApi('set_governance_scope', {
-        mode: 'agent',
-        agent_instance_id: activeAgentInstanceId,
-      });
+      const result = await waitForMutation(
+        await callApi('set_governance_scope', {
+          mode: 'agent',
+          agent_instance_id: activeAgentInstanceId,
+        }),
+        '退出多 Agent 范围',
+      );
+      if (!result || result.error || result.ok === false) {
+        return showToast((result && result.error) || '治理范围保存失败', 'error');
+      }
     }
+    dataPageMode = 'single_agent';
+    activeShareGroupId = '';
   } catch (_) {}
   showToast('已退回单 Agent 模式');
   renderSources();

@@ -4256,13 +4256,31 @@ class GovernanceApi:
             return admin_error
         from .agent_binding import AgentBindingStore
         store = AgentBindingStore(self.workspace)
-        return store.bind_agents_to_group(
+        result = store.bind_agents_to_group(
             agent_instance_ids=agent_instance_ids,
             share_group_id=share_group_id,
             mcp_server_name=mcp_server_name,
             native_memory_modes=native_memory_modes or {},
             redirect_paths=redirect_paths or {},
         )
+        # Creating a shared binding is also the GUI's explicit selection of
+        # that shared scope.  Persist the preference in the same trusted
+        # server-side operation so a localhost request cannot lose the group
+        # between the binding commit and the follow-up scope request.
+        from .governance_scope import GovernanceScope, save_scope_preference
+        persisted_scope = save_scope_preference(
+            self.workspace,
+            GovernanceScope(
+                mode="share_group",
+                share_group_id=result["share_group_id"],
+            ),
+        )
+        result["scope_persisted"] = bool(persisted_scope.get("ok"))
+        if persisted_scope.get("ok"):
+            result["scope"] = persisted_scope.get("scope")
+        else:
+            result["scope_error"] = persisted_scope.get("error", "scope_preference_save_failed")
+        return result
 
     def install_shared_group_mcp_redirects(
         self,
@@ -4724,29 +4742,54 @@ class GovernanceApi:
     def list_share_groups(self) -> dict:
         """全局治理入口:列出所有 share_group 及其记忆统计。
 
-        扫描 .memoryguard/shared-memory/*/memory.db,
-        返回每个 group 的记录数、冲突数、隔离数、绑定 Agent 数。
+        合并扫描 .memoryguard/shared-memory/*/memory.db 与 active
+        binding ledger，返回每个 group 的记录数、冲突数、隔离数、
+        绑定 Agent 数。binding 是组存在的事实来源，数据库目录只是
+        记忆统计来源，不能因为统计库暂时缺失就把已绑定组隐藏。
         """
         from pathlib import Path
+        from .agent_binding import AgentBindingStore, group_kind
+
         sm_root = Path(self.workspace) / ".memoryguard" / "shared-memory"
-        if not sm_root.is_dir():
-            return {"groups": [], "total": 0}
+        binding_store = AgentBindingStore(self.workspace)
+        active_bindings = binding_store.list_bindings(include_inactive=False)
+        group_ids = {
+            str(binding.share_group_id or "").strip()
+            for binding in active_bindings
+            if str(binding.share_group_id or "").strip()
+        }
+        if sm_root.is_dir():
+            group_ids.update(
+                path.name
+                for path in sm_root.iterdir()
+                if path.is_dir()
+            )
+
         groups: list[dict] = []
-        for group_dir in sorted(sm_root.iterdir()):
-            if not group_dir.is_dir():
-                continue
-            group_id = group_dir.name
+        for group_id in sorted(group_ids):
             try:
                 from .shared_memory_store import SharedMemoryStore
-                store = SharedMemoryStore(self.workspace, group_id)
-                records = store.list_records()
-                active = [r for r in records if r.status.value == "active"]
-                conflicts = store.list_conflicts()
-                quarantine = store.list_quarantine()
-                from .agent_binding import AgentBindingStore, group_kind
-                bindings = AgentBindingStore(self.workspace).list_bindings()
-                agents = [b.agent_instance_id for b in bindings
-                          if b.share_group_id == group_id and b.status.value == "active"]
+                try:
+                    store = SharedMemoryStore(
+                        self.workspace,
+                        group_id,
+                        read_only=True,
+                        must_exist=True,
+                    )
+                    records = store.list_records()
+                    active = [r for r in records if r.status.value == "active"]
+                    conflicts = store.list_conflicts()
+                    quarantine = store.list_quarantine()
+                except FileNotFoundError:
+                    # Keep the binding visible even when the statistics DB was
+                    # archived or interrupted before creation.
+                    records, active, conflicts, quarantine = [], [], [], []
+                agents = [
+                    binding.agent_instance_id
+                    for binding in active_bindings
+                    if binding.share_group_id == group_id
+                    and binding.status.value == "active"
+                ]
                 groups.append({
                     "share_group_id": group_id,
                     "group_kind": group_kind(group_id),
@@ -4756,6 +4799,9 @@ class GovernanceApi:
                     "quarantine_count": len(quarantine),
                     "bound_agents": agents,
                     "agent_count": len(agents),
+                    "store_available": bool(records or conflicts or quarantine or (
+                        sm_root / group_id / "memory.db"
+                    ).exists()),
                 })
             except Exception as e:
                 import logging

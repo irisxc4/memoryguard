@@ -81,8 +81,12 @@ class RequestExecutor:
 
     DISABLED_METHODS = frozenset({"purge_agent_dir"})
 
-    def __init__(self, workspace: str | Path):
+    def __init__(self, workspace: str | Path, *, trusted_desktop: bool = False):
         self.workspace = Path(workspace).resolve()
+        # Only the real desktop executor entrypoint may opt into the
+        # server-owned admin context. Direct/unit-test construction remains
+        # unprivileged, so a caller cannot forge admin through request args.
+        self.trusted_desktop = bool(trusted_desktop)
         from .security import RequestQueue
         self.queue = RequestQueue(self.workspace)
 
@@ -134,7 +138,25 @@ class RequestExecutor:
             }
 
         from .gui import GovernanceApi
-        api = GovernanceApi(str(self.workspace))
+        access_context = None
+        if self.trusted_desktop:
+            from .access_context import AccessContext
+            access_context = AccessContext(
+                trusted_agent_id="",
+                is_admin=True,
+                strict_binding=True,
+                allow_anon=False,
+                session_id=f"desktop-executor-{os.getpid()}",
+                session_source="transport",
+                session_trusted=True,
+            )
+        if access_context is None:
+            api = GovernanceApi(str(self.workspace))
+        else:
+            api = GovernanceApi(
+                str(self.workspace),
+                _trusted_access_context=access_context,
+            )
 
         fn = getattr(api, req.method, None)
         if not callable(fn):
@@ -532,7 +554,7 @@ def handle_uri(uri: str) -> int:
         )
         return 1
 
-    executor = RequestExecutor(ws)
+    executor = RequestExecutor(ws, trusted_desktop=True)
     results = executor.process_request(request_id)
 
     _show_results_window(results)
@@ -692,7 +714,7 @@ def main(argv: list[str] | None = None) -> int:
         return handle_uri(args.uri)
 
     workspace = Path(args.workspace).resolve()
-    executor = RequestExecutor(workspace)
+    executor = RequestExecutor(workspace, trusted_desktop=True)
 
     if args.request:
         # 处理单个请求

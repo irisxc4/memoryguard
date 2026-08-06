@@ -156,3 +156,49 @@ def test_gui_workspace_prefers_environment(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     assert _resolve_gui_workspace([]) == tmp_path.resolve()
+
+
+def test_bare_gui_uses_fixed_user_control_directory_without_picker(
+    monkeypatch, tmp_path,
+) -> None:
+    from memoryguard import cli
+
+    control_home = tmp_path / "memoryguard-home"
+    stale_project = tmp_path / "stale-project"
+    stale_project.mkdir()
+    control_home.mkdir()
+    (control_home / "gui-state.json").write_text(
+        '{"workspace": "%s"}' % stale_project,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(control_home))
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+
+    assert cli._resolve_gui_workspace([]) == control_home.resolve()
+
+
+def test_bare_gui_creates_fixed_control_directory(
+    monkeypatch, tmp_path,
+) -> None:
+    from memoryguard import cli
+    from memoryguard import gui
+
+    control_home = tmp_path / "memoryguard-home"
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(control_home))
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.setattr(gui, "has_native_gui", lambda: False)
+
+    called = {}
+
+    def fake_localhost(workspace: str, *, auto_open: bool = True):
+        called["workspace"] = workspace
+        called["auto_open"] = auto_open
+        return 0, "http://127.0.0.1:12345/"
+
+    monkeypatch.setattr(gui, "open_localhost_window", fake_localhost)
+    assert cli.gui_main([]) == 0
+    assert control_home.is_dir()
+    assert called == {
+        "workspace": str(control_home.resolve()),
+        "auto_open": True,
+    }

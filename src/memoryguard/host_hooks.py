@@ -88,15 +88,21 @@ _SHELL_WRITE_PATTERN = re.compile(
 
 
 
-def read_hook_stdin_json(stdin_buffer=None):
-    """Decode hook stdin JSON. utf-8-sig strips BOM (Cursor) and accepts plain UTF-8 (Codex)."""
-    import json
-    import sys
+def read_hook_stdin_json(stdin_buffer=None) -> dict[str, Any]:
+    """Decode hook stdin JSON.
+
+    Always read bytes and decode with utf-8-sig so Cursor BOM stdin and
+    Codex plain UTF-8 both parse. Install/upgrade ships this path; hosts
+    must not depend on emergency site-packages patches.
+    """
     buf = sys.stdin.buffer if stdin_buffer is None else stdin_buffer
-    raw = buf.read()
-    if not raw:
+    raw = buf.read(2_000_000)
+    if not raw or not raw.strip():
         return {}
-    return json.loads(raw.decode("utf-8-sig"))
+    data = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(data, dict):
+        raise ValueError("hook input must be a JSON object")
+    return data
 
 
 def _now_iso() -> str:
@@ -1395,12 +1401,20 @@ def _is_memoryguard_tool(tool_name: str, operation: str = "") -> bool:
 def _cursor_mcp_inner_tool_name(tool_name: str, tool_input: Any = None) -> str:
     """Cursor agents wrap MCP as CallMcpTool; real MCP tool name is in tool_input."""
     raw = (tool_name or "").casefold()
-    compact = raw.replace("_", "")
-    if compact != "callmcptool" and "callmcptool" not in compact:
+    compact = raw.replace("_", "").replace("-", "")
+    if "callmcptool" not in compact and compact not in {"callmcptool"}:
         return ""
     if not isinstance(tool_input, dict):
         return ""
-    inner = tool_input.get("toolName") or tool_input.get("tool_name") or ""
+    inner = (
+        tool_input.get("toolName")
+        or tool_input.get("tool_name")
+        or tool_input.get("name")
+        or ""
+    )
+    if not inner and isinstance(tool_input.get("arguments"), dict):
+        args = tool_input["arguments"]
+        inner = args.get("toolName") or args.get("tool_name") or args.get("name") or ""
     return str(inner)
 
 
@@ -2011,7 +2025,8 @@ def run_hook(
                     "stop_continued": False,
                 }
                 _save_state(root, normalized_provider, session_id, state)
-            # Cursor: mark bootstrap on pre_tool; do not rely on postToolUse for MCP.
+            # Cursor: mark bootstrap on pre_tool (CallMcpTool-aware).
+            # Install/upgrade ships CallMcpTool bootstrap recognition;
             if _is_memoryguard_bootstrap(tool_name, tool_input):
                 if not isinstance(state, dict):
                     state = {}
@@ -2116,13 +2131,8 @@ def run_hook(
 
 
 def _read_stdin_json() -> dict[str, Any]:
-    raw = sys.stdin.read(2_000_000)
-    if not raw.strip():
-        return {}
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError("hook input must be a JSON object")
-    return data
+    """CLI entrypoint: binary utf-8-sig decode (Cursor BOM-safe)."""
+    return read_hook_stdin_json()
 
 
 def _configure_utf8_stdio() -> None:

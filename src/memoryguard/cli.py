@@ -1335,7 +1335,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.set_defaults(func=cmd_gc)
 
     p_gui = sub.add_parser("gui", help="launch the interactive governance console")
-    p_gui.add_argument("workspace", nargs="?", default="", help="workspace path (auto-detected when omitted)")
+    p_gui.add_argument(
+        "workspace",
+        nargs="?",
+        default="",
+        help="workspace path (uses the fixed user-level control directory when omitted)",
+    )
     p_gui.set_defaults(func=cmd_gui)
 
     p_desktop = sub.add_parser("desktop", help="launch MemoryGuard Desktop Executor (trusted execution)")
@@ -1350,51 +1355,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _gui_state_path() -> Path:
+def _default_gui_workspace() -> Path:
+    """Return the fixed user-level workspace used by a bare GUI launch.
+
+    The installed package directory is an application location, not a data
+    location. Runtime UI and governance artifacts belong under the same
+    user-level home used by the Knowledge Library.
+    """
     from .data_home import resolve_data_home
 
-    return resolve_data_home() / "gui-state.json"
-
-
-def _load_last_gui_workspace() -> Path | None:
-    try:
-        data = json.loads(_gui_state_path().read_text(encoding="utf-8"))
-        path = Path(str(data.get("workspace", ""))).expanduser().resolve()
-        return path if path.is_dir() else None
-    except (OSError, ValueError, TypeError):
-        return None
-
-
-def _choose_gui_workspace() -> Path | None:
-    """让无上下文启动的 GUI 选择一次项目目录。"""
-    try:
-        import tkinter
-        from tkinter import filedialog
-
-        root = tkinter.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        selected = filedialog.askdirectory(
-            title="选择要打开的 MemoryGuard 项目文件夹",
-            mustexist=True,
-        )
-        root.destroy()
-        return Path(selected).resolve() if selected else None
-    except Exception as exc:
-        print(f"error: cannot open the workspace picker: {exc}", file=sys.stderr)
-        return None
-
-
-def _remember_gui_workspace(workspace: Path) -> None:
-    try:
-        state_path = _gui_state_path()
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(
-            json.dumps({"workspace": str(workspace)}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
+    return resolve_data_home()
 
 
 def _resolve_gui_workspace(argv: list[str]) -> Path | None:
@@ -1407,16 +1377,10 @@ def _resolve_gui_workspace(argv: list[str]) -> Path | None:
         if candidate.is_dir():
             return candidate
 
-    last = _load_last_gui_workspace()
-    if last is not None:
-        return last
-
-    cwd = Path.cwd().resolve()
-    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
-    if cwd.is_dir() and cwd != system_root and system_root not in cwd.parents:
-        return cwd
-
-    return _choose_gui_workspace()
+    # A GUI shortcut commonly starts with C:\Windows\System32 as cwd. Never
+    # infer the data workspace from that process detail; use the stable
+    # per-user control directory instead.
+    return _default_gui_workspace()
 
 
 def gui_main(argv: list[str] | None = None) -> int:
@@ -1440,9 +1404,21 @@ def gui_main(argv: list[str] | None = None) -> int:
         )
         return 2
     if not workspace.is_dir():
-        print(f"error: GUI workspace does not exist or is not a directory: {workspace}", file=sys.stderr)
-        return 2
-    _remember_gui_workspace(workspace)
+        if workspace != _default_gui_workspace():
+            print(
+                f"error: GUI workspace does not exist or is not a directory: {workspace}",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"error: cannot create the fixed GUI control directory: {workspace}\n"
+                f"  {exc}",
+                file=sys.stderr,
+            )
+            return 2
     from .gui import (
         has_native_gui,
         open_interactive_window,

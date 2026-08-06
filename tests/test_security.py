@@ -277,6 +277,22 @@ class TestDesktopExecutor:
         assert result["ok"] is True, result
         assert result["result"].get("version_id")
 
+    def test_trusted_desktop_entrypoint_can_execute_admin_binding(self, tmp_path, monkeypatch):
+        """真实桌面入口在确认后拥有服务端管理员上下文。"""
+        monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+        from memoryguard.desktop_executor import RequestExecutor
+        from memoryguard.security import RequestQueue
+
+        request = RequestQueue(tmp_path).submit(
+            "bind_agents_to_shared_group",
+            [["agent-a", "agent-b"], "trusted-desktop-group"],
+        )
+        result = RequestExecutor(tmp_path, trusted_desktop=True).execute(request)
+
+        assert result["ok"] is True, result
+        assert result["result"]["share_group_id"] == "trusted-desktop-group"
+        assert result["result"]["scope_persisted"] is True
+
     def test_confirmed_injection_spy(self, tmp_path):
         """spy 测试：验证 confirmed=True 被正确注入到绑定方法。
 
