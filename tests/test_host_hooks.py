@@ -1127,3 +1127,58 @@ def test_cli_ensure_installs_only_explicit_provider(
     assert (home / ".claude" / "settings.json").exists()
     assert not (home / ".codex" / "hooks.json").exists()
     assert not (home / ".cursor" / "hooks.json").exists()
+
+
+# --- Part B1: payload-derived host provider + conflict diagnostic ----------
+
+def test_derive_host_provider_recognizes_cursor_envelope_and_claude_event():
+    from memoryguard.host_hooks import derive_host_provider
+
+    assert derive_host_provider({"event": {"name": "beforeSubmitPrompt"}}) == "cursor"
+    assert derive_host_provider({"session": {"session_id": "x"}}) == "cursor"
+    assert derive_host_provider({"hook_event_name": "UserPromptSubmit"}) == "claude"
+    assert derive_host_provider({}) == ""
+    assert derive_host_provider({"event": "user_prompt"}) == ""  # top-level string, not dict
+    assert derive_host_provider(None) == ""
+
+
+def test_history_archived_under_payload_provider_and_conflict_recorded(tmp_path: Path):
+    from memoryguard.host_hooks import derive_host_provider, run_hook
+
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "cursor-agent", "group-a")
+    # argv says cursor, but payload has a Claude-shaped top-level marker:
+    # the session must be archived under the *proven* provider (claude),
+    # and a host_provider_conflict diagnostic must be recorded.
+    payload = {
+        "session_id": "payload-proven-session",
+        "prompt": "根据宿主形状归档",
+        "cwd": str(workspace),
+        "hook_event_name": "UserPromptSubmit",
+    }
+    result = run_hook(
+        provider="cursor",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload=payload,
+    )
+    assert derive_host_provider(payload) == "claude"
+
+    from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+    scope = HistoryScope(agent_instance_id="cursor-agent", project_ref=str(workspace),
+                         provider="claude", share_group_id="group-a")
+    sessions = ConversationHistoryStore(workspace).list_sessions(scope)["sessions"]
+    proven = [s for s in sessions if s["external_id"] == "payload-proven-session"]
+    assert len(proven) == 1
+    assert proven[0]["provider"] == "claude"
+    receipts = (workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json")
+    history = next(
+        json.loads(r.read_text(encoding="utf-8"))["history_archive"]
+        for r in receipts
+        if "history_archive" in json.loads(r.read_text(encoding="utf-8"))
+    )
+    assert history.get("host_provider_conflict") is True
+    assert history.get("payload_provider") == "claude"

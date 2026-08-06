@@ -4249,6 +4249,7 @@ class GovernanceApi:
                                     mcp_server_name: str = "memoryguard",
                                     native_memory_modes: dict[str, str] | None = None,
                                     redirect_paths: dict[str, list[str]] | None = None,
+                                    allow_empty_group_creation: bool = False,
                                     *, _admin_override: bool = False) -> dict:
         # A2: 与 bind_agent 对齐
         admin_error = self._require_admin()
@@ -4262,6 +4263,7 @@ class GovernanceApi:
             mcp_server_name=mcp_server_name,
             native_memory_modes=native_memory_modes or {},
             redirect_paths=redirect_paths or {},
+            allow_empty_group_creation=allow_empty_group_creation,
         )
         # Creating a shared binding is also the GUI's explicit selection of
         # that shared scope.  Persist the preference in the same trusted

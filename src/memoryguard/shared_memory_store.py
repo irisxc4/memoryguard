@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shutil
 import sqlite3
 from collections.abc import Mapping
@@ -548,6 +549,7 @@ class SharedMemoryStore:
                 raise FileNotFoundError(
                     f"shared memory group not found: {self.group_id}"
                 )
+            self._warn_on_silent_empty_group()
             self._ensure_dirs()
             self._init_db()
             self._migrate_from_jsonl()
@@ -565,6 +567,36 @@ class SharedMemoryStore:
 
     def _ensure_dirs(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def _warn_on_silent_empty_group(self) -> None:
+        """C3: 切换控制目录后防止静默物化空组。
+
+        当本 group 尚不存在、却已存在其它非空 shared-memory 组时（例如
+        控制面搬到了 AppData 而记忆留在项目 workspace），写打开一个全新空组
+        会让人以为记忆「消失」。这里只告警、不阻断（首跑/personal 流程依赖
+        写打开自动建组）；跨 workspace 的迁移由 ``memoryguard groups migrate``
+        工具补位。
+        """
+        if self.group_id.startswith("personal-") or self.db_path.exists():
+            return
+        try:
+            from .group_migration import find_nonempty_shared_groups
+            legacy = find_nonempty_shared_groups(self.workspace)
+        except Exception:
+            # Best-effort advisory only; never break group open.
+            return
+        if not legacy:
+            return
+        names = ", ".join(
+            f"{g['group_id']}({g['records']})" for g in legacy
+        )
+        logging.warning(
+            "creating shared-memory group %s while non-empty legacy groups "
+            "exist (%s); run `memoryguard groups migrate` to consolidate "
+            "before relying on this group",
+            self.group_id,
+            names,
+        )
 
     def _append_jsonl(self, path: Path, obj: Any) -> None:
         """追加一行 JSON 到 JSONL 备份文件。"""

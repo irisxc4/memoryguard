@@ -507,6 +507,58 @@ class ConversationHistoryStore:
         return "hist-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
     @staticmethod
+    def _resolve_canonical_session(
+        conn: Any,
+        candidate_session_id: str,
+        external_id: str,
+        scope: HistoryScope,
+        provider: str,
+    ) -> str:
+        """Retarget an append at the canonical session row for ``external_id``.
+
+        The session identity hashes ``provider`` into the key, so the same
+        physical conversation archived under two hosts (the dual-write bug)
+        yields two rows.  Look the row up by ``external_id`` -- same agent /
+        same canonical project first, then any agent -- and when a *different*
+        row already exists, fold it into the current host-proven identity
+        (provider / agent / project / group) and return its ``session_id`` so
+        the append continues under the canonical row.  Returns the candidate
+        when no such row exists.
+        """
+        same_agent = conn.execute(
+            "SELECT session_id FROM conversation_sessions "
+            "WHERE external_id=? AND deleted_at='' AND agent_instance_id=? "
+            "AND (project_ref=? OR project_ref='') "
+            "ORDER BY CASE WHEN project_ref=? THEN 0 ELSE 1 END LIMIT 1",
+            (external_id, scope.agent_instance_id, scope.project_ref, scope.project_ref),
+        ).fetchone()
+        row = same_agent
+        if row is None:
+            # Cross-agent fallback: the original bug also wrote rows under a
+            # different agent instance.  Consolidate onto one row either way.
+            row = conn.execute(
+                "SELECT session_id FROM conversation_sessions "
+                "WHERE external_id=? AND deleted_at='' "
+                "ORDER BY rowid LIMIT 1",
+                (external_id,),
+            ).fetchone()
+        if row is None:
+            return candidate_session_id
+        canonical = str(row["session_id"])
+        if canonical == candidate_session_id:
+            return canonical
+        # Fold the row into the current identity so the subsequent
+        # ON CONFLICT(external_id, provider, agent_instance_id, project_ref,
+        # share_group_id) matches it instead of colliding on the primary key.
+        conn.execute(
+            "UPDATE conversation_sessions SET provider=?, agent_instance_id=?, "
+            "project_ref=?, share_group_id=? WHERE session_id=?",
+            (provider, scope.agent_instance_id, scope.project_ref,
+             scope.share_group_id, canonical),
+        )
+        return canonical
+
+    @staticmethod
     def _import_turn_id(session_id: str, source_ordinal: int, content_hash: str) -> str:
         return f"{session_id}-i{source_ordinal:06d}-{content_hash[:16]}"
 
@@ -521,6 +573,13 @@ class ConversationHistoryStore:
         items = list(conversations)
         if len(items) > MAX_IMPORT_CONVERSATIONS:
             raise ValueError("history_import_conversation_limit_exceeded")
+        from .encoding_guard import guard_persist_content
+
+        def _guard_import_content(value: str) -> str:
+            """Repair mojibake; unrecoverable messages are skipped (fail-closed
+            per message, never aborting the whole batch import)."""
+            return guard_persist_content(value)
+
         sessions = turns = total_chars = 0
         with self._transaction() as conn:
             try:
@@ -555,15 +614,31 @@ class ConversationHistoryStore:
                     # stable; the project column is the only identity that
                     # changes.  Prefer an exact current-project row.
                     prior = conn.execute(
-                        "SELECT session_id FROM conversation_sessions "
+                        "SELECT session_id, provider FROM conversation_sessions "
                         "WHERE external_id=? AND provider=? AND agent_instance_id=? "
                         "AND (project_ref=? OR project_ref='') "
                         "ORDER BY CASE WHEN project_ref=? THEN 0 ELSE 1 END LIMIT 1",
                         (external_id, active_provider, conv_scope.agent_instance_id,
                          conv_scope.project_ref, conv_scope.project_ref),
                     ).fetchone()
+                    if prior is None:
+                        # Cross-provider retry: a conversation imported under
+                        # another host (dual-write) must fold into one row.
+                        prior = conn.execute(
+                            "SELECT session_id, provider FROM conversation_sessions "
+                            "WHERE external_id=? AND agent_instance_id=? "
+                            "AND (project_ref=? OR project_ref='') "
+                            "ORDER BY CASE WHEN project_ref=? THEN 0 ELSE 1 END LIMIT 1",
+                            (external_id, conv_scope.agent_instance_id,
+                             conv_scope.project_ref, conv_scope.project_ref),
+                        ).fetchone()
                     if prior is not None:
                         session_id = str(prior["session_id"])
+                        if str(prior["provider"] or "") != active_provider:
+                            conn.execute(
+                                "UPDATE conversation_sessions SET provider=? WHERE session_id=?",
+                                (active_provider, session_id),
+                            )
                     existing = conn.execute(
                         "SELECT title FROM conversation_sessions WHERE session_id=?", (session_id,)
                     ).fetchone()
@@ -581,6 +656,10 @@ class ConversationHistoryStore:
                             continue
                         candidate = str(message.get("content") or "").strip()
                         if not candidate:
+                            continue
+                        try:
+                            candidate = _guard_import_content(candidate)
+                        except ValueError:
                             continue
                         digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
                         new_turn_ids.append(self._import_turn_id(session_id, source_ordinal, digest))
@@ -616,6 +695,10 @@ class ConversationHistoryStore:
                             continue
                         content = str(message.get("content") or "").strip()
                         if not content:
+                            continue
+                        try:
+                            content = _guard_import_content(content)
+                        except ValueError:
                             continue
                         if len(content) > MAX_TURN_CHARS:
                             raise ValueError("history_import_turn_size_limit_exceeded")
@@ -681,100 +764,110 @@ class ConversationHistoryStore:
             raise ValueError("history_event_identity_and_content_required")
         if len(text) > MAX_TURN_CHARS:
             raise ValueError("history_import_turn_size_limit_exceeded")
-        try:
-            text.encode("utf-8", errors="strict")
-        except UnicodeError as exc:
-            raise ValueError("history_content_not_utf8") from exc
+        # Persist-boundary mojibake guard: auto-repair pervasively corrupt
+        # content; raise (fail-closed) if irrecoverable garbage remains.  This
+        # replaces the old ``.encode("utf-8", errors="strict")`` check, which
+        # could not stop already-mojibake'd *valid* Unicode.
+        from .encoding_guard import guard_persist_content
 
-        session_id = self._session_id(external_session_id, scope, active_provider)
+        text = guard_persist_content(text)
+
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         event_key = event_id if event_stable else ""
         capture_key = event_key or f"capture:{uuid.uuid4().hex}"
-        turn_hash = hashlib.sha256(
-            f"{session_id}\x1f{capture_key}\x1f{content_hash}".encode("utf-8")
-        ).hexdigest()[:24]
-        turn_id = f"{session_id}-e{turn_hash}"
-        safe_created_at = str(created_at or "")[:80]
-        candidate_title, candidate_quality = _choose_session_title(
-            explicit_title=title,
-            messages=[{"role": role, "content": text}],
-            provider=active_provider, occurred_at=safe_created_at or _now(),
-            external_id=external_session_id, session_id=session_id,
-        )
         with self._transaction() as conn:
-                existing_session = conn.execute(
-                    "SELECT title FROM conversation_sessions WHERE session_id=?", (session_id,)
+            # Cross-provider dedup: fold the append into the canonical row for
+            # this external_id (B2) before deriving any session-scoped IDs.
+            candidate_session_id = self._session_id(
+                external_session_id, scope, active_provider
+            )
+            session_id = self._resolve_canonical_session(
+                conn, candidate_session_id, external_session_id, scope, active_provider,
+            )
+            turn_hash = hashlib.sha256(
+                f"{session_id}\x1f{capture_key}\x1f{content_hash}".encode("utf-8")
+            ).hexdigest()[:24]
+            turn_id = f"{session_id}-e{turn_hash}"
+            safe_created_at = str(created_at or "")[:80]
+            candidate_title, candidate_quality = _choose_session_title(
+                explicit_title=title,
+                messages=[{"role": role, "content": text}],
+                provider=active_provider, occurred_at=safe_created_at or _now(),
+                external_id=external_session_id, session_id=session_id,
+            )
+            existing_session = conn.execute(
+                "SELECT title FROM conversation_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            existing_title = str(existing_session["title"] or "") if existing_session else ""
+            existing_quality = 0 if _is_low_quality_title(
+                existing_title, external_id=external_session_id, session_id=session_id,
+            ) else (1 if existing_title.startswith(f"{_provider_label(active_provider)} 对话 · ") else 3)
+            safe_title = (
+                candidate_title
+                if candidate_quality == 3 or candidate_quality > existing_quality
+                else existing_title
+            )
+            conn.execute("""
+                INSERT INTO conversation_sessions(
+                  session_id, external_id, title, provider, agent_instance_id,
+                  project_ref, share_group_id, created_at, imported_at, deleted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')
+                ON CONFLICT(external_id, provider, agent_instance_id, project_ref, share_group_id)
+                DO UPDATE SET
+                  title=excluded.title,
+                  imported_at=excluded.imported_at, deleted_at=''
+            """, (session_id, external_session_id, safe_title, active_provider,
+                  scope.agent_instance_id, scope.project_ref, scope.share_group_id,
+                  safe_created_at, _now()))
+            if safe_title != existing_title:
+                conn.execute("UPDATE history_fts SET title=? WHERE session_id=?", (safe_title, session_id))
+            existing = None
+            if event_key:
+                existing = conn.execute(
+                    "SELECT turn_id,content_hash FROM conversation_turns "
+                    "WHERE session_id=? AND event_key=?",
+                    (session_id, event_key),
                 ).fetchone()
-                existing_title = str(existing_session["title"] or "") if existing_session else ""
-                existing_quality = 0 if _is_low_quality_title(
-                    existing_title, external_id=external_session_id, session_id=session_id,
-                ) else (1 if existing_title.startswith(f"{_provider_label(active_provider)} 对话 · ") else 3)
-                safe_title = (
-                    candidate_title
-                    if candidate_quality == 3 or candidate_quality > existing_quality
-                    else existing_title
-                )
-                conn.execute("""
-                    INSERT INTO conversation_sessions(
-                      session_id, external_id, title, provider, agent_instance_id,
-                      project_ref, share_group_id, created_at, imported_at, deleted_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '')
-                    ON CONFLICT(external_id, provider, agent_instance_id, project_ref, share_group_id)
-                    DO UPDATE SET
-                      title=excluded.title,
-                      imported_at=excluded.imported_at, deleted_at=''
-                """, (session_id, external_session_id, safe_title, active_provider,
-                      scope.agent_instance_id, scope.project_ref, scope.share_group_id,
-                      safe_created_at, _now()))
-                if safe_title != existing_title:
-                    conn.execute("UPDATE history_fts SET title=? WHERE session_id=?", (safe_title, session_id))
-                existing = None
-                if event_key:
-                    existing = conn.execute(
-                        "SELECT turn_id,content_hash FROM conversation_turns "
-                        "WHERE session_id=? AND event_key=?",
-                        (session_id, event_key),
-                    ).fetchone()
-                if existing is not None:
-                    conflict = existing["content_hash"] != content_hash
-                    return {
-                        "session_id": session_id, "turn_id": existing["turn_id"],
-                        "inserted": False, "replayed": not conflict,
-                        "event_conflict": conflict, "idempotency": "strict",
-                    }
-                count = conn.execute(
-                    "SELECT COUNT(*) AS count FROM conversation_turns WHERE session_id=?", (session_id,)
-                ).fetchone()["count"]
-                if count >= MAX_SESSION_TURNS:
-                    raise ValueError("history_import_session_turn_limit_exceeded")
-                ordinal = int(count) + 1
-                conn.execute("""
-                    INSERT INTO conversation_turns(
-                      turn_id, session_id, ordinal, role, content, created_at,
-                      content_type, event_key, content_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (turn_id, session_id, ordinal, str(role or "unknown")[:64], text,
-                      safe_created_at, str(content_type or "text")[:64],
-                      event_key, content_hash))
-                row = conn.execute(
-                    "SELECT title FROM conversation_sessions WHERE session_id=?", (session_id,)
-                ).fetchone()
-                conn.execute("""
-                    INSERT INTO history_fts(session_id, turn_id, result_type, title, content)
-                    VALUES (?, ?, 'turn', ?, ?)
-                """, (session_id, turn_id, row["title"] if row else safe_title, text))
-                summary = f"{ordinal} turns archived; last event {str(created_at or _now())[:25]}"
-                conn.execute("DELETE FROM history_fts WHERE session_id=? AND result_type='summary'", (session_id,))
-                conn.execute("""
-                    INSERT INTO session_summaries(session_id, summary, summary_kind, updated_at)
-                    VALUES (?, ?, 'hook', ?)
-                    ON CONFLICT(session_id) DO UPDATE SET
-                      summary=excluded.summary, summary_kind='hook', updated_at=excluded.updated_at
-                """, (session_id, summary, _now()))
-                conn.execute("""
-                    INSERT INTO history_fts(session_id, turn_id, result_type, title, content)
-                    VALUES (?, '', 'summary', ?, ?)
-                """, (session_id, row["title"] if row else safe_title, summary))
+            if existing is not None:
+                conflict = existing["content_hash"] != content_hash
+                return {
+                    "session_id": session_id, "turn_id": existing["turn_id"],
+                    "inserted": False, "replayed": not conflict,
+                    "event_conflict": conflict, "idempotency": "strict",
+                }
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM conversation_turns WHERE session_id=?", (session_id,)
+            ).fetchone()["count"]
+            if count >= MAX_SESSION_TURNS:
+                raise ValueError("history_import_session_turn_limit_exceeded")
+            ordinal = int(count) + 1
+            conn.execute("""
+                INSERT INTO conversation_turns(
+                  turn_id, session_id, ordinal, role, content, created_at,
+                  content_type, event_key, content_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (turn_id, session_id, ordinal, str(role or "unknown")[:64], text,
+                  safe_created_at, str(content_type or "text")[:64],
+                  event_key, content_hash))
+            row = conn.execute(
+                "SELECT title FROM conversation_sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+            conn.execute("""
+                INSERT INTO history_fts(session_id, turn_id, result_type, title, content)
+                VALUES (?, ?, 'turn', ?, ?)
+            """, (session_id, turn_id, row["title"] if row else safe_title, text))
+            summary = f"{ordinal} turns archived; last event {str(created_at or _now())[:25]}"
+            conn.execute("DELETE FROM history_fts WHERE session_id=? AND result_type='summary'", (session_id,))
+            conn.execute("""
+                INSERT INTO session_summaries(session_id, summary, summary_kind, updated_at)
+                VALUES (?, ?, 'hook', ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                  summary=excluded.summary, summary_kind='hook', updated_at=excluded.updated_at
+            """, (session_id, summary, _now()))
+            conn.execute("""
+                INSERT INTO history_fts(session_id, turn_id, result_type, title, content)
+                VALUES (?, '', 'summary', ?, ?)
+            """, (session_id, row["title"] if row else safe_title, summary))
         return {
             "session_id": session_id, "turn_id": turn_id, "inserted": True,
             "replayed": False, "event_conflict": False,
@@ -800,6 +893,52 @@ class ConversationHistoryStore:
             conn.execute("INSERT INTO history_fts(session_id,turn_id,result_type,title,content) VALUES (?,?,'observation',?,?)", (session_id, turn_id, session["title"], summary))
         return observation_id
 
+    @staticmethod
+    def _collapse_duplicate_sessions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Read-side dedup of dual-write rows for the SAME physical session.
+
+        A conversation archived under two hosts (the append guard B2 is
+        forward-only) can leave two session rows sharing one ``external_id``.
+        Fold them at read time -- but only when the group shares the same
+        agent instance and the same canonical project.  Rows that differ in
+        agent or project are genuinely separate conversations and are kept.
+        The first member of a folded group survives (caller's sort order),
+        with ``duplicate_count`` reporting how many were absorbed.  Items
+        without an ``external_id`` are never touched.
+        """
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in items:
+            external = str(item.get("external_id") or "")
+            if external:
+                grouped.setdefault(external, []).append(item)
+        processed: set[str] = set()
+        out: list[dict[str, Any]] = []
+        for item in items:
+            external = str(item.get("external_id") or "")
+            if not external:
+                out.append(item)
+                continue
+            if external in processed:
+                continue
+            processed.add(external)
+            members = grouped[external]
+            if len(members) == 1:
+                out.append(members[0])
+                continue
+            agent = str(members[0].get("agent_instance_id") or "")
+            project_key = _project_metadata(str(members[0].get("project_ref") or ""))["project_key"]
+            if all(
+                str(m.get("agent_instance_id") or "") == agent
+                and _project_metadata(str(m.get("project_ref") or ""))["project_key"] == project_key
+                for m in members
+            ):
+                first = dict(members[0])
+                first["duplicate_count"] = len(members) - 1
+                out.append(first)
+            else:
+                out.extend(members)
+        return out
+
     def list_sessions(self, scope: HistoryScope, *, limit: int = 50, offset: int = 0,
                       extracted: bool | None = None, date_from: str = "", date_to: str = "") -> dict[str, Any]:
         limit = max(1, min(int(limit), MAX_PAGE))
@@ -813,7 +952,7 @@ class ConversationHistoryStore:
         if extracted is not None:
             evidence_clause = " HAVING evidence_count " + ("> 0" if extracted else "= 0")
         query = f"""
-          SELECT s.session_id, s.title, s.provider, s.agent_instance_id, s.project_ref, s.share_group_id,
+          SELECT s.session_id, s.external_id, s.title, s.provider, s.agent_instance_id, s.project_ref, s.share_group_id,
                  s.created_at, s.imported_at, COALESCE(ss.summary, '') AS summary,
                  COUNT(DISTINCT t.turn_id) AS turn_count,
                  COUNT(DISTINCT CASE WHEN e.status='valid' THEN e.link_id END) AS evidence_count
@@ -867,8 +1006,9 @@ class ConversationHistoryStore:
             if agent and agent not in group["agents"]:
                 group["agents"].append(agent)
             group["latest_at"] = max(str(group["latest_at"] or ""), str(row["latest_at"] or ""))
+        collapsed = self._collapse_duplicate_sessions([dict(row) for row in rows])
         return {
-            "sessions": [_safe_session_projection(dict(row)) for row in rows],
+            "sessions": [_safe_session_projection(item) for item in collapsed],
             "project_groups": sorted(groups.values(), key=lambda item: (item["latest_at"], item["project_key"]), reverse=True),
             "total": total, "limit": limit, "offset": offset,
         }
@@ -886,7 +1026,7 @@ class ConversationHistoryStore:
         where, args = self._scope_where(scope)
         fts_query = self._fts_query(query)
         sql = f"""
-          SELECT h.session_id, h.turn_id, h.result_type, s.title, s.provider, s.agent_instance_id, s.project_ref,
+          SELECT h.session_id, s.external_id, h.turn_id, h.result_type, s.title, s.provider, s.agent_instance_id, s.project_ref,
                  s.created_at, COALESCE(ss.summary, '') AS summary, t.role, t.created_at AS turn_created_at,
                  t.content_type, snippet(history_fts,4,'','',' … ',18) AS matched_summary
           FROM history_fts h
@@ -907,6 +1047,7 @@ class ConversationHistoryStore:
             item["can_timeline"] = bool(anchor)
             item["read_target"] = "turn" if anchor else "session"
             results.append(item)
+        results = self._collapse_duplicate_sessions(results)
         return {"query": query, "results": results, "limit": limit, "offset": offset}
 
     def timeline(self, scope: HistoryScope, session_id: str, anchor_turn_id: str, *, radius: int = 4) -> dict[str, Any]:

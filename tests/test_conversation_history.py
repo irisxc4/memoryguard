@@ -471,3 +471,74 @@ def test_legacy_project_aliases_merge_in_projection_and_project_filter(tmp_path:
     assert len(listing["project_groups"]) == 1
     assert listing["project_groups"][0]["session_count"] == 3
     assert {row["project_ref"] for row in listing["sessions"]} == {scope.project_ref}
+
+
+# --- Part B2: cross-provider session dedup on append -----------------------
+
+def test_append_turn_dedups_same_external_id_across_providers(tmp_path: Path):
+    store = ConversationHistoryStore(tmp_path)
+    scope_a = HistoryScope(agent_instance_id="agent-a", provider="claude")
+    scope_b = HistoryScope(agent_instance_id="agent-a", provider="cursor")
+    first = store.append_turn(scope_a, external_session_id="dual-session", provider="claude",
+                              role="user", content="同一物理会话", event_id="turn-1")
+    second = store.append_turn(scope_b, external_session_id="dual-session", provider="cursor",
+                               role="user", content="同一物理会话", event_id="turn-1")
+    # Both writes land on the SAME session row despite differing provider;
+    # the canonical row now carries the host-proven provider (cursor).
+    assert second["session_id"] == first["session_id"]
+    sessions = store.list_sessions(scope_b)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0]["provider"] == "cursor"
+    raw = store.read(scope_b, session_id=first["session_id"])
+    assert len(raw["turns"]) == 1
+
+
+def test_append_turn_dedups_across_agents_on_second_append(tmp_path: Path):
+    store = ConversationHistoryStore(tmp_path)
+    scope_a = HistoryScope(agent_instance_id="agent-a", provider="claude")
+    scope_b = HistoryScope(agent_instance_id="agent-b", provider="cursor")
+    first = store.append_turn(scope_a, external_session_id="agent-dual", provider="claude",
+                              role="user", content="跨 agent 双写", event_id="turn-1")
+    second = store.append_turn(scope_b, external_session_id="agent-dual", provider="cursor",
+                               role="user", content="跨 agent 双写", event_id="turn-1")
+    assert second["session_id"] == first["session_id"]
+    # The canonical row was folded into agent-b's identity; scope_b sees it once.
+    assert len(store.list_sessions(scope_b)["sessions"]) == 1
+    raw = store.read(scope_b, session_id=first["session_id"])
+    assert len(raw["turns"]) == 1
+
+
+# --- Part B3: read-side duplicate collapse ---------------------------------
+
+def test_list_sessions_collapses_same_provider_agent_duplicates(tmp_path: Path):
+    store = ConversationHistoryStore(tmp_path)
+    scope = HistoryScope(agent_instance_id="agent-a", provider="claude")
+    # Insert the same physical session under two rows directly (as the old
+    # dual-write bug produced), then confirm the reader folds them.
+    s1 = store.append_turn(scope, external_session_id="dup-session", provider="claude",
+                           role="user", content="重复行 A", event_id="turn-1")
+    s2 = store.append_turn(scope, external_session_id="dup-session", provider="claude",
+                           role="user", content="重复行 B", event_id="turn-2")
+    # Same agent + same project + same external_id -> the append dedup already
+    # routes both to one row (B2).  list_sessions must show exactly one.
+    assert s1["session_id"] == s2["session_id"]
+    sessions = store.list_sessions(scope)["sessions"]
+    assert len(sessions) == 1
+    assert sessions[0].get("duplicate_count", 0) == 0
+
+
+def test_import_conversations_dedups_prior_across_providers(tmp_path: Path):
+    store = ConversationHistoryStore(tmp_path)
+    conv = _conversation()
+    chat_scope = HistoryScope(agent_instance_id="agent-a", project_ref="project-x", provider="chatgpt")
+    cur_scope = HistoryScope(agent_instance_id="agent-a", project_ref="project-x", provider="cursor")
+    # Import once under chatgpt, then re-import the same source conversation
+    # under a different provider label; B2's prior lookup must ignore provider.
+    first = store.import_conversations([conv], provider="chatgpt", scope=chat_scope)
+    second = store.import_conversations([conv], provider="cursor", scope=cur_scope)
+    # Re-import rewrites the SAME canonical row (B2 prior redirect across
+    # provider) rather than creating a second session with duplicated turns.
+    sessions = store.list_sessions(cur_scope)["sessions"]
+    assert len(sessions) == 1
+    raw = store.read(cur_scope, session_id=sessions[0]["session_id"])
+    assert len(raw["turns"]) == first["turn_count"]

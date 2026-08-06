@@ -263,13 +263,29 @@ class AgentBindingStore:
     def bind_agents_to_group(self, agent_instance_ids: list[str], share_group_id: str = "",
                              mcp_server_name: str = "memoryguard",
                              native_memory_modes: dict[str, str] | None = None,
-                             redirect_paths: dict[str, list[str]] | None = None) -> dict[str, Any]:
+                             redirect_paths: dict[str, list[str]] | None = None,
+                             allow_empty_group_creation: bool = False) -> dict[str, Any]:
         clean_agents = [str(a or "").strip() for a in dict.fromkeys(agent_instance_ids) if str(a or "").strip()]
         if len(clean_agents) < 2:
             raise ValueError("shared_group_requires_at_least_two_agents")
-        group_id = str(share_group_id or "").strip() or self.create_share_group_id(clean_agents)
+        explicit_group = str(share_group_id or "").strip()
+        group_id = explicit_group or self.create_share_group_id(clean_agents)
         if is_personal_group_id(group_id):
             raise ValueError("personal_group_cannot_be_shared")
+        if not explicit_group and not allow_empty_group_creation:
+            # C3: 自动派生一个全新共享组、而 workspace 里已有非空遗留组时
+            # fail-closed。否则旧记忆会再次被「静默新建空组」孤立（控制面搬家
+            # 事故的复发路径）。显式 --share-group-id 视为操作者意图，不拦。
+            from .group_migration import find_nonempty_shared_groups
+            db_path = Path(self.workspace) / ".memoryguard" / "shared-memory" / group_id / "memory.db"
+            if not db_path.exists() and find_nonempty_shared_groups(self.workspace):
+                raise ValueError(
+                    "legacy_shared_group_data_detected: non-empty shared-memory "
+                    "groups exist but no shared binding is linked to them; "
+                    "refusing to silently create a new empty group. Run "
+                    "`memoryguard groups migrate` first or pass "
+                    "allow_empty_group_creation=True."
+                )
         # 预校验目标目录，避免第一个 Agent 已切换后第二个才发现 group 非法。
         SharedMemoryStore(self.workspace, group_id)._ensure_dirs()
         modes = native_memory_modes or {}

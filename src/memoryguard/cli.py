@@ -1171,6 +1171,131 @@ def cmd_gc(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_groups(args: argparse.Namespace) -> int:
+    """Inspect and migrate shared-memory groups.
+
+    ``groups list`` prints every non-empty group in a workspace plus the
+    active bindings.  ``groups migrate`` copies one legacy group's records
+    into a target group (dry-run unless ``--apply``), which is the manual
+    recovery path for the "control directory moved but memory did not"
+    incident.
+    """
+    from .group_migration import (
+        copy_group_records,
+        discover_legacy_group,
+        find_nonempty_shared_groups,
+    )
+
+    workspace = Path(args.workspace).resolve()
+
+    if args.action == "list":
+        print("MemoryGuard shared-memory groups")
+        print(f"  workspace: {workspace}")
+        groups = find_nonempty_shared_groups(workspace)
+        if not groups:
+            print("  (no non-empty groups found)")
+        for g in groups:
+            suffix = f"  [error: {g['error']}]" if g.get("error") else ""
+            print(
+                f"  {g['group_id']}  records={g['records']} active={g['active']}  "
+                f"{g['db_path']}{suffix}"
+            )
+        from .agent_binding import AgentBindingStore
+        bindings = AgentBindingStore(workspace).list_bindings(include_inactive=False)
+        if bindings:
+            print("  active bindings:")
+            for b in bindings:
+                print(f"    {b.agent_instance_id} -> {b.share_group_id}")
+        else:
+            print("  (no active bindings)")
+        return 0
+
+    source_ws = (
+        Path(args.source_workspace).resolve() if args.source_workspace else workspace
+    )
+    source_gid = args.from_gid
+    if not source_gid:
+        legacy = discover_legacy_group(source_ws)
+        if legacy is None:
+            print(
+                f"error: no non-empty legacy group found in {source_ws}; "
+                "pass --from <group-id>",
+                file=sys.stderr,
+            )
+            return 2
+        source_gid = legacy["group_id"]
+        print(
+            f"auto-detected source group: {source_gid} "
+            f"({legacy['records']} records)"
+        )
+
+    target_gid = args.to_gid
+    if not target_gid:
+        from .agent_binding import AgentBindingStore
+        active = [
+            b for b in AgentBindingStore(workspace).list_bindings(include_inactive=False)
+            if b.share_group_id and not b.share_group_id.startswith("personal-")
+        ]
+        if not active:
+            print(
+                "error: no active shared binding in target workspace; "
+                "pass --to <group-id>",
+                file=sys.stderr,
+            )
+            return 2
+        target_gid = active[0].share_group_id
+        print(f"auto-detected target group: {target_gid}")
+
+    result = copy_group_records(
+        source_ws, source_gid, workspace, target_gid,
+        dry_run=not args.apply,
+        archive_source=args.archive_source,
+    )
+    mode = "dry-run" if result["dry_run"] else "apply"
+    prefix = "would-" if result["dry_run"] else ""
+    print("MemoryGuard groups migrate")
+    print(f"  mode:          {mode}")
+    print(
+        f"  source:        {result['source']['workspace']} / "
+        f"{result['source']['group_id']} ({result['source']['records']} records)"
+    )
+    print(
+        f"  target:        {result['target']['workspace']} / "
+        f"{result['target']['group_id']} "
+        f"(existing {result['target']['existing_records']} records, "
+        f"{result['target']['existing_active']} active)"
+    )
+    print(
+        f"  {prefix}copied={result['copied']} {prefix}updated={result['updated']} "
+        f"{prefix}replaced={result['replaced']} "
+        f"assignments={result['assignments_migrated']} "
+        f"failed={len(result['failed'])}"
+    )
+    if result["collisions"]:
+        print("  collisions (target holds these memory_id under another domain):")
+        for mid in result["collisions"]:
+            print(f"    {mid}")
+    for failed in result["failed"]:
+        print(
+            f"  failed {failed['memory_id']}: {failed['error']}",
+            file=sys.stderr,
+        )
+    if result["archived_to"]:
+        print(f"  archived source -> {result['archived_to']}")
+
+    if not result["dry_run"] and result["failed"]:
+        return 1
+    if (
+        not result["dry_run"]
+        and not result["copied"]
+        and not result["updated"]
+        and not result["replaced"]
+    ):
+        print("  (no records migrated)", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_desktop(args: argparse.Namespace) -> int:
     """启动 MemoryGuard Desktop Executor（可信执行端）。"""
     from .desktop_executor import main as desktop_main
@@ -1333,6 +1458,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--keep-releases", type=int, default=20, help="reserved for future release pruning")
     p_gc.add_argument("--keep-snapshots", type=int, default=3, help="snapshots to retain")
     p_gc.set_defaults(func=cmd_gc)
+
+    p_groups = sub.add_parser(
+        "groups",
+        help="inspect and migrate shared-memory groups (migrate defaults to dry-run)",
+    )
+    p_groups.add_argument("action", choices=("list", "migrate"))
+    p_groups.add_argument(
+        "-w", "--workspace", default=".",
+        help="target workspace (migration destination; default: .)",
+    )
+    p_groups.add_argument(
+        "--source-workspace", default="",
+        help="legacy source workspace (default: --workspace)",
+    )
+    p_groups.add_argument(
+        "--from", dest="from_gid", default="",
+        help="source group id (default: largest non-empty legacy group)",
+    )
+    p_groups.add_argument(
+        "--to", dest="to_gid", default="",
+        help="target group id (default: first active shared binding in --workspace)",
+    )
+    p_groups.add_argument(
+        "--apply", action="store_true",
+        help="execute the migration (default: dry-run)",
+    )
+    p_groups.add_argument(
+        "--archive-source", action="store_true",
+        help="archive the source group directory after a successful copy",
+    )
+    p_groups.set_defaults(func=cmd_groups)
 
     p_gui = sub.add_parser("gui", help="launch the interactive governance console")
     p_gui.add_argument(

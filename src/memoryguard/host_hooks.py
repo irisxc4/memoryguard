@@ -99,7 +99,13 @@ def read_hook_stdin_json(stdin_buffer=None) -> dict[str, Any]:
     raw = buf.read(2_000_000)
     if not raw or not raw.strip():
         return {}
-    data = json.loads(raw.decode("utf-8-sig"))
+    # Byte-level decode: strict UTF-8 first (current correct path, BOM-aware);
+    # if the host shipped locale-encoded bytes (Windows GBK pipe) the intended
+    # text is recovered instead of failing the whole hook.
+    from .encoding_guard import decode_hook_bytes
+
+    text = decode_hook_bytes(raw, source="hook_stdin")
+    data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("hook input must be a JSON object")
     return data
@@ -1109,6 +1115,30 @@ def _emit_runtime_write_diagnostic(kind: str, provider: str, event: str, exc: Ex
     }, ensure_ascii=True), file=sys.stderr)
 
 
+def derive_host_provider(payload: dict[str, Any]) -> str:
+    """Provider identity derived from the payload shape alone ("" = unknown).
+
+    ``run_hook`` stamps the provider from argv today without checking the
+    payload, so a misconfigured hook can attribute one host's session to
+    another (the observed dual-write: Cursor sessions archived as ``claude``).
+    Payload shape gives an independent, conservative signal -- Cursor wraps
+    lifecycle events in a nested envelope (``event.name`` / ``session`` dict),
+    Claude Code emits a top-level ``hook_event_name``, and Codex carries no
+    marker (argv stays authoritative there).  Empty string = unknown.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    event = payload.get("event")
+    if isinstance(event, dict) and isinstance(event.get("name"), str):
+        return "cursor"
+    if isinstance(payload.get("session"), dict):
+        return "cursor"
+    hook_event_name = payload.get("hook_event_name")
+    if isinstance(hook_event_name, str) and hook_event_name.strip():
+        return "claude"
+    return ""
+
+
 def _record_history_diagnostic(
     workspace: Path,
     provider: str,
@@ -1301,6 +1331,11 @@ def _archive_history_event(
     try:
         from .conversation_history import ConversationHistoryStore, HistoryScope, MAX_TURN_CHARS
 
+        # Persist-boundary mojibake guard: repair pervasively corrupt content;
+        # raise (fail-closed, swallowed here) rather than persist garbage.
+        from .encoding_guard import guard_persist_content
+
+        content = guard_persist_content(content)
         truncated = len(content) > MAX_TURN_CHARS
         if truncated:
             content = content[:MAX_TURN_CHARS]
@@ -1727,18 +1762,28 @@ def run_hook(
     # Archive only event payload supplied by that host; this is best-effort and
     # deliberately independent from long-term memory/bootstrapping.
     if event in {"user_prompt", "stop"}:
+        # Provider is argv-stamped today; the payload shape is an independent
+        # check (B1).  Only the history archive provider is corrected -- state,
+        # heartbeat and mandatory-rule paths keep the argv provider untouched.
+        history_provider = derive_host_provider(payload) or normalized_provider
+        archive_result = _archive_history_event(
+            workspace=root,
+            provider=history_provider,
+            event=event,
+            agent_instance_id=agent_instance_id,
+            share_group_id=share_group_id,
+            payload=payload,
+        )
+        if history_provider != normalized_provider:
+            archive_result = dict(archive_result)
+            archive_result["host_provider_conflict"] = True
+            archive_result["argv_provider"] = normalized_provider
+            archive_result["payload_provider"] = history_provider
         _record_history_diagnostic(
             root,
-            normalized_provider,
+            history_provider,
             agent_instance_id,
-            _archive_history_event(
-                workspace=root,
-                provider=normalized_provider,
-                event=event,
-                agent_instance_id=agent_instance_id,
-                share_group_id=share_group_id,
-                payload=payload,
-            ),
+            archive_result,
         )
 
     if event == "session_start":
