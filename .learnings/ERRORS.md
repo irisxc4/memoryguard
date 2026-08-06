@@ -3,6 +3,34 @@
 Command failures and integration errors.
 
 ---
+## [ERR-20260806-001] luna_max_spawn_encrypted_content
+
+**Logged**: 2026-08-06T15:19:57+08:00
+**Priority**: medium
+**Status**: pending
+**Area**: infra
+
+### Summary
+Luna Max 代码修复任务因上游加密内容校验失败，未产生工作区改动。
+
+### Error
+```
+invalid_encrypted_content: encrypted content could not be decrypted or parsed
+```
+
+### Context
+- 操作：通过 `multi_agent_v1.spawn_agent` 派发知识库扫描修复。
+- 结果：Agent 创建成功后立即以 400 错误退出。
+- 处理：主线程继续完成同一范围的实现、审查和验证。
+
+### Suggested Fix
+重试时使用全新独立上下文；若持续复现，检查多 Agent 服务的加密内容传输链路。
+
+### Metadata
+- Reproducible: unknown
+- Related Files: none
+
+---
 
 ## [ERR-20260802-003] p3_runtime_digest_transient_projection_lag
 

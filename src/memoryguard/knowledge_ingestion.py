@@ -68,6 +68,10 @@ class KnowledgeScanResult:
     truncations: list[ScanTruncation] = field(default_factory=list)
     scanned_count: int = 0
     total_size: int = 0
+    # 已通过扩展名和 include/exclude 过滤、且在目录遍历中出现过的路径。
+    seen_paths: set[str] = field(default_factory=set)
+    # 暂时不可读取的文件或目录，必须阻止删除对应旧索引。
+    unreadable_entries: list[ScanTruncation] = field(default_factory=list)
 
 
 @dataclass
@@ -137,6 +141,13 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
     scan = _scan_files(
         root, book.include_globs, book.exclude_globs, budget=KNOWLEDGE_SCAN_BUDGET,
     )
+    # 外部扫描实现或旧测试桩可能给出自相矛盾的结果；任何不可读条目都必须
+    # 失败封闭，并进入统一截断账本。
+    for unreadable in scan.unreadable_entries:
+        if unreadable not in scan.truncations:
+            scan.truncations.append(unreadable)
+    if scan.unreadable_entries:
+        scan.complete = False
     store.create_job(job_id, book_id, len(scan.files))
 
     # 检查已有文档
@@ -144,7 +155,7 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
         row["relative_path"]: row
         for row in store.list_documents(book_id)
     }
-    current_paths = set()
+    current_paths = set(scan.seen_paths)
     processed = 0
     skipped = 0
     chunks_created = 0
@@ -166,6 +177,10 @@ def _ingest_book_unlocked(store: KnowledgeStore, book_id: str) -> IngestionResul
             content_hash = hashlib.sha256(content).hexdigest()[:16]
         except OSError:
             skipped += 1
+            unreadable = ScanTruncation("unreadable_file", rel)
+            scan.truncations.append(unreadable)
+            scan.unreadable_entries.append(unreadable)
+            scan.complete = False
             continue
 
         # 检查是否需要更新（内容哈希未变则跳过）
@@ -567,6 +582,8 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
     all_supported = set(SUPPORTED_EXTENSIONS.keys()) | set(CODE_EXTENSIONS.keys())
     files: list[Path] = []
     truncations: list[ScanTruncation] = []
+    unreadable_entries: list[ScanTruncation] = []
+    seen_paths: set[str] = set()
     total_size = 0
     start = time.time()
     stop_scan = False
@@ -577,7 +594,28 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
     def _depth(p: Path) -> int:
         return len(p.relative_to(root).parts)
 
-    for dirpath, dirnames, filenames in os.walk(root):
+    def _relative_path(path_value: str | os.PathLike[str] | None) -> str:
+        """把 walk 错误路径转成稳定的书内相对路径。"""
+        if not path_value:
+            return "."
+        candidate = Path(path_value)
+        try:
+            return str(candidate.relative_to(root)).replace("\\", "/") or "."
+        except ValueError:
+            try:
+                return str(candidate.resolve().relative_to(real_root)).replace("\\", "/") or "."
+            except (OSError, ValueError):
+                return str(path_value).replace("\\", "/")
+
+    def _record_unreadable(reason: str, path_value: str | os.PathLike[str] | None) -> None:
+        entry = ScanTruncation(reason, _relative_path(path_value))
+        truncations.append(entry)
+        unreadable_entries.append(entry)
+
+    def _on_walk_error(error: OSError) -> None:
+        _record_unreadable("unreadable_directory", getattr(error, "filename", None))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
         if time.time() - start > budget.timeout_seconds:
             truncations.append(ScanTruncation("timeout", "扫描超过预算时长，停止扫描"))
             break
@@ -609,20 +647,6 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             file_path = Path(dirpath) / fname
             if file_path.is_symlink():
                 continue  # 符号链接文件不扫描
-            try:
-                if not str(file_path.resolve()).startswith(str(real_root)):
-                    continue  # 逃逸出根目录
-                size = file_path.stat().st_size
-            except OSError:
-                continue
-            if size > budget.max_single_file:
-                continue  # 超单文件上限：跳过该文件，不视为整体截断
-            if total_size + size > budget.max_total_size:
-                truncations.append(ScanTruncation(
-                    "max_total_size",
-                    f"超过总大小上限 {budget.max_total_size}，停止扫描"))
-                stop_scan = True
-                break
             rel = str(file_path.relative_to(root)).replace("\\", "/")
 
             # 应用 exclude
@@ -632,6 +656,25 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
             # 应用 include（如果指定了）
             if include_patterns and not any(_match_glob(rel, p) for p in include_patterns):
                 continue
+
+            # 先记录目录遍历中出现的候选路径，再尝试读取元数据；这样瞬时
+            # stat/read 失败时仍不会把已有文档误判为已删除。
+            seen_paths.add(rel)
+            try:
+                if not str(file_path.resolve()).startswith(str(real_root)):
+                    continue  # 逃逸出根目录
+                size = file_path.stat().st_size
+            except OSError:
+                _record_unreadable("unreadable_file", rel)
+                continue
+            if size > budget.max_single_file:
+                continue  # 超单文件上限：跳过该文件，不视为整体截断
+            if total_size + size > budget.max_total_size:
+                truncations.append(ScanTruncation(
+                    "max_total_size",
+                    f"超过总大小上限 {budget.max_total_size}，停止扫描"))
+                stop_scan = True
+                break
 
             files.append(file_path)
             total_size += size
@@ -644,6 +687,8 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
         truncations=truncations,
         scanned_count=len(files),
         total_size=total_size,
+        seen_paths=seen_paths,
+        unreadable_entries=unreadable_entries,
     )
 
 

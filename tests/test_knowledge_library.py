@@ -620,7 +620,13 @@ class TestP13ModelEnhance:
         from memoryguard.knowledge_store import _row_to_chunk
         book = create_book(store, str(tmp_book_dir), title="游戏设计")
         ingest_book(store, book.book_id)
-        row = store._conn.execute("SELECT * FROM chunks LIMIT 1").fetchone()
+        row = store._conn.execute(
+            "SELECT * FROM chunks "
+            "WHERE length(text) >= 20 "
+            "ORDER BY length(text) DESC, chunk_id "
+            "LIMIT 1"
+        ).fetchone()
+        assert row is not None
         chunk = _row_to_chunk(row)
 
         class FakeProvider:
@@ -825,6 +831,88 @@ class TestP0IndexConsistency:
         assert active_after == active_before, "扫描不完整时不得删除未扫到的文档"
         assert len(active_after) == 4
         s.close()
+
+    def test_unreadable_directory_does_not_deactivate_existing_documents(
+        self, tmp_path, monkeypatch
+    ):
+        """目录暂时不可读时，现有文档必须保留。"""
+        from memoryguard.knowledge_ingestion import (
+            _ingest_book_unlocked,
+            create_book,
+            ingest_book,
+        )
+        from memoryguard.knowledge_store import KnowledgeStore
+
+        root = self._make_multi(tmp_path, 4)
+        store = KnowledgeStore(tmp_path / "unreadable-dir")
+        book = create_book(store, str(root), title="不可读目录")
+        ingest_book(store, book.book_id)
+        active_before = {
+            row["relative_path"] for row in store.list_documents(book.book_id)
+        }
+
+        def blocked_walk(path, onerror=None):
+            error = PermissionError(13, "permission denied", str(root / "dir1"))
+            if onerror:
+                onerror(error)
+            yield str(path), [], []
+
+        monkeypatch.setattr("memoryguard.knowledge_ingestion.os.walk", blocked_walk)
+        result = _ingest_book_unlocked(store, book.book_id)
+
+        assert result.status == "partial"
+        assert result.files_deleted == 0
+        assert any(
+            truncation.reason == "unreadable_directory"
+            for truncation in result.truncations
+        )
+        assert {
+            row["relative_path"] for row in store.list_documents(book.book_id)
+        } == active_before
+        store.close()
+
+    def test_transient_stat_error_does_not_deactivate_document(
+        self, tmp_path, monkeypatch
+    ):
+        """文件 stat 暂时失败时，旧文档不能被停用。"""
+        from memoryguard.knowledge_ingestion import (
+            _ingest_book_unlocked,
+            create_book,
+            ingest_book,
+        )
+        from memoryguard.knowledge_store import KnowledgeStore
+
+        root = tmp_path / "stat-error"
+        root.mkdir()
+        document = root / "document.md"
+        document.write_text("# 稳定文档\n\n这是一段用于验证临时读取失败保护的正文。\n", encoding="utf-8")
+        store = KnowledgeStore(tmp_path / "unreadable-file")
+        book = create_book(store, str(root), title="不可读文件")
+        ingest_book(store, book.book_id)
+        document_id = store.get_document_by_path(book.book_id, "document.md")["document_id"]
+
+        original_stat = Path.stat
+
+        def flaky_stat(path, *args, **kwargs):
+            if path == document:
+                raise OSError("temporarily unavailable")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", flaky_stat)
+        result = _ingest_book_unlocked(store, book.book_id)
+
+        assert result.status == "partial"
+        assert result.files_deleted == 0
+        assert any(
+            truncation.reason == "unreadable_file"
+            and truncation.detail == "document.md"
+            for truncation in result.truncations
+        )
+        row = store._conn.execute(
+            "SELECT status FROM documents WHERE document_id=?", (document_id,)
+        ).fetchone()
+        assert row["status"] == "active"
+        store.close()
 
     def test_max_files_truncation_records_reason(self, tmp_path):
         """max_files 截断会记录截断原因并标记不完整。"""
