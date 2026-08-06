@@ -208,6 +208,10 @@ def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     assert "renderedPosition()" in html
     assert "control-point-distances" in html
     assert "Math.atan2" in html
+    assert "isSignalNeuronEdge" in html
+    assert "virtual_index: 0.46" in html
+    assert "underlay-opacity" in html
+    assert "shadow-blur" not in html
     assert "粒子层异常不能影响 Cytoscape 边/节点脉冲" in html
     assert "const anchors = leaves.filter" in html
     assert "collectNeuronSignalPaths" in html

@@ -1482,7 +1482,10 @@ function graphElements(graph) {
   // edge: id / source / target / edge_type (+ strength 粗细)
   const elements = [];
   const positions = neuronNodePositions(graph.nodes || []);
-  const EDGE_STRENGTH = { derived_from: 0.58, related: 0.28, shared_source: 0.4, duplicate: 0.34 };
+  const EDGE_STRENGTH = {
+    derived_from: 0.58, related: 0.28, shared_source: 0.4,
+    duplicate: 0.34, virtual_index: 0.46,
+  };
   for (const node of graph.nodes || []) {
     const root = node.node_kind === 'root';
     const hub = node.node_kind === 'source_hub';
@@ -1757,13 +1760,13 @@ function renderNeuronGraph() {
         'font-family': 'Segoe UI, PingFang SC, sans-serif', 'font-weight': 500,
         'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 8,
         'text-outline-width': 2, 'text-outline-color': '#040b09', 'text-wrap': 'wrap', 'text-max-width': 92,
-        'transition-property': 'border-width, border-color, background-color, opacity, shadow-blur, background-opacity',
+        'transition-property': 'border-width, border-color, background-color, opacity, background-opacity, underlay-opacity, overlay-opacity',
         'transition-duration': '180ms',
       }},
       { selector: 'node[kind = "root"]', style: {
         'background-color': '#6ee7c4', 'background-opacity': .24, 'border-width': 2.5,
         'border-color': '#bcffeb', 'font-size': 11,
-        'shadow-blur': 18, 'shadow-color': '#9ff0d6', 'shadow-opacity': .5,
+        'underlay-color': '#9ff0d6', 'underlay-opacity': .5, 'underlay-padding': 8,
       }},
       { selector: 'node[kind = "claim_anchor"]', style: {
         'background-opacity': .68, 'border-width': 0, 'label': '',
@@ -1792,7 +1795,8 @@ function renderNeuronGraph() {
         'border-width': 1.2, 'border-color': '#bae6fd', 'font-size': 8,
       }},
       { selector: 'edge[etype = "virtual_index"]', style: {
-        'line-style': 'dotted', 'line-color': '#8de8cf', 'line-opacity': .36, 'width': 1.25,
+        'line-style': 'dotted', 'line-color': '#8de8cf', 'line-opacity': .42,
+        'width': 'mapData(strength, 0, 1, 1.2, 3.8)',
       }},
       { selector: 'node[status = "tentative"]', style: {
         'background-color': '#2b2a20', 'border-color': '#e9bb64', 'border-style': 'dashed',
@@ -1807,31 +1811,37 @@ function renderNeuronGraph() {
       { selector: 'edge[etype = "duplicate"]', style: { 'line-style': 'dashed', 'line-color': '#f6ad55', 'line-opacity': .28 }},
       { selector: 'edge.signal', style: {
         'line-opacity': 1, 'width': 'mapData(strength, 0, 1, 3.6, 6.4)', 'line-color': '#effff9',
-        'shadow-blur': 30, 'shadow-color': '#6ee7c4', 'shadow-opacity': .92,
+        'underlay-color': '#6ee7c4', 'underlay-opacity': .92, 'underlay-padding': 8,
+        'overlay-color': '#effff9', 'overlay-opacity': .78, 'overlay-padding': 2,
       }},
       { selector: 'edge.signal-trail', style: {
         'line-opacity': .72, 'width': 'mapData(strength, 0, 1, 2.2, 4.2)', 'line-color': '#98f5d0',
-        'shadow-blur': 18, 'shadow-color': '#6ee7c4', 'shadow-opacity': .55,
+        'underlay-color': '#6ee7c4', 'underlay-opacity': .55, 'underlay-padding': 5,
       }},
       { selector: 'node.signal', style: {
         'border-width': 4, 'border-color': '#ffffff',
-        'shadow-blur': 38, 'shadow-color': '#bcffeb', 'shadow-opacity': .8,
+        'underlay-color': '#bcffeb', 'underlay-opacity': .8, 'underlay-padding': 9,
+        'overlay-color': '#ffffff', 'overlay-opacity': .82, 'overlay-padding': 2,
       }},
       { selector: 'node.hover', style: {
-        'border-width': 3.4, 'border-color': '#fff3a3', 'shadow-blur': 32, 'shadow-color': '#fff3a3', 'shadow-opacity': .58,
+        'border-width': 3.4, 'border-color': '#fff3a3',
+        'underlay-color': '#fff3a3', 'underlay-opacity': .58, 'underlay-padding': 8,
       }},
       { selector: 'node.focusPulse', style: {
-        'border-width': 4.5, 'border-color': '#ffffff', 'shadow-blur': 48, 'shadow-color': '#ffffff', 'shadow-opacity': .95,
+        'border-width': 4.5, 'border-color': '#ffffff',
+        'underlay-color': '#ffffff', 'underlay-opacity': .95, 'underlay-padding': 10,
+        'overlay-color': '#ffffff', 'overlay-opacity': .76, 'overlay-padding': 2,
       }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
       { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.5 }},
       { selector: 'node:selected', style: {
-        'border-width': 3, 'border-color': '#fff6c7', 'shadow-blur': 28,
-        'shadow-color': '#fff3a3', 'shadow-opacity': .46,
+        'border-width': 3, 'border-color': '#fff6c7',
+        'underlay-color': '#fff3a3', 'underlay-opacity': .46, 'underlay-padding': 7,
       }},
       { selector: 'node.pulse', style: {
-        'border-width': 4, 'border-color': '#ffffff', 'shadow-blur': 42,
-        'shadow-color': '#ffffff', 'shadow-opacity': .62,
+        'border-width': 4, 'border-color': '#ffffff',
+        'underlay-color': '#ffffff', 'underlay-opacity': .62, 'underlay-padding': 9,
+        'overlay-color': '#ffffff', 'overlay-opacity': .7, 'overlay-padding': 2,
       }},
     ],
     layout: {
@@ -1950,9 +1960,10 @@ function _releaseSignal(cy, eleId, cls) {
   if (ele && ele.length) ele.removeClass(cls);
 }
 
-function isDerivedNeuronEdge(edge) {
-  const type = edge.data('etype');
-  return !type || type === 'derived_from';
+function isSignalNeuronEdge(edge) {
+  // Follow the rendered topology instead of one projection edge schema.
+  // The live graph is commonly composed entirely of virtual_index edges.
+  return !!edge && edge.length > 0;
 }
 
 function buildNeuronSignalPath(cy, leaf) {
@@ -1964,7 +1975,7 @@ function buildNeuronSignalPath(cy, leaf) {
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
     pathNodes.unshift(cur);
-    const incomers = cur.incomers('edge').filter(isDerivedNeuronEdge);
+    const incomers = cur.incomers('edge').filter(isSignalNeuronEdge);
     if (!incomers.length) break;
     const edge = incomers[Math.floor(Math.random() * Math.min(incomers.length, 2))];
     pathEdges.unshift(edge);
@@ -1982,8 +1993,8 @@ function collectNeuronSignalPaths(cy, limit = 6) {
   if (!cy || limit < 1) return [];
   const leaves = cy.nodes().filter(n => {
     if (!n || !n.length || n.data('kind') === 'root') return false;
-    const incoming = n.incomers('edge').filter(isDerivedNeuronEdge);
-    const outgoing = n.outgoers('edge').filter(isDerivedNeuronEdge);
+    const incoming = n.incomers('edge').filter(isSignalNeuronEdge);
+    const outgoing = n.outgoers('edge').filter(isSignalNeuronEdge);
     return incoming.length > 0 && outgoing.length === 0;
   });
   const anchors = leaves.filter(n => {
@@ -2010,7 +2021,7 @@ function collectNeuronSignalPaths(cy, limit = 6) {
   }
   if (!paths.length) {
     const edges = [];
-    cy.edges().filter(isDerivedNeuronEdge).forEach(edge => edges.push(edge));
+    cy.edges().filter(isSignalNeuronEdge).forEach(edge => edges.push(edge));
     for (let i = edges.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [edges[i], edges[j]] = [edges[j], edges[i]];
