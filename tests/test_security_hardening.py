@@ -2,7 +2,7 @@
 
 4 条硬断言:
 1. 越权:Agent B 无法读写 Agent A 的 group(默认 STRICT_BINDING=1)
-2. 只读无副作用:只读请求前后文件系统完全不变
+2. 只读无副作用:只读请求前后持久化文件完全不变
 3. update secret:update 路径也脱敏,原文不入持久层
 4. 并发唯一:N 并发同正文 -> 1 active + N provenance
 
@@ -71,7 +71,7 @@ def test_cross_group_access_denied(monkeypatch):
 
 
 def test_readonly_no_side_effects():
-    """硬断言2: 只读请求前后文件系统完全不变。"""
+    """硬断言2: 只读请求前后持久化文件完全不变。"""
     from memoryguard.shared_memory_store import SharedMemoryStore
     from memoryguard.schema_v3 import SharedMemoryRecord, SharedMemoryStatus, MemoryKind
 
@@ -84,12 +84,15 @@ def test_readonly_no_side_effects():
         )
         store_w.append_record(rec)
 
-        # 快照文件系统状态
+        # 快照文件系统状态。WAL mode 的只读连接可能创建/刷新 -wal/-shm
+        # sidecar，这是参与 WAL 一致性协议的正常行为；硬断言只覆盖持久化
+        # 文件和 JSONL 备份，不允许出现新的真实数据文件。
         sm_root = Path(ws) / ".memoryguard" / "shared-memory"
         before = set()
         for f in sm_root.rglob("*"):
-            if f.is_file():
+            if f.is_file() and f.name not in {"memory.db-shm", "memory.db-wal"}:
                 before.add(str(f.relative_to(ws)))
+        before_db = (sm_root / "ro-test-group" / "memory.db").read_bytes()
 
         # 只读打开 + 查询
         store_r = SharedMemoryStore(ws, "ro-test-group", read_only=True)
@@ -116,12 +119,14 @@ def test_readonly_no_side_effects():
         # 快照后文件系统状态
         after = set()
         for f in sm_root.rglob("*"):
-            if f.is_file():
+            if f.is_file() and f.name not in {"memory.db-shm", "memory.db-wal"}:
                 after.add(str(f.relative_to(ws)))
+        after_db = (sm_root / "ro-test-group" / "memory.db").read_bytes()
 
-        # 硬断言:文件列表完全不变
+        # 硬断言:持久化文件列表与 memory.db 内容完全不变
         assert before == after, \
             f"filesystem changed! before={before} after={after}"
+        assert before_db == after_db
 
 
 def test_update_secret_redacted(monkeypatch):

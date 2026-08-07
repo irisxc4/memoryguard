@@ -49,6 +49,10 @@ def _shared_hashes(workspace: Path) -> dict[str, str]:
         str(path.relative_to(workspace)): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in root.rglob("*")
         if path.is_file()
+        # WAL mode read-only connections may create/refresh -shm/-wal sidecars
+        # without changing the durable memory.db; the hash covers only the
+        # authoritative database file and any JSONL backups.
+        and path.name not in {"memory.db-shm", "memory.db-wal"}
     }
 
 
@@ -222,3 +226,115 @@ def test_context_bootstrap_runtime_lease_guard(tmp_path, monkeypatch):
         {"task": "lease check", "workspace": str(ws)},
     )
     assert result.get("error") == "runtime_split_brain"
+
+
+def test_shared_memory_read_only_reader_observes_concurrent_write(tmp_path):
+    ws = tmp_path / "ws"
+    group = "default"
+    writer = SharedMemoryStore(ws, group)
+    writer.append_record(SharedMemoryRecord(
+        memory_id="before",
+        body="record visible before writer commits again",
+        kind=MemoryKind.FACT,
+        status=SharedMemoryStatus.ACTIVE,
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+    ))
+    group_dir = ws / ".memoryguard" / "shared-memory" / group
+    assert not (group_dir / "memory.db-wal").exists()
+
+    reader = SharedMemoryStore(ws, group, read_only=True)
+    assert reader.get_record("before") is not None
+
+    writer.append_record(SharedMemoryRecord(
+        memory_id="after",
+        body="record committed after read-only reader opened",
+        kind=MemoryKind.FACT,
+        status=SharedMemoryStatus.ACTIVE,
+        created_at="2026-01-02T00:00:00+00:00",
+        updated_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert reader.get_record("after") is not None
+    assert reader.get_record("before") is not None
+
+
+def test_canonical_status_old_shared_schema_is_structured_diagnostic(
+    tmp_path, monkeypatch,
+):
+    ws = tmp_path / "ws"
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    RuleMergeStore(ws)
+    group = "legacy-diagnostic"
+    db_path = ws / ".memoryguard" / "shared-memory" / group / "memory.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TABLE records ("
+            "memory_id TEXT PRIMARY KEY, body TEXT NOT NULL, "
+            "kind TEXT NOT NULL, status TEXT NOT NULL)"
+        )
+
+    result = execute_tool("memoryguard_canonical_status", {
+        "workspace": str(ws),
+        "share_group_id": group,
+    })
+    assert result.get("isError") is not True, result
+    payload = json.loads(result["content"][0]["text"])
+    assert payload["ok"] is True
+    assert payload["canonical_ready"] is False
+    assert "shared_memory_schema_upgrade_required" in payload["failures"]
+    assert payload["checks"]["legacy_readable"] is False
+    assert payload["checks"]["shared_memory_schema_upgrade_required"]
+
+
+def test_read_only_mcp_never_enters_shared_memory_write_transaction(
+    tmp_path, monkeypatch,
+):
+    ws = tmp_path / "ws"
+    AgentBindingStore(ws).bind_agent("ro-agent", "default")
+    SharedMemoryStore(ws, "default")
+    RuleMergeStore(ws)
+
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "ro-agent")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(ws / "project"))
+    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
+    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
+    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
+
+    def _deny_tx(*args, **kwargs):
+        raise AssertionError("read-only MCP path entered SharedMemoryStore._tx")
+
+    monkeypatch.setattr(SharedMemoryStore, "_tx", _deny_tx)
+
+    calls = [
+        (
+            "memoryguard_canonical_status",
+            {"workspace": str(ws), "share_group_id": "default"},
+        ),
+        (
+            "memoryguard_context_bootstrap",
+            {"workspace": str(ws), "task": "read-only MCP path"},
+        ),
+        (
+            "memoryguard_rule_decision_read",
+            {"workspace": str(ws), "decision_id": "missing"},
+        ),
+        (
+            "memoryguard_rule_scope_stats",
+            {"workspace": str(ws)},
+        ),
+    ]
+    for name, args in calls:
+        result = execute_tool(name, args)
+        assert result is not None
+        if name == "memoryguard_rule_decision_read":
+            # A missing decision is a normal MCP error result; the read path
+            # must still fail without entering SharedMemoryStore._tx.
+            assert result.get("isError") is True, (name, result)
+        else:
+            assert result.get("isError") is not True, (name, result)

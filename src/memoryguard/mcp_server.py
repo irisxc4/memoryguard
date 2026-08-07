@@ -2300,14 +2300,18 @@ def _handle_rule_merge_cooldown_clear(args: dict[str, Any]) -> dict[str, Any]:
     return _governance_json_response({"ok": True, **(result or {})})
 
 
-def _rule_service_for_args(args: dict[str, Any], workspace: Path):
+def _rule_service_for_args(
+    args: dict[str, Any], workspace: Path, *, read_only: bool = False,
+):
     from .rule_creation import RuleCreationService
     group_id, err, access_ctx = _resolve_access(args, workspace)
     if err:
         return None, None, None, _mcp_error(err)
     from .shared_memory_store import SharedMemoryStore
     try:
-        store = SharedMemoryStore(workspace, group_id)
+        store = SharedMemoryStore(
+            workspace, group_id, read_only=read_only,
+        )
     except FileNotFoundError:
         return None, None, None, _mcp_error(f"group not found: {group_id}")
     service = RuleCreationService(
@@ -2337,7 +2341,9 @@ def _handle_rule_create_auto(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_rule_decision_read(args: dict[str, Any]) -> dict[str, Any]:
     workspace = _resolve_memory_workspace(args)
-    service, _group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    service, _group_id, _access_ctx, error = _rule_service_for_args(
+        args, workspace, read_only=True,
+    )
     if error:
         return error
     result = service.read_decision(str(args.get("decision_id", "") or ""))
@@ -2361,7 +2367,9 @@ def _handle_rule_undo(args: dict[str, Any]) -> dict[str, Any]:
 
 def _handle_rule_scope_stats(args: dict[str, Any]) -> dict[str, Any]:
     workspace = _resolve_memory_workspace(args)
-    service, group_id, _access_ctx, error = _rule_service_for_args(args, workspace)
+    service, group_id, _access_ctx, error = _rule_service_for_args(
+        args, workspace, read_only=True,
+    )
     if error:
         return error
     result = service.scope_stats(_effective_agent_context(args, group_id))

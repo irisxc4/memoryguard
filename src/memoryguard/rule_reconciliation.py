@@ -582,8 +582,14 @@ class RuleReconciliationService:
         self.jobs = RuleReconciliationStore(store)
         self._legacy_cache: dict[str, Any] = {}
 
-    def _legacy(self, share_group_id: str) -> Any:
+    def _legacy(
+        self, share_group_id: str, *, read_only: bool = False,
+    ) -> Any:
         from .shared_memory_store import SharedMemoryStore
+        if read_only:
+            return SharedMemoryStore(
+                self.workspace, share_group_id, read_only=True,
+            )
         if share_group_id not in self._legacy_cache:
             self._legacy_cache[share_group_id] = SharedMemoryStore(
                 self.workspace, share_group_id,
@@ -593,7 +599,7 @@ class RuleReconciliationService:
     # ------------------------------------------------------------- digests
 
     def source_digest(self, share_group_id: str) -> str:
-        legacy = self._legacy(share_group_id)
+        legacy = self._legacy(share_group_id, read_only=True)
         records = [
             record for record in legacy.list_records()
             if str(record.injection_policy or "") == "always"
@@ -1991,7 +1997,25 @@ def canonical_reconciliation_status(
     store = store or RuleMergeStore(workspace, read_only=True)
     recon = RuleReconciliationService(store, workspace=workspace)
     jobs = RuleReconciliationStore(store)
-    legacy = SharedMemoryStore(workspace, share_group_id)
+    try:
+        legacy = SharedMemoryStore(
+            workspace, share_group_id, read_only=True,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "schema_upgrade_required" not in message:
+            raise
+        return {
+            "share_group_id": share_group_id,
+            "canonical_ready": False,
+            "read_path": "legacy",
+            "failures": ["shared_memory_schema_upgrade_required"],
+            "checks": {
+                "shared_memory_schema_upgrade_required": message,
+                "legacy_readable": False,
+            },
+            "error": message,
+        }
 
     failures: list[str] = []
     checks: dict[str, Any] = {}

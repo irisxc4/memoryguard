@@ -649,20 +649,10 @@ class SharedMemoryStore:
 
     def _connect(self) -> sqlite3.Connection:
         if self.read_only:
-            # SQLite 的普通 mode=ro 连接到 WAL 数据库时，可能创建 -shm/-wal
-            # 侧车。干净数据库用 immutable 保证绝对无副作用；已经存在有效
-            # WAL 时必须用普通只读模式，才能看见尚未 checkpoint 的最新提交。
-            wal_path = Path(f"{self.db_path}-wal")
-            # A checkpoint can remove the sidecar between ``exists`` and
-            # ``stat``.  That narrow race is common on Windows because the
-            # hook/MCP writer lives in another process.  Probe once instead:
-            # a disappearing WAL simply means the main DB is now current.
-            try:
-                has_live_wal = wal_path.stat().st_size > 0
-            except FileNotFoundError:
-                has_live_wal = False
-            immutable = "" if has_live_wal else "&immutable=1"
-            uri = f"file:{self.db_path}?mode=ro{immutable}"
+            # 共享库是 WAL 模式、多 Agent/多进程共享数据库。immutable=1 会
+            # 跳过锁与变更检测，此刻没有 -wal 不代表后续不会有合法 writer；
+            # 普通 mode=ro 才会参与 WAL 一致性协议并看到并发提交。
+            uri = f"file:{self.db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
         elif self.must_exist:
             uri = f"file:{self.db_path}?mode=rw"
