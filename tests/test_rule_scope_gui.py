@@ -134,6 +134,34 @@ def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(
     assert invented["error"] == "unknown_agent_target"
 
 
+def test_rule_habits_list_hides_deleted_and_shadowed_records(tmp_path: Path) -> None:
+    group_id = "team-rules"
+    store = SharedMemoryStore(tmp_path, group_id)
+    store.append_record(SharedMemoryRecord(
+        memory_id="active-pref", body="active preference",
+        kind=MemoryKind.PREFERENCE, status=SharedMemoryStatus.ACTIVE,
+        injection_policy="relevant", agent_instance_id="agent-a",
+    ))
+    store.append_record(SharedMemoryRecord(
+        memory_id="shadowed-pref", body="shadowed preference",
+        kind=MemoryKind.PREFERENCE, status=SharedMemoryStatus.SHADOWED,
+        injection_policy="relevant", agent_instance_id="agent-a",
+    ))
+    store.append_record(SharedMemoryRecord(
+        memory_id="deleted-pref", body="deleted preference",
+        kind=MemoryKind.PREFERENCE, status=SharedMemoryStatus.DELETED,
+        injection_policy="relevant", agent_instance_id="agent-a",
+    ))
+
+    listed = GovernanceApi(tmp_path).list_rules_habits(group_id)
+    visible = {
+        item["memory_id"]
+        for items in listed["buckets"].values()
+        for item in items
+    }
+    assert visible == {"active-pref"}
+
+
 def test_preview_accepts_only_verified_project_provider_and_role_contexts(tmp_path: Path, monkeypatch) -> None:
     api, group_id = _prepare(tmp_path)
     verified = {

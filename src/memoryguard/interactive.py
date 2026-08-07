@@ -2015,10 +2015,10 @@ function renderNeuronGraph() {
   cyInstance.on('grab', 'node', event => {
     if (!cyInstance) return;
     const dragRoot = event.target;
-    if (!dragRoot || !dragRoot.selected()) return;
+    if (!dragRoot) return;
+    if (!dragRoot.selected()) dragRoot.select();
     const selectedNodes = cyInstance.$('node:selected');
-    if (!selectedNodes.length) return;
-    const dragNodeIds = new Set(selectedNodes.map(n => n.id()));
+    const dragNodeIds = new Set(selectedNodes.length ? selectedNodes.map(n => n.id()) : [dragRoot.id()]);
     collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));
     const basePositions = {};
     dragNodeIds.forEach(nodeId => {
@@ -3872,6 +3872,8 @@ function ruleCard(record) {
   const exceptions = ruleExceptionsFor(record);
   const confidence = decision?.scope_confidence ?? record.scope_confidence ?? record.auto_scope_confidence ?? record.confidence;
   const decisionId = decision?.decision_id || record.decision_id || '';
+  const mergedCount = Array.isArray(record.supersedes) ? record.supersedes.length : 0;
+  const mergedHtml = mergedCount ? `<span class="chip chip-info">已合并 ${mergedCount} 条旧记忆</span>` : '';
   const exceptionHtml = exceptions.length ? `<div class="rule-exceptions"><div class="muted">子例外（父规则：${escapeHtml(record.memory_id)}）</div>${exceptions.map(item => `<div class="rule-exception-row"><code>${escapeHtml(item.child_exception || item.child_rule_id || '')}</code><span class="chip chip-info">priority ${Number(item.priority || 0)}</span><span class="muted">${escapeHtml(item.reason || '')}</span>${item.active === false ? '<span class="chip chip-medium">已撤销</span>' : `<button class="btn btn-danger btn-icon" type="button" onclick="revokeRuleException('${escapeHtml(item.exception_id || '')}')">撤销</button>`}</div>`).join('')}</div>` : '';
   // Pure parent/child relation editing is an administrator diagnostic path.
   // Daily governance uses the receipt-level “例外” action above, which carries
@@ -3880,6 +3882,7 @@ function ruleCard(record) {
   const receiptHtml = receipts.slice(-3).map(renderRuleReceiptActions).join('');
   return `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(displayTitle(record))}</strong>
     <span class="chip ${record.injection_policy === 'always' ? 'chip-confirmed' : ''}">${record.injection_policy === 'always' ? '强制' : '按需'}</span>
+    ${mergedHtml}
     ${stateLabel ? `<span class="chip ${stateChip}">${escapeHtml(stateLabel)}</span>` : ''}</div>
     <p>${escapeHtml(displayBody(record)).slice(0, 300)}</p>
     <div class="muted">适用范围：${escapeHtml(ruleAudience(record))}</div>

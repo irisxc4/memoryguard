@@ -355,12 +355,15 @@ def test_rule_habits_render_as_collapsible_folders() -> None:
     assert '<details class="folder-group" open style="--folder-depth:0">' in html
     assert '<summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${label}</span><span class="folder-count">${cards.length} 条</span></summary>' in html
     assert '<div class="folder-children">${cards.join(\'\')}</div>' in html
+    assert "const mergedHtml = mergedCount ? `<span class=\"chip chip-info\">已合并 ${mergedCount} 条旧记忆</span>` : '';" in html
 
 
 def test_neuron_drag_carries_descendant_branches() -> None:
     html = render_interactive_html()
 
     assert "const collectNeuronSubtree = (rootId) => {" in html
+    assert "if (!dragRoot.selected()) dragRoot.select();" in html
+    assert "const dragNodeIds = new Set(selectedNodes.length ? selectedNodes.map(n => n.id()) : [dragRoot.id()]);" in html
     assert "collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));" in html
     assert "dragNodeIds.forEach(nodeId => {" in html
 

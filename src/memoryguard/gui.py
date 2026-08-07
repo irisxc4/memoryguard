@@ -6741,6 +6741,8 @@ class GovernanceApi:
         options = self._rule_scope_options(share_group_id)
         buckets = {"mandatory": [], "preferences": [], "procedures": [], "corrections": [], "projects": []}
         for record in store.list_records():
+            if getattr(record.status, "value", record.status) != "active":
+                continue
             data = record.to_dict()
             policy = data.get("injection_policy", "relevant")
             kind = data.get("kind", "")
