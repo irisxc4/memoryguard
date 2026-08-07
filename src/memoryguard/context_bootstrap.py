@@ -6,6 +6,8 @@ selects a bounded packet from an already-open, trusted SharedMemoryStore.
 
 from __future__ import annotations
 
+import json
+
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -22,7 +24,11 @@ from .schema_v3 import (
 )
 from .rule_scope import effective_assignments, normalize_assignment
 from .rule_scope import canonical_project_ref
-from .rule_read_path import MODE_LEGACY, resolve_read_path_mode
+from .rule_read_path import (
+    MODE_LEGACY,
+    MODE_RULE_INTELLIGENCE,
+    resolve_read_path_mode,
+)
 from .shared_memory_store import (
     MANDATORY_MAX_CHARS,
     MANDATORY_MAX_ITEMS,
@@ -98,6 +104,43 @@ def _sort_key(candidate: _Candidate) -> tuple[Any, ...]:
         record.updated_at or record.created_at or "",
         record.memory_id,
     )
+
+
+def _folded_source_ids(store: Any, group_id: str) -> set[str]:
+    """Return legacy sources folded by a reconciliation job that is not ready.
+
+    A retryable saga may shadow sources before its final canonical commit.  The
+    legacy fallback must keep reading those rules until the canonical layer is
+    actually ready; otherwise a failed/partial job silently empties the rules
+    that are supposed to stay available during the retry window.
+    """
+    try:
+        from .rule_merge_store import RuleMergeStore
+        from .rule_reconciliation import RuleReconciliationStore
+    except Exception:
+        return set()
+    try:
+        jobs = RuleReconciliationStore(RuleMergeStore(store.workspace))
+        latest = jobs.latest_job(group_id)
+        if not latest:
+            return set()
+        status = str(latest.get("status") or "")
+        if status not in {
+            "pending_model", "model_running", "staged", "applying",
+            "retryable_failed",
+        }:
+            return set()
+        raw = latest.get("result_json") or ""
+        if not raw:
+            return set()
+        plan = json.loads(raw)
+    except Exception:
+        return set()
+    folded: set[str] = set()
+    for bundle in plan.get("bundles", []) or []:
+        for source_id in bundle.get("source_memory_ids", []) or []:
+            folded.add(str(source_id))
+    return folded
 
 
 def build_context_packet(
@@ -239,6 +282,32 @@ def build_context_packet(
                 canonical_mapping = None  # keep the legacy path; canonical is advisory
                 effective_read_path = "legacy"
                 fallback_reason = "canonical_mapping_unavailable"
+    # Canonical output records are internal projection data, not legacy
+    # governance input.  Before readiness they must not leak into a fallback
+    # packet, otherwise the "legacy" read path would silently switch behavior.
+    packet_records = all_records
+    folded_source_ids: set[str] = set()
+    if effective_read_path != MODE_RULE_INTELLIGENCE:
+        shadowed_non_canonical = {
+            record.memory_id for record in all_records
+            if (
+                record.status == SharedMemoryStatus.SHADOWED
+                and not str(
+                    getattr(record, "dedup_domain", "") or ""
+                ).startswith("canonical:")
+            )
+        }
+        if shadowed_non_canonical:
+            folded_source_ids = (
+                _folded_source_ids(store, store.group_id)
+                & shadowed_non_canonical
+            )
+        packet_records = [
+            record for record in all_records
+            if not str(getattr(record, "dedup_domain", "") or "").startswith(
+                "canonical:"
+            )
+        ]
     omitted = {
         "non_active": 0,
         "sensitive": 0,
@@ -274,9 +343,15 @@ def build_context_packet(
     effective_priorities: dict[str, int] = {}
     legacy_unscoped: list[str] = []
     scoped_corrupt: list[SharedMemoryRecord] = []
-    for record in all_records:
+    for record in packet_records:
         if record.status != SharedMemoryStatus.ACTIVE:
-            continue
+            if (
+                str(getattr(record, "dedup_domain", "") or "").startswith(
+                    "canonical:"
+                )
+                or record.memory_id not in folded_source_ids
+            ):
+                continue
         record_assignments = assignments_by_memory.get(record.memory_id, [])
         if record.injection_policy not in {"always", "relevant"}:
             if direct_compat:
@@ -494,7 +569,7 @@ def build_context_packet(
     # these slots/characters and are not reconsidered as preferences.
     candidates: list[_Candidate] = []
 
-    for record in all_records:
+    for record in packet_records:
         if record.status != SharedMemoryStatus.ACTIVE:
             omitted["non_active"] += 1
             continue

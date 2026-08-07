@@ -31,6 +31,17 @@ VERSION = "0.5.2"
 FP = "a" * 64
 
 
+def test_norm_path_normalizes_windows_case(tmp_path):
+    from memoryguard.runtime_lease import _norm_path
+
+    upper = _norm_path(tmp_path / "Case.sqlite")
+    lower = _norm_path(tmp_path / "case.sqlite")
+    if os.name == "nt":
+        assert upper == lower
+    else:
+        assert upper != lower
+
+
 def _lease(store: RuntimeLeaseStore, *, pid: int, version: str, fingerprint: str) -> None:
     store.upsert({
         "pid": pid,

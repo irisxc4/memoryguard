@@ -142,15 +142,57 @@ def default_database_paths(control_workspace: str | Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _win_pid_alive(pid: int) -> bool:
+    """Read-only Windows process existence probe.
+
+    Python's ``os.kill(pid, 0)`` is *not* a signal-0 probe on Windows; any
+    non-ctrl signal calls ``TerminateProcess`` and would kill the peer we are
+    checking.  OpenProcess + GetExitCodeProcess only reads process state.
+    Access-denied is treated as alive so elevated peers are not mistaken for
+    stale leases.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+    )
+    if not handle:
+        error = ctypes.get_last_error()
+        # ERROR_INVALID_PARAMETER means no such pid; access denied is unknown.
+        return error not in (0, 87)
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # fail closed: do not prune a peer we cannot inspect
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_alive(pid: Any) -> bool:
-    """True when ``pid`` names a live process.  ``os.kill(pid, 0)`` is a pure
-    liveness probe (signal 0), never a kill."""
+    """True when ``pid`` names a live process.  Never kills on any platform."""
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
         return False
     if pid_int <= 0:
         return False
+    if os.name == "nt":
+        return _win_pid_alive(pid_int)
     try:
         os.kill(pid_int, 0)
     except PermissionError:
@@ -163,7 +205,10 @@ def _pid_alive(pid: Any) -> bool:
 def _norm_path(path: Any) -> str:
     if not path:
         return ""
-    return os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
+    normalized = os.path.realpath(
+        os.path.abspath(os.path.expanduser(str(path))),
+    )
+    return os.path.normcase(os.path.normpath(normalized))
 
 
 def _lease_identity(lease: dict[str, Any]) -> tuple[Any, ...]:

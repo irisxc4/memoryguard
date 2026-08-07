@@ -532,6 +532,86 @@ def test_resume_from_retryable_failed_phase(tmp_path):
     assert status["canonical_ready"] is True
 
 
+def test_legacy_read_path_semantics_unchanged_during_retryable_failure(tmp_path):
+    from memoryguard.context_bootstrap import build_context_packet
+    from memoryguard.schema_v3 import EffectiveAgentContext
+
+    run_ws = tmp_path / "shadow-window"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan = build_bundles(
+        store, legacy, GROUP, _active_mandatory(legacy),
+    )
+    context = EffectiveAgentContext(
+        agent_instance_id=CODEX,
+        share_group_id=GROUP,
+        project_ref=CODEX_PROJECT,
+        provider="codex",
+        runtime_role="worker",
+    )
+    baseline = build_context_packet(
+        legacy,
+        task="运行测试",
+        effective_context=context,
+        read_path="rule-intelligence",
+    )
+    assert baseline["effective_read_path"] == "legacy"
+    baseline_ids = set(baseline["mandatory_rule_ids"])
+    baseline_bodies = [
+        item["body"]
+        for item in baseline["context_packet"]["mandatory_items"]
+    ]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected-after-shadow-window-failure")
+
+    service._retire_previous_canonical = boom  # type: ignore[assignment]
+    try:
+        with pytest.raises(
+            RuntimeError, match="injected-after-shadow-window-failure",
+        ):
+            service.run(GROUP, bundle_plan=plan, model_mode="scripted")
+    finally:
+        del service._retire_previous_canonical
+
+    failed = service.jobs.latest_job(GROUP)
+    assert failed["status"] == "retryable_failed"
+    assert failed["phase"] == "retire_previous"
+    # The window is real: source rules were shadowed before the failed phase,
+    # while only the canonical projection records remain active.
+    all_records = list(legacy.list_records())
+    folded_sources = {
+        "src-caveman", "src-rtk",
+        "src-codex-luna", "src-codex-xhigh", "src-codex-nokill",
+    }
+    assert folded_sources <= set(_shadowed_ids(legacy))
+    assert all(
+        not record.agent_instance_id
+        and record.status == SharedMemoryStatus.ACTIVE
+        for record in all_records
+        if str(record.dedup_domain or "").startswith("canonical:")
+    )
+
+    packet = build_context_packet(
+        legacy,
+        task="运行测试",
+        effective_context=context,
+        read_path="rule-intelligence",
+    )
+    assert packet["effective_read_path"] == "legacy"
+    assert set(packet["mandatory_rule_ids"]) == baseline_ids
+    assert [
+        item["body"]
+        for item in packet["context_packet"]["mandatory_items"]
+    ] == baseline_bodies
+    assert not any(
+        str(item.get("dedup_domain") or "").startswith("canonical:")
+        for item in packet["context_packet"]["mandatory_items"]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Req5 fault-injection: every retryable phase resumes with the same job row.
 # ---------------------------------------------------------------------------

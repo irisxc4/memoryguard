@@ -54,8 +54,8 @@ JOB_STATUSES = frozenset({
 # old duplicates are shadowed.  Never shadow before building.
 SAGA_PHASES = (
     "model", "stage", "backfill_p3", "write_canonical",
-    "verify_source_links", "shadow_legacy", "drain_outbox",
-    "build_projection", "activate_canonical", "verify_readiness",
+    "verify_source_links", "drain_outbox", "build_projection",
+    "activate_canonical", "verify_readiness", "shadow_legacy",
     "retire_previous", "canonical_ready",
 )
 
@@ -1511,14 +1511,8 @@ class RuleReconciliationService:
                     f"unlinked_sources={len(unlinked)}: {','.join(unlinked[:5])}"
                 )
 
-        # ---- shadow_legacy (never before building) -------------------------
-        if phase in {"verify_source_links", "shadow_legacy"}:
-            self.jobs.transition(job_id, phase="shadow_legacy")
-            self._shadow_legacy(share_group_id, legacy, plan)
-            phase = "shadow_legacy"
-
         # ---- drain_outbox --------------------------------------------------
-        if phase in {"shadow_legacy", "drain_outbox"}:
+        if phase in {"verify_source_links", "shadow_legacy", "drain_outbox"}:
             self.jobs.transition(job_id, phase="drain_outbox")
             phase = "drain_outbox"
             RuleMergeService(self.store).consume_outbox(
@@ -1568,8 +1562,14 @@ class RuleReconciliationService:
                 )
             phase = "verify_readiness"
 
+        # ---- shadow_legacy: only after readiness ---------------------------
+        if phase in {"verify_readiness", "shadow_legacy"}:
+            self.jobs.transition(job_id, phase="shadow_legacy")
+            self._shadow_legacy(share_group_id, legacy, plan)
+            phase = "shadow_legacy"
+
         # ---- retire_previous: old canonical output leaves service -----------
-        if phase in {"verify_readiness", "retire_previous"}:
+        if phase in {"shadow_legacy", "retire_previous"}:
             self.jobs.transition(job_id, phase="retire_previous")
             self._retire_previous_canonical(
                 share_group_id, legacy, plan, job_id=job_id,
