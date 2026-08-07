@@ -5,7 +5,7 @@ from memoryguard.extractor import MemoryExtractor
 from memoryguard.light_graph import LightGraphManager
 from pathlib import Path
 
-ws = r"H:\ai\workspace\工具项目\memoryguard\tests\fixtures\workspace"
+ws = str(Path(__file__).resolve().parent / "fixtures" / "workspace")
 d = WorkspaceDiscoverer(Path(ws)).discover()
 ctx = RuleContext(agrs=d.agrs)
 ext = MemoryExtractor(ctx)

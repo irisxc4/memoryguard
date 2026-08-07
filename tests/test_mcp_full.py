@@ -1,7 +1,8 @@
 """MCP 全工具验证（8 个工具）。"""
 import json, subprocess, sys
+from pathlib import Path
 
-ws = r"H:\ai\workspace\工具项目\memoryguard\tests\fixtures\workspace"
+ws = str(Path(__file__).resolve().parent / "fixtures" / "workspace")
 
 reqs = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},

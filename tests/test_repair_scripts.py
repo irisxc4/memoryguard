@@ -14,10 +14,18 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
+
 from memoryguard.schema_v3 import SharedMemoryRecord
 from memoryguard.shared_memory_store import SharedMemoryStore
 
-SCRIPTS = Path(r"h:\ai\workspace\工具项目\memoryguard\scripts")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "scripts"
+
+pytestmark = pytest.mark.skipif(
+    not SCRIPTS.exists(),
+    reason="scripts directory missing",
+)
 
 
 def _load(script: str, modname: str):

@@ -39,7 +39,7 @@ from memoryguard.group_migration import copy_group_records, _has_migrated_from  
 from memoryguard.shared_memory_store import SharedMemoryStore  # noqa: E402
 
 # Defaults for the 2026-08 incident (overridable via argv).
-DEFAULT_SOURCE_WS = r"H:\ai\workspace\工具项目\memoryguard"
+DEFAULT_SOURCE_WS = str(ROOT)
 DEFAULT_SOURCE_GID = "shared-6767d0c38b9cc5f1"
 DEFAULT_TARGET_GID = "shared-9b8b5d020a74b2fd"
 DEFAULT_EXPECT_SOURCE = 127
