@@ -7,9 +7,9 @@ prefer that canonical layer so that merged duplicates inject once, not N times
 is exactly what its group stored.
 
 **Safety default (v2).**  The canonical read path is a shadow feature, not the
-production default.  ``resolve_read_path_mode`` and ``build_context_packet``
-default to ``legacy``; the canonical path only runs when explicitly requested
-(``rule-intelligence`` / ``auto`` via an explicit opt-in or env var), and it
+production default for *explicitly requested legacy*.  ``build_context_packet``
+defaults to ``auto``; the canonical path only runs when the group is actually
+canonically ready (``rule-intelligence`` / ``auto``), and it
 deduplicates *after* the active/audience/exclude match so a canonical collapse
 can never delete the one record that actually applies to the current Agent or
 project.  ``shadow_compare`` exposes the legacy-vs-canonical context diff so an
@@ -84,7 +84,9 @@ class RuleReadPath:
             try:
                 from .rule_merge_store import RuleMergeStore
 
-                self._store = RuleMergeStore(self.workspace)
+                self._store = RuleMergeStore(
+                    self.workspace, read_only=True,
+                )
             except Exception:
                 self._store = None
         return self._store

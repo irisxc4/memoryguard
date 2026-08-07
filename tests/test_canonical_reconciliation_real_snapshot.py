@@ -50,6 +50,10 @@ from pathlib import Path
 import pytest
 
 from memoryguard.agent_binding import AgentBindingStore
+from memoryguard.governance_scope import (
+    GovernanceScope,
+    share_group_projection_path,
+)
 from memoryguard.host_enrichment import _pending_path
 from memoryguard.rule_binding import RuleBinding
 from memoryguard.rule_merge import RuleMergeService
@@ -422,6 +426,15 @@ def test_canonical_reconciliation_two_builds_idempotent(tmp_path):
     assert status["checks"]["projection_error"] == ""
     assert status["checks"]["graph_built"] is True
     assert status["checks"]["canonical_activation"] == "active"
+    assert status["checks"]["projection_source_set_match"] is True
+
+    graph_path = share_group_projection_path(
+        run_ws, GovernanceScope(mode="share_group", share_group_id=GROUP),
+    )
+    graph = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert graph["meta"]["source_record_ids"] == sorted(
+        record.memory_id for record in legacy.list_records(status="active")
+    )
 
     # Codex + project visible rules = 2 (baseline + overlay; Merak excluded).
     visible = [
@@ -487,6 +500,55 @@ def test_canonical_reconciliation_two_builds_idempotent(tmp_path):
     assert src_status["checks"]["canonical_definitions"] == 0
     assert len(_active_mandatory(src_legacy)) == 6
     assert not src_store.list_source_links(share_group_id=GROUP)
+
+
+def test_canonical_ready_default_bootstrap_keeps_mandatory_rules(tmp_path):
+    """Default read must stay useful after originals are shadowed.
+
+    Once a generation is canonical_ready, an auto/default packet serves the
+    finalized canonical layer instead of returning an empty legacy view.
+    """
+    from memoryguard.context_bootstrap import build_context_packet
+    from memoryguard.schema_v3 import EffectiveAgentContext
+
+    run_ws = tmp_path / "default-read"
+    _seed_baseline(run_ws)
+    store = RuleMergeStore(run_ws)
+    service = RuleReconciliationService(store, workspace=run_ws)
+    legacy = service._legacy(GROUP)
+    plan = build_bundles(
+        store, legacy, GROUP, _active_mandatory(legacy),
+    )
+    job = service.run(GROUP, bundle_plan=plan, model_mode="scripted")
+    assert job["status"] == "canonical_ready"
+
+    context = EffectiveAgentContext(
+        agent_instance_id=CODEX,
+        share_group_id=GROUP,
+        project_ref=CODEX_PROJECT,
+        provider="codex",
+        runtime_role="worker",
+    )
+    packet = build_context_packet(
+        legacy,
+        task="运行测试",
+        effective_context=context,
+    )
+    assert packet["effective_read_path"] == "rule-intelligence"
+    assert packet["canonical_ready"] is True
+    assert packet["mandatory_rule_ids"], "default read lost mandatory rules"
+    assert len(packet["mandatory_rule_ids"]) >= 2
+
+    legacy_packet = build_context_packet(
+        legacy,
+        task="运行测试",
+        effective_context=context,
+        read_path="legacy",
+    )
+    assert legacy_packet["effective_read_path"] == "legacy"
+    assert legacy_packet["mandatory_rule_ids"], (
+        "explicit legacy read lost folded mandatory rules"
+    )
 
 
 def test_resume_from_retryable_failed_phase(tmp_path):

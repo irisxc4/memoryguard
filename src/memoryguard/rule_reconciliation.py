@@ -1574,6 +1574,14 @@ class RuleReconciliationService:
             self._retire_previous_canonical(
                 share_group_id, legacy, plan, job_id=job_id,
             )
+            # Shadowing/retirement changes the active record set.  Rebuild the
+            # projection so the finalized graph corresponds to this generation,
+            # not to the pre-switch superset.
+            self._build_projection(share_group_id)
+            self.jobs.transition(
+                job_id,
+                projection_version=self._projection_version(share_group_id),
+            )
             phase = "retire_previous"
 
         # ---- canonical_ready -----------------------------------------------
@@ -1594,6 +1602,16 @@ class RuleReconciliationService:
                     str((activation or {}).get("activated_at") or "")
                     if activation else _now_iso()
                 ),
+            )
+        final_status = canonical_reconciliation_status(
+            self.workspace, share_group_id, store=self.store,
+            exclude_job_id=job_id,
+        )
+        if not final_status["canonical_ready"]:
+            raise RuntimeError(
+                "post_switch_verify_failed: " + json.dumps(
+                    final_status["failures"], ensure_ascii=False,
+                )
             )
         return self.jobs.transition(
             job_id,
@@ -1961,7 +1979,16 @@ def canonical_reconciliation_status(
     )
     from .shared_memory_store import SharedMemoryStore
     workspace = Path(workspace).resolve()
-    store = store or RuleMergeStore(workspace)
+    rule_db = workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
+    if not rule_db.exists():
+        return {
+            "share_group_id": share_group_id,
+            "canonical_ready": False,
+            "read_path": "legacy",
+            "failures": ["rule_intelligence_not_initialized"],
+            "checks": {"rule_intelligence_db": False},
+        }
+    store = store or RuleMergeStore(workspace, read_only=True)
     recon = RuleReconciliationService(store, workspace=workspace)
     jobs = RuleReconciliationStore(store)
     legacy = SharedMemoryStore(workspace, share_group_id)
@@ -2017,6 +2044,33 @@ def canonical_reconciliation_status(
     if active and not canonical_defs:
         failures.append("no_canonical_definitions")
 
+    # 5b) Every active source link must be anchored by Evidence on its
+    # canonical Definition.  The read path derives memory_id -> definition_id
+    # from Source Links, but its shadow permission check resolves legacy
+    # sources through Evidence; a ready generation without those anchors would
+    # fail closed as soon as the canonical read actually runs.
+    anchored_evidence = {
+        (ev.source_rule_id, ev.definition_id)
+        for ev in store.list_evidence()
+        if ev.source_rule_id and ev.definition_id
+    }
+    missing_evidence: list[str] = []
+    for link in links:
+        memory_id = str(link.get("memory_id") or "")
+        definition_id = str(
+            link.get("canonical_definition_id")
+            or link.get("original_definition_id") or ""
+        )
+        if (
+            not memory_id
+            or not definition_id
+            or (memory_id, definition_id) not in anchored_evidence
+        ):
+            missing_evidence.append(memory_id)
+    checks["missing_evidence_sources"] = sorted(missing_evidence)
+    if missing_evidence:
+        failures.append("evidence_anchor_missing")
+
     # 6) Shadow diff is empty (missing/extra/permission_diff all 0).
     shadow = _shadow_diff(store, legacy, share_group_id)
     checks["shadow"] = shadow
@@ -2032,6 +2086,33 @@ def canonical_reconciliation_status(
     checks["graph_built"] = graph_built
     if not graph_built:
         failures.append("graph_not_built")
+
+    # The projection is authoritative only when its source-record set matches
+    # the current active shared-memory set.  A graph built before shadow/retire
+    # is stale even though the file itself is valid JSON.
+    graph_source_ids: list[str] = []
+    if graph_built:
+        try:
+            graph = json.loads(graph_path.read_text(encoding="utf-8"))
+            graph_source_ids = sorted(
+                str(item)
+                for item in (
+                    (graph.get("meta", {}) or {}).get("source_record_ids", []) or []
+                )
+            )
+        except Exception:
+            graph_source_ids = []
+    current_active_ids = sorted(
+        record.memory_id for record in legacy.list_records(status="active")
+    )
+    checks["projection_source_record_ids"] = graph_source_ids
+    checks["current_active_record_ids"] = current_active_ids
+    projection_source_set_match = (
+        graph_built and graph_source_ids == current_active_ids
+    )
+    checks["projection_source_set_match"] = projection_source_set_match
+    if graph_built and not projection_source_set_match:
+        failures.append("projection_source_set_drift")
 
     # 8) Group-level canonical activation written (Req8 gate).
     activation = jobs.canonical_activation(share_group_id)

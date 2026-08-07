@@ -291,12 +291,13 @@ TOOLS = [
                 "read_path": {
                     "type": "string",
                     "enum": ["auto", "legacy", "rule-intelligence"],
-                    "default": "legacy",
-                    "description": "Phase5 canonical read path (shadow by "
-                    "default): legacy forces the old path; auto / "
-                    "rule-intelligence prefer the rule-intelligence layer when "
-                    "data exists, deduplicating merged duplicates only after "
-                    "the active/audience/exclude match",
+                    "default": "auto",
+                    "description": "Phase5 canonical read path: auto uses "
+                    "canonical only when the group is canonically ready, "
+                    "otherwise legacy; legacy forces the old path; "
+                    "rule-intelligence prefers the rule-intelligence layer, "
+                    "deduplicating merged duplicates only after the "
+                    "active/audience/exclude match",
                 },
             },
             "required": ["task"],
@@ -2056,7 +2057,7 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
             max_items=int(args.get("max_items", DEFAULT_MAX_ITEMS)),
             max_chars=int(args.get("max_chars", DEFAULT_MAX_CHARS)),
             effective_context=_effective_agent_context(args, group_id),
-            read_path=str(args.get("read_path", "legacy") or "legacy"),
+            read_path=str(args.get("read_path", "auto") or "auto"),
         )
     except (TypeError, ValueError) as exc:
         return _mcp_error(str(exc))
@@ -2584,7 +2585,7 @@ def _build_diagnostics_snapshot(
         }
     try:
         from .rule_merge_store import RuleMergeStore
-        store = RuleMergeStore(workspace)
+        store = RuleMergeStore(workspace, read_only=True)
         mem = sqlite3.connect(":memory:")
         try:
             src = store._db()
@@ -2713,7 +2714,9 @@ def _handle_projection_status(args: dict[str, Any]) -> dict[str, Any]:
         })
     try:
         from .rule_merge_store import RuleMergeStore
-        proj = RuleMergeStore(workspace).projection_status(group_ids=[group_id])
+        proj = RuleMergeStore(
+            workspace, read_only=True,
+        ).projection_status(group_ids=[group_id])
     except (OSError, sqlite3.Error, ValueError) as exc:
         return _mcp_error(f"projection_status_failed: {exc}")
     return _governance_json_response({

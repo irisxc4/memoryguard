@@ -466,17 +466,25 @@ def _execute_sql_script_atomic(conn: sqlite3.Connection, script: str) -> None:
 class RuleMergeStore:
     """Cross-group SQLite storage for Definitions, Bindings and Evidence."""
 
-    def __init__(self, workspace: str | Path):
+    def __init__(
+        self, workspace: str | Path, *, read_only: bool = False,
+    ):
         self.workspace = Path(workspace).resolve()
         base = self.workspace / ".memoryguard" / _RULE_INTELLIGENCE_DIR
         self.root = base
-        self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "memory.db"
+        self.read_only = bool(read_only)
         # SharedMemoryStore and RuleMergeStore coordinate through this exact
         # workspace lock.  Re-entry is supported by WorkspaceGovernanceLock,
         # so higher-level lifecycle operations can compose safely.
         self._governance_lock = WorkspaceGovernanceLock(self.workspace)
         self._write_state = threading.local()
+        if self.read_only:
+            # A read-only consumer must not create a directory, schema, or
+            # source-link bootstrap row.  Missing stores simply read as empty
+            # / unavailable through the read-only connection.
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
         self._init_db()
         self._bootstrap_pending_feedback_source_links()
 
@@ -485,6 +493,21 @@ class RuleMergeStore:
     # ------------------------------------------------------------------
 
     def _db(self) -> sqlite3.Connection:
+        if self.read_only:
+            # SQLite mode=ro prevents all writes, including implicit database
+            # creation.  Immutable avoids even WAL sidecar creation when there
+            # is no live WAL to inspect.
+            try:
+                wal_path = Path(f"{self.db_path}-wal")
+                has_live_wal = wal_path.stat().st_size > 0
+            except FileNotFoundError:
+                has_live_wal = False
+            immutable = "" if has_live_wal else "&immutable=1"
+            uri = f"file:{self.db_path}?mode=ro{immutable}"
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            return conn
         conn = sqlite3.connect(str(self.db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
@@ -493,6 +516,8 @@ class RuleMergeStore:
     @contextmanager
     def _write_conn(self) -> Iterator[sqlite3.Connection]:
         """Yield one locked connection with one explicit write transaction."""
+        if self.read_only:
+            raise PermissionError("rule_intelligence_store_read_only")
         active = getattr(self._write_state, "conn", None)
         if active is not None:
             # Nested store mutations on one thread share the caller's

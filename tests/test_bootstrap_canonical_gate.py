@@ -234,6 +234,19 @@ def test_activated_and_ready_engages_canonical(tmp_path):
     assert packet["read_path"]["mode"] == MODE_RULE_INTELLIGENCE
 
 
+def test_default_read_path_uses_canonical_when_gate_passes(tmp_path):
+    legacy, intel = _seed_group(tmp_path)
+    _activate_canonical(tmp_path, "g1", intel, legacy)
+    packet = build_context_packet(
+        legacy, task="写测试",
+        effective_context=EffectiveAgentContext("agent-1", "g1"),
+    )
+    assert packet["requested_read_path"] == "auto"
+    assert packet["effective_read_path"] == MODE_RULE_INTELLIGENCE
+    assert packet["canonical_ready"] is True
+    assert packet["mandatory_rule_ids"]
+
+
 def test_auto_uses_canonical_when_gate_passes(tmp_path):
     legacy, intel = _seed_group(tmp_path)
     _activate_canonical(tmp_path, "g1", intel, legacy)

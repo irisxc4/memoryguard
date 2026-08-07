@@ -107,12 +107,13 @@ def _sort_key(candidate: _Candidate) -> tuple[Any, ...]:
 
 
 def _folded_source_ids(store: Any, group_id: str) -> set[str]:
-    """Return legacy sources folded by a reconciliation job that is not ready.
+    """Return legacy sources folded by the latest reconciliation job.
 
-    A retryable saga may shadow sources before its final canonical commit.  The
-    legacy fallback must keep reading those rules until the canonical layer is
-    actually ready; otherwise a failed/partial job silently empties the rules
-    that are supposed to stay available during the retry window.
+    A saga may shadow sources before its final commit, and a completed job also
+    shadows folded originals after the canonical layer is ready.  The legacy
+    fallback must keep reading those rules in either state; otherwise a failed
+    partial job or an explicit legacy read after ``canonical_ready`` silently
+    empties rules that are supposed to remain available.
     """
     try:
         from .rule_merge_store import RuleMergeStore
@@ -120,15 +121,11 @@ def _folded_source_ids(store: Any, group_id: str) -> set[str]:
     except Exception:
         return set()
     try:
-        jobs = RuleReconciliationStore(RuleMergeStore(store.workspace))
+        jobs = RuleReconciliationStore(
+            RuleMergeStore(store.workspace, read_only=True),
+        )
         latest = jobs.latest_job(group_id)
         if not latest:
-            return set()
-        status = str(latest.get("status") or "")
-        if status not in {
-            "pending_model", "model_running", "staged", "applying",
-            "retryable_failed",
-        }:
             return set()
         raw = latest.get("result_json") or ""
         if not raw:
@@ -151,14 +148,17 @@ def build_context_packet(
     max_items: int = DEFAULT_MAX_ITEMS,
     max_chars: int = DEFAULT_MAX_CHARS,
     effective_context: EffectiveAgentContext | None = None,
-    read_path: str = "legacy",
+    read_path: str = "auto",
 ) -> dict[str, Any]:
     """Build bounded long-term-memory context from a read-only trusted store.
 
-    ``read_path`` controls the Phase5 canonical read path.  It is shadow by
-    default: ``legacy`` (the default and the env fallback) forces the old
-    byte-for-byte path.  ``auto`` / ``rule-intelligence`` never switch the
-    group to canonical by themselves (Req8): the canonical layer only engages
+    ``read_path`` controls the Phase5 canonical read path.  The default is
+    ``auto``: it keeps using the legacy byte-for-byte path until a group is
+    canonically ready, then serves the finalized canonical layer so a
+    successful migration can never leave the default read with an empty rule
+    set.  Explicit ``legacy`` forces the old path.  ``auto`` /
+    ``rule-intelligence`` never switch the group to canonical by themselves
+    (Req8): the canonical layer only engages
     when the group-level canonical activation is persisted
     (``rule_canonical_state`` ``activation_status == "active"``) *and*
     ``canonical_reconciliation_status`` reports ``canonical_ready``.  Any other
@@ -234,31 +234,37 @@ def build_context_packet(
                 canonical_reconciliation_status,
             )
 
-            rms = RuleMergeStore(store.workspace)
-            activation = RuleReconciliationStore(rms).canonical_activation(
-                store.group_id,
+            rule_db = (
+                store.workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
             )
-            status = canonical_reconciliation_status(
-                store.workspace, store.group_id, store=rms,
-            )
-            canonical_definitions = int(
-                status.get("checks", {}).get("canonical_definitions", 0) or 0
-            )
-            canonical_ready = bool(status.get("canonical_ready", False))
-            if (
-                activation
-                and str(activation.get("activation_status", "") or "") == "active"
-                and canonical_ready
-            ):
-                gate_pass = True
-            elif not activation or str(
-                activation.get("activation_status", "") or ""
-            ) != "active":
-                fallback_reason = "canonical_not_activated"
+            if not rule_db.exists():
+                fallback_reason = "canonical_not_initialized"
             else:
-                fallback_reason = "readiness_failed:" + ",".join(
-                    status.get("failures") or []
+                rms = RuleMergeStore(store.workspace, read_only=True)
+                activation = RuleReconciliationStore(rms).canonical_activation(
+                    store.group_id,
                 )
+                status = canonical_reconciliation_status(
+                    store.workspace, store.group_id, store=rms,
+                )
+                canonical_definitions = int(
+                    status.get("checks", {}).get("canonical_definitions", 0) or 0
+                )
+                canonical_ready = bool(status.get("canonical_ready", False))
+                if (
+                    activation
+                    and str(activation.get("activation_status", "") or "") == "active"
+                    and canonical_ready
+                ):
+                    gate_pass = True
+                elif not activation or str(
+                    activation.get("activation_status", "") or ""
+                ) != "active":
+                    fallback_reason = "canonical_not_activated"
+                else:
+                    fallback_reason = "readiness_failed:" + ",".join(
+                        status.get("failures") or []
+                    )
         except Exception:
             canonical_ready = False
             canonical_definitions = 0
@@ -270,10 +276,19 @@ def build_context_packet(
                 read = RuleReadPath(store.workspace, store.group_id)
                 if not read.has_intelligence():
                     raise RuntimeError("intelligence projection missing")
+                # Use the persisted group readiness shadow summary.  After a
+                # successful generation, originals are legitimately shadowed;
+                # recomputing the old legacy-vs-canonical diff over those
+                # shadowed rows would falsely report permission drift.
+                shadow_summary = (
+                    status.get("checks", {}).get("shadow")
+                    if isinstance(status, dict) else None
+                )
                 canonical_mapping = read.resolve_canonical_map(
                     known_memory_ids={r.memory_id for r in all_records},
                     legacy_store=store,
                     context=effective_context,
+                    shadow_summary=shadow_summary,
                 )
                 if not isinstance(canonical_mapping, dict):
                     raise RuntimeError("canonical mapping did not resolve")
