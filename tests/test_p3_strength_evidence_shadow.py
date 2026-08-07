@@ -448,6 +448,40 @@ def test_shadow_verify_matches_migrated_broad_audiences(
     assert result == {"missing": [], "extra": [], "permission_diff": 0}
 
 
+def test_shadow_verify_uses_record_priority_for_exact_legacy_audience(tmp_path):
+    store = RuleMergeStore(tmp_path)
+    definition = _definition("shadow rule", "definition-shadow")
+    store.upsert_definition(definition)
+    store.upsert_binding(build_binding(
+        definition.definition_id,
+        share_group_id="group-1",
+        target_type="agent",
+        target_id="agent-1",
+        priority=10,
+    ))
+    store.upsert_evidence(build_evidence(
+        definition_id=definition.definition_id,
+        source_rule_id="memory-1",
+        agent_instance_id="agent-1",
+        content="shadow rule",
+    ))
+    legacy = [("memory-1", [{
+        "target_type": "agent",
+        "target_id": "agent-1",
+        "effect": "include",
+    }])]
+    context = EffectiveAgentContext(
+        agent_instance_id="agent-1",
+        share_group_id="group-1",
+    )
+    result = store.shadow_verify(
+        context,
+        legacy,
+        legacy_priorities={"memory-1": 10},
+    )
+    assert result == {"missing": [], "extra": [], "permission_diff": 0}
+
+
 def test_shadow_verify_ignores_other_groups_and_detects_audience_changes(tmp_path):
     store = RuleMergeStore(tmp_path)
     definition = _definition("shadow scope", "definition-shadow")

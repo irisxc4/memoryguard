@@ -845,6 +845,21 @@ def _untrusted_merge_waiver() -> int:
     return int(bool(store.list_merge_decisions()))
 
 
+def _shadow_inputs(
+    legacy: SharedMemoryStore,
+) -> tuple[list[tuple[str, list]], dict[str, int]]:
+    return (
+        [
+            (record.memory_id, legacy.list_rule_assignments(record.memory_id))
+            for record in legacy.list_records()
+        ],
+        {
+            record.memory_id: int(record.priority or 0)
+            for record in legacy.list_records()
+        },
+    )
+
+
 def _shadow_permission_false_positive() -> int:
     workspace = Path(tempfile.mkdtemp())
     group_id, agent_id, memory_id = "shadow-group", "agent-shadow", "shadow-rule"
@@ -860,11 +875,10 @@ def _shadow_permission_false_positive() -> int:
         share_group_id=group_id,
         project_ref="project-a",
     )
-    legacy_records = [
-        (record.memory_id, legacy.list_rule_assignments(record.memory_id))
-        for record in legacy.list_records()
-    ]
-    shadow = store.shadow_verify(context, legacy_records)
+    legacy_records, legacy_priorities = _shadow_inputs(legacy)
+    shadow = store.shadow_verify(
+        context, legacy_records, legacy_priorities=legacy_priorities,
+    )
     return int(shadow.get("permission_diff", 0) != 0)
 
 
@@ -1717,11 +1731,10 @@ def _true_permission_expansion() -> int:
         agent_instance_id=agent_id, share_group_id=group_id,
         project_ref=project_ref, provider="codex", runtime_role="worker",
     )
-    legacy_records = [
-        (record.memory_id, legacy.list_rule_assignments(record.memory_id))
-        for record in legacy.list_records()
-    ]
-    shadow = store.shadow_verify(context, legacy_records)
+    legacy_records, legacy_priorities = _shadow_inputs(legacy)
+    shadow = store.shadow_verify(
+        context, legacy_records, legacy_priorities=legacy_priorities,
+    )
     return int(int(shadow.get("permission_diff", 0) or 0) <= 0)
 
 
@@ -1759,11 +1772,10 @@ def _true_system_permission_expansion() -> tuple[int, dict[str, int]]:
         provider="codex",
         runtime_role="worker",
     )
-    legacy_records = [
-        (record.memory_id, legacy.list_rule_assignments(record.memory_id))
-        for record in legacy.list_records()
-    ]
-    shadow = store.shadow_verify(context, legacy_records)
+    legacy_records, legacy_priorities = _shadow_inputs(legacy)
+    shadow = store.shadow_verify(
+        context, legacy_records, legacy_priorities=legacy_priorities,
+    )
     raw_detected = int(shadow.get("permission_diff", 0) or 0)
     legacy_system_count = sum(
         len([

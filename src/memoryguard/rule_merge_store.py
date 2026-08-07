@@ -6248,6 +6248,8 @@ class RuleMergeStore:
         cls,
         value: Any,
         share_group_id: str,
+        *,
+        priority: int | None = None,
     ) -> tuple[str, str, str, str, str, str, int, str]:
         target_type = str(
             cls._shadow_value(value, "target_type", "") or ""
@@ -6261,12 +6263,13 @@ class RuleMergeStore:
             cls._shadow_value(value, "runtime_role", "") or ""
         )
         effect = str(cls._shadow_value(value, "effect", "include") or "include")
-        raw_priority = cls._shadow_value(
-            value,
-            "priority" if isinstance(value, RuleBinding) else "priority_override",
-            0,
-        )
-        priority = int(raw_priority or 0)
+        if priority is None:
+            raw_priority = cls._shadow_value(
+                value,
+                "priority" if isinstance(value, RuleBinding) else "priority_override",
+                0,
+            )
+            priority = int(raw_priority or 0)
         if target_type == "project" and not project_ref:
             project_ref = canonical_project_ref(target_id)
         if target_type == "project":
@@ -6308,6 +6311,8 @@ class RuleMergeStore:
         self,
         context: EffectiveAgentContext,
         legacy_records: list[tuple[str, list[Any]]],
+        *,
+        legacy_priorities: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         """Compare the legacy matcher with the Definition/Binding matcher.
 
@@ -6319,6 +6324,7 @@ class RuleMergeStore:
         """
         legacy_matched: set[str] = set()
         legacy_audiences: Counter[tuple[Any, ...]] = Counter()
+        priorities = legacy_priorities or {}
         for memory_id, assignments in legacy_records:
             for assignment in assignments:
                 try:
@@ -6330,7 +6336,9 @@ class RuleMergeStore:
                 legacy_matched.add(memory_id)
                 legacy_audiences[
                     self._shadow_audience_key(
-                        normalized, context.share_group_id,
+                        normalized,
+                        context.share_group_id,
+                        priority=priorities.get(memory_id),
                     )
                 ] += 1
 
