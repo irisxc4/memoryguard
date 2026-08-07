@@ -6,7 +6,6 @@ from memoryguard.host_hooks import _read_heartbeat, run_hook, set_hook_mode
 from memoryguard.governance_engine import GovernanceEngine
 import json
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from memoryguard.mcp_server import TOOLS, execute_tool
@@ -131,7 +130,9 @@ def test_interactive_memory_records_offer_visible_injection_toggle():
     assert "renderMemoryRecords()" in html
 
 
-def test_readonly_open_migrates_legacy_sqlite_before_mcp_update(tmp_path, monkeypatch):
+def test_readonly_open_old_schema_fails_closed_until_writable_migration(
+    tmp_path, monkeypatch,
+):
     group_id, agent_id = "legacy-sqlite", "legacy-agent"
     root = tmp_path / ".memoryguard" / "shared-memory" / group_id
     root.mkdir(parents=True, exist_ok=True)
@@ -159,14 +160,14 @@ def test_readonly_open_migrates_legacy_sqlite_before_mcp_update(tmp_path, monkey
     finally:
         conn.close()
 
-    def open_legacy_readonly():
-        return SharedMemoryStore(tmp_path, group_id, read_only=True).get_record("legacy").memory_id
+    # A read-only open must not take a write transaction to upgrade the DB.
+    with pytest.raises(RuntimeError, match="schema_upgrade_required"):
+        SharedMemoryStore(tmp_path, group_id, read_only=True).get_record("legacy")
 
-    # Two first-open consumers must serialize the migration rather than race
-    # the column inspection/ALTER sequence.
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        assert sorted(pool.map(lambda _: open_legacy_readonly(), range(2))) == ["legacy", "legacy"]
-
+    # The explicit writable open performs the migration, after which the same
+    # database is safe to open read-only.
+    migrated = SharedMemoryStore(tmp_path, group_id)
+    assert migrated.get_record("legacy").injection_policy == "relevant"
     AgentBindingStore(tmp_path).bind_agent(agent_id, group_id)
     readonly = SharedMemoryStore(tmp_path, group_id, read_only=True)
     assert readonly.get_record("legacy").injection_policy == "relevant"

@@ -280,8 +280,8 @@ CREATE TABLE IF NOT EXISTS rule_assignments (
 CREATE INDEX IF NOT EXISTS idx_rule_assignments_memory ON rule_assignments(memory_id);
 """
 
-# Kept separate from the large bootstrap schema so read-only consumers can
-# create/migrate receipt tables before opening immutable query connections.
+# Kept separate from the large bootstrap schema so writable startup can
+# create receipt tables before opening query connections.
 _RULE_MATCH_SCHEMA = """
 CREATE TABLE IF NOT EXISTS rule_match_receipts (
     receipt_id TEXT PRIMARY KEY,
@@ -502,7 +502,8 @@ class SharedMemoryStore:
 
     安全:
     - group_id 必须是合法 slug(防路径穿越)
-    - read_only=True 时不初始化目录/数据库；无 WAL 时用 immutable
+    - read_only=True 时不初始化目录/数据库，也不做 schema migration；
+      旧 schema 会 fail-closed 报 ``schema_upgrade_required``
     """
 
     def __init__(
@@ -559,11 +560,10 @@ class SharedMemoryStore:
                 raise FileNotFoundError(
                     f"shared memory group not found: {self.group_id}"
                 )
-            # A read-only consumer (MCP read/bootstrap) can be the first
-            # process opened after upgrade.  Upgrade the existing database
-            # before creating immutable/ro query connections; otherwise old
-            # rows lack new columns and sqlite.Row lookup fails at read time.
-            self._migrate_existing_records_schema()
+            # Read consumers must never take a write transaction to upgrade
+            # schema.  A pre-upgrade database fails closed and must be opened
+            # by a writable startup/migration phase first.
+            self._ensure_readable_schema()
 
     def _ensure_dirs(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -790,6 +790,49 @@ class SharedMemoryStore:
             )
             self._migration_checkpoint("schema_version")
             self._migrate_records_schema(conn)
+
+    def _ensure_readable_schema(self) -> None:
+        """Fail closed when a read-only consumer opens a pre-upgrade DB.
+
+        Schema upgrades are writes.  Keeping them out of the read constructor
+        preserves the physical read-only guarantee; a writable open is the
+        explicit migration path.
+        """
+        required_columns = {
+            "memory_id", "body", "kind", "status", "confidence",
+            "conflict_group_id", "locked", "injection_policy", "priority",
+            "supersedes", "provenance", "agent_instance_id", "created_at",
+            "updated_at", "canonical_hash", "dedup_domain",
+        }
+        required_tables = {
+            "schema_meta", "records", "rule_assignments",
+            "rule_match_receipts", "rule_match_feedbacks", "rule_event_outbox",
+            "rule_decisions", "rule_scope_stats", "rule_scope_evaluations",
+            "rule_exceptions", "events", "decisions", "conflicts",
+            "quarantine", "versions", "active_version", "records_fts",
+        }
+        with self._db() as conn:
+            columns = {
+                row[1] for row in conn.execute(
+                    "PRAGMA table_info(records)",
+                ).fetchall()
+            }
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                ).fetchall()
+            }
+        missing_columns = sorted(required_columns - columns)
+        missing_tables = sorted(required_tables - tables)
+        if missing_columns or missing_tables:
+            detail = []
+            if missing_columns:
+                detail.append("columns=" + ",".join(missing_columns))
+            if missing_tables:
+                detail.append("tables=" + ",".join(missing_tables))
+            raise RuntimeError(
+                "schema_upgrade_required: " + "; ".join(detail)
+            )
 
     def _migrate_existing_records_schema(self) -> None:
         """Transactionally migrate an existing group before read-only access."""

@@ -494,16 +494,11 @@ class RuleMergeStore:
 
     def _db(self) -> sqlite3.Connection:
         if self.read_only:
-            # SQLite mode=ro prevents all writes, including implicit database
-            # creation.  Immutable avoids even WAL sidecar creation when there
-            # is no live WAL to inspect.
-            try:
-                wal_path = Path(f"{self.db_path}-wal")
-                has_live_wal = wal_path.stat().st_size > 0
-            except FileNotFoundError:
-                has_live_wal = False
-            immutable = "" if has_live_wal else "&immutable=1"
-            uri = f"file:{self.db_path}?mode=ro{immutable}"
+            # mode=ro prevents writes and implicit database creation.  Do not
+            # add immutable=1: this is a live multi-process SQLite database,
+            # and immutable skips locking/change detection, so a concurrent
+            # writer could make a reader observe stale or corrupt data.
+            uri = f"file:{self.db_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=5.0)
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")

@@ -49,6 +49,13 @@ _MUTATING_TOOLS = {
     "memoryguard_rule_merge_cooldown_clear",
 }
 
+# Tools that physically write SQLite state even though their business role is
+# mostly read.  They must pass the runtime split-brain lease, but they should
+# not be treated as governance mutations by the write-degraded gate.
+_DB_WRITING_TOOLS = _MUTATING_TOOLS | {
+    "memoryguard_context_bootstrap",
+}
+
 
 # ---------------------------------------------------------------------------
 # Req9: governance-degraded read-only diagnostics
@@ -1016,11 +1023,13 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     if name.startswith("memoryguard_knowledge_"):
         return handle_knowledge_tool(name, args) or _mcp_error(f"unknown knowledge tool: {name}")
 
-    # 写操作：runtime lease + 本地参数预检，再执行
-    if name in _MUTATING_TOOLS:
+    # 写数据库：runtime lease 覆盖所有真实 DB 写入；本地参数预检只用于
+    # 明确的治理 mutation，避免 bootstrap 被 outbox/投影降级误伤。
+    if name in _DB_WRITING_TOOLS:
         lease_err = _runtime_lease_guard(name, args, workspace)
         if lease_err is not None:
             return lease_err
+    if name in _MUTATING_TOOLS:
         preflight_err = _preflight_mutating_tool(name, args, workspace)
         if preflight_err is not None:
             return preflight_err
@@ -2049,6 +2058,8 @@ def _handle_context_bootstrap(args: dict[str, Any]) -> dict[str, Any]:
         store = SharedMemoryStore(workspace, group_id, read_only=True)
     except FileNotFoundError:
         return _mcp_error(f"group not found: {group_id}")
+    except RuntimeError as exc:
+        return _mcp_error(str(exc))
     try:
         packet = build_context_packet(
             store,
@@ -2865,17 +2876,18 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
-    """Fail-closed runtime split-brain guard for mutating tools (Req10).
+    """Fail-closed runtime split-brain guard for DB-writing tools (Req10).
 
-    Read-only tools return ``None`` immediately.  For a mutating tool the
-    workspace's runtime lease is checked -- the first mutating call also
-    acquires this process's lease.  When a live process already holds the same
-    database set with a different memoryguard version / code fingerprint, the
-    call is rejected with ``runtime_split_brain`` and ``restart_required=True``;
-    the conflicting process is never killed.  Returns ``None`` when the lease
-    is granted.
+    Tools that only read return ``None`` immediately.  For any tool that can
+    write SQLite state (including bootstrap receipt persistence) the
+    workspace's runtime lease is checked -- the first such call also acquires
+    this process's lease.  When a live process already holds the same database
+    set with a different memoryguard version / code fingerprint, the call is
+    rejected with ``runtime_split_brain`` and ``restart_required=True``; the
+    conflicting process is never killed.  Returns ``None`` when the lease is
+    granted.
     """
-    if name not in _MUTATING_TOOLS:
+    if name not in _DB_WRITING_TOOLS:
         return None
     from .runtime_lease import check_runtime_lease
 
