@@ -2017,8 +2017,7 @@ function renderNeuronGraph() {
     const dragRoot = event.target;
     if (!dragRoot) return;
     if (!dragRoot.selected()) dragRoot.select();
-    const selectedNodes = cyInstance.$('node:selected');
-    const dragNodeIds = new Set(selectedNodes.length ? selectedNodes.map(n => n.id()) : [dragRoot.id()]);
+    const dragNodeIds = new Set([dragRoot.id()]);
     collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));
     const basePositions = {};
     dragNodeIds.forEach(nodeId => {

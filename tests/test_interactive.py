@@ -363,7 +363,7 @@ def test_neuron_drag_carries_descendant_branches() -> None:
 
     assert "const collectNeuronSubtree = (rootId) => {" in html
     assert "if (!dragRoot.selected()) dragRoot.select();" in html
-    assert "const dragNodeIds = new Set(selectedNodes.length ? selectedNodes.map(n => n.id()) : [dragRoot.id()]);" in html
+    assert "const dragNodeIds = new Set([dragRoot.id()]);" in html
     assert "collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));" in html
     assert "dragNodeIds.forEach(nodeId => {" in html
 
