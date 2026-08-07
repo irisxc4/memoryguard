@@ -34,6 +34,14 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.5.2 更新内容
+
+- **规范规则治理：** 持久化规则智能任务、来源链接、证据锚点、投影对齐；未证明就绪前安全回退到传统规则。
+- **真正的只读诊断：** canonical status、规则读取和治理诊断不会进入写事务；活跃 WAL 读取端无需 `immutable=1` 也能看到并发提交。
+- **多进程运行时租约：** 共享同一工作区的 MCP 进程会拒绝来自不同构建版本的写入，避免分裂脑状态。
+- **桌面与神经图：** 固定工作区启动、独立原生窗口、文件夹式规则习惯、子树拖动、更密集的外向脉冲，以及分类主链连接。
+- **历史与知识库修复：** 修复历史乱码和双写会话；知识库删除以扫描结果为准，部分扫描失败不再保护旧索引。
+
 ## 为什么需要 MemoryGuard
 
 持久化只解决“存下来”，没有解决“以后还能不能可靠复用”。
@@ -142,8 +150,9 @@ memoryguard gui
 
 `memoryguard-gui .` 仍可用于桌面快捷方式。PowerShell 和其他终端推荐使用
 `memoryguard gui .`，这样启动失败时可以直接看到错误信息。
-不传路径时，MemoryGuard 会依次使用 `MEMORYGUARD_WORKSPACE`、上次打开的项目和当前目录；
-都不可用时自动弹出文件夹选择器。
+不传路径时，MemoryGuard 使用 `MEMORYGUARD_WORKSPACE` 或固定用户级控制目录
+（`MEMORYGUARD_HOME`，Windows 默认 `%LOCALAPPDATA%\MemoryGuard`）。
+它不再记住上次项目，也不会从启动目录推断工作区或弹出文件夹选择器。
 在 Windows 上，`memoryguard gui` 会把原生窗口独立到后台进程，关闭 PowerShell 不会关闭 GUI。
 
 详细说明：[Claude Code](docs/install-claude-code.md) ·

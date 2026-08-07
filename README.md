@@ -36,6 +36,14 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.5.2
+
+- **Canonical rule reconciliation:** durable rule-intelligence jobs, source links, evidence anchors, projection parity, and a safe legacy fallback until readiness is proven.
+- **Physically read-only diagnostics:** canonical status, rule reads, and governance diagnostics never enter a write transaction; live WAL readers observe concurrent committed writes without `immutable=1`.
+- **Multi-process runtime lease:** MCP processes sharing one workspace reject writes from a different build instead of allowing split-brain state changes.
+- **Desktop and neuron graph:** fixed workspace launch, detached native window, folder-style rule habits, subtree drag, denser outward pulses, and connected category links.
+- **History and Knowledge Library fixes:** history mojibake repair and dual-write reconciliation; knowledge deletion now trusts scan results and protects stale indexes after partial scans.
+
 ## Why MemoryGuard
 
 Persistent memory solves storage. It does not solve governance.
