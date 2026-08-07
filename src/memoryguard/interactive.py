@@ -1992,16 +1992,40 @@ function renderNeuronGraph() {
     const selId = event.target.id();
     if (selectedNeuronId === selId) positionNeuronPopover(selectedNeuronId);
   });
+  const collectNeuronSubtree = (rootId) => {
+    const result = new Set();
+    const nodes = (neuronGraph && Array.isArray(neuronGraph.nodes)) ? neuronGraph.nodes : [];
+    const childrenByParent = new Map();
+    nodes.forEach(node => {
+      const parentId = String(node.parent_id || '');
+      if (!parentId) return;
+      if (!childrenByParent.has(parentId)) childrenByParent.set(parentId, []);
+      childrenByParent.get(parentId).push(node.id);
+    });
+    const visit = (nodeId) => {
+      for (const childId of childrenByParent.get(nodeId) || []) {
+        if (result.has(childId)) continue;
+        result.add(childId);
+        visit(childId);
+      }
+    };
+    visit(String(rootId || ''));
+    return [...result];
+  };
   cyInstance.on('grab', 'node', event => {
     if (!cyInstance) return;
     const dragRoot = event.target;
     if (!dragRoot || !dragRoot.selected()) return;
     const selectedNodes = cyInstance.$('node:selected');
     if (!selectedNodes.length) return;
+    const dragNodeIds = new Set(selectedNodes.map(n => n.id()));
+    collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));
     const basePositions = {};
-    selectedNodes.forEach(n => {
-      if (n.id() === dragRoot.id()) return;
-      basePositions[n.id()] = { ...n.position() };
+    dragNodeIds.forEach(nodeId => {
+      if (nodeId === dragRoot.id()) return;
+      const n = cyInstance.getElementById(nodeId);
+      if (!n || !n.length) return;
+      basePositions[nodeId] = { ...n.position() };
     });
     neuronDragState = {
       dragRootId: dragRoot.id(),
@@ -2326,7 +2350,7 @@ function startNeuronSignalPulses(cy) {
     if (!cyInstance || cyInstance !== cy) return;
     const candidates = cy.nodes('node[kind = "virtual_category"], node[kind = "topic"], node[kind = "source_hub"], node[kind = "virtual_bucket"], node[kind = "history_project"], node[kind = "history_agent"], node[kind = "claim_anchor"]');
     if (!candidates || !candidates.length) return;
-    const count = Math.min(2, candidates.length);
+    const count = Math.min(9, Math.max(5, Math.ceil(candidates.length * .16)));
     const sparkIndex = Number(window.__neuronSparkIndex || 0);
     window.__neuronSparkIndex = sparkIndex + count;
     for (let i = 0; i < count; i++) {
@@ -2340,17 +2364,17 @@ function startNeuronSignalPulses(cy) {
   };
   rootPulse();
   spark();
-  window.__neuronSomaPulse = setInterval(rootPulse, 3600);
-  window.__neuronSparkPulse = setInterval(spark, 5200);
+  window.__neuronSomaPulse = setInterval(rootPulse, 2800);
+  window.__neuronSparkPulse = setInterval(spark, 2200);
   const fireWave = () => {
     if (!cyInstance || cyInstance !== cy) return;
-    // Always launch 3–4 concurrent full-path pulses for a denser, cooler look.
-    const desired = Math.min(4, Math.max(3, Math.min(4, cy.edges().length || 3)));
+    // Always launch 5–8 concurrent full-path pulses with a tight stagger.
+    const desired = Math.min(8, Math.max(5, Math.min(8, cy.edges().length || 5)));
     const waveIndex = Number(window.__neuronSignalWaveIndex || 0);
     window.__neuronSignalWaveIndex = waveIndex + 1;
     const paths = collectNeuronSignalPaths(cy, desired, waveIndex);
     paths.forEach((path, index) => {
-      const delay = index * 260;
+      const delay = index * 160;
       const tid = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         runNeuronSignalPulse(cy, path);
@@ -2358,9 +2382,9 @@ function startNeuronSignalPulses(cy) {
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
     });
   };
-  const initialWave = setTimeout(fireWave, 720);
+  const initialWave = setTimeout(fireWave, 360);
   (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(initialWave);
-  window.__neuronSignalTimer = setInterval(fireWave, 2400);
+  window.__neuronSignalTimer = setInterval(fireWave, 1600);
 }
 
 function fitNeuronGraph() {
@@ -4046,9 +4070,12 @@ async function renderRulesHabits() {
       (preview.unavailable || []).forEach(item => { rulePreviewById.set(item.memory_id, 'unavailable'); const r = ruleRecordsById.get(item.memory_id); if (r) r._preview = item; });
     }
     const blocks = Object.entries(labels).map(([key, label]) => {
-      const cards = ((data.buckets || {})[key] || []).map(ruleCard).filter(Boolean).join('');
-      if (!cards) return '';
-      return `<section class="card" style="margin-bottom:12px"><div class="section-head"><h3>${label}</h3></div>${cards}</section>`;
+      const cards = ((data.buckets || {})[key] || []).map(ruleCard).filter(Boolean);
+      if (!cards.length) return '';
+      return `<details class="folder-group" open style="--folder-depth:0">
+        <summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${label}</span><span class="folder-count">${cards.length} 条</span></summary>
+        <div class="folder-children">${cards.join('')}</div>
+      </details>`;
     }).join('');
     const agentOptions = `<option value="">全部范围（不做有效性预览）</option>${ruleSelectOptions(agents, rulePreviewAgentId)}`;
     const projectOptions = `<option value="">未确认项目（不猜测）</option>${ruleSelectOptions(projects, rulePreviewProjectRef)}`;

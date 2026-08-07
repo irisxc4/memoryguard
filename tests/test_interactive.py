@@ -229,11 +229,11 @@ def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
     assert "const leafEdge = outgoers.find" in html
     assert "collectNeuronSignalPaths" in html
     assert "One continuous light travels branch -> leaf" in html
-    assert "Always launch 3–4 concurrent full-path pulses" in html
-    assert "const delay = index * 260" in html
+    assert "Always launch 5–8 concurrent full-path pulses" in html
+    assert "const delay = index * 160" in html
     assert "underlay-opacity': 0" in html
     assert "Math.random()" not in html[html.index("function buildNeuronSignalPath"):html.index("function fitNeuronGraph")]
-    assert "const initialWave = setTimeout(fireWave, 720)" in html
+    assert "const initialWave = setTimeout(fireWave, 360)" in html
     assert "neuron-particle-travel" not in html
 
 
@@ -347,6 +347,22 @@ def test_history_projects_render_as_collapsible_folders() -> None:
     assert 'class="card history-project-group folder-group"' in html
     assert "${sessionCount} 个会话" in html
     assert '<div class="folder-children">${agents}</div>' in html
+
+
+def test_rule_habits_render_as_collapsible_folders() -> None:
+    html = render_interactive_html()
+
+    assert '<details class="folder-group" open style="--folder-depth:0">' in html
+    assert '<summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${label}</span><span class="folder-count">${cards.length} 条</span></summary>' in html
+    assert '<div class="folder-children">${cards.join(\'\')}</div>' in html
+
+
+def test_neuron_drag_carries_descendant_branches() -> None:
+    html = render_interactive_html()
+
+    assert "const collectNeuronSubtree = (rootId) => {" in html
+    assert "collectNeuronSubtree(dragRoot.id()).forEach(id => dragNodeIds.add(id));" in html
+    assert "dragNodeIds.forEach(nodeId => {" in html
 
 
 def test_neuron_graph_bridges_missing_parent_edges() -> None:

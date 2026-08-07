@@ -319,6 +319,59 @@ def test_mandatory_semantic_duplicate_proposes_low_confidence(tmp_path):
     assert store.get_record("existing").status.value == "active"
 
 
+def test_mandatory_rule_supersedes_related_relevant_preference(tmp_path):
+    from memoryguard.governance_engine import GovernanceEngine
+    from memoryguard.schema_v3 import (
+        MemoryEvent, MemoryKind, SharedMemoryRecord, SharedMemoryStatus, _now_iso,
+    )
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    store = SharedMemoryStore(tmp_path, "g1")
+    store.append_record(SharedMemoryRecord(
+        memory_id="existing",
+        body="用户偏好：默认使用 caveman 和 RTK，子代理也默认遵循。",
+        kind=MemoryKind.PREFERENCE, status=SharedMemoryStatus.ACTIVE,
+        confidence=0.72, injection_policy="relevant",
+        created_at=_now_iso(), updated_at=_now_iso(),
+    ))
+    store.append_record(SharedMemoryRecord(
+        memory_id="unrelated",
+        body="用户长期文档偏好：先给结论，使用清晰中文、紧凑表格和可执行里程碑。",
+        kind=MemoryKind.PREFERENCE, status=SharedMemoryStatus.ACTIVE,
+        confidence=0.72, injection_policy="relevant",
+        created_at=_now_iso(), updated_at=_now_iso(),
+    ))
+    store.append_record(SharedMemoryRecord(
+        memory_id="project-summary",
+        body="MemoryGuard 自动治理审查结论：已实现 Agent 分层与 bootstrap 注入，尚未实现会话增量自压缩。",
+        kind=MemoryKind.PROJECT, status=SharedMemoryStatus.ACTIVE,
+        confidence=0.72, injection_policy="relevant",
+        created_at=_now_iso(), updated_at=_now_iso(),
+    ))
+    engine = GovernanceEngine(tmp_path, "g1", store=store)
+    event = MemoryEvent(
+        event_id="event-mandatory-merge", agent_instance_id="agent-a",
+        share_group_id="g1",
+        raw_content="全局默认使用 caveman 和 RTK，主 Agent 与所有子代理也默认遵循。",
+        created_at=_now_iso(),
+    )
+    result = engine.auto_write(
+        event,
+        injection_policy="always",
+        rule_assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+    )
+    assert result["mutation_kind"] == "superseded"
+    new_record = store.get_record(result["memory_id"])
+    assert new_record is not None
+    assert new_record.injection_policy == "always"
+    assert "existing" in new_record.supersedes
+    assert "unrelated" not in new_record.supersedes
+    assert "project-summary" not in new_record.supersedes
+    assert store.get_record("existing").status == SharedMemoryStatus.SHADOWED
+    assert store.get_record("unrelated").status == SharedMemoryStatus.ACTIVE
+    assert store.get_record("project-summary").status == SharedMemoryStatus.ACTIVE
+
+
 def test_rule_cockpit_service_unavailable_is_fail_closed(tmp_path, monkeypatch):
     from memoryguard.gui import GovernanceApi
     from memoryguard.agent_binding import AgentBindingStore

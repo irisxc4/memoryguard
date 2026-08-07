@@ -496,10 +496,76 @@ class AutoOrganizer:
             })
             return record, actions, "proposed"
 
+        if incoming_policy == "always" and not duplicates:
+            subsumed_ids = self._find_rule_subsumed_habits(
+                event.raw_content, kind,
+                excluded_ids=[item.memory_id for item in duplicates],
+            )
+            if subsumed_ids:
+                record = self._create_record(
+                    event, kind, SharedMemoryStatus.ACTIVE,
+                    supersedes=subsumed_ids, confidence=confidence,
+                )
+                actions.append({
+                    "action": "supersede",
+                    "old_ids": subsumed_ids,
+                    "reason": "mandatory rule subsumes related relevant habit/preference/project memories",
+                })
+                return record, actions, "superseded"
+
         status = SharedMemoryStatus.LOW_CONFIDENCE if confidence < 0.45 else SharedMemoryStatus.ACTIVE
         record = self._create_record(event, kind, status, confidence=confidence)
         actions.append({"action": "create_low_confidence" if status == SharedMemoryStatus.LOW_CONFIDENCE else "create_active"})
         return record, actions, "created"
+
+    def _find_rule_subsumed_habits(
+        self,
+        content: str,
+        new_kind: MemoryKind,
+        *,
+        excluded_ids: list[str] | None = None,
+    ) -> list[str]:
+        """Find active relevant memories that a new mandatory rule should replace.
+
+        This is deliberately narrower than generic semantic dedup: only active
+        relevant records with a meaningful token overlap are folded into the
+        mandatory lifecycle so the same preference is not injected twice.
+        """
+        import re as _re
+        active_records = self.store.list_records(status="active")
+        content_tokens = self._tokenize(content)
+        if not content_tokens:
+            return []
+        content_ascii = set(_re.findall(r"[a-zA-Z][a-zA-Z0-9_]*", content.lower()))
+        excluded = set(excluded_ids or [])
+        mergeable_kinds = {
+            MemoryKind.PREFERENCE, MemoryKind.PROCEDURE,
+            MemoryKind.FACT, MemoryKind.CORRECTION,
+        }
+        candidates: list[tuple[float, str]] = []
+        for rec in active_records:
+            if rec.injection_policy == "always":
+                continue
+            if rec.memory_id in excluded or rec.kind not in mergeable_kinds:
+                continue
+            rec_body = rec.body or ""
+            rec_tokens = self._tokenize(rec_body)
+            if not rec_tokens:
+                continue
+            if content_ascii:
+                rec_ascii = set(_re.findall(r"[a-zA-Z][a-zA-Z0-9_]*", rec_body.lower()))
+                required_ascii_matches = 2 if len(content_ascii) >= 2 else 1
+                if len(content_ascii & rec_ascii) < required_ascii_matches:
+                    continue
+            overlap = content_tokens & rec_tokens
+            if len(overlap) < 3:
+                continue
+            coverage = len(overlap) / len(content_tokens)
+            jaccard = len(overlap) / len(content_tokens | rec_tokens)
+            if coverage >= 0.45 or (coverage >= 0.38 and jaccard >= 0.22):
+                candidates.append((coverage + jaccard, rec.memory_id))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [memory_id for _score, memory_id in candidates]
 
     def _append_record(self, record: SharedMemoryRecord) -> None:
         self.store.append_record(
