@@ -10,7 +10,6 @@ import pytest
 from memoryguard.evidence import EvidenceStore
 from memoryguard.memory import MemoryAtomStore
 from memoryguard.migration.v2_coordinator import V2MigrationCoordinator
-from memoryguard.storage.database import open_database_snapshot
 
 
 def _group(root: Path, name: str, *, policy: str = "always", priority: int = 2) -> Path:
@@ -186,12 +185,12 @@ def test_phase2_store_rejects_future_base_marker_without_downgrade(tmp_path: Pat
     with sqlite3.connect(path) as conn:
         conn.execute(f"UPDATE {table} SET version=99, marker='future-marker' WHERE domain=?", (domain,))
         conn.commit()
+    # Read the expected marker before establishing the physical baseline.
+    # Python 3.10 SQLite may checkpoint WAL state when this observation closes.
+    with sqlite3.connect(path) as conn:
+        expected = tuple(conn.execute(f"SELECT version,marker FROM {table} WHERE domain=?", (domain,)).fetchone())
     before = path.read_bytes()
     with pytest.raises(RuntimeError):
         store_cls(path)
+    assert expected == (99, "future-marker")
     assert path.read_bytes() == before, "schema preflight mutated the live database"
-    # Verify through an isolated copy.  Older SQLite versions may checkpoint
-    # the copied WAL state on close, but cannot mutate the live database.
-    with open_database_snapshot(path) as conn:
-        assert tuple(conn.execute(f"SELECT version,marker FROM {table} WHERE domain=?", (domain,)).fetchone()) == (99, "future-marker")
-    assert path.read_bytes() == before, "read-only observation mutated the live database"

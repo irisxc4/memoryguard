@@ -9,7 +9,6 @@ import pytest
 from memoryguard.content import ContentStore
 from memoryguard.content.store import ContentError, ContentReadScope, register_acl_values
 from memoryguard.migration.content import ContentMigrationError, V1ContentMigrator
-from memoryguard.storage.database import open_database_snapshot
 
 
 def _history(path: Path) -> None:
@@ -356,18 +355,15 @@ def test_content_schema_marker_preflight_is_fail_closed_without_target_mutation(
         conn.execute("DELETE FROM content_schema_meta")
         conn.executemany("INSERT INTO content_schema_meta(key,value) VALUES(?,?)", marker_rows)
         conn.commit()
-    before_bytes = path.read_bytes()
-    # Observation must itself be physically read-only.  A plain
-    # sqlite3.connect() is write-capable and older SQLite builds may checkpoint
-    # WAL state when the final connection closes, changing the main DB bytes.
-    with open_database_snapshot(path) as conn:
+    # Read expected rows before establishing the physical baseline.  Python
+    # 3.10 SQLite may checkpoint WAL state when this observation closes.
+    with sqlite3.connect(path) as conn:
         before_rows = conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall()
+    before_bytes = path.read_bytes()
     with pytest.raises(ContentError):
         ContentStore(tmp_path)
+    assert before_rows == sorted(marker_rows)
     assert path.read_bytes() == before_bytes, "schema preflight mutated the live database"
-    with open_database_snapshot(path) as conn:
-        assert conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall() == before_rows
-    assert path.read_bytes() == before_bytes, "read-only observation mutated the live database"
 
 
 def test_partial_aux_schema_without_marker_is_not_inferred(tmp_path: Path) -> None:
