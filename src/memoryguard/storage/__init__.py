@@ -10,6 +10,7 @@ from .database import (
     SQLiteDatabase,
     connect_database,
     open_database,
+    open_database_snapshot,
     execute_sql_script,
 )
 from .layout import LayoutError, WorkspaceV2Layout
@@ -55,5 +56,6 @@ __all__ = [
     "initialize_database",
     "initialize_domain",
     "open_database",
+    "open_database_snapshot",
     "transaction",
 ]

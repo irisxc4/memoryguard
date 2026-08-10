@@ -25,7 +25,7 @@ from typing import Any, Iterable, Mapping
 import unicodedata
 import uuid
 
-from ..storage.database import execute_sql_script, open_database
+from ..storage.database import execute_sql_script, open_database, open_database_snapshot
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.schema import initialize_database
 from ..storage.transaction import transaction
@@ -526,7 +526,7 @@ class ContentStore:
                 # Keep ordinary reads/writes sidecar-stable.  Only invoke the
                 # additive migration when a legacy marker-2 database is
                 # missing one of the Phase-3 proof columns.
-                with open_database(self.db_path, readonly=True) as conn:
+                with open_database_snapshot(self.db_path) as conn:
                     state_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(source_sync_state)")}
                     evidence_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(content_evidence_links)")}
                 required_state = {"owner_id", "cursor_digest", "cursor_source_id", "cursor_run_id", "cursor_owner_id", "cursor_revision", "cursor_position", "cursor_batch_digest", "expected_revision", "expected_manifest_digest"}
@@ -544,7 +544,7 @@ class ContentStore:
         if not self.db_path.is_file():
             return "fresh"
         try:
-            with open_database(self.db_path, readonly=True) as conn:
+            with open_database_snapshot(self.db_path) as conn:
                 tables = {
                     str(row[0])
                     for row in conn.execute(

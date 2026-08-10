@@ -34,7 +34,7 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.6.1 更新内容
+## v0.6.2 更新内容
 
 - **Python 3.10 SQLite 热修：** Memory 与 Evidence Store 现在会先通过 SQLite `mode=ro` 校验现有基础 schema metadata，再创建任何可写 WAL 连接。future/unknown schema marker 因此会在旧版 SQLite 上保持数据库物理字节不变并 fail-closed。
 - **跨版本只读验收修正：** V2 migration 测试的失败后观察连接改为真正只读，避免 Python 3.10 自带 SQLite 在测试关闭连接时自行 checkpoint WAL、反过来把测试数据库改掉。

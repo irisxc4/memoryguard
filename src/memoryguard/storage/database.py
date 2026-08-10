@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import shutil
 import sqlite3
+import tempfile
 from typing import Iterator
 from urllib.parse import quote
 
@@ -23,6 +25,22 @@ def _readonly_uri(path: Path, *, immutable: bool = False) -> str:
     # spaces and non-ASCII workspace names while remaining valid on Windows.
     query = "mode=ro&immutable=1" if immutable else "mode=ro"
     return "file:" + quote(str(path.resolve()), safe="/:\\") + "?" + query
+
+
+def _copy_sqlite_snapshot(source: Path, target: Path) -> None:
+    """Copy a SQLite database and its WAL companions to a private path.
+
+    Older SQLite builds may checkpoint a WAL database when the final read-only
+    connection closes.  A preflight must be physically side-effect free, so
+    callers that need that guarantee inspect this private copy instead of the
+    live database.  Copying the main file before the WAL lets SQLite reject a
+    concurrently changing source as a stale/inconsistent snapshot.
+    """
+
+    for suffix in ("", "-wal", "-shm"):
+        source_file = Path(str(source) + suffix)
+        if source_file.is_file():
+            shutil.copy2(source_file, Path(str(target) + suffix))
 
 
 def connect_database(
@@ -110,6 +128,39 @@ def open_database(
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def open_database_snapshot(
+    path: str | Path,
+    *,
+    timeout: float = 5.0,
+    busy_timeout_ms: int = 5_000,
+) -> Iterator[sqlite3.Connection]:
+    """Read a private SQLite snapshot without mutating the source database.
+
+    The snapshot includes the main file and any ``-wal``/``-shm`` companions,
+    so uncheckpointed metadata remains visible.  SQLite may checkpoint while
+    closing the temporary read-only connection, but that can only change the
+    temporary directory.
+    """
+
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    with tempfile.TemporaryDirectory(prefix="memoryguard-db-read-") as directory:
+        snapshot = Path(directory) / source.name
+        _copy_sqlite_snapshot(source, snapshot)
+        conn = connect_database(
+            snapshot,
+            readonly=True,
+            timeout=timeout,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
 
 
 def execute_sql_script(conn: sqlite3.Connection, script: str) -> None:

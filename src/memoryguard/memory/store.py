@@ -20,7 +20,7 @@ import sqlite3
 import threading
 from typing import Any, Iterator, Mapping, Sequence
 
-from ..storage.database import connect_database
+from ..storage.database import connect_database, open_database_snapshot
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.schema import SCHEMA_MARKER as BASE_SCHEMA_MARKER
 from ..storage.transaction import transaction
@@ -417,8 +417,7 @@ class MemoryAtomStore:
     def _preflight_write_schema(self) -> None:
         """Reject unknown/future base metadata before any writable open."""
 
-        conn = self._checked_connect(readonly=True)
-        try:
+        with open_database_snapshot(self.db_path) as conn:
             tables = {
                 str(row[0])
                 for row in conn.execute(
@@ -448,8 +447,6 @@ class MemoryAtomStore:
                     raise RuntimeError("unsupported memory phase2 schema metadata")
                 if int(phase_rows[0][1]) != self.SCHEMA_VERSION or str(phase_rows[0][2]) != self.SCHEMA_MARKER:
                     raise RuntimeError("unsupported memory phase2 schema metadata")
-        finally:
-            conn.close()
 
     def _init_schema(self) -> None:
         conn = self._checked_connect(readonly=False)

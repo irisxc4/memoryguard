@@ -10,7 +10,7 @@ import pytest
 from memoryguard.evidence import EvidenceStore
 from memoryguard.memory import MemoryAtomStore
 from memoryguard.migration.v2_coordinator import V2MigrationCoordinator
-from memoryguard.storage.database import open_database
+from memoryguard.storage.database import open_database_snapshot
 
 
 def _group(root: Path, name: str, *, policy: str = "always", priority: int = 2) -> Path:
@@ -192,6 +192,6 @@ def test_phase2_store_rejects_future_base_marker_without_downgrade(tmp_path: Pat
     # Keep the verification read physically read-only.  A normal
     # sqlite3.connect() may checkpoint WAL state on close with older SQLite
     # versions, which would make the test itself mutate the file bytes.
-    with open_database(path, readonly=True) as conn:
+    with open_database_snapshot(path) as conn:
         assert tuple(conn.execute(f"SELECT version,marker FROM {table} WHERE domain=?", (domain,)).fetchone()) == (99, "future-marker")
     assert path.read_bytes() == before

@@ -36,10 +36,10 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.6.1
+## What's New in v0.6.2
 
-- **Python 3.10 SQLite hotfix:** Memory and Evidence stores now validate existing base schema metadata through SQLite `mode=ro` before any write-capable WAL connection is opened. Future or unknown schema markers therefore fail closed without changing the database image on older SQLite builds.
-- **Cross-version no-write verification:** V2 migration tests now use genuinely read-only SQLite observation handles, avoiding test-induced WAL checkpoints on Python 3.10.
+- **Python 3.10 SQLite correction:** Memory, Evidence, and Content schema preflights inspect a private copy of the SQLite main file plus any `-wal`/`-shm` companions. Older SQLite builds may checkpoint the temporary read-only handle, but the live database remains byte-stable.
+- **Physical no-write verification:** post-failure checks use the same private snapshot path, so validation cannot mutate the database it is checking.
 - **No V2 behavior change:** the v0.6.0 production cutover, frozen-source migration, native routing, readiness gates, and explicit `memoryguard-v2` operator flow remain unchanged.
 
 ## Why MemoryGuard
