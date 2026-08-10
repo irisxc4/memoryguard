@@ -36,14 +36,11 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.6.0
+## What's New in v0.6.1
 
-- **MemoryGuard V2 production cutover is shipped:** authoritative Memory, Rules, Evidence, Content, Runtime, Projection, Assets, CodeGraph, Skills, and System state can run in explicit V2 SQLite domains behind the four-state cutover manifest. Existing V1 workspaces stay on V1 until an explicit V2 prepare/activate flow succeeds.
-- **Lossless frozen-source migration:** live V1 SQLite sources are captured with coherent online backups, migrated from an immutable snapshot, validated against source/target digests, and rechecked for drift before READY and ACTIVE transitions.
-- **Native cutover is closed:** all 233 registered MCP/CLI/GUI/Hook surfaces are explicitly classified with zero blockers and zero neutral routes. Retired V1 workflows fail explicitly instead of silently falling back.
-- **Evidence-first readiness:** two-epoch Reference Audit, integrity/FK checks, outbox draining, maintenance schema verification, runtime-context equivalence, and native coverage all gate activation.
-- **Safer operations after activation:** CLI `doctor`, `mcp-status`, and `storage audit/report` work directly against V2. Unbound terminal diagnostics expose only workspace-level health and never cross-tenant memory counts.
-- **Rollback evidence is preserved:** migration backups and legacy V1 artifacts remain local audit/recovery evidence; V2 activation does not delete them.
+- **Python 3.10 SQLite hotfix:** Memory and Evidence stores now validate existing base schema metadata through SQLite `mode=ro` before any write-capable WAL connection is opened. Future or unknown schema markers therefore fail closed without changing the database image on older SQLite builds.
+- **Cross-version no-write verification:** V2 migration tests now use genuinely read-only SQLite observation handles, avoiding test-induced WAL checkpoints on Python 3.10.
+- **No V2 behavior change:** the v0.6.0 production cutover, frozen-source migration, native routing, readiness gates, and explicit `memoryguard-v2` operator flow remain unchanged.
 
 ## Why MemoryGuard
 

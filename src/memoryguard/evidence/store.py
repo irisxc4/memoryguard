@@ -258,6 +258,12 @@ class EvidenceStore:
                 raise FileNotFoundError(self.db_path)
             self._check_schema(readonly=True)
         else:
+            # Preflight existing schema metadata through SQLite mode=ro before
+            # any write-capable WAL connection exists.  Older SQLite builds
+            # can otherwise alter the physical database image on close even
+            # when the schema transaction itself rolls back.
+            if self.db_path.is_file():
+                self._preflight_write_schema()
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self._init_schema()
 
@@ -272,6 +278,43 @@ class EvidenceStore:
     def _checked_connect(self, *, readonly: bool | None = None) -> sqlite3.Connection:
         self.layout.assert_database_path(self.db_path, "evidence")
         return connect_database(self.db_path, readonly=self.readonly if readonly is None else readonly)
+
+    def _preflight_write_schema(self) -> None:
+        """Reject unknown/future base metadata before any writable open."""
+
+        conn = self._checked_connect(readonly=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if "schema_meta" not in tables:
+                if tables:
+                    raise RuntimeError("evidence base schema metadata is missing")
+                return
+            rows = conn.execute(
+                "SELECT domain, version, marker FROM schema_meta"
+            ).fetchall()
+            if len(rows) != 1 or str(rows[0][0]) != "evidence":
+                raise RuntimeError("unsupported evidence base schema metadata")
+            version = int(rows[0][1])
+            marker = str(rows[0][2])
+            if version != self.SCHEMA_VERSION:
+                raise RuntimeError("unsupported evidence base schema version")
+            if marker not in {BASE_SCHEMA_MARKER, self.SCHEMA_MARKER}:
+                raise RuntimeError("unsupported evidence base schema marker")
+            if self.SCHEMA_META_TABLE in tables:
+                phase_rows = conn.execute(
+                    f"SELECT domain, version, marker FROM {self.SCHEMA_META_TABLE}"
+                ).fetchall()
+                if len(phase_rows) != 1 or str(phase_rows[0][0]) != "evidence":
+                    raise RuntimeError("unsupported evidence phase2 schema metadata")
+                if int(phase_rows[0][1]) != self.SCHEMA_VERSION or str(phase_rows[0][2]) != self.SCHEMA_MARKER:
+                    raise RuntimeError("unsupported evidence phase2 schema metadata")
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         conn = self._checked_connect(readonly=False)

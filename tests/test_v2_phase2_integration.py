@@ -10,6 +10,7 @@ import pytest
 from memoryguard.evidence import EvidenceStore
 from memoryguard.memory import MemoryAtomStore
 from memoryguard.migration.v2_coordinator import V2MigrationCoordinator
+from memoryguard.storage.database import open_database
 
 
 def _group(root: Path, name: str, *, policy: str = "always", priority: int = 2) -> Path:
@@ -170,7 +171,15 @@ def test_coordinator_rejects_workspace_or_ancestor_symlink(tmp_path: Path):
         V2MigrationCoordinator(link)
 
 
-@pytest.mark.parametrize("store_cls,table,domain", [(MemoryAtomStore, "schema_meta", "memory"), (EvidenceStore, "schema_meta", "evidence")])
+@pytest.mark.parametrize(
+    "store_cls,table,domain",
+    [
+        (MemoryAtomStore, "schema_meta", "memory"),
+        (EvidenceStore, "schema_meta", "evidence"),
+        (MemoryAtomStore, "memory_schema_meta", "memory"),
+        (EvidenceStore, "evidence_schema_meta", "evidence"),
+    ],
+)
 def test_phase2_store_rejects_future_base_marker_without_downgrade(tmp_path: Path, store_cls, table: str, domain: str) -> None:
     store = store_cls(tmp_path)
     path = store.path
@@ -180,6 +189,9 @@ def test_phase2_store_rejects_future_base_marker_without_downgrade(tmp_path: Pat
     before = path.read_bytes()
     with pytest.raises(RuntimeError):
         store_cls(path)
-    with sqlite3.connect(path) as conn:
+    # Keep the verification read physically read-only.  A normal
+    # sqlite3.connect() may checkpoint WAL state on close with older SQLite
+    # versions, which would make the test itself mutate the file bytes.
+    with open_database(path, readonly=True) as conn:
         assert tuple(conn.execute(f"SELECT version,marker FROM {table} WHERE domain=?", (domain,)).fetchone()) == (99, "future-marker")
     assert path.read_bytes() == before

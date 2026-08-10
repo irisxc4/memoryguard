@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.6.1] - 2026-08-10
+
+### Fixed
+
+- Restored the Python 3.10 CI contract for V2 schema fail-closed checks.
+- Memory and Evidence stores now preflight existing base schema metadata through SQLite `mode=ro` before opening any write-capable WAL connection, so future/unknown schema markers fail without changing the database image.
+- V2 migration tests now use genuinely read-only SQLite connections for post-failure observations; older SQLite versions could otherwise checkpoint WAL state from the test itself and make a no-write assertion fail spuriously.
+
+### Verification
+
+- Targeted schema/migration/storage regressions: 81 passed.
+- V2 test suite: 591 passed.
+- Non-V2 test suite: 1087 passed.
+- Split full-suite total: 1678 passed / 0 failed on the local release candidate.
+- Release gate: GitHub Linux / Python 3.10 full CI must pass before tag/release.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

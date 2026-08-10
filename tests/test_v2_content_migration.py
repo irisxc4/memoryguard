@@ -9,6 +9,7 @@ import pytest
 from memoryguard.content import ContentStore
 from memoryguard.content.store import ContentError, ContentReadScope, register_acl_values
 from memoryguard.migration.content import ContentMigrationError, V1ContentMigrator
+from memoryguard.storage.database import open_database
 
 
 def _history(path: Path) -> None:
@@ -356,12 +357,15 @@ def test_content_schema_marker_preflight_is_fail_closed_without_target_mutation(
         conn.executemany("INSERT INTO content_schema_meta(key,value) VALUES(?,?)", marker_rows)
         conn.commit()
     before_bytes = path.read_bytes()
-    with sqlite3.connect(path) as conn:
+    # Observation must itself be physically read-only.  A plain
+    # sqlite3.connect() is write-capable and older SQLite builds may checkpoint
+    # WAL state when the final connection closes, changing the main DB bytes.
+    with open_database(path, readonly=True) as conn:
         before_rows = conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall()
     with pytest.raises(ContentError):
         ContentStore(tmp_path)
     assert path.read_bytes() == before_bytes
-    with sqlite3.connect(path) as conn:
+    with open_database(path, readonly=True) as conn:
         assert conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall() == before_rows
 
 
