@@ -39,8 +39,19 @@
 ## What's New in v0.6.2
 
 - **Python 3.10 SQLite correction:** Memory, Evidence, and Content schema preflights inspect a private copy of the SQLite main file plus any `-wal`/`-shm` companions. Older SQLite builds may checkpoint the temporary handle, but the live database remains byte-stable.
-- **Physical no-write verification:** post-failure checks use the same private snapshot path, so validation cannot mutate the database it is checking.
+- **Physical no-write verification:** schema preflight and its verification baseline keep older SQLite WAL checkpoint behavior away from the live database.
 - **No V2 behavior change:** the v0.6.0 production cutover, frozen-source migration, native routing, readiness gates, and explicit `memoryguard-v2` operator flow remain unchanged.
+
+## Major V2 refactor in v0.6.0
+
+v0.6.0 was a production data-plane refactor, not a storage-only upgrade:
+
+- **Authoritative V2 domains:** Memory, Rules, Evidence, Content, Runtime, Projection, Assets, CodeGraph, Skills, and System state are separated into explicit SQLite domains with governed boundaries.
+- **Explicit cutover:** `V1_ACTIVE → V2_BUILDING → V2_READY → V2_ACTIVE` is fail-closed; V2 never silently falls back to legacy stores or dual-writes after READY/ACTIVE.
+- **Lossless migration:** frozen-source preparation uses coherent SQLite online backups, validates source/target evidence, rechecks live-source drift, and preserves V1 data plus migration backups for rollback.
+- **Native routing:** MCP, CLI, GUI, and Hook surfaces are classified explicitly; the release closed the 233-surface cutover with 138 implemented routes, 95 retired routes, and zero neutral/blocker routes.
+- **Governed intelligence:** Rule lifecycle and RuleMerge, extraction/enrichment, External MCP import, provider control-plane, conversation history, Knowledge Library, and GUI governance all use the V2 evidence and decision paths.
+- **Operational evidence:** Reference Audit, per-domain SQLite health, guarded maintenance, rollback evidence, and safe unbound diagnostics are part of readiness and operations.
 
 ## Why MemoryGuard
 

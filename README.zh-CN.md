@@ -36,9 +36,20 @@
 
 ## v0.6.2 更新内容
 
-- **Python 3.10 SQLite 热修：** Memory 与 Evidence Store 现在会先通过 SQLite `mode=ro` 校验现有基础 schema metadata，再创建任何可写 WAL 连接。future/unknown schema marker 因此会在旧版 SQLite 上保持数据库物理字节不变并 fail-closed。
-- **跨版本只读验收修正：** V2 migration 测试的失败后观察连接改为真正只读，避免 Python 3.10 自带 SQLite 在测试关闭连接时自行 checkpoint WAL、反过来把测试数据库改掉。
+- **Python 3.10 SQLite 热修：** Memory、Evidence 与 Content schema preflight 会先检查包含 `-wal`/`-shm` 的私有副本，再创建任何可写 WAL 连接；旧版 SQLite 的 checkpoint 不会改动 live database。
+- **物理只写验收：** schema preflight 与验证基线隔离旧版 SQLite 的 WAL checkpoint 行为，确保失败关闭路径不修改原数据库。
 - **V2 行为不变：** v0.6.0 已交付的 production cutover、frozen-source 迁移、native routing、readiness gate 与显式 `memoryguard-v2` 运维流程均保持不变。
+
+## v0.6.0 重大 V2 重构
+
+v0.6.0 不是单纯的存储升级，而是生产数据平面的整体重构：
+
+- **权威 V2 分域：** Memory、Rules、Evidence、Content、Runtime、Projection、Assets、CodeGraph、Skills、System 分离为明确的 SQLite 域，并由治理边界统一约束。
+- **显式切换：** `V1_ACTIVE → V2_BUILDING → V2_READY → V2_ACTIVE` 全程 fail-closed；进入 READY/ACTIVE 后不会静默回落旧存储，也不会双写。
+- **无损迁移：** frozen-source 准备使用一致的 SQLite online backup，校验源/目标证据，复核 live-source drift，并保留 V1 数据与 migration-backups 以支持回滚。
+- **Native 路由收口：** MCP、CLI、GUI、Hook 全部显式分类；233 个切换面中 138 个实现、95 个退休，neutral/blocker 均为 0。
+- **治理智能链路：** Rule lifecycle、RuleMerge、抽取/富化、External MCP 导入、provider 控制面、会话历史、Knowledge Library 与 GUI 治理统一走 V2 evidence/decision 流程。
+- **运维证据：** Reference Audit、分域 SQLite 健康检查、受保护维护、回滚证据和未绑定 Agent 的安全诊断共同参与 readiness 与运维。
 
 ## 为什么需要 MemoryGuard
 
