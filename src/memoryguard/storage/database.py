@@ -141,8 +141,9 @@ def open_database_snapshot(
 
     The snapshot includes the main file and any ``-wal``/``-shm`` companions,
     so uncheckpointed metadata remains visible.  SQLite may checkpoint while
-    closing the temporary read-only connection, but that can only change the
-    temporary directory.
+    closing the temporary connection, but that can only change the temporary
+    directory.  The connection is write-capable only against the copied files,
+    never against ``source``.
     """
 
     source = Path(path).expanduser().resolve()
@@ -153,7 +154,6 @@ def open_database_snapshot(
         _copy_sqlite_snapshot(source, snapshot)
         conn = connect_database(
             snapshot,
-            readonly=True,
             timeout=timeout,
             busy_timeout_ms=busy_timeout_ms,
         )

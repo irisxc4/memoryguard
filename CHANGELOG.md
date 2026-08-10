@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Memory, Evidence, and Content schema preflights now inspect a private copy of the SQLite main file plus any `-wal`/`-shm` companions. Older SQLite builds can therefore checkpoint the temporary read-only handle without changing the live database.
+- Memory, Evidence, and Content schema preflights now inspect a private copy of the SQLite main file plus any `-wal`/`-shm` companions. Older SQLite builds can therefore checkpoint the temporary handle without changing the live database.
 - The post-failure no-write assertions use the same snapshot path, so the verification itself cannot mutate the database image it is checking.
 
 ### Verification
