@@ -189,9 +189,10 @@ def test_phase2_store_rejects_future_base_marker_without_downgrade(tmp_path: Pat
     before = path.read_bytes()
     with pytest.raises(RuntimeError):
         store_cls(path)
+    assert path.read_bytes() == before, "schema preflight mutated the live database"
     # Keep the verification read physically read-only.  A normal
     # sqlite3.connect() may checkpoint WAL state on close with older SQLite
     # versions, which would make the test itself mutate the file bytes.
     with open_database_snapshot(path) as conn:
         assert tuple(conn.execute(f"SELECT version,marker FROM {table} WHERE domain=?", (domain,)).fetchone()) == (99, "future-marker")
-    assert path.read_bytes() == before
+    assert path.read_bytes() == before, "read-only observation mutated the live database"

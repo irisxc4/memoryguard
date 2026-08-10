@@ -364,9 +364,10 @@ def test_content_schema_marker_preflight_is_fail_closed_without_target_mutation(
         before_rows = conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall()
     with pytest.raises(ContentError):
         ContentStore(tmp_path)
-    assert path.read_bytes() == before_bytes
+    assert path.read_bytes() == before_bytes, "schema preflight mutated the live database"
     with open_database_snapshot(path) as conn:
         assert conn.execute("SELECT key,value FROM content_schema_meta ORDER BY key").fetchall() == before_rows
+    assert path.read_bytes() == before_bytes, "read-only observation mutated the live database"
 
 
 def test_partial_aux_schema_without_marker_is_not_inferred(tmp_path: Path) -> None:
