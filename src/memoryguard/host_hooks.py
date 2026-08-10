@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -1163,6 +1164,194 @@ def _record_history_diagnostic(
         return False
 
 
+def _codex_active_thread_ids(payload: dict[str, Any]) -> set[str]:
+    """Read an optional host-provided active-thread allowlist.
+
+    ``CODEX_THREAD_ID`` remains the only trusted root identity.  The active
+    list is merely a conservative no-touch boundary when Codex exposes it in
+    a Stop payload or environment; malformed values are ignored.
+    """
+    from .codex_subagent_reconcile import _active_ids
+
+    values: list[Any] = []
+    for key in (
+        "active_thread_ids",
+        "active_threads",
+        "active_subagent_thread_ids",
+    ):
+        raw = payload.get(key)
+        if isinstance(raw, (list, tuple, set)):
+            values.extend(raw)
+        elif isinstance(raw, str):
+            values.extend(part.strip() for part in raw.split(","))
+    return _active_ids(values)
+
+
+def _record_codex_reconcile_diagnostic(
+    workspace: Path,
+    provider: str,
+    agent_instance_id: str,
+    result: dict[str, Any],
+) -> None:
+    """Merge only a sanitized reconciliation summary into the heartbeat."""
+    path = _heartbeat_path(workspace, provider, agent_instance_id)
+    try:
+        from .codex_subagent_reconcile import sanitize_reconcile_result
+
+        receipt = _load_json_config(path, strict=False)
+        receipt["codex_subagent_reconcile"] = sanitize_reconcile_result(result)
+        receipt["at"] = _now_iso()
+        _write_json_config(path, receipt)
+    except Exception as exc:
+        _emit_runtime_write_diagnostic(
+            "codex_reconcile_receipt_write_failed", provider, "stop", exc
+        )
+
+
+def _best_effort_codex_reconcile(
+    *,
+    workspace: Path,
+    agent_instance_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Reconcile Codex state without ever affecting the host hook result."""
+    try:
+        from .codex_subagent_reconcile import (
+            codex_thread_matches_workspace,
+            reconcile_codex_subagents,
+            reconcile_global_codex_subagents,
+            trusted_codex_thread_id,
+        )
+
+        # The environment is host-owned.  Never use payload ``thread_id`` as
+        # a fallback because it can be prompt-controlled in synthetic hooks.
+        root_thread_id = trusted_codex_thread_id()
+        if not root_thread_id:
+            return {}
+        workspace_matches = codex_thread_matches_workspace(root_thread_id, workspace)
+        active = _codex_active_thread_ids(payload) | {root_thread_id}
+        result = reconcile_codex_subagents(
+            root_thread_id,
+            active_thread_ids=active,
+            receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
+        )
+        global_result = (
+            reconcile_global_codex_subagents(
+                active_thread_ids=active,
+                receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
+            )
+            if workspace_matches
+            else {
+                "status": "skipped",
+                "reason": "thread_workspace_mismatch",
+                "degraded": False,
+                "closed_edge_count": 0,
+                "archived_thread_count": 0,
+            }
+        )
+        # Root Stop reconciliation remains the primary receipt.  Aggregate the
+        # terminal-event sweep counts without copying global thread IDs into a
+        # workspace heartbeat.
+        result["global_reconcile"] = True
+        result["global_status"] = str(global_result.get("status") or "")
+        result["global_degraded"] = bool(global_result.get("degraded"))
+        result["closed_edge_count"] = int(result.get("closed_edge_count") or 0) + int(
+            global_result.get("closed_edge_count") or 0
+        )
+        result["archived_thread_count"] = int(
+            result.get("archived_thread_count") or 0
+        ) + int(global_result.get("archived_thread_count") or 0)
+        result["open_edge_count"] = int(global_result.get("open_edge_count") or 0)
+        result["skipped_nonterminal_count"] = int(
+            global_result.get("skipped_nonterminal_count") or 0
+        )
+        result["terminal_event_counts"] = dict(
+            global_result.get("terminal_event_counts") or {}
+        )
+        _record_codex_reconcile_diagnostic(
+            workspace, "codex", agent_instance_id, result
+        )
+        if result.get("degraded") or global_result.get("degraded"):
+            _emit_runtime_write_diagnostic(
+                "codex_subagent_reconcile_degraded", "codex", "stop",
+                RuntimeError(
+                    str(
+                        global_result.get("reason")
+                        or result.get("reason")
+                        or global_result.get("status")
+                        or result.get("status")
+                    )
+                ),
+            )
+        return result
+    except Exception as exc:
+        # Stop is an observational seam; a state DB failure must not suppress
+        # MemoryGuard's own feedback/continuation path or brick the session.
+        _emit_runtime_write_diagnostic(
+            "codex_subagent_reconcile_failed", "codex", "stop", exc
+        )
+        return {
+            "version": "1",
+            "provider": "codex",
+            "ok": False,
+            "degraded": True,
+            "status": "degraded",
+            "reason": f"reconcile_failed:{type(exc).__name__}",
+        }
+
+
+def _best_effort_codex_global_reconcile(
+    *,
+    workspace: Path,
+    agent_instance_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Repair terminal stale tasks on startup without touching live branches."""
+
+    try:
+        from .codex_subagent_reconcile import (
+            codex_thread_matches_workspace,
+            reconcile_global_codex_subagents,
+            trusted_codex_thread_id,
+        )
+
+        root_thread_id = trusted_codex_thread_id()
+        if not root_thread_id or not codex_thread_matches_workspace(
+            root_thread_id, workspace
+        ):
+            return {}
+        result = reconcile_global_codex_subagents(
+            active_thread_ids=_codex_active_thread_ids(payload) | {root_thread_id},
+            receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
+        )
+        _record_codex_reconcile_diagnostic(
+            workspace, "codex", agent_instance_id, result
+        )
+        if result.get("degraded"):
+            _emit_runtime_write_diagnostic(
+                "codex_subagent_global_reconcile_degraded",
+                "codex",
+                "session_start",
+                RuntimeError(str(result.get("reason") or result.get("status"))),
+            )
+        return result
+    except Exception as exc:
+        _emit_runtime_write_diagnostic(
+            "codex_subagent_global_reconcile_failed",
+            "codex",
+            "session_start",
+            exc,
+        )
+        return {
+            "version": "2",
+            "provider": "codex",
+            "ok": False,
+            "degraded": True,
+            "status": "degraded",
+            "reason": f"reconcile_failed:{type(exc).__name__}",
+        }
+
+
 def _read_heartbeat(
     workspace: Path,
     provider: str,
@@ -1728,6 +1917,274 @@ def _allow_output(provider: str, event: str) -> dict[str, Any]:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Phase6 V2 host-hook seam
+# ---------------------------------------------------------------------------
+
+_V2_STATES = frozenset({"V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"})
+_V2_FACADE_MISSING = object()
+_v2_runtime_facade_factory: Any = None
+
+
+def _load_v2_runtime_facade(workspace: Path) -> Any:
+    factory = globals().get("_v2_runtime_facade_factory")
+    if factory is None:
+        factory = globals().get("V2RuntimeFacade")
+    if callable(factory):
+        try:
+            return factory(workspace)
+        except TypeError:
+            return factory(workspace=workspace)
+    try:
+        from .cutover_v2.facade import V2RuntimeFacade
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing.startswith("memoryguard.cutover_v2"):
+            return _V2_FACADE_MISSING
+        raise
+    try:
+        from .system.manifest import ManifestManager
+        return V2RuntimeFacade(
+            manifest=ManifestManager(workspace),
+            workspace=str(workspace),
+        )
+    except TypeError:
+        return V2RuntimeFacade(workspace=workspace)
+
+
+def _v2_state(value: Any) -> str:
+    # Host hooks consume an injected facade snapshot.  Require the same
+    # trusted RuntimeSnapshot factory semantics as MCP; malformed generation,
+    # unavailable/error envelopes, and hand-built snapshots fail closed.
+    try:
+        from .cutover_v2.state import CutoverState, RuntimeSnapshot
+        if isinstance(value, RuntimeSnapshot):
+            if not value.trusted or not value.available:
+                return "UNKNOWN"
+            return value.state.value if value.generation >= 0 else "UNKNOWN"
+        if isinstance(value, CutoverState):
+            return "UNKNOWN"
+        if isinstance(value, dict) and any(key in value for key in ("state", "manifest_state", "status", "marker")):
+            snapshot = RuntimeSnapshot.from_value(value)
+            return snapshot.state.value if snapshot.available else "UNKNOWN"
+        if hasattr(value, "state"):
+            snapshot = RuntimeSnapshot.from_value(value)
+            return snapshot.state.value if snapshot.available else "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        value = enum_value
+    object_state = getattr(value, "state", None)
+    if object_state is not None and object_state is not value:
+        return _v2_state(object_state)
+    if isinstance(value, dict):
+        for key in ("state", "manifest_state", "status", "marker"):
+            if key in value:
+                return _v2_state(value[key])
+        for key in ("manifest", "snapshot"):
+            if isinstance(value.get(key), dict):
+                return _v2_state(value[key])
+        return "UNKNOWN"
+    marker = str(value or "").strip().upper()
+    return marker if marker in _V2_STATES else "UNKNOWN"
+
+
+def _v2_facade_snapshot(facade: Any) -> tuple[str, Any]:
+    fn = getattr(facade, "state_snapshot", None)
+    if not callable(fn):
+        fn = getattr(facade, "status", None)
+    if not callable(fn):
+        return "UNKNOWN", None
+    try:
+        value = fn()
+        return _v2_state(value), value
+    except Exception:
+        return "UNKNOWN", None
+
+
+def _v2_hook_context(
+    provider: str,
+    agent_instance_id: str,
+    share_group_id: str,
+    payload: dict[str, Any],
+    event: str,
+) -> dict[str, Any]:
+    context = _effective_agent_context(
+        provider, agent_instance_id, share_group_id, payload, event=event,
+    )
+    return asdict(context)
+
+
+def _v2_hook_cutover(
+    *,
+    provider: str,
+    event: str,
+    workspace: Path,
+    agent_instance_id: str,
+    share_group_id: str,
+    session_id: str,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Route V2 bootstrap/Stop events without touching legacy stores.
+
+    ``None`` means the Phase6 facade is not installed or V1/BUILDING is still
+    active; callers then execute the byte-compatible legacy hook path.
+    """
+    facade = _load_v2_runtime_facade(workspace)
+    if facade is _V2_FACADE_MISSING:
+        return None
+    state, snapshot = _v2_facade_snapshot(facade)
+    if state in {"V1_ACTIVE", "V2_BUILDING"}:
+        return None
+    if state == "UNKNOWN":
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 manifest state unavailable; tool execution denied.")
+        return _context_output(provider, event, "MemoryGuard V2 manifest state unavailable; bootstrap blocked.")
+
+    # pre/post-tool and compact guard logic remains local and byte-compatible.
+    # Only bootstrap and Stop feedback cross the V2 runtime port.
+    if event not in {"session_start", "subagent_start", "user_prompt", "stop"}:
+        return None
+    if state == "V2_READY" and event == "stop":
+        # Stop feedback is a mutation. READY must not call either V2 or legacy.
+        if provider == "codex":
+            _best_effort_codex_reconcile(
+                workspace=workspace,
+                agent_instance_id=agent_instance_id,
+                payload=payload,
+            )
+        return {}
+    hook = getattr(facade, "bootstrap_hook", None)
+    if not callable(hook):
+        return _context_output(provider, event, "MemoryGuard V2 hook capability unavailable; bootstrap blocked.")
+    try:
+        params = inspect.signature(hook).parameters
+        has_context = "context" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        accepts_snapshot = "snapshot" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+    except (TypeError, ValueError):
+        has_context = False
+        accepts_snapshot = False
+    if not has_context:
+        return _context_output(provider, event, "MemoryGuard V2 hook context capability unavailable; bootstrap blocked.")
+    try:
+        context = _v2_hook_context(
+            provider, agent_instance_id, share_group_id, payload, event,
+        )
+        kwargs: dict[str, Any] = {"context": context}
+        if accepts_snapshot:
+            kwargs["snapshot"] = snapshot
+        result = hook(event, dict(payload), **kwargs)
+    except Exception as exc:
+        _record_heartbeat(
+            workspace, provider, agent_instance_id, event=event,
+            error=f"v2 hook dispatch failed: {type(exc).__name__}",
+        )
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
+        return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
+
+    # A facade envelope is part of the trusted bootstrap contract.  Do not
+    # treat an explicit failure (or a malformed result) as an empty, successful
+    # packet: that would silently bypass mandatory context injection.
+    if not isinstance(result, dict):
+        invalid_reason = "v2 hook returned invalid envelope"
+        failed_state = _load_state(workspace, provider, session_id)
+        failed_state.update({
+            "bootstrap_ok": False,
+            "bootstrap_error": invalid_reason,
+            "mandatory_overflow": True,
+            "mandatory_invalid_reason": invalid_reason,
+            "mandatory_match_receipts": [],
+        })
+        _save_state(workspace, provider, session_id, failed_state)
+        _record_heartbeat(
+            workspace, provider, agent_instance_id, event=event,
+            error=invalid_reason,
+        )
+        return _context_output(provider, event, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
+    result_status = str(result.get("status", "") or "").strip().casefold()
+    if result.get("ok") is False or result_status in {"error", "blocked", "failed"} or result.get("error"):
+        reason = str(result.get("error") or result.get("code") or "v2 hook bootstrap failed")
+        failed_state = _load_state(workspace, provider, session_id)
+        failed_state.update({
+            "bootstrap_ok": False,
+            "bootstrap_error": reason[:500],
+            "mandatory_overflow": True,
+            "mandatory_invalid_reason": reason[:500],
+            "mandatory_match_receipts": [],
+        })
+        _save_state(workspace, provider, session_id, failed_state)
+        _record_heartbeat(
+            workspace, provider, agent_instance_id, event=event,
+            error=f"v2 hook envelope failed: {reason}",
+        )
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
+        return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
+
+    if provider == "codex" and event == "stop":
+        # Reconciliation remains observational/best-effort and is deliberately
+        # independent of the V2 receipt/feedback result.
+        _best_effort_codex_reconcile(
+            workspace=workspace,
+            agent_instance_id=agent_instance_id,
+            payload=payload,
+        )
+
+    data = dict(result) if isinstance(result, dict) else {}
+    embedded = data.get("data")
+    if isinstance(embedded, dict):
+        # Facade envelopes may carry the hook packet under ``data``; preserve
+        # top-level status/path fields while exposing the packet uniformly.
+        data = {**embedded, **data}
+    packet = data.get("packet") or data.get("context_packet")
+    if not isinstance(packet, dict):
+        packet = {}
+    receipts = packet.get("mandatory_match_receipts", data.get("mandatory_match_receipts", []))
+    state_payload = _load_state(workspace, provider, session_id)
+    state_payload.update({
+        "bootstrap_ok": not bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
+        "mandatory_overflow": bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
+        "mandatory_invalid_reason": str(packet.get("mandatory_invalid_reason", data.get("error", "")) or ""),
+        "mandatory_rule_ids": list(packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []),
+        "mandatory_match_receipts": receipts if isinstance(receipts, list) else [],
+    })
+    if event == "user_prompt":
+        state_payload.update({
+            "prompt_hash": _short_hash(_prompt(payload)),
+            "durable_candidate": _durable_candidate(_prompt(payload)),
+            "write_seen": False,
+            "stop_continued": False,
+        })
+    _save_state(workspace, provider, session_id, state_payload)
+    _record_heartbeat(
+        workspace, provider, agent_instance_id, event=event,
+        error=str(packet.get("error", data.get("error", "")) or ""),
+        mandatory_rule_ids=state_payload.get("mandatory_rule_ids", []),
+        mandatory_overflow=bool(state_payload.get("mandatory_overflow")),
+    )
+
+    direct_output = data.get("output") or data.get("host_output")
+    if isinstance(direct_output, dict):
+        return direct_output
+    text = str(data.get("text", "") or "")
+    if not text and packet:
+        text = _render_context({"context_packet": packet, **packet})
+    if event == "session_start":
+        text = _static_session_context(provider) + ("\n" + text if text else "")
+        return _context_output(provider, event, text)
+    if event == "subagent_start":
+        return _context_output(provider, event, _static_session_context(provider) + ("\n" + text if text else ""))
+    if event == "user_prompt":
+        return _context_output(provider, event, text) if text else _allow_output(provider, event)
+    return {}
+
+
 def run_hook(
     *,
     provider: str,
@@ -1758,9 +2215,32 @@ def run_hook(
     if mode == "paused":
         return _allow_output(normalized_provider, event)
 
-    # The three installed adapters all use these verified lifecycle seams.
-    # Archive only event payload supplied by that host; this is best-effort and
-    # deliberately independent from long-term memory/bootstrapping.
+    if normalized_provider == "codex" and event == "session_start":
+        # Recover terminal child tasks left open by a prior crash or missed
+        # Stop hook before any V1/V2 routing can return early.
+        _best_effort_codex_global_reconcile(
+            workspace=root,
+            agent_instance_id=agent_instance_id,
+            payload=payload,
+        )
+
+    # Phase6 cutover reads the manifest once per event. READY/ACTIVE bootstrap
+    # and Stop feedback return here before any legacy SharedMemoryStore path.
+    v2_result = _v2_hook_cutover(
+        provider=normalized_provider,
+        event=event,
+        workspace=root,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+        session_id=session_id,
+        payload=payload,
+    )
+    if v2_result is not None:
+        return v2_result
+
+    # V1/BUILDING only: raw-history capture is a legacy persistence seam.  A
+    # READY/ACTIVE request has already returned through the V2 hook above and
+    # must never fall through to this writer (or to any legacy mutation).
     if event in {"user_prompt", "stop"}:
         # Provider is argv-stamped today; the payload shape is an independent
         # check (B1).  Only the history archive provider is corrected -- state,
@@ -2138,6 +2618,17 @@ def run_hook(
                 _COMPACT_REMINDER,
             )
         return {}
+
+    if event == "stop" and normalized_provider == "codex":
+        # Codex's UI index can retain open child edges after a real agent has
+        # stopped.  Reconcile only from the host-owned CODEX_THREAD_ID and
+        # swallow every failure so MemoryGuard's mandatory-feedback path stays
+        # authoritative for the Stop hook.
+        _best_effort_codex_reconcile(
+            workspace=root,
+            agent_instance_id=agent_instance_id,
+            payload=payload,
+        )
 
     state = _load_state(root, normalized_provider, session_id)
     _flush_pending_rule_feedback(

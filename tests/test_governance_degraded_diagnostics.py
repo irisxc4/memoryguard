@@ -28,12 +28,28 @@ from memoryguard.mcp_server import (
     _DEGRADED_WHITELIST,
     _governance_diagnostics_state,
     execute_tool,
+    handle_request,
     governance_degraded,
     governance_global_read_degraded,
     governance_write_degraded,
 )
 
 EXPECTED_BLOCK = {"ok": False, "error": "governance_degraded", "degraded": True}
+
+
+def _tool_payload(result: dict) -> dict:
+    """Decode the JSON text carried by a spec-shaped MCP CallToolResult."""
+    assert isinstance(result.get("content"), list) and result["content"]
+    assert result["content"][0]["type"] == "text"
+    return json.loads(result["content"][0]["text"])
+
+
+def _assert_degraded_result(result: dict) -> dict:
+    assert result.get("isError") is True
+    payload = _tool_payload(result)
+    for key, value in EXPECTED_BLOCK.items():
+        assert payload.get(key) == value
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +59,15 @@ EXPECTED_BLOCK = {"ok": False, "error": "governance_degraded", "degraded": True}
 
 @pytest.fixture(autouse=True)
 def _isolated_env(monkeypatch):
-    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    for name in (
+        "MEMORYGUARD_WORKSPACE",
+        "MEMORYGUARD_HOME",
+        "MEMORYGUARD_AGENT_ID",
+        "MEMORYGUARD_PROVIDER",
+        "MEMORYGUARD_CONTROL_SCOPE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    mcp_server._LEGACY_GLOBAL_REDIRECT_CACHE.clear()
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
     monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
@@ -116,7 +140,29 @@ def test_degraded_blocks_mutating_tool_exact_shape(tmp_path, monkeypatch):
         ("memoryguard_memory_write", {"body": "x", "workspace": str(tmp_path)}),
         ("memoryguard_rule_undo", {"undo_id": "u1", "workspace": str(tmp_path)}),
     ]:
-        assert execute_tool(name, args) == EXPECTED_BLOCK, name
+        _assert_degraded_result(execute_tool(name, args))
+
+
+def test_degraded_tools_call_wire_result_is_valid_call_tool_result(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
+    response = handle_request({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "memoryguard_memory_write",
+            "arguments": {"body": "x", "workspace": str(tmp_path)},
+        },
+    })
+    assert response is not None
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 7
+    result = response["result"]
+    payload = _assert_degraded_result(result)
+    assert payload["error"] == "governance_degraded"
+    assert "error" not in result
 
 
 def test_broken_lock_blocks_normal_read_tool(tmp_path, monkeypatch):
@@ -125,12 +171,12 @@ def test_broken_lock_blocks_normal_read_tool(tmp_path, monkeypatch):
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(tmp_path)},
     )
-    assert res == EXPECTED_BLOCK
+    _assert_degraded_result(res)
     res2 = execute_tool(
         "memoryguard_memory_search",
         {"query": "anything", "workspace": str(tmp_path)},
     )
-    assert res2.get("error") == "governance_degraded"
+    assert _assert_degraded_result(res2)["error"] == "governance_degraded"
 
 
 def _outbox_degraded_state(*_args, **_kwargs):
@@ -152,12 +198,97 @@ def test_outbox_backlog_blocks_writes_but_not_reads(tmp_path, monkeypatch):
         "memoryguard_memory_write",
         {"body": "x", "workspace": str(ws)},
     )
-    assert write == EXPECTED_BLOCK
+    payload = _assert_degraded_result(write)
+    assert payload["recovery"]["reason"] == "reconciliation_in_flight"
     read = execute_tool(
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(ws)},
     )
-    assert read.get("error") != "governance_degraded"
+    assert "governance_degraded" not in read["content"][0]["text"]
+
+
+def test_write_gate_auto_recovers_deterministic_outbox_backlog(tmp_path):
+    from memoryguard.schema_v3 import MemoryKind, SharedMemoryRecord, SharedMemoryStatus
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    ws = _make_workspace(tmp_path)
+    legacy = SharedMemoryStore(ws, "default")
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id="mandatory-source",
+            body="Always verify deterministic recovery before memory writes.",
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            priority=10,
+            created_at="2026-08-08T00:00:00+00:00",
+            updated_at="2026-08-08T00:00:00+00:00",
+            agent_instance_id="",
+        ),
+        assignments=[{
+            "target_type": "system",
+            "target_id": "",
+            "effect": "include",
+        }],
+        emit_lifecycle_outbox=True,
+    )
+    before = _governance_diagnostics_state(ws, "default")
+    assert governance_write_degraded(before) is True
+    assert before["canonical"]["outbox_pending"] == 1
+
+    written = execute_tool(
+        "memoryguard_memory_write",
+        {"body": "write after automatic recovery", "workspace": str(ws)},
+    )
+    assert written.get("isError") is not True, written
+    payload = _tool_payload(written)
+    assert payload.get("memory_id")
+
+    after = _governance_diagnostics_state(ws, "default")
+    assert governance_write_degraded(after) is False
+    assert after["canonical"]["canonical_ready"] is True, after
+    assert after["canonical"]["outbox_pending"] == 0
+    assert after["canonical"]["projection_lag"] == 0
+
+
+def test_startup_auto_recovery_repairs_deterministic_backlog(tmp_path):
+    from memoryguard.schema_v3 import MemoryKind, SharedMemoryRecord, SharedMemoryStatus
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    ws = _make_workspace(tmp_path)
+    legacy = SharedMemoryStore(ws, "default")
+    legacy.append_record(
+        SharedMemoryRecord(
+            memory_id="startup-mandatory-source",
+            body="Always recover deterministic governance state at startup.",
+            kind=MemoryKind.PROCEDURE,
+            status=SharedMemoryStatus.ACTIVE,
+            injection_policy="always",
+            priority=10,
+            created_at="2026-08-08T00:00:00+00:00",
+            updated_at="2026-08-08T00:00:00+00:00",
+            agent_instance_id="",
+        ),
+        assignments=[{
+            "target_type": "system",
+            "target_id": "",
+            "effect": "include",
+        }],
+        emit_lifecycle_outbox=True,
+    )
+    before = _governance_diagnostics_state(ws, "default")
+    assert governance_write_degraded(before) is True
+
+    recovery = mcp_server._attempt_startup_governance_recovery(ws)
+    assert recovery["attempted"] is True, recovery
+    assert recovery["recovered"] is True, recovery
+    assert recovery["share_group_id"] == "default"
+
+    after = _governance_diagnostics_state(ws, "default")
+    assert governance_write_degraded(after) is False
+    assert after["canonical"]["canonical_ready"] is True
+    assert after["canonical"]["outbox_pending"] == 0
+    assert after["canonical"]["projection_lag"] == 0
 
 
 def test_canonical_status_error_blocks_writes_but_not_reads(tmp_path, monkeypatch):
@@ -173,12 +304,13 @@ def test_canonical_status_error_blocks_writes_but_not_reads(tmp_path, monkeypatc
         "memoryguard_memory_write",
         {"body": "x", "workspace": str(ws)},
     )
-    assert write == EXPECTED_BLOCK
+    payload = _assert_degraded_result(write)
+    assert payload["canonical_error"] == "ValueError: cannot read canonical status"
     read = execute_tool(
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(ws)},
     )
-    assert read.get("error") != "governance_degraded"
+    assert "governance_degraded" not in read["content"][0]["text"]
 
 
 def test_split_degraded_predicates():

@@ -1,0 +1,84 @@
+"""V1 -> V2 migration safety framework."""
+
+from .framework import (
+    ErrorLedgerEntry,
+    InventoryItem,
+    InventorySnapshot,
+    JsonManifestStore,
+    ManifestStore,
+    MigrationCoordinator,
+    MigrationError,
+    MigrationPhase,
+    MigrationReadError,
+    MigrationState,
+    MigrationValidator,
+    PathContainmentError,
+    SystemManifestStore,
+    V1Reader,
+    V2_DOMAIN_DB_NAMES,
+    V2_DOMAINS,
+    ValidationResult,
+)
+from .content import ContentMigrationError, MigrationReport, V1ContentMigrator
+from .memory import MigrationResult as MemoryMigrationReport, V1MemoryMigrator
+from .rules import RulesMigrationError, RulesMigrationReport, V1RulesMigrator
+from .v2_coordinator import V2CoordinatorResult, V2MigrationCoordinator, V2MigrationError
+from .v2_validator import DomainValidation, V2MigrationValidator, V2ValidationResult
+from .workspace_prepare import (
+    SCHEMA as WORKSPACE_PREPARE_SCHEMA,
+    WorkspaceCASConflict,
+    WorkspacePrepareError,
+    WorkspaceSourceDrift,
+    prepare_v2_workspace,
+)
+from .codegraph import (
+    CodeGraphMigrationError,
+    CodeGraphMigrationReport,
+    CodeGraphMigrator,
+    V1CodeGraphMigrator,
+    V1LightGraphMigrator,
+)
+
+__all__ = [
+    "ErrorLedgerEntry",
+    "InventoryItem",
+    "InventorySnapshot",
+    "JsonManifestStore",
+    "ManifestStore",
+    "MigrationCoordinator",
+    "MigrationError",
+    "MigrationPhase",
+    "MigrationReadError",
+    "MigrationState",
+    "MigrationValidator",
+    "PathContainmentError",
+    "SystemManifestStore",
+    "V1Reader",
+    "V2_DOMAIN_DB_NAMES",
+    "V2_DOMAINS",
+    "ValidationResult",
+    "ContentMigrationError",
+    "MigrationReport",
+    "V1ContentMigrator",
+    "MemoryMigrationReport",
+    "V1MemoryMigrator",
+    "RulesMigrationError",
+    "RulesMigrationReport",
+    "V1RulesMigrator",
+    "DomainValidation",
+    "V2CoordinatorResult",
+    "V2MigrationCoordinator",
+    "V2MigrationError",
+    "V2MigrationValidator",
+    "V2ValidationResult",
+    "WORKSPACE_PREPARE_SCHEMA",
+    "WorkspaceCASConflict",
+    "WorkspacePrepareError",
+    "WorkspaceSourceDrift",
+    "prepare_v2_workspace",
+    "CodeGraphMigrationError",
+    "CodeGraphMigrationReport",
+    "CodeGraphMigrator",
+    "V1CodeGraphMigrator",
+    "V1LightGraphMigrator",
+]

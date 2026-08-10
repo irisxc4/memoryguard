@@ -502,6 +502,11 @@ def cmd_source(args: argparse.Namespace) -> int:
     workspace = Path(getattr(args, "workspace", ".")).resolve()
     reg = SourceRegistry(workspace)
     action = args.action
+    source_id = str(getattr(args, "source_id", "") or "").strip()
+    if action == "remove" and not source_id:
+        # Backward-compatible handling for hand-built Namespaces created
+        # before the parser's source-target fix.
+        source_id = str(getattr(args, "path", "") or "").strip()
     if action == "list":
         sources = reg.list_sources()
         print(f"sources: {len(sources)}")
@@ -517,11 +522,11 @@ def cmd_source(args: argparse.Namespace) -> int:
         print(f"  estimated_files: {preview.get('estimated_files', 0)}")
         return 0
     if action == "remove":
-        ok = reg.remove(args.source_id)
+        ok = reg.remove(source_id)
         if ok:
-            print(f"removed: {args.source_id}")
+            print(f"removed: {source_id}")
             return 0
-        print(f"error: cannot remove {args.source_id} (not found or project default)", file=sys.stderr)
+        print(f"error: cannot remove {source_id} (not found or project default)", file=sys.stderr)
         return 1
     if action == "preview":
         root_type = SourceRootType(args.type)
@@ -1127,6 +1132,19 @@ def cmd_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_provider(args: argparse.Namespace) -> int:
+    """Repair global MCP/rule integrations from canonical data-home bindings."""
+    from .provider_adapters import repair_global_provider_configs
+
+    try:
+        result = repair_global_provider_configs(list(args.providers or ["all"]))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result.get("ok") else 1
+
+
 def cmd_gc(args: argparse.Namespace) -> int:
     """`.memoryguard/` GC：默认可重建物优先清的 dry-run 预览。"""
     from .gc import MemoryGuardGc
@@ -1169,6 +1187,31 @@ def cmd_gc(args: argparse.Namespace) -> int:
     print(f"  applied:       {result.get('applied', 0)}")
     print(f"  history:       {result.get('history_path', '')}")
     return 0
+
+
+def cmd_storage(args: argparse.Namespace) -> int:
+    """Phase 7 storage audit/report entrypoint for pre-active workspaces."""
+
+    from .maintenance_v2.api import MaintenanceV2Api
+
+    workspace = Path(args.workspace).expanduser()
+    try:
+        api = MaintenanceV2Api(workspace)
+        if args.action == "audit":
+            payload = api.audit_references()
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0 if not payload.get("blocked") else 2
+        if args.action == "report":
+            payload = api.storage_report(args.domain)
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            return 0
+        # V1_ACTIVE/V2_BUILDING routes reach this legacy callback.  Every
+        # mutating Phase 7 operation must wait for the native V2_ACTIVE port.
+        print(json.dumps({"ok": False, "status": "error", "code": "v2_not_active", "error": "v2_not_active"}, sort_keys=True))
+        return 2
+    except Exception as exc:
+        print(json.dumps({"ok": False, "status": "error", "code": type(exc).__name__, "error": type(exc).__name__}, sort_keys=True))
+        return 2
 
 
 def cmd_groups(args: argparse.Namespace) -> int:
@@ -1347,6 +1390,23 @@ def cmd_gui(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+class _SourceTargetAction(argparse.Action):
+    """Route source's sole positional to ``path`` or ``source_id``.
+
+    Declaring two optional positionals made ``source remove ROOT`` populate
+    ``path`` and leave the id empty.  Keep the Namespace names stable while
+    selecting the destination from the already-parsed action.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, "action", "") == "remove":
+            setattr(namespace, "source_id", values)
+            setattr(namespace, "path", None)
+        else:
+            setattr(namespace, "path", values)
+            setattr(namespace, "source_id", None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memoryguard",
@@ -1400,11 +1460,14 @@ def build_parser() -> argparse.ArgumentParser:
     # v3 命令（spec §4.1-§4.4）
     p_source = sub.add_parser("source", help="manage authorized sources (v3)")
     p_source.add_argument("action", choices=("list", "add", "remove", "preview"))
-    p_source.add_argument("path", nargs="?", help="path for add/preview")
+    p_source.add_argument(
+        "target", nargs="?", action=_SourceTargetAction,
+        help="path for add/preview, or source_id for remove",
+    )
     p_source.add_argument("--type", default="selected_directory",
                           choices=("project_directory", "selected_directory", "selected_file", "obsidian_vault"))
     p_source.add_argument("--name", default="", help="display name")
-    p_source.add_argument("source_id", nargs="?", help="source_id for remove")
+    p_source.set_defaults(path=None, source_id=None)
     p_source.add_argument("-w", "--workspace", default=".", help="workspace path")
     p_source.set_defaults(func=cmd_source)
 
@@ -1451,6 +1514,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hooks.set_defaults(func=cmd_hooks)
 
+    p_provider = sub.add_parser(
+        "provider",
+        help="repair global provider MCP/rule integrations from canonical bindings",
+    )
+    p_provider.add_argument("action", choices=("repair",))
+    p_provider.add_argument(
+        "providers",
+        nargs="*",
+        default=["all"],
+        help="claude codex cursor trae, or all (default: all)",
+    )
+    p_provider.set_defaults(func=cmd_provider)
+
     p_gc = sub.add_parser("gc", help="garbage-collect .memoryguard/ artifacts (default dry-run)")
     p_gc.add_argument("path", nargs="?", default=".", help="workspace path (default: .)")
     p_gc.add_argument("--apply", action="store_true", help="execute the GC plan (default: dry-run)")
@@ -1458,6 +1534,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_gc.add_argument("--keep-releases", type=int, default=20, help="reserved for future release pruning")
     p_gc.add_argument("--keep-snapshots", type=int, default=3, help="snapshots to retain")
     p_gc.set_defaults(func=cmd_gc)
+
+    p_storage = sub.add_parser("storage", help="audit and maintain authoritative V2 SQLite storage")
+    p_storage.add_argument("action", choices=("audit", "report", "lease-acquire", "lease-release", "sweep", "compact"))
+    p_storage.add_argument("-w", "--workspace", default=".", help="target workspace (default: .)")
+    p_storage.add_argument("--domain", default="content", choices=("runtime", "memory", "rules", "evidence", "content", "knowledge", "codegraph", "assets", "scenario", "profile", "system", "skills"))
+    p_storage.add_argument("--request-key", default="", help="stable idempotency key for sweep/compact")
+    p_storage.add_argument("--lease-id", default="", help="active maintenance lease")
+    p_storage.add_argument("--ttl-seconds", type=int, default=300, help="lease lifetime for lease-acquire")
+    p_storage.add_argument("--apply", action="store_true", help="perform physical sweep/compact (default: dry-run)")
+    p_storage.set_defaults(func=cmd_storage)
 
     p_groups = sub.add_parser(
         "groups",
@@ -1600,10 +1686,133 @@ def gui_main(argv: list[str] | None = None) -> int:
     return 0
 
 
+class _CliLegacyPort:
+    """Invoke the already-parsed legacy callback without losing Namespace data."""
+
+    def __init__(self, callback) -> None:
+        self.callback = callback
+
+    def dispatch(self, surface: str, name: str, payload: dict) -> dict:
+        namespace = argparse.Namespace(**dict(payload or {}))
+        namespace.command = name
+        namespace.func = self.callback
+        exit_code = self.callback(namespace)
+        return {
+            "ok": int(exit_code or 0) == 0,
+            "exit_code": int(exit_code or 0),
+        }
+
+
+def _cli_trusted_context(workspace: str | Path = ".") -> dict:
+    """Return one process-issued CLI authority for native and maintenance ports.
+
+    CLI flags are business inputs, never identity.  Resolve the active binding
+    from the trusted process AccessContext, mint the same NativeBoundContext
+    used by MCP/GUI, then attach the narrower maintenance sentinel to that
+    envelope.  A missing/ambiguous binding returns no capability and all V2
+    mutations fail closed.
+    """
+    try:
+        from .access_context import load_access_context
+        from .agent_binding import AgentBindingStore
+        from .runtime_v2.native_ports import bind_native_transport_context
+        from .maintenance_v2.runtime_port import bind_maintenance_transport_context
+
+        ctx = load_access_context()
+        agent_id = str(getattr(ctx, "trusted_agent_id", "") or "").strip()
+        if not agent_id:
+            return {}
+        resolved_workspace = Path(workspace).expanduser().resolve()
+        bindings = AgentBindingStore(resolved_workspace).find_by_agent(
+            agent_id, include_inactive=False,
+        )
+        if len(bindings) != 1:
+            return {}
+        envelope = bind_native_transport_context(
+            ctx,
+            workspace_id=str(resolved_workspace),
+            share_group_id=str(bindings[0].share_group_id or ""),
+            runtime_role="cli",
+            entrypoint="cli",
+        )
+        return bind_maintenance_transport_context(envelope)
+    except Exception:
+        return {}
+
+
+def _dispatch_cutover(args: argparse.Namespace) -> int:
+    """Run one CLI command through the Phase 6 one-way cutover gate."""
+    from .compat_v2 import make_cutover_adapter
+
+    workspace = getattr(args, "workspace", None) or getattr(args, "path", ".") or "."
+    # ``gui`` uses a fixed per-user control directory when no positional
+    # workspace was supplied.  Feed the same resolved path to the cutover
+    # manifest gate that ``cmd_gui`` will use on the legacy route.
+    if getattr(args, "command", "") == "gui" and not getattr(args, "workspace", ""):
+        workspace = str(_resolve_gui_workspace([]))
+    adapter = make_cutover_adapter(
+        workspace,
+        # Construct the legacy CLI port only after V1_ACTIVE/V2_BUILDING is
+        # selected.  V2/unknown calls must not instantiate callback adapters.
+        legacy_port=lambda: _CliLegacyPort(args.func),
+        trusted_context=_cli_trusted_context(workspace),
+    )
+    try:
+        mutation = adapter._cli_is_mutation(args.command, args)
+    except Exception as exc:
+        # Do not interpret malformed string booleans as a dry-run/read.
+        print(
+            json.dumps(
+                {"ok": False, "status": "error", "code": str(exc), "error": str(exc), "path": "none"},
+                ensure_ascii=False, sort_keys=True,
+            )
+        )
+        return 1
+    result = adapter.dispatch_cli(
+        args.command, args, mutation=mutation,
+        context=_cli_trusted_context(workspace),
+    )
+    path = str(result.get("path", ""))
+    if path == "v2" and result.get("ok"):
+        # A small set of host-control commands are deliberately executed only
+        # after the native V2 manifest/identity gate has returned an explicit
+        # action receipt.  This is not a data-plane fallback: these callbacks
+        # manage source/provider/hook/UI host state and must never be used for
+        # V2 Memory/Rules/Content persistence.
+        cursor: Any = result
+        host_action = ""
+        for _ in range(3):
+            if not isinstance(cursor, dict):
+                break
+            host_action = str(cursor.get("host_action") or "")
+            if host_action:
+                break
+            cursor = cursor.get("data")
+        allowed_host_actions = {"source", "provider", "hooks", "gui", "open", "desktop"}
+        if host_action:
+            if host_action != str(args.command) or host_action not in allowed_host_actions:
+                print(json.dumps({"ok": False, "status": "error", "code": "invalid_v2_host_action", "path": "v2"}, ensure_ascii=False, sort_keys=True))
+                return 1
+            return int(args.func(args) or 0)
+    if path == "legacy":
+        legacy = result.get("legacy")
+        if isinstance(legacy, dict) and "exit_code" in legacy:
+            return int(legacy.get("exit_code") or 0)
+        # Legacy callback failures retain the old recoverable-error code.
+        return 1 if not result.get("ok") else 0
+    # V2 and fail-closed envelopes are machine-readable and intentionally do
+    # not fall back to the callback.  Keep command/status/path for callers.
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    if result.get("ok"):
+        return 0
+    code = str(result.get("code", ""))
+    return 2 if code in {"v2_manifest_state_unavailable", "v2_not_active", "unknown_cli_command", "v2_context_capability_required"} else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    return _dispatch_cutover(args)
 
 
 if __name__ == "__main__":

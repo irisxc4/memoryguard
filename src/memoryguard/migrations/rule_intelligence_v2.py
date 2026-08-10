@@ -160,6 +160,9 @@ GOVERNANCE_SCHEMA += "\n" + GOVERNANCE_CAPABILITY_SCHEMA
 
 # (table, column, DDL) added only when the column is absent.
 GOVERNANCE_UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("governance_capabilities", "recovery_proof_hash", "TEXT NOT NULL DEFAULT ''"),
+    ("governance_capabilities", "token_version", "TEXT NOT NULL DEFAULT 'v1'"),
+    ("governance_capabilities", "revoked", "INTEGER NOT NULL DEFAULT 0"),
     ("rule_definitions", "rule_strength", "TEXT NOT NULL DEFAULT 'observation'"),
     ("rule_definitions", "maturity_state", "TEXT NOT NULL DEFAULT 'observing'"),
     ("rule_merge_proposals", "readiness_score", "REAL NOT NULL DEFAULT 0.0"),

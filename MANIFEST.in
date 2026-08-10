@@ -1,3 +1,4 @@
+include CHANGELOG.md
 global-exclude *.py[cod]
 global-exclude __pycache__/*
 prune **/__pycache__

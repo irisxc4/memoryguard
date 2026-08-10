@@ -1333,6 +1333,11 @@ class RuleReconciliationService:
                 last_error="model_bundle_required",
             )
             return None, "model_bundle_required"
+        # ``build_bundles`` returns ScopeBundle dataclasses while model-backed
+        # callers return plain dicts.  Persisted job state is JSON, so normalize
+        # both paths before the saga stores ``result_json``.  Acceptance scripts
+        # used to normalize externally, which hid this production-path gap.
+        plan = _normalize_bundle_plan(plan)
         if effective_mode == "heuristic":
             effective_mode = "deterministic_safe_only"
         return plan, effective_mode

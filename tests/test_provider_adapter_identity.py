@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from memoryguard import toml_compat as tomllib
 from pathlib import Path
@@ -15,6 +16,7 @@ from memoryguard.provider_adapters import (
     CodexAdapter,
     CursorAdapter,
     TraeAdapter,
+    repair_global_provider_configs,
 )
 from memoryguard.schema_v3 import AgentInstance
 
@@ -56,6 +58,7 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     assert config["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "claude-real-7",
         "MEMORYGUARD_PROVIDER": "claude",
+        "MEMORYGUARD_CONTROL_SCOPE": "project",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert config["mcpServers"]["other"] == {"command": "other-server"}
@@ -98,6 +101,7 @@ def test_claude_global_scope_uses_user_config_and_stable_workspace(
     home.mkdir()
     workspace.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     AgentBindingStore(workspace).bind_agent("claude-global", "team-global")
 
     result = ClaudeAdapter(workspace).install(
@@ -111,6 +115,7 @@ def test_claude_global_scope_uses_user_config_and_stable_workspace(
     assert config["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "claude-global",
         "MEMORYGUARD_PROVIDER": "claude",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert result["mcp_config_file"] == str(home / ".claude.json")
@@ -163,6 +168,7 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-real-9",
         "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_CONTROL_SCOPE": "project",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcp_servers"]["other"]["command"] == "other-server"
@@ -194,6 +200,7 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
     home.mkdir()
     workspace.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     AgentBindingStore(workspace).bind_agent("codex-legacy", "team-legacy")
 
     config_path = home / ".codex" / "config.toml"
@@ -229,6 +236,7 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-legacy",
         "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcp_servers"]["other"]["command"] == "keep-me"
@@ -239,6 +247,86 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
     assert config_path.read_text(encoding="utf-8") == first_text
 
 
+def test_repair_global_provider_configs_rebuilds_from_canonical_binding(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    data_home = tmp_path / "data-home"
+    home.mkdir()
+    data_home.mkdir()
+    _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+    AgentBindingStore(data_home).bind_agent("codex-current", "canonical-group")
+
+    monkeypatch.setattr(
+        "memoryguard.agent_locator.AgentLocator.detect_instances",
+        lambda self: ([AgentInstance("codex-current", "codex", "codex")], {}),
+    )
+    result = repair_global_provider_configs(["codex"])
+
+    assert result["ok"] is True
+    assert result["configured"] == 1
+    config = tomllib.loads(
+        (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+    )
+    assert config["mcp_servers"]["memoryguard"]["env"] == {
+        "MEMORYGUARD_AGENT_ID": "codex-current",
+        "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
+        "MEMORYGUARD_WORKSPACE": str(data_home.resolve()),
+    }
+
+
+def test_codex_global_takeover_removes_superseded_project_override(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    data_home = tmp_path / "data-home"
+    project = tmp_path / "project"
+    home.mkdir()
+    data_home.mkdir()
+    project.mkdir()
+    _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+    AgentBindingStore(data_home).bind_agent("codex-current", "canonical-group")
+
+    project_config = project / ".codex" / "config.toml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(
+        '# BEGIN memoryguard:provider-redirect\n'
+        '[mcp_servers.memoryguard]\n'
+        'command = "python"\n'
+        'args = ["-m", "memoryguard.mcp_server"]\n'
+        'env = { MEMORYGUARD_AGENT_ID = "old-codex" }\n'
+        '# END memoryguard:provider-redirect\n',
+        encoding="utf-8",
+    )
+    (project / "AGENTS.md").write_text(
+        '<!-- BEGIN memoryguard:provider-redirect -->\nold\n'
+        '<!-- END memoryguard:provider-redirect -->\n',
+        encoding="utf-8",
+    )
+
+    result = CodexAdapter(project).install(
+        project,
+        share_group_id="canonical-group",
+        agent_instance_id="codex-current",
+        global_scope=True,
+    )
+
+    global_text = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+    parsed = tomllib.loads(global_text)
+    assert parsed["mcp_servers"]["memoryguard"]["env"] == {
+        "MEMORYGUARD_AGENT_ID": "codex-current",
+        "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
+        "MEMORYGUARD_WORKSPACE": str(data_home.resolve()),
+    }
+    assert not project_config.exists()
+    assert not (project / "AGENTS.md").exists()
+    assert any("项目级 MemoryGuard 覆盖" in item for item in result["warnings"])
+
+
 def test_governance_configures_trae_and_reports_other_adapter_errors(
     tmp_path, monkeypatch,
 ):
@@ -247,6 +335,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     workspace.mkdir()
     home.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
@@ -296,6 +385,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     )["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "trae-real",
         "MEMORYGUARD_PROVIDER": "trae",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
 
@@ -305,6 +395,7 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     assert parsed["mcp_servers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "codex-real",
         "MEMORYGUARD_PROVIDER": "codex",
+        "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert {
@@ -351,6 +442,7 @@ def test_cursor_workspace_install_uses_project_config(tmp_path, monkeypatch):
     assert parsed["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "cursor-real",
         "MEMORYGUARD_PROVIDER": "cursor",
+        "MEMORYGUARD_CONTROL_SCOPE": "project",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert json.loads(global_config.read_text(encoding="utf-8")) == {
@@ -408,6 +500,7 @@ def test_trae_workspace_install_uses_project_config_and_preserves_servers(
     assert parsed["mcpServers"]["memoryguard"]["env"] == {
         "MEMORYGUARD_AGENT_ID": "trae-real",
         "MEMORYGUARD_PROVIDER": "trae",
+        "MEMORYGUARD_CONTROL_SCOPE": "project",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
     }
     assert parsed["mcpServers"]["existing"] == {"command": "existing-server"}
@@ -441,6 +534,7 @@ def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstal
     workspace.mkdir()
     home.mkdir()
     _patch_home(monkeypatch, home)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
@@ -569,6 +663,104 @@ def test_install_refuses_corrupt_existing_config(tmp_path):
 
     assert config_path.read_text(encoding="utf-8") == "{broken-json"
     assert not (workspace / "CLAUDE.md").exists()
+
+
+def test_legacy_global_runtime_redirect_requires_migration_evidence(
+    tmp_path, monkeypatch,
+):
+    from memoryguard.mcp_server import (
+        _LEGACY_GLOBAL_REDIRECT_CACHE,
+        _resolve_memory_workspace,
+    )
+    from memoryguard.schema_v3 import (
+        MemoryKind,
+        Provenance,
+        SharedMemoryRecord,
+        SharedMemoryStatus,
+    )
+    from memoryguard.shared_memory_store import SharedMemoryStore
+
+    legacy = tmp_path / "legacy-control"
+    canonical = tmp_path / "canonical-home"
+    legacy.mkdir()
+    canonical.mkdir()
+    AgentBindingStore(legacy).bind_agent("old-codex", "legacy-group")
+    AgentBindingStore(canonical).bind_agent("new-codex", "canonical-group")
+    SharedMemoryStore(canonical, "canonical-group").append_record(
+        SharedMemoryRecord(
+            memory_id="migrated-record",
+            body="migrated memory",
+            kind=MemoryKind.FACT,
+            status=SharedMemoryStatus.ACTIVE,
+            provenance=[Provenance(
+                source_object_id="migrated-from:legacy-group",
+                locator="source",
+                excerpt_hash="",
+                source_revision="",
+            )],
+            created_at="2026-08-08T00:00:00+00:00",
+            updated_at="2026-08-08T00:00:00+00:00",
+        )
+    )
+
+    def fake_detect(self):
+        root = Path(self.workspace).resolve()
+        if root == legacy.resolve():
+            return ([AgentInstance("old-codex", "codex", "codex")], {})
+        if root == canonical.resolve():
+            return ([AgentInstance("new-codex", "codex", "codex")], {})
+        return ([], {})
+
+    monkeypatch.setattr(
+        "memoryguard.agent_locator.AgentLocator.detect_instances", fake_detect,
+    )
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(canonical))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(legacy))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "old-codex")
+    monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_PROVIDER", raising=False)
+    _LEGACY_GLOBAL_REDIRECT_CACHE.clear()
+
+    resolved = _resolve_memory_workspace({})
+    assert resolved == canonical.resolve()
+    from memoryguard.access_context import effective_provider, load_access_context
+    assert load_access_context().trusted_agent_id == "new-codex"
+    assert effective_provider() == "codex"
+    # The host-owned environment remains untouched; only MemoryGuard's trusted
+    # connection view is normalized.
+    assert os.environ["MEMORYGUARD_AGENT_ID"] == "old-codex"
+    assert "MEMORYGUARD_CONTROL_SCOPE" not in os.environ
+    assert Path(os.environ["MEMORYGUARD_WORKSPACE"]).resolve() == legacy.resolve()
+
+    # Old project-level configs often carried only the legacy AgentInstance id
+    # and relied on cwd instead of MEMORYGUARD_WORKSPACE.  The same migration
+    # evidence must repair that shape too.
+    from memoryguard.access_context import clear_runtime_connection_override
+    clear_runtime_connection_override()
+    _LEGACY_GLOBAL_REDIRECT_CACHE.clear()
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.chdir(legacy)
+    resolved_from_cwd = _resolve_memory_workspace({})
+    assert resolved_from_cwd == canonical.resolve()
+    assert load_access_context().trusted_agent_id == "new-codex"
+
+
+def test_explicit_project_scope_never_auto_redirects_legacy_workspace(
+    tmp_path, monkeypatch,
+):
+    from memoryguard.mcp_server import _resolve_memory_workspace
+
+    project = tmp_path / "project-control"
+    canonical = tmp_path / "canonical-home"
+    project.mkdir()
+    canonical.mkdir()
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(canonical))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(project))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "project-agent")
+    monkeypatch.setenv("MEMORYGUARD_CONTROL_SCOPE", "project")
+
+    assert _resolve_memory_workspace({}) == project.resolve()
+    assert os.environ["MEMORYGUARD_AGENT_ID"] == "project-agent"
 
 
 def test_trusted_env_supplies_missing_tool_identity_and_rejects_mismatch(

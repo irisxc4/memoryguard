@@ -255,9 +255,11 @@ def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
         assert run.returncode == 0, run.stderr[-2000:]
         assert len(responses) == 1, (responses, run.stderr[-2000:])
         result = responses[0]["result"]
-        assert result.get("error") == "runtime_split_brain", result
-        assert result.get("restart_required") is True
-        pids = [str(item.get("pid", "")) for item in result.get("conflicting", [])]
+        assert result.get("isError") is True, result
+        payload = json.loads(result["content"][0]["text"])
+        assert payload.get("error") == "runtime_split_brain", payload
+        assert payload.get("restart_required") is True
+        pids = [str(item.get("pid", "")) for item in payload.get("conflicting", [])]
         assert str(proc.pid) in pids
         assert _pid_alive(proc.pid)
     finally:

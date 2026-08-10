@@ -24,6 +24,7 @@ import sys
 import threading
 import webbrowser
 from pathlib import Path
+from typing import Any, Mapping
 
 
 class BuildCancelled(Exception):
@@ -371,6 +372,7 @@ def open_localhost_window(
         detect_sandbox_mode,
         RequestQueue,
     )
+    from .cutover_v2.surfaces import GUI_MUTATION_NAMES
 
     port = _find_free_port()
     if port == 0:
@@ -378,22 +380,26 @@ def open_localhost_window(
 
     session_token = generate_session_token()
     from .access_context import AccessContext
-    api = GovernanceApi(
-        workspace,
-        _trusted_access_context=AccessContext(
-            trusted_agent_id="",
-            is_admin=True,
-            strict_binding=True,
-            allow_anon=False,
-            session_id=session_token,
-            session_source="transport",
-            session_trusted=True,
-        ),
+    trusted_access_context = AccessContext(
+        trusted_agent_id="",
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id=session_token,
+        session_source="transport",
+        session_trusted=True,
     )
     # 网页环境绑定 127.0.0.1,等价于本地 GUI
     # 沙箱状态只读当前可信进程环境；GUI 不替调用方修改安全边界。
     is_sandbox = detect_sandbox_mode()
     request_queue = RequestQueue(workspace)
+    # Ordinary GUI calls use SafeBridge as the sole readonly/mutation
+    # entrance. The HTTP handler never dispatches directly to GovernanceApi.
+    bridge = SafeBridgeApi(
+        workspace,
+        direct_mutations=not is_sandbox,
+        _trusted_access_context=trusted_access_context,
+    )
 
     def inject_runtime_context(html: str, *, session_token: str, sandbox: bool) -> str:
         """把会话令牌与沙箱标记注入任意 HTML 页面（知识书库等独立路由）。"""
@@ -517,31 +523,25 @@ def open_localhost_window(
             # KB5 知识书库 API 路由（变更类在沙箱下进入请求队列，不单开特快通道）
             if is_knowledge:
                 from .knowledge_gui import handle_knowledge_api, is_knowledge_mutation
-                if is_knowledge_mutation(method) and is_sandbox:
-                    req = request_queue.submit(method, args)
-                    self._json_response(200, {
-                        "ok": True,
-                        "deferred": True,
-                        "request": req.to_dict(),
-                        "message": "请求已提交，等待桌面执行器确认",
-                    })
-                    return
-                try:
-                    result = handle_knowledge_api(method, args, workspace)
-                    self._json_response(200, result if result is not None else {})
-                except Exception as e:
-                    self._json_response(500, {"error": str(e)})
+                # Knowledge writes are ordinary bridge mutations.  Read-only
+                # bookshelf queries retain their direct compatibility handler.
+                result = (
+                    bridge.request_mutation(method, args)
+                    if is_knowledge_mutation(method)
+                    else handle_knowledge_api(method, args, workspace)
+                )
+                self._json_response(200, result if result is not None else {})
                 return
 
             # 特殊方法：请求队列管理
             if method == "submit_request":
                 target_method = args[0] if args else ""
                 target_args = args[1] if len(args) > 1 else []
-                if not is_mutation_method(target_method):
+                if not (is_mutation_method(target_method) or target_method in GUI_MUTATION_NAMES):
                     self._json_response(400, {"error": "not a mutation method"})
                     return
-                req = request_queue.submit(target_method, target_args)
-                self._json_response(200, {"ok": True, "request": req.to_dict()})
+                result = bridge.request_mutation(target_method, target_args)
+                self._json_response(200, result if result is not None else {})
                 return
 
             if method == "get_request_status":
@@ -558,40 +558,25 @@ def open_localhost_window(
                 self._json_response(200, {"requests": [r.to_dict() for r in pending]})
                 return
 
-            # 变更 API：沙箱模式下只创建请求
-            if is_mutation_method(method):
-                if is_sandbox:
-                    req = request_queue.submit(method, args)
-                    self._json_response(200, {
-                        "ok": True,
-                        "deferred": True,
-                        "request": req.to_dict(),
-                        "message": "请求已提交，等待桌面执行器确认",
-                    })
-                    return
-                # 非沙箱模式：直接执行，注入 confirmed=True
-                import inspect as _inspect
-                _fn = getattr(api, method, None)
-                if _fn and callable(_fn):
-                    _sig = _inspect.signature(_fn)
-                    _params = list(_sig.parameters.keys())
-                    if "confirmed" in _params:
-                        _cidx = _params.index("confirmed")
-                        args = list(args)
-                        while len(args) <= _cidx:
-                            args.append(_sig.parameters[_params[len(args)]].default)
-                        args[_cidx] = True
-
-            # 只读 API 或非沙箱变更：直接执行
-            fn = getattr(api, method, None)
-            if not callable(fn):
-                self._json_response(501, {"error": f"method not implemented: {method}"})
+            # SafeBridge owns the sandbox/deferred decision and the V2
+            # manifest gate. Do not call GovernanceApi directly here.
+            if is_mutation_method(method) or method in GUI_MUTATION_NAMES:
+                result = bridge.request_mutation(method, args)
+                self._json_response(200, result if result is not None else {})
                 return
+
+            # Security methods are exposed by the bridge itself; all other
+            # reads use its readonly entrance.
             try:
-                # 授权由 API 自己从 AccessContext 派生；HTTP/浏览器参数不得注入。
-                result = fn(*args) if args else fn()
-                result = result if result is not None else {}
-                self._json_response(200, result)
+                if method in {"get_sandbox_status", "get_api_method_registry", "pick_path"}:
+                    fn = getattr(bridge, method, None)
+                    if not callable(fn):
+                        self._json_response(501, {"error": f"method not implemented: {method}"})
+                        return
+                    result = fn(*args) if args else fn()
+                else:
+                    result = bridge.call_readonly(method, args)
+                self._json_response(200, result if result is not None else {})
             except Exception as e:
                 self._json_response(500, {"error": str(e)})
 
@@ -632,7 +617,7 @@ def open_localhost_window(
             bridge = SafeBridgeApi(
                 workspace,
                 direct_mutations=True,
-                _trusted_access_context=api._trusted_access_context,
+                _trusted_access_context=trusted_access_context,
             )
             window = webview.create_window(
                 native_title,
@@ -1132,12 +1117,8 @@ class GovernanceApi:
 
         统一单一来源：前端不再维护自己的 MUTATION_METHODS 列表。
         """
-        from .security import READONLY_API_METHODS, MUTATION_API_METHODS, _SECURITY_API_METHODS
-        return {
-            "readonly": sorted(READONLY_API_METHODS),
-            "mutation": sorted(MUTATION_API_METHODS),
-            "security": sorted(_SECURITY_API_METHODS),
-        }
+        from .security import get_api_method_registry
+        return get_api_method_registry()
 
     def get_sandbox_status(self) -> dict:
         """返回当前沙箱状态。"""
@@ -1147,7 +1128,8 @@ class GovernanceApi:
     def submit_request(self, method: str, args: list | None = None) -> dict:
         """提交变更请求到请求队列。"""
         from .security import RequestQueue, is_mutation_method
-        if not is_mutation_method(method):
+        from .cutover_v2.surfaces import GUI_MUTATION_NAMES
+        if not (is_mutation_method(method) or method in GUI_MUTATION_NAMES):
             return {"error": "not a mutation method"}
         rq = RequestQueue(self.workspace)
         req = rq.submit(method, args or [])
@@ -8182,6 +8164,159 @@ class GovernanceApi:
         return out
 
 
+_GUI_SOURCE_READS = frozenset({
+    "list_sources", "scan_sources", "preview_source", "get_raw_memory",
+    "get_source_file_content", "extract_preview", "extract_preview_by_path",
+    "get_agent_data", "get_residual_cleanup",
+})
+
+_GUI_PATH_KEYS = frozenset({
+    "path", "root_path", "resolved_path", "relative_path", "absolute_path",
+    "source_path", "workspace", "target_path", "manifest_path",
+    "published_target_file", "sidecar_memory_md", "dir_path", "export_path",
+    "canonical_store_path", "targets", "changed_paths", "backup_paths",
+})
+_GUI_ROUTE_PATHS = frozenset({"v2", "legacy", "none", "native", "unknown"})
+
+
+def _stable_gui_source_ref(share_group_id: str, root_id: str) -> str:
+    digest = hashlib.sha256(
+        f"{share_group_id}\x00{root_id}".encode("utf-8", "replace"),
+    ).hexdigest()[:20]
+    return f"source:{digest}"
+
+
+def _stable_gui_path_descriptor(value: Any, share_group_id: str, key: str) -> dict[str, str]:
+    """Describe a filesystem path without returning the path itself."""
+    if value is None:
+        raw = ""
+    elif isinstance(value, Path):
+        raw = str(value)
+    elif isinstance(value, str):
+        raw = value
+    else:
+        # Bytes and opaque values must never be coerced into a path-bearing
+        # string; callers may rely on their original type/bytes.
+        return {"ref": "path:opaque", "hash": "", "summary": "opaque"}
+    if not raw:
+        return {"ref": "path:empty", "hash": "", "summary": "empty"}
+    digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+    scoped = hashlib.sha256(
+        f"{share_group_id}\x00{key}\x00{raw}".encode("utf-8", "replace"),
+    ).hexdigest()[:20]
+    # A basename is useful for the UI, while never exposing parent segments.
+    try:
+        name = Path(raw).name
+    except (OSError, ValueError):
+        name = ""
+    summary = name if name and name not in {".", ".."} else "path"
+    return {"ref": f"path:{scoped}", "hash": digest, "summary": summary[:96]}
+
+
+def _redact_gui_paths(value: Any, share_group_id: str = "", *, _key: str = "") -> Any:
+    """Recursively redact path-bearing GUI output; bytes remain byte-for-byte."""
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            lowered = key.casefold()
+            if lowered in _GUI_PATH_KEYS:
+                if isinstance(raw_value, (bytes, bytearray, memoryview)):
+                    output[key] = raw_value
+                    continue
+                if isinstance(raw_value, (list, tuple)):
+                    output[key] = [
+                        _stable_gui_path_descriptor(item, share_group_id, lowered)
+                        if not isinstance(item, (bytes, bytearray, memoryview)) else item
+                        for item in raw_value
+                    ]
+                    continue
+                if lowered == "path" and isinstance(raw_value, str) and raw_value.casefold() in _GUI_ROUTE_PATHS:
+                    output[key] = raw_value
+                else:
+                    output[key] = _stable_gui_path_descriptor(raw_value, share_group_id, lowered)
+            else:
+                output[key] = _redact_gui_paths(raw_value, share_group_id, _key=lowered)
+        return output
+    if isinstance(value, list):
+        return [_redact_gui_paths(item, share_group_id, _key=_key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_gui_paths(item, share_group_id, _key=_key) for item in value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return value
+    return value
+
+
+def _safe_gui_error(exc: BaseException, *, code: str = "gui_operation_failed") -> dict[str, Any]:
+    from .compat_v2.legacy_adapter import safe_exception_diagnostic
+
+    return {
+        "ok": False,
+        "error": code,
+        "code": code,
+        "diagnostic": safe_exception_diagnostic(exc, code=code),
+    }
+
+
+def _redact_gui_source_result(
+    method: str,
+    result: Any,
+    share_group_id: str,
+) -> dict[str, Any]:
+    """Return source data with stable refs and no filesystem path fields."""
+    if not isinstance(result, Mapping):
+        return _redact_gui_paths({"data": result}, share_group_id)
+    if method == "list_sources":
+        safe: list[dict[str, Any]] = []
+        for raw in result.get("sources", []) if isinstance(result.get("sources"), list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            root_id = str(raw.get("root_id", "") or "").strip()
+            safe_root_id = (
+                root_id
+                if root_id and not root_id.startswith(("/", "\\"))
+                and not (len(root_id) > 2 and root_id[1] == ":")
+                else ("REDACTED" if root_id else "NO_SOURCE")
+            )
+            safe.append({
+                "source_ref": _stable_gui_source_ref(share_group_id, root_id) if root_id else "NO_SOURCE",
+                "root_id": safe_root_id,
+                "type": str(raw.get("type", "") or ""),
+                "scope": str(raw.get("scope", "") or ""),
+            })
+        return _redact_gui_paths({"sources": safe, "total": len(safe)}, share_group_id)
+    if method == "scan_sources":
+        coverage = result.get("coverage")
+        safe = {
+            key: value for key, value in result.items()
+            if key not in {"path", "workspace", "source_path"}
+        }
+        safe["scope_ref"] = _stable_gui_source_ref(share_group_id, "scan")
+        if isinstance(coverage, Mapping):
+            safe["coverage"] = dict(coverage)
+        return _redact_gui_paths(safe, share_group_id)
+    if method == "get_raw_memory":
+        safe_groups: list[dict[str, Any]] = []
+        for raw in result.get("groups", []) if isinstance(result.get("groups"), list) else []:
+            if not isinstance(raw, Mapping):
+                continue
+            item = {
+                key: value for key, value in raw.items()
+                if key not in {"root_path", "path", "workspace", "source_path"}
+            }
+            root_id = str(raw.get("root_id", "") or "").strip()
+            item["source_ref"] = _stable_gui_source_ref(share_group_id, root_id) if root_id else "NO_SOURCE"
+            safe_groups.append(item)
+        safe = {key: value for key, value in result.items() if key != "groups"}
+        safe["groups"] = safe_groups
+        return _redact_gui_paths(safe, share_group_id)
+    # Other source methods may include a path in a nested implementation
+    # response.  Keep the business payload but redact path-bearing keys.
+    from .compat_v2.legacy_adapter import sanitize_public_payload
+
+    return _redact_gui_paths(sanitize_public_payload(dict(result)), share_group_id)
+
+
 class SafeBridgeApi:
     """受限桥接 API：pywebview js_api 的安全代理。
 
@@ -8198,17 +8333,201 @@ class SafeBridgeApi:
         *,
         direct_mutations: bool = False,
         _trusted_access_context=None,
+        _v2_port=None,
     ):
-        self._inner = GovernanceApi(
-            workspace,
-            _trusted_access_context=_trusted_access_context,
-        )
         self._workspace = workspace
+        # GovernanceApi is a legacy implementation.  Keep it completely
+        # lazy: V2/unknown calls must never construct it (or its adapter).
+        self._inner_instance = None
+        self._window = None
         # 原生桌面窗口本身即执行端，变更应直接执行，不被 IDE 沙箱启发式推迟
         self._direct_mutations = bool(direct_mutations)
+        # Phase 6-A facade is optional during the shadow build.  Keep the
+        # override injectable for acceptance fixtures; normal operation uses
+        # feature detection from ``compat_v2``.
+        self._v2_port = _v2_port
+        self._trusted_access_context = _trusted_access_context
+        self._defer_mutations = False
+
+    def _get_inner(self) -> GovernanceApi:
+        """Construct the legacy API only after the cutover selects legacy."""
+        if self._inner_instance is None:
+            self._inner_instance = GovernanceApi(
+                self._workspace,
+                _trusted_access_context=self._trusted_access_context,
+            )
+            if self._window is not None:
+                self._inner_instance._set_window(self._window)
+        return self._inner_instance
+
+    # Compatibility seam for older in-process tests/integrations that inject
+    # a fake ``_inner``.  Reading it remains lazy and therefore does not alter
+    # V2 path behavior.
+    @property
+    def _inner(self):
+        return self._get_inner()
+
+    @_inner.setter
+    def _inner(self, value):
+        self._inner_instance = value
+
+    class _LegacyPort:
+        """Adapt GovernanceApi's positional JS surface to the V2 adapter."""
+
+        def __init__(self, bridge: "SafeBridgeApi") -> None:
+            self.bridge = bridge
+
+        def dispatch(self, surface: str, name: str, args: dict) -> object:
+            # This object is itself created only on a legacy route.  A
+            # sandbox mutation is still gated before this method is reached;
+            # in that case queue the request rather than invoking the legacy
+            # callback directly.
+            payload = dict(args or {})
+            positional = payload.get("args")
+            if self.bridge._defer_mutations:
+                from .security import RequestQueue
+
+                values = list(positional) if isinstance(positional, (list, tuple)) else []
+                req = RequestQueue(self.bridge._workspace).submit(name, values)
+                return {
+                    "ok": True,
+                    "deferred": True,
+                    "request": req.to_dict(),
+                    "message": "请求已提交，等待桌面执行器确认",
+                }
+            inner = self.bridge._get_inner()
+            fn = getattr(inner, name, None)
+            if not callable(fn):
+                raise AttributeError(f"method not found: {name}")
+            if isinstance(positional, (list, tuple)):
+                values = list(positional)
+                # Legacy mutators commonly expose a trailing ``confirmed``
+                # parameter.  Inject it only after the manifest selected the
+                # legacy route; V2 calls never inspect or alter payloads.
+                try:
+                    import inspect
+
+                    signature = inspect.signature(fn)
+                    names = list(signature.parameters)
+                    if "confirmed" in names:
+                        index = names.index("confirmed")
+                        while len(values) <= index:
+                            parameter = signature.parameters[names[len(values)]]
+                            values.append(parameter.default)
+                        values[index] = True
+                except (TypeError, ValueError, IndexError):
+                    pass
+                return fn(*values)
+            return fn(**payload)
+
+    def _trusted_bridge_context(self) -> object:
+        """Return a native capability issued from the real AccessContext.
+
+        Browser payloads are never merged into this mapping.  The V2 native
+        port recognizes the process-local sentinel attached by
+        ``bind_native_transport_context``; a plain identity dictionary is not
+        accepted as mutation authority.  Read-only calls intentionally do
+        not receive this capability (their scope remains payload-scoped), so
+        a read port that lacks mutation-context support is not blocked.
+        """
+        ctx = self._trusted_access_context
+        if ctx is None:
+            return {}
+        try:
+            from .access_context import AccessContext
+            if not isinstance(ctx, AccessContext):
+                return {}
+            # AccessContext carries the connection principal but not its
+            # governance group. Resolve exactly one active binding from the
+            # local ledger; a GUI preference alone is never an authority.
+            from .runtime_v2.native_ports import bind_native_transport_context
+            agent_id = str(ctx.trusted_agent_id or "").strip()
+            share_group_id = ""
+            if agent_id:
+                from .agent_binding import AgentBindingStore
+
+                active = AgentBindingStore(self._workspace).find_by_agent(
+                    agent_id, include_inactive=False,
+                )
+                if len(active) == 1:
+                    share_group_id = str(active[0].share_group_id or "")
+                elif len(active) > 1:
+                    # Ambiguous bindings must fail closed at the native scope
+                    # boundary instead of selecting an arbitrary tenant.
+                    share_group_id = ""
+            return bind_native_transport_context(
+                ctx,
+                workspace_id=str(self._workspace),
+                share_group_id=share_group_id,
+                runtime_role="gui",
+                entrypoint="gui",
+            )
+        except Exception:
+            # A missing/invalid capability must fail closed in V2.  The
+            # adapter will return a structured context error rather than
+            # silently retrying without provenance.
+            return {}
+
+    def _cutover(self):
+        from .compat_v2 import make_cutover_adapter
+
+        return make_cutover_adapter(
+            self._workspace,
+            # The factory is evaluated only for V1_ACTIVE/V2_BUILDING.  This
+            # is what keeps GovernanceApi/_LegacyPort out of the V2 path.
+            legacy_port=lambda: self._LegacyPort(self),
+            v2_port=self._v2_port,
+            trusted_context=self._trusted_bridge_context(),
+        )
+
+    def _source_scope(self) -> tuple[str, str]:
+        """Resolve exactly one active binding for source introspection."""
+        ctx = self._trusted_access_context
+        principal = str(getattr(ctx, "trusted_agent_id", "") or "").strip() if ctx is not None else ""
+        if not principal:
+            return "", "active_binding_required"
+        try:
+            from .agent_binding import AgentBindingStore
+
+            bindings = AgentBindingStore(self._workspace).find_by_agent(
+                principal, include_inactive=False,
+            )
+        except Exception as exc:
+            return "", "trusted_context_unavailable"
+        if len(bindings) != 1:
+            return "", "active_binding_required"
+        return str(bindings[0].share_group_id or ""), ""
+
+    def _dispatch_source_read(self, method: str, args: list | None = None) -> dict:
+        group_id, scope_error = self._source_scope()
+        if scope_error:
+            return {"ok": False, "error": scope_error, "code": scope_error}
+        try:
+            result = self._cutover().dispatch_gui(method, args or [], mutation=False)
+            result = self._unwrap_legacy(result)
+            return _redact_gui_source_result(method, result, group_id)
+        except Exception as exc:
+            return _safe_gui_error(exc, code="gui_source_read_failed")
+
+    @staticmethod
+    def _unwrap_legacy(result: dict) -> dict:
+        # Preserve the pre-Phase-6 GUI return envelope for V1/building calls.
+        if result.get("path") == "legacy" and "legacy" in result:
+            value = result.get("legacy")
+            value = value if isinstance(value, dict) else {"data": value}
+        else:
+            value = result
+        if isinstance(value, Mapping) and (value.get("error") or value.get("code")):
+            from .compat_v2.legacy_adapter import sanitize_public_payload
+
+            return sanitize_public_payload(dict(value))
+        return value
 
     def _set_window(self, window) -> None:
-        self._inner._set_window(window)
+        # pywebview setup must not force legacy construction on a V2 path.
+        self._window = window
+        if self._inner_instance is not None:
+            self._inner_instance._set_window(window)
 
     def call_readonly(self, method: str, args: list | None = None) -> dict:
         """调用只读方法。
@@ -8218,17 +8537,16 @@ class SafeBridgeApi:
         from .security import is_readonly_method
 
         if not is_readonly_method(method):
-            return {"error": f"not a readonly method: {method}"}
+            return {"error": "not a readonly method: <redacted>", "code": "not_readonly"}
 
-        fn = getattr(self._inner, method, None)
-        if not callable(fn):
-            return {"error": f"method not found: {method}"}
+        if method in _GUI_SOURCE_READS:
+            return self._dispatch_source_read(method, args)
 
         try:
-            result = fn(*(args or []))
-            return result if result is not None else {}
-        except Exception as e:
-            return {"error": str(e)}
+            result = self._cutover().dispatch_gui(method, args or [], mutation=False)
+            return _redact_gui_paths(self._unwrap_legacy(result), "")
+        except Exception as exc:
+            return _safe_gui_error(exc)
 
     def request_mutation(self, method: str, args: list | None = None) -> dict:
         """调用变更方法。
@@ -8236,44 +8554,26 @@ class SafeBridgeApi:
         沙箱模式下走请求队列；非沙箱 / 原生 GUI 直接执行模式下注入 confirmed=True 后执行。
         """
         from .security import is_mutation_method, detect_sandbox_mode
+        from .cutover_v2.surfaces import GUI_MUTATION_NAMES
 
-        if not is_mutation_method(method):
-            return {"error": f"not a mutation method: {method}"}
+        if not (is_mutation_method(method) or method in GUI_MUTATION_NAMES):
+            return {"error": "not a mutation method: <redacted>", "code": "not_mutation"}
 
-        # 沙箱模式：走请求队列，返回 deferred 标记。原生桌面窗口同样遵守真实沙箱状态。
-        if detect_sandbox_mode() and not self._direct_mutations:
-            result = self._inner.submit_request(method, args or [])
-            return {
-                "ok": True,
-                "deferred": True,
-                "request": result.get("request", result),
-                "message": "请求已提交，等待桌面执行器确认",
-            }
-
-        # 非沙箱：注入 confirmed=True 后直接执行
-        fn = getattr(self._inner, method, None)
-        if not callable(fn):
-            return {"error": f"method not found: {method}"}
-
+        # Queueing is selected only after the adapter's manifest gate.  The
+        # legacy port consumes this flag; V2 calls never construct that port.
+        self._defer_mutations = bool(detect_sandbox_mode() and not self._direct_mutations)
         try:
-            import inspect
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.keys())
-            call_args = list(args or [])
-            if "confirmed" in params:
-                cidx = params.index("confirmed")
-                while len(call_args) <= cidx:
-                    call_args.append(sig.parameters[params[len(call_args)]].default)
-                call_args[cidx] = True
-            # Authorization is derived by target API from AccessContext/capability.
-            result = fn(*call_args)
-            return result if result is not None else {}
-        except Exception as e:
-            return {"error": str(e)}
+            result = self._cutover().dispatch_gui(method, args or [], mutation=True)
+            return self._unwrap_legacy(result)
+        except Exception as exc:
+            return _safe_gui_error(exc)
+        finally:
+            self._defer_mutations = False
 
     def get_api_method_registry(self) -> dict:
         """返回 API 方法注册表，供前端动态加载。"""
-        return self._inner.get_api_method_registry()
+        from .security import get_api_method_registry
+        return get_api_method_registry()
 
     def get_sandbox_status(self) -> dict:
         """返回沙箱状态。原生 GUI 直接执行时对外报告非沙箱。"""
@@ -8286,7 +8586,23 @@ class SafeBridgeApi:
 
     def pick_path(self, for_files: bool = False) -> dict:
         """系统目录/文件选择器。"""
-        return self._inner.pick_path(for_files)
+        # Treat the chooser as a read-only GUI capability so V2/unknown
+        # calls still cross the manifest gate and do not construct the legacy
+        # GovernanceApi merely because HTTP/pywebview invoked this method.
+        try:
+            result = self._cutover().dispatch_gui(
+                "pick_path", [bool(for_files)], mutation=False,
+            )
+            if result.get("path") == "v2":
+                data = result.get("data") if isinstance(result.get("data"), Mapping) else {}
+                if data.get("host_action") == "pick_path":
+                    # Execute only the local chooser body, without constructing
+                    # GovernanceApi or any legacy data store. The native port
+                    # has already performed the manifest/context gate.
+                    return GovernanceApi.pick_path(self, bool(for_files))
+            return _redact_gui_paths(self._unwrap_legacy(result), "")
+        except Exception as exc:
+            return _safe_gui_error(exc, code="gui_path_picker_failed")
 
 
 def open_interactive_window(workspace: str, title: str = "MemoryGuard 治理面板") -> int:

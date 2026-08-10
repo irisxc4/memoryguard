@@ -12,12 +12,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import inspect
 import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from . import __version__ as PACKAGE_VERSION
 from .cli import run_audit, _load_report
 from .report import render_html_report
 from .schema import Report
@@ -25,12 +28,25 @@ from .history_api import TOOL_DEFINITIONS as HISTORY_TOOL_DEFINITIONS
 from .history_api import handle_history_tool
 from .knowledge_mcp import KNOWLEDGE_TOOL_DEFINITIONS
 from .knowledge_mcp import handle_knowledge_tool
+from .compat_v2.legacy_adapter import (
+    safe_error_code,
+    safe_exception_diagnostic,
+    sanitize_public_payload,
+)
 
 
 # 写操作工具列表：执行前做本地参数预检，避免无效请求写入状态。
 # 注：memoryguard_extract_memories 现为只读 preview（§8.5 两步流程步骤 1）。
 #     memoryguard_accept_candidates 写入共享记忆（§8.5 步骤 2）。
 _MUTATING_TOOLS = {
+    # Current handlers persist report/extraction/snapshot/projection state;
+    # keep the canonical transport gate conservative until pure services
+    # replace those side effects.
+    "memoryguard_audit",
+    "memoryguard_list_sources",
+    "memoryguard_scan_summary",
+    "memoryguard_extract_memories",
+    "memoryguard_build_and_enrich",
     "memoryguard_memory_write",
     "memoryguard_memory_update",
     "memoryguard_memory_delete",
@@ -54,6 +70,15 @@ _MUTATING_TOOLS = {
 # not be treated as governance mutations by the write-degraded gate.
 _DB_WRITING_TOOLS = _MUTATING_TOOLS | {
     "memoryguard_context_bootstrap",
+}
+
+# Canonical-rule readiness protects memory/rule mutations.  Host integration
+# repair and binding administration must remain available while canonical rule
+# projection is degraded; otherwise a stale provider config can deadlock its
+# own repair path.
+_CANONICAL_GATED_TOOLS = _MUTATING_TOOLS - {
+    "memoryguard_provider_install",
+    "memoryguard_binding_create",
 }
 
 
@@ -104,7 +129,7 @@ _LOCK_PROBE_TIMEOUT = 0.3
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memoryguard"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = PACKAGE_VERSION
 
 TOOLS = [
     {
@@ -798,8 +823,56 @@ TOOLS.extend(KNOWLEDGE_TOOL_DEFINITIONS)
 # ---------------------------------------------------------------------------
 
 
-def _mcp_error(message: str) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": f"error: {message}"}], "isError": True}
+def _mcp_error(message: str, *, code: str = "") -> dict[str, Any]:
+    """Return a compact MCP error without reflecting caller/exception text."""
+    raw = str(message or "").strip()
+    lower = raw.casefold()
+    risky = any(token in lower for token in (
+        "password", "secret", "token", "api_key", "sqlite", "select ",
+        "insert ", "update ", "delete ", "drop ", "traceback", "\\", "/",
+    )) or len(raw) > 240
+    # Keep established human-readable validation text when it contains no
+    # path/SQL/secret material; arbitrary exception/path text becomes a stable
+    # code instead.
+    safe_text = raw if raw and not risky and all(ord(ch) < 128 for ch in raw) else ""
+    stable = safe_error_code(code or raw.replace(" ", "_"), "request_failed")
+    return {
+        "content": [{"type": "text", "text": f"error: {safe_text or stable}"}],
+        "isError": True,
+        "code": stable,
+    }
+
+
+def _mcp_json_error(
+    payload: dict[str, Any],
+    *,
+    include_legacy_fields: bool = False,
+) -> dict[str, Any]:
+    """Return a spec-shaped CallToolResult for machine-readable failures.
+
+    MCP CallToolResult only guarantees ``content`` and ``isError`` at the
+    top level.  Legacy scalar fields are opt-in for the runtime split-brain
+    compatibility seam; ordinary degraded/V2 errors stay protocol-shaped.
+    """
+    safe_payload = sanitize_public_payload(dict(payload), error_code="request_failed")
+    result: dict[str, Any] = {
+        "content": [{
+            "type": "text",
+            "text": json.dumps(safe_payload, ensure_ascii=False, indent=2),
+        }],
+        "isError": True,
+    }
+    if include_legacy_fields:
+        # Runtime-lease hosts historically read these fields directly from
+        # the tool result; preserve that split-brain compatibility contract
+        # without widening ordinary CallToolResult envelopes.
+        for key in (
+            "ok", "error", "code", "restart_required", "conflicting",
+            "message", "state", "detail", "reason", "path", "status",
+        ):
+            if key in safe_payload:
+                result[key] = safe_payload[key]
+    return result
 
 
 def _preflight_mutating_tool(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
@@ -970,16 +1043,330 @@ def _resolve_workspace(args: dict[str, Any]) -> Path:
     return Path(explicit or configured or ".").expanduser().resolve()
 
 
+_LEGACY_GLOBAL_REDIRECT_CACHE: dict[tuple[str, str, str], tuple[str, str, str] | None] = {}
+
+
+def _legacy_global_redirect(
+    configured_workspace: Path,
+    legacy_agent_id: str,
+) -> tuple[Path, str, str] | None:
+    """Resolve a pre-scope global config only when migration evidence proves it.
+
+    Older global provider configs pinned ``MEMORYGUARD_WORKSPACE`` to a source
+    checkout and carried the checkout-specific AgentInstance id.  We must not
+    reinterpret every old project-scoped integration as global.  Redirect only
+    when all of these are true:
+
+    * the legacy agent has exactly one active binding in the configured control
+      workspace;
+    * the user data home contains exactly one group with durable
+      ``migrated-from:<legacy-group>`` provenance;
+    * AgentLocator identifies the legacy and current instances as the same
+      provider/product; and
+    * the current instance is actively bound to that migrated target group.
+    """
+    from .data_home import resolve_data_home
+
+    data_home = resolve_data_home()
+    configured_workspace = configured_workspace.expanduser().resolve()
+    if configured_workspace == data_home or not legacy_agent_id:
+        return None
+    key = (str(configured_workspace), legacy_agent_id, str(data_home))
+    if key in _LEGACY_GLOBAL_REDIRECT_CACHE:
+        cached = _LEGACY_GLOBAL_REDIRECT_CACHE[key]
+        if cached is None:
+            return None
+        return Path(cached[0]), cached[1], cached[2]
+    try:
+        from .agent_binding import AgentBindingStore
+        from .agent_locator import AgentLocator
+        from .provider_adapters import get_provider_adapter_class
+        from .shared_memory_store import SharedMemoryStore
+
+        legacy_bindings = AgentBindingStore(configured_workspace).find_by_agent(
+            legacy_agent_id, include_inactive=False,
+        )
+        if len(legacy_bindings) != 1:
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+        legacy_group = legacy_bindings[0].share_group_id
+        marker = f"migrated-from:{legacy_group}"
+
+        target_groups: list[str] = []
+        group_root = data_home / ".memoryguard" / "shared-memory"
+        if group_root.is_dir():
+            for db_path in sorted(group_root.glob("*/memory.db")):
+                group_id = db_path.parent.name
+                try:
+                    records = SharedMemoryStore(
+                        data_home, group_id, read_only=True, must_exist=True,
+                    ).list_records()
+                except Exception:  # noqa: BLE001 - skip unreadable candidates
+                    continue
+                if any(
+                    any(
+                        str(getattr(prov, "source_object_id", "") or "") == marker
+                        for prov in (getattr(record, "provenance", None) or [])
+                    )
+                    for record in records
+                ):
+                    target_groups.append(group_id)
+        if len(target_groups) != 1:
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+        target_group = target_groups[0]
+
+        legacy_instances, _ = AgentLocator(configured_workspace).detect_instances()
+        legacy_matches = [
+            item for item in legacy_instances
+            if item.instance_id == legacy_agent_id
+        ]
+        if len(legacy_matches) != 1:
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+        product = legacy_matches[0].product
+        adapter_cls = get_provider_adapter_class(product)
+        if adapter_cls is None:
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+
+        current_instances, _ = AgentLocator(data_home).detect_instances()
+        current_matches = [
+            item for item in current_instances
+            if get_provider_adapter_class(item.product) is adapter_cls
+        ]
+        if len(current_matches) != 1:
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+        current_agent_id = current_matches[0].instance_id
+        current_bindings = AgentBindingStore(data_home).find_by_agent(
+            current_agent_id, include_inactive=False,
+        )
+        if (
+            len(current_bindings) != 1
+            or current_bindings[0].share_group_id != target_group
+        ):
+            _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+            return None
+
+        provider = adapter_cls.provider_name
+        resolved = (str(data_home), current_agent_id, provider)
+        _LEGACY_GLOBAL_REDIRECT_CACHE[key] = resolved
+        return data_home, current_agent_id, provider
+    except Exception:  # noqa: BLE001 - compatibility redirect must fail closed
+        _LEGACY_GLOBAL_REDIRECT_CACHE[key] = None
+        return None
+
+
 def _resolve_memory_workspace(args: dict[str, Any]) -> Path:
-    """共享记忆始终服从安装身份，防止对话参数把存储切到当前项目。"""
+    """Resolve the trusted shared-memory control plane.
+
+    Global provider installs are permanently anchored to the per-user data
+    home.  Their MCP config carries ``MEMORYGUARD_CONTROL_SCOPE=global`` so a
+    stale ``MEMORYGUARD_WORKSPACE`` left by an older installer can never pull
+    the runtime back into a source checkout after an upgrade.  Project-scoped
+    installs keep honoring their explicit workspace.  Pre-scope global configs
+    are migrated only through :func:`_legacy_global_redirect` evidence.
+    """
+    from .access_context import (
+        clear_runtime_connection_override,
+        set_runtime_connection_override,
+    )
+
+    control_scope = os.environ.get("MEMORYGUARD_CONTROL_SCOPE", "").strip().lower()
+    if control_scope == "global":
+        from .data_home import resolve_data_home
+
+        clear_runtime_connection_override()
+        return resolve_data_home()
     configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
     if configured:
-        return Path(configured).expanduser().resolve()
-    return _resolve_workspace(args)
+        configured_path = Path(configured).expanduser().resolve()
+        if not control_scope:
+            legacy_agent_id = os.environ.get("MEMORYGUARD_AGENT_ID", "").strip()
+            redirect = _legacy_global_redirect(configured_path, legacy_agent_id)
+            if redirect is not None:
+                data_home, current_agent_id, provider = redirect
+                # Normalize the trusted connection inside MemoryGuard without
+                # mutating the host-owned environment envelope.
+                set_runtime_connection_override(
+                    agent_instance_id=current_agent_id,
+                    provider=provider,
+                )
+                return data_home
+        clear_runtime_connection_override()
+        return configured_path
+
+    candidate = _resolve_workspace(args)
+    if not control_scope:
+        legacy_agent_id = os.environ.get("MEMORYGUARD_AGENT_ID", "").strip()
+        redirect = _legacy_global_redirect(candidate, legacy_agent_id)
+        if redirect is not None:
+            data_home, current_agent_id, provider = redirect
+            set_runtime_connection_override(
+                agent_instance_id=current_agent_id,
+                provider=provider,
+            )
+            return data_home
+    clear_runtime_connection_override()
+    return candidate
+
+
+def _attempt_governance_auto_recovery(
+    workspace: Path,
+    share_group_id: str,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Try one deterministic-safe reconciliation before rejecting a write.
+
+    Upgrade/migration can leave committed lifecycle outbox rows or an
+    unactivated canonical generation behind.  Those states are recoverable by
+    the existing reconciliation saga.  The saga itself refuses semantic merges
+    when a trusted bundle plan is required, so this automatic path never guesses
+    rule meaning: it either reaches canonical-ready deterministically or leaves
+    the write fail-closed with a precise diagnostic.
+    """
+    if not share_group_id:
+        return {"attempted": False, "reason": "missing_share_group_id"}
+    lock = state.get("lock") if isinstance(state.get("lock"), dict) else {}
+    if lock.get("acquirable") is False:
+        return {"attempted": False, "reason": "governance_lock_unavailable"}
+    canonical = state.get("canonical")
+    if not isinstance(canonical, dict):
+        return {"attempted": False, "reason": "canonical_state_unavailable"}
+    if canonical.get("error"):
+        return {
+            "attempted": False,
+            "reason": "canonical_state_error",
+            "error": str(canonical.get("error") or ""),
+        }
+    if int(canonical.get("reconciliation_in_flight", 0) or 0) > 0:
+        return {"attempted": False, "reason": "reconciliation_in_flight"}
+    if not _group_store_exists(workspace, share_group_id):
+        return {"attempted": False, "reason": "group_store_not_initialized"}
+
+    try:
+        from .runtime_lease import check_runtime_lease
+
+        lease = check_runtime_lease(workspace, pid=os.getpid())
+        if not lease.get("granted"):
+            return {
+                "attempted": False,
+                "reason": "runtime_split_brain",
+                "restart_required": True,
+            }
+        from .rule_merge_store import RuleMergeStore
+        from .rule_reconciliation import RuleReconciliationService
+
+        job = RuleReconciliationService(
+            RuleMergeStore(workspace), workspace=workspace,
+        ).run(
+            share_group_id,
+            model_mode="heuristic",
+            reason="automatic_write_gate_recovery",
+        )
+        after = _governance_diagnostics_state(workspace, share_group_id)
+        return {
+            "attempted": True,
+            "recovered": not governance_write_degraded(after),
+            "job_status": str((job or {}).get("status", "") or ""),
+            "job_phase": str((job or {}).get("phase", "") or ""),
+            "after": after,
+        }
+    except Exception as exc:  # noqa: BLE001 - recovery failure must stay fail-closed
+        return {
+            "attempted": True,
+            "recovered": False,
+            "reason": "reconciliation_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _attempt_startup_governance_recovery(workspace: Path) -> dict[str, Any]:
+    """Repair deterministic governance drift before the first MCP request.
+
+    A package upgrade or control-plane migration can leave the canonical
+    projection one generation behind even when the host only performs reads
+    after restart.  Waiting for the first mutation to discover that backlog
+    makes the integration look half-broken.  Startup therefore runs the same
+    deterministic-safe recovery used by the write gate.  Ambiguous/model-
+    required states remain fail-closed and the server still starts so the four
+    read-only diagnostics stay available.
+    """
+    args: dict[str, Any] = {}
+    share_group_id, err = _diag_share_group_id(args, workspace)
+    if err or not share_group_id:
+        return {
+            "attempted": False,
+            "recovered": False,
+            "reason": err or "missing_share_group_id",
+        }
+    state = _governance_diagnostics_state(workspace, share_group_id)
+    if governance_global_read_degraded(state):
+        return {
+            "attempted": False,
+            "recovered": False,
+            "reason": "governance_lock_unavailable",
+            "before": state,
+        }
+    if not governance_write_degraded(state):
+        return {
+            "attempted": False,
+            "recovered": True,
+            "reason": "not_needed",
+            "before": state,
+        }
+    result = _attempt_governance_auto_recovery(
+        workspace, share_group_id, state,
+    )
+    result.setdefault("share_group_id", share_group_id)
+    result.setdefault("before", state)
+    return result
+
+
+def _governance_degraded_error(
+    share_group_id: str,
+    state: dict[str, Any],
+    *,
+    recovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    canonical = state.get("canonical") if isinstance(state.get("canonical"), dict) else {}
+    payload: dict[str, Any] = {
+        "ok": False,
+        "error": "governance_degraded",
+        "degraded": True,
+        "share_group_id": share_group_id,
+        "lock": state.get("lock", {}),
+        "failures": canonical.get("failures", []),
+        "outbox_pending": int(canonical.get("outbox_pending", 0) or 0),
+        "projection_lag": int(canonical.get("projection_lag", 0) or 0),
+        "projection_error": str(canonical.get("projection_error", "") or ""),
+        "read_path": str(canonical.get("read_path", "") or ""),
+    }
+    if canonical.get("error"):
+        payload["canonical_error"] = str(canonical.get("error") or "")
+    if recovery is not None:
+        payload["recovery"] = recovery
+    return _mcp_json_error(payload)
 
 
 def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """执行工具，返回 MCP tool result。"""
+    # Read activation manifest once before any legacy governance/store path.
+    # V2 states return from this seam and never instantiate legacy stores.
+    try:
+        v2_workspace = _resolve_memory_workspace(args)
+        v2_result = _v2_cutover_dispatch(name, args, v2_workspace)
+    except Exception as exc:
+        diagnostic = safe_exception_diagnostic(exc, code="v2_manifest_state_unavailable")
+        return _mcp_json_error({
+            "ok": False,
+            "error": "v2_manifest_state_unavailable",
+            "code": "v2_manifest_state_unavailable",
+            "diagnostic": diagnostic,
+        })
+    if v2_result is not None:
+        return v2_result
     workspace = (
         _resolve_memory_workspace(args)
         if (
@@ -987,27 +1374,48 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             or name.startswith("memoryguard_history_")
             or name == "memoryguard_context_bootstrap"
             or name == "memoryguard_rule_feedback"
+            or name == "memoryguard_provider_install"
+            or name == "memoryguard_resolve_group"
+            or name == "memoryguard_neuron_graph"
+            or name in _DEGRADED_WHITELIST
+            or name.startswith("memoryguard_binding_")
             or name.startswith("memoryguard_rule_")
         )
         else _resolve_workspace(args)
     )
 
     # Req9: split governance-degraded gates.  Only a broken workspace lock
-    # blocks ordinary reads.  Mutations additionally fail closed on canonical
-    # read errors, outbox backlog and projection errors.  The four diagnostics
-    # remain whitelisted so the operator can always see why the gate tripped.
+    # blocks ordinary reads.  Canonical-dependent mutations first get one
+    # deterministic-safe reconciliation attempt, then fail closed with a valid
+    # MCP CallToolResult if the state still is not writable.  Provider/binding
+    # repair remains available so stale integrations cannot deadlock themselves.
     if name not in _DEGRADED_WHITELIST:
         _diag_group, _diag_err = _diag_share_group_id(args, workspace)
         _diag_state = _governance_diagnostics_state(
             workspace, _diag_group,
         )
         if governance_global_read_degraded(_diag_state):
-            return {"ok": False, "error": "governance_degraded", "degraded": True}
+            return _governance_degraded_error(_diag_group, _diag_state)
         if (
-            name in _MUTATING_TOOLS
+            name in _CANONICAL_GATED_TOOLS
             and governance_write_degraded(_diag_state)
         ):
-            return {"ok": False, "error": "governance_degraded", "degraded": True}
+            recovery = None
+            if not _diag_err:
+                recovery = _attempt_governance_auto_recovery(
+                    workspace, _diag_group, _diag_state,
+                )
+                if recovery.get("recovered"):
+                    _diag_state = recovery.get("after", _diag_state)
+                else:
+                    return _governance_degraded_error(
+                        _diag_group, _diag_state, recovery=recovery,
+                    )
+            else:
+                return _governance_degraded_error(
+                    _diag_group, _diag_state,
+                    recovery={"attempted": False, "reason": _diag_err},
+                )
 
     # Req9 read-only diagnostics dispatch (whitelisted, always allowed).
     if name == "memoryguard_canonical_status":
@@ -1081,19 +1489,23 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     # --- v3 只读工具 ---
 
     if name == "memoryguard_list_sources":
+        share_group_id, scope_error = _legacy_source_scope_or_error(args, workspace)
+        if scope_error is not None:
+            return scope_error
         api = _get_governance_api(workspace)
-        result = api.list_sources()
-        text = f"Sources: {result['total']}\n"
-        for s in result["sources"]:
-            text += f"  - {s['root_id']}  {s['type']}  {s['display_name']}  scope={s['scope']}\n"
-            text += f"      path: {s['path']}\n"
+        result = _redacted_legacy_sources(api.list_sources(), share_group_id or "")
+        text = json.dumps(result, ensure_ascii=False, sort_keys=True)
         return {"content": [{"type": "text", "text": text}]}
 
     if name == "memoryguard_scan_summary":
+        share_group_id, scope_error = _legacy_source_scope_or_error(args, workspace)
+        if scope_error is not None:
+            return scope_error
         api = _get_governance_api(workspace)
         result = api.scan_sources()
         cov = result["coverage"]
         text = (
+            f"Scope: {_stable_source_ref(share_group_id or '', 'scan')}\n"
             f"Snapshot: {result['snapshot_id']}\n"
             f"  created_at: {result['created_at']}\n"
             f"  source_objects: {result['source_object_count']}\n"
@@ -1596,7 +2008,12 @@ def _resolve_access(
     return (group_id, None, ctx)
 
 
-def _effective_agent_context(args: dict[str, Any], group_id: str):
+def _effective_agent_context(
+    args: dict[str, Any],
+    group_id: str,
+    *,
+    access_context: Any = None,
+):
     """Build scope only from trusted connection/runtime environment.
 
     Clients cannot claim a provider or a sub-agent role in a tool call.  Hosts
@@ -1605,12 +2022,13 @@ def _effective_agent_context(args: dict[str, Any], group_id: str):
     """
     from .schema_v3 import EffectiveAgentContext
     from .rule_scope import canonical_project_ref
-    from .access_context import load_access_context
-    access_context = load_access_context()
+    from .access_context import effective_provider, load_access_context
+    if access_context is None:
+        access_context = load_access_context()
     return EffectiveAgentContext(
         agent_instance_id=str(args.get("agent_instance_id", "") or ""),
         share_group_id=group_id,
-        provider=os.environ.get("MEMORYGUARD_PROVIDER", "").strip().lower(),
+        provider=effective_provider().strip().lower(),
         project_ref=canonical_project_ref(
             os.environ.get("MEMORYGUARD_PROJECT_CWD") or os.getcwd()
         ),
@@ -1772,6 +2190,87 @@ def _handle_memory_search(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
+def _sync_after_memory_mutation(
+    workspace: Path,
+    group_id: str,
+) -> dict[str, Any]:
+    """Drain rule lifecycle outbox and refresh the shared projection.
+
+    A successful memory mutation must not leave the next mutation blocked by
+    its own committed lifecycle event.  Ordinary memories no longer emit rule
+    lifecycle events, but every mutation still refreshes the projection so the
+    canonical source-set check tracks the live shared-memory graph.
+    """
+    if not _rule_intelligence_db_exists(workspace):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "rule_intelligence_store_not_initialized",
+        }
+    try:
+        from .rule_merge import RuleMergeService
+        from .rule_merge_store import RuleMergeStore
+        from .rule_reconciliation import RuleReconciliationService
+
+        store = RuleMergeStore(workspace)
+        outbox = RuleMergeService(store).consume_outbox(
+            workspace, only_group=group_id,
+        )
+        recon = RuleReconciliationService(
+            store, workspace=workspace,
+        )
+        recon._build_projection(group_id)
+        latest = recon.jobs.latest_job(group_id)
+        # Refreshing the all-memory graph changes the projection file even when
+        # the canonical mandatory-rule inputs did not change.  Keep a ready
+        # generation's projection receipt in sync only when its source digest
+        # is still identical; a real mandatory-rule mutation must still force
+        # a new reconciliation generation.
+        if (
+            latest is not None
+            and latest.get("status") == "canonical_ready"
+            and str(latest.get("source_digest") or "")
+            == recon.source_digest(group_id)
+        ):
+            recon.jobs.transition(
+                latest["job_id"],
+                projection_version=recon._projection_version(group_id),
+            )
+        state = _governance_diagnostics_state(workspace, group_id)
+        return {
+            "ok": True,
+            "outbox": outbox,
+            "write_degraded": governance_write_degraded(state),
+            "canonical_ready": bool(
+                (state.get("canonical") or {}).get("canonical_ready", False)
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - mutation already committed
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _mutation_sync_error(
+    *,
+    operation: str,
+    group_id: str,
+    result: dict[str, Any],
+    sync: dict[str, Any],
+) -> dict[str, Any]:
+    """Report post-commit projection failure without inviting blind retries."""
+    return _mcp_json_error({
+        "ok": False,
+        "error": "post_commit_governance_sync_failed",
+        "mutation_committed": True,
+        "operation": operation,
+        "share_group_id": group_id,
+        "memory_id": str(result.get("memory_id", "") or ""),
+        "sync": sync,
+    })
+
+
 def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
     """P0-A/D: 身份校验 + secret 脱敏。"""
     from .governance_engine import GovernanceEngine
@@ -1849,6 +2348,13 @@ def _handle_memory_write(args: dict[str, Any]) -> dict[str, Any]:
         ).list_rule_assignments(memory_id)
         result["assignments"] = [item.to_dict() for item in assignments]
     result["record"] = result.get("after")
+    sync = _sync_after_memory_mutation(workspace, group_id)
+    if not sync.get("ok"):
+        return _mutation_sync_error(
+            operation="memory_write", group_id=group_id,
+            result=result, sync=sync,
+        )
+    result["governance_sync"] = sync
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
@@ -1969,11 +2475,19 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
         except ValueError as exc:
             return _mcp_error(str(exc))
         payload = {
-            "ok": True, "record": updated_record.to_dict(),
+            "ok": True, "memory_id": memory_id,
+            "record": updated_record.to_dict(),
             "assignments": [
                 item.to_dict() for item in updated_assignments
             ],
         }
+        sync = _sync_after_memory_mutation(workspace, group_id)
+        if not sync.get("ok"):
+            return _mutation_sync_error(
+                operation="memory_update_policy", group_id=group_id,
+                result=payload, sync=sync,
+            )
+        payload["governance_sync"] = sync
         return {"content": [{"type": "text", "text": json.dumps(
             payload, ensure_ascii=False, indent=2,
         )}]}
@@ -1995,6 +2509,13 @@ def _handle_memory_update(args: dict[str, Any]) -> dict[str, Any]:
     if not result["ok"]:
         return _mcp_error(result["blocked_reason"])
     result["record"] = result.get("after")
+    sync = _sync_after_memory_mutation(workspace, group_id)
+    if not sync.get("ok"):
+        return _mutation_sync_error(
+            operation="memory_update", group_id=group_id,
+            result=result, sync=sync,
+        )
+    result["governance_sync"] = sync
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
@@ -2019,6 +2540,13 @@ def _handle_memory_delete(args: dict[str, Any]) -> dict[str, Any]:
     )
     if not result["ok"]:
         return _mcp_error(result["blocked_reason"])
+    sync = _sync_after_memory_mutation(workspace, group_id)
+    if not sync.get("ok"):
+        return _mutation_sync_error(
+            operation="memory_delete", group_id=group_id,
+            result=result, sync=sync,
+        )
+    result["governance_sync"] = sync
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
@@ -2806,6 +3334,405 @@ def _handle_runtime_processes(args: dict[str, Any]) -> dict[str, Any]:
 _api_cache: dict[str, Any] = {}
 
 
+def _stable_source_ref(share_group_id: str, root_id: str) -> str:
+    """Return a non-path source reference stable within one bound scope."""
+    digest = hashlib.sha256(
+        f"{share_group_id}\x00{root_id}".encode("utf-8", "replace"),
+    ).hexdigest()[:20]
+    return f"source:{digest}"
+
+
+def _legacy_source_scope_or_error(args: dict[str, Any], workspace: Path) -> tuple[str | None, dict[str, Any] | None]:
+    """Require a trusted binding before legacy source introspection.
+
+    V1/V2_BUILDING still use the legacy source registry, whose records contain
+    absolute paths.  A missing/ambiguous binding therefore rejects the request
+    rather than allowing an anonymous path oracle.
+    """
+    try:
+        group_id, error, access = _resolve_access(dict(args), workspace)
+    except Exception:
+        return None, _mcp_json_error({
+            "ok": False,
+            "error": "trusted_context_unavailable",
+            "code": "trusted_context_unavailable",
+        })
+    if error or not group_id:
+        code = safe_error_code(error, "trusted_context_required")
+        return None, _mcp_json_error({"ok": False, "error": code, "code": code})
+    return str(group_id), None
+
+
+def _redacted_legacy_sources(result: Mapping[str, Any], share_group_id: str) -> dict[str, Any]:
+    """Drop path-bearing source fields and expose stable refs only."""
+    sources = result.get("sources") if isinstance(result, Mapping) else None
+    safe: list[dict[str, Any]] = []
+    if isinstance(sources, list):
+        for item in sources:
+            if not isinstance(item, Mapping):
+                continue
+            root_id = str(item.get("root_id", "") or "").strip()
+            safe_root_id = (
+                root_id
+                if root_id and not root_id.startswith(("/", "\\"))
+                and not (len(root_id) > 2 and root_id[1] == ":")
+                else ("REDACTED" if root_id else "NO_SOURCE")
+            )
+            safe.append({
+                "source_ref": _stable_source_ref(share_group_id, root_id) if root_id else "NO_SOURCE",
+                "root_id": safe_root_id,
+                "type": str(item.get("type", "") or ""),
+                "scope": str(item.get("scope", "") or ""),
+            })
+    return {"total": len(safe), "sources": safe}
+
+
+# ---------------------------------------------------------------------------
+# Phase6 V2 cutover seam
+# ---------------------------------------------------------------------------
+
+_V2_STATES = frozenset({"V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"})
+_V2_READ_STATES = frozenset({"V2_READY", "V2_ACTIVE"})
+_V2_FACADE_MISSING = object()
+_v2_runtime_facade_factory: Any = None
+
+# Identity is carried by the trusted AccessContext supplied separately to the
+# V2 port.  Keeping these client-controlled aliases in the request payload
+# would let a V2 implementation accidentally prefer a spoofed value over the
+# context.  ``workspace`` is included because it selects the control plane,
+# not a business argument; the facade is already bound to the resolved path.
+_V2_PAYLOAD_IDENTITY_KEYS = frozenset({
+    "agent_instance_id", "share_group_id", "workspace", "provider",
+    "project_ref", "runtime_role", "runtime_agent_id", "parent_agent_id",
+    "session_id", "context_hash", "session_source", "session_trusted",
+    "context", "access_context", "trusted_context",
+})
+
+
+def _load_v2_runtime_facade(workspace: Path) -> Any:
+    """Load the optional Phase6 facade without importing legacy stores.
+
+    Phase6-A lands independently of this compatibility module.  A missing
+    package therefore means the old path remains in force; once the package is
+    present, constructor/status failures are *not* treated as legacy fallback.
+    """
+    factory = globals().get("_v2_runtime_facade_factory")
+    if factory is None:
+        factory = globals().get("V2RuntimeFacade")
+    if callable(factory):
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("v2_runtime_factory_signature_unavailable") from exc
+        try:
+            signature.bind(workspace)
+        except TypeError:
+            try:
+                signature.bind(workspace=workspace)
+            except TypeError as exc:
+                raise RuntimeError("v2_runtime_factory_signature_unavailable") from exc
+            return factory(workspace=workspace)
+        return factory(workspace)
+    try:
+        from .cutover_v2.facade import V2RuntimeFacade
+    except ModuleNotFoundError as exc:
+        missing = str(getattr(exc, "name", "") or "")
+        if missing.startswith("memoryguard.cutover_v2"):
+            return _V2_FACADE_MISSING
+        raise
+    from .system.manifest import ManifestManager
+    manifest = ManifestManager(workspace)
+    try:
+        signature = inspect.signature(V2RuntimeFacade)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("v2_runtime_constructor_signature_unavailable") from exc
+    kwargs = {"manifest": manifest, "workspace": str(workspace)}
+    try:
+        signature.bind(**kwargs)
+    except TypeError:
+        try:
+            signature.bind(workspace=workspace)
+        except TypeError as exc:
+            raise RuntimeError("v2_runtime_constructor_signature_unavailable") from exc
+        return V2RuntimeFacade(workspace=workspace)
+    return V2RuntimeFacade(**kwargs)
+
+
+def _v2_state_from_value(value: Any) -> str:
+    # Normalize injected snapshots through the guarded factory.  Do not
+    # accept a hand-constructed RuntimeSnapshot or a mapping that advertises
+    # an invalid generation/availability marker.
+    try:
+        from .cutover_v2.state import CutoverState, RuntimeSnapshot
+        if isinstance(value, RuntimeSnapshot):
+            if not value.trusted or not value.available:
+                return "UNKNOWN"
+            return value.state.value if value.generation >= 0 else "UNKNOWN"
+        if isinstance(value, CutoverState):
+            return "UNKNOWN"
+        if isinstance(value, dict) and any(key in value for key in ("state", "manifest_state", "status", "marker")):
+            snapshot = RuntimeSnapshot.from_value(value)
+            if snapshot.available:
+                return snapshot.state.value
+            return "UNKNOWN"
+        if hasattr(value, "state"):
+            snapshot = RuntimeSnapshot.from_value(value)
+            if snapshot.available:
+                return snapshot.state.value
+            return "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and enum_value is not value:
+        value = enum_value
+    # RuntimeSnapshot/CutoverState are the trusted object forms returned by
+    # the Phase6 facade.  Normalize their state field before string fallback.
+    object_state = getattr(value, "state", None)
+    if object_state is not None and object_state is not value:
+        return _v2_state_from_value(object_state)
+    if isinstance(value, dict):
+        for key in ("state", "manifest_state", "status", "marker"):
+            if key in value:
+                return _v2_state_from_value(value[key])
+        for key in ("manifest", "snapshot"):
+            if isinstance(value.get(key), dict):
+                return _v2_state_from_value(value[key])
+        return "UNKNOWN"
+    marker = str(value or "").strip().upper()
+    return marker if marker in _V2_STATES else "UNKNOWN"
+
+
+def _v2_facade_state(facade: Any, workspace: Path | str = "") -> tuple[str, Any]:
+    fn = getattr(facade, "state_snapshot", None)
+    if not callable(fn):
+        fn = getattr(facade, "status", None)
+    if not callable(fn):
+        return "UNKNOWN", None
+    try:
+        # The facade contract is zero-argument.  A legacy-compatible injected
+        # port may expose a workspace argument; inspect before calling so the
+        # manifest is still read exactly once.
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return "UNKNOWN", None
+        target = str(workspace or "")
+        try:
+            signature.bind()
+        except TypeError:
+            try:
+                signature.bind(target)
+            except TypeError:
+                try:
+                    signature.bind(workspace=target)
+                except TypeError:
+                    return "UNKNOWN", None
+                value = fn(workspace=target)
+            else:
+                value = fn(target)
+        else:
+            value = fn()
+    except Exception:
+        return "UNKNOWN", None
+    return _v2_state_from_value(value), value
+
+
+def _trusted_context_for_v2(args: dict[str, Any], workspace: Path) -> tuple[Any | None, str | None]:
+    """Build context from the active binding/environment, never payload claims."""
+    # Resolve on a copy: legacy public argument shape remains untouched while
+    # ``_resolve_access`` replaces a claimed agent with the binding identity.
+    trusted_args = dict(args)
+    try:
+        group_id, error, access_context = _resolve_access(trusted_args, workspace)
+    except Exception as exc:
+        return None, f"trusted_context_unavailable:{type(exc).__name__}"
+    if error or not group_id:
+        return None, error or "trusted_context_unavailable"
+    try:
+        context_builder = _effective_agent_context
+        try:
+            context_params = inspect.signature(context_builder).parameters
+        except (TypeError, ValueError):
+            context_params = {}
+        accepts_context_kw = "access_context" in context_params or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in context_params.values()
+        )
+        if accepts_context_kw:
+            context = context_builder(
+                trusted_args,
+                group_id,
+                access_context=access_context,
+            )
+        elif access_context is None:
+            # Compatibility-only injected fakes from the pre-capability test
+            # seam do not accept the new keyword.  A real resolver always
+            # returns AccessContext; if this plain fallback reaches a native
+            # mutation, NativeV2RuntimePort rejects it before writing.
+            context = context_builder(trusted_args, group_id)
+        else:
+            return None, "trusted_context_unavailable"
+        # The native port's mutation boundary requires a process-local
+        # capability.  Preserve the real AccessContext from _resolve_access
+        # rather than serializing EffectiveAgentContext into a forgeable dict.
+        from .runtime_v2.native_ports import bind_native_transport_context
+
+        if access_context is None:
+            to_dict = getattr(context, "to_dict", None)
+            if callable(to_dict):
+                plain = to_dict()
+            else:
+                try:
+                    plain = dict(vars(context))
+                except TypeError:
+                    plain = {}
+            return (dict(plain), None) if isinstance(plain, Mapping) else (None, "trusted_context_unavailable")
+        bound = bind_native_transport_context(
+            access_context,
+            workspace_id=str(workspace),
+            share_group_id=group_id,
+            project_ref=str(getattr(context, "project_ref", "") or ""),
+            provider=str(getattr(context, "provider", "") or ""),
+            runtime_role=str(getattr(context, "runtime_role", "") or ""),
+            runtime_agent_id=str(getattr(context, "runtime_agent_id", "") or ""),
+            parent_agent_id=str(getattr(context, "parent_agent_id", "") or ""),
+            context_hash=str(getattr(context, "context_hash", "") or ""),
+            entrypoint="mcp",
+        )
+        return bound, None
+    except Exception as exc:
+        return None, f"trusted_context_unavailable:{type(exc).__name__}"
+
+
+_V2_PROVIDER_TARGETS = frozenset({"claude", "codex", "cursor", "trae"})
+
+
+def _v2_port_args(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Return business args after removing client identity aliases.
+
+    ``provider`` is normally an identity alias and is stripped.  The provider
+    install tool is the exception: its schema uses provider as the explicit
+    business target, so retain only a canonical allow-listed value.
+    """
+    payload = {
+        key: value
+        for key, value in dict(args).items()
+        if key not in _V2_PAYLOAD_IDENTITY_KEYS
+    }
+    if name == "memoryguard_provider_install":
+        provider = str(args.get("provider", "")).strip().casefold()
+        if provider not in _V2_PROVIDER_TARGETS:
+            raise ValueError("invalid_provider")
+        payload["provider"] = provider
+    return payload
+
+
+def _v2_result_envelope(result: Any) -> dict[str, Any]:
+    """Keep the existing CallToolResult envelope for facade responses."""
+    if isinstance(result, dict) and "content" in result:
+        if result.get("isError"):
+            # Facade-provided error text is untrusted.  Preserve a structured
+            # code where available; do not forward arbitrary exception/path
+            # text through MCP content.
+            payload = dict(result)
+            code = safe_error_code(payload.get("code") or payload.get("error"), "v2_dispatch_failed")
+            payload["code"] = code
+            payload["error"] = code
+            payload["content"] = [{"type": "text", "text": f"error: {code}"}]
+            payload["isError"] = True
+            return payload
+        return result
+    if isinstance(result, dict) and result.get("error"):
+        payload = sanitize_public_payload(dict(result), error_code="v2_dispatch_failed")
+        payload.setdefault("ok", False)
+        return _mcp_json_error(payload)
+    return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
+
+
+def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> dict[str, Any] | None:
+    """Route one MCP request through V2, or return ``None`` for legacy V1."""
+    facade = _load_v2_runtime_facade(workspace)
+    if facade is _V2_FACADE_MISSING:
+        return None
+    state, snapshot = _v2_facade_state(facade, workspace)
+    if state == "UNKNOWN":
+        return _mcp_json_error({
+            "ok": False,
+            "error": "v2_manifest_state_unavailable",
+            "code": "v2_manifest_state_unavailable",
+            "state": state,
+        })
+    if state in {"V1_ACTIVE", "V2_BUILDING"}:
+        return None
+    if state not in _V2_READ_STATES:
+        return _mcp_json_error({
+            "ok": False,
+            "error": "v2_manifest_state_unavailable",
+            "code": "v2_manifest_state_unavailable",
+            "state": state,
+        })
+    known_tools = {str(item.get("name", "")) for item in TOOLS if isinstance(item, dict)}
+    if name not in known_tools:
+        return _mcp_error(f"unknown tool: {name}")
+    # V2_READY permits reads/bootstrap only; mutations must never touch either
+    # port.  The list mirrors _MUTATING_TOOLS and remains intentionally local.
+    if state == "V2_READY" and name in _MUTATING_TOOLS:
+        return _mcp_json_error({"ok": False, "error": "v2_not_active", "code": "v2_not_active"})
+    dispatch = getattr(facade, "dispatch_mcp", None)
+    if not callable(dispatch):
+        return _mcp_json_error({"ok": False, "error": "v2_dispatch_unavailable", "code": "v2_dispatch_unavailable"})
+    context, context_error = _trusted_context_for_v2(args, workspace)
+    # Non-memory read tools may not have a binding; their V2 implementation can
+    # still run without an identity.  Scope-sensitive tools fail closed.
+    scoped = (
+        name in _MUTATING_TOOLS
+        or name.startswith("memoryguard_memory_")
+        or name.startswith("memoryguard_rule_")
+        or name.startswith("memoryguard_history_")
+        or name.startswith("memoryguard_binding_")
+        or name in {"memoryguard_context_bootstrap", "memoryguard_accept_candidates", "memoryguard_external_mcp_import"}
+    )
+    if context_error and scoped:
+        return _mcp_json_error({"ok": False, "error": context_error, "code": context_error})
+    try:
+        params = inspect.signature(dispatch).parameters
+        has_context = "context" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        accepts_snapshot = "snapshot" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        has_context = False
+        accepts_snapshot = False
+    if not has_context:
+        return _mcp_json_error({"ok": False, "error": "v2_context_capability_required", "code": "v2_context_capability_required"})
+    try:
+        port_args = _v2_port_args(name, args)
+    except ValueError as exc:
+        code = safe_error_code(exc, "invalid_tool_arguments")
+        return _mcp_json_error({
+            "ok": False,
+            "error": code,
+            "code": code,
+            "diagnostic": safe_exception_diagnostic(exc, code=code),
+        })
+    try:
+        kwargs: dict[str, Any] = {"context": context}
+        # Phase6 facade consumes the immutable snapshot read above.  Passing
+        # it is what enforces one manifest read per tools/call; older fakes
+        # without the optional parameter remain compatible.
+        if accepts_snapshot:
+            kwargs["snapshot"] = snapshot
+        # Identity is conveyed only through the trusted context.  Never hand
+        # attacker-controlled aliases to the V2 port as a second authority.
+        result = dispatch(name, port_args, **kwargs)
+    except Exception as exc:
+        return _mcp_json_error({
+            "ok": False,
+            "error": "v2_dispatch_failed",
+            "code": "v2_dispatch_failed",
+            "diagnostic": safe_exception_diagnostic(exc, code="v2_dispatch_failed"),
+        })
+    return _v2_result_envelope(result)
+
+
 def _get_governance_api(workspace: Path):
     """获取或创建 workspace 对应的 GovernanceApi 实例。"""
     key = str(workspace)
@@ -2909,14 +3836,13 @@ def _runtime_lease_guard(name: str, args: dict[str, Any], workspace: Path) -> di
         "a different build; refusing to write. "
         f"restart_required=true; conflicting_pids={pids}"
     )
-    return {
+    return _mcp_json_error({
         "ok": False,
         "error": "runtime_split_brain",
         "restart_required": True,
         "conflicting": conflicting,
-        "content": [{"type": "text", "text": f"error: {text}"}],
-        "isError": True,
-    }
+        "message": text,
+    }, include_legacy_fields=True)
 
 
 def serve_stdio() -> int:
@@ -2927,14 +3853,25 @@ def serve_stdio() -> int:
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
             reconfigure(encoding="utf-8", errors="strict")
+    # Resolve a legacy-global migration before identity preflight and runtime
+    # lease acquisition.  Otherwise a stale host config can take a lease on the
+    # retired project control plane before the first tool call gets a chance to
+    # redirect it.
+    startup_workspace: Path | None = None
+    if (
+        os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+        or os.environ.get("MEMORYGUARD_CONTROL_SCOPE", "").strip().lower()
+        == "global"
+    ):
+        startup_workspace = _resolve_memory_workspace({})
+
     # A3: 启动预检,打印身份与权限态
     from .access_context import preflight_check
     preflight_check()
-    configured_workspace = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-    if configured_workspace:
+    if startup_workspace is not None:
         from .runtime_lease import check_runtime_lease
         lease = check_runtime_lease(
-            Path(configured_workspace).resolve(), pid=os.getpid(),
+            startup_workspace, pid=os.getpid(),
         )
         if not lease.get("granted"):
             conflicting = lease.get("conflicting", [])
@@ -2945,6 +3882,24 @@ def serve_stdio() -> int:
                 file=sys.stderr,
             )
             return 1
+        startup_recovery = _attempt_startup_governance_recovery(
+            startup_workspace,
+        )
+        if startup_recovery.get("attempted"):
+            if startup_recovery.get("recovered"):
+                print(
+                    "[memoryguard] startup governance recovery: recovered "
+                    f"group={startup_recovery.get('share_group_id', '')}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[memoryguard] WARNING: startup governance recovery "
+                    "did not reach canonical-ready; diagnostics remain "
+                    "available; "
+                    f"reason={startup_recovery.get('reason', 'unknown')}",
+                    file=sys.stderr,
+                )
     for line in sys.stdin:
         line = line.strip()
         if not line:

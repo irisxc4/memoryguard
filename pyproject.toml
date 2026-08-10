@@ -1,6 +1,6 @@
 [project]
 name = "agent-memguard"
-version = "0.5.2"
+version = "0.6.0"
 description = "Local-first MCP memory backend and governance console for coding agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,7 @@ Issues = "https://github.com/irisxc4/memoryguard/issues"
 
 [project.scripts]
 memoryguard = "memoryguard.cli:main"
+memoryguard-v2 = "memoryguard.v2_cli:main"
 
 [project.gui-scripts]
 memoryguard-gui = "memoryguard.cli:gui_main"

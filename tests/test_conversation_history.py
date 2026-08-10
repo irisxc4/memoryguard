@@ -5,7 +5,7 @@ import pytest
 
 from memoryguard.adapters import ChatGPTImportAdapter, ImportedConversation
 from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+from memoryguard.conversation_history import ConversationHistoryStore, HistorySchemaError, HistoryScope
 from memoryguard.history_api import handle_history_tool
 
 
@@ -118,7 +118,7 @@ def test_observation_is_indexed_without_raw_turn_content_in_search(tmp_path: Pat
     assert "content" not in hit
 
 
-def test_legacy_evidence_fk_migrates_to_tombstone_table(tmp_path: Path):
+def test_partial_v0_history_is_rejected_without_healing_or_byte_changes(tmp_path: Path):
     db = tmp_path / ".memoryguard" / "history" / "history.sqlite"
     db.parent.mkdir(parents=True)
     with sqlite3.connect(db) as conn:
@@ -128,12 +128,11 @@ def test_legacy_evidence_fk_migrates_to_tombstone_table(tmp_path: Path):
             CREATE TABLE evidence_links (link_id TEXT PRIMARY KEY, memory_id TEXT NOT NULL, session_id TEXT NOT NULL REFERENCES conversation_sessions(session_id) ON DELETE CASCADE, turn_id TEXT REFERENCES conversation_turns(turn_id) ON DELETE SET NULL, status TEXT NOT NULL DEFAULT 'valid', created_at TEXT NOT NULL, invalidated_at TEXT NOT NULL DEFAULT '');
             CREATE VIRTUAL TABLE history_fts USING fts5(session_id UNINDEXED, turn_id UNINDEXED, title, content);
         """)
-    store = ConversationHistoryStore(tmp_path)
-    with store._connect() as conn:
-        foreign = conn.execute("PRAGMA foreign_key_list(evidence_links)").fetchall()
-        cols = [row[1] for row in conn.execute("PRAGMA table_info(history_fts)").fetchall()]
-    assert foreign == []
-    assert "result_type" in cols
+    before = db.read_bytes()
+    with pytest.raises(HistorySchemaError, match="history_schema_partial"):
+        ConversationHistoryStore(tmp_path)
+    assert db.read_bytes() == before
+    assert not db.with_name(db.name + "-wal").exists()
 
 
 def test_every_sqlite_connection_is_closed_and_database_can_move(tmp_path: Path, monkeypatch):
@@ -247,6 +246,21 @@ def test_add_observation_is_fts_idempotent_and_schema_is_versioned(tmp_path: Pat
     assert len(store.search(_scope(), "indexed observation")["results"]) == 1
     with store._connect() as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+
+
+def test_future_history_schema_is_rejected_before_any_write(tmp_path: Path):
+    db = tmp_path / ".memoryguard" / "history" / "history.sqlite"
+    db.parent.mkdir(parents=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE future_marker(value TEXT)")
+        conn.execute("PRAGMA user_version=99")
+    before = db.read_bytes()
+    with pytest.raises(HistorySchemaError, match="history_schema_future"):
+        ConversationHistoryStore(tmp_path)
+    assert db.read_bytes() == before
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 99
+    assert not db.with_name(db.name + "-wal").exists()
 
 
 def test_scope_normalizes_project_paths_and_rejects_unbounded_identity(tmp_path: Path):

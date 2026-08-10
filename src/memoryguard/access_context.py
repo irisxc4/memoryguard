@@ -19,6 +19,31 @@ _SESSION_SOURCES = frozenset({
     "host", "transport", "generated", "manual", "client", "absent",
 })
 
+# Process-local connection normalization for proven legacy-global migrations.
+# Never mutate os.environ: the host owns that immutable connection envelope.
+_RUNTIME_AGENT_ID_OVERRIDE = ""
+_RUNTIME_PROVIDER_OVERRIDE = ""
+
+
+def set_runtime_connection_override(
+    *, agent_instance_id: str = "", provider: str = "",
+) -> None:
+    global _RUNTIME_AGENT_ID_OVERRIDE, _RUNTIME_PROVIDER_OVERRIDE
+    _RUNTIME_AGENT_ID_OVERRIDE = str(agent_instance_id or "").strip()
+    _RUNTIME_PROVIDER_OVERRIDE = str(provider or "").strip().lower()
+
+
+def clear_runtime_connection_override() -> None:
+    set_runtime_connection_override()
+
+
+def effective_agent_id() -> str:
+    return _RUNTIME_AGENT_ID_OVERRIDE or os.environ.get("MEMORYGUARD_AGENT_ID", "")
+
+
+def effective_provider() -> str:
+    return _RUNTIME_PROVIDER_OVERRIDE or os.environ.get("MEMORYGUARD_PROVIDER", "")
+
 
 def session_trust_is_valid(
     session_id: object,
@@ -109,7 +134,7 @@ class AccessContext:
 def load_access_context() -> AccessContext:
     """从环境变量加载 AccessContext。"""
     return AccessContext(
-        trusted_agent_id=os.environ.get("MEMORYGUARD_AGENT_ID", ""),
+        trusted_agent_id=effective_agent_id(),
         is_admin=os.environ.get("MEMORYGUARD_ADMIN", "") == "1",
         # P0-A: 默认 STRICT_BINDING=1
         strict_binding=os.environ.get("MEMORYGUARD_STRICT_BINDING", "1") != "0",

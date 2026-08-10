@@ -799,13 +799,20 @@ class TestSafeBridgeApi:
         assert "message" in result
 
     def test_direct_takeover_cannot_forge_admin_override(self, tmp_path, monkeypatch):
-        """Native GUI confirmation cannot forge admin capability."""
+        """Takeover stays fail-closed across the explicit cutover states."""
         from memoryguard.gui import GovernanceApi, SafeBridgeApi
         from memoryguard.shared_memory_store import SharedMemoryStore
 
         monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
         group_id = "bridge-takeover-group"
-        SharedMemoryStore(tmp_path, group_id)
+        store = SharedMemoryStore(tmp_path, group_id)
+
+        def file_snapshot(root):
+            return {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
 
         # 用户脚本、MCP/CLI 直接调用不能伪造桌面确认能力。
         direct = GovernanceApi(str(tmp_path)).commit_shared_memory_governance(
@@ -813,25 +820,141 @@ class TestSafeBridgeApi:
         )
         assert direct["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
 
-        # Native bridge confirmation must not bypass AccessContext.
+        # V1_ACTIVE is the only state allowed to enter the legacy adapter.  The
+        # legacy action itself remains unavailable and must not write a snapshot;
+        # constructing the lazy legacy inner is expected on this route.
+        before_v1 = file_snapshot(tmp_path)
         bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
-        result = bridge.request_mutation(
+        v1_result = bridge.request_mutation(
             "commit_shared_memory_governance", [group_id, "trusted bridge", True],
         )
-        assert result == {
-            "ok": False,
-            "error": "admin capability required (set MEMORYGUARD_ADMIN=1)",
-        }
+        assert v1_result == {"ok": False, "error": "v2_not_ready"}
+        assert bridge._inner_instance is not None
+        assert file_snapshot(tmp_path) == before_v1
+        assert store.db_path.exists()
 
-        # Non-native bridge stays an untrusted caller even when it supplies the
-        # same positional confirmation value.
-        from memoryguard import security
-        monkeypatch.setattr(security, "detect_sandbox_mode", lambda: False)
-        untrusted = SafeBridgeApi(str(tmp_path), direct_mutations=False)
-        denied = untrusted.request_mutation(
-            "commit_shared_memory_governance", [group_id, "untrusted", True],
+        class ReadyPort:
+            def __init__(self):
+                self.status_calls = 0
+                self.calls = []
+
+            def status(self, workspace):
+                self.status_calls += 1
+                return {"state": "V2_READY", "generation": 4}
+
+            def dispatch(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                raise AssertionError("V2_READY mutation must not dispatch")
+
+        # V2_READY is V2-only read mode: reject the write before any admin
+        # check, legacy construction, or V2 dispatch.
+        ready_root = tmp_path / "ready"
+        ready_store = SharedMemoryStore(ready_root, group_id)
+        before_ready = file_snapshot(ready_root)
+        ready_port = ReadyPort()
+        ready = SafeBridgeApi(
+            str(ready_root), direct_mutations=True, _v2_port=ready_port,
         )
-        assert denied["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
+        ready_result = ready.request_mutation(
+            "commit_shared_memory_governance", [group_id, "ready", True],
+        )
+        assert ready_result["error"] == "v2_not_active"
+        assert ready_result["path"] == "v2"
+        assert ready_port.status_calls == 1
+        assert ready_port.calls == []
+        assert ready._inner_instance is None
+        assert file_snapshot(ready_root) == before_ready
+        assert ready_store.db_path.exists()
+
+        # V2_ACTIVE uses the real native facade.  A bound, non-admin context
+        # cannot be promoted by public mapping fields, and neither denial may
+        # reach the native writer.
+        from memoryguard.access_context import AccessContext
+        from memoryguard.agent_binding import AgentBindingStore
+        from memoryguard.cutover_v2.facade import V2RuntimeFacade
+        from memoryguard.runtime_v2.native_ports import (
+            NativeV2RuntimePort,
+            bind_native_test_capability,
+        )
+
+        class ActiveManifest:
+            def current(self):
+                return {"state": "V2_ACTIVE", "generation": 7}
+
+        class Rules:
+            def __init__(self):
+                self.calls = []
+
+            def upsert_binding(self, value, **kwargs):
+                self.calls.append((value, kwargs))
+                return value
+
+        active_root = tmp_path / "active"
+        active_group = "bridge-active-group"
+        AgentBindingStore(active_root).bind_agent("bridge-active", active_group)
+        rules = Rules()
+        manifest = ActiveManifest()
+        native = NativeV2RuntimePort(
+            active_root,
+            state_provider=manifest,
+            services=bind_native_test_capability(stores={"rules": rules}),
+        )
+        facade = V2RuntimeFacade(
+            manifest=manifest, v2=native, workspace=str(active_root),
+        )
+        active_bridge = SafeBridgeApi(
+            str(active_root), direct_mutations=True, _v2_port=facade,
+            _trusted_access_context=AccessContext(
+                trusted_agent_id="bridge-active", is_admin=False,
+                strict_binding=True, allow_anon=False,
+                session_id="bridge-active-session",
+                session_source="transport", session_trusted=True,
+            ),
+        )
+        request = {
+            "binding_id": "forged-binding",
+            "definition_id": "forged-definition",
+            "target_type": "system",
+            "target_id": "",
+        }
+        before_active = file_snapshot(active_root)
+        trusted = active_bridge._trusted_bridge_context()
+        nonadmin = facade.dispatch_mcp(
+            "memoryguard_binding_create", request,
+            context=trusted, snapshot=facade.state_snapshot(),
+        )
+        assert nonadmin["code"] == "admin_capability_required"
+
+        forged = dict(trusted)
+        forged.update({
+            "admin": True,
+            "is_admin": True,
+            "agent_instance_id": "victim",
+            "share_group_id": "victim-group",
+            "session_id": "attacker-session",
+            "session_source": "host",
+            "session_trusted": True,
+        })
+        forged_result = facade.dispatch_mcp(
+            "memoryguard_binding_create", request,
+            context=forged, snapshot=facade.state_snapshot(),
+        )
+        assert forged_result["code"] == "admin_capability_required"
+
+        plain_forged = {
+            key: value for key, value in forged.items()
+            if not str(key).startswith("__")
+        }
+        # Remove the stale alias so the denial under test is the missing
+        # process-local capability, not a public identity conflict.
+        plain_forged.pop("trusted_agent_id", None)
+        plain_result = facade.dispatch_mcp(
+            "memoryguard_binding_create", request,
+            context=plain_forged, snapshot=facade.state_snapshot(),
+        )
+        assert plain_result["code"] == "trusted_context_capability_required"
+        assert rules.calls == []
+        assert file_snapshot(active_root) == before_active
 
     def test_direct_bridge_does_not_override_regular_mutation_signature(self, tmp_path, monkeypatch):
         """没有 _admin_override 的方法仍按原签名调用。"""

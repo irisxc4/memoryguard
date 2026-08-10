@@ -109,6 +109,7 @@ def _mcp_server_config(
     agent_instance_id: str = "",
     memoryguard_workspace: str | Path = "",
     provider: str = "",
+    control_scope: str = "project",
 ) -> dict[str, Any]:
     """返回 MemoryGuard MCP server 的配置片段（JSON 格式，Claude/Cursor 通用）。"""
     cmd = _mcp_command()
@@ -121,6 +122,9 @@ def _mcp_server_config(
         env["MEMORYGUARD_AGENT_ID"] = agent_instance_id
     if provider:
         env["MEMORYGUARD_PROVIDER"] = provider
+    env["MEMORYGUARD_CONTROL_SCOPE"] = (
+        "global" if str(control_scope).strip().lower() == "global" else "project"
+    )
     if memoryguard_workspace:
         env["MEMORYGUARD_WORKSPACE"] = str(
             Path(memoryguard_workspace).expanduser().resolve()
@@ -134,6 +138,7 @@ def _mcp_toml_section(
     agent_instance_id: str = "",
     memoryguard_workspace: str | Path = "",
     provider: str = "codex",
+    control_scope: str = "project",
 ) -> str:
     """返回 MemoryGuard MCP server 的 TOML 配置段落（Codex 用）。
 
@@ -156,6 +161,12 @@ def _mcp_toml_section(
         env_items.append(
             f"MEMORYGUARD_PROVIDER = {json.dumps(provider)}"
         )
+    env_items.append(
+        "MEMORYGUARD_CONTROL_SCOPE = "
+        + json.dumps(
+            "global" if str(control_scope).strip().lower() == "global" else "project"
+        )
+    )
     if memoryguard_workspace:
         resolved = str(Path(memoryguard_workspace).expanduser().resolve())
         env_items.append(
@@ -451,6 +462,51 @@ class ProviderAdapter:
 
     provider_name: str = "base"
 
+    def _select_install_workspace(
+        self, workspace: str | Path = "", *, global_scope: bool = False,
+    ) -> str:
+        """Select the control plane before validating bindings or writing config.
+
+        Global host integrations must always bind to the stable per-user
+        MemoryGuard data home.  A source checkout/project path is valid only
+        for an explicit project-scoped integration.  This prevents an upgrade
+        or repair launched from a repository checkout from pinning a global MCP
+        back to that checkout again.
+        """
+        self._superseded_project_workspace: Path | None = None
+        if global_scope:
+            from .data_home import resolve_data_home
+
+            data_home = resolve_data_home()
+            if workspace:
+                requested = Path(workspace).expanduser().resolve()
+                if requested != data_home:
+                    self._superseded_project_workspace = requested
+            self.workspace = data_home
+            self._has_workspace = False
+            return "global"
+        if workspace:
+            self.workspace = Path(workspace).expanduser().resolve()
+            self._has_workspace = True
+        return "project"
+
+    def _cleanup_superseded_project_override(self) -> list[str]:
+        """Remove only MemoryGuard-owned project config after global takeover."""
+        project = getattr(self, "_superseded_project_workspace", None)
+        if not isinstance(project, Path):
+            return []
+        try:
+            project_adapter = type(self)(project)
+            project_adapter.uninstall()
+            return [
+                f"已移除被全局配置取代的项目级 MemoryGuard 覆盖：{project}"
+            ]
+        except Exception as exc:  # global config is already valid; report cleanup debt
+            return [
+                "全局 MemoryGuard 配置已修复，但项目级旧覆盖清理失败："
+                f"{project}: {type(exc).__name__}: {exc}"
+            ]
+
     def _find_binding(self, agent_instance_id: str = "",
                       share_group_id: str = "") -> tuple[str | None, str | None]:
         """只读查找现有真实 binding；adapter 不创建或解绑授权关系。"""
@@ -601,11 +657,9 @@ class ClaudeAdapter(ProviderAdapter):
     def install(self, workspace: str | Path = "", share_group_id: str = "default",
                 agent_instance_id: str = "",
                 global_scope: bool = False) -> dict[str, Any]:
-        if workspace:
-            self.workspace = Path(workspace).resolve()
-            self._has_workspace = True
-        if global_scope:
-            self._has_workspace = False
+        control_scope = self._select_install_workspace(
+            workspace, global_scope=global_scope,
+        )
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
@@ -621,7 +675,9 @@ class ClaudeAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace, "claude"),
+            _mcp_server_config(
+                agent_instance_id, self.workspace, "claude", control_scope,
+            ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([
@@ -633,10 +689,12 @@ class ClaudeAdapter(ProviderAdapter):
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
         )
+        warnings = self._cleanup_superseded_project_override()
         return self._configured_result(
             instruction_path=instr_path,
             mcp_path=mcp_path,
             binding_id=binding_id,
+            warnings=warnings,
             hook=hook,
         )
 
@@ -735,11 +793,9 @@ class CodexAdapter(ProviderAdapter):
     def install(self, workspace: str | Path = "", share_group_id: str = "default",
                 agent_instance_id: str = "",
                 global_scope: bool = False) -> dict[str, Any]:
-        if workspace:
-            self.workspace = Path(workspace).resolve()
-            self._has_workspace = True
-        if global_scope:
-            self._has_workspace = False
+        control_scope = self._select_install_workspace(
+            workspace, global_scope=global_scope,
+        )
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
@@ -752,7 +808,9 @@ class CodexAdapter(ProviderAdapter):
         mcp_path = self._mcp_config_path()
         toml_content = _read_text_for_update(mcp_path)
         toml_content = _reconcile_memoryguard_toml_tables(toml_content)
-        section = _mcp_toml_section(agent_instance_id, self.workspace)
+        section = _mcp_toml_section(
+            agent_instance_id, self.workspace, control_scope=control_scope,
+        )
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
         _validate_toml(new_toml, mcp_path)
         _apply_file_transaction([
@@ -768,6 +826,7 @@ class CodexAdapter(ProviderAdapter):
             ["Codex 仅在用户信任该项目后加载项目级 .codex/config.toml"]
             if self._has_workspace else []
         )
+        warnings.extend(self._cleanup_superseded_project_override())
         global_path = Path.home() / ".codex" / "config.toml"
         if self._has_workspace and global_path != mcp_path:
             global_text = _read_text(global_path)
@@ -910,11 +969,9 @@ class CursorAdapter(ProviderAdapter):
     def install(self, workspace: str | Path = "", share_group_id: str = "default",
                 agent_instance_id: str = "",
                 global_scope: bool = False) -> dict[str, Any]:
-        if workspace:
-            self.workspace = Path(workspace).resolve()
-            self._has_workspace = True
-        if global_scope:
-            self._has_workspace = False
+        control_scope = self._select_install_workspace(
+            workspace, global_scope=global_scope,
+        )
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
@@ -927,7 +984,9 @@ class CursorAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace, "cursor"),
+            _mcp_server_config(
+                agent_instance_id, self.workspace, "cursor", control_scope,
+            ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([
@@ -939,7 +998,7 @@ class CursorAdapter(ProviderAdapter):
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
         )
-        warnings: list[str] = []
+        warnings: list[str] = self._cleanup_superseded_project_override()
         global_path = Path.home() / ".cursor" / "mcp.json"
         if self._has_workspace and global_path != mcp_path:
             global_data = _load_json(global_path)
@@ -1063,11 +1122,9 @@ class TraeAdapter(ProviderAdapter):
     def install(self, workspace: str | Path = "", share_group_id: str = "default",
                 agent_instance_id: str = "",
                 global_scope: bool = False) -> dict[str, Any]:
-        if workspace:
-            self.workspace = Path(workspace).resolve()
-            self._has_workspace = True
-        if global_scope:
-            self._has_workspace = False
+        control_scope = self._select_install_workspace(
+            workspace, global_scope=global_scope,
+        )
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
@@ -1082,7 +1139,9 @@ class TraeAdapter(ProviderAdapter):
         _set_mcp_server(
             data,
             MCP_SERVER_NAME,
-            _mcp_server_config(agent_instance_id, self.workspace, "trae"),
+            _mcp_server_config(
+                agent_instance_id, self.workspace, "trae", control_scope,
+            ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
         _apply_file_transaction([
@@ -1095,7 +1154,7 @@ class TraeAdapter(ProviderAdapter):
             share_group_id=share_group_id,
         )
 
-        warnings: list[str] = []
+        warnings: list[str] = self._cleanup_superseded_project_override()
         global_path = self._user_mcp_config_path()
         if self._has_workspace and global_path != mcp_path:
             global_data = _load_json(global_path)
@@ -1192,3 +1251,144 @@ PROVIDER_ADAPTERS: dict[str, type[ProviderAdapter]] = {
 def get_provider_adapter_class(product: str) -> type[ProviderAdapter] | None:
     """按规范化 product ID 返回自动安装适配器。"""
     return PROVIDER_ADAPTERS.get((product or "").strip().lower())
+
+
+def repair_global_provider_configs(
+    providers: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Rebuild global provider integrations from canonical data-home bindings.
+
+    This is the upgrade/repair entry point.  It never trusts a provider's
+    existing AgentInstance id, share-group id, or MEMORYGUARD_WORKSPACE.  The
+    current instances are rediscovered, then each provider is installed from
+    the one active binding stored in the canonical user data home.
+    """
+    from .agent_binding import AgentBindingStore
+    from .agent_locator import AgentLocator
+    from .data_home import resolve_data_home
+
+    data_home = resolve_data_home()
+    data_home.mkdir(parents=True, exist_ok=True)
+    instances, _ = AgentLocator(data_home).detect_instances()
+    binding_store = AgentBindingStore(data_home)
+
+    requested: set[str] = set()
+    for raw in providers or ():
+        value = str(raw or "").strip().lower()
+        if value in {"", "all", "*"}:
+            continue
+        cls = get_provider_adapter_class(value)
+        if cls is None:
+            raise ValueError(f"unsupported provider: {value}")
+        requested.add(cls.provider_name)
+    if not requested:
+        requested = {"claude", "codex", "cursor", "trae"}
+
+    by_provider: dict[str, list[Any]] = {}
+    for instance in instances:
+        cls = get_provider_adapter_class(instance.product)
+        if cls is None or cls.provider_name not in requested:
+            continue
+        by_provider.setdefault(cls.provider_name, []).append(instance)
+
+    repaired: list[dict[str, Any]] = []
+    for provider in sorted(requested):
+        matches = by_provider.get(provider, [])
+        if not matches:
+            repaired.append({
+                "provider": provider,
+                "status": "skipped",
+                "reason": "provider_instance_not_detected",
+            })
+            continue
+        if len(matches) != 1:
+            repaired.append({
+                "provider": provider,
+                "status": "error",
+                "reason": "multiple_provider_instances_detected",
+                "agent_instance_ids": sorted(item.instance_id for item in matches),
+            })
+            continue
+        instance = matches[0]
+        bindings = binding_store.find_by_agent(
+            instance.instance_id, include_inactive=False,
+        )
+        if len(bindings) != 1:
+            repaired.append({
+                "provider": provider,
+                "status": "error",
+                "reason": (
+                    "active_binding_not_found" if not bindings
+                    else "multiple_active_bindings"
+                ),
+                "agent_instance_id": instance.instance_id,
+            })
+            continue
+        binding = bindings[0]
+        cls = get_provider_adapter_class(instance.product)
+        if cls is None:  # guarded above; keep the write path explicit
+            continue
+        try:
+            result = cls(data_home).install(
+                data_home,
+                share_group_id=binding.share_group_id,
+                agent_instance_id=instance.instance_id,
+                global_scope=True,
+            )
+            repaired.append({
+                "provider": provider,
+                "status": "configured",
+                "agent_instance_id": instance.instance_id,
+                "share_group_id": binding.share_group_id,
+                "result": result,
+            })
+        except Exception as exc:
+            repaired.append({
+                "provider": provider,
+                "status": "error",
+                "agent_instance_id": instance.instance_id,
+                "share_group_id": binding.share_group_id,
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+
+    configured = sum(item["status"] == "configured" for item in repaired)
+    errors = sum(item["status"] == "error" for item in repaired)
+    skipped = sum(item["status"] == "skipped" for item in repaired)
+    return {
+        "ok": errors == 0,
+        "data_home": str(data_home),
+        "configured": configured,
+        "errors": errors,
+        "skipped": skipped,
+        "providers": repaired,
+        "restart_required": configured > 0,
+    }
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """Small maintenance CLI used after upgrades and control-plane migration."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Repair MemoryGuard provider integrations")
+    sub = parser.add_subparsers(dest="command", required=True)
+    repair = sub.add_parser(
+        "repair", help="rebuild global provider configs from canonical bindings",
+    )
+    repair.add_argument(
+        "providers", nargs="*", default=["all"],
+        help="claude codex cursor trae, or all",
+    )
+    opts = parser.parse_args(argv)
+    if opts.command == "repair":
+        try:
+            result = repair_global_provider_configs(opts.providers)
+        except ValueError as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

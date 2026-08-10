@@ -25,7 +25,6 @@ MAX_BATCH_BYTES = 64 * 1024 * 1024
 # Large historical sessions are not rejected by size.  We preserve a bounded
 # prefix/index, then mark the source partial for transparent later review.
 MAX_SOURCE_READ_BYTES = 2 * 1024 * 1024
-MAX_FILE_TURNS = 10_000
 MAX_MESSAGE_CHARS = 100_000
 
 
@@ -188,6 +187,7 @@ def _visible_message(raw: dict[str, Any], provider: str) -> dict[str, str] | Non
     return {
         "role": role,
         "content": content[:MAX_MESSAGE_CHARS],
+        "event_id": str(message.get("event_id") or message.get("event_key") or message.get("id") or raw.get("event_id") or raw.get("id") or ""),
         "created_at": str(message.get("timestamp") or raw.get("timestamp") or raw.get("created_at") or "")[:80],
         "content_type": "text",
     }
@@ -220,7 +220,7 @@ def _parse_jsonl(source: HistoryImportSource) -> ParsedHistoryFile:
     try:
         with source.path.open("rb") as handle:
             for raw_line in handle:
-                if len(messages) >= MAX_FILE_TURNS or read_bytes + len(raw_line) > MAX_SOURCE_READ_BYTES:
+                if read_bytes + len(raw_line) > MAX_SOURCE_READ_BYTES:
                     truncated = True
                     break
                 read_bytes += len(raw_line)
@@ -358,6 +358,9 @@ def backfill_local_history(
     continuation: dict[str, Any] | None = None,
     max_files: int = MAX_BATCH_FILES,
     max_bytes: int = MAX_BATCH_BYTES,
+    shadow: Any | None = None,
+    shadow_max_turns: int = 1000,
+    shadow_max_chars: int = 1_000_000,
 ) -> dict[str, Any]:
     """Import one bounded batch of supported local history.
 
@@ -380,6 +383,7 @@ def backfill_local_history(
     state = _load_state(root)
     imported = skipped = errors = processed_bytes = processed_files = partial = 0
     imported_by_provider: dict[str, int] = {}
+    shadow_results: list[dict[str, Any]] = []
     detected_providers = _detected_provider_by_agent(root)
     pending_binding = sorted({
         item.provider for item in ready
@@ -396,7 +400,7 @@ def backfill_local_history(
             errors += 1
             continue
         state_key = f"{source.provider}:{source.path}"
-        if _state_status(state.get(state_key, ""), fingerprint) in {"complete", "partial"}:
+        if _state_status(state.get(state_key, ""), fingerprint) == "complete":
             skipped += 1
             continue
         read_budget = min(size, MAX_SOURCE_READ_BYTES)
@@ -413,7 +417,13 @@ def backfill_local_history(
         if scope is None:  # binding may have changed during a long batch
             pending_binding = sorted(set(pending_binding) | {source.provider})
             continue
-        result = store.import_conversations([parsed.conversation], provider=source.provider, scope=scope)
+        result = store.import_conversations(
+            [parsed.conversation], provider=source.provider, scope=scope,
+            shadow=shadow, shadow_max_turns=shadow_max_turns,
+            shadow_max_chars=shadow_max_chars,
+        )
+        if isinstance(result.get("shadow"), list):
+            shadow_results.extend(item for item in result["shadow"] if isinstance(item, dict))
         imported += int(result["conversation_count"])
         imported_by_provider[source.provider] = imported_by_provider.get(source.provider, 0) + int(result["conversation_count"])
         if parsed.truncated:
@@ -444,5 +454,6 @@ def backfill_local_history(
         "pending_binding": pending_binding,
         "continuation": {"providers": remaining_by_provider} if remaining else None,
         "progress": {"processed_files": processed_files, "remaining_files": remaining},
+        "shadow": shadow_results if shadow is not None else None,
         "inventory": final_inventory,
     }

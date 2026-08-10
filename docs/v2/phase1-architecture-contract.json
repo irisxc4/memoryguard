@@ -1,0 +1,85 @@
+{
+  "contract": "memoryguard-v2-phase1",
+  "contract_version": 1,
+  "phase": 1,
+  "schema_marker": "memoryguard-v2-phase1",
+  "database_layout": [
+    {"domain": "runtime", "path": ".memoryguard/runtime/runtime.db"},
+    {"domain": "memory", "path": ".memoryguard/memory/memory.db"},
+    {"domain": "rules", "path": ".memoryguard/rules/rules.db"},
+    {"domain": "evidence", "path": ".memoryguard/evidence/evidence.db"},
+    {"domain": "content", "path": ".memoryguard/content/content.db"},
+    {"domain": "knowledge", "path": ".memoryguard/knowledge/knowledge.db"},
+    {"domain": "codegraph", "path": ".memoryguard/codegraph/codegraph.db"},
+    {"domain": "assets", "path": ".memoryguard/assets/assets.db"},
+    {"domain": "projection", "path": ".memoryguard/projection/scenario.db"},
+    {"domain": "projection", "path": ".memoryguard/projection/profile.db"},
+    {"domain": "system", "path": ".memoryguard/system/manifest.db"}
+  ],
+  "domain_rules": {
+    "content": {
+      "owns": ["raw_content", "conversation_turns", "content_blobs", "occurrences"],
+      "must_not_be_long_term_memory": true
+    },
+    "evidence": {
+      "owns": ["evidence_references", "summaries", "content_hashes"],
+      "forbids": ["raw_content", "conversation_body", "full_transcript"]
+    },
+    "knowledge": {
+      "owns": ["knowledge_metadata", "derived_indexes"],
+      "legacy_migration_source": "${MEMORYGUARD_HOME}/knowledge/knowledge.db"
+    }
+  },
+  "data_home": {
+    "manifest_fields": ["workspace_source_pointer", "global_source_pointer", "data_home_root"],
+    "pointer_must_be_explicit": true,
+    "containment_check_required": true,
+    "forbid_guessing_or_silent_move": true,
+    "legacy_knowledge_source": "${MEMORYGUARD_HOME}/knowledge/knowledge.db"
+  },
+  "manifest": {
+    "states": ["V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"],
+    "transitions": [
+      {"from": "V1_ACTIVE", "to": "V1_ACTIVE"},
+      {"from": "V1_ACTIVE", "to": "V2_BUILDING"},
+      {"from": "V2_BUILDING", "to": "V2_BUILDING"},
+      {"from": "V2_BUILDING", "to": "V2_READY"},
+      {"from": "V2_BUILDING", "to": "V1_ACTIVE"},
+      {"from": "V2_READY", "to": "V2_READY"},
+      {"from": "V2_READY", "to": "V2_ACTIVE"},
+      {"from": "V2_READY", "to": "V1_ACTIVE"},
+      {"from": "V2_ACTIVE", "to": "V2_ACTIVE"},
+      {"from": "V2_ACTIVE", "to": "V1_ACTIVE"}
+    ],
+    "v2_read_requires": "V2_ACTIVE",
+    "build_mode": "no_dual_read_or_write",
+    "failure_target": "V1_ACTIVE",
+    "atomicity": "logical_only",
+    "physical_atomicity_claim": false,
+    "commit_evidence": ["generation", "immutable_digests", "checkpoints"],
+    "ready_requires": ["source_digest", "target_digest", "manifest_digest", "validator_passed", "checkpoints"],
+    "active_inherits_ready_evidence": true
+  },
+  "migration": {
+    "v1_dependency": "migration_reader_only",
+    "phase6_forbidden": ["legacy_imports", "legacy_database_active_references", "legacy_schema_references"],
+    "unknown_domains": {
+      "codegraph": "NO_SOURCE",
+      "assets": "NO_SOURCE",
+      "taskcanvas": "NO_SOURCE"
+    },
+    "lossless_conversion_claim": false
+  },
+  "acceptance": {
+    "new_v2_source_roots": ["src/memoryguard/storage", "src/memoryguard/system"],
+    "forbidden_call_tokens": [".executescript("],
+    "forbidden_legacy_import_tokens": [
+      "from memoryguard.shared_memory_store import",
+      "from memoryguard.conversation_history import",
+      "from ..shared_memory_store import",
+      "from ..conversation_history import",
+      "from .shared_memory_store import",
+      "from .conversation_history import"
+    ]
+  }
+}

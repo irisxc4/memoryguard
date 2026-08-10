@@ -59,7 +59,11 @@ def memoryguard_version() -> str:
     is ``memoryguard``, so the package ``__version__`` is the reliable
     fallback and ``"unknown"`` is the final resort.
     """
-    for dist in ("memoryguard", "agent-memguard"):
+    # The published distribution is ``agent-memguard``.  An old unrelated
+    # ``memoryguard`` distribution can coexist in site-packages, so consulting
+    # that name first reports a false runtime version and triggers bogus lease
+    # split-brain diagnostics.
+    for dist in ("agent-memguard",):
         try:
             import importlib.metadata
             return importlib.metadata.version(dist)

@@ -8,6 +8,7 @@ provide a trusted Agent scope; the store does not infer a cross-agent scope.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import uuid
@@ -21,7 +22,6 @@ from typing import Any, Iterable
 MAX_PAGE = 100
 MAX_TIMELINE_RADIUS = 25
 MAX_IMPORT_CONVERSATIONS = 1_000
-MAX_SESSION_TURNS = 10_000
 MAX_TURN_CHARS = 100_000
 MAX_IMPORT_CHARS = 20_000_000
 MAX_AGENT_ID_CHARS = 256
@@ -32,7 +32,66 @@ MAX_SHARE_GROUP_ID_CHARS = 256
 MAX_TITLE_CHARS = 500
 MAX_DERIVED_TITLE_CHARS = 88
 MAX_MATCHED_SUMMARY_CHARS = 320
-HISTORY_SCHEMA_VERSION = 2
+HISTORY_SCHEMA_VERSION = 3
+
+
+class HistorySchemaError(RuntimeError):
+    """The history database is missing, partial, or from an unsupported version."""
+
+    def __init__(self, code: str) -> None:
+        allowed = {
+            "history_schema_future", "history_schema_invalid", "history_schema_partial",
+            "history_schema_unsupported", "history_schema_version_invalid",
+        }
+        self.code = str(code) if str(code) in allowed else "history_schema_invalid"
+        super().__init__(self.code)
+
+
+# These are the canonical user-facing tables.  The native adapter imports the
+# contract so a read-only open cannot silently accept a partial or widened
+# schema.  SQLite's FTS implementation creates additional internal tables;
+# those names are listed separately below and are validated by name only.
+HISTORY_TABLE_COLUMNS: dict[str, frozenset[str]] = {
+    "conversation_sessions": frozenset({
+        "session_id", "external_id", "title", "provider", "agent_instance_id",
+        "project_ref", "share_group_id", "created_at", "imported_at", "deleted_at",
+    }),
+    "conversation_turns": frozenset({
+        "turn_id", "session_id", "ordinal", "role", "content", "created_at",
+        "content_type", "event_key", "content_hash",
+    }),
+    "session_summaries": frozenset({
+        "session_id", "summary", "summary_kind", "updated_at",
+    }),
+    "observations": frozenset({
+        "observation_id", "session_id", "turn_id", "observation_type", "summary",
+        "created_at",
+    }),
+    "evidence_links": frozenset({
+        "link_id", "memory_id", "session_id", "turn_id", "status", "created_at",
+        "invalidated_at",
+    }),
+    "history_mutation_receipts": frozenset({
+        "idempotency_key", "operation", "payload_digest", "result_json", "created_at",
+    }),
+    "history_fts": frozenset({
+        "session_id", "turn_id", "result_type", "title", "content",
+    }),
+}
+HISTORY_FTS_INTERNAL_TABLES = frozenset({
+    "history_fts_config", "history_fts_content", "history_fts_data",
+    "history_fts_docsize", "history_fts_idx",
+})
+HISTORY_ALLOWED_TABLES = frozenset(HISTORY_TABLE_COLUMNS) | HISTORY_FTS_INTERNAL_TABLES
+_HISTORY_AUTHORITATIVE_TABLES = frozenset(HISTORY_TABLE_COLUMNS)
+_HISTORY_V2_REQUIRED_TABLES = _HISTORY_AUTHORITATIVE_TABLES - {"history_mutation_receipts"}
+_HISTORY_V2_TABLE_COLUMNS = {
+    name: frozenset(columns)
+    for name, columns in HISTORY_TABLE_COLUMNS.items()
+    if name != "history_mutation_receipts"
+}
+_HISTORY_V2_TABLE_COLUMNS["conversation_turns"] -= {"event_key", "content_hash"}
+_HISTORY_V2_TABLE_COLUMNS["history_fts"] -= {"result_type"}
 
 
 def _now() -> str:
@@ -274,6 +333,11 @@ class ConversationHistoryStore:
     accidentally query every local Agent's raw conversations.
     """
 
+    # Native adapters may require a durable replay fence before accepting a
+    # destructive DI path.  This marker is separate from the read-only
+    # protocol, which writable instances do not claim.
+    supports_durable_idempotency = True
+
     def __init__(self, workspace: str | Path):
         self.workspace = Path(workspace).resolve()
         self.db_path = self.workspace / ".memoryguard" / "history" / "history.sqlite"
@@ -311,11 +375,132 @@ class ConversationHistoryStore:
                 conn.commit()
 
     def _init_db(self) -> None:
+        # Inspect an existing database without WAL/transactions/DDL first.
+        # Partial history stores are a hard boundary: opening one must not
+        # silently create missing tables or mutate its bytes.
+        if not self.db_path.exists():
+            conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+            try:
+                self._create_schema(conn)
+            finally:
+                conn.close()
+            return
+
+        try:
+            inspect_conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        except sqlite3.DatabaseError as exc:
+            raise HistorySchemaError("history_schema_invalid") from exc
+        try:
+            row = inspect_conn.execute("PRAGMA user_version").fetchone()
+            try:
+                version = int(row[0]) if row is not None else 0
+            except (TypeError, ValueError, IndexError) as exc:
+                raise HistorySchemaError("history_schema_version_invalid") from exc
+            if version > HISTORY_SCHEMA_VERSION:
+                raise HistorySchemaError("history_schema_future")
+            if version not in {0, 2, HISTORY_SCHEMA_VERSION}:
+                raise HistorySchemaError("history_schema_unsupported")
+            objects = self._schema_objects(inspect_conn)
+            user_objects = {name for name in objects if not name.startswith("sqlite_")}
+            if version == 0:
+                # v0 means an actually fresh SQLite file only.  A file with
+                # any user/canonical table is an explicitly partial legacy DB.
+                if user_objects:
+                    raise HistorySchemaError("history_schema_partial")
+                needs_create = True
+            elif version == 2:
+                if not self._schema_matches(inspect_conn, version=2):
+                    raise HistorySchemaError("history_schema_partial")
+                needs_create = False
+            else:
+                if not self._schema_matches(inspect_conn, version=HISTORY_SCHEMA_VERSION):
+                    raise HistorySchemaError("history_schema_partial")
+                needs_create = False
+        finally:
+            inspect_conn.close()
+
+        if needs_create:
+            conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+            try:
+                self._create_schema(conn)
+            finally:
+                conn.close()
+            return
+
+        # Only a complete, known schema is allowed to enter a write/migration
+        # transaction.  v2 -> v3 is intentionally explicit and bounded.
         with self._connect() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.executescript("""
+                if version == 2:
+                    conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS history_mutation_receipts (
+                      idempotency_key TEXT PRIMARY KEY,
+                      operation TEXT NOT NULL,
+                      payload_digest TEXT NOT NULL,
+                      result_json TEXT NOT NULL,
+                      created_at TEXT NOT NULL
+                    );
+                    """)
+                    self._migrate_turn_identity(conn)
+                    self._migrate_evidence_tombstones(conn)
+                    self._migrate_fts(conn)
+                self._backfill_session_titles(conn)
+                conn.execute(f"PRAGMA user_version={HISTORY_SCHEMA_VERSION}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _schema_objects(conn: sqlite3.Connection) -> dict[str, str]:
+        rows = conn.execute(
+            "SELECT type,name FROM sqlite_master "
+            "WHERE type IN ('table','view')"
+        ).fetchall()
+        return {str(row[1]): str(row[0]) for row in rows}
+
+    @classmethod
+    def _schema_matches(cls, conn: sqlite3.Connection, *, version: int) -> bool:
+        try:
+            objects = cls._schema_objects(conn)
+            allowed = set(HISTORY_ALLOWED_TABLES)
+            names = set(objects)
+            if {name for name in names if not name.startswith("sqlite_")} - allowed:
+                return False
+            if version == 2:
+                required = _HISTORY_V2_REQUIRED_TABLES
+                expected = _HISTORY_V2_TABLE_COLUMNS
+            else:
+                required = _HISTORY_AUTHORITATIVE_TABLES | HISTORY_FTS_INTERNAL_TABLES
+                expected = HISTORY_TABLE_COLUMNS
+            if not required.issubset(names):
+                return False
+            for table in required:
+                if table in expected:
+                    if objects.get(table) != "table":
+                        return False
+                    columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+                    if columns != set(expected[table]):
+                        return False
+            if version == 2:
+                # FTS5 internals may be rebuilt by the explicit migration, but
+                # the public virtual table itself is never silently created.
+                if objects.get("history_fts") != "table":
+                    return False
+            elif not HISTORY_FTS_INTERNAL_TABLES.issubset(names):
+                return False
+            return True
+        except sqlite3.DatabaseError:
+            return False
+
+    @staticmethod
+    def _create_schema(conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS conversation_sessions (
                   session_id TEXT PRIMARY KEY,
                   external_id TEXT NOT NULL,
@@ -368,19 +553,22 @@ class ConversationHistoryStore:
                   ON conversation_sessions(agent_instance_id, project_ref, provider, deleted_at);
                 CREATE INDEX IF NOT EXISTS idx_history_turns_session ON conversation_turns(session_id, ordinal);
                 CREATE INDEX IF NOT EXISTS idx_history_evidence_session ON evidence_links(session_id, status);
+                CREATE TABLE IF NOT EXISTS history_mutation_receipts (
+                  idempotency_key TEXT PRIMARY KEY,
+                  operation TEXT NOT NULL,
+                  payload_digest TEXT NOT NULL,
+                  result_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
                 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
                   session_id UNINDEXED, turn_id UNINDEXED, result_type UNINDEXED, title, content, tokenize='unicode61'
                 );
                 """)
-                self._migrate_turn_identity(conn)
-                self._migrate_evidence_tombstones(conn)
-                self._migrate_fts(conn)
-                self._backfill_session_titles(conn)
-                conn.execute(f"PRAGMA user_version={HISTORY_SCHEMA_VERSION}")
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+            conn.execute(f"PRAGMA user_version={HISTORY_SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _migrate_turn_identity(conn: sqlite3.Connection) -> None:
@@ -563,7 +751,9 @@ class ConversationHistoryStore:
         return f"{session_id}-i{source_ordinal:06d}-{content_hash[:16]}"
 
     def import_conversations(self, conversations: Iterable[Any], *, provider: str,
-                             scope: HistoryScope) -> dict[str, int]:
+                             scope: HistoryScope, shadow: Any | None = None,
+                             shadow_max_turns: int = 1000,
+                             shadow_max_chars: int = 1_000_000) -> dict[str, Any]:
         """Idempotently archive parsed ImportedConversation objects.
 
         This method intentionally creates no MemoryRecord and no evidence link.
@@ -601,8 +791,9 @@ class ConversationHistoryStore:
                     )
                     session_id = self._session_id(external_id, conv_scope, active_provider)
                     messages = list(getattr(conv, "messages", []) or [])
-                    if len(messages) > MAX_SESSION_TURNS:
-                        raise ValueError("history_import_session_turn_limit_exceeded")
+                    # There is no lifetime session-turn ceiling.  Bounded
+                    # provider batches belong to the optional shadow bridge;
+                    # V1 history remains complete for arbitrarily long logs.
                     created_at = next((str(m.get("created_at") or "") for m in messages if isinstance(m, dict) and m.get("created_at")), "")
                     candidate_title, candidate_quality = _choose_session_title(
                         explicit_title=getattr(conv, "title", ""), messages=messages,
@@ -725,7 +916,24 @@ class ConversationHistoryStore:
                     sessions += 1
             except Exception:
                 raise
-        return {"conversation_count": sessions, "turn_count": turns}
+        result: dict[str, Any] = {"conversation_count": sessions, "turn_count": turns}
+        if shadow is not None:
+            shadow_results = []
+            for item in items:
+                try:
+                    shadow_results.append(shadow.sync_conversation(
+                        item,
+                        provider=provider,
+                        scope=scope,
+                        max_turns=shadow_max_turns,
+                        max_chars=shadow_max_chars,
+                    ))
+                except Exception as exc:
+                    # Shadow failures are diagnostics only; V1 has already
+                    # committed and remains the primary source of truth.
+                    shadow_results.append({"status": "failed", "code": type(exc).__name__})
+            result["shadow"] = shadow_results
+        return result
 
     def append_turn(
         self,
@@ -740,6 +948,9 @@ class ConversationHistoryStore:
         title: str = "",
         created_at: str = "",
         content_type: str = "text",
+        shadow: Any | None = None,
+        shadow_max_turns: int = 1000,
+        shadow_max_chars: int = 1_000_000,
     ) -> dict[str, Any]:
         """Atomically append one host-captured turn without keeping raw text elsewhere.
 
@@ -830,16 +1041,31 @@ class ConversationHistoryStore:
                 ).fetchone()
             if existing is not None:
                 conflict = existing["content_hash"] != content_hash
-                return {
+                result = {
                     "session_id": session_id, "turn_id": existing["turn_id"],
                     "inserted": False, "replayed": not conflict,
                     "event_conflict": conflict, "idempotency": "strict",
                 }
+                if shadow is not None:
+                    try:
+                        result["shadow"] = shadow.sync_turn(
+                            external_session_id=external_session_id,
+                            provider=active_provider,
+                            role=role,
+                            content=text,
+                            event_id=event_id,
+                            title=title,
+                            created_at=created_at,
+                            scope=scope,
+                            max_turns=shadow_max_turns,
+                            max_chars=shadow_max_chars,
+                        )
+                    except Exception as exc:
+                        result["shadow"] = {"status": "failed", "code": type(exc).__name__}
+                return result
             count = conn.execute(
                 "SELECT COUNT(*) AS count FROM conversation_turns WHERE session_id=?", (session_id,)
             ).fetchone()["count"]
-            if count >= MAX_SESSION_TURNS:
-                raise ValueError("history_import_session_turn_limit_exceeded")
             ordinal = int(count) + 1
             conn.execute("""
                 INSERT INTO conversation_turns(
@@ -868,11 +1094,28 @@ class ConversationHistoryStore:
                 INSERT INTO history_fts(session_id, turn_id, result_type, title, content)
                 VALUES (?, '', 'summary', ?, ?)
             """, (session_id, row["title"] if row else safe_title, summary))
-        return {
+        result = {
             "session_id": session_id, "turn_id": turn_id, "inserted": True,
             "replayed": False, "event_conflict": False,
             "idempotency": "strict" if event_key else "degraded",
         }
+        if shadow is not None:
+            try:
+                result["shadow"] = shadow.sync_turn(
+                    external_session_id=external_session_id,
+                    provider=active_provider,
+                    role=role,
+                    content=text,
+                    event_id=event_id,
+                    title=title,
+                    created_at=created_at,
+                    scope=scope,
+                    max_turns=shadow_max_turns,
+                    max_chars=shadow_max_chars,
+                )
+            except Exception as exc:
+                result["shadow"] = {"status": "failed", "code": type(exc).__name__}
+        return result
 
     def add_observation(self, scope: HistoryScope, *, session_id: str, summary: str,
                         observation_type: str = "note", turn_id: str = "") -> str:
@@ -1142,7 +1385,15 @@ class ConversationHistoryStore:
             exported.append(self.read(scope, session_id=session_id))
         return {"format": "memoryguard-history-v1", "exported_at": _now(), "sessions": exported}
 
-    def delete(self, scope: HistoryScope, *, session_ids: list[str], invalidate_evidence: bool = False) -> dict[str, int]:
+    def delete(
+        self,
+        scope: HistoryScope,
+        *,
+        session_ids: list[str],
+        invalidate_evidence: bool = False,
+        idempotency_key: str = "",
+        operation_digest: str = "",
+    ) -> dict[str, int | bool]:
         if not session_ids:
             raise ValueError("history_delete_scope_required")
         unique = list(dict.fromkeys(str(x) for x in session_ids if str(x)))[:MAX_PAGE]
@@ -1150,13 +1401,50 @@ class ConversationHistoryStore:
         where, args = self._owner_where(scope)
         deleted = invalidated = 0
         with self._transaction() as conn:
-                for session_id in unique:
-                    row = conn.execute(f"SELECT session_id FROM conversation_sessions s WHERE s.session_id=? AND {where}", [session_id, *args]).fetchone()
-                    if row is None: continue
-                    # A raw source may be removed only with a durable evidence
-                    # tombstone.  The legacy flag remains API-compatible, but
-                    # deletion always invalidates valid links atomically.
-                    cur = conn.execute("UPDATE evidence_links SET status='invalid', invalidated_at=? WHERE session_id=? AND status='valid'", (_now(), session_id)); invalidated += cur.rowcount
-                    conn.execute("DELETE FROM history_fts WHERE session_id=?", (session_id,))
-                    cur = conn.execute("DELETE FROM conversation_sessions WHERE session_id=?", (session_id,)); deleted += cur.rowcount
-        return {"deleted_sessions": deleted, "invalidated_evidence_links": invalidated, "long_term_memories_deleted": 0}
+            key = str(idempotency_key or "")
+            digest = str(operation_digest or "")
+            if key:
+                if not digest:
+                    raise ValueError("history_delete_idempotency_digest_required")
+                table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_mutation_receipts'"
+                ).fetchone()
+                if table is None:
+                    # Never perform a destructive mutation without a durable
+                    # replay fence.  The caller can surface this as a stable
+                    # blocker instead of pretending process-local idempotency.
+                    raise ValueError("durable_idempotency_unavailable")
+                prior = conn.execute(
+                    "SELECT operation,payload_digest,result_json FROM history_mutation_receipts WHERE idempotency_key=?",
+                    (key,),
+                ).fetchone()
+                if prior is not None:
+                    if prior["operation"] != "delete" or prior["payload_digest"] != digest:
+                        raise ValueError("mutation_idempotency_conflict")
+                    try:
+                        replay = json.loads(prior["result_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise ValueError("history_mutation_receipt_corrupt") from exc
+                    replay["idempotent_replay"] = True
+                    return replay
+            for session_id in unique:
+                row = conn.execute(f"SELECT session_id FROM conversation_sessions s WHERE s.session_id=? AND {where}", [session_id, *args]).fetchone()
+                if row is None: continue
+                # A raw source may be removed only with a durable evidence
+                # tombstone.  The legacy flag remains API-compatible, but
+                # deletion always invalidates valid links atomically.
+                cur = conn.execute("UPDATE evidence_links SET status='invalid', invalidated_at=? WHERE session_id=? AND status='valid'", (_now(), session_id)); invalidated += cur.rowcount
+                conn.execute("DELETE FROM history_fts WHERE session_id=?", (session_id,))
+                cur = conn.execute("DELETE FROM conversation_sessions WHERE session_id=?", (session_id,)); deleted += cur.rowcount
+            result: dict[str, int | bool] = {
+                "deleted_sessions": deleted,
+                "invalidated_evidence_links": invalidated,
+                "long_term_memories_deleted": 0,
+            }
+            if key:
+                result["idempotent_replay"] = False
+                conn.execute(
+                    "INSERT INTO history_mutation_receipts(idempotency_key,operation,payload_digest,result_json,created_at) VALUES (?,?,?,?,?)",
+                    (key, "delete", digest, json.dumps(result, sort_keys=True, separators=(",", ":")), _now()),
+                )
+            return result

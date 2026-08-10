@@ -539,6 +539,7 @@ def test_global_provider_install_includes_hook_without_duplicate_handlers(
     workspace.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     _bind(workspace, "codex-agent", "group-a")
 
     adapter = CodexAdapter(workspace)

@@ -1,0 +1,1265 @@
+from __future__ import annotations
+
+import copy
+import gc
+import json
+import os
+import pickle
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+from types import MappingProxyType
+import weakref
+
+import pytest
+
+from memoryguard.compat_v2 import CLI_COMMAND_NAMES, GUI_METHOD_NAMES, MCP_TOOL_NAMES
+from memoryguard.cutover_v2 import V2RuntimeFacade
+from memoryguard.cutover_v2.facade import _GenerationPort, get_v2_runtime_facade
+from memoryguard.runtime_v2.native_ports import (
+    NativeContextEnvelope,
+    NativeContextError,
+    NativePortError,
+    NativeV2RuntimePort,
+    bind_native_test_capability,
+    bind_native_test_services,
+    bind_native_transport_context,
+    resolve_native_transport_context,
+)
+
+
+def _trusted_native_context(tmp_path: Path) -> dict[str, object]:
+    from memoryguard.access_context import AccessContext
+
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="native-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+    )
+
+
+def _prepare_native_memory_workspace(tmp_path: Path) -> None:
+    from memoryguard.evidence.store import EvidenceStore
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.memory.store import MemoryAtomStore
+
+    MemoryAtomStore(tmp_path)
+    EvidenceStore(tmp_path)
+    GovernanceV2(tmp_path)
+
+
+def test_native_ports_fresh_import_does_not_load_legacy_compatibility_code():
+    root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(root / "src"), env.get("PYTHONPATH", "")) if part
+    )
+    code = (
+        "import sys; import memoryguard.runtime_v2.native_ports; "
+        "bad=sorted(k for k in sys.modules if k == 'memoryguard.compat_v2' "
+        "or k.startswith('memoryguard.compat_v2.')); assert not bad, bad"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_native_scoped_read_services_are_read_only_and_scope_isolated(tmp_path: Path):
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    pending = tmp_path / ".memoryguard" / "enrichments" / "pending.jsonl"
+    pending.parent.mkdir(parents=True)
+    pending.write_text(
+        '{"task_id":"t1","memory_id":"m1","scope":{"mode":"share_group","share_group_id":"g1"},"status":"pending","input":{"body":"scoped"}}\n',
+        encoding="utf-8",
+    )
+    before = pending.read_bytes()
+    context = bind_native_transport_context(
+        __import__("memoryguard.access_context", fromlist=["AccessContext"]).AccessContext(
+            trusted_agent_id="agent-a", is_admin=False, strict_binding=True,
+            allow_anon=False, session_id="s", session_source="transport", session_trusted=True,
+        ),
+        workspace_id=str(tmp_path), share_group_id="g1",
+    )
+    other = bind_native_transport_context(
+        __import__("memoryguard.access_context", fromlist=["AccessContext"]).AccessContext(
+            trusted_agent_id="agent-b", is_admin=False, strict_binding=True,
+            allow_anon=False, session_id="s2", session_source="transport", session_trusted=True,
+        ),
+        workspace_id=str(tmp_path), share_group_id="g2",
+    )
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    visible = port.dispatch_mcp("memoryguard_list_pending_enrichments", {}, context=context, generation=1)
+    hidden = port.dispatch_mcp("memoryguard_list_pending_enrichments", {}, context=other, generation=1)
+    status = port.dispatch_mcp("memoryguard_enrichment_status", {}, context=context, generation=1)
+    # V2 reads intentionally ignore the retired V1 pending.jsonl queue.  With
+    # no V2 Content Plane present the stable result is NO_SOURCE/zero for every
+    # scope, and the legacy file remains byte-for-byte untouched.
+    assert visible["ok"] and visible["data"]["pending_count"] == 0
+    assert visible["data"]["status"] == "NO_SOURCE"
+    assert hidden["ok"] and hidden["data"]["pending_count"] == 0
+    assert status["ok"] and status["data"]["pending"] == 0
+    assert status["data"]["status"] == "NO_SOURCE"
+    assert pending.read_bytes() == before
+    assert not (tmp_path / ".memoryguard" / "agent-bindings").exists()
+
+
+def test_native_gui_status_aliases_are_read_only_and_scope_neutral(tmp_path: Path):
+    """GUI compatibility aliases stay native, bounded, and non-creating."""
+
+    port = NativeV2RuntimePort(tmp_path)
+    first_context = _context(tmp_path)
+    second_context = {
+        **first_context,
+        "agent_instance_id": "other-agent",
+        "share_group_id": "other-group",
+    }
+    aliases = ("get_global_memory_status", "get_api_method_registry")
+    before = sorted(
+        str(path.relative_to(tmp_path))
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+
+    first = {
+        name: port.dispatch_gui(name, {}, context=first_context, generation=1)
+        for name in aliases
+    }
+    second = {
+        name: port.dispatch_gui(name, {}, context=second_context, generation=1)
+        for name in aliases
+    }
+    repeated = {
+        name: port.dispatch_gui(name, {}, context=first_context, generation=1)
+        for name in aliases
+    }
+
+    assert first["get_global_memory_status"]["ok"] is True
+    memory_status = first["get_global_memory_status"]["data"]
+    assert memory_status["status"] == "NO_SOURCE"
+    assert memory_status["available"] is False
+    assert memory_status["total_records"] == 0
+    registry = first["get_api_method_registry"]
+    assert registry["ok"] is True
+    assert registry["data"]["schema"] == "v2-native-coverage-1"
+    assert len(registry["data"]["registry_digest"]) == 64
+    assert "db_path" not in registry["data"]
+    # Scope is now a real bounded V2 status input, so different trusted
+    # tenants receive distinct scope projections while repeated calls remain
+    # deterministic and non-creating.
+    assert first == repeated
+    assert second["get_global_memory_status"]["data"]["scope"]["share_group_id"] == "other-group"
+    assert second["get_api_method_registry"] == first["get_api_method_registry"]
+    assert sorted(
+        str(path.relative_to(tmp_path))
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    ) == before
+    assert not (tmp_path / ".memoryguard").exists()
+
+
+def test_native_control_plane_reads_and_cli_probes_are_noop(tmp_path: Path):
+    """Control-plane aliases never create storage, paths, or child processes."""
+
+    port = NativeV2RuntimePort(tmp_path)
+    first_context = _context(tmp_path)
+    second_context = {
+        **first_context,
+        "agent_instance_id": "other-agent",
+        "share_group_id": "other-group",
+    }
+    gui_aliases = (
+        "get_sandbox_status",
+        "get_host_enrichment_guide",
+        "list_host_llm_agents",
+    )
+    cli_aliases = ("gui", "open", "desktop")
+
+    first = {
+        name: port.dispatch_gui(name, {}, context=first_context, generation=1)
+        for name in gui_aliases
+    }
+    second = {
+        name: port.dispatch_gui(name, {}, context=second_context, generation=1)
+        for name in gui_aliases
+    }
+    repeated = {
+        name: port.dispatch_gui(name, {}, context=first_context, generation=1)
+        for name in gui_aliases
+    }
+    cli = {
+        name: port.dispatch_cli(name, {}, generation=1)
+        for name in cli_aliases
+    }
+
+    assert first["get_sandbox_status"]["ok"] is True
+    assert isinstance(first["get_sandbox_status"]["data"]["sandbox"], bool)
+    guide = first["get_host_enrichment_guide"]
+    assert guide["ok"] is True
+    assert guide["data"]["mode"] == "host_skill_primary"
+    assert guide["data"]["pending_count"] == 0
+    agents = first["list_host_llm_agents"]
+    assert agents["ok"] is True
+    assert agents["data"]["primary"] == "host"
+    assert all(item.get("cli", "") == "" for item in agents["data"]["agents"])
+    assert first == second == repeated
+    for name in ("gui", "open"):
+        result = cli[name]
+        assert result["ok"] is True
+        assert result["data"]["host_action"] == name
+        assert result["data"]["gated_by"] == "v2_native_manifest"
+    assert cli["desktop"]["ok"] is False
+    assert cli["desktop"]["code"] == "v2_state_provider_required"
+
+    assert not (tmp_path / ".memoryguard").exists()
+
+    gui_entries = {
+        item["name"]: item
+        for item in port.coverage()["surfaces"]["gui"]["entries"]
+    }
+    cli_entries = {
+        item["name"]: item
+        for item in port.coverage()["surfaces"]["cli"]["entries"]
+    }
+    for name in gui_aliases:
+        assert gui_entries[name]["status"] == "implemented"
+    for name in cli_aliases:
+        assert cli_entries[name]["status"] == "implemented"
+    assert gui_entries["get_build_progress"]["status"] == "retired"
+    assert gui_entries["get_request_status"]["status"] == "retired"
+    assert gui_entries["list_pending_requests"]["status"] == "retired"
+
+
+def test_native_graph_and_semantic_reads_are_scoped_and_no_body_leak(tmp_path: Path):
+    from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore
+    from memoryguard.memory.store import MemoryAtomStore
+
+    context = {
+        **_context(tmp_path),
+        "runtime_role": "root",
+    }
+    missing = NativeV2RuntimePort(tmp_path)
+    before = list(tmp_path.rglob("*"))
+    for name, args in (
+        ("memoryguard_neuron_graph", {}),
+        ("memoryguard_semantic_check", {"text": "hello"}),
+    ):
+        result = missing.dispatch_mcp(name, args, context=context, generation=1)
+        assert result["ok"] is False
+        assert result["code"] in {"v2_store_unavailable", "v2_schema_missing"}
+    assert list(tmp_path.rglob("*")) == before
+
+    graph_store = CodeGraphStore(tmp_path)
+    graph_scope = CodeGraphScope(
+        str(tmp_path), "agent-bound", "project-bound", "codex", "group-bound", "root",
+    )
+    source = graph_store.upsert_source_file(
+        "src/demo.py",
+        "digest-demo",
+        scope=graph_scope,
+        symbols=({"name": "demo", "kind": "function", "signature": "demo()", "line_start": 1, "line_end": 2},),
+    )
+    # Native semantic reads accept an explicitly validated read-only store;
+    # no atom rows are needed to prove empty/scope-neutral behavior here.
+    memory_store = MemoryAtomStore(tmp_path)
+    readonly_memory = MemoryAtomStore(tmp_path, readonly=True)
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(stores={"memory": readonly_memory}),
+    )
+    graph = port.dispatch_mcp(
+        "memoryguard_neuron_graph", {}, context=context, generation=1,
+    )
+    assert graph["ok"] is True
+    assert graph["data"]["status"] == "READY"
+    assert any(node["id"] == source.file_id for node in graph["data"]["nodes"])
+    encoded_graph = json.dumps(graph, ensure_ascii=False)
+    assert "body" not in encoded_graph and "demo source body" not in encoded_graph
+
+    semantic = port.dispatch_mcp(
+        "memoryguard_semantic_check", {"text": "hello", "threshold": 0.8},
+        context=context, generation=1,
+    )
+    assert semantic["ok"] is True
+    assert semantic["data"]["duplicates"] == []
+    assert semantic["data"]["checked_against"] == 0
+    assert not (tmp_path / "legacy").exists()
+    del memory_store
+
+    other = {
+        **context,
+        "agent_instance_id": "other-agent",
+        "share_group_id": "other-group",
+    }
+    isolated = port.dispatch_mcp(
+        "memoryguard_neuron_graph", {}, context=other, generation=1,
+    )
+    assert isolated["ok"] is True
+    assert isolated["data"]["nodes"] == []
+
+
+def test_native_audit_is_real_ro_receipt_without_report_writes(tmp_path: Path):
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    context = _trusted_native_context(tmp_path)
+    before = sorted(
+        str(path.relative_to(tmp_path))
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
+    first = port.dispatch_mcp(
+        "memoryguard_audit", {}, context=context, generation=1,
+    )
+    second = port.dispatch_mcp(
+        "memoryguard_audit", {}, context=context, generation=1,
+    )
+    assert first["ok"] is True
+    assert first["status"] == "ok"
+    assert first["data"]["status"] == "BLOCKED"
+    assert first["data"]["blocked"] is True
+    assert "row_hash" not in json.dumps(first, ensure_ascii=False)
+    assert first == second
+    assert sorted(
+        str(path.relative_to(tmp_path))
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    ) == before
+    assert not (tmp_path / ".memoryguard" / "reports").exists()
+
+
+def _context(tmp_path: Path) -> dict[str, str]:
+    return {
+        "workspace_id": str(tmp_path),
+        "agent_instance_id": "agent-bound",
+        "share_group_id": "group-bound",
+        "project_ref": "project-bound",
+        "provider": "codex",
+        "runtime_role": "root",
+    }
+
+
+def test_registry_is_complete_and_digest_is_stable(tmp_path):
+    port = NativeV2RuntimePort(tmp_path)
+    coverage = port.coverage()
+    assert coverage["schema"] == "v2-native-coverage-1"
+    assert len(coverage["registry_digest"]) == 64
+    assert set(coverage["surfaces"]) == {"mcp", "gui", "cli", "hook"}
+    assert {item["name"] for item in coverage["surfaces"]["mcp"]["entries"]} == set(MCP_TOOL_NAMES)
+    assert {item["name"] for item in coverage["surfaces"]["gui"]["entries"]} == set(GUI_METHOD_NAMES)
+    assert {item["name"] for item in coverage["surfaces"]["cli"]["entries"]} == set(CLI_COMMAND_NAMES)
+    assert coverage["registry_digest"] == NativeV2RuntimePort(tmp_path).coverage()["registry_digest"]
+    assert coverage["counts"]["blocker"] == 0
+    assert coverage["counts"]["neutral-read"] == 0
+    assert coverage["counts"]["retired"] > 0
+    assert coverage["complete"] is True
+    assert coverage["production_complete"] is True
+    gui_by_name = {
+        item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]
+    }
+    for name in (
+        "edit_memory", "lock_memory", "unlock_memory",
+        "set_memory_injection_policy", "restore_memory", "delete_memory",
+    ):
+        assert gui_by_name[name]["status"] == "implemented"
+    assert gui_by_name["rollback_memory"]["status"] == "retired"
+    assert gui_by_name["rollback_memory"]["reason"]
+
+
+def test_context_spoof_is_rejected_before_native_handler(tmp_path):
+    calls: list[dict] = []
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_services({"memoryguard_memory_status": lambda payload, **kwargs: calls.append(payload) or {"ok": True}}),
+    )
+    result = port.dispatch_mcp(
+        "memoryguard_memory_status",
+        {"agent_instance_id": "attacker"},
+        context=_context(tmp_path),
+        generation=3,
+    )
+    assert result["code"] == "context_identity_spoof"
+    assert not calls
+
+
+def test_native_transport_resolver_rejects_sentinel_only_and_tampered_association(tmp_path):
+    bound = _trusted_native_context(tmp_path)
+    authority = bound.bound_context
+    assert resolve_native_transport_context(bound) is authority
+    assert resolve_native_transport_context(dict(bound)) is authority
+    assert resolve_native_transport_context(copy.copy(bound)) is authority
+
+    sentinel_only = {
+        "__native_transport_capability": bound["__native_transport_capability"],
+        "admin": True,
+    }
+    with pytest.raises(NativeContextError, match="trusted_context_capability_required"):
+        resolve_native_transport_context(sentinel_only)
+
+    tampered = NativeContextEnvelope(authority)
+    tampered["__native_bound_context"] = object()
+    with pytest.raises(NativeContextError, match="trusted_context_capability_required"):
+        resolve_native_transport_context(tampered)
+
+    class EnvelopeSubclass(NativeContextEnvelope):
+        pass
+
+    with pytest.raises(NativeContextError, match="trusted_context_capability_required"):
+        resolve_native_transport_context(EnvelopeSubclass(authority))
+    with pytest.raises(NativeContextError, match="trusted_context_capability_required"):
+        resolve_native_transport_context(MappingProxyType(dict(bound)))
+
+
+def test_wrapper_to_dict_cannot_supply_native_authority_for_read_or_mutation(tmp_path):
+    """P1: untrusted wrappers must not turn ``to_dict`` into an authority seam."""
+
+    class Rules:
+        def __init__(self):
+            self.calls = []
+
+        def upsert_binding(self, value, **kwargs):
+            self.calls.append(dict(value))
+            return value
+
+    class Wrapper:
+        def __init__(self, envelope):
+            self.envelope = envelope
+
+        def to_dict(self):
+            forged = dict(self.envelope)
+            forged.update({
+                "admin": True,
+                "is_admin": True,
+                "agent_instance_id": "victim-agent",
+                "share_group_id": "victim-group",
+                "session_id": "attacker-session",
+                "session_source": "host",
+                "session_trusted": True,
+            })
+            return forged
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    calls = []
+    rules = Rules()
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(
+            services={
+                "memoryguard_memory_status": lambda payload, **kwargs: calls.append(kwargs["context"]) or {"ok": True},
+            },
+            stores={"rules": rules},
+        ),
+        state_provider=Manifest(),
+    )
+    wrapper = Wrapper(_trusted_native_context(tmp_path))
+    read = port.dispatch_mcp(
+        "memoryguard_memory_status", {}, context=wrapper, generation=1,
+    )
+    assert read["code"] == "trusted_context_capability_required"
+    assert calls == []
+
+    mutation = port.dispatch_mcp(
+        "memoryguard_binding_create",
+        {"binding_id": "wrapper-attack", "definition_id": "d1", "target_type": "system"},
+        context=wrapper,
+        generation=1,
+    )
+    assert mutation["code"] == "trusted_context_capability_required"
+    assert rules.calls == []
+
+
+def test_native_bound_context_registry_is_weak_and_shrinks_after_gc(tmp_path):
+    from memoryguard.runtime_v2 import native_ports
+
+    baseline = len(native_ports._NATIVE_BOUND_CONTEXTS)
+    envelopes = [
+        _trusted_native_context(tmp_path)
+        for _ in range(32)
+    ]
+    references = [weakref.ref(envelope.bound_context) for envelope in envelopes]
+    assert len(native_ports._NATIVE_BOUND_CONTEXTS) >= baseline + 32
+    del envelopes
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    # Weak registries may also release baseline contexts owned by prior tests
+    # once this explicit collection runs.  The invariant is no retained growth
+    # from this batch, not that unrelated garbage must stay alive.
+    assert len(native_ports._NATIVE_BOUND_CONTEXTS) <= baseline
+
+
+def test_plain_governed_injection_is_rejected_and_coverage_cannot_promote(tmp_path):
+    with pytest.raises(NativePortError, match="service_injection_capability"):
+        NativeV2RuntimePort(tmp_path, services={"memoryguard_memory_write": lambda *_a, **_k: {}})
+    with pytest.raises(NativePortError, match="store_injection_capability"):
+        NativeV2RuntimePort(tmp_path, memory_store=object())
+
+    # An explicit capability is only a test seam; it does not alter the
+    # registry/readiness claim for any mutation surface.
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(
+            services={"memoryguard_history_read": lambda *_a, **_k: {"forged": True}},
+        ),
+    )
+    entry = next(item for item in port.coverage()["surfaces"]["mcp"]["entries"] if item["name"] == "memoryguard_history_read")
+    # History is now a production builtin; a generic test service cannot
+    # promote or replace it, but the registry remains implemented.
+    assert entry["status"] == "implemented"
+    result = port.dispatch_mcp(
+        "memoryguard_history_read",
+        {"session_id": "missing"},
+        context=_context(tmp_path),
+        generation=3,
+    )
+    assert result["ok"] is True
+    assert result["data"]["neutral"] is True
+
+
+@pytest.mark.parametrize(
+    "argument",
+    [
+        "memory_store", "evidence_store", "governance", "rule_store",
+        "asset_store", "skill_store", "knowledge_adapter", "content_store",
+        "codegraph_store", "projection_store",
+    ],
+)
+def test_direct_store_and_governance_overrides_are_rejected(argument, tmp_path):
+    with pytest.raises(NativePortError, match="native_.*injection|native_governance_injection"):
+        NativeV2RuntimePort(tmp_path, **{argument: object()})
+
+
+def test_governed_service_override_never_runs_even_with_private_capability(tmp_path):
+    _prepare_native_memory_workspace(tmp_path)
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    calls: list[dict] = []
+    with pytest.raises(NativePortError, match="native_mutation_service_override_forbidden"):
+        NativeV2RuntimePort(
+            tmp_path,
+            state_provider=Manifest(),
+            services=bind_native_test_services(
+                {"memoryguard_memory_write": lambda payload, **kwargs: calls.append(dict(kwargs)) or {"forged": True}},
+            ),
+        )
+    assert calls == []
+
+
+def test_schema_lease_blocks_path_replacement_before_writable_constructor(tmp_path, monkeypatch):
+    _prepare_native_memory_workspace(tmp_path)
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    db = tmp_path / ".memoryguard" / "memory" / "memory.db"
+    original_identity = port._file_identity
+    identity_calls = 0
+
+    def replaced_identity(path):
+        nonlocal identity_calls
+        identity_calls += 1
+        value = original_identity(path)
+        # The second check observes a replacement between preflight and the
+        # writable constructor.  No Store constructor should be reached.
+        return (*value[:3], value[3] + 1) if identity_calls >= 2 else value
+
+    monkeypatch.setattr(port, "_file_identity", replaced_identity)
+    result = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "replace", "body": "x", "idempotency_key": "replace-1"},
+        context=_trusted_native_context(tmp_path),
+        generation=1,
+    )
+    assert result["code"] == "v2_schema_replaced"
+    assert db.stat().st_size > 0
+
+
+@pytest.mark.parametrize(
+    "service_result",
+    [
+        {"ok": False, "status": "error", "error": "denied", "detail": "extra"},
+        {"ok": True, "status": "blocked", "reason": "gate", "detail": "extra"},
+        {"status": "failed", "code": "failed_code", "detail": "extra"},
+    ],
+)
+def test_native_result_promotes_failure_envelope_even_with_extra_fields(tmp_path, service_result):
+    result = NativeV2RuntimePort._result(
+        "mcp", "memoryguard_memory_status", service_result, generation=1,
+    )
+    assert result["ok"] is False
+    assert result["status"] in {"error", "blocked", "failed"}
+    assert result["path"] == "v2"
+    assert result["detail"] == "extra"
+
+
+def test_history_surface_is_a_native_neutral_read_when_unbound(tmp_path):
+    port = NativeV2RuntimePort(tmp_path)
+    result = port.dispatch_mcp(
+        "memoryguard_history_read", {}, context=_context(tmp_path), generation=1,
+    )
+    assert result["status"] == "ok"
+    assert result["data"]["neutral"] is True
+
+
+def test_hook_bootstrap_uses_one_native_route(tmp_path):
+    calls: list[tuple] = []
+
+    class Engine:
+        def bootstrap(self, request, candidates):
+            calls.append((request, candidates))
+            return {"ready": True, "items": []}
+
+    port = NativeV2RuntimePort(tmp_path, context_engine=Engine())
+    result = port.bootstrap_hook(
+        {"task": "hello"}, {"candidates": []}, context=_context(tmp_path), generation=5,
+    )
+    assert result["ok"] is True
+    assert result["path"] == "v2"
+    assert result["generation"] == 5
+    assert len(calls) == 1
+
+
+def test_facade_active_routes_native_once_and_ready_blocks_write(tmp_path):
+    class Manifest:
+        def __init__(self, state):
+            self.state = state
+            self.calls = 0
+
+        def current(self):
+            self.calls += 1
+            return {"state": self.state, "generation": 7}
+
+    calls: list[tuple] = []
+    native = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_services({
+            "memoryguard_memory_status": lambda payload, **kwargs: calls.append((payload, kwargs)) or {"healthy": True},
+        }),
+    )
+    manifest = Manifest("V2_ACTIVE")
+    facade = V2RuntimeFacade(manifest=manifest, v2=native, workspace=str(tmp_path))
+    result = facade.dispatch_mcp("memoryguard_memory_status", {}, context=_context(tmp_path))
+    assert result["path"] == "v2" and result["ok"] is True
+    assert len(calls) == 1 and manifest.calls == 1
+
+    ready = V2RuntimeFacade(manifest=Manifest("V2_READY"), v2=native, workspace=str(tmp_path))
+    denied = ready.dispatch_mcp("memoryguard_memory_write", {"memory_id": "m", "body": "x"}, context=_context(tmp_path))
+    assert denied["code"] == "v2_not_active"
+
+
+def test_missing_or_partial_store_never_creates_or_heals(tmp_path):
+    port = NativeV2RuntimePort(tmp_path)
+    result = port.dispatch_mcp("memoryguard_memory_status", {}, context=_context(tmp_path), generation=1)
+    assert result["ok"] is True
+    assert result["data"]["status"] == "NO_SOURCE"
+    assert result["data"]["available"] is False
+    assert result["data"]["total_records"] == 0
+    assert not (tmp_path / ".memoryguard").exists()
+
+    db = tmp_path / ".memoryguard" / "memory" / "memory.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    before = db.stat().st_size
+    result = port.dispatch_mcp("memoryguard_memory_status", {}, context=_context(tmp_path), generation=1)
+    assert result["ok"] is False
+    assert result["code"] in {"v2_schema_missing", "v2_store_schema_invalid", "v2_memory_status_unavailable"}
+    assert db.stat().st_size == before
+
+
+def test_native_memory_mutation_preflights_empty_schema_before_store_init(tmp_path):
+    db = tmp_path / ".memoryguard" / "memory" / "memory.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    result = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m", "body": "x", "idempotency_key": "k", "evidence": [{"source_ref": "s", "digest": "d"}]},
+        context=_trusted_native_context(tmp_path),
+        generation=1,
+    )
+    assert result["code"] == "v2_schema_missing"
+    assert db.stat().st_size == 0
+
+
+def test_native_memory_mutation_blocks_future_and_partial_schema(tmp_path):
+    from memoryguard.memory.store import MemoryAtomStore
+
+    MemoryAtomStore(tmp_path)
+    memory_db = tmp_path / ".memoryguard" / "memory" / "memory.db"
+    with sqlite3.connect(memory_db) as conn:
+        conn.execute("UPDATE memory_schema_meta SET version=99 WHERE domain='memory'")
+        conn.commit()
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    future = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m", "body": "x", "idempotency_key": "k"},
+        context=_trusted_native_context(tmp_path),
+        generation=1,
+    )
+    assert future["code"] == "v2_schema_future"
+
+    # A fresh empty file is classified as missing; a marker-bearing file
+    # without required tables/columns is a stable partial blocker.
+    partial_root = tmp_path / "partial"
+    MemoryAtomStore(partial_root)
+    partial_db = partial_root / ".memoryguard" / "memory" / "memory.db"
+    with sqlite3.connect(partial_db) as conn:
+        conn.execute("DROP TABLE atom_deltas")
+        conn.commit()
+    partial_port = NativeV2RuntimePort(partial_root, state_provider=Manifest())
+    partial = partial_port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m", "body": "x", "idempotency_key": "k"},
+        context=_trusted_native_context(partial_root),
+        generation=1,
+    )
+    assert partial["code"] == "v2_schema_partial"
+
+
+def test_native_memory_governance_receipt_replays_across_restart_and_conflicts_on_body(tmp_path):
+    _prepare_native_memory_workspace(tmp_path)
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    request = {
+        "memory_id": "native-retry",
+        "body": "v1",
+        "idempotency_key": "native-request-1",
+        "evidence": [{"source_ref": "native-retry", "digest": "r1"}],
+    }
+    context = _trusted_native_context(tmp_path)
+    first = NativeV2RuntimePort(tmp_path, state_provider=Manifest()).dispatch_mcp(
+        "memoryguard_memory_write", request, context=context, generation=1,
+    )
+    second = NativeV2RuntimePort(tmp_path, state_provider=Manifest()).dispatch_mcp(
+        "memoryguard_memory_write", request, context=context, generation=1,
+    )
+    assert first["ok"] is True and second["ok"] is True
+    assert first["data"]["receipt"]["decision_id"] == second["data"]["receipt"]["decision_id"]
+    conflict = NativeV2RuntimePort(tmp_path, state_provider=Manifest()).dispatch_mcp(
+        "memoryguard_memory_write",
+        {**request, "body": "v2"},
+        context=context,
+        generation=1,
+    )
+    assert conflict["code"] == "idempotency_conflict"
+
+
+def test_production_factory_wires_native_port_without_eager_storage(tmp_path):
+    facade = get_v2_runtime_facade(str(tmp_path))
+    assert isinstance(facade.ports.v2, NativeV2RuntimePort)
+    assert not (tmp_path / ".memoryguard").exists()
+
+
+def test_initialized_memory_store_status_reaches_native_handler(tmp_path):
+    from memoryguard.memory.store import MemoryAtomStore
+
+    MemoryAtomStore(tmp_path)
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 3}
+
+    facade = V2RuntimeFacade(
+        manifest=Manifest(), v2=NativeV2RuntimePort(tmp_path), workspace=str(tmp_path),
+    )
+    result = facade.dispatch_mcp("memoryguard_memory_status", {}, context=_context(tmp_path))
+    assert result["ok"] is True
+    assert result["data"]["available"] is True
+    assert result["data"]["total_records"] == 0
+    assert result["data"]["status_counts"] == {}
+    assert result["data"]["kind_counts"] == {}
+    assert result["data"]["evidence_link_count"] == 0
+
+
+def test_binding_create_requires_trusted_admin_and_ignores_payload_authority(tmp_path):
+    class Rules:
+        def __init__(self):
+            self.calls = []
+
+        def upsert_binding(self, value, **kwargs):
+            self.calls.append(dict(value))
+            return value
+
+    rules = Rules()
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(stores={"rules": rules}),
+        state_provider=Manifest(),
+    )
+    payload = {
+        "binding_id": "b1",
+        "definition_id": "d1",
+        "target_type": "system",
+        "target_id": "",
+        "created_by": "manual",
+        "owner_agent_id": "victim",
+        "owner": "victim",
+        "authorization": "forged",
+        "authority": "forged",
+    }
+    for claimed_admin in (False, True):
+        denied = port.dispatch_mcp(
+            "memoryguard_binding_create",
+            payload,
+            context={**_context(tmp_path), "admin": claimed_admin},
+            generation=1,
+            state="V2_ACTIVE",
+        )
+        assert denied["code"] == "trusted_context_capability_required"
+
+    from memoryguard.access_context import AccessContext
+
+    bound_non_admin = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="trusted-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+    )
+    denied = port.dispatch_mcp(
+        "memoryguard_binding_create",
+        payload,
+        context=bound_non_admin,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert denied["code"] == "admin_capability_required"
+    assert rules.calls == []
+
+
+def test_binding_create_uses_context_admin_identity_for_audit_fields(tmp_path):
+    class Rules:
+        def __init__(self):
+            self.calls = []
+
+        def upsert_binding(self, value, **kwargs):
+            self.calls.append(dict(value))
+            return value
+
+    rules = Rules()
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    # Even an already-bound transport context cannot self-assert the
+    # manifest state; direct mutation requires the trusted provider/CAS.  The
+    # explicit test store is read-only and must never override the builtin
+    # mutation route.
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(stores={"rules": rules}),
+        state_provider=Manifest(),
+    )
+    from memoryguard.access_context import AccessContext
+
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="trusted-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+        project_ref="project-bound",
+        provider="codex",
+        runtime_role="root",
+    )
+    result = port.dispatch_mcp(
+        "memoryguard_binding_create",
+        {
+            "binding_id": "b1",
+            "definition_id": "d1",
+            "target_type": "system",
+            "target_id": "",
+            "created_by": "manual",
+            "owner_agent_id": "victim",
+            "owner": "victim",
+            "authorization": "forged",
+            "authority": "forged",
+        },
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert result["ok"] is False
+    assert rules.calls == []
+
+
+def test_native_bound_context_public_mapping_attacks_never_write(tmp_path):
+    """P0: only the issued immutable authority may authorize binding_create."""
+
+    class Rules:
+        def __init__(self):
+            self.calls = []
+
+        def upsert_binding(self, value, **kwargs):
+            self.calls.append(dict(value))
+            return value
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    rules = Rules()
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(stores={"rules": rules}),
+        state_provider=Manifest(),
+    )
+    from memoryguard.access_context import AccessContext
+
+    bound = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="trusted-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+    )
+    request = {
+        "binding_id": "attack",
+        "definition_id": "definition",
+        "target_type": "system",
+        "target_id": "",
+    }
+
+    # Mutating the compatibility mapping cannot promote its private authority.
+    public_mutation = dict(bound)
+    public_mutation.update({
+        "admin": True,
+        "is_admin": True,
+        "agent_instance_id": "victim",
+        "share_group_id": "victim-group",
+        "session_id": "attacker-session",
+        "session_source": "host",
+        "session_trusted": True,
+    })
+    denied = port.dispatch_mcp(
+        "memoryguard_binding_create", request, context=public_mutation,
+        generation=1,
+    )
+    assert denied["code"] == "admin_capability_required"
+
+    # Sentinel-only/plain mappings and hand-written lookalikes are not native.
+    sentinel_only = dict(public_mutation)
+    sentinel_only.pop("__native_bound_context", None)
+    denied = port.dispatch_mcp(
+        "memoryguard_binding_create", request, context=sentinel_only,
+        generation=1,
+    )
+    assert denied["code"] in {"trusted_context_capability_required", "context_identity_conflict"}
+
+    class Lookalike:
+        admin = True
+        is_admin = True
+        agent_instance_id = "victim"
+        share_group_id = "victim-group"
+        workspace_id = str(tmp_path)
+        session_id = "attacker-session"
+        session_source = "host"
+        session_trusted = True
+
+    denied = port.dispatch_mcp(
+        "memoryguard_binding_create", request, context=Lookalike(),
+        generation=1,
+    )
+    assert denied["code"] == "trusted_context_capability_required"
+
+    # Envelope shallow copies retain the same non-admin authority; copying the
+    # authority itself, deep-copy and pickle all fail closed.
+    shallow = copy.copy(bound)
+    denied = port.dispatch_mcp(
+        "memoryguard_binding_create", request, context=shallow,
+        generation=1,
+    )
+    assert denied["code"] == "admin_capability_required"
+    with pytest.raises(TypeError):
+        copy.copy(bound["__native_bound_context"])
+    with pytest.raises(TypeError):
+        copy.deepcopy(bound)
+    with pytest.raises(TypeError):
+        pickle.dumps(bound)
+    assert rules.calls == []
+
+
+def test_direct_mutation_requires_manifest_provider_and_generation_cas(tmp_path):
+    class Manifest:
+        def __init__(self, state="V2_ACTIVE", generation=7):
+            self.state = state
+            self.generation = generation
+
+        def current(self):
+            return {"state": self.state, "generation": self.generation}
+
+    calls = []
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    from memoryguard.access_context import AccessContext
+
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="trusted-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+    )
+    stale = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m1", "body": "x", "idempotency_key": "native-cas-1"},
+        context=context,
+        generation=6,
+    )
+    assert stale["code"] == "manifest_generation_mismatch"
+    assert calls == []
+    current = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m1", "body": "x", "idempotency_key": "native-cas-1"},
+        context=context,
+        generation=7,
+    )
+    # Governed memory writes never dispatch to an injected service.
+    assert current["code"] == "v2_schema_missing"
+    assert calls == []
+
+
+def test_direct_mutation_with_self_asserted_state_is_rejected(tmp_path):
+    from memoryguard.access_context import AccessContext
+
+    port = NativeV2RuntimePort(tmp_path)
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="trusted-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="group-bound",
+    )
+    result = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        {"memory_id": "m1", "body": "x"},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert result["code"] == "v2_state_provider_required"
+
+
+def test_injected_service_cannot_promote_blocker_into_production_coverage(tmp_path):
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_services({"memoryguard_history_read": lambda payload, **kwargs: {"forged": True}}),
+    )
+    coverage = port.coverage()
+    entry = next(
+        item for item in coverage["surfaces"]["mcp"]["entries"]
+        if item["name"] == "memoryguard_history_read"
+    )
+    assert entry["status"] == "implemented"
+    result = port.dispatch_mcp(
+        "memoryguard_history_read", {}, context=_context(tmp_path), generation=1,
+    )
+    assert result["status"] == "ok"
+    assert result["data"]["neutral"] is True
+
+
+def test_cli_maintenance_requires_its_private_transport_capability(tmp_path):
+    from memoryguard.maintenance_v2.runtime_port import (
+        MaintenanceRuntimePort,
+        bind_maintenance_transport_context,
+    )
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    native = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=Manifest(),
+        maintenance_port=MaintenanceRuntimePort(tmp_path),
+    )
+    trusted = bind_maintenance_transport_context({"trusted_agent_id": "cli-agent"})
+    allowed = native.dispatch_cli(
+        "storage",
+        {"action": "lease-acquire", "ttl_seconds": 30},
+        context=trusted,
+        generation=1,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert allowed["ok"] is True, allowed
+
+    forged = native.dispatch_cli(
+        "storage",
+        {"action": "lease-acquire", "ttl_seconds": 30},
+        context={"trusted_agent_id": "attacker"},
+        generation=1,
+        # The caller cannot downgrade a storage write to a read.
+        mutation=False,
+        state="V2_ACTIVE",
+    )
+    assert forged["ok"] is False
+    assert forged["status"] == "error"
+
+    # A valid maintenance capability cannot downgrade a mutating sub-action
+    # and self-assert ACTIVE when the native port has no trusted state source.
+    unbound_native = NativeV2RuntimePort(
+        tmp_path / "unbound",
+        maintenance_port=MaintenanceRuntimePort(tmp_path / "unbound"),
+    )
+    downgraded = unbound_native.dispatch_cli(
+        "storage",
+        {"action": "lease-acquire", "ttl_seconds": 30},
+        context=trusted,
+        generation=1,
+        mutation=False,
+        state="V2_ACTIVE",
+    )
+    assert downgraded["ok"] is False
+    assert downgraded["code"] == "v2_state_provider_required"
+
+
+def test_native_statuses_return_scoped_no_source_without_global_store_reads(tmp_path):
+    class Exploding:
+        def status(self):
+            raise AssertionError("native status must not open unrelated aggregate store")
+
+    # Native status routes report real scoped availability without opening an
+    # unrelated injected aggregate store or creating missing V2 domains.
+    port = NativeV2RuntimePort(
+        tmp_path,
+        services=bind_native_test_capability(stores={"codegraph": Exploding()}),
+    )
+    context = _context(tmp_path)
+    memory = port.dispatch_mcp("memoryguard_memory_status", {}, context=context, generation=1)
+    graph = port.dispatch_mcp("memoryguard_projection_status", {}, context=context, generation=1)
+    canonical = port.dispatch_mcp("memoryguard_canonical_status", {}, context=context, generation=1)
+    diagnostics = port.dispatch_mcp("memoryguard_diagnostics_snapshot", {}, context=context, generation=1)
+    scope = port.dispatch_gui("get_governance_scope", {}, context=context, generation=1)
+    for result in (memory, graph, canonical, diagnostics, scope):
+        assert result["ok"] is True, result
+        assert "db_path" not in result
+        assert "atoms" not in result
+    assert memory["data"]["status"] == "NO_SOURCE"
+    assert memory["data"]["total_records"] == 0
+    assert graph["data"]["status"] == "NO_SOURCE"
+    assert canonical["data"]["status"] == "NO_SOURCE"
+    assert diagnostics["data"]["status"] == "READY"
+    assert diagnostics["data"]["memory"]["status"] == "NO_SOURCE"
+    assert scope["data"]["available"] is True
+    assert scope["data"]["agent_instance_id"] == "agent-bound"
+    assert scope["data"]["share_group_id"] == "group-bound"
+    assert scope["data"]["project_ref"] == "project-bound"
+    assert scope["data"]["provider"] == "codex"
+    assert not (tmp_path / ".memoryguard").exists()
+
+
+def test_cli_doctor_and_mcp_status_are_safe_without_agent_binding(tmp_path):
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 11}
+
+    _prepare_native_memory_workspace(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+
+    doctor = port.dispatch_cli(
+        "doctor", {}, context={}, generation=11, state="V2_ACTIVE",
+    )
+    status = port.dispatch_cli(
+        "mcp-status", {}, context={}, generation=11, state="V2_ACTIVE",
+    )
+
+    for result in (doctor, status):
+        assert result["ok"] is True, result
+        data = result["data"]
+        assert data["status"] == "READY"
+        assert data["scope_status"] == "UNBOUND"
+        assert data["manifest"] == {"state": "V2_ACTIVE", "generation": 11}
+        assert data["native_coverage"]["production_complete"] is True
+        assert "total_records" not in data
+        assert "share_group_id" not in json.dumps(data, ensure_ascii=False)
+    assert status["data"]["available"] is True
+    assert status["data"]["memory_status"] == "READY"
+
+
+def test_generation_port_status_does_not_retry_type_error_without_workspace(tmp_path):
+    class Port:
+        def status(self, workspace):
+            raise TypeError("implementation failure")
+
+    class Facade:
+        pass
+
+    import pytest
+
+    with pytest.raises(TypeError, match="implementation failure"):
+        _GenerationPort(Port(), generation=1, facade=Facade()).status(str(tmp_path))

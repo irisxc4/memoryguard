@@ -442,6 +442,25 @@ CREATE TABLE IF NOT EXISTS rule_canonical_state (
 # ledger has a foreign key to rule_definitions.
 _SCHEMA += EVIDENCE_LEDGER_SCHEMA
 _SCHEMA += "\n" + GOVERNANCE_CAPABILITY_SCHEMA
+# Native V2 governance requests are fenced in the same SQLite transaction as
+# capability consumption and proposal mutation.  The ledger intentionally
+# stores only a request fingerprint/result projection; bearer tokens and raw
+# mutation receipts never persist here.
+_SCHEMA += """
+CREATE TABLE IF NOT EXISTS rule_merge_native_requests (
+    request_key TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'committed')),
+    result_json TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_merge_native_requests_status
+    ON rule_merge_native_requests(status);
+"""
 
 
 def _now() -> str:
@@ -700,6 +719,9 @@ class RuleMergeStore:
     # ------------------------------------------------------------------
 
     _UPGRADE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+        ("governance_capabilities", "recovery_proof_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("governance_capabilities", "token_version", "TEXT NOT NULL DEFAULT 'v1'"),
+        ("governance_capabilities", "revoked", "INTEGER NOT NULL DEFAULT 0"),
         ("rule_definitions", "rule_strength", "TEXT NOT NULL DEFAULT 'observation'"),
         ("rule_definitions", "maturity_state", "TEXT NOT NULL DEFAULT 'observing'"),
         ("rule_merge_proposals", "readiness_score", "REAL NOT NULL DEFAULT 0.0"),

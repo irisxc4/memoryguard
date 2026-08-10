@@ -36,13 +36,14 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.5.2
+## What's New in v0.6.0
 
-- **Canonical rule reconciliation:** durable rule-intelligence jobs, source links, evidence anchors, projection parity, and a safe legacy fallback until readiness is proven.
-- **Physically read-only diagnostics:** canonical status, rule reads, and governance diagnostics never enter a write transaction; live WAL readers observe concurrent committed writes without `immutable=1`.
-- **Multi-process runtime lease:** MCP processes sharing one workspace reject writes from a different build instead of allowing split-brain state changes.
-- **Desktop and neuron graph:** fixed workspace launch, detached native window, folder-style rule habits, subtree drag, denser outward pulses, and connected category links.
-- **History and Knowledge Library fixes:** history mojibake repair and dual-write reconciliation; knowledge deletion now trusts scan results and protects stale indexes after partial scans.
+- **MemoryGuard V2 production cutover is shipped:** authoritative Memory, Rules, Evidence, Content, Runtime, Projection, Assets, CodeGraph, Skills, and System state can run in explicit V2 SQLite domains behind the four-state cutover manifest. Existing V1 workspaces stay on V1 until an explicit V2 prepare/activate flow succeeds.
+- **Lossless frozen-source migration:** live V1 SQLite sources are captured with coherent online backups, migrated from an immutable snapshot, validated against source/target digests, and rechecked for drift before READY and ACTIVE transitions.
+- **Native cutover is closed:** all 233 registered MCP/CLI/GUI/Hook surfaces are explicitly classified with zero blockers and zero neutral routes. Retired V1 workflows fail explicitly instead of silently falling back.
+- **Evidence-first readiness:** two-epoch Reference Audit, integrity/FK checks, outbox draining, maintenance schema verification, runtime-context equivalence, and native coverage all gate activation.
+- **Safer operations after activation:** CLI `doctor`, `mcp-status`, and `storage audit/report` work directly against V2. Unbound terminal diagnostics expose only workspace-level health and never cross-tenant memory counts.
+- **Rollback evidence is preserved:** migration backups and legacy V1 artifacts remain local audit/recovery evidence; V2 activation does not delete them.
 
 ## Why MemoryGuard
 
@@ -84,7 +85,7 @@ flowchart TB
 
     subgraph Stores["LOCAL GOVERNED STORES&nbsp;&nbsp;&nbsp;&nbsp;"]
         direction LR
-        SharedDB[("MEMORY STORE<br/>records · rules · evidence&nbsp;&nbsp;&nbsp;&nbsp;")]:::store
+        SharedDB[("V2 DOMAIN STORES<br/>Memory · Rules · Evidence · Content&nbsp;&nbsp;&nbsp;&nbsp;")]:::store
         HistoryDB[("HISTORY STORE<br/>isolated conversations&nbsp;&nbsp;&nbsp;&nbsp;")]:::historyStore
         AuditDB[("RECOVERY STORE<br/>versions · receipts · backups&nbsp;&nbsp;&nbsp;&nbsp;")]:::store
     end
@@ -137,19 +138,19 @@ python -m pip install "agent-memguard[gui]"
 memoryguard source add .
 ```
 
-### 3. Connect your coding agent
+### 3. Connect or repair your coding agent
 
-Run one provider installer:
+Global provider configuration is rebuilt from the real binding in the canonical user data home. The command is idempotent and removes superseded MemoryGuard project-level overrides after a successful global takeover.
 
 ```bash
-# Claude Code
-python -m memoryguard.provider_adapters install claude
+# Repair one provider
+memoryguard provider repair claude
+memoryguard provider repair codex
+memoryguard provider repair cursor
+memoryguard provider repair trae
 
-# Codex
-python -m memoryguard.provider_adapters install codex
-
-# Cursor
-python -m memoryguard.provider_adapters install cursor
+# Repair every detected provider
+memoryguard provider repair all
 ```
 
 Restart the host after installation, then verify the integration:
@@ -199,8 +200,28 @@ python -m pip install --upgrade "agent-memguard[gui]"
 ```
 
 There is no separate `memoryguard update` self-update command yet. The package
-manager is the authoritative upgrade path, while MemoryGuard's schema
-migrations run when the upgraded application opens its local stores.
+manager is the authoritative package-upgrade path.
+
+### Existing v0.5.x workspaces: explicit V2 cutover
+
+v0.6.0 never auto-activates an existing workspace. Upgrade the package first,
+then use the packaged operator CLI:
+
+```bash
+# Read-only manifest status
+memoryguard-v2 status -w .
+
+# Build a frozen-source V2 shadow and stop at V2_READY
+memoryguard-v2 prepare -w . --apply
+
+# Activate only after the prepare result is V2_READY / ready=true
+memoryguard-v2 activate -w . --confirm V2_ACTIVE
+```
+
+The prepare step uses coherent SQLite online backups, preserves V1 and
+`migration-backups`, and rechecks live-source drift before READY. Activation
+performs another fresh drift check before changing the manifest. Do not delete
+legacy V1 data or migration backups as part of the upgrade.
 
 ## Knowledge Library
 
@@ -382,12 +403,15 @@ memory when the host exposes no reliable integration point.
 
 | Layer | Responsibility |
 |---|---|
-| **Evidence** | Authorized files, documents, host-native memory, external MCP descriptors, and conversation archives |
-| **Memory** | Local SQLite shared-memory stores, scoped rules, provenance, conflicts, quarantine, and versions |
-| **Governance** | MCP tools, CLI, desktop console, provider adapters, Hooks, confirmation bridges, and rollback |
+| **Evidence & Content** | Authorized sources, immutable evidence, content-addressed blobs/occurrences, source manifests, and conversation archives |
+| **Memory & Rules** | Scoped memory atoms, revisions, bindings, rule definitions, decisions, evidence links, and compensating governance operations |
+| **Runtime & Projection** | Bounded working context, scenario/profile projections, CodeGraph, Assets, and Skills metadata |
+| **Cutover & Governance** | Four-state manifest, native MCP/CLI/GUI/Hook routing, Reference Audit, maintenance, provider adapters, and rollback evidence |
 
-The shared-memory store is the governed source of truth. Evidence remains
-traceable without being treated as automatically trusted memory.
+V2 uses separate authoritative SQLite domains rather than one shared-memory
+database. The runtime reads and writes V2 only after the manifest reaches
+`V2_ACTIVE`; `V2_BUILDING` and `V2_READY` never silently fall back or dual-write.
+Evidence remains traceable without being treated as automatically trusted memory.
 
 ## Privacy and safety
 
@@ -397,9 +421,11 @@ traceable without being treated as automatically trusted memory.
 - The Knowledge Library database uses `MEMORYGUARD_HOME` or the platform user
   data directory, so a selected source folder does not receive its own
   knowledge database.
-- Some shared-memory, conversation-history, audit, and recovery artifacts still
-  use an authorized workspace's `.memoryguard/` directory in the current
-  release. Storage is therefore local, but not yet fully centralized.
+- V2 authoritative workspace state is separated under `.memoryguard/` into
+  explicit Memory, Rules, Evidence, Content, Runtime, Projection, Assets,
+  CodeGraph, Skills, and System domains. Legacy V1 artifacts are preserved as
+  local rollback/audit evidence after cutover and are no longer the active V2
+  runtime write path.
 - Source scanning is read-only by default.
 - Mutating governance paths use validation, explicit scope, provenance, and
   reversible state.
@@ -417,19 +443,21 @@ The installed `memoryguard` command exposes these top-level operations:
 | `audit [path]` | Run a read-only audit and generate a report |
 | `open [path]` | Open the latest interactive report |
 | `explain <finding_id>` | Explain evidence and risk for a finding |
-| `plan <finding_ids...>` | Build a minimal fix plan without writing |
-| `apply <plan_id>` | Apply a confirmed plan with backup and rescan |
-| `verify` | Compare the workspace before and after a change |
-| `undo <change_id>` | Restore a backed-up change and verify it |
 | `source <action>` | List, add, remove, or preview authorized sources |
 | `scan` | Scan authorized sources and build the coverage ledger |
-| `import <action> <bundle>` | Preview or create an offline import bundle |
-| `doctor` | Diagnose installation and integration state |
-| `mcp-status` | Inspect local shared-memory groups |
+| `doctor` | Diagnose V2 manifest, domain availability, and native coverage |
+| `mcp-status` | Inspect V2 MCP/backend health; tenant counts require a bound Agent scope |
 | `hooks <action>` | Install, inspect, pause, repair, or remove host Hooks |
-| `gc [path]` | Preview or apply garbage collection for rebuildable artifacts |
+| `provider <action>` | Inspect or repair global provider integrations |
+| `storage audit|report` | Run read-only V2 Reference Audit and per-domain SQLite health reports |
+| `storage sweep|compact` | Run guarded V2 maintenance; physical changes require ACTIVE state, lease, generation, and safety proofs |
+| `groups <action>` | Inspect governed group state |
 | `gui [path]` | Launch the interactive governance console |
 | `desktop` | Launch the trusted desktop executor |
+
+The old V1 `plan`, `apply`, `verify`, `undo`, `import`, and `gc` workflows remain
+parseable for compatibility but are explicitly retired under `V2_ACTIVE`; they
+return a stable retired result instead of writing through a legacy store.
 
 Run `memoryguard --help` or `memoryguard <command> --help` for the live command
 reference.
@@ -456,6 +484,7 @@ the installed version.
 
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
+- [Changelog](CHANGELOG.md)
 - [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Contributor License Agreement](CLA.md)
@@ -463,12 +492,14 @@ the installed version.
 
 ## Roadmap
 
-- **Current:** local MCP memory, automatic organization, scoped rules,
-  conversation evidence, Knowledge Library, provider adapters, governance UI,
-  and rollback.
-- **Next:** content-addressed deduplication, natural source synchronization,
-  delta/checkpoint storage, derived-index maintenance, and clearer governance
-  reports. Long-term records are not retired merely because they are old.
+- **Current:** production-active V2 data plane, frozen-source migration and
+  cutover, native MCP/CLI/GUI/Hook routing, scoped Memory/Rules, Content/Evidence,
+  conversation archives, provider adapters, Reference Audit, maintenance, and
+  governance UI.
+- **Next:** richer scenario/profile projections, broader CodeGraph/Skills
+  ingestion, more operator-friendly maintenance reports, and additional
+  migration observability. Long-term records are not retired merely because
+  they are old.
 - **Later:** team and enterprise capabilities only after validated demand.
 
 ## Contributing

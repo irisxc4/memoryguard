@@ -140,6 +140,14 @@ MUTATION_API_METHODS: frozenset[str] = frozenset({
 # 所有允许的 API 方法
 ALL_ALLOWED_METHODS: frozenset[str] = READONLY_API_METHODS | MUTATION_API_METHODS
 
+# Phase 6 keeps this registry as the single security classification source for
+# GUI SafeBridge and CLI cutover adapters.  The version is metadata only; it
+# does not alter the public method names or old request envelope.
+API_METHOD_REGISTRY_VERSION = 2
+V2_CUTOVER_STATES: frozenset[str] = frozenset({
+    "V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE",
+})
+
 # 保留在 GovernanceApi 内仅供旧数据兼容/内部测试的原生写回实现。
 # 产品入口（GUI bridge、MCP、CLI）必须明确拒绝这些方法。
 BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS: frozenset[str] = frozenset({
@@ -201,6 +209,15 @@ def is_mutation_method(method: str) -> bool:
 def is_allowed_method(method: str) -> bool:
     """判断方法是否在白名单中。"""
     return method in ALL_ALLOWED_METHODS or method in _SECURITY_API_METHODS
+
+
+def get_api_method_registry() -> dict[str, Any]:
+    """Return immutable security classifications for bridge/CLI consumers."""
+    return {
+        "readonly": sorted(READONLY_API_METHODS),
+        "mutation": sorted(MUTATION_API_METHODS),
+        "security": sorted(_SECURITY_API_METHODS),
+    }
 
 
 # ---------------------------------------------------------------------------

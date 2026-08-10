@@ -34,13 +34,14 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.5.2 更新内容
+## v0.6.0 更新内容
 
-- **规范规则治理：** 持久化规则智能任务、来源链接、证据锚点、投影对齐；未证明就绪前安全回退到传统规则。
-- **真正的只读诊断：** canonical status、规则读取和治理诊断不会进入写事务；活跃 WAL 读取端无需 `immutable=1` 也能看到并发提交。
-- **多进程运行时租约：** 共享同一工作区的 MCP 进程会拒绝来自不同构建版本的写入，避免分裂脑状态。
-- **桌面与神经图：** 固定工作区启动、独立原生窗口、文件夹式规则习惯、子树拖动、更密集的外向脉冲，以及分类主链连接。
-- **历史与知识库修复：** 修复历史乱码和双写会话；知识库删除以扫描结果为准，部分扫描失败不再保护旧索引。
+- **MemoryGuard V2 生产切换路径已正式交付：** Memory、Rules、Evidence、Content、Runtime、Projection、Assets、CodeGraph、Skills 与 System 可运行在显式分域 SQLite 上，并由四态 manifest 统一切换。已有 V1 工作区不会因升级包而自动激活，必须显式完成 V2 prepare/activate。
+- **无损 frozen-source 迁移：** live V1 SQLite 通过 online backup 形成一致快照，只从 immutable snapshot 迁移；READY 与 ACTIVE 前都会重新校验 source/target digest 和 live-source drift。
+- **Native cutover 全部收口：** 233 个 MCP/CLI/GUI/Hook surface 均已显式分类，0 blocker、0 neutral。已退役的 V1 工作流会明确返回 retired，不再静默回落旧存储。
+- **证据驱动 readiness：** 两轮 Reference Audit、SQLite integrity/FK、Outbox drain、Maintenance schema、Context 等价性和 Native coverage 共同决定是否允许激活。
+- **激活后诊断可直接使用：** `doctor`、`mcp-status`、`storage audit/report` 直接读取 V2；未绑定 Agent 的终端只显示工作区级健康状态，不暴露跨租户记忆计数。
+- **保留回滚证据：** migration backups 与 legacy V1 数据继续保留在本机用于审计/恢复，激活 V2 不会删除它们。
 
 ## 为什么需要 MemoryGuard
 
@@ -75,7 +76,7 @@ flowchart TB
         Identity --> Knowledge
     end
 
-    Stores[("本地存储<br/>记忆 · 历史 · 知识 · 版本与回执&nbsp;&nbsp;&nbsp;&nbsp;")]:::store
+    Stores[("V2 分域存储<br/>Memory · Rules · Evidence · Content · Runtime · Projection&nbsp;&nbsp;&nbsp;&nbsp;")]:::store
     Bootstrap["有界上下文<br/>强制规则包 · 相关记忆 · 相关知识&nbsp;&nbsp;&nbsp;&nbsp;"]:::bootstrap
     Control["人工治理<br/>CLI · 桌面控制台&nbsp;&nbsp;&nbsp;&nbsp;"]:::surface
 
@@ -121,17 +122,19 @@ python -m pip install "agent-memguard[gui]"
 memoryguard source add .
 ```
 
-### 3. 连接编程 Agent
+### 3. 连接 / 修复编程 Agent
+
+全局 Provider 配置始终从用户级 canonical data home 的真实 binding 重建；重复执行是幂等的，也会清理被全局配置取代的 MemoryGuard 项目级覆盖。
 
 ```bash
-# Claude Code
-python -m memoryguard.provider_adapters install claude
+# 单独修复
+memoryguard provider repair claude
+memoryguard provider repair codex
+memoryguard provider repair cursor
+memoryguard provider repair trae
 
-# Codex
-python -m memoryguard.provider_adapters install codex
-
-# Cursor
-python -m memoryguard.provider_adapters install cursor
+# 一次修复全部已检测 Provider
+memoryguard provider repair all
 ```
 
 重启宿主后验证：
@@ -175,7 +178,27 @@ python -m pip install --upgrade "agent-memguard[gui]"
 ```
 
 目前**没有**独立的 `memoryguard update` 自更新命令。包管理器是正式升级入口；
-新版本打开本地存储时会执行对应 Schema 迁移。
+包升级本身不会自动把已有工作区切到 V2。
+
+### 从 v0.5.x 显式切换到 V2
+
+v0.6.0 随包安装 `memoryguard-v2` 运维命令：
+
+```bash
+# 只读查看 manifest
+memoryguard-v2 status -w .
+
+# 生成 frozen-source V2 shadow，并只停在 V2_READY
+memoryguard-v2 prepare -w . --apply
+
+# 仅当 prepare 输出 V2_READY / ready=true 后显式激活
+memoryguard-v2 activate -w . --confirm V2_ACTIVE
+```
+
+prepare 会使用 SQLite online backup 捕获一致快照，保留 V1 与
+`migration-backups`，并在 READY 前检查 live-source drift；activate 在真正修改
+manifest 前还会再检查一次 drift。升级过程中不要删除 legacy V1 数据，也不要删除
+迁移备份。
 
 ## 知识库
 
@@ -237,8 +260,9 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 - 除非你明确授权远程模型或 Embedding 操作，受治理数据不会离开本机。
 - 知识库数据库位于 `MEMORYGUARD_HOME` 或平台用户数据目录；被选中的源文件夹不会
   获得一套独立知识库数据库。
-- 当前版本部分共享记忆、对话历史、审计和恢复产物仍位于授权工作区的
-  `.memoryguard/`。因此数据是本地的，但尚未全部集中到统一数据目录。
+- V2 权威工作区状态按 Memory、Rules、Evidence、Content、Runtime、Projection、
+  Assets、CodeGraph、Skills 与 System 分域保存在 `.memoryguard/`。切换后 legacy
+  V1 产物继续保留为本地回滚/审计证据，但不再是 V2 运行时写入目标。
 - 来源扫描默认只读；变更路径带有校验、明确作用域、来源证据和可逆状态。
 - 隔离记录不会进入活跃共享记忆。
 - 原始对话历史永不自动注入 bootstrap。
@@ -251,19 +275,20 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 | `audit [path]` | 只读审计并生成报告 |
 | `open [path]` | 打开最新交互报告 |
 | `explain <finding_id>` | 解释发现项的证据和风险 |
-| `plan <finding_ids...>` | 生成不写入的最小修复计划 |
-| `apply <plan_id>` | 备份后应用计划并重新扫描 |
-| `verify` | 比较变更前后工作区 |
-| `undo <change_id>` | 从备份恢复并验证 |
 | `source <action>` | 管理授权来源 |
 | `scan` | 扫描授权来源并生成覆盖账本 |
-| `import <action> <bundle>` | 预览或创建离线导入包 |
-| `doctor` | 诊断安装和集成状态 |
-| `mcp-status` | 查看本地共享记忆组 |
+| `doctor` | 诊断 V2 manifest、分域可用性和 native coverage |
+| `mcp-status` | 查看 V2 MCP/后端健康状态；租户计数要求已绑定 Agent scope |
 | `hooks <action>` | 安装、检查、暂停、修复或移除宿主 Hook |
-| `gc [path]` | 预览或执行可重建产物清理 |
+| `provider <action>` | 检查或修复全局 Provider 集成 |
+| `storage audit|report` | 执行只读 Reference Audit 与分域 SQLite 健康报告 |
+| `storage sweep|compact` | 执行受门控的 V2 维护；物理变更要求 ACTIVE、lease、generation 与安全证明 |
+| `groups <action>` | 检查受治理共享组状态 |
 | `gui [path]` | 启动交互式治理台 |
 | `desktop` | 启动可信桌面执行器 |
+
+旧 V1 的 `plan`、`apply`、`verify`、`undo`、`import` 与 `gc` 命令仍可被解析，
+但在 `V2_ACTIVE` 下属于显式 retired surface，会返回稳定 retired 结果，不会写回 legacy store。
 
 以 `memoryguard --help` 和 `memoryguard <command> --help` 为当前安装版本的命令真相源。
 
@@ -286,6 +311,7 @@ MCP 服务提供：
 
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
+- [更新日志](CHANGELOG.md)
 - [长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)
 - [贡献指南](CONTRIBUTING.md)
 - [贡献者许可协议](CLA.md)
@@ -293,14 +319,16 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前：** 本地 MCP 记忆、自动整理、范围规则、对话证据、知识库、Provider
-  适配器、治理 UI 和回滚。
-- **下一步：** 内容寻址去重、自然来源同步、Delta/Checkpoint 存储、派生索引维护和
-  更清晰的治理报告。长期记录不会仅仅因为存在时间长而被淘汰。
+- **当前：** 已激活的 V2 数据面、frozen-source 迁移与 cutover、Native
+  MCP/CLI/GUI/Hook、范围 Memory/Rules、Content/Evidence、对话档案、Provider
+  适配器、Reference Audit、Maintenance 与治理 UI。
+- **下一步：** 更丰富的 Scenario/Profile Projection、CodeGraph/Skills ingestion、
+  更友好的维护报告和更细的迁移可观测性。长期记录不会仅仅因为存在时间长而被淘汰。
 - **以后：** 只在需求被验证后扩展团队和企业能力。
 
 详细设计见[长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)。
-其中 Content Plane、Delta/Checkpoint 等属于拟议架构，不代表当前版本已经实现。
+其中 Content Plane、Delta/Checkpoint 等核心存储机制已进入 V2；Spec 中更远期的
+扩展仍以对应实现与验收状态为准，不把设计稿当已交付功能。
 
 ## 贡献
 

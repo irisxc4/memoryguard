@@ -9,7 +9,11 @@ updates.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import hmac
+import json
 import re
 import secrets
 import sqlite3
@@ -31,6 +35,8 @@ CAPABILITY_TABLE = "governance_capabilities"
 # intentionally format-only; the database digest remains the authority.
 _OPAQUE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,}$")
 _TOKEN_BYTES = 32
+RECOVERY_TOKEN_VERSION = "v2"
+RECOVERY_SECRET_MIN_BYTES = 32
 
 
 GOVERNANCE_CAPABILITY_SCHEMA = f"""
@@ -43,7 +49,10 @@ CREATE TABLE IF NOT EXISTS {CAPABILITY_TABLE} (
     issued_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0, 1)),
-    consumed_at REAL
+    consumed_at REAL,
+    recovery_proof_hash TEXT NOT NULL DEFAULT '',
+    token_version TEXT NOT NULL DEFAULT 'v1',
+    revoked INTEGER NOT NULL DEFAULT 0 CHECK (revoked IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_governance_capabilities_proposal
     ON {CAPABILITY_TABLE}(proposal_id);
@@ -80,6 +89,9 @@ class CapabilityRecord:
     expires_at: float
     consumed: bool
     consumed_at: float | None
+    recovery_proof_hash: str = ""
+    token_version: str = "v1"
+    revoked: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | Mapping[str, Any]) -> "CapabilityRecord":
@@ -88,6 +100,12 @@ class CapabilityRecord:
                 return row[name]  # type: ignore[index]
             except (IndexError, TypeError):
                 return row[index]  # type: ignore[index]
+
+        def optional(name: str, default: Any) -> Any:
+            try:
+                return row[name]  # type: ignore[index]
+            except (IndexError, KeyError, TypeError):
+                return default
 
         return cls(
             token_hash=str(value("token_hash", 0)),
@@ -103,6 +121,9 @@ class CapabilityRecord:
                 if value("consumed_at", 8) is None
                 else float(value("consumed_at", 8))
             ),
+            recovery_proof_hash=str(optional("recovery_proof_hash", "") or ""),
+            token_version=str(optional("token_version", "v1") or "v1"),
+            revoked=bool(optional("revoked", 0)),
         )
 
 
@@ -150,6 +171,63 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
+def _recovery_secret(value: Any) -> bytes:
+    """Strictly decode canonical, unpadded base64url secret text."""
+
+    if not isinstance(value, str) or not value or "=" in value:
+        raise CapabilityIssueError("recovery_secret_invalid")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", value) is None:
+        raise CapabilityIssueError("recovery_secret_invalid")
+    padding = "=" * ((4 - len(value) % 4) % 4)
+    try:
+        decoded = base64.b64decode(value + padding, altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise CapabilityIssueError("recovery_secret_invalid") from exc
+    if len(decoded) < RECOVERY_SECRET_MIN_BYTES:
+        raise CapabilityIssueError("recovery_secret_invalid")
+    if base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=") != value:
+        raise CapabilityIssueError("recovery_secret_invalid")
+    return decoded
+
+
+def recovery_secret_proof(value: Any) -> str:
+    """Return the non-reversible SHA-256 proof stored by the ledger."""
+
+    return hashlib.sha256(_recovery_secret(value)).hexdigest()
+
+
+def capability_recovery_token(
+    recovery_secret: Any,
+    *,
+    workspace: str,
+    principal: str,
+    proposal_id: str,
+    request_key: str,
+    manifest_generation: int,
+    scope: str = RULE_MERGE_APPROVE_SCOPE,
+) -> str:
+    """Derive a deterministic v2 bearer for one exact request binding."""
+
+    secret = _recovery_secret(recovery_secret)
+    if type(manifest_generation) is not int or manifest_generation < 0:
+        raise CapabilityIssueError("manifest_generation_invalid")
+    _require_scope(scope)
+    binding = {
+        "version": RECOVERY_TOKEN_VERSION,
+        "workspace": _require_text(workspace, "workspace"),
+        "principal": _require_text(principal, "principal"),
+        "proposal": _require_text(proposal_id, "proposal_id"),
+        "request_key": _require_text(request_key, "request_key"),
+        "manifest_generation": manifest_generation,
+        "scope": scope,
+    }
+    encoded = json.dumps(
+        binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = hmac.new(secret, encoded, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
 def _principal_from_context(access_context: AccessContext) -> str:
     if not isinstance(access_context, AccessContext):
         raise CapabilityIssueError("trusted AccessContext required")
@@ -175,6 +253,10 @@ def issue_capability(
     ttl_seconds: float = 300.0,
     issued_at: float | int | datetime | None = None,
     expires_at: float | int | datetime | None = None,
+    recovery_secret: str | None = None,
+    workspace: str | None = None,
+    request_key: str | None = None,
+    manifest_generation: int | None = None,
 ) -> str:
     """Issue and persist one opaque capability, returning its raw token once.
 
@@ -200,10 +282,29 @@ def issue_capability(
     if expiry <= issued:
         raise CapabilityIssueError("capability expiry must be after issued_at")
 
-    # A collision is cryptographically negligible; retrying keeps the API
-    # correct even under a deliberately patched RNG in tests.
-    for _ in range(3):
-        token = secrets.token_urlsafe(_TOKEN_BYTES)
+    deterministic = recovery_secret is not None
+    proof_hash = ""
+    token_version = "v1"
+    if deterministic:
+        if workspace is None or request_key is None or type(manifest_generation) is not int:
+            raise CapabilityIssueError("recovery_binding_required")
+        token = capability_recovery_token(
+            recovery_secret,
+            workspace=workspace,
+            principal=trusted_principal,
+            proposal_id=proposal,
+            request_key=request_key,
+            manifest_generation=manifest_generation,
+            scope=scope,
+        )
+        proof_hash = recovery_secret_proof(recovery_secret)
+        token_version = RECOVERY_TOKEN_VERSION
+        attempts = (token,)
+    else:
+        # A collision is cryptographically negligible; retrying keeps the API
+        # correct even under a deliberately patched RNG in tests.
+        attempts = tuple(secrets.token_urlsafe(_TOKEN_BYTES) for _ in range(3))
+    for token in attempts:
         digest = _token_hash(token)
         nonce = secrets.token_urlsafe(16)
         try:
@@ -211,11 +312,12 @@ def issue_capability(
                 f"""
                 INSERT INTO {CAPABILITY_TABLE} (
                     token_hash, principal, scope, proposal_id, nonce,
-                    issued_at, expires_at, consumed, consumed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                    issued_at, expires_at, consumed, consumed_at,
+                    recovery_proof_hash, token_version, revoked
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, 0)
                 """,
                 (digest, trusted_principal, RULE_MERGE_APPROVE_SCOPE,
-                 proposal, nonce, issued, expiry),
+                 proposal, nonce, issued, expiry, proof_hash, token_version),
             )
         except sqlite3.IntegrityError as exc:
             if "token_hash" in str(exc) or "nonce" in str(exc):
@@ -255,6 +357,7 @@ def _consume_record(
           AND proposal_id = ?
           AND expires_at > ?
           AND consumed = 0
+          AND revoked = 0
         """,
         (current_time, digest, expected_principal, RULE_MERGE_APPROVE_SCOPE,
          proposal, current_time),
@@ -267,7 +370,8 @@ def _consume_record(
     row = connection.execute(
         f"""
         SELECT token_hash, principal, scope, proposal_id, nonce,
-               issued_at, expires_at, consumed, consumed_at
+               issued_at, expires_at, consumed, consumed_at,
+               recovery_proof_hash, token_version, revoked
         FROM {CAPABILITY_TABLE}
         WHERE token_hash = ?
         """,
@@ -347,11 +451,15 @@ __all__ = [
     "CapabilityStore",
     "GovernanceCapabilityStore",
     "GOVERNANCE_CAPABILITY_SCHEMA",
+    "RECOVERY_SECRET_MIN_BYTES",
+    "RECOVERY_TOKEN_VERSION",
     "RULE_MERGE_APPROVE_SCOPE",
     "consume_capability",
     "consume_capability_record",
     "consume_server_capability",
+    "capability_recovery_token",
     "initialize_capability_schema",
     "issue_capability",
     "issue_server_capability",
+    "recovery_secret_proof",
 ]

@@ -255,6 +255,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- build 2 -----------------------------------------------------------
     build2_error = ""
+    build2_skipped = bool(build1_error)
     job2 = None
     if not build1_error:
         try:
@@ -275,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
         and snap1["outbox_total"] == snap2["outbox_total"]
     )
 
+    build2_reconciliation_status = (
+        status1 if build2_skipped else canonical_reconciliation_status(
+            run_ws, group_id, store=store,
+        )
+    )
     summary = {
         "workspace": str(control_ws),
         "group_id": group_id,
@@ -296,10 +302,20 @@ def main(argv: list[str] | None = None) -> int:
         },
         "build2": {
             "error": build2_error,
-            "job": job2,
-            "status": canonical_reconciliation_status(
-                run_ws, group_id, store=store,
+            # Preserve the historical status object on success.  A skipped or
+            # failed second build gets a scalar marker so callers can branch
+            # without dereferencing a missing job.
+            "status": (
+                "skipped" if build2_skipped
+                else ("failed" if build2_error else build2_reconciliation_status)
             ),
+            "skipped": build2_skipped,
+            "skip_reason": build1_error if build2_skipped else "",
+            "job": job2,
+            # A failed first build must not invoke the second status/read path:
+            # that path assumes a job row and used to raise ``job2 is None``
+            # while trying to print the original failure.
+            "reconciliation_status": build2_reconciliation_status,
             "snapshot": snap2,
         },
         "idempotent": idempotent,
@@ -331,9 +347,15 @@ def main(argv: list[str] | None = None) -> int:
                   f"graph={status1['checks']['graph_built']}")
             print(f"  digest after  : {job1['canonical_digest_after']}")
             print(f"  projection    : {job1['projection_version']}")
-        if build2_error:
+        if build2_skipped:
+            print(f"build 2        : SKIPPED (build 1 failed: {build1_error})")
+        elif build2_error:
             print(f"build 2        : FAILED {build2_error}")
         else:
+            # ``job2`` is guaranteed by the branches above. Keep the guard
+            # explicit so a future failure path cannot regress to a confusing
+            # secondary ``NoneType`` exception.
+            assert job2 is not None
             print(f"build 2        : {job2['status']} "
                   f"ready={snap2 and status1['canonical_ready']}")
             print(f"  digest after  : {job2['canonical_digest_after']}")

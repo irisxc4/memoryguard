@@ -573,7 +573,11 @@ class AutoOrganizer:
             assignments=list(
                 getattr(self, "_active_rule_assignments", []) or []
             ),
-            emit_lifecycle_outbox=True,
+            # The P2->P3 lifecycle outbox is a mandatory-rule projection
+            # channel, not a journal for every ordinary memory.  Emitting for
+            # relevant facts/episodes makes any successful memory write create
+            # an outbox backlog and immediately trip the next write gate.
+            emit_lifecycle_outbox=(record.injection_policy == "always"),
         )
 
     # ------------------------------------------------------------------
@@ -929,7 +933,7 @@ class AutoOrganizer:
             updated_at=_now_iso(),
             agent_instance_id=event.agent_instance_id,
         )
-        self.store.append_record(derived_record, emit_lifecycle_outbox=True)
+        self.store.append_record(derived_record, emit_lifecycle_outbox=False)
 
         # 记录 DecisionEvent
         decision = DecisionEvent(
