@@ -353,8 +353,22 @@ def test_diagnostics_snapshot_uses_backup_not_raw_copy(tmp_path, monkeypatch):
     _configure_identity(monkeypatch, ws)
 
     copy_calls: list[str] = []
-    monkeypatch.setattr(shutil, "copy", lambda *a, **k: copy_calls.append("copy"))
-    monkeypatch.setattr(shutil, "copyfile", lambda *a, **k: copy_calls.append("copyfile"))
+    # Patch the migration module's copy surface, not the process-global
+    # ``shutil`` module.  Other tests may legitimately finish an unrelated
+    # background cleanup while this assertion is active; the contract under
+    # test is specifically that diagnostics never enter workspace_prepare.
+    from memoryguard.migration import workspace_prepare
+
+    class _CopyGuard:
+        def copy(self, *a, **k):
+            copy_calls.append("copy")
+
+        def copyfile(self, *a, **k):
+            copy_calls.append("copyfile")
+
+        move = shutil.move
+
+    monkeypatch.setattr(workspace_prepare, "shutil", _CopyGuard())
 
     result = execute_tool(
         "memoryguard_diagnostics_snapshot",
