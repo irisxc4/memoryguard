@@ -1264,7 +1264,8 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
 def cmd_gui(args: argparse.Namespace) -> int:
     """从可见终端启动交互式治理台。"""
-    workspace_args = [args.workspace] if args.workspace else []
+    workspace = getattr(args, "workspace_option", "") or getattr(args, "workspace", "")
+    workspace_args = [workspace] if workspace else []
     if os.name == "nt" and os.environ.get("_MEMORYGUARD_GUI_CHILD") != "1":
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         if not pythonw.exists():
@@ -1486,7 +1487,14 @@ def build_parser() -> argparse.ArgumentParser:
         "workspace",
         nargs="?",
         default="",
-        help="workspace path (uses the fixed user-level control directory when omitted)",
+        help="workspace path (uses the current project when it contains .memoryguard)",
+    )
+    p_gui.add_argument(
+        "-w",
+        "--workspace",
+        dest="workspace_option",
+        default="",
+        help="workspace path (same as the positional path)",
     )
     p_gui.set_defaults(func=cmd_gui)
 
@@ -1524,9 +1532,22 @@ def _resolve_gui_workspace(argv: list[str]) -> Path | None:
         if candidate.is_dir():
             return candidate
 
-    # A GUI shortcut commonly starts with C:\Windows\System32 as cwd. Never
-    # infer the data workspace from that process detail; use the stable
-    # per-user control directory instead.
+    # MEMORYGUARD_HOME is an explicit operator choice for the shared control
+    # directory.  It must take precedence over the terminal's current project
+    # so existing shortcuts and isolated test/operator environments remain
+    # deterministic.
+    if os.environ.get("MEMORYGUARD_HOME", "").strip():
+        return _default_gui_workspace()
+
+    # A terminal launched inside a project should open that project's V2
+    # workspace.  This keeps the bare command consistent with ``doctor`` and
+    # ``mcp-status``.  A GUI shortcut commonly starts in C:\Windows\System32;
+    # that directory is never a workspace and therefore falls through to the
+    # stable per-user control directory below.
+    cwd = Path.cwd().resolve()
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
+    if cwd != system_root and system_root not in cwd.parents and (cwd / ".memoryguard").is_dir():
+        return cwd
     return _default_gui_workspace()
 
 
@@ -1634,11 +1655,18 @@ def _cli_workspace(args: argparse.Namespace) -> Path:
         from .data_home import resolve_data_home
 
         return resolve_data_home().expanduser().resolve()
-    if command == "gui" and not getattr(args, "workspace", ""):
+    if command == "gui" and not (
+        getattr(args, "workspace", "") or getattr(args, "workspace_option", "")
+    ):
         resolved = _resolve_gui_workspace([])
         if resolved is not None:
             return resolved.expanduser().resolve()
-    raw = getattr(args, "workspace", None) or getattr(args, "path", ".") or "."
+    raw = (
+        getattr(args, "workspace_option", None)
+        or getattr(args, "workspace", None)
+        or getattr(args, "path", ".")
+        or "."
+    )
     return Path(raw).expanduser().resolve()
 
 

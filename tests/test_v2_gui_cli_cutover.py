@@ -26,7 +26,11 @@ from memoryguard.cutover_v2.facade import (  # noqa: E402
 )
 from memoryguard.cutover_v2.surfaces import CLI_COMMAND_NAMES  # noqa: E402
 from memoryguard.gui import SafeBridgeApi, _dispatch_gui_api_call, _redact_gui_paths  # noqa: E402
-from memoryguard.cli import build_parser  # noqa: E402
+from memoryguard.cli import (  # noqa: E402
+    _cli_workspace,
+    _resolve_gui_workspace,
+    build_parser,
+)
 
 
 class Manifest:
@@ -303,6 +307,21 @@ def test_cli_snapshot_matches_all_commands_and_namespace_subactions_survive(tmp_
     assert result["path"] == "v2"
     assert v2.calls[0][2].action == "migrate"
     assert v2.calls[0][2].apply is False
+
+
+def test_bare_gui_uses_current_project_workspace_and_supports_workspace_flag(tmp_path, monkeypatch):
+    (tmp_path / ".memoryguard").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+
+    parser = build_parser()
+    bare = parser.parse_args(["gui"])
+    flagged = parser.parse_args(["gui", "--workspace", str(tmp_path)])
+
+    assert _resolve_gui_workspace([]) == tmp_path.resolve()
+    assert _cli_workspace(bare) == tmp_path.resolve()
+    assert _cli_workspace(flagged) == tmp_path.resolve()
 
 
 @pytest.mark.parametrize(
