@@ -248,11 +248,13 @@ memoryguard gui
 ```
 
 `memoryguard-gui .` remains available for desktop shortcuts. In PowerShell and
-other terminals, a bare `memoryguard gui` opens the current project when it
-contains `.memoryguard` and no explicit data home is configured, keeping GUI
-state aligned with `doctor` and `mcp-status`. Use either
-`memoryguard gui <project-path>` or `memoryguard gui --workspace <project-path>`
-to select a project explicitly.
+other terminals, a bare `memoryguard gui` automatically discovers the nearest
+usable V2 project from the current directory, its local project siblings, and
+the configured local workspace roots. It skips stale `V1_ACTIVE` workspaces,
+keeping GUI state aligned with `doctor` and `mcp-status`; no path argument is
+required. An explicit `memoryguard gui <project-path>` or
+`memoryguard gui --workspace <project-path>` remains available for selecting a
+specific project.
 `MEMORYGUARD_WORKSPACE` and then an explicit `MEMORYGUARD_HOME` take priority;
 otherwise a non-project shortcut location uses the fixed user-level control
 directory (defaulting to `%LOCALAPPDATA%\MemoryGuard` on Windows).

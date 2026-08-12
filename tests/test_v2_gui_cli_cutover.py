@@ -324,6 +324,28 @@ def test_bare_gui_uses_current_project_workspace_and_supports_workspace_flag(tmp
     assert _cli_workspace(flagged) == tmp_path.resolve()
 
 
+def test_bare_gui_skips_v1_parent_and_discovers_v2_child(tmp_path, monkeypatch):
+    from memoryguard import cli
+
+    root = tmp_path / "tools"
+    child = root / "memoryguard"
+    (root / ".memoryguard").mkdir(parents=True)
+    (child / ".memoryguard").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+
+    states = {
+        root.resolve(): ("V1_ACTIVE", 0, object()),
+        child.resolve(): ("V2_ACTIVE", 11, object()),
+    }
+    monkeypatch.setattr(cli, "_cli_manifest_snapshot", lambda path: states.get(
+        Path(path).resolve(), ("UNKNOWN", None, None),
+    ))
+
+    assert _resolve_gui_workspace([]) == child.resolve()
+
+
 @pytest.mark.parametrize(
     ("command", "payload", "expected"),
     [

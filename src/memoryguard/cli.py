@@ -1540,14 +1540,90 @@ def _resolve_gui_workspace(argv: list[str]) -> Path | None:
         return _default_gui_workspace()
 
     # A terminal launched inside a project should open that project's V2
-    # workspace.  This keeps the bare command consistent with ``doctor`` and
-    # ``mcp-status``.  A GUI shortcut commonly starts in C:\Windows\System32;
-    # that directory is never a workspace and therefore falls through to the
-    # stable per-user control directory below.
+    # workspace.  Search the current ancestry and the small set of known local
+    # project roots, because a common layout has a legacy workspace beside the
+    # actual repository (for example ``tools/.memoryguard`` and
+    # ``tools/memoryguard/.memoryguard``).  The first ``.memoryguard`` directory
+    # is not authoritative: prefer a V2_READY/V2_ACTIVE manifest.
     cwd = Path.cwd().resolve()
     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
-    if cwd != system_root and system_root not in cwd.parents and (cwd / ".memoryguard").is_dir():
-        return cwd
+
+    candidates: list[Path] = []
+    local_candidates: set[Path] = set()
+
+    def add_candidate(path: Path, *, local: bool = False) -> None:
+        path = path.expanduser().resolve()
+        if path in candidates or not path.is_dir() or not (path / ".memoryguard").is_dir():
+            return
+        candidates.append(path)
+        if local:
+            local_candidates.add(path)
+
+    def scan_tree(root: Path, max_depth: int) -> None:
+        if not root.is_dir():
+            return
+        frontier = [root]
+        for _ in range(max_depth + 1):
+            next_frontier: list[Path] = []
+            for directory in frontier:
+                add_candidate(directory)
+                try:
+                    children = sorted(
+                        (item for item in directory.iterdir() if item.is_dir() and not item.is_symlink()),
+                        key=lambda item: str(item).casefold(),
+                    )
+                except (OSError, PermissionError):
+                    continue
+                next_frontier.extend(children)
+            frontier = next_frontier
+
+    if cwd != system_root and system_root not in cwd.parents:
+        ancestor = cwd
+        for _ in range(6):
+            add_candidate(ancestor, local=True)
+            try:
+                children = sorted(
+                    (item for item in ancestor.iterdir() if item.is_dir() and not item.is_symlink()),
+                    key=lambda item: str(item).casefold(),
+                )
+            except (OSError, PermissionError):
+                children = []
+            for child in children:
+                # Only direct children of the launch directory are local
+                # candidates.  Treating every child of every ancestor as
+                # local makes unrelated temporary projects compete with the
+                # workspace the user is actually in.
+                add_candidate(child, local=ancestor == cwd)
+            if ancestor.parent == ancestor:
+                break
+            ancestor = ancestor.parent
+
+    for root in (
+        Path.home() / "workspace",
+        Path.home() / "projects",
+        Path(r"H:\ai\workspace"),
+        Path(r"C:\workspace"),
+        Path(r"D:\workspace"),
+        Path(r"D:\ai\workspace"),
+    ):
+        scan_tree(root, 2)
+
+    active: list[tuple[int, Path]] = []
+    fallback: list[Path] = []
+    for path in candidates:
+        state, _generation, _record = _cli_manifest_snapshot(path)
+        if state in {"V2_READY", "V2_ACTIVE"}:
+            distance = 0 if path == cwd else 1 if path in cwd.parents or path in local_candidates else 2
+            active.append((distance, path))
+        elif path == cwd or path in cwd.parents:
+            fallback.append(path)
+
+    if active and (not fallback or min(item[0] for item in active) < 2):
+        # Prefer the current project/ancestor over a merely discoverable
+        # workspace elsewhere; sort the remainder for deterministic launches.
+        return min(active, key=lambda item: (item[0], len(item[1].parts), str(item[1]).casefold()))[1]
+    if fallback:
+        return min(fallback, key=lambda path: (len(path.parts), str(path).casefold()))
     return _default_gui_workspace()
 
 
