@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.history_store import ContentHistoryStore, V2HistoryScope
 from memoryguard.history_importers import (
     backfill_local_history,
     discover_local_history_sources,
@@ -16,13 +16,21 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def _bound_agents(workspace: Path) -> dict[str, str]:
-    bindings = AgentBindingStore(workspace)
+    bindings = GroupControlService(workspace, write=True)
     result = {}
     for provider in ("codex", "claude", "cursor"):
         agent = f"{provider}-agent"
-        bindings.ensure_personal_memory_group(agent)
+        bindings.ensure_personal(agent, idempotency_key=f"test-personal:{agent}")
         result[provider] = agent
     return result
+
+
+def _history(workspace: Path) -> ContentHistoryStore:
+    return ContentHistoryStore(workspace, readonly=True)
+
+
+def _scope(agent: str, provider: str = "") -> V2HistoryScope:
+    return V2HistoryScope(agent_instance_id=agent, provider=provider)
 
 
 def _write_discovery(workspace: Path, agents: dict[str, str]) -> None:
@@ -63,12 +71,12 @@ def test_backfill_imports_stable_hosts_and_filters_private_event_types(tmp_path:
     inventory = result["inventory"]["sources"]
     assert any(item["status"] == "unsupported" and item["support_reason"] == "prompt_index_not_full_conversation" for item in inventory)
     assert all({"provider", "path", "file_count", "byte_count", "support_reason", "matched_agent_id"} <= item.keys() for item in inventory)
-    store = ConversationHistoryStore(workspace)
+    store = _history(workspace)
     all_text = []
     for provider, agent in agents.items():
-        sessions = store.list_sessions(HistoryScope(agent_instance_id=agent, provider=provider))["sessions"]
+        sessions = store.list_sessions(_scope(agent, provider))["sessions"]
         assert len(sessions) == 1
-        raw = store.read(HistoryScope(agent_instance_id=agent, provider=provider), session_id=sessions[0]["session_id"])
+        raw = store.read(_scope(agent, provider), session_id=sessions[0]["session_id"])
         all_text.extend(turn["content"] for turn in raw["turns"])
     assert "visible codex user" in all_text
     assert "visible cursor answer" in all_text
@@ -97,8 +105,8 @@ def test_backfill_is_idempotent_bounded_and_resumable(tmp_path: Path):
     replay = backfill_local_history(workspace, home=home, agent_ids_by_provider=agents)
     assert replay["imported"] == 0
     assert replay["status"] == "complete"
-    sessions = ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id=agents["codex"], provider="codex")
+    sessions = _history(workspace).list_sessions(
+        _scope(agents["codex"], "codex")
     )["sessions"]
     assert len(sessions) == 2
 
@@ -109,8 +117,8 @@ def test_discovery_and_backfill_fail_closed_without_provider_binding(tmp_path: P
     _write_jsonl(home / ".claude" / "projects" / "p" / "only.jsonl", [
         {"sessionId": "c", "message": {"role": "user", "content": "must not bind to codex"}},
     ])
-    bindings = AgentBindingStore(workspace)
-    bindings.ensure_personal_memory_group("codex-agent")
+    bindings = GroupControlService(workspace, write=True)
+    bindings.ensure_personal("codex-agent", idempotency_key="test-personal:codex-agent")
     _write_discovery(workspace, {"codex": "codex-agent"})
     discovery = discover_local_history_sources(home, workspace=workspace,
                                                agent_ids_by_provider={"codex": "codex-agent"})
@@ -120,9 +128,7 @@ def test_discovery_and_backfill_fail_closed_without_provider_binding(tmp_path: P
     result = backfill_local_history(workspace, home=home, agent_ids_by_provider={"codex": "codex-agent"})
     assert result["status"] == "pending_binding"
     assert result["pending_binding"] == ["claude"]
-    assert ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id="codex-agent")
-    )["sessions"] == []
+    assert not _history(workspace).db_path.exists()
 
 
 def test_history_backfill_security_registration_is_not_read_only():
@@ -140,20 +146,20 @@ def test_pending_provider_is_not_skipped_by_other_provider_continuation(tmp_path
     _write_jsonl(home / ".claude" / "projects" / "p" / "claude.jsonl", [
         {"sessionId": "claude", "message": {"role": "user", "content": "claude now"}},
     ])
-    bindings = AgentBindingStore(workspace)
-    bindings.ensure_personal_memory_group("claude-agent")
+    bindings = GroupControlService(workspace, write=True)
+    bindings.ensure_personal("claude-agent", idempotency_key="test-personal:claude-agent")
     _write_discovery(workspace, {"claude": "claude-agent"})
     first = backfill_local_history(workspace, home=home, agent_ids_by_provider={"claude": "claude-agent"})
     assert first["imported"] == 1
     assert first["pending_binding"] == ["codex"]
-    bindings.ensure_personal_memory_group("codex-agent")
+    bindings.ensure_personal("codex-agent", idempotency_key="test-personal:codex-agent")
     _write_discovery(workspace, {"claude": "claude-agent", "codex": "codex-agent"})
     second = backfill_local_history(workspace, home=home, agent_ids_by_provider={
         "claude": "claude-agent", "codex": "codex-agent",
     }, continuation=first["continuation"])
     assert second["imported"] == 1
-    assert ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id="codex-agent", provider="codex")
+    assert _history(workspace).list_sessions(
+        _scope("codex-agent", "codex")
     )["sessions"]
 
 
@@ -172,8 +178,8 @@ def test_large_jsonl_creates_partial_history_index_instead_of_being_dropped(tmp_
     assert result["partial"] == 1
     codex_source = next(item for item in result["inventory"]["sources"] if item["provider"] == "codex")
     assert codex_source["status"] == "partial"
-    sessions = ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id=agents["codex"], provider="codex")
+    sessions = _history(workspace).list_sessions(
+        _scope(agents["codex"], "codex")
     )["sessions"]
     assert len(sessions) == 1
     assert "部分导入" in sessions[0]["title"]
@@ -184,7 +190,9 @@ def test_provider_identity_mismatch_fails_closed_even_with_active_binding(tmp_pa
     _write_jsonl(home / ".claude" / "projects" / "p" / "only.jsonl", [
         {"sessionId": "c", "message": {"role": "user", "content": "never bind to codex"}},
     ])
-    AgentBindingStore(workspace).ensure_personal_memory_group("codex-agent")
+    GroupControlService(workspace, write=True).ensure_personal(
+        "codex-agent", idempotency_key="test-personal:codex-agent"
+    )
     _write_discovery(workspace, {"codex": "codex-agent"})
     result = backfill_local_history(workspace, home=home, agent_ids_by_provider={"claude": "codex-agent"})
     assert result["status"] == "pending_binding"
@@ -203,8 +211,8 @@ def test_backfill_derives_readable_title_when_host_jsonl_has_none(tmp_path: Path
     _write_discovery(workspace, agents)
     result = backfill_local_history(workspace, home=home, agent_ids_by_provider=agents)
     assert result["imported"] == 1
-    sessions = ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id=agents["codex"], provider="codex")
+    sessions = _history(workspace).list_sessions(
+        _scope(agents["codex"], "codex")
     )["sessions"]
     assert sessions[0]["title"] == "请把历史会话映射进神经图"
     assert "rollout" not in sessions[0]["title"].lower()

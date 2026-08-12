@@ -25,7 +25,6 @@ from .schema_v3 import (
     _now_iso,
     stable_hash,
 )
-from .shared_memory_store import SharedMemoryStore
 
 
 class GovernanceEngine:
@@ -36,10 +35,19 @@ class GovernanceEngine:
         workspace: str | Path,
         share_group_id: str,
         *,
-        store: SharedMemoryStore | None = None,
+        store: Any | None = None,
     ):
-        self.store = store or SharedMemoryStore(workspace, share_group_id)
-        self.group_id = share_group_id
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.group_id = str(share_group_id or "").strip()
+        self.store = store
+        self.native = None
+        if self.store is None:
+            # The old record writer is intentionally not recreated.  Native
+            # callers use GovernanceNativeService directly; this compatibility
+            # facade remains inert until an explicitly V2-backed caller is
+            # supplied and therefore fails closed on old state.
+            from .runtime_v2.governance_native import GovernanceNativeService
+            self.native = GovernanceNativeService(self.workspace)
 
     @staticmethod
     def _state(record: SharedMemoryRecord | None) -> dict[str, Any] | None:

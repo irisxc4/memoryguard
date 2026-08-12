@@ -13,6 +13,25 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 
+def _activate_v2(root: Path, migration_id: str = "security-test") -> None:
+    """Create the real V2 control/data plane and promote it to V2_ACTIVE."""
+    from memoryguard.storage.layout import WorkspaceV2Layout
+    from memoryguard.storage.schema import initialize_all
+    from memoryguard.system.manifest import ManifestManager, ManifestState
+
+    initialize_all(WorkspaceV2Layout(root))
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id=migration_id)
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest=f"{migration_id}-source",
+        target_digest=f"{migration_id}-target",
+        manifest_digest=f"{migration_id}-manifest",
+        digests={"validator_passed": True, "checkpoints": {"core": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
 @pytest.fixture(autouse=True)
 def mock_ipc_notification(monkeypatch):
     """自动 mock IPC 通知，防止测试中真实打开 URI、启动进程或写通知文件。"""
@@ -259,23 +278,21 @@ class TestDesktopExecutor:
         }
 
     def test_confirmed_executor_requires_real_admin_context_for_takeover(self, tmp_path, monkeypatch):
-        """Desktop confirmation succeeds only with real admin context."""
+        """Desktop confirmation succeeds only with a V2 admin context."""
         from memoryguard.desktop_executor import RequestExecutor
         from memoryguard.security import RequestQueue
-        from memoryguard.shared_memory_store import SharedMemoryStore
 
-        monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+        _activate_v2(tmp_path, "security-executor")
         group_id = "executor-takeover-group"
-        SharedMemoryStore(tmp_path, group_id)
         queue = RequestQueue(tmp_path)
         request = queue.submit(
-            "commit_shared_memory_governance", [group_id, "desktop confirmed", True],
+            "bind_agents_to_shared_group", [["executor-agent", "executor-agent-2"], group_id],
         )
 
-        result = RequestExecutor(tmp_path).execute(request)
+        result = RequestExecutor(tmp_path, trusted_desktop=True).execute(request)
 
         assert result["ok"] is True, result
-        assert result["result"].get("version_id")
+        assert result["result"]["data"]["share_group_id"] == group_id
 
     def test_trusted_desktop_entrypoint_can_execute_admin_binding(self, tmp_path, monkeypatch):
         """真实桌面入口在确认后拥有服务端管理员上下文。"""
@@ -283,6 +300,7 @@ class TestDesktopExecutor:
         from memoryguard.desktop_executor import RequestExecutor
         from memoryguard.security import RequestQueue
 
+        _activate_v2(tmp_path, "security-trusted-desktop")
         request = RequestQueue(tmp_path).submit(
             "bind_agents_to_shared_group",
             [["agent-a", "agent-b"], "trusted-desktop-group"],
@@ -290,8 +308,8 @@ class TestDesktopExecutor:
         result = RequestExecutor(tmp_path, trusted_desktop=True).execute(request)
 
         assert result["ok"] is True, result
-        assert result["result"]["share_group_id"] == "trusted-desktop-group"
-        assert result["result"]["scope_persisted"] is True
+        assert result["result"]["data"]["share_group_id"] == "trusted-desktop-group"
+        assert len(result["result"]["data"]["bindings"]) == 2
 
     def test_confirmed_injection_spy(self, tmp_path):
         """spy 测试：验证 confirmed=True 被正确注入到绑定方法。
@@ -353,9 +371,9 @@ class TestDesktopExecutor:
             real_fn = original_build
             real_sig = inspect.signature(real_fn)
             real_params = list(real_sig.parameters.keys())
-            assert "confirmed" in real_params
-            confirmed_idx = real_params.index("confirmed")
-            assert confirmed_idx == 0  # build_projection(confirmed=False) -> confirmed 在位置 0
+            # GovernanceApi is now the V2 SafeBridge facade; confirmation is
+            # an executor concern and is not a public method parameter.
+            assert "confirmed" not in real_params
 
     def test_confirmed_injection_real_method(self, tmp_path):
         """验证真实 GovernanceApi.build_projection 在桌面执行器中不返回'需要确认'。"""
@@ -782,95 +800,57 @@ class TestSafeBridgeApi:
         assert "not a mutation method" in result["error"]
 
     def test_request_mutation_sandbox_returns_deferred(self, tmp_path, monkeypatch):
-        """沙箱模式下 request_mutation 返回 deferred=True。"""
+        """沙箱模式下 V2 mutation 只入队，不在当前进程执行。"""
         from memoryguard.gui import SafeBridgeApi
         from memoryguard import security
+        from memoryguard.security import RequestQueue
 
-        # 强制沙箱模式
+        _activate_v2(tmp_path, "security-sandbox")
         monkeypatch.setattr(security, "detect_sandbox_mode", lambda: True)
 
-        api = SafeBridgeApi(str(tmp_path))
-        result = api.request_mutation("build_projection", [])
+        api = SafeBridgeApi(str(tmp_path), direct_mutations=True)
+        result = api.request_mutation(
+            "bind_agents_to_shared_group",
+            [["sandbox-agent-a", "sandbox-agent-b"], "sandbox-group"],
+        )
 
-        # 必须包含 deferred=True，不能只返回 ok=True
         assert result.get("deferred") is True, f"deferred must be True, got: {result}"
         assert result.get("ok") is True
+        assert result.get("code") == "mutation_deferred"
         assert "request" in result
         assert "message" in result
+        pending = RequestQueue(tmp_path).get(result["request"]["request_id"])
+        assert pending is not None and pending.status == "pending"
 
     def test_direct_takeover_cannot_forge_admin_override(self, tmp_path, monkeypatch):
-        """Takeover stays fail-closed across the explicit cutover states."""
+        """V2_ACTIVE takeover auth is fail-closed and byte-stable."""
         from memoryguard.gui import GovernanceApi, SafeBridgeApi
-        from memoryguard.shared_memory_store import SharedMemoryStore
 
         monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
-        group_id = "bridge-takeover-group"
-        store = SharedMemoryStore(tmp_path, group_id)
+        _activate_v2(tmp_path, "security-takeover")
 
         def file_snapshot(root):
             return {
                 path.relative_to(root): path.read_bytes()
                 for path in root.rglob("*")
-                if path.is_file()
+                if path.is_file() and not path.name.endswith(("-shm", "-wal", "-journal"))
             }
 
-        # 用户脚本、MCP/CLI 直接调用不能伪造桌面确认能力。
+        # A direct GovernanceApi call has no process-issued context.  The
+        # V2 context gate wins before any admin claim and performs no write.
+        before_direct = file_snapshot(tmp_path)
         direct = GovernanceApi(str(tmp_path)).commit_shared_memory_governance(
-            group_id, "direct", confirmed=True,
+            "bridge-takeover-group", "direct", confirmed=True,
         )
-        assert direct["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
-
-        # V1_ACTIVE is the only state allowed to enter the legacy adapter.  The
-        # legacy action itself remains unavailable and must not write a snapshot;
-        # constructing the lazy legacy inner is expected on this route.
-        before_v1 = file_snapshot(tmp_path)
-        bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
-        v1_result = bridge.request_mutation(
-            "commit_shared_memory_governance", [group_id, "trusted bridge", True],
-        )
-        assert v1_result == {"ok": False, "error": "v2_not_ready"}
-        assert bridge._inner_instance is not None
-        assert file_snapshot(tmp_path) == before_v1
-        assert store.db_path.exists()
-
-        class ReadyPort:
-            def __init__(self):
-                self.status_calls = 0
-                self.calls = []
-
-            def status(self, workspace):
-                self.status_calls += 1
-                return {"state": "V2_READY", "generation": 4}
-
-            def dispatch(self, *args, **kwargs):
-                self.calls.append((args, kwargs))
-                raise AssertionError("V2_READY mutation must not dispatch")
-
-        # V2_READY is V2-only read mode: reject the write before any admin
-        # check, legacy construction, or V2 dispatch.
-        ready_root = tmp_path / "ready"
-        ready_store = SharedMemoryStore(ready_root, group_id)
-        before_ready = file_snapshot(ready_root)
-        ready_port = ReadyPort()
-        ready = SafeBridgeApi(
-            str(ready_root), direct_mutations=True, _v2_port=ready_port,
-        )
-        ready_result = ready.request_mutation(
-            "commit_shared_memory_governance", [group_id, "ready", True],
-        )
-        assert ready_result["error"] == "v2_not_active"
-        assert ready_result["path"] == "v2"
-        assert ready_port.status_calls == 1
-        assert ready_port.calls == []
-        assert ready._inner_instance is None
-        assert file_snapshot(ready_root) == before_ready
-        assert ready_store.db_path.exists()
+        assert direct["ok"] is False
+        assert direct["code"] == "native_context_required"
+        assert file_snapshot(tmp_path) == before_direct
 
         # V2_ACTIVE uses the real native facade.  A bound, non-admin context
         # cannot be promoted by public mapping fields, and neither denial may
         # reach the native writer.
         from memoryguard.access_context import AccessContext
-        from memoryguard.agent_binding import AgentBindingStore
+        from memoryguard.runtime_v2.group_native import GroupControlService
         from memoryguard.cutover_v2.facade import V2RuntimeFacade
         from memoryguard.runtime_v2.native_ports import (
             NativeV2RuntimePort,
@@ -889,9 +869,9 @@ class TestSafeBridgeApi:
                 self.calls.append((value, kwargs))
                 return value
 
-        active_root = tmp_path / "active"
+        active_root = tmp_path
         active_group = "bridge-active-group"
-        AgentBindingStore(active_root).bind_agent("bridge-active", active_group)
+        GroupControlService(active_root, write=True).bind_agent("bridge-active", active_group)
         rules = Rules()
         manifest = ActiveManifest()
         native = NativeV2RuntimePort(
@@ -957,36 +937,73 @@ class TestSafeBridgeApi:
         assert file_snapshot(active_root) == before_active
 
     def test_direct_bridge_does_not_override_regular_mutation_signature(self, tmp_path, monkeypatch):
-        """没有 _admin_override 的方法仍按原签名调用。"""
+        """V2 SafeBridge forwards ordinary mutation kwargs without overrides."""
+        from memoryguard.access_context import AccessContext
+        from memoryguard.cutover_v2.facade import V2RuntimeFacade
         from memoryguard.gui import SafeBridgeApi
+        from memoryguard.runtime_v2.group_native import GroupControlService
+        from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort
 
-        bridge = SafeBridgeApi(str(tmp_path), direct_mutations=True)
+        _activate_v2(tmp_path, "security-ordinary-signature")
+        GroupControlService(tmp_path, write=True).bind_agent(
+            "ordinary-admin", "ordinary-admin-group",
+        )
+
+        class ActiveManifest:
+            def current(self):
+                return {"state": "V2_ACTIVE", "generation": 1}
+
+        native = NativeV2RuntimePort(tmp_path, state_provider=ActiveManifest())
         seen = {}
+        original_dispatch = native.dispatch_gui
 
-        def ordinary(confirmed=False):
-            seen["confirmed"] = confirmed
-            return {"ok": True}
+        def spy_dispatch(name, args=None, **kwargs):
+            seen.update(kwargs)
+            return original_dispatch(name, args, **kwargs)
 
-        monkeypatch.setattr(bridge._inner, "build_projection", ordinary)
-        result = bridge.request_mutation("build_projection", [])
-        assert result == {"ok": True}
-        assert seen == {"confirmed": True}
+        monkeypatch.setattr(native, "dispatch_gui", spy_dispatch)
+        facade = V2RuntimeFacade(
+            manifest=ActiveManifest(), v2=native, workspace=str(tmp_path),
+        )
+        bridge = SafeBridgeApi(
+            str(tmp_path),
+            direct_mutations=True,
+            _v2_port=facade,
+            _trusted_access_context=AccessContext(
+                trusted_agent_id="ordinary-admin",
+                is_admin=True,
+                strict_binding=True,
+                allow_anon=False,
+                session_id="ordinary-admin-session",
+                session_source="transport",
+                session_trusted=True,
+            ),
+        )
+        result = bridge.request_mutation(
+            "bind_agents_to_shared_group",
+            [["ordinary-agent-a", "ordinary-agent-b"], "ordinary-group"],
+        )
+        assert result["ok"] is True, result
+        assert "confirmed" not in seen
+        assert "_admin_override" not in seen
 
     def test_server_owned_local_ui_context_can_create_shared_binding(
         self, tmp_path, monkeypatch,
     ):
-        """localhost 会话可管理绑定，但权限必须由服务端上下文注入。"""
+        """localhost binding uses only the server-owned V2 context."""
         from memoryguard.access_context import AccessContext
+        from memoryguard.desktop_executor import SERVER_ADMIN_AGENT_ID
         from memoryguard.gui import GovernanceApi
 
+        _activate_v2(tmp_path, "security-local-ui")
         monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
         denied = GovernanceApi(str(tmp_path)).bind_agents_to_shared_group(
-            ["codex-a", "claude-b"],
+            ["codex-a", "claude-b"], "local-ui-group",
         )
-        assert denied["error"] == "admin capability required (set MEMORYGUARD_ADMIN=1)"
+        assert denied["error"] == "native_context_required"
 
         local_ui_context = AccessContext(
-            trusted_agent_id="",
+            trusted_agent_id=SERVER_ADMIN_AGENT_ID,
             is_admin=True,
             strict_binding=True,
             allow_anon=False,
@@ -997,11 +1014,11 @@ class TestSafeBridgeApi:
         result = GovernanceApi(
             str(tmp_path),
             _trusted_access_context=local_ui_context,
-        ).bind_agents_to_shared_group(["codex-a", "claude-b"])
+        ).bind_agents_to_shared_group(["codex-a", "claude-b"], "local-ui-group")
 
         assert result["ok"] is True
-        assert result["share_group_id"]
-        assert len(result["bindings"]) == 2
+        assert result["data"]["share_group_id"]
+        assert len(result["data"]["bindings"]) == 2
 
 
 class TestUriWakeup:

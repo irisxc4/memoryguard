@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.7.0] - 2026-08-12 (local release acceptance passed; ready for commit/publish, not yet published)
+
+### Scope
+
+- V2-only production boundary: V1 runtime/store modules are physically absent
+  from production entrypoint import closure. `V1_ACTIVE` is a migration starting
+  state, not a runtime fallback; legacy format input is accepted only by
+  `memoryguard.migration`, while other entrypoints fail closed with
+  `v2_upgrade_required`.
+- V2 Memory, Evidence, History, Source, Binding, and Group planes are explicit;
+  raw History remains separate from governed Memory and evidence receipts.
+
+### Added and changed
+
+- Canonical reconciliation builds `shared_baseline`, `agent_overlay`, and
+  `project_overlay` bundles, retains source links, activates canonical reads
+  only after parity, and shadows old duplicates recoverably.
+- Same-group V2 automatic organization performs exact/semantic deduplication;
+  Rule duplicate scans create governed merge proposals, and merge/supersede/
+  conflict/quarantine decisions retain scope, evidence, idempotency, and undo
+  receipts across Agents sharing one trusted group.
+- Knowledge accepts files and folders as governed books/documents. Source bodies
+  stay in the Content Plane; Knowledge stores metadata/references and supports
+  re-ingest, remove/restore/purge, and explicit candidate review.
+- GUI Agent discovery/name/instance data, source selection, Binding/Group member
+  management, drift, personal/shared groups, leave, and dissolve use V2-native
+  system control. Build, Knowledge, import, history, maintenance, release, and
+  compatibility work use durable `TaskRun` status, bounded cancellation, and
+  owned background-worker/process cleanup before shutdown.
+- Graphify metadata-only export feeds CodeGraph under trusted scope with source
+  role, provenance, source maps, revisions, tombstones, outbox state, and
+  bounded query/path/explain/affected operations. Source bodies are rejected.
+- Fail-closed state/scope/provenance/path/metadata checks, isolation, public
+  receipt redaction, audit/outbox decisions, and Content Plane held-occurrence
+  rollback are part of the V2 release boundary.
+- `memoryguard upgrade` provides the 0.6.2-to-0.7.0 preview, `V2_READY`, and
+  exact `V2_ACTIVE` confirmation path; failed validation remains non-active and
+  V1/migration evidence is retained.
+
+### Local release acceptance evidence
+
+- Local release acceptance passed: `1761 / 1761`, with no skip or xfail.
+- V1 retirement + CodeGraph: `15 / 15`; Graphify focused checks: `3 / 3`;
+  canonical reconciliation: `ACCEPTED`; RuleMerge: `46 / 46`; v3.2: `27 / 27`.
+- The real full-repository Graphify export/projection covered `486 files / 11672
+  nodes / 38714 edges → 11667 canonical symbols / 38714 edges`; query/path/
+  affected passed and failure atomicity was `0` throughout.
+- Final clean wheel: `206 files`, `legacy bad=0`; isolated package, CLI, and MCP
+  all reported `0.7.0`; desktop help passed.
+- These Graphify results record the focused checks and the real full-repository
+  export/projection only. They do not claim that upstream Graphify's full-
+  repository test suite passed.
+
+### Release state
+
+- Local release acceptance passed. v0.7.0 is ready for commit/publish, not yet
+  published.
+- The acceptance result is local and receipt-backed. The Graphify evidence is
+  intentionally limited to the focused `3 / 3` checks and the real
+  full-repository export/projection; it is not an upstream Graphify
+  full-repository test-suite claim.
+
 ## [0.6.2] - 2026-08-10
 
 ### Fixed

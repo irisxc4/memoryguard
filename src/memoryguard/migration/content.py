@@ -54,7 +54,13 @@ _KNOWN_KNOWLEDGE_TABLES = frozenset(
     }
 )
 
-
+_HISTORY_RECEIPT_COLUMNS: tuple[str, ...] = (
+    "idempotency_key",
+    "operation",
+    "payload_digest",
+    "result_json",
+    "created_at",
+)
 @dataclass
 class MigrationReport:
     status: str = "OK"
@@ -324,6 +330,15 @@ class V1ContentMigrator:
                 tables = _table_names(conn)
                 if not tables:
                     raise ContentMigrationError(f"{kind} source has no tables: {path}")
+                if kind == "history" and "history_mutation_receipts" in tables:
+                    receipt_columns = {
+                        str(info[1])
+                        for info in conn.execute("PRAGMA table_info(history_mutation_receipts)").fetchall()
+                    }
+                    if receipt_columns != set(_HISTORY_RECEIPT_COLUMNS):
+                        raise ContentMigrationError(
+                            "history_mutation_receipts schema is not the 0.6.2 authority contract"
+                        )
                 # Trigger a read of schema metadata and one row from each
                 # table.  This catches malformed pages before target writes.
                 for table in tables:
@@ -401,6 +416,13 @@ class V1ContentMigrator:
         report.target_counts = store.counts()
         with open_database(store.db_path, readonly=True) as conn:
             report.migration_map_count = int(conn.execute("SELECT COUNT(*) FROM migration_map").fetchone()[0])
+            if (
+                sources["history"].status == "READY"
+                and "history_mutation_receipts" in sources["history"].tables
+            ):
+                report.target_counts["history_mutation_receipts"] = int(
+                    conn.execute("SELECT COUNT(*) FROM history_mutation_receipts").fetchone()[0]
+                )
             for kind in ("history", "knowledge"):
                 row = conn.execute("SELECT source_id,coverage_digest FROM source_sync_state WHERE source_id LIKE ? ORDER BY source_id LIMIT 1", (f"{kind}-%",)).fetchone()
                 if row is not None:
@@ -529,6 +551,56 @@ class V1ContentMigrator:
             (source_id, run_id, state, "", run_id if complete else "", manifest_digest, coverage_digest, now, now, "",),
         )
 
+    def _import_history_mutation_receipts(
+        self,
+        target: sqlite3.Connection,
+        source: _Source,
+        source_id: str,
+        conn: sqlite3.Connection,
+        *,
+        counter: list[int],
+        fail_after: int | None,
+        report: MigrationReport,
+        seen: set[str],
+    ) -> None:
+        """Copy the V1 idempotency authority without rewriting its payload."""
+
+        if "history_mutation_receipts" not in source.tables:
+            return
+        columns = ", ".join(_HISTORY_RECEIPT_COLUMNS)
+        for raw in conn.execute(
+            f"SELECT {columns} FROM history_mutation_receipts ORDER BY idempotency_key"
+        ).fetchall():
+            self._check_fail(counter, fail_after)
+            values = tuple(raw[column] for column in _HISTORY_RECEIPT_COLUMNS)
+            key = _as_text(values[0])
+            existing = target.execute(
+                f"SELECT {columns} FROM history_mutation_receipts WHERE idempotency_key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None and tuple(existing) != values:
+                raise ContentMigrationError(
+                    f"history_mutation_receipt identity changed: {key}"
+                )
+            if existing is None:
+                target.execute(
+                    f"INSERT INTO history_mutation_receipts({columns}) VALUES (?,?,?,?,?)",
+                    values,
+                )
+            self._upsert_map(
+                target,
+                source=source,
+                table="history_mutation_receipts",
+                pk=key,
+                target_type="history_mutation_receipt",
+                target_id=stable_id("history-receipt", source_id, key),
+                source_hash=_hash_row(_row_dict(raw)),
+            )
+            seen.add(f"receipt:{key}|receipt")
+            report.source_counts["history.history_mutation_receipts"] = report.source_counts.get(
+                "history.history_mutation_receipts", 0
+            ) + 1
+
     def _import_history(self, target: sqlite3.Connection, store: ContentStore, source: _Source, *, complete: bool, report: MigrationReport, counter: list[int], fail_after: int | None) -> None:
         assert source.path is not None
         source_id = self._source_connector(target, store, source, provider="history", source_type="conversation_history")
@@ -539,6 +611,16 @@ class V1ContentMigrator:
             tables = set(source.tables)
             sessions: dict[str, str] = {}
             session_acls: dict[str, dict[str, Any]] = {}
+            self._import_history_mutation_receipts(
+                target,
+                source,
+                source_id,
+                conn,
+                counter=counter,
+                fail_after=fail_after,
+                report=report,
+                seen=seen,
+            )
             if "conversation_sessions" in tables:
                 for row in _iter_rows(conn, "conversation_sessions", batch_size=self.batch_size):
                     self._check_fail(counter, fail_after)
@@ -589,7 +671,7 @@ class V1ContentMigrator:
             if "evidence_links" in tables:
                 for row in _iter_rows(conn, "evidence_links", batch_size=self.batch_size):
                     self._check_fail(counter, fail_after); pk = _pk("evidence_links", row); source_hash = _hash_row(row); link_id = stable_id("evidence", source_id, pk); target.execute("INSERT INTO content_evidence_links(link_id,memory_id,session_id,turn_id,occurrence_id,status,created_at,invalidated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(link_id) DO UPDATE SET status=excluded.status,invalidated_at=excluded.invalidated_at", (link_id, _as_text(_first(row, "memory_id")), _as_text(_first(row, "session_id")), _as_text(_first(row, "turn_id")), "", _as_text(_first(row, "status", default="valid")), _as_text(_first(row, "created_at", default=_now())), _as_text(_first(row, "invalidated_at")))); self._upsert_map(target, source=source, table="evidence_links", pk=pk, target_type="content_evidence_link", target_id=link_id, source_hash=source_hash); report.source_counts["history.evidence_links"] = report.source_counts.get("history.evidence_links", 0) + 1
-            self._map_unhandled_rows(target, source, tables, known={"conversation_sessions", "conversation_turns", "session_summaries", "observations", "evidence_links", "history_fts"}, report=report, counter=counter, fail_after=fail_after)
+            self._map_unhandled_rows(target, source, tables, known={"conversation_sessions", "conversation_turns", "session_summaries", "observations", "evidence_links", "history_mutation_receipts", "history_fts"}, report=report, counter=counter, fail_after=fail_after)
         self._tombstone_missing(target, source_id=source_id, seen=seen, complete=complete, run_id=run_id, reason="source_deleted")
         self._mark_sync(target, source_id=source_id, state="complete" if complete else "partial", complete=complete, run_id=run_id, manifest=seen, coverage=acl_rows)
         report.acl_digests["history"] = hashlib.sha256("\n".join(sorted(acl_rows)).encode("utf-8")).hexdigest()

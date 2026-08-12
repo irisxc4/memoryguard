@@ -38,6 +38,140 @@ def temp_workspace():
         yield ws
 
 
+def _ensure_v2_workspace(root: Path) -> None:
+    """Install the real V2 stores and activate the manifest for GUI tests."""
+    from memoryguard.assets_v2.store import AssetStore
+    from memoryguard.codegraph_v2.store import CodeGraphStore
+    from memoryguard.content.store import ContentStore
+    from memoryguard.evidence.store import EvidenceStore
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.memory.store import MemoryAtomStore
+    from memoryguard.projection_v2.store import ProjectionStore
+    from memoryguard.rules.v2_store import RuleV2Store
+    from memoryguard.runtime_v2.working_memory import RuntimeStore
+    from memoryguard.skills_v2.store import SkillStore
+    from memoryguard.storage.layout import WorkspaceV2Layout
+    from memoryguard.storage.schema import initialize_all
+    from memoryguard.system.manifest import ManifestManager, ManifestState
+
+    manager = ManifestManager(root)
+    if manager.current().state is ManifestState.V2_ACTIVE:
+        return
+    initialize_all(WorkspaceV2Layout(root))
+    MemoryAtomStore(root)
+    EvidenceStore(root)
+    RuleV2Store(root)
+    ProjectionStore(root)
+    ContentStore(root)
+    RuntimeStore(root)
+    CodeGraphStore(root)
+    AssetStore(root)
+    SkillStore(root)
+    GovernanceV2(
+        root,
+        memory_store=MemoryAtomStore(root),
+        evidence_store=EvidenceStore(root),
+    )
+    manager.transition(ManifestState.V2_BUILDING, migration_id="lifecycle-v2-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="lifecycle-source",
+        target_digest="lifecycle-target",
+        manifest_digest="lifecycle-manifest",
+        digests={"validator_passed": True, "checkpoints": {"lifecycle": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def _v2_admin_api(
+    root: Path,
+    *,
+    agent: str = "lifecycle-admin",
+    group: str = "lifecycle-group",
+    bind: bool = True,
+):
+    from memoryguard.access_context import AccessContext
+    from memoryguard.gui import GovernanceApi
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    _ensure_v2_workspace(root)
+    if bind:
+        bound = GroupControlService(root, write=True).bind_agent(agent, group)
+        assert bound["ok"] is True
+    access = AccessContext(
+        trusted_agent_id=agent,
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id=f"lifecycle-{agent}",
+        session_source="transport",
+        session_trusted=True,
+    )
+    return GovernanceApi(str(root), _trusted_access_context=access)
+
+
+def _seed_v2_atoms(
+    root: Path,
+    group: str,
+    specs: list[dict[str, object]],
+) -> None:
+    import hashlib
+
+    from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+    from memoryguard.memory.store import MemoryAtom, MemoryAtomStore
+
+    memory = MemoryAtomStore(root, readonly=False)
+    governance = GovernanceV2(root, memory_store=memory)
+    resolved = str(root.resolve())
+    context = V2MutationContext(
+        workspace_id=resolved,
+        share_group_id=group,
+        agent_instance_id="lifecycle-admin",
+        project_ref=resolved,
+        provider="gui",
+        runtime_role="gui",
+        actor="lifecycle-admin",
+        admin=True,
+        authority="admin",
+    )
+    atom_ids: list[str] = []
+    for spec in specs:
+        memory_id = str(spec["memory_id"])
+        evidence, _ = governance.put_evidence(
+            context=context,
+            reason="lifecycle V2 security fixture evidence",
+            source_ref=f"lifecycle:{memory_id}",
+            digest=hashlib.sha256(memory_id.encode("utf-8")).hexdigest(),
+            authority="governance",
+            evidence_type="reference",
+        )
+        atom, _ = governance.put_atom(
+            MemoryAtom(
+                memory_id=memory_id,
+                body=str(spec.get("body") or ""),
+                kind=str(spec.get("kind") or "fact"),
+                workspace_id=resolved,
+                share_group_id=group,
+                agent_instance_id="lifecycle-admin",
+                project_ref=resolved,
+                provider="gui",
+                runtime_role="gui",
+                metadata=dict(spec.get("metadata") or {}),
+            ),
+            context=context,
+            evidence=[evidence.to_dict()],
+            reason="lifecycle V2 security fixture atom",
+            idempotency_key=f"lifecycle-fixture:{memory_id}",
+        )
+        atom_ids.append(atom.atom_id)
+    for _ in range(4):
+        state = memory.project_evidence(governance.evidence)
+        if int(state.get("pending", 0)) == 0:
+            break
+    assert memory.pending_outbox(include_failed=True) == []
+    memory.set_visibility("active", atom_ids=atom_ids)
+
+
 # ============================================================
 # 改动包1：数据契约测试
 # ============================================================
@@ -264,19 +398,21 @@ class TestScopeWriteback:
     """场景9：选择后 scope 正确写入 SourceRoot。"""
 
     def test_commit_selection_writes_scope(self, temp_workspace):
-        """选择提交后 scope 正确写入 SourceRoot。
+        """选择提交后 scope 由 V2 discovery tree 保持，并写入 connector selection。
 
         先尝试默认选中的文件（import_verbatim），若没有则手动选中所有 found 文件，
         确保 SelectionManifest 提交流程始终被测试。
         """
-        from memoryguard.gui import GovernanceApi
         from memoryguard.agent_locator import AgentLocator, DetectionContext
-        api = GovernanceApi(temp_workspace)
+        from memoryguard.content.store import ContentStore, stable_id
+        from memoryguard.runtime_v2.agent_native import AgentNativeService
+        from memoryguard.runtime_v2.group_native import GroupControlService
+
+        service = AgentNativeService(temp_workspace)
         ctx = DetectionContext.from_workspace(temp_workspace)
         locator = AgentLocator(temp_workspace, ctx)
         instances, _ = locator.detect_instances()
-        if not instances:
-            pytest.skip("No agent instances detected")
+        assert instances, "V2 source selection requires a discovered agent instance"
         inst = instances[0]
         tree = locator.get_selection_tree(inst.instance_id)
         # 先尝试默认选中的文件，再回退到所有 found 文件
@@ -300,17 +436,33 @@ class TestScopeWriteback:
         if not selected:
             # 没有默认选中文件时，手动选中前 3 个 found 文件
             selected = all_found[:3]
-        if not selected:
-            pytest.skip("No found files to select")
-        result = api.commit_selection(inst.instance_id, selected, confirmed=True)
-        assert "error" not in result
-        # 验证 SourceRoot 的 scope
-        from memoryguard.source_registry import SourceRegistry
-        reg = SourceRegistry(temp_workspace)
-        for root in reg.list_sources():
-            if root.agent_instance_id == inst.instance_id:
-                assert root.scope in ("user", "project", "unknown")
-                assert root.scope_source in ("profile_declared", "project_resolver", "fallback")
+        assert selected, "V2 source selection requires a discovered file"
+        result = service.commit_selection(
+            inst.instance_id, [{"path": item["path"]} for item in selected],
+        )
+        assert result["source_count"] == len(selected)
+        expected_ids = [
+            stable_id("agent-source", inst.instance_id, str(Path(item["path"]).resolve()))
+            for item in selected
+        ]
+        assert GroupControlService(temp_workspace).selected_source_ids(
+            inst.instance_id,
+        ) == expected_ids
+        connectors = {
+            row["source_id"]: row
+            for row in ContentStore(temp_workspace).list_source_connectors(
+                workspace_id=str(temp_workspace.resolve()), enabled=True,
+            )
+        }
+        assert set(expected_ids) <= set(connectors)
+        for item, source_id in zip(selected, expected_ids):
+            assert connectors[source_id]["external_root_key"] == str(
+                Path(item["path"]).resolve()
+            )
+            assert item["scope"] in ("user", "project", "unknown")
+            assert item["scope_source"] in (
+                "profile_declared", "project_resolver", "fallback",
+            )
 
 
 # ============================================================
@@ -449,8 +601,6 @@ class TestLifecycleApiSplit:
         return inst
 
     def test_shared_agents_md_does_not_create_data_only_residual(self, temp_workspace, monkeypatch):
-        from memoryguard.gui import GovernanceApi
-
         agents_md = temp_workspace / "AGENTS.md"
         agents_md.write_text("shared rules", encoding="utf-8")
         self._patch_instances(monkeypatch, temp_workspace, [{
@@ -460,7 +610,14 @@ class TestLifecycleApiSplit:
             "evidence_role": "shared_surface",
         }])
 
-        result = GovernanceApi(str(temp_workspace)).list_agents()
+        result = _v2_admin_api(
+            temp_workspace,
+            agent="v2-admin-principal",
+            group="v2-admin-group",
+        ).list_agents()
+        assert result["path"] == "v2"
+        assert result.get("ok") is True, result
+        result = result["data"]
 
         assert result["agents"] == []
         assert result["residuals"] == []
@@ -468,8 +625,6 @@ class TestLifecycleApiSplit:
         assert result["residual_total"] == 0
 
     def test_private_data_only_goes_to_residuals_and_cleanup_items(self, temp_workspace, monkeypatch):
-        from memoryguard.gui import GovernanceApi
-
         fake_home = temp_workspace / "fake-home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
@@ -482,8 +637,15 @@ class TestLifecycleApiSplit:
             "status": "found",
             "evidence_role": "private_data_evidence",
         }])
-        api = GovernanceApi(str(temp_workspace))
+        api = _v2_admin_api(
+            temp_workspace,
+            agent="v2-admin-principal",
+            group="v2-admin-group",
+        )
         result = api.list_agents()
+        assert result["path"] == "v2"
+        assert result.get("ok") is True, result
+        result = result["data"]
 
         assert result["agents"] == []
         assert result["residual_total"] == 1
@@ -492,6 +654,8 @@ class TestLifecycleApiSplit:
         assert residual["private_data_surface_count"] == 1
 
         cleanup = api.get_residual_cleanup(residual["instance_id"])
+        assert cleanup["path"] == "v2"
+        cleanup = cleanup["data"]
         assert cleanup["candidate_id"] == residual["candidate_id"]
         assert len(cleanup["data_evidence"]) == 1
         assert len(cleanup["archive_previews"]) == 1
@@ -499,8 +663,6 @@ class TestLifecycleApiSplit:
         assert cleanup["items"][0]["residual_type"] == "private_data_evidence"
 
     def test_archive_api_ignores_client_supplied_whitelist(self, temp_workspace, monkeypatch):
-        from memoryguard.gui import GovernanceApi
-
         fake_home = temp_workspace / "fake-home"
         fake_home.mkdir()
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
@@ -515,8 +677,10 @@ class TestLifecycleApiSplit:
             "status": "found",
             "evidence_role": "private_data_evidence",
         }])
-        api = GovernanceApi(str(temp_workspace))
-        residual = api.list_agents()["residuals"][0]
+        api = _v2_admin_api(temp_workspace)
+        listed = api.list_agents()
+        assert listed["path"] == "v2"
+        residual = listed["data"]["residuals"][0]
 
         result = api.archive_agent_dir(
             product="split-agent",
@@ -525,9 +689,11 @@ class TestLifecycleApiSplit:
             dry_run=True,
             allowed_data_paths=[str(malicious_dir)],
         )
-
-        assert result["error"] == "path_validation_failed"
-        assert "path_not_in_profile_whitelist" in result["reason_codes"]
+        assert result["path"] == "v2"
+        assert result["ok"] is False, result
+        assert result["status"] in {"error", "blocked", "rejected"}
+        assert result["code"] == "agent_path_not_discovered"
+        assert "data" not in result
         assert malicious_dir.exists()
 
 
@@ -535,69 +701,70 @@ class TestGovernanceSnapshotSecurity:
     """治理快照安全回归。"""
 
     def test_snapshot_json_does_not_contain_raw_secret(self, temp_workspace):
-        from memoryguard.gui import GovernanceApi
-        from memoryguard.schema_v3 import MemoryEvent, QuarantineEntry
-        from memoryguard.shared_memory_store import SharedMemoryStore
-
         secret = "AKIAABCDEFGHIJKLMNOP"
-        store = SharedMemoryStore(temp_workspace, "default")
-        store.append_event(MemoryEvent(
-            event_id="evt-secret",
-            agent_instance_id="agent-1",
-            share_group_id="default",
-            raw_content=f"deploy key {secret}",
-            created_at="2026-01-01T00:00:00Z",
-        ))
-        store.append_quarantine(QuarantineEntry(
-            quarantine_id="quar-secret",
-            memory_id="mem-secret",
-            reason="secret",
-            detected_pattern="aws_key",
-            original_content=f"deploy key {secret}",
-            quarantined_at="2026-01-01T00:00:01Z",
-        ))
-
-        api = GovernanceApi(str(temp_workspace))
+        group = "governance-security-group"
+        api = _v2_admin_api(
+            temp_workspace, agent="lifecycle-admin", group=group,
+        )
+        _seed_v2_atoms(temp_workspace, group, [{
+            "memory_id": "mem-secret",
+            "body": f"deploy key {secret}",
+            "metadata": {"detected_pattern": "aws_access_key"},
+        }])
+        decided = api.neuron_decide(
+            "mem-secret", "quarantine", "secret", True,
+        )
+        assert decided["path"] == "v2"
+        assert decided["data"]["memory_status"] == "quarantined"
         snapshot = api.get_governance_snapshot()
         quarantine = api.get_quarantine()
+        assert snapshot["path"] == "v2"
+        assert quarantine["path"] == "v2"
         payload = json.dumps({"snapshot": snapshot, "quarantine": quarantine}, ensure_ascii=False)
 
         assert secret not in payload
         assert "AKIA" not in payload
         assert "original_content" not in payload
         assert "raw_content\":" not in payload
-        assert "REDACTED:aws_access_key" in payload
+        assert "masked_preview" in payload
+        assert "•" in payload
 
     def test_supersede_decisions_do_not_contain_raw_secret(self, temp_workspace):
-        from memoryguard.gui import GovernanceApi
-        from memoryguard.schema_v3 import DecisionEvent, MemoryKind, SharedMemoryRecord, SharedMemoryStatus
-        from memoryguard.shared_memory_store import SharedMemoryStore
-
         secret = "AKIAABCDEFGHIJKLMNOP"
-        store = SharedMemoryStore(temp_workspace, "default")
-        store.append_record(SharedMemoryRecord(
-            memory_id="old-secret",
-            body=f"old key {secret}",
-            kind=MemoryKind.FACT,
-            status=SharedMemoryStatus.SHADOWED,
-        ))
-        store.append_record(SharedMemoryRecord(
-            memory_id="new-secret",
-            body=f"new key {secret}",
-            kind=MemoryKind.CORRECTION,
-            status=SharedMemoryStatus.ACTIVE,
-            supersedes=["old-secret"],
-        ))
-        store.append_decision(DecisionEvent(
-            event_id="decision-secret",
-            actor="auto",
-            action="auto_supersede",
-            target_ids=["old-secret", "new-secret"],
+        group = "supersede-security-group"
+        _v2_admin_api(
+            temp_workspace, agent="lifecycle-admin", group=group,
+        )
+        _seed_v2_atoms(temp_workspace, group, [
+            {"memory_id": "old-secret", "body": f"old key {secret}"},
+            {"memory_id": "new-secret", "body": f"new key {secret}"},
+        ])
+        from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+        from memoryguard.memory.store import MemoryAtomStore
+        resolved = str(temp_workspace.resolve())
+        GovernanceV2(
+            temp_workspace, memory_store=MemoryAtomStore(temp_workspace),
+        ).supersede(
+            "old-secret",
+            "new-secret",
+            context=V2MutationContext(
+                workspace_id=resolved,
+                share_group_id=group,
+                agent_instance_id="lifecycle-admin",
+                project_ref=resolved,
+                provider="gui",
+                runtime_role="gui",
+                actor="lifecycle-admin",
+                admin=True,
+                authority="admin",
+            ),
             reason="correction",
-            created_at="2026-01-01T00:00:02Z",
-        ))
-
-        result = GovernanceApi(str(temp_workspace)).get_supersede_decisions()
+            idempotency_key="lifecycle-security-supersede",
+        )
+        result = _v2_admin_api(
+            temp_workspace, agent="lifecycle-admin", group=group,
+        ).get_supersede_decisions()
+        assert result["path"] == "v2"
         payload = json.dumps(result, ensure_ascii=False)
 
         assert secret not in payload
@@ -610,6 +777,7 @@ class TestDiscoveryObjectAuthorization:
 
     def _patch_tree(self, temp_workspace, monkeypatch):
         from memoryguard.agent_locator import AgentLocator
+        from types import SimpleNamespace
 
         authorized_file = temp_workspace / "agent-memory.md"
         authorized_file.write_text("allowed", encoding="utf-8")
@@ -639,45 +807,67 @@ class TestDiscoveryObjectAuthorization:
             }],
         }
         monkeypatch.setattr(AgentLocator, "get_selection_tree", lambda self, instance_id: tree)
+        instance = SimpleNamespace(
+            instance_id="inst-1",
+            product="test-agent",
+            surfaces=[{
+                "status": "found",
+                "resolved_path": str(authorized_file),
+            }],
+        )
+        monkeypatch.setattr(
+            AgentLocator, "detect_instances", lambda self: ([instance], {}),
+        )
         return authorized_file
 
     def test_forged_discovery_object_id_is_rejected(self, temp_workspace, monkeypatch):
-        from memoryguard.gui import GovernanceApi
+        from memoryguard.runtime_v2.agent_native import AgentNativeError, AgentNativeService
 
         self._patch_tree(temp_workspace, monkeypatch)
-        api = GovernanceApi(str(temp_workspace))
-        result = api.commit_selection("inst-1", [{
-            "discovery_object_id": "forged-object-id",
-            "path": str(temp_workspace / "evil.md"),
-            "category": "control_surface",
-            "scope": "project",
-        }], confirmed=True)
-
-        assert "error" in result
-        assert result["error"] == "所有 discovery_object_id 验证失败，无有效条目"
+        with pytest.raises(AgentNativeError) as exc_info:
+            AgentNativeService(temp_workspace).commit_selection("inst-1", [{
+                "discovery_object_id": "forged-object-id",
+                "path": str(temp_workspace / "evil.md"),
+                "category": "control_surface",
+                "scope": "project",
+            }])
+        assert exc_info.value.code == "selection_path_not_discovered"
 
     def test_commit_selection_uses_server_category_and_path(self, temp_workspace, monkeypatch):
-        from memoryguard.gui import GovernanceApi
-        from memoryguard.source_registry import SourceRegistry
+        from memoryguard.content.store import ContentStore, stable_id
+        from memoryguard.runtime_v2.agent_native import AgentNativeService
+        from memoryguard.runtime_v2.group_native import GroupControlService
 
         authorized_file = self._patch_tree(temp_workspace, monkeypatch)
         bogus_file = temp_workspace / "evil.md"
         bogus_file.write_text("evil", encoding="utf-8")
-        api = GovernanceApi(str(temp_workspace))
-        result = api.commit_selection("inst-1", [{
+        result = AgentNativeService(temp_workspace).commit_selection("inst-1", [{
             "discovery_object_id": "valid-object-id",
-            "path": str(bogus_file),
+            "path": str(authorized_file),
             "category": "control_surface",
             "scope": "project",
             "scope_source": "fallback",
             "project_ref": "evil-project",
-        }], confirmed=True)
+        }])
 
-        assert "error" not in result
-        reg = SourceRegistry(temp_workspace)
-        roots = [r for r in reg.list_sources() if r.discovery_object_id == "valid-object-id"]
-        assert len(roots) == 1
-        assert roots[0].path == str(authorized_file.resolve())
-        assert roots[0].source_category == "native_memory"
-        assert roots[0].scope == "user"
-        assert roots[0].project_ref == ""
+        assert result["source_count"] == 1
+        source_id = stable_id(
+            "agent-source", "inst-1", str(authorized_file.resolve()),
+        )
+        rows = [
+            row for row in ContentStore(temp_workspace).list_source_connectors(
+                workspace_id=str(temp_workspace.resolve()),
+            ) if row["source_id"] == source_id
+        ]
+        assert len(rows) == 1
+        assert rows[0]["external_root_key"] == str(authorized_file.resolve())
+        assert rows[0]["source_type"] == "file"
+        assert GroupControlService(temp_workspace).selected_source_ids("inst-1") == [
+            source_id
+        ]
+        server_file = AgentNativeService(temp_workspace).get_selection_tree(
+            "inst-1",
+        )["scopes"][0]["categories"][0]["files"][0]
+        assert server_file["scope"] == "user"
+        assert server_file["scope_source"] == "profile_declared"
+        assert server_file["project_ref"] == ""

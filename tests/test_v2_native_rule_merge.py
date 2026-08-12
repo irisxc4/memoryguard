@@ -10,7 +10,6 @@ import pytest
 
 from memoryguard.access_context import AccessContext
 from memoryguard.rule_definition import build_definition
-from memoryguard.rule_merge_store import RuleMergeStore
 from memoryguard.rules.v2_store import RuleV2Store
 from memoryguard.runtime_v2.native_ports import (
     NativeV2RuntimePort,
@@ -48,22 +47,36 @@ def _context(workspace: Path, *, admin: bool = True, agent: str = "agent-a"):
 
 
 def _seed(workspace: Path):
-    store = RuleMergeStore(workspace)
+    store = RuleV2Store(workspace)
     a = build_definition("Always save an audit receipt", kind="procedure")
     b = build_definition("Always preserve an audit receipt", kind="procedure")
     store.upsert_definition(a)
     store.upsert_definition(b)
-    proposal = store.create_proposal(
-        [a.definition_id, b.definition_id], 0.9,
-        definition_a=a, definition_b=b,
-    )
+    proposal_id = "v2-native-proposal"
+    store.record_merge_proposal({
+        "proposal_id": proposal_id,
+        "definition_ids_json": json.dumps(
+            [a.definition_id, b.definition_id], ensure_ascii=False,
+        ),
+        "status": "candidate",
+        "metadata_json": json.dumps({
+            "definition_revision_a": a.revision,
+            "definition_revision_b": b.revision,
+        }, ensure_ascii=False, sort_keys=True),
+    })
+    proposal = {
+        "proposal_id": proposal_id,
+        "definition_ids": [a.definition_id, b.definition_id],
+        "definition_revision_a": a.revision,
+        "definition_revision_b": b.revision,
+    }
     return store, proposal
 
 
-def _native(workspace: Path, store: RuleMergeStore, manifest: _Manifest | None = None):
+def _native(workspace: Path, store: RuleV2Store | None = None, manifest: _Manifest | None = None):
+    del store
     return NativeRuleMergeService(
         workspace,
-        rule_store=bind_native_test_capability(rule_merge_store=store),
         state_provider=manifest or _Manifest(),
     )
 
@@ -158,12 +171,6 @@ def test_native_rule_merge_production_path_writes_only_v2_rules_db(tmp_path: Pat
 
 def test_native_rule_merge_token_swap_wrong_proposal_and_replay_are_stable(tmp_path: Path):
     store, proposal = _seed(tmp_path)
-    # This slice exercises the native transport fence; the Store's independent
-    # semantic similarity gate is covered by RuleMergeStore tests.
-    store.approve_proposal = lambda *args, **kwargs: {
-        "approval_id": "approval-a", "proposal_id": proposal["proposal_id"],
-        "approved_by": "agent-a", "capability_id": "hash-a",
-    }
     service = _native(tmp_path, store)
     context = _context(tmp_path)
     issue = service.dispatch(
@@ -239,7 +246,7 @@ def test_native_rule_merge_restart_replay_is_durable_and_never_reissues_token(tm
     assert second["data"]["capability_token"] == first["data"]["capability_token"]
     assert second["data"].get("idempotent_replay") is True
     with sqlite3.connect(store.db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM governance_capabilities").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0] == 1
 
 
 def test_native_rule_merge_same_key_conflict_happens_before_second_write(tmp_path: Path):
@@ -252,14 +259,14 @@ def test_native_rule_merge_same_key_conflict_happens_before_second_write(tmp_pat
     )
     assert first["ok"]
     with sqlite3.connect(store.db_path) as conn:
-        before = conn.execute("SELECT COUNT(*) FROM governance_capabilities").fetchone()[0]
+        before = conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0]
     conflict = service.dispatch(
         "issue", {"proposal_id": proposal["proposal_id"], "idempotency_key": "conflict-key", "mutation_receipt": _receipt("b"), "recovery_secret": _secret()},
         context=context, generation=7, state="V2_ACTIVE",
     )
     assert conflict["code"] == "idempotency_conflict"
     with sqlite3.connect(store.db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM governance_capabilities").fetchone()[0] == before
+        assert conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0] == before
 
 
 def test_native_rule_merge_concurrent_same_key_has_one_durable_effect(tmp_path: Path):
@@ -277,7 +284,7 @@ def test_native_rule_merge_concurrent_same_key_has_one_durable_effect(tmp_path: 
     assert all(item["ok"] for item in results)
     assert results[0]["data"]["capability_token"] == results[1]["data"]["capability_token"]
     with sqlite3.connect(store.db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM governance_capabilities").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0] == 1
 
 
 def test_native_rule_merge_orphaned_pending_request_fails_closed(tmp_path: Path):
@@ -287,7 +294,7 @@ def test_native_rule_merge_orphaned_pending_request_fails_closed(tmp_path: Path)
         conn.execute(
             "INSERT INTO rule_merge_native_requests "
             "(request_key, request_fingerprint, operation, schema_version, status, result_json, created_at, updated_at) "
-            "VALUES (?, ?, 'capability_issue', 1, 'pending', '', 'now', 'now')",
+            "VALUES (?, ?, 'capability_issue', 2, 'pending', '', 'now', 'now')",
             ("orphan-key", "f" * 64),
         )
     result = _native(tmp_path, store).dispatch(
@@ -296,7 +303,7 @@ def test_native_rule_merge_orphaned_pending_request_fails_closed(tmp_path: Path)
     )
     assert result["code"] in {"idempotency_conflict", "idempotency_in_progress"}
     with sqlite3.connect(store.db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM governance_capabilities").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0] == 0
 
 
 def test_native_rule_merge_non_issue_replays_are_durable_and_token_free(tmp_path: Path):
@@ -314,7 +321,7 @@ def test_native_rule_merge_non_issue_replays_are_durable_and_token_free(tmp_path
     }
     ack = service.dispatch("acknowledge", ack_payload, context=context, generation=7, state="V2_ACTIVE")
     assert ack["ok"]
-    ack_replay = _native(tmp_path, RuleMergeStore(tmp_path)).dispatch(
+    ack_replay = _native(tmp_path).dispatch(
         "acknowledge", ack_payload, context=context, generation=7, state="V2_ACTIVE",
     )
     assert ack_replay["ok"] and ack_replay["data"].get("idempotent_replay") is True
@@ -330,7 +337,7 @@ def test_native_rule_merge_non_issue_replays_are_durable_and_token_free(tmp_path
     }
     clear = service.dispatch("cooldown_clear", clear_payload, context=context, generation=7, state="V2_ACTIVE")
     assert clear["ok"]
-    clear_replay = _native(tmp_path, RuleMergeStore(tmp_path)).dispatch(
+    clear_replay = _native(tmp_path).dispatch(
         "cooldown_clear", clear_payload, context=context, generation=7, state="V2_ACTIVE",
     )
     assert clear_replay["ok"] and clear_replay["data"].get("idempotent_replay") is True
@@ -356,7 +363,7 @@ def test_native_rule_merge_recovery_secret_validation_binding_and_no_plaintext(t
     assert wrong["code"] == "idempotency_conflict"
     with sqlite3.connect(store.db_path) as conn:
         rows = conn.execute("SELECT * FROM rule_merge_native_requests").fetchall()
-        capability = conn.execute("SELECT * FROM governance_capabilities").fetchone()
+        capability = conn.execute("SELECT * FROM rule_governance_capabilities").fetchone()
     encoded = json.dumps([tuple(row) for row in rows] + [tuple(capability)])
     assert secret not in encoded and token not in encoded
 
@@ -374,12 +381,12 @@ def test_native_rule_merge_terminal_and_pending_drift_fail_closed(tmp_path: Path
     issued = service.dispatch("issue", payload, context=context, generation=7, state="V2_ACTIVE")
     assert issued["ok"]
     with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE governance_capabilities SET consumed=1 WHERE proposal_id=?", (proposal["proposal_id"],))
+        conn.execute("UPDATE rule_governance_capabilities SET consumed_at='consumed' WHERE proposal_id=?", (proposal["proposal_id"],))
         conn.commit()
     replay = service.dispatch("issue", payload, context=context, generation=7, state="V2_ACTIVE")
     assert replay["code"] == "capability_replay_unavailable"
     with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE governance_capabilities SET consumed=0")
+        conn.execute("UPDATE rule_governance_capabilities SET consumed_at=''")
         conn.execute("UPDATE rule_merge_native_requests SET status='pending', result_json='drift' WHERE request_key=?", ("terminal-key",))
         conn.commit()
     drift = service.dispatch("issue", payload, context=context, generation=7, state="V2_ACTIVE")

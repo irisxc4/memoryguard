@@ -1,13 +1,22 @@
 from memoryguard import toml_compat as tomllib
+import pytest
 
-from memoryguard.agent_binding import AgentBindingStore
 from memoryguard.provider_adapters import CodexAdapter
+from memoryguard.runtime_v2.group_native import GroupControlService
+
+
+@pytest.fixture(autouse=True)
+def _v2_provider_plane(monkeypatch):
+    monkeypatch.setattr(
+        "memoryguard.provider_adapters._binding_plane_for_workspace",
+        lambda _workspace: "v2",
+    )
 
 
 def test_codex_install_reconciles_owned_duplicate_and_orphan_marker(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    AgentBindingStore(workspace).bind_agent("codex-owned", "toml-group")
+    GroupControlService(workspace, write=True).bind_agent("codex-owned", "toml-group")
     config = workspace / ".codex" / "config.toml"
     config.parent.mkdir()
     config.write_text(
@@ -34,7 +43,7 @@ def test_codex_install_reconciles_owned_duplicate_and_orphan_marker(tmp_path):
 def test_codex_install_fails_closed_for_unknown_memoryguard_table(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    AgentBindingStore(workspace).bind_agent("codex-unknown", "toml-group")
+    GroupControlService(workspace, write=True).bind_agent("codex-unknown", "toml-group")
     config = workspace / ".codex" / "config.toml"
     config.parent.mkdir()
     original = "[mcp_servers.memoryguard]\ncommand = 'someone-else'\n"

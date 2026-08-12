@@ -262,10 +262,6 @@ class RuntimeSnapshot:
     def read_only(self) -> bool:
         return self.state is CutoverState.V2_READY
 
-    @property
-    def legacy_route(self) -> bool:
-        return self.state in {CutoverState.V1_ACTIVE, CutoverState.V2_BUILDING}
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.value,

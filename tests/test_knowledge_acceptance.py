@@ -1,16 +1,188 @@
 from __future__ import annotations
 
 import sqlite3
-import threading
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.knowledge_gui import handle_knowledge_api
 from memoryguard.knowledge_ingestion import create_book, ingest_book
 from memoryguard.knowledge_mcp import handle_knowledge_tool
 from memoryguard.knowledge_retriever import _graph_results, read_chunk, search
 from memoryguard.knowledge_store import KnowledgeStore
-from memoryguard.shared_memory_store import SharedMemoryStore
+
+
+def _ensure_v2_knowledge_workspace(root: Path) -> None:
+    """Create the explicitly active V2 stores used by acceptance tests."""
+    from memoryguard.assets_v2.store import AssetStore
+    from memoryguard.codegraph_v2.store import CodeGraphStore
+    from memoryguard.content.store import ContentStore
+    from memoryguard.evidence.store import EvidenceStore
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.memory.store import MemoryAtomStore
+    from memoryguard.projection_v2.store import ProjectionStore
+    from memoryguard.rules.v2_store import RuleV2Store
+    from memoryguard.runtime_v2.working_memory import RuntimeStore
+    from memoryguard.skills_v2.store import SkillStore
+    from memoryguard.storage.layout import WorkspaceV2Layout
+    from memoryguard.storage.schema import initialize_all
+    from memoryguard.system.manifest import ManifestManager, ManifestState
+
+    manager = ManifestManager(root)
+    if manager.current().state is ManifestState.V2_ACTIVE:
+        return
+    initialize_all(WorkspaceV2Layout(root))
+    MemoryAtomStore(root)
+    EvidenceStore(root)
+    RuleV2Store(root)
+    ProjectionStore(root)
+    ContentStore(root)
+    RuntimeStore(root)
+    CodeGraphStore(root)
+    AssetStore(root)
+    SkillStore(root)
+    GovernanceV2(
+        root,
+        memory_store=MemoryAtomStore(root),
+        evidence_store=EvidenceStore(root),
+    )
+    manager.transition(ManifestState.V2_BUILDING, migration_id="knowledge-acceptance-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="knowledge-acceptance-source",
+        target_digest="knowledge-acceptance-target",
+        manifest_digest="knowledge-acceptance-manifest",
+        digests={"validator_passed": True, "checkpoints": {"knowledge": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def _knowledge_v2_fixture(
+    root: Path,
+    *,
+    agent: str = "knowledge-acceptance-agent",
+    group: str = "knowledge-acceptance-group",
+):
+    """Return a trusted GUI bridge and its same-process native V2 port."""
+    from memoryguard.access_context import AccessContext
+    from memoryguard.gui import GovernanceApi
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    workspace = root.resolve()
+    _ensure_v2_knowledge_workspace(workspace)
+    GroupControlService(workspace, write=True).bind_agent(agent, group)
+    access = AccessContext(
+        trusted_agent_id=agent,
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id=f"{agent}-session",
+        session_source="transport",
+        session_trusted=True,
+    )
+    bridge = GovernanceApi(str(workspace), _trusted_access_context=access)
+    runtime = bridge._get_v2_runtime()
+    snapshot = runtime.state_snapshot()
+    assert snapshot.state.value == "V2_ACTIVE"
+    context = bridge._trusted_bridge_context()
+    assert context.get("__native_bound_context") is not None
+    port = runtime.ports.v2
+    assert port is not None
+    return bridge, port, context, snapshot, group
+
+
+def _wait_for_v2_job(bridge, run_id: str) -> dict:
+    import time
+
+    latest = {}
+    for _ in range(500):
+        latest = bridge.knowledge_job_status(run_id)
+        if latest.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    assert latest.get("status") == "succeeded", latest
+    assert latest.get("task", {}).get("run_id") == run_id, latest
+    return latest
+
+
+def _add_v2_book(bridge, root: Path, title: str) -> dict:
+    accepted = bridge.knowledge_add(str(root), title)
+    assert accepted.get("ok") is True, accepted
+    run_id = accepted.get("job_id") or accepted.get("task", {}).get("run_id")
+    assert run_id
+    return _wait_for_v2_job(bridge, str(run_id))
+
+
+def _seed_v2_candidate(
+    workspace: Path,
+    context,
+    candidate_id: str,
+    *,
+    source_occurrence_id: str | None = None,
+    content_hash: str | None = None,
+    summary: str = "知识接受候选",
+) -> dict[str, str]:
+    """Stage a reference-only candidate in the V2 knowledge plane."""
+    import json
+
+    from memoryguard.knowledge_v2.service import KNOWLEDGE_CANDIDATE_TABLE
+    from memoryguard.storage.layout import WorkspaceV2Layout
+
+    layout = WorkspaceV2Layout(workspace)
+    with sqlite3.connect(layout.knowledge_db) as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM knowledge_documents "
+            "WHERE status='active' ORDER BY path LIMIT 1",
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(str(row[0]))
+        actual_occurrence_id = str(metadata["occurrence_ids"][0])
+        actual_content_hash = str(metadata["content_hash"])
+        conn.execute(
+            f"INSERT INTO {KNOWLEDGE_CANDIDATE_TABLE} "
+            "(candidate_id,namespace_id,workspace_id,agent_instance_id,project_ref,"
+            "provider,share_group_id,sensitivity,policy_class,status,summary,reference,"
+            "content_hash,source_occurrence_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                candidate_id,
+                str(context["namespace_id"]),
+                str(context["workspace_id"]),
+                str(context["agent_instance_id"]),
+                str(context["project_ref"]),
+                str(context["provider"]),
+                str(context["share_group_id"]),
+                str(context["sensitivity"]),
+                str(context["policy_class"]),
+                "pending",
+                summary,
+                source_occurrence_id or actual_occurrence_id,
+                content_hash or actual_content_hash,
+                source_occurrence_id or actual_occurrence_id,
+            ),
+        )
+        conn.commit()
+    return {
+        "candidate_id": candidate_id,
+        "occurrence_id": actual_occurrence_id,
+        "content_hash": actual_content_hash,
+    }
+
+
+def _memory_scope(context) -> dict[str, str]:
+    return {
+        key: str(context[key])
+        for key in (
+            "workspace_id",
+            "share_group_id",
+            "agent_instance_id",
+            "project_ref",
+            "provider",
+            "runtime_role",
+        )
+    }
+
+
+def _synced_memory_id(result: dict) -> str:
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
+    return str(data.get("synced_memory_id") or "")
 
 
 class RecordingProvider:
@@ -159,102 +331,95 @@ def test_remote_provider_and_public_read_paths_exclude_restricted_content(
 
 
 def test_candidate_sync_writes_real_memory_and_retry_survives_failure(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ) -> None:
-    import memoryguard.knowledge_gui as knowledge_gui
-
     workspace = tmp_path / "control"
-    workspace.mkdir()
-    group_id = AgentBindingStore(workspace).ensure_personal_memory_group(
-        "knowledge-agent",
-    )["group_id"]
-    data_home = tmp_path / "knowledge-data"
+    bridge, port, context, snapshot, group_id = _knowledge_v2_fixture(workspace)
+    try:
+        _add_v2_book(bridge, _book_root(tmp_path), "知识接受")
 
-    with KnowledgeStore(data_home) as store:
-        book = create_book(store, str(_book_root(tmp_path)))
-        candidate_id = store.add_memory_candidate(
-            book.book_id,
-            "该项目使用统一的知识治理流程。",
-            kind="project",
-            source="normal.md",
-            confidence=0.9,
+        candidate = _seed_v2_candidate(
+            workspace,
+            context,
+            "knowledge-acceptance-candidate",
+            summary="该项目使用统一的知识治理流程。",
+        )
+        result = bridge.knowledge_candidate_review(
+            candidate["candidate_id"], "approve", group_id,
+        )
+        assert result["ok"] is True
+        assert result["status"] == "succeeded"
+        memory_id = _synced_memory_id(result)
+        assert memory_id
+
+        from memoryguard.evidence import EvidenceStore
+        from memoryguard.memory import MemoryAtomStore
+
+        memory = MemoryAtomStore(workspace)
+        atom = memory.get_atom(memory_id, scope=_memory_scope(context))
+        assert atom is not None
+        assert atom.body
+        assert memory.evidence_ids_for_atom(atom.atom_id)
+        assert EvidenceStore(workspace).status()["evidence"] >= 1
+
+        broken = _seed_v2_candidate(
+            workspace,
+            context,
+            "knowledge-acceptance-retry",
+            source_occurrence_id="missing-occurrence",
+            content_hash="missing-content-hash",
+            summary="失败后必须允许重试。",
+        )
+        failed = bridge.knowledge_candidate_review(
+            broken["candidate_id"], "approve", group_id,
+        )
+        assert failed["ok"] is False
+        assert failed["code"] == "knowledge_candidate_source_unavailable"
+        pending = bridge.knowledge_candidates_list("", "pending")
+        assert pending["ok"] is True
+        assert any(
+            item["candidate_id"] == broken["candidate_id"]
+            for item in pending["data"]["references"]
         )
 
-    monkeypatch.setattr(
-        knowledge_gui,
-        "open_shared_knowledge_store",
-        lambda **kwargs: KnowledgeStore(data_home),
-    )
-    result = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [candidate_id, "approve", group_id],
-        workspace,
-    )
-    assert result["ok"] is True
-    assert result["status"] == "synced"
-    assert result["synced_memory_id"]
+        from memoryguard.storage.layout import WorkspaceV2Layout
 
-    with KnowledgeStore(data_home) as store:
-        candidate = store.get_memory_candidate(candidate_id)
-        assert candidate["status"] == "synced"
-        assert candidate["synced_memory_id"] == result["synced_memory_id"]
-    records = SharedMemoryStore(workspace, group_id, read_only=True).list_records()
-    assert any(r.memory_id == result["synced_memory_id"] for r in records)
+        layout = WorkspaceV2Layout(workspace)
+        with sqlite3.connect(layout.knowledge_db) as conn:
+            conn.execute(
+                "UPDATE knowledge_v2_candidates SET content_hash=?, "
+                "source_occurrence_id=?, reference=? WHERE candidate_id=?",
+                (
+                    candidate["content_hash"],
+                    candidate["occurrence_id"],
+                    candidate["occurrence_id"],
+                    broken["candidate_id"],
+                ),
+            )
+            conn.commit()
 
-    with KnowledgeStore(data_home) as store:
-        failed_id = store.add_memory_candidate(
-            book.book_id,
-            "失败后必须允许重试。",
-            kind="fact",
-            source="normal.md",
+        retried = bridge.knowledge_candidate_review(
+            broken["candidate_id"], "approve", group_id,
         )
-        store._conn.execute(
-            "UPDATE memory_candidates SET kind='knowledge' WHERE candidate_id=?",
-            (failed_id,),
-        )
+        assert retried["ok"] is True
+        assert retried["status"] == "succeeded"
+        retry_memory_id = _synced_memory_id(retried)
+        assert retry_memory_id
+        assert memory.get_atom(retry_memory_id, scope=_memory_scope(context)) is not None
 
-    failed = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [failed_id, "approve", group_id],
-        workspace,
-    )
-    assert failed["ok"] is False
-    assert failed["status"] == "sync_failed"
-    with KnowledgeStore(data_home) as store:
-        candidate = store.get_memory_candidate(failed_id)
-        assert candidate["status"] == "sync_failed"
-        assert candidate["synced_memory_id"] == ""
-        actionable = store.list_memory_candidates(status="actionable")
-        assert any(item["candidate_id"] == failed_id for item in actionable)
-        store._conn.execute(
-            "UPDATE memory_candidates SET kind='fact' WHERE candidate_id=?",
-            (failed_id,),
+        kept = _seed_v2_candidate(
+            workspace,
+            context,
+            "knowledge-acceptance-kept",
+            summary="用户可以暂时保留候选而不执行同步。",
         )
-
-    retried = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [failed_id, "approve", group_id],
-        workspace,
-    )
-    assert retried["ok"] is True
-    assert retried["status"] == "synced"
-
-    with KnowledgeStore(data_home) as store:
-        kept_id = store.add_memory_candidate(
-            book.book_id,
-            "用户可以暂时保留候选而不执行同步。",
-            kind="fact",
-            source="normal.md",
+        kept_result = bridge.knowledge_candidate_review(
+            kept["candidate_id"], "keep", group_id,
         )
-    kept = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [kept_id, "keep", group_id],
-        workspace,
-    )
-    assert kept["ok"] is True
-    assert kept["status"] == "pending"
-    with KnowledgeStore(data_home) as store:
-        assert store.get_memory_candidate(kept_id)["status"] == "pending"
+        assert kept_result["ok"] is True
+        assert kept_result["data"]["status"] == "pending"
+    finally:
+        port.shutdown(timeout=5.0)
 
 
 def test_graph_query_relation_cleanup_and_same_name_book_isolation(
@@ -401,114 +566,130 @@ def test_native_gui_loads_the_localhost_application(
 def test_sandbox_request_executes_knowledge_add_until_job_done(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    import time
-    from memoryguard import provider_api
     from memoryguard.desktop_executor import RequestExecutor
-    from memoryguard.knowledge_store import open_shared_knowledge_store
     from memoryguard.security import RequestQueue
 
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    data_home = tmp_path / "data-home"
+    bridge, port, _context, _snapshot, _group = _knowledge_v2_fixture(
+        workspace,
+        agent="memoryguard-server-admin",
+        group="memoryguard-server-control",
+    )
     root = tmp_path / "sandbox-book"
     root.mkdir()
     (root / "README.md").write_text(
         "# Sandbox E2E\n\nThe desktop executor must create and index this book.\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
     monkeypatch.setattr(RequestQueue, "_notify_desktop", lambda self, request_id: None)
-    monkeypatch.setattr(provider_api, "get_provider_state", lambda workspace=None: (None, None))
 
-    queue = RequestQueue(workspace)
-    request = queue.submit("knowledge_add", [str(root), "Sandbox E2E"])
-    result = RequestExecutor(workspace).process_request(
-        request.request_id, auto_confirm=True,
-    )
+    try:
+        queue = RequestQueue(workspace)
+        request = queue.submit("knowledge_add", [str(root), "Sandbox E2E"])
+        result = RequestExecutor(
+            workspace,
+            trusted_desktop=True,
+            v2_port=port,
+        ).process_request(
+            request.request_id, auto_confirm=True,
+        )
 
-    assert result[0]["status"] == "done"
-    job_id = result[0]["result"]["job_id"]
-    deadline = time.monotonic() + 10
-    job = None
-    books = []
-    while time.monotonic() < deadline:
-        with open_shared_knowledge_store(read_only=True, must_exist=True) as store:
-            job = store.get_job(job_id)
-            books = store.list_books()
-        if job and job["status"] in {"done", "failed"}:
-            break
-        time.sleep(0.05)
+        assert result[0]["status"] == "done", result
+        payload = result[0]["result"]
+        assert payload.get("ok") is True, result
+        assert payload.get("deferred") is True, result
+        assert payload.get("error") in (None, ""), result
+        job_id = str(payload["task"]["run_id"])
+        job = _wait_for_v2_job(bridge, job_id)
 
-    assert queue.get(request.request_id).status == "done"
-    assert job is not None and job["status"] == "done"
-    assert any(book.title == "Sandbox E2E" for book in books)
+        assert queue.get(request.request_id).status == "done"
+        assert job["status"] == "succeeded"
+        assert job.get("task", {}).get("run_id") == job_id
+        books = bridge.knowledge_list("", 50)
+        assert books.get("ok") is True, books
+        assert any(book["title"] == "Sandbox E2E" for book in books["data"]["books"])
+    finally:
+        port.shutdown(timeout=5.0)
 
 
 def test_sandbox_candidate_review_forwards_explicit_target_group(
     tmp_path: Path, monkeypatch,
 ) -> None:
     from memoryguard.desktop_executor import RequestExecutor
+    from memoryguard.memory import MemoryAtomStore
     from memoryguard.security import RequestQueue
 
     workspace = tmp_path / "candidate-workspace"
-    workspace.mkdir()
-    data_home = tmp_path / "candidate-data"
-    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
-    monkeypatch.setattr(RequestQueue, "_notify_desktop", lambda self, request_id: None)
     group_id = "sandbox-shared-knowledge"
-    AgentBindingStore(workspace).bind_agents_to_group(
-        ["sandbox-agent-a", "sandbox-agent-b"],
-        share_group_id=group_id,
+    bridge, port, context, _snapshot, _group = _knowledge_v2_fixture(
+        workspace,
+        agent="memoryguard-server-admin",
+        group=group_id,
     )
-
-    with KnowledgeStore(data_home) as store:
-        book = create_book(store, str(_book_root(tmp_path)))
-        candidate_id = store.add_memory_candidate(
-            book.book_id,
-            "Sandbox candidate review must preserve the selected target group.",
-            kind="project",
-            source="normal.md",
+    monkeypatch.setattr(RequestQueue, "_notify_desktop", lambda self, request_id: None)
+    try:
+        _add_v2_book(bridge, _book_root(tmp_path), "Sandbox candidate book")
+        candidate = _seed_v2_candidate(
+            workspace,
+            context,
+            "sandbox-candidate",
+            summary="Sandbox candidate review must preserve the selected target group.",
         )
 
-    queue = RequestQueue(workspace)
-    request = queue.submit(
-        "knowledge_candidate_review",
-        [candidate_id, "approve", group_id],
-    )
-    result = RequestExecutor(workspace).process_request(
-        request.request_id, auto_confirm=True,
-    )
+        queue = RequestQueue(workspace)
+        request = queue.submit(
+            "knowledge_candidate_review",
+            [candidate["candidate_id"], "approve", group_id],
+        )
+        result = RequestExecutor(workspace, trusted_desktop=True).process_request(
+            request.request_id, auto_confirm=True,
+        )
 
-    assert result[0]["status"] == "done"
-    assert result[0]["result"]["status"] == "synced"
-    memory_id = result[0]["result"]["synced_memory_id"]
-    records = SharedMemoryStore(workspace, group_id, read_only=True).list_records()
-    assert any(record.memory_id == memory_id for record in records)
+        assert result[0]["status"] == "done", result
+        payload = result[0]["result"]
+        assert payload.get("ok") is True, result
+        assert payload.get("status") == "succeeded", result
+        memory_id = _synced_memory_id(payload)
+        assert memory_id
+        atom = MemoryAtomStore(workspace).get_atom(
+            memory_id,
+            scope=_memory_scope(context),
+        )
+        assert atom is not None
+        assert atom.share_group_id == group_id
+        assert MemoryAtomStore(workspace).evidence_ids_for_atom(atom.atom_id)
+    finally:
+        port.shutdown(timeout=5.0)
 
 
 def test_book_detail_is_layered_and_never_renders_restricted_content(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ) -> None:
     import memoryguard.knowledge_gui as knowledge_gui
 
-    data_home = tmp_path / "detail-data"
-    with KnowledgeStore(data_home) as store:
-        book = create_book(store, str(_book_root(tmp_path)), title="Detail")
-        ingest_book(store, book.book_id)
+    workspace = tmp_path / "detail-workspace"
+    bridge, port, _context, _snapshot, _group = _knowledge_v2_fixture(workspace)
+    try:
+        _add_v2_book(bridge, _book_root(tmp_path), "Detail")
+        books = bridge.knowledge_list("", 50)
+        assert books.get("ok") is True, books
+        book = next(item for item in books["data"]["books"] if item["title"] == "Detail")
 
-    monkeypatch.setattr(
-        knowledge_gui,
-        "_get_store",
-        lambda read_only=False: KnowledgeStore(data_home, read_only=read_only),
-    )
-    html = knowledge_gui.render_book_detail_html(book.book_id)
+        # The public V2 knowledge bridge is the dependency seam for the detail
+        # asset; the renderer itself remains a transport-only HTML shell.
+        detail = bridge.knowledge_book(book["book_id"], "", 50)
+        assert detail.get("ok") is True, detail
+        assert detail.get("data", {}).get("book_id") == book["book_id"]
+        html = knowledge_gui.render_book_detail_html(book["book_id"])
 
-    for heading in ("知识片段", "实体", "关系", "构建状态", "书籍设置"):
-        assert heading in html
-    assert "--bg: #040b09" in html
-    assert "--accent: #6ee7c4" in html
-    assert "postgres://user:password" not in html
-    assert "上传到远程服务" not in html
+        assert "知识详情" in html
+        assert 'href="/knowledge"' in html
+        assert "V2 服务" in html
+        assert "background:#07110e" in html
+        assert "postgres://user:password" not in html
+        assert "上传到远程服务" not in html
+    finally:
+        port.shutdown(timeout=5.0)
 
 
 def test_bookshelf_matches_main_panel_and_has_back_navigation() -> None:
@@ -518,8 +699,10 @@ def test_bookshelf_matches_main_panel_and_has_back_navigation() -> None:
 
     assert 'class="back-link" href="/"' in html
     assert "返回主面板" in html
-    assert "--bg: #040b09" in html
-    assert "--accent: #6ee7c4" in html
+    assert "V2 知识服务已接管" in html
+    assert "/api/knowledge_list" in html
+    assert "background:#07110e" in html
+    assert "color:#6ee7c4" in html
     assert "#efe9dd" not in html
 
 
@@ -594,15 +777,11 @@ def test_remote_search_query_requires_authorization_and_existing_vectors(
 
 
 def test_bootstrap_and_unknown_provider_never_send_query_text(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ) -> None:
     from memoryguard import provider_api
-    from memoryguard.context_bootstrap import build_context_packet
-    from memoryguard.knowledge_store import open_shared_knowledge_store
-    from memoryguard.schema_v3 import EffectiveAgentContext
+    from memoryguard.memory import MemoryAtomStore
 
-    data_home = tmp_path / "bootstrap-data"
-    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
     backend = RecordingProvider()
     config = provider_api.ProviderConfig(
         provider_type="openai_compatible",
@@ -612,124 +791,103 @@ def test_bootstrap_and_unknown_provider_never_send_query_text(
         embedding_model="remote-embed",
     )
     provider_api.set_provider(backend, config=config)
-    with open_shared_knowledge_store() as store:
-        book = create_book(store, str(_book_root(tmp_path)))
-        store.update_book_settings(
-            book.book_id,
-            remote_embedding_allowed=True,
-            remote_query_embedding_allowed=True,
+    workspace = tmp_path / "bootstrap-v2-workspace"
+    bridge, port, context, snapshot, _group = _knowledge_v2_fixture(workspace)
+    try:
+        backend.embedding_inputs.clear()
+        backend.chat_inputs.clear()
+        bootstrap = port.dispatch_mcp(
+            "memoryguard_context_bootstrap",
+            {"task": "TOP SECRET bootstrap task"},
+            context=context,
+            generation=snapshot.generation,
+            state=snapshot.state,
         )
-        ingest_book(store, book.book_id)
-    backend.embedding_inputs.clear()
+        assert bootstrap.get("ok") is True, bootstrap
+        assert MemoryAtomStore(workspace).list_atoms(
+            scope=_memory_scope(context),
+        ) == []
 
-    memory_store = SharedMemoryStore(tmp_path / "memory", "default")
-    build_context_packet(
-        memory_store,
-        task="TOP SECRET bootstrap task",
-        effective_context=EffectiveAgentContext("agent-1", "default"),
-    )
-    assert backend.embedding_inputs == []
-
-    provider_api.set_provider(backend)
-    with open_shared_knowledge_store(read_only=True, must_exist=True) as store:
-        search(
-            store,
-            "UNKNOWN PROVIDER QUERY",
-            allow_remote_vector_query=True,
+        search_result = port.dispatch_mcp(
+            "memoryguard_memory_search",
+            {"query": "UNKNOWN PROVIDER QUERY", "limit": 20},
+            context=context,
+            generation=snapshot.generation,
+            state=snapshot.state,
         )
-    assert backend.embedding_inputs == []
-    provider_api.clear_provider()
+        assert search_result.get("ok") is True, search_result
+        assert "UNKNOWN PROVIDER QUERY" not in str(search_result)
+        assert backend.embedding_inputs == []
+        assert backend.chat_inputs == []
+    finally:
+        port.shutdown(timeout=5.0)
+        provider_api.clear_provider()
 
 
 def test_candidate_sync_is_single_group_cas_and_reject_fails_closed(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
 ) -> None:
-    import memoryguard.knowledge_gui as knowledge_gui
+    from memoryguard.evidence import EvidenceStore
+    from memoryguard.memory import MemoryAtomStore
 
     workspace = tmp_path / "candidate-cas-workspace"
-    workspace.mkdir()
-    bindings = AgentBindingStore(workspace)
-    group_a = bindings.bind_agents_to_group(
-        ["candidate-agent-a1", "candidate-agent-a2"],
-        share_group_id="candidate-group-a",
-    )["share_group_id"]
-    group_b = bindings.bind_agents_to_group(
-        ["candidate-agent-b1", "candidate-agent-b2"],
-        share_group_id="candidate-group-b",
-    )["share_group_id"]
-    data_home = tmp_path / "candidate-cas-data"
-    with KnowledgeStore(data_home) as store:
-        book = create_book(store, str(_book_root(tmp_path)))
-        candidate_id = store.add_memory_candidate(
-            book.book_id,
-            "A candidate may be synchronized to exactly one share group.",
-            kind="project",
-            source="normal.md",
+    bridge_a, port_a, context_a, _snapshot_a, group_a = _knowledge_v2_fixture(
+        workspace,
+        agent="candidate-agent-a1",
+        group="candidate-group-a",
+    )
+    bridge_b, port_b, context_b, _snapshot_b, group_b = _knowledge_v2_fixture(
+        workspace,
+        agent="candidate-agent-b1",
+        group="candidate-group-b",
+    )
+    try:
+        _add_v2_book(bridge_a, _book_root(tmp_path), "Candidate CAS")
+        candidate = _seed_v2_candidate(
+            workspace,
+            context_a,
+            "candidate-cas",
+            summary="A candidate may be synchronized to exactly one share group.",
         )
 
-    monkeypatch.setattr(
-        knowledge_gui,
-        "open_shared_knowledge_store",
-        lambda **kwargs: KnowledgeStore(data_home),
-    )
-    original_sync = knowledge_gui._sync_candidate_to_memory
-    claimed = threading.Event()
-    release = threading.Event()
+        first = bridge_a.knowledge_candidate_review(
+            candidate["candidate_id"], "approve", group_a,
+        )
+        assert first.get("ok") is True, first
+        first_memory_id = _synced_memory_id(first)
+        assert first_memory_id
 
-    def _paused_sync(*args, **kwargs):
-        claimed.set()
-        assert release.wait(5)
-        return original_sync(*args, **kwargs)
+        cross_group = bridge_b.knowledge_candidate_review(
+            candidate["candidate_id"], "approve", group_b,
+        )
+        rejected = bridge_b.knowledge_candidate_review(
+            candidate["candidate_id"], "reject", group_b,
+        )
+        assert cross_group.get("ok") is False, cross_group
+        assert cross_group.get("code") == "knowledge_candidate_not_found"
+        assert rejected.get("ok") is False, rejected
+        assert rejected.get("code") == "knowledge_candidate_not_found"
 
-    monkeypatch.setattr(knowledge_gui, "_sync_candidate_to_memory", _paused_sync)
-    first_result: dict[str, object] = {}
+        same_group = bridge_a.knowledge_candidate_review(
+            candidate["candidate_id"], "approve", group_a,
+        )
+        assert same_group.get("ok") is True, same_group
+        assert _synced_memory_id(same_group) == first_memory_id
 
-    def _approve_first() -> None:
-        first_result.update(handle_knowledge_api(
-            "knowledge_candidate_review",
-            [candidate_id, "approve", group_a],
-            workspace,
-        ))
-
-    worker = threading.Thread(target=_approve_first)
-    worker.start()
-    assert claimed.wait(5)
-
-    cross_group = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [candidate_id, "approve", group_b],
-        workspace,
-    )
-    rejected = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [candidate_id, "reject", group_a],
-        workspace,
-    )
-    release.set()
-    worker.join(10)
-
-    assert first_result["ok"] is True
-    assert cross_group["ok"] is False
-    assert cross_group["error"] == "candidate_already_targeted_to_other_group"
-    assert rejected["ok"] is False
-    assert rejected["error"] == "candidate not found or invalid decision"
-
-    same_group = handle_knowledge_api(
-        "knowledge_candidate_review",
-        [candidate_id, "approve", group_a],
-        workspace,
-    )
-    assert same_group["ok"] is True
-    assert same_group["synced_memory_id"] == first_result["synced_memory_id"]
-
-    records_a = SharedMemoryStore(workspace, group_a, read_only=True).list_records()
-    records_b = SharedMemoryStore(workspace, group_b, read_only=True).list_records()
-    candidate_records = [
-        record
-        for record in [*records_a, *records_b]
-        if record.body == "A candidate may be synchronized to exactly one share group."
-    ]
-    assert len(candidate_records) == 1
+        memory = MemoryAtomStore(workspace)
+        atoms_a = memory.list_atoms(scope=_memory_scope(context_a))
+        candidate_atoms = [
+            atom for atom in atoms_a
+            if atom.metadata.get("candidate_id") == candidate["candidate_id"]
+        ]
+        assert len(candidate_atoms) == 1
+        assert candidate_atoms[0].share_group_id == group_a
+        assert memory.evidence_ids_for_atom(candidate_atoms[0].atom_id)
+        assert memory.list_atoms(scope=_memory_scope(context_b)) == []
+        assert EvidenceStore(workspace).status()["evidence"] >= 1
+    finally:
+        port_b.shutdown(timeout=5.0)
+        port_a.shutdown(timeout=5.0)
 
 
 def test_mcp_book_hides_restricted_filenames_and_headings(

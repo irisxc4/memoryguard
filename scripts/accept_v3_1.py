@@ -1,346 +1,233 @@
-"""MemoryGuard v3.1 MVP 验收脚本（spec §13.1）。
+"""MemoryGuard v3.1 acceptance over the formal V2 public contracts.
 
-逐项验证 9 个 MVP 指标：
-1. 一次点击列出 Agent 候选和分类，候选阶段不读正文
-2. 所有已知表面 100% 进入 DiscoveryLedger
-3. 所有授权候选 100% 进入 SourceCoverageLedger
-4. 所有选中对象 100% 进入 NormalizationLedger
-5. 所有 active MemoryRecord 100% 进入 PublicationLedger
-6. 外部来源和 Obsidian 不再出现"页面可见、IR 丢失"
-7. 变更记录兼容旧 Change、新 Release 和损坏记录
-8. 只有 Loader 复读成功才能显示"已接管"（EXPORT_ONLY 不声称接管）
-9. 所有写入可通过精确 Release 回滚
-
-用法：python scripts/accept_v3_1.py
+The acceptance path is intentionally the same path used by the V2 GUI:
+GroupControlService/SourceControlService -> NativeExtractionEnrichmentService
+-> MemoryAtomStore -> ProjectionBuildService/ProjectionStore.
 """
 from __future__ import annotations
 
-import json
-import os
+from pathlib import Path
 import shutil
 import sys
 import tempfile
-from pathlib import Path
 
-# 确保能从 memoryguard/ 目录运行（src 在父目录）
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-from src.memoryguard.agent_locator import AgentLocator, compute_takeover_state
-from src.memoryguard.change_history import list_change_history
-from src.memoryguard.gui import GovernanceApi
-from src.memoryguard.managed_store import ManagedStore
-from src.memoryguard.projection import ProjectionBuilder
-from src.memoryguard.schema_v3 import (
-    IngestionPolicy, Ownership, SourceCategory, SourceRootType, SurfaceStatus,
-    TakeoverState, TargetCapability, TargetRole,
-)
-from src.memoryguard.source_registry import SourceRegistry, ScanBudget
-from src.memoryguard.governance_scope import grant_root_to_agent
+from memoryguard.access_context import AccessContext
+from memoryguard.memory import MemoryAtomStore, MemoryReadScope
+from memoryguard.projection_v2 import ProjectionReadScope, ProjectionStore
+from memoryguard.runtime_v2.extraction_native import NativeExtractionEnrichmentService
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import bind_native_transport_context
+from memoryguard.runtime_v2.projection_build import ProjectionBuildService
+from memoryguard.runtime_v2.source_control import SourceControlService
 
 
-def _setup_test_workspace(tmp: Path) -> None:
-    """创建测试 workspace：含 CLAUDE.md + notes.md + .claude/memory/。"""
-    (tmp / "CLAUDE.md").write_text(
-        "# Claude Instructions\nYou are a helpful agent.\n", encoding="utf-8")
-    (tmp / "notes.md").write_text(
-        "# 项目偏好\n用户喜欢简洁代码。\n## 任务记录\n完成了 v3.1 实施。\n",
-        encoding="utf-8")
-    claude_mem = tmp / ".claude" / "memory"
-    claude_mem.mkdir(parents=True, exist_ok=True)
-    (claude_mem / "preference.md").write_text(
-        "# 偏好\n- 偏好中文交流\n- 重视代码质量\n", encoding="utf-8")
+AGENT = "accept-v3-1-agent"
+PROVIDER = "accept-v3-1"
+RUNTIME_ROLE = "acceptance"
 
 
-def _check(label: str, ok: bool, detail: str = "") -> bool:
-    status = "PASS" if ok else "FAIL"
-    msg = f"[{status}] {label}"
-    if detail:
-        msg += f" :: {detail}"
-    print(msg)
-    return ok
+def _native_context(workspace: Path):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=AGENT,
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="accept-v3-1-session",
+            session_source="acceptance",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="",
+        project_ref=str(workspace.resolve()),
+        provider=PROVIDER,
+        runtime_role=RUNTIME_ROLE,
+    )
+
+
+def _source_context() -> dict[str, object]:
+    return {"admin": True, "agent_instance_id": AGENT}
+
+
+def _projection_scope(workspace: Path, group: str) -> ProjectionReadScope:
+    return ProjectionReadScope(
+        workspace_id=str(workspace.resolve()),
+        agent_instance_id=AGENT,
+        project_ref=str(workspace.resolve()),
+        provider=PROVIDER,
+        share_group_id=group,
+        sensitivity="normal",
+        policy_class="private",
+    )
+
+
+def _check(label: str, condition: bool, detail: str = "") -> bool:
+    if condition:
+        suffix = f" :: {detail}" if detail else ""
+        print(f"[PASS] {label}{suffix}")
+        return True
+    suffix = f" :: {detail}" if detail else ""
+    print(f"[ERROR] {label}{suffix}")
+    return False
 
 
 def main() -> int:
-    all_pass = True
-    # 确定性 Agent Fixture：CI Runner 可能没有安装任何本地 Agent 产品。
-    # Codex 的 %HOME%/.codex 既是声明的 surface 又是 strong install probe，
-    # 因此创建真实布局即可同时满足 Discovery 与 assess_lifecycle()。
-    fixture_home = Path(tempfile.mkdtemp(prefix="mg-fixture-home-"))
-    codex_dir = fixture_home / ".codex"
-    (codex_dir / "memories").mkdir(parents=True, exist_ok=True)
-    (codex_dir / "memories" / "MEMORY.md").write_text(
-        "# fixture memory\n", encoding="utf-8")
-    os.environ["HOME"] = str(fixture_home)
-    os.environ["USERPROFILE"] = str(fixture_home)
-    os.environ["APPDATA"] = str(fixture_home / "AppData" / "Roaming")
-    os.environ["LOCALAPPDATA"] = str(fixture_home / "AppData" / "Local")
-    _orig_home = Path.home
-    Path.home = staticmethod(lambda: fixture_home)  # type: ignore[assignment]
-    with tempfile.TemporaryDirectory() as tmp_str:
-        tmp = Path(tmp_str)
-        _setup_test_workspace(tmp)
-        api = GovernanceApi(str(tmp))
-
-        # -----------------------------------------------------------------
-        # 1. 一次点击列出 Agent 候选和分类，候选阶段不读正文
-        # -----------------------------------------------------------------
-        print("\n=== 1. 一次点击列出 Agent 候选 ===")
-        d = api.discover_agents()
-        instances = d["instances"]
-        ok1 = len(instances) > 0
-        # 验证候选阶段不读正文：DiscoveryLedger 只记录 status，不记录 content
-        ok1_detail = f"instances={len(instances)}, products={[i['product'] for i in instances]}"
-        all_pass &= _check("发现 Agent 候选", ok1, ok1_detail)
-        # 验证不读正文：检查 DiscoveryEntry 没有 content 字段
-        discovery_path = tmp / ".memoryguard" / "discovery" / "latest.json"
-        if discovery_path.exists():
-            data = json.loads(discovery_path.read_text(encoding="utf-8"))
-            for ledger in data.get("ledgers", {}).values():
-                for entry in ledger.get("entries", []):
-                    has_content = "content" in entry or "excerpt" in entry
-                    all_pass &= _check(f"候选阶段不读正文 ({entry.get('surface_id')})",
-                                       not has_content,
-                                       f"status={entry.get('status')}")
-
-        # -----------------------------------------------------------------
-        # 2. 所有已知表面 100% 进入 DiscoveryLedger
-        # -----------------------------------------------------------------
-        print("\n=== 2. 所有已知表面进入 DiscoveryLedger ===")
-        for inst in instances:
-            inst_id = inst["instance_id"]
-            locator = AgentLocator(str(tmp))
-            tree = locator.get_selection_tree(inst_id)
-            if "error" in tree:
-                all_pass &= _check(f"SelectionTree {inst_id}", False, tree["error"])
-                continue
-            total_surfaces = len(inst.get("surfaces", []))
-            found_surfaces = sum(1 for s in inst.get("surfaces", [])
-                                 if s.get("status") == SurfaceStatus.FOUND.value)
-            # DiscoveryLedger 必须包含所有 surface（found + missing）
-            ledger = data.get("ledgers", {}).get(inst_id, {}) if discovery_path.exists() else {}
-            ledger_entry_count = len(ledger.get("entries", []))
-            ok2 = ledger_entry_count == total_surfaces
-            all_pass &= _check(
-                f"DiscoveryLedger 完整 ({inst['product']})",
-                ok2,
-                f"surfaces={total_surfaces}, ledger_entries={ledger_entry_count}, found={found_surfaces}",
-            )
-
-        # -----------------------------------------------------------------
-        # 3. 所有授权候选 100% 进入 SourceCoverageLedger
-        # -----------------------------------------------------------------
-        print("\n=== 3. 所有授权候选进入 SourceCoverageLedger ===")
-        # v3.2 要求显式治理范围。测试夹具直接登记一条隔离在临时目录中的
-        # agent-managed 原生记忆，避免 AgentLocator 读取开发者真实 HOME。
-        if instances:
-            inst = instances[0]
-            inst_id = inst["instance_id"]
-            reg = SourceRegistry(str(tmp))
-            memory_file = tmp / ".claude" / "memory" / "preference.md"
-            memory_root = reg.add(
-                str(memory_file),
-                SourceRootType.SELECTED_FILE,
-                display_name="v3.1 fixture native memory",
-                scope="user",
-            )
-            memory_root.source_category = SourceCategory.NATIVE_MEMORY.value
-            memory_root.ingestion_policy = IngestionPolicy.IMPORT_VERBATIM.value
-            memory_root.ownership = Ownership.AGENT_MANAGED.value
-            memory_root.target_role = TargetRole.TAKEOVER_INPUT.value
-            memory_root.scope_source = "acceptance_fixture"
-            grant_root_to_agent(memory_root, inst_id)
-            reg._save()
-            all_pass &= _check(
-                "临时原生记忆已授权给显式 Agent scope",
-                inst_id in memory_root.authorized_agent_ids,
-                f"agent={inst_id[:8]}, root={memory_root.root_id}",
-            )
-            # 扫描并检查 CoverageLedger
-            snap = reg.scan(ScanBudget())
-            cov_counts = snap.coverage.counts()
-            # v3.1 §1.4 P0：unaccounted_count 必须为 0
-            ok3b = cov_counts.get("unaccounted_count", -1) == 0
-            all_pass &= _check(
-                "CoverageLedger unaccounted_count=0",
-                ok3b,
-                f"unaccounted={cov_counts.get('unaccounted_count')}, total={cov_counts.get('candidate_count')}",
-            )
-
-        # -----------------------------------------------------------------
-        # 4. 所有选中对象 100% 进入 NormalizationLedger
-        # -----------------------------------------------------------------
-        print("\n=== 4. 所有选中对象进入 NormalizationLedger ===")
-        # build_projection 会扫描+规范化，生成 Memory IR
-        proj = api.build_projection(
-            confirmed=True,
-            mode="native",
-            scope={"mode": "agent", "agent_instance_id": inst_id},
-            enrich_mode="heuristic",
+    workspace = Path(tempfile.mkdtemp(prefix="memoryguard-v3-1-v2-"))
+    passed = True
+    try:
+        docs = workspace / "docs"
+        docs.mkdir()
+        (docs / "notes.md").write_text(
+            "# Project preferences\n\nUse explicit V2 contracts.\n\n"
+            "## Migration procedure\nRun focused tests before release.\n",
+            encoding="utf-8",
         )
-        # 检查 IR 是否有 records
-        from src.memoryguard.memory_ir import MemoryNormalizer
-        norm = MemoryNormalizer(str(tmp))
-        ir = norm.load()
-        ok4 = ir is not None and len(ir.records) > 0
-        all_pass &= _check(
-            "Memory IR 生成 records",
-            ok4,
-            f"records={len(ir.records) if ir else 0}",
+        (docs / "review.md").write_text(
+            "# Review rules\n\nKeep scope checks and evidence links.\n",
+            encoding="utf-8",
         )
 
-        # -----------------------------------------------------------------
-        # 5. 所有 active MemoryRecord 100% 进入 PublicationLedger
-        # -----------------------------------------------------------------
-        print("\n=== 5. 所有 active MemoryRecord 进入 PublicationLedger ===")
-        # build_projection 会为每个 agent_instance 创建 ManagedStore initial version
-        mm_root = tmp / ".memoryguard" / "managed-memory"
-        if mm_root.exists():
-            for inst_dir in mm_root.iterdir():
-                if not inst_dir.is_dir():
-                    continue
-                store = ManagedStore(str(tmp), inst_dir.name)
-                active_vid = store.get_active_version_id()
-                active_version = store.get_active_version()
-                if active_version:
-                    recs = store.list_records()
-                    # 所有 records 都在 active version 的 records.jsonl 中
-                    ok5 = len(recs) == active_version.record_count
-                    all_pass &= _check(
-                        f"PublicationLedger 完整 ({inst_dir.name[:8]})",
-                        ok5,
-                        f"records={len(recs)}, version_record_count={active_version.record_count}, vid={active_vid[:8] if active_vid else 'none'}",
-                    )
+        groups = GroupControlService(workspace, write=True)
+        binding = groups.bind_agent(AGENT, "accept-v3-1-group")
+        group = str(binding["share_group_id"])
+        native_context = bind_native_transport_context(
+            AccessContext(
+                trusted_agent_id=AGENT,
+                is_admin=False,
+                strict_binding=True,
+                allow_anon=False,
+                session_id="accept-v3-1-session",
+                session_source="acceptance",
+                session_trusted=True,
+            ),
+            workspace_id=str(workspace.resolve()),
+            share_group_id=group,
+            project_ref=str(workspace.resolve()),
+            provider=PROVIDER,
+            runtime_role=RUNTIME_ROLE,
+        )
 
-        # -----------------------------------------------------------------
-        # 6. 外部来源和 Obsidian 不再出现"页面可见、IR 丢失"
-        # -----------------------------------------------------------------
-        print("\n=== 6. 外部来源不丢失 ===")
-        # 添加一个外部目录作为 SourceRoot
-        with tempfile.TemporaryDirectory() as ext_tmp:
-            ext_path = Path(ext_tmp)
-            (ext_path / "external.md").write_text(
-                "# 外部记忆\n这是来自外部目录的记忆。\n", encoding="utf-8")
-            reg = SourceRegistry(str(tmp))
-            root = reg.add(str(ext_path), SourceRootType.SELECTED_DIRECTORY,
-                           display_name="外部目录")
-            # 重新扫描+规范化
-            snap = reg.scan(ScanBudget())
-            root_map = {r.root_id: r.path for r in reg.list_sources()}
-            norm = MemoryNormalizer(str(tmp))
-            ir = norm.normalize(snap, root_map=root_map)
-            norm.save(ir)
-            # 检查外部来源的记录是否在 IR 中
-            ext_obj = next((o for o in snap.source_objects
-                            if o.source_root_id == root.root_id), None)
-            ok6 = ext_obj is not None
-            if ext_obj:
-                ext_records = [r for r in ir.records
-                               if any(p.source_object_id == ext_obj.source_object_id
-                                      for p in r.provenance)]
-                ok6 = len(ext_records) > 0
-                all_pass &= _check(
-                    "外部来源进入 IR",
-                    ok6,
-                    f"ext_obj={ext_obj.source_object_id[:8]}, ir_records={len(ext_records)}",
+        # 1. Group binding is explicit and the acceptance scope is stable.
+        passed &= _check(
+            "V2 group binding",
+            binding["binding"]["status"] == "active" and group == "accept-v3-1-group",
+            f"agent={AGENT}, group={group}",
+        )
+
+        # 2–3. Source inventory and authorization coverage are reference-only.
+        sources = SourceControlService(workspace)
+        added = sources.add(
+            str(docs),
+            "selected_directory",
+            _source_context(),
+            display_name="v3.1 V2 acceptance documents",
+        )
+        scan = sources.scan_summary(_source_context())
+        raw = sources.raw_summary(_source_context())
+        passed &= _check(
+            "SourceControl coverage",
+            scan["status"] == "READY"
+            and scan["coverage"]["unaccounted_count"] == 0
+            and raw["coverage"]["unaccounted_count"] == 0,
+            f"source={added['source_id']}, candidates={scan['coverage']['candidate_count']}",
+        )
+        passed &= _check(
+            "SourceControl selected objects",
+            raw["coverage"]["candidate_count"] == 2
+            and all(item.get("authorized") for group_item in raw["groups"] for item in group_item["files"]),
+            f"objects={raw['coverage']['candidate_count']}",
+        )
+
+        # 4. Native extraction is staged and accepted through one formal batch.
+        native = NativeExtractionEnrichmentService(workspace)
+        batches: list[dict[str, object]] = []
+        for source_group in raw["groups"]:
+            for item in source_group["files"]:
+                preview = native.extract(
+                    {"source_id": source_group["root_id"], "relative_path": item["relative_path"]},
+                    context=native_context,
                 )
-            else:
-                all_pass &= _check("外部来源进入 IR", False, "external source not found in snapshot")
-
-        # -----------------------------------------------------------------
-        # 7. 变更记录兼容旧 Change、新 Release 和损坏记录
-        # -----------------------------------------------------------------
-        print("\n=== 7. 变更记录兼容性 ===")
-        # 写入一个旧格式 Change
-        changes_dir = tmp / ".memoryguard" / "changes"
-        changes_dir.mkdir(parents=True, exist_ok=True)
-        (changes_dir / "old-change.json").write_text(
-            json.dumps({"change_id": "old-1", "plan_id": "p1", "status": "verified",
-                        "applied_at": "2026-01-01T00:00:00Z",
-                        "backup_paths": [], "changed_paths": []}),
-            encoding="utf-8",
+                if preview.get("candidates"):
+                    batches.append({
+                        "extract_id": preview["extract_id"],
+                        "candidate_ids": [candidate["candidate_id"] for candidate in preview["candidates"]],
+                    })
+        accepted = native.accept_batch({"batches": batches}, context=native_context)
+        memory = MemoryAtomStore(workspace, readonly=True)
+        memory_scope = MemoryReadScope(
+            workspace_id=str(workspace.resolve()),
+            share_group_id=group,
+            agent_instance_id=AGENT,
+            project_ref=str(workspace.resolve()),
+            provider=PROVIDER,
+            runtime_role=RUNTIME_ROLE,
         )
-        # 写入一个新格式 Release
-        (changes_dir / "new-release.json").write_text(
-            json.dumps({"release_id": "new-1", "schema_version": "3.1",
-                        "build_id": "b1", "status": "applied",
-                        "applied_at": "2026-07-20T00:00:00Z"}),
-            encoding="utf-8",
+        atoms = memory.list_atoms(scope=memory_scope, status="active")
+        passed &= _check(
+            "NativeExtraction batch acceptance",
+            accepted["total"] == len(atoms) and len(atoms) > 0,
+            f"batches={len(batches)}, accepted={accepted['total']}, atoms={len(atoms)}",
         )
-        # 写入一个损坏 JSON
-        (changes_dir / "broken.json").write_text("{invalid json", encoding="utf-8")
-        # list_change_history 应该不崩溃，返回所有有效记录 + warnings
-        history = list_change_history(tmp)
-        events = history.get("items", [])
-        warnings = history.get("warnings", [])
-        ok7 = len(events) >= 2  # old-change + new-release
-        ok7_warnings = len(warnings) >= 1  # broken.json
-        all_pass &= _check(
-            "变更记录兼容旧 Change + 新 Release",
-            ok7,
-            f"events={len(events)}, warnings={len(warnings)}",
-        )
-        all_pass &= _check(
-            "损坏记录不崩溃，产生 warning",
-            ok7_warnings,
-            f"warnings={warnings}",
+        passed &= _check(
+            "V2 atom metadata is body-free",
+            all("body" not in atom.metadata and "content" not in atom.metadata for atom in atoms),
+            f"metadata_atoms={len(atoms)}",
         )
 
-        # -----------------------------------------------------------------
-        # 8. 只有 Loader 复读成功才能显示"已接管"
-        # -----------------------------------------------------------------
-        print("\n=== 8. EXPORT_ONLY 不声称已接管 ===")
-        # 当前所有 Profile 都是 EXPORT_ONLY，takeover_state 不应是 OPERATIONAL
-        meta = proj.get("meta", {})
-        for inst_meta in meta.get("agent_instances", []):
-            cap = inst_meta.get("target_capability")
-            state = inst_meta.get("takeover_state")
-            # EXPORT_ONLY 不应达到 OPERATIONAL
-            ok8 = cap == TargetCapability.EXPORT_ONLY.value and state != TakeoverState.OPERATIONAL.value
-            all_pass &= _check(
-                f"EXPORT_ONLY 不声称已接管 ({inst_meta.get('product')})",
-                ok8,
-                f"capability={cap}, takeover_state={state}",
-            )
-
-        # -----------------------------------------------------------------
-        # 9. 所有写入可通过精确 Release 回滚
-        # -----------------------------------------------------------------
-        print("\n=== 9. 精确 Release 回滚 ===")
-        # 检查 ReleaseManager 是否有 rollback_release
-        from src.memoryguard.release_manager import ReleaseManager
-        rm = ReleaseManager(str(tmp))
-        has_rollback = hasattr(rm, "rollback_release")
-        all_pass &= _check(
-            "ReleaseManager 支持 rollback_release",
-            has_rollback,
-            f"has method={has_rollback}",
+        # 5–7. Build and reread the official reference projection.
+        projection_scope = _projection_scope(workspace, group)
+        projections = ProjectionBuildService(workspace)
+        first = projections.build(mode="reconstructed", scope=projection_scope, runtime_role=RUNTIME_ROLE)
+        key = str((first.get("projection") or {}).get("key") or "")
+        record = ProjectionStore(workspace, initialize=False).get_projection(
+            "scenario", key, scope=projection_scope,
+        ) if key else None
+        payload = record.payload if record is not None else {}
+        metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+        graph = metadata.get("derived_graph") if isinstance(metadata, dict) else {}
+        body_free = not any(
+            token in str(payload).lower() for token in ("raw_content", "full_text", "source_body")
+        )
+        passed &= _check(
+            "ProjectionBuildService commit",
+            first.get("status") == "succeeded" and record is not None and bool(graph.get("nodes")),
+            f"projection={record.projection_id if record else 'none'}, nodes={len(graph.get('nodes', [])) if isinstance(graph, dict) else 0}",
+        )
+        passed &= _check("ProjectionStore reference-only payload", body_free)
+        second = projections.build(mode="reconstructed", scope=projection_scope, runtime_role=RUNTIME_ROLE)
+        passed &= _check(
+            "Projection idempotency",
+            (second.get("projection") or {}).get("projection_id") == (first.get("projection") or {}).get("projection_id"),
         )
 
-        # -----------------------------------------------------------------
-        # 附加：投影 meta 完整性
-        # -----------------------------------------------------------------
-        print("\n=== 附加：投影 meta 7 项状态 ===")
-        meta_keys = {"agent_instances", "instance_count", "coverage",
-                     "coverage_status", "release_count", "drifted"}
-        ok_meta = meta_keys.issubset(meta.keys())
-        all_pass &= _check(
-            "投影 meta 包含 7 项状态字段",
-            ok_meta,
-            f"keys={set(meta.keys())}",
+        # 8. Source map and group status retain the external-source boundary.
+        source_map = projections.source_map(scope=projection_scope)
+        group_status = groups.get_global_memory_status()
+        passed &= _check(
+            "V2 source map and group status",
+            source_map["summary"]["enabled"] == 1
+            and any(item["share_group_id"] == group and item["record_count"] == len(atoms) for item in group_status["groups"]),
+            f"enabled={source_map['summary']['enabled']}, groups={group_status['total_groups']}",
         )
 
-    # -----------------------------------------------------------------
-    # 汇总
-    # -----------------------------------------------------------------
-    print("\n" + "=" * 60)
-    Path.home = _orig_home
-    shutil.rmtree(fixture_home, ignore_errors=True)
-    if all_pass:
-        print("v3.1 MVP 验收：全部通过")
-        return 0
-    else:
-        print("v3.1 MVP 验收：存在失败项")
-        return 1
+        # 9. Projection deletion is precise and idempotent; group export remains
+        # the explicit rollback artifact rather than an implicit filesystem copy.
+        exported = groups.export_group(group)
+        first_delete = projections.delete(mode="reconstructed", scope=projection_scope)
+        second_delete = projections.delete(mode="reconstructed", scope=projection_scope)
+        passed &= _check(
+            "V2 export and precise projection delete",
+            exported["records_written"] == len(atoms)
+            and first_delete["deleted"] is True
+            and second_delete["deleted"] is False,
+            f"export_records={exported['records_written']}, tombstone={first_delete['tombstone_id']}",
+        )
+        return 0 if passed else 1
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
 
 
 if __name__ == "__main__":

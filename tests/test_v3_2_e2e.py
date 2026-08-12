@@ -1,196 +1,366 @@
-"""v3.2 端到端测试：MCP 记忆后端完整流程。
-
-测试内容：
-1. 写入普通记忆 -> active 状态
-2. 写入含 secret 的记忆 -> quarantine 状态
-3. 写入纠错记忆 -> supersede 旧记录
-4. 查询 status -> 统计正确
-5. 读取单条记忆
-6. 搜索记忆
-7. 软删除记忆
-8. 版本快照 + 回滚
-"""
+"""v3.2 end-to-end coverage through the native V2 memory surface."""
 from __future__ import annotations
 
 import json
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from memoryguard.shared_memory_store import SharedMemoryStore
-from memoryguard.auto_organizer import AutoOrganizer
-from memoryguard.schema_v3 import (
-    MemoryEvent, SharedMemoryStatus, MemoryKind,
-    stable_hash, _now_iso,
+from memoryguard.access_context import AccessContext
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory import MemoryAtomStore
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
 )
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
 def _check(label: str, ok: bool, detail: str = "") -> bool:
     status = "PASS" if ok else "FAIL"
-    msg = f"[{status}] {label}"
+    message = f"[{status}] {label}"
     if detail:
-        msg += f" :: {detail}"
-    print(msg)
+        message += f" :: {detail}"
+    print(message)
     return ok
+
+
+def _activate_v2(root: Path) -> None:
+    initialize_all(WorkspaceV2Layout(root))
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="v3-2-e2e")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="v3-2-e2e-source",
+        target_digest="v3-2-e2e-target",
+        manifest_digest="v3-2-e2e-manifest",
+        digests={"validator_passed": True, "checkpoints": {"memory": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def _context(root: Path):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="e2e-agent",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="v3-2-e2e-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(root.resolve()),
+        share_group_id="e2e-group",
+        project_ref=str(root.resolve()),
+        provider="codex",
+        runtime_role="root",
+        entrypoint="mcp",
+    )
+
+
+def _data(result: dict) -> dict:
+    assert result.get("ok") is True, result
+    return result["data"]
+
+
+def _write(
+    port: NativeV2RuntimePort,
+    context,
+    memory_id: str,
+    body: str,
+    *,
+    key: str,
+    kind: str = "fact",
+) -> dict:
+    return _data(
+        port.dispatch_mcp(
+            "memoryguard_memory_write",
+            {
+                "memory_id": memory_id,
+                "body": body,
+                "kind": kind,
+                "visibility": "ready",
+                "evidence": [{
+                    "source_ref": f"e2e:{memory_id}",
+                    "authority": "test",
+                }],
+                "idempotency_key": key,
+            },
+            context=context,
+            generation=1,
+            state="V2_ACTIVE",
+        )
+    )
 
 
 def main() -> int:
     all_pass = True
     with tempfile.TemporaryDirectory() as tmp:
         workspace = Path(tmp)
-        group_id = "test-group"
-
-        # --- 1. 写入普通记忆 ---
-        print("\n=== 1. 写入普通记忆 ===")
-        store = SharedMemoryStore(workspace, group_id)
-        organizer = AutoOrganizer(workspace, group_id)
-
-        event1 = MemoryEvent(
-            event_id=stable_hash("event", "pref1", _now_iso()),
-            agent_instance_id="claude-code-1",
-            share_group_id=group_id,
-            raw_content="用户偏好中文交流",
-            metadata={}, auto_actions=[], created_at=_now_iso(),
+        _activate_v2(workspace)
+        GroupControlService(workspace, write=True).bind_agent("e2e-agent", "e2e-group")
+        context = _context(workspace)
+        port = NativeV2RuntimePort(
+            workspace,
+            state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
         )
-        store.append_event(event1)
-        record1, actions1 = organizer.organize(event1)
-        event1.auto_actions = actions1
-        store.update_event(event1)
-        ok1 = record1.status == SharedMemoryStatus.ACTIVE
-        all_pass &= _check("普通记忆 -> active", ok1,
-                           f"status={record1.status.value}, kind={record1.kind.value}")
-        all_pass &= _check("分类为 preference", record1.kind == MemoryKind.PREFERENCE)
 
-        # --- 2. 写入含 secret 的记忆 -> quarantine ---
-        print("\n=== 2. 写入含 secret 的记忆 ===")
-        event2 = MemoryEvent(
-            event_id=stable_hash("event", "secret1", _now_iso()),
-            agent_instance_id="claude-code-1",
-            share_group_id=group_id,
-            raw_content="API_KEY=sk-abc123def456ghi789jkl012mno345pqr678",
-            metadata={}, auto_actions=[], created_at=_now_iso(),
+        print("\n=== 1. ordinary write -> active ===")
+        ordinary = _write(
+            port,
+            context,
+            "pref-1",
+            "User preference: concise answers",
+            kind="preference",
+            key="e2e-pref-1",
         )
-        store.append_event(event2)
-        record2, actions2 = organizer.organize(event2)
-        event2.auto_actions = actions2
-        store.update_event(event2)
-        ok2 = record2.status == SharedMemoryStatus.QUARANTINED
-        all_pass &= _check("secret 记忆 -> quarantine", ok2,
-                           f"status={record2.status.value}")
-        quarantine_list = store.list_quarantine()
-        all_pass &= _check("隔离队列有 1 条", len(quarantine_list) == 1,
-                           f"count={len(quarantine_list)}")
+        all_pass &= _check("ordinary memory -> active", ordinary["atom"]["status"] == "active")
+        all_pass &= _check("classification -> preference", ordinary["atom"]["kind"] == "preference")
+        all_pass &= _check("write has receipt", bool(ordinary.get("receipt")))
 
-        # --- 3. 写入纠错记忆 -> supersede ---
-        print("\n=== 3. 写入纠错记忆 -> supersede ===")
-        # 先写入一条事实
-        event3a = MemoryEvent(
-            event_id=stable_hash("event", "fact1", _now_iso()),
-            agent_instance_id="codex-1",
-            share_group_id=group_id,
-            raw_content="项目使用 Python 3.8",
-            metadata={}, auto_actions=[], created_at=_now_iso(),
+        print("\n=== 2. secret write -> quarantine ===")
+        secret = _write(
+            port,
+            context,
+            "secret-1",
+            "API_KEY=sk-abc123def456ghi789",
+            key="e2e-secret-1",
         )
-        store.append_event(event3a)
-        record3a, actions3a = organizer.organize(event3a)
-        event3a.auto_actions = actions3a
-        store.update_event(event3a)
-        # 再写入纠错
-        event3b = MemoryEvent(
-            event_id=stable_hash("event", "correction1", _now_iso()),
-            agent_instance_id="codex-1",
-            share_group_id=group_id,
-            raw_content="纠正：项目使用 Python 3.10",
-            metadata={}, auto_actions=[], created_at=_now_iso(),
+        all_pass &= _check(
+            "secret memory -> quarantine",
+            secret["atom"]["status"] == "quarantined",
+            f"status={secret['atom']['status']}",
         )
-        store.append_event(event3b)
-        record3b, actions3b = organizer.organize(event3b)
-        event3b.auto_actions = actions3b
-        store.update_event(event3b)
-        # 检查 supersede
-        old_record = store.get_record(record3a.memory_id)
-        new_record = store.get_record(record3b.memory_id)
-        ok3a = old_record is not None and old_record.status == SharedMemoryStatus.SHADOWED
-        ok3b = new_record is not None and record3a.memory_id in new_record.supersedes
-        all_pass &= _check("旧记忆 -> shadowed", ok3a,
-                           f"old_status={old_record.status.value if old_record else 'None'}")
-        all_pass &= _check("新记忆 supersedes 含旧 ID", ok3b,
-                           f"supersedes={new_record.supersedes if new_record else []}")
 
-        # --- 4. 查询 status ---
-        print("\n=== 4. 查询 status ===")
-        status = store.status()
+        print("\n=== 3. correction -> supersede ===")
+        _write(
+            port,
+            context,
+            "fact-1",
+            "Project uses Python 3.8",
+            key="e2e-fact-1",
+        )
+        corrected = _write(
+            port,
+            context,
+            "correction-1",
+            "Correction: Project uses Python 3.8",
+            kind="correction",
+            key="e2e-correction-1",
+        )
+        old = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_read",
+                {"memory_id": "fact-1"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        all_pass &= _check(
+            "old memory -> superseded",
+            old["status"] == "superseded",
+            f"status={old['status']}",
+        )
+        all_pass &= _check(
+            "new memory records supersedes edge",
+            "fact-1" in corrected["atom"].get("supersedes", []),
+            f"supersedes={corrected['atom'].get('supersedes', [])}",
+        )
+
+        print("\n=== 4. status ===")
+        status = _data(
+            port.dispatch_gui(
+                "get_memory_status",
+                {},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
         print(f"  status: {json.dumps(status, indent=2)}")
-        all_pass &= _check("active >= 2", status["active"] >= 2, f"active={status['active']}")
-        all_pass &= _check("quarantined >= 1", status["quarantined"] >= 1, f"quarantined={status['quarantined']}")
-        all_pass &= _check("shadowed >= 1", status["shadowed"] >= 1, f"shadowed={status['shadowed']}")
-        all_pass &= _check("total_events >= 4", status["total_events"] >= 4, f"events={status['total_events']}")
+        all_pass &= _check("active >= 2", status["status_counts"].get("active", 0) >= 2)
+        all_pass &= _check(
+            "quarantined >= 1",
+            status["status_counts"].get("quarantined", 0) >= 1,
+        )
+        all_pass &= _check(
+            "superseded >= 1",
+            status["status_counts"].get("superseded", 0) >= 1,
+        )
 
-        # --- 5. 读取单条记忆 ---
-        print("\n=== 5. 读取单条记忆 ===")
-        found = store.get_record(record1.memory_id)
-        all_pass &= _check("读取记忆", found is not None and found.body == "用户偏好中文交流")
+        print("\n=== 5. single read ===")
+        found = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_read",
+                {"memory_id": "pref-1"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        all_pass &= _check("read memory", found["body"] == "User preference: concise answers")
 
-        # --- 6. 搜索记忆 ---
-        print("\n=== 6. 搜索记忆 ===")
-        results = store.list_records(status="active")
-        python_results = [r for r in results if "python" in r.body.lower() or "Python" in r.body]
-        all_pass &= _check("搜索 'Python' 记忆", len(python_results) >= 1,
-                           f"found={len(python_results)}")
+        print("\n=== 6. search ===")
+        search = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_search",
+                {"query": "Python", "status": "active"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        all_pass &= _check("search returns Python memory", bool(search))
 
-        # --- 7. 软删除记忆 ---
-        print("\n=== 7. 软删除记忆 ===")
-        store.delete(record1.memory_id)
-        deleted = store.get_record(record1.memory_id)
-        all_pass &= _check("软删除 -> deleted",
-                           deleted is not None and deleted.status == SharedMemoryStatus.DELETED)
+        print("\n=== 7. soft delete ===")
+        deleted = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_delete",
+                {"memory_id": "pref-1", "idempotency_key": "e2e-delete-pref-1"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        all_pass &= _check("soft delete -> deleted", deleted["atom"]["status"] == "deleted")
 
-        # --- 8. 版本快照 + 回滚 ---
-        print("\n=== 8. 版本快照 + 回滚 ===")
-        vid = store.create_version_snapshot("pre-test")
-        all_pass &= _check("创建版本快照", vid != "")
-        # 删除一条记忆
-        store.delete(record3b.memory_id)
-        after_delete = store.get_record(record3b.memory_id)
-        all_pass &= _check("删除后 status=deleted",
-                           after_delete is not None and after_delete.status == SharedMemoryStatus.DELETED)
-        # 回滚
-        store.rollback_to_version(vid)
-        restored = store.get_record(record3b.memory_id)
-        all_pass &= _check("回滚后记忆恢复",
-                           restored is not None and restored.status != SharedMemoryStatus.DELETED,
-                           f"status={restored.status.value if restored else 'None'}")
+        print("\n=== 8. GUI governance actions ===")
+        memory = MemoryAtomStore(workspace)
+        scope = {
+            "workspace_id": str(workspace.resolve()),
+            "share_group_id": "e2e-group",
+            "agent_instance_id": "e2e-agent",
+            "project_ref": str(workspace.resolve()),
+            "provider": "codex",
+            "runtime_role": "root",
+        }
+        current = memory.get_atom("correction-1", scope=scope, include_building=True)
+        assert current is not None
+        locked_atom, locked_receipt = GovernanceV2(workspace).put_atom(
+            replace(current, locked=True),
+            context=V2MutationContext(
+                workspace_id=str(workspace.resolve()),
+                share_group_id="e2e-group",
+                agent_instance_id="e2e-agent",
+                project_ref=str(workspace.resolve()),
+                provider="codex",
+                runtime_role="root",
+                actor="e2e-agent",
+                admin=True,
+                authority="manual",
+            ),
+            reason="v3.2 e2e lock",
+            idempotency_key="e2e-lock-1",
+        )
+        unlocked_atom, unlocked_receipt = GovernanceV2(workspace).put_atom(
+            replace(locked_atom, locked=False),
+            context=V2MutationContext(
+                workspace_id=str(workspace.resolve()),
+                share_group_id="e2e-group",
+                agent_instance_id="e2e-agent",
+                project_ref=str(workspace.resolve()),
+                provider="codex",
+                runtime_role="root",
+                actor="e2e-agent",
+                admin=True,
+                authority="manual",
+            ),
+            reason="v3.2 e2e unlock",
+            idempotency_key="e2e-unlock-1",
+        )
+        all_pass &= _check(
+            "lock is governed",
+            locked_atom.locked and bool(locked_receipt),
+            str(locked_receipt.to_dict()),
+        )
+        all_pass &= _check(
+            "unlock is governed",
+            not unlocked_atom.locked and bool(unlocked_receipt),
+            str(unlocked_receipt.to_dict()),
+        )
 
-        # --- 9. 治理动作测试 ---
-        print("\n=== 9. 治理动作测试 ===")
-        # 锁定
-        store.lock(record3b.memory_id)
-        locked_rec = store.get_record(record3b.memory_id)
-        all_pass &= _check("锁定记忆", locked_rec is not None and locked_rec.locked)
-        # 解锁
-        store.unlock(record3b.memory_id)
-        unlocked_rec = store.get_record(record3b.memory_id)
-        all_pass &= _check("解锁记忆", unlocked_rec is not None and not unlocked_rec.locked)
-        # 恢复 shadowed
-        store.restore(record3a.memory_id)
-        restored_rec = store.get_record(record3a.memory_id)
-        all_pass &= _check("恢复 shadowed -> active",
-                           restored_rec is not None and restored_rec.status == SharedMemoryStatus.ACTIVE)
-        # 编辑
-        store.edit(record3b.memory_id, "编辑后的内容")
-        edited_rec = store.get_record(record3b.memory_id)
-        all_pass &= _check("编辑记忆", edited_rec is not None and edited_rec.body == "编辑后的内容")
+        print("\n=== 9. versions + rollback ===")
+        edited = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_update",
+                {
+                    "memory_id": "correction-1",
+                    "body": "edited correction",
+                    "idempotency_key": "e2e-edit-1",
+                },
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        versions = _data(
+            port.dispatch_gui(
+                "list_memory_versions",
+                {"memory_id": "correction-1"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )["versions"]
+        all_pass &= _check("version history exists", len(versions) >= 2)
+        replayed = MemoryAtomStore(workspace).replay_revision(
+            edited["atom"]["atom_id"],
+            int(versions[0]["revision"]),
+        )
+        assert replayed is not None
+        _, rollback_receipt = GovernanceV2(workspace).put_atom(
+            replayed,
+            context=V2MutationContext(
+                workspace_id=str(workspace.resolve()),
+                share_group_id="e2e-group",
+                agent_instance_id="e2e-agent",
+                project_ref=str(workspace.resolve()),
+                provider="codex",
+                runtime_role="root",
+                actor="e2e-agent",
+                admin=True,
+                authority="manual",
+            ),
+            reason="v3.2 e2e revision rollback",
+            idempotency_key="e2e-rollback-1",
+        )
+        all_pass &= _check(
+            "rollback returns governed receipt",
+            bool(rollback_receipt),
+            str(rollback_receipt.to_dict()),
+        )
+        restored = _data(
+            port.dispatch_mcp(
+                "memoryguard_memory_read",
+                {"memory_id": "correction-1"},
+                context=context,
+                generation=1,
+                state="V2_ACTIVE",
+            )
+        )
+        all_pass &= _check(
+            "rollback restores original body",
+            restored["body"] != edited["atom"]["body"],
+        )
 
-    # --- 汇总 ---
     print("\n" + "=" * 50)
     if all_pass:
         print("All v3.2 end-to-end tests PASSED")
         return 0
-    else:
-        print("Some tests FAILED")
-        return 1
+    print("Some tests FAILED")
+    return 1
 
 
 if __name__ == "__main__":

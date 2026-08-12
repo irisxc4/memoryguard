@@ -1,6 +1,6 @@
 """Rule Merge orchestration (P3).
 
-Sits between the shared-memory layer (SharedMemoryStore) and the Rule
+Retired compatibility shell around the V2 Rules service and the Rule
 Intelligence store (RuleMergeStore).  It wires up:
 
   * backfill       — migrate legacy records+assignments into Definitions/Bindings
@@ -133,7 +133,7 @@ class RuleMergeService:
         Returns a ``{missing:0, extra:0, permission_diff:0}``-style ledger plus
         per-group counts so the migration is machine-checkable.
         """
-        from .shared_memory_store import SharedMemoryStore
+        raise RuntimeError("v2_native_rule_backfill_required")
 
         workspace = Path(workspace).resolve()
         groups: list[tuple[str, Path]] = []
@@ -148,7 +148,7 @@ class RuleMergeService:
         }
         per_group: dict[str, dict[str, int]] = {}
         for group_id, _db_path in groups:
-            store = SharedMemoryStore(workspace, group_id)
+            store = None
             ledger = self.backfill_group(store, group_id)
             per_group[group_id] = ledger
             for key in totals:
@@ -633,7 +633,16 @@ class RuleMergeService:
         only_group: str | None = None,
         only_groups: Iterable[str] | None = None,
     ) -> dict[str, Any]:
-        """Drain the legacy outbox under the shared workspace governance lock."""
+        """Return a stable retirement result; V2 owns the native outbox."""
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": "v2_native_outbox_required",
+            "groups": 0,
+            "events_seen": 0,
+            "events_consumed": 0,
+            "definitions_touched": 0,
+        }
         with self.store.governance_lock():
             return self._consume_outbox_locked(
                 workspace, only_group=only_group, only_groups=only_groups,
@@ -665,8 +674,6 @@ class RuleMergeService:
         """
         workspace = Path(workspace) if workspace is not None else self.store.workspace
         workspace = Path(workspace).resolve()
-        from .shared_memory_store import SharedMemoryStore
-
         summary: dict[str, Any] = {
             "groups": 0, "events_seen": 0, "events_consumed": 0,
             "definitions_touched": 0,
@@ -680,7 +687,7 @@ class RuleMergeService:
         for group_id, _db_path in iter_legacy_groups(workspace):
             if selected_groups is not None and group_id not in selected_groups:
                 continue
-            legacy = SharedMemoryStore(workspace, group_id)
+            legacy = None
             events = legacy.list_unconsumed_rule_events()
             summary["groups"] += 1
             summary["events_seen"] += len(events)
@@ -1048,13 +1055,7 @@ class RuleMergeService:
             # unbound stores retain the historical direct-projection path so
             # old callers can migrate explicitly without a silent behavior
             # break.
-            from .agent_binding import AgentBindingStore
-
-            source_link_required = bool(
-                AgentBindingStore(
-                    getattr(legacy, "workspace", self.store.workspace),
-                ).find_by_group(group_id, include_inactive=False)
-            )
+            source_link_required = True
         if source_link_required and (
             not self._has_durable_source_link(group_id, memory_id)
             or link is None
@@ -1584,7 +1585,12 @@ class RuleMergeService:
     def merge_proposal(
         self, proposal_id: str, *, actor: str = "auto", judge: Any | None = None,
     ) -> dict[str, Any]:
-        """Drain every legacy group, then recompute and execute one proposal."""
+        """Merge one V2 proposal behind the native projection barrier.
+
+        The rule-intelligence store is already the V2 canonical store.  Do not
+        discover or reopen retired per-group databases here; the barrier only
+        observes native projection state and serializes the V2 merge callback.
+        """
         initial = self.store.get_proposal(proposal_id)
         if initial is None:
             raise ValueError("rule_merge_proposal_not_found")
@@ -1594,69 +1600,34 @@ class RuleMergeService:
         if any(self.store.get_definition(item) is None for item in definition_ids):
             raise ValueError("rule_merge_definition_not_found")
 
-        def all_group_ids() -> set[str]:
-            return {
-                str(group_id)
-                for group_id, _db_path in iter_legacy_groups(self.store.workspace)
-            }
+        def group_ids() -> set[str]:
+            return self.store.groups_for_definitions(definition_ids)
 
-        def all_legacy_stores() -> list[Any]:
-            from .shared_memory_store import SharedMemoryStore
-
-            return [
-                SharedMemoryStore(
-                    self.store.workspace, group_id, must_exist=True,
-                )
-                for group_id, _db_path in iter_legacy_groups(self.store.workspace)
-            ]
-
-        def assert_all_group_outboxes_drained() -> None:
-            """Confirm every legacy group is empty while barrier lock is held."""
-            pending: dict[str, int] = {}
-            from .shared_memory_store import SharedMemoryStore
-
-            for group_id, _db_path in iter_legacy_groups(self.store.workspace):
-                legacy = SharedMemoryStore(
-                    self.store.workspace, group_id, must_exist=True,
-                )
-                count = len(legacy.list_unconsumed_rule_events())
-                if count:
-                    pending[group_id] = count
-            if pending:
-                raise RuntimeError(
-                    "projection_barrier_outbox_not_drained: "
-                    + json.dumps(pending, ensure_ascii=False, sort_keys=True)
-                )
-
-        def drain_all_groups_and_recompute() -> Any:
-            # Coordinator already owns workspace lock. Keep drain, confirmation
-            # and proposal rescan in one stable observation window.
-            drained = self._consume_outbox_locked(self.store.workspace)
-            assert_all_group_outboxes_drained()
-            # P3-04: never form cross-agent consensus while the workspace still
-            # carries unmigrated legacy rules or unprojected binding
-            # contributions.  Drain only flushes the outbox; a legacy rule with
-            # no pending event would never appear in it, so the migration
-            # metrics are the authoritative coverage gate.
+        def drain_native_and_recompute() -> Any:
+            """Refresh the V2 proposal without touching a retired store."""
+            # Native V2 producers commit directly to RuleMergeStore.  There is
+            # no legacy outbox to enumerate here; projection readiness is read
+            # from the durable V2 checkpoints by the barrier precheck.
             metrics = self.store.metrics()
-            migration_loss = int(metrics.get('migration_loss', 0) or 0)
-            binding_diff = int(metrics.get('binding_contribution_diff', 0) or 0)
-            if migration_loss != 0:
-                raise RuntimeError('rule_merge_migration_incomplete')
-            if binding_diff != 0:
-                raise RuntimeError('rule_merge_binding_projection_incomplete')
-            self.scan_and_propose(definition_ids=definition_ids, judge=judge)
-            assert_all_group_outboxes_drained()
-            return drained
+            if int(metrics.get("migration_loss", 0) or 0) != 0:
+                raise RuntimeError("rule_merge_migration_incomplete")
+            if int(metrics.get("binding_contribution_diff", 0) or 0) != 0:
+                raise RuntimeError("rule_merge_binding_projection_incomplete")
+            refreshed = self.scan_and_propose(
+                definition_ids=definition_ids, judge=judge,
+            )
+            return {
+                "status": "native",
+                "groups": sorted(group_ids()),
+                "proposals_refreshed": len(refreshed),
+            }
 
         coordinator = MergeGovernanceCoordinator(
             self.store.workspace,
-            legacy_stores=all_legacy_stores,
-            # The coordinator owns the lock while this callback drains every
-            # group; the proposal is recomputed only after that drain returns.
-            drain_callback=drain_all_groups_and_recompute,
+            legacy_stores=[],
+            drain_callback=drain_native_and_recompute,
             projection_status=lambda: self.store.projection_status(
-                group_ids=all_group_ids(),
+                group_ids=group_ids(),
             ),
         )
         merge_error: list[BaseException] = []

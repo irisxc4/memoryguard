@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .conversation_history import ConversationHistoryStore, HistoryAccessResolver
+from .runtime_v2.history_store import ContentHistoryStore, V2HistoryAccessResolver
 
 
 TOOL_DEFINITIONS = [
@@ -20,8 +20,8 @@ TOOL_DEFINITIONS = [
 
 
 def handle_history_tool(name: str, args: dict[str, Any], *, workspace: str, trusted_agent_id: str) -> dict[str, Any]:
-    scope = HistoryAccessResolver(workspace).resolve(trusted_agent_id, args.get("scope"))
-    store = ConversationHistoryStore(workspace)
+    scope = V2HistoryAccessResolver(workspace).resolve(trusted_agent_id, args.get("scope"))
+    store = ContentHistoryStore(workspace, readonly=True)
     if name == "memoryguard_history_search":
         return store.search(scope, str(args.get("query") or ""), limit=args.get("limit", 20), offset=args.get("offset", 0))
     if name == "memoryguard_history_timeline":

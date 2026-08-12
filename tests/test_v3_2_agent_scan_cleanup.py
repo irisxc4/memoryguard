@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -17,7 +19,8 @@ from memoryguard.agent_mapping import (
     product_for_dot_dir, is_known_product,
 )
 from memoryguard.agent_cleanup import AgentCleanup
-from memoryguard.gui import GovernanceApi, _private_data_paths
+from memoryguard.gui import GovernanceApi
+from memoryguard.runtime_v2.agent_native import AgentNativeService
 
 
 def _check(label: str, ok: bool, detail: str = "") -> bool:
@@ -336,26 +339,48 @@ def main() -> int:
             f"result={delete_result}",
         )
 
-    print("\n=== 10. nested residual paths are collapsed ===")
+    print("\n=== 10. public V2 residual paths follow agent-scan evidence ===")
+    nested_root = Path(tmpfile := tempfile.mkdtemp()) / ".agent"
+    nested_child = nested_root / "memories"
+    nested_child.mkdir(parents=True)
+
     class _FakeInstance:
+        instance_id = "nested-agent"
+        product = "fake-agent"
         surfaces = [
             {
                 "status": "found",
-                "resolved_path": "C:/Users/test/.agent",
+                "resolved_path": str(nested_root),
                 "evidence_role": "private_data_evidence",
             },
             {
                 "status": "found",
-                "resolved_path": "C:/Users/test/.agent/memories",
+                "resolved_path": str(nested_child),
                 "evidence_role": "private_data_evidence",
             },
         ]
 
-    paths = _private_data_paths(_FakeInstance())
+    class _FakeLocator:
+        context = SimpleNamespace(platform="test", host_id="test")
+
+        def __init__(self, _workspace):
+            pass
+
+        def detect_instances(self):
+            return [_FakeInstance()], {}
+
+        def discover_candidates(self, **_kwargs):
+            return []
+
+    residual = AgentNativeService(
+        workspace,
+        locator_factory=_FakeLocator,
+    ).residual_cleanup(instance_id="nested-agent")
+    paths = [item["path"] for item in residual["items"]]
     all_pass &= _check(
-        "nested child is not shown as a second cleanup target",
-        paths == [str(Path("C:/Users/test/.agent").resolve())],
-        f"paths={paths}",
+        "V2 cleanup targets are limited to discovered private-data evidence",
+        paths == [str(nested_root.resolve()), str(nested_child.resolve())],
+        f"paths={paths}, evidence={residual['data_evidence']}",
     )
 
     print("\n" + "=" * 50)

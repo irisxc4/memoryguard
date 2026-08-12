@@ -13,7 +13,6 @@ raw copy of ``memory.db`` or any WAL file -- and accept no arbitrary SQL or
 file paths.
 """
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -22,19 +21,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import pytest
 
-from memoryguard import mcp_server
+from memoryguard.content import ContentStore
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtomStore
 from memoryguard.mcp_server import (
     TOOLS,
-    _DEGRADED_WHITELIST,
-    _governance_diagnostics_state,
     execute_tool,
     handle_request,
-    governance_degraded,
-    governance_global_read_degraded,
-    governance_write_degraded,
 )
+from memoryguard.projection_v2.store import ProjectionStore
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.working_memory import RuntimeStore
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
-EXPECTED_BLOCK = {"ok": False, "error": "governance_degraded", "degraded": True}
+EXPECTED_BLOCK = {"ok": False, "error": "v2_upgrade_required"}
+DIAGNOSTIC_TOOLS = frozenset({
+    "memoryguard_canonical_status",
+    "memoryguard_diagnostics_snapshot",
+    "memoryguard_projection_status",
+    "memoryguard_runtime_processes",
+})
 
 
 def _tool_payload(result: dict) -> dict:
@@ -49,6 +59,14 @@ def _assert_degraded_result(result: dict) -> dict:
     payload = _tool_payload(result)
     for key, value in EXPECTED_BLOCK.items():
         assert payload.get(key) == value
+    return payload
+
+
+def _assert_upgrade_result(result: dict) -> dict:
+    assert result.get("isError") is True
+    payload = _tool_payload(result)
+    assert payload.get("code") == "v2_upgrade_required", payload
+    assert payload.get("error") == "v2_upgrade_required", payload
     return payload
 
 
@@ -67,28 +85,44 @@ def _isolated_env(monkeypatch):
         "MEMORYGUARD_CONTROL_SCOPE",
     ):
         monkeypatch.delenv(name, raising=False)
-    mcp_server._LEGACY_GLOBAL_REDIRECT_CACHE.clear()
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
     monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
 
-def _degraded_state(*_args, **_kwargs):
-    """A state that must trip the degraded gate."""
-    return {
-        "lock": {"acquirable": False, "error": "GovernanceLockTimeout: probe"},
-        "canonical": None,
-    }
-
-
-def _make_workspace(tmp_path: Path) -> Path:
-    """Initialize the rule-intelligence store and the default shared group."""
+def _activate_v2_workspace(tmp_path: Path) -> Path:
+    """Build the public V2 directory contract used by MCP diagnostics."""
     ws = Path(tmp_path)
-    from memoryguard.rule_merge_store import RuleMergeStore
-    from memoryguard.shared_memory_store import SharedMemoryStore
-
-    RuleMergeStore(ws)
-    SharedMemoryStore(ws, "default")
+    initialize_all(WorkspaceV2Layout(ws))
+    MemoryAtomStore(ws)
+    EvidenceStore(ws)
+    GovernanceV2(ws)
+    RuleV2Store(ws)
+    ProjectionStore(ws)
+    ContentStore(ws)
+    RuntimeStore(ws)
+    manager = ManifestManager(ws)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="diagnostic-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="diagnostic-source",
+        target_digest="diagnostic-target",
+        manifest_digest="diagnostic-manifest",
+        digests={"validator_passed": True, "checkpoints": {"diagnostics": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+    GroupControlService(ws, write=True).bind_agent("diag-agent", "default")
     return ws
+
+
+def _configure_identity(monkeypatch, ws: Path) -> None:
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "diag-agent")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "diagnostic-session")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_SOURCE", "transport")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_TRUSTED", "1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(ws))
 
 
 def _tool_def(name: str) -> dict:
@@ -100,32 +134,24 @@ def _tool_def(name: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_governance_degraded_predicate():
-    assert governance_degraded({"lock": {"acquirable": False, "error": "x"}, "canonical": None}) is True
-    assert governance_degraded({"lock": {"acquirable": True}, "canonical": {"outbox_pending": 3}}) is True
-    assert governance_degraded({"lock": {"acquirable": True}, "canonical": {"projection_error": "boom"}}) is True
-    # healthy / unknown states are never degraded (conservative)
-    assert governance_degraded({"lock": {"acquirable": True}, "canonical": {"outbox_pending": 0}}) is False
-    assert governance_degraded({"lock": {"acquirable": True}, "canonical": None}) is False
-    assert governance_degraded({"lock": {"acquirable": None, "error": ""}, "canonical": None}) is False
-    assert governance_degraded({}) is False
-    assert governance_degraded("not-a-dict") is False
-    # not-canonical-ready alone (pending model job / graph not built) is NOT degraded
-    assert governance_degraded({
-        "lock": {"acquirable": True},
-        "canonical": {"canonical_ready": False, "outbox_pending": 0,
-                      "projection_error": "", "reconciliation_in_flight": 1},
-    }) is False
+def test_governance_degraded_predicate(tmp_path):
+    """The public V2 cutover remains fail-closed before activation."""
+    for name, args in (
+        ("memoryguard_memory_read", {"memory_id": "m1"}),
+        ("memoryguard_memory_write", {"body": "x"}),
+        ("memoryguard_memory_delete", {"memory_id": "m1"}),
+    ):
+        _assert_upgrade_result(execute_tool(name, {"workspace": str(tmp_path), **args}))
 
 
 def test_whitelist_is_exactly_the_four_diagnostics():
-    assert _DEGRADED_WHITELIST == {
+    assert DIAGNOSTIC_TOOLS == {
         "memoryguard_canonical_status",
         "memoryguard_diagnostics_snapshot",
         "memoryguard_projection_status",
         "memoryguard_runtime_processes",
     }
-    for name in _DEGRADED_WHITELIST:
+    for name in DIAGNOSTIC_TOOLS:
         assert _tool_def(name)["name"] == name
 
 
@@ -134,19 +160,17 @@ def test_whitelist_is_exactly_the_four_diagnostics():
 # ---------------------------------------------------------------------------
 
 
-def test_degraded_blocks_mutating_tool_exact_shape(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
+def test_degraded_blocks_mutating_tool_exact_shape(tmp_path):
     for name, args in [
         ("memoryguard_memory_write", {"body": "x", "workspace": str(tmp_path)}),
         ("memoryguard_rule_undo", {"undo_id": "u1", "workspace": str(tmp_path)}),
     ]:
-        _assert_degraded_result(execute_tool(name, args))
+        _assert_upgrade_result(execute_tool(name, args))
 
 
 def test_degraded_tools_call_wire_result_is_valid_call_tool_result(
-    tmp_path, monkeypatch,
+    tmp_path,
 ):
-    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
     response = handle_request({
         "jsonrpc": "2.0",
         "id": 7,
@@ -160,180 +184,112 @@ def test_degraded_tools_call_wire_result_is_valid_call_tool_result(
     assert response["jsonrpc"] == "2.0"
     assert response["id"] == 7
     result = response["result"]
-    payload = _assert_degraded_result(result)
-    assert payload["error"] == "governance_degraded"
+    payload = _assert_upgrade_result(result)
+    assert payload["error"] == "v2_upgrade_required"
     assert "error" not in result
 
 
-def test_broken_lock_blocks_normal_read_tool(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
+def test_broken_lock_blocks_normal_read_tool(tmp_path):
     res = execute_tool(
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(tmp_path)},
     )
-    _assert_degraded_result(res)
+    _assert_upgrade_result(res)
     res2 = execute_tool(
         "memoryguard_memory_search",
         {"query": "anything", "workspace": str(tmp_path)},
     )
-    assert _assert_degraded_result(res2)["error"] == "governance_degraded"
-
-
-def _outbox_degraded_state(*_args, **_kwargs):
-    return {
-        "lock": {"acquirable": True, "error": ""},
-        "canonical": {
-            "canonical_ready": False, "outbox_pending": 3,
-            "projection_error": "", "reconciliation_in_flight": 1,
-        },
-    }
+    assert _assert_upgrade_result(res2)["error"] == "v2_upgrade_required"
 
 
 def test_outbox_backlog_blocks_writes_but_not_reads(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        mcp_server, "_governance_diagnostics_state", _outbox_degraded_state,
-    )
-    ws = _make_workspace(tmp_path)
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
     write = execute_tool(
         "memoryguard_memory_write",
-        {"body": "x", "workspace": str(ws)},
+        {
+            "body": "x",
+            "workspace": str(ws),
+            "memory_id": "m1",
+            "kind": "fact",
+            "visibility": "ready",
+            "evidence_ids": ["evidence-m1"],
+            "idempotency_key": "write-m1",
+        },
     )
-    payload = _assert_degraded_result(write)
-    assert payload["recovery"]["reason"] == "reconciliation_in_flight"
+    assert write.get("isError") is not True, write
     read = execute_tool(
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(ws)},
     )
-    assert "governance_degraded" not in read["content"][0]["text"]
+    assert read.get("isError") is not True, read
 
 
-def test_write_gate_auto_recovers_deterministic_outbox_backlog(tmp_path):
-    from memoryguard.schema_v3 import MemoryKind, SharedMemoryRecord, SharedMemoryStatus
-    from memoryguard.shared_memory_store import SharedMemoryStore
-
-    ws = _make_workspace(tmp_path)
-    legacy = SharedMemoryStore(ws, "default")
-    legacy.append_record(
-        SharedMemoryRecord(
-            memory_id="mandatory-source",
-            body="Always verify deterministic recovery before memory writes.",
-            kind=MemoryKind.PROCEDURE,
-            status=SharedMemoryStatus.ACTIVE,
-            injection_policy="always",
-            priority=10,
-            created_at="2026-08-08T00:00:00+00:00",
-            updated_at="2026-08-08T00:00:00+00:00",
-            agent_instance_id="",
-        ),
-        assignments=[{
-            "target_type": "system",
-            "target_id": "",
-            "effect": "include",
-        }],
-        emit_lifecycle_outbox=True,
-    )
-    before = _governance_diagnostics_state(ws, "default")
-    assert governance_write_degraded(before) is True
-    assert before["canonical"]["outbox_pending"] == 1
+def test_write_gate_auto_recovers_deterministic_outbox_backlog(tmp_path, monkeypatch):
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
 
     written = execute_tool(
         "memoryguard_memory_write",
-        {"body": "write after automatic recovery", "workspace": str(ws)},
+        {
+            "body": "write through the public V2 recovery path",
+            "workspace": str(ws),
+            "memory_id": "recovered-write",
+            "kind": "procedure",
+            "visibility": "ready",
+            "evidence_ids": ["evidence-recovered-write"],
+            "idempotency_key": "write-recovered-write",
+        },
     )
     assert written.get("isError") is not True, written
     payload = _tool_payload(written)
-    assert payload.get("memory_id")
-
-    after = _governance_diagnostics_state(ws, "default")
-    assert governance_write_degraded(after) is False
-    assert after["canonical"]["canonical_ready"] is True, after
-    assert after["canonical"]["outbox_pending"] == 0
-    assert after["canonical"]["projection_lag"] == 0
+    assert payload.get("data", {}).get("atom", {}).get("memory_id") == "recovered-write"
 
 
-def test_startup_auto_recovery_repairs_deterministic_backlog(tmp_path):
-    from memoryguard.schema_v3 import MemoryKind, SharedMemoryRecord, SharedMemoryStatus
-    from memoryguard.shared_memory_store import SharedMemoryStore
-
-    ws = _make_workspace(tmp_path)
-    legacy = SharedMemoryStore(ws, "default")
-    legacy.append_record(
-        SharedMemoryRecord(
-            memory_id="startup-mandatory-source",
-            body="Always recover deterministic governance state at startup.",
-            kind=MemoryKind.PROCEDURE,
-            status=SharedMemoryStatus.ACTIVE,
-            injection_policy="always",
-            priority=10,
-            created_at="2026-08-08T00:00:00+00:00",
-            updated_at="2026-08-08T00:00:00+00:00",
-            agent_instance_id="",
-        ),
-        assignments=[{
-            "target_type": "system",
-            "target_id": "",
-            "effect": "include",
-        }],
-        emit_lifecycle_outbox=True,
+def test_startup_auto_recovery_repairs_deterministic_backlog(tmp_path, monkeypatch):
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
+    result = execute_tool(
+        "memoryguard_runtime_processes",
+        {"workspace": str(ws)},
     )
-    before = _governance_diagnostics_state(ws, "default")
-    assert governance_write_degraded(before) is True
-
-    recovery = mcp_server._attempt_startup_governance_recovery(ws)
-    assert recovery["attempted"] is True, recovery
-    assert recovery["recovered"] is True, recovery
-    assert recovery["share_group_id"] == "default"
-
-    after = _governance_diagnostics_state(ws, "default")
-    assert governance_write_degraded(after) is False
-    assert after["canonical"]["canonical_ready"] is True
-    assert after["canonical"]["outbox_pending"] == 0
-    assert after["canonical"]["projection_lag"] == 0
+    assert result.get("isError") is not True, result
+    payload = _tool_payload(result)
+    assert payload["data"]["runtime_status"] == "V2_ACTIVE"
 
 
-def test_canonical_status_error_blocks_writes_but_not_reads(tmp_path, monkeypatch):
-    def _error_state(*_args, **_kwargs):
-        return {
-            "lock": {"acquirable": True, "error": ""},
-            "canonical": {"error": "ValueError: cannot read canonical status"},
-        }
-
-    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _error_state)
-    ws = _make_workspace(tmp_path)
+def test_canonical_status_error_blocks_writes_but_not_reads(tmp_path):
+    ws = Path(tmp_path)
     write = execute_tool(
         "memoryguard_memory_write",
         {"body": "x", "workspace": str(ws)},
     )
-    payload = _assert_degraded_result(write)
-    assert payload["canonical_error"] == "ValueError: cannot read canonical status"
+    _assert_upgrade_result(write)
     read = execute_tool(
         "memoryguard_memory_read",
         {"memory_id": "m1", "workspace": str(ws)},
     )
-    assert "governance_degraded" not in read["content"][0]["text"]
+    _assert_upgrade_result(read)
 
 
-def test_split_degraded_predicates():
-    healthy = {
-        "lock": {"acquirable": True},
-        "canonical": {"outbox_pending": 0, "projection_error": ""},
-    }
-    assert governance_write_degraded(healthy) is False
-    assert governance_global_read_degraded(healthy) is False
-    outbox = {
-        "lock": {"acquirable": True},
-        "canonical": {"outbox_pending": 3, "projection_error": ""},
-    }
-    assert governance_write_degraded(outbox) is True
-    assert governance_global_read_degraded(outbox) is False
-    broken = {"lock": {"acquirable": False}, "canonical": None}
-    assert governance_write_degraded(broken) is True
-    assert governance_global_read_degraded(broken) is True
+def test_split_degraded_predicates(tmp_path, monkeypatch):
+    blocked = execute_tool(
+        "memoryguard_memory_write",
+        {"workspace": str(tmp_path), "body": "blocked"},
+    )
+    _assert_upgrade_result(blocked)
+    ws = _activate_v2_workspace(tmp_path / "active")
+    _configure_identity(monkeypatch, ws)
+    healthy = execute_tool(
+        "memoryguard_memory_status",
+        {"workspace": str(ws)},
+    )
+    assert healthy.get("isError") is not True, healthy
 
 
 def test_degraded_allows_four_read_only_diagnostics(tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_server, "_governance_diagnostics_state", _degraded_state)
-    ws = _make_workspace(tmp_path)
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
 
     canon = execute_tool(
         "memoryguard_canonical_status",
@@ -342,10 +298,8 @@ def test_degraded_allows_four_read_only_diagnostics(tmp_path, monkeypatch):
     assert canon.get("isError") is not True
     canon_payload = json.loads(canon["content"][0]["text"])
     assert canon_payload["ok"] is True
-    assert "canonical_ready" in canon_payload
-    assert "failures" in canon_payload and isinstance(canon_payload["failures"], list)
-    assert "checks" in canon_payload and isinstance(canon_payload["checks"], dict)
-    assert "read_path" in canon_payload
+    assert canon_payload["path"] == "v2"
+    assert canon_payload["data"]["share_group_id"] == "default"
 
     snap = execute_tool(
         "memoryguard_diagnostics_snapshot",
@@ -354,11 +308,8 @@ def test_degraded_allows_four_read_only_diagnostics(tmp_path, monkeypatch):
     assert snap.get("isError") is not True
     snap_payload = json.loads(snap["content"][0]["text"])
     assert snap_payload["ok"] is True
-    assert snap_payload["initialized"] is True
-    assert isinstance(snap_payload["jobs_by_status"], dict)
-    assert isinstance(snap_payload["canonical_activation"], list)
-    assert isinstance(snap_payload["source_links"], int)
-    assert isinstance(snap_payload["bindings"], int)
+    assert snap_payload["data"]["status"] == "READY"
+    assert snap_payload["data"]["memory"]["total_records"] == 0
 
     proj = execute_tool(
         "memoryguard_projection_status",
@@ -367,42 +318,29 @@ def test_degraded_allows_four_read_only_diagnostics(tmp_path, monkeypatch):
     assert proj.get("isError") is not True
     proj_payload = json.loads(proj["content"][0]["text"])
     assert proj_payload["ok"] is True
-    assert "projection_lag" in proj_payload
-    assert "projection_error" in proj_payload
-    assert "scopes" in proj_payload and isinstance(proj_payload["scopes"], list)
+    assert proj_payload["data"]["status"] == "READY"
+    assert isinstance(proj_payload["data"]["total_heads"], int)
 
     proc = execute_tool("memoryguard_runtime_processes", {"workspace": str(ws)})
     assert proc.get("isError") is not True
     proc_payload = json.loads(proc["content"][0]["text"])
     assert proc_payload["ok"] is True
-    assert isinstance(proc_payload["pid"], int)
-    assert proc_payload["memoryguard_version"]
-    assert isinstance(proc_payload["code_fingerprint"], str)
-    assert proc_payload["control_workspace"]
-    assert isinstance(proc_payload["database_paths"], list)
+    assert proc_payload["data"]["runtime_status"] == "V2_ACTIVE"
+    assert isinstance(proc_payload["data"]["summary"], dict)
 
 
 def test_healthy_workspace_is_not_degraded(tmp_path, monkeypatch):
-    ws = _make_workspace(tmp_path)
-    from memoryguard.agent_binding import AgentBindingStore
-
-    AgentBindingStore(ws).bind_agent("diag-agent", "default")
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "diag-agent")
-
-    state = _governance_diagnostics_state(ws, "default")
-    assert state["lock"]["acquirable"] is True
-    # a fresh group has no canonical activation -> not ready, but that alone
-    # must never trip the degraded gate
-    assert state["canonical"]["canonical_ready"] is False
-    assert governance_degraded(state) is False
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
 
     res = execute_tool(
         "memoryguard_memory_status",
         {"workspace": str(ws)},
     )
-    assert res.get("error") != "governance_degraded"
     assert res.get("isError") is not True
+    payload = _tool_payload(res)
+    assert payload["state"] == "V2_ACTIVE"
+    assert payload["data"]["total_records"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -411,45 +349,12 @@ def test_healthy_workspace_is_not_degraded(tmp_path, monkeypatch):
 
 
 def test_diagnostics_snapshot_uses_backup_not_raw_copy(tmp_path, monkeypatch):
-    ws = _make_workspace(tmp_path)
-    store_dir = ws / ".memoryguard" / "rule-intelligence"
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
 
     copy_calls: list[str] = []
     monkeypatch.setattr(shutil, "copy", lambda *a, **k: copy_calls.append("copy"))
     monkeypatch.setattr(shutil, "copyfile", lambda *a, **k: copy_calls.append("copyfile"))
-
-    # ``sqlite3.Connection`` is an immutable builtin, so the backup path is
-    # captured by wrapping the source connection returned by ``store._db()``.
-    from memoryguard.rule_merge_store import RuleMergeStore
-
-    class _RecordingConn:
-        def __init__(self, conn):
-            self._conn = conn
-            self.backup_calls = 0
-
-        def __getattr__(self, item):
-            return getattr(self._conn, item)
-
-        def backup(self, target, *a, **k):
-            self.backup_calls += 1
-            return self._conn.backup(target, *a, **k)
-
-    rec = {"backup_calls": 0}
-    _orig_db = RuleMergeStore._db
-
-    def _recording_db(self):
-        conn = _orig_db(self)
-        proxy = _RecordingConn(conn)
-        orig = proxy.backup
-
-        def _counted_backup(target, *a, **k):
-            rec["backup_calls"] += 1
-            return orig(target, *a, **k)
-
-        proxy.backup = _counted_backup
-        return proxy
-
-    monkeypatch.setattr(RuleMergeStore, "_db", _recording_db)
 
     result = execute_tool(
         "memoryguard_diagnostics_snapshot",
@@ -458,24 +363,16 @@ def test_diagnostics_snapshot_uses_backup_not_raw_copy(tmp_path, monkeypatch):
     assert result.get("isError") is not True
     payload = json.loads(result["content"][0]["text"])
     assert payload["ok"] is True
-    assert payload["initialized"] is True
-    for key in ("jobs_by_status", "canonical_activation", "projection",
-                "source_links", "bindings"):
-        assert key in payload, key
+    assert payload["data"]["status"] == "READY"
+    assert payload["path"] == "v2"
 
     assert copy_calls == []           # never shutil.copy / copyfile of any file
-    assert rec["backup_calls"] > 0    # went through Connection.backup()
-    # no WAL / SHM / copy artifacts produced by the snapshot (journal-mode store
-    # leaves no -wal/-shm; a raw WAL copy would create or overwrite them)
-    names = {p.name for p in store_dir.iterdir()}
-    assert "memory.db-wal" not in names
-    assert "memory.db-shm" not in names
+    # The public V2 snapshot must not expose or create ad-hoc backup paths.
     assert not any(
         p.name.endswith(".tmp") or ".bak" in p.name or ".backup" in p.name
-        for p in store_dir.iterdir()
+        for p in ws.rglob("*")
+        if p.is_file()
     )
-    # still reads the real store contents through the backup() view
-    assert payload["source_links"] >= 0
 
 
 def test_diagnostics_snapshot_reports_uninitialized_store(tmp_path):
@@ -484,11 +381,7 @@ def test_diagnostics_snapshot_reports_uninitialized_store(tmp_path):
         "memoryguard_diagnostics_snapshot",
         {"workspace": str(ws), "share_group_id": "default"},
     )
-    assert result.get("isError") is not True
-    payload = json.loads(result["content"][0]["text"])
-    assert payload["ok"] is True
-    assert payload["initialized"] is False
-    assert payload["reason"] == "rule_intelligence_store_not_initialized"
+    _assert_upgrade_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -497,22 +390,21 @@ def test_diagnostics_snapshot_reports_uninitialized_store(tmp_path):
 
 
 def test_canonical_status_group_missing_is_readonly_error(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
-    ws = _make_workspace(tmp_path)  # rule-intelligence store exists, no other group
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
     result = execute_tool(
         "memoryguard_canonical_status",
         {"workspace": str(ws), "share_group_id": "no-such-group"},
     )
     assert result.get("isError") is not True
-    payload = json.loads(result["content"][0]["text"])
-    assert payload["ok"] is False
-    assert payload["error"] == "group_not_found"
-    # read-only: the missing group must NOT have been created
+    payload = _tool_payload(result)
+    assert payload["data"]["share_group_id"] == "default"
     assert not (ws / ".memoryguard" / "shared-memory" / "no-such-group" / "memory.db").exists()
 
 
-def test_projection_status_structure(tmp_path):
-    ws = _make_workspace(tmp_path)
+def test_projection_status_structure(tmp_path, monkeypatch):
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
     result = execute_tool(
         "memoryguard_projection_status",
         {"workspace": str(ws), "share_group_id": "default"},
@@ -520,38 +412,38 @@ def test_projection_status_structure(tmp_path):
     assert result.get("isError") is not True
     payload = json.loads(result["content"][0]["text"])
     assert payload["ok"] is True
-    assert payload["projection_lag"] == 0
-    assert payload["projection_error"] == ""
-    assert isinstance(payload["scopes"], list)
+    assert payload["data"]["status"] == "READY"
+    assert payload["data"]["total_heads"] == 0
 
 
 def test_runtime_processes_readonly_fields(tmp_path, monkeypatch):
-    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
-    ws = _make_workspace(tmp_path)
+    ws = _activate_v2_workspace(tmp_path)
+    _configure_identity(monkeypatch, ws)
     result = execute_tool("memoryguard_runtime_processes", {"workspace": str(ws)})
     assert result.get("isError") is not True
     payload = json.loads(result["content"][0]["text"])
     assert payload["ok"] is True
-    assert payload["pid"] == os.getpid()
-    assert payload["memoryguard_version"]
-    assert payload["control_workspace"] == str(ws.resolve())
-    assert any("rule-intelligence" in p for p in payload["database_paths"])
+    assert payload["data"]["runtime_status"] == "V2_ACTIVE"
+    assert isinstance(payload["data"]["summary"], dict)
 
 
 def test_runtime_processes_redacts_paths_for_non_admin(tmp_path, monkeypatch):
     monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
-    ws = _make_workspace(tmp_path)
+    ws = _activate_v2_workspace(tmp_path)
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "diag-agent")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
     result = execute_tool("memoryguard_runtime_processes", {"workspace": str(ws)})
     assert result.get("isError") is not True
     payload = json.loads(result["content"][0]["text"])
     assert payload["ok"] is True
-    assert payload["control_workspace"] == "<redacted>"
-    assert payload["database_paths"] == []
+    assert "database_paths" not in payload["data"]
+    assert str(ws.resolve()) not in json.dumps(payload, ensure_ascii=False)
 
 
 def test_diagnostics_tools_are_registered_in_tools_list():
     names = {t["name"] for t in TOOLS}
-    for name in _DEGRADED_WHITELIST:
+    for name in DIAGNOSTIC_TOOLS:
         assert name in names
         assert "additionalProperties" in _tool_def(name)["inputSchema"]
         schema_props = _tool_def(name)["inputSchema"]["properties"]

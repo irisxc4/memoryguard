@@ -17,9 +17,10 @@ from memoryguard.cutover_v2.readiness import stable_digest
 from memoryguard.cutover_v2.surfaces import (
     CLI_COMMAND_NAMES,
     GUI_METHOD_NAMES,
+    GUI_MUTATION_NAMES,
+    GUI_OPERATION_SPECS,
     MCP_MUTATION_NAMES,
     MCP_TOOL_NAMES,
-    RULE_MUTATION_GUI_NAMES,
 )
 from memoryguard.maintenance_v2.registry import DEFAULT_REGISTRY
 
@@ -138,8 +139,15 @@ def _native(status: str = "implemented", *, omit: str = "") -> dict[str, Any]:
         entries = []
         for name in sorted(expected[surface]):
             mutation = name in MCP_MUTATION_NAMES if surface == "mcp" else False
-            if surface == "gui" and (name in RULE_MUTATION_GUI_NAMES or name == "request_mutation"):
-                mutation = True
+            canonical_name = name
+            domain = surface
+            execution = "sync"
+            if surface == "gui":
+                mutation = name in GUI_MUTATION_NAMES
+                operation = GUI_OPERATION_SPECS[name]
+                canonical_name = operation.canonical_name
+                domain = operation.domain
+                execution = operation.execution
             entries.append({
                 "name": name,
                 "status": entry_status,
@@ -149,6 +157,9 @@ def _native(status: str = "implemented", *, omit: str = "") -> dict[str, Any]:
                     "fixture blocker" if entry_status == "blocker"
                     else ("fixture retired" if entry_status == "retired" else "")
                 ),
+                "canonical_name": canonical_name,
+                "domain": domain,
+                "execution": execution,
             })
         surfaces[surface] = {"entries": entries}
     return _refresh_native({

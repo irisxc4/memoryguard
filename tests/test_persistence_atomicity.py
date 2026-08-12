@@ -1,362 +1,431 @@
-"""Store-level regression tests for the report's P0 persistence edges."""
+"""V2 persistence, governance, projection, and lifecycle atomicity tests."""
+from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
 import pytest
 
-from memoryguard.schema_v3 import (
-    ConflictGroup,
-    EffectiveAgentContext,
-    MemoryEvent,
-    MemoryKind,
-    QuarantineEntry,
-    RuleDecision,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
+from memoryguard.access_context import AccessContext
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import (
+    GovernanceV2,
+    V2GovernanceError,
+    V2MutationContext,
+    V2ScopeError,
 )
-from memoryguard.rule_creation import RuleCreationService
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
+)
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
-def _record(memory_id: str = "r", *, agent: str = "agent-a") -> SharedMemoryRecord:
-    return SharedMemoryRecord(
-        memory_id=memory_id,
-        body=f"body-{memory_id}",
-        kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE,
-        injection_policy="always",
+def _activate_v2(root: Path) -> tuple[MemoryAtomStore, EvidenceStore, GovernanceV2, GroupControlService]:
+    initialize_all(WorkspaceV2Layout(root))
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    governance = GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="persistence-atomicity")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="persistence-source",
+        target_digest="persistence-target",
+        manifest_digest="persistence-manifest",
+        digests={"validator_passed": True, "checkpoints": {"core": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+    return memory, evidence, governance, GroupControlService(root, write=True)
+
+
+def _context(root: Path, *, agent: str = "agent-a", group: str = "atomic", admin: bool = True, authority: str = "manual") -> V2MutationContext:
+    workspace = str(root.resolve())
+    return V2MutationContext(
+        workspace_id=workspace,
+        share_group_id=group,
         agent_instance_id=agent,
-        created_at=_now_iso(),
-        updated_at=_now_iso(),
+        project_ref=workspace,
+        provider="codex",
+        runtime_role="test",
+        actor=agent,
+        authority=authority,
+        admin=admin,
     )
 
 
-def _decision(memory_id: str) -> RuleDecision:
-    return RuleDecision(
-        decision_id=f"decision-{memory_id}",
-        actor="agent:agent-a",
-        owner_agent_id="agent-a",
-        action="rule_create_auto",
-        rule_id=memory_id,
+def _atom(root: Path, memory_id: str, *, body: str | None = None, group: str = "atomic", agent: str = "agent-a", metadata: dict | None = None, status: str = "active") -> MemoryAtom:
+    workspace = str(root.resolve())
+    return MemoryAtom(
         memory_id=memory_id,
-        before={},
-        after={},
+        body=body or f"body-{memory_id}",
+        kind="procedure",
+        status=status,
+        confidence=0.8,
+        injection_policy="always",
+        priority=10,
+        agent_instance_id=agent,
+        share_group_id=group,
+        project_ref=workspace,
+        provider="codex",
+        runtime_role="test",
+        workspace_id=workspace,
+        metadata=metadata or {},
     )
 
 
-def test_rule_create_decision_failure_rolls_back_record_and_event(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    original = store._insert_rule_decision
+def _seed(root: Path, boundary: GovernanceV2, memory_id: str, *, body: str | None = None, group: str = "atomic", agent: str = "agent-a", metadata: dict | None = None) -> MemoryAtom:
+    atom, _decision = boundary.put_atom(
+        _atom(root, memory_id, body=body, group=group, agent=agent, metadata=metadata),
+        context=_context(root, agent=agent, group=group),
+        evidence=[{"source_ref": f"security/{memory_id}", "digest": memory_id}],
+        reason=f"seed {memory_id}",
+        idempotency_key=f"seed-{memory_id}",
+    )
+    return atom
 
-    def fail(*args, **kwargs):
+
+def _scope(root: Path, group: str = "atomic") -> MemoryReadScope:
+    return MemoryReadScope(
+        workspace_id=str(root.resolve()),
+        share_group_id=group,
+        admin=True,
+    )
+
+
+def _native_context(root: Path, group: str = "atomic", agent: str = "agent-a"):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"persistence-{agent}",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(root.resolve()),
+        share_group_id=group,
+        project_ref=str(root.resolve()),
+        provider="codex",
+        runtime_role="test",
+        entrypoint="persistence-test",
+    )
+
+
+def _native_port(root: Path) -> NativeV2RuntimePort:
+    return NativeV2RuntimePort(
+        root,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+
+
+def test_rule_create_decision_failure_rolls_back_record_and_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+
+    def fail(*_args, **_kwargs):
         raise RuntimeError("decision fault")
 
-    monkeypatch.setattr(store, "_insert_rule_decision", fail)
+    monkeypatch.setattr(boundary, "_record", fail)
     with pytest.raises(RuntimeError, match="decision fault"):
-        store.apply_rule_create_atomic(
-            _record(),
-            MemoryEvent(
-                event_id="event-r",
-                agent_instance_id="agent-a",
-                share_group_id="atomic",
-                raw_content="body-r",
-            ),
-            assignments=[{"target_type": "agent", "target_id": "agent-a"}],
-            decision=_decision("r"),
+        boundary.put_atom(
+            _atom(tmp_path, "r"),
+            context=context,
+            evidence=[{"source_ref": "atomic/r", "digest": "r"}],
+            reason="atomic create",
+            idempotency_key="atomic-create-r",
         )
-    assert store.get_record("r") is None
-    assert not store.list_events()
-    monkeypatch.setattr(store, "_insert_rule_decision", original)
+
+    persisted = memory.get_atom("r", scope=_scope(tmp_path), include_building=True)
+    assert persisted is None or persisted.status == "deleted"
+    assert boundary.list_decisions() == []
 
 
-def test_rule_create_undo_decision_failure_rolls_back_delete(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    result = store.apply_rule_create_atomic(
-        _record(),
-        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
-        decision=_decision("r"),
-    )
-    # Revision is the full rule behavior hash (body + kind + priority + locked
-    # + provenance + audience), captured at creation time -- never a body-only
-    # canonical hash, which would let an edit of priority/assignments still be
-    # undone by the stale create decision.
-    expected_hash = result["decision"]["metadata"]["record_revision_hash"]
-    original = store._insert_rule_decision
+def test_rule_create_undo_decision_failure_rolls_back_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    _seed(tmp_path, boundary, "r")
 
-    def fail(*args, **kwargs):
+    original = boundary._record
+
+    def fail(*_args, **_kwargs):
         raise RuntimeError("inverse fault")
 
-    monkeypatch.setattr(store, "_insert_rule_decision", fail)
+    monkeypatch.setattr(boundary, "_record", fail)
     with pytest.raises(RuntimeError, match="inverse fault"):
-        store.revert_rule_create_atomic(
-            "r", expected_hash,
-            RuleDecision(
-                decision_id="inverse-r", actor="agent:agent-a",
-                owner_agent_id="agent-a", action="rule_create_undo",
-                rule_id="r", memory_id="r",
-            ),
+        boundary.tombstone("r", context=context, reason="rollback delete", idempotency_key="delete-r")
+    monkeypatch.setattr(boundary, "_record", original)
+
+    restored = memory.get_atom("r", scope=_scope(tmp_path), include_building=True)
+    assert restored is not None and restored.status == "active"
+
+
+def test_cross_domain_failure_reports_committed_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    memory, evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    atom, _decision = boundary.put_atom(
+        _atom(tmp_path, "r"),
+        context=context,
+        evidence=[{"source_ref": "atomic/r", "digest": "r"}],
+        reason="projection failure fixture",
+        idempotency_key="projection-failure-r",
+    )
+
+    def fail_projection(_events):
+        raise OSError("evidence sink unavailable")
+
+    monkeypatch.setattr(evidence, "project_batch", fail_projection)
+    result = memory.project_evidence(evidence)
+    assert result["failed"] >= 1
+    assert result["pending"] >= 1
+    assert memory.get_atom("r", scope=_scope(tmp_path), include_building=True) is not None
+
+
+def test_deduplicated_decision_targets_existing_record(tmp_path: Path):
+    _memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    original = _seed(tmp_path, boundary, "original", body="body-original")
+
+    decision = boundary.record_deduplication(
+        original,
+        context=context,
+        request_payload={"candidate_memory_id": "candidate", "body_digest": "body-original"},
+        reason="same body deduplication",
+        idempotency_key="dedup-candidate",
+    )
+    replay = boundary.record_deduplication(
+        original,
+        context=context,
+        request_payload={"candidate_memory_id": "candidate", "body_digest": "body-original"},
+        reason="same body deduplication",
+        idempotency_key="dedup-candidate",
+    )
+    assert decision.operation == "deduplicate"
+    assert decision.target == {"atom_id": original.atom_id, "memory_id": "original"}
+    assert replay.decision_id == decision.decision_id
+    assert len([item for item in boundary.list_decisions() if item.decision_id == decision.decision_id]) == 1
+
+
+def test_owner_scope_rejects_cross_agent_update_and_admin_can_update(tmp_path: Path):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    _seed(tmp_path, boundary, "owned", metadata={"owner_agent_id": "agent-a"})
+
+    with pytest.raises(V2ScopeError, match="mutation logical record is outside context") as rejected:
+        boundary.put_atom(
+            _atom(tmp_path, "owned", body="forged", agent="agent-b"),
+            context=_context(tmp_path, agent="agent-b", admin=False),
+            evidence=[{"source_ref": "atomic/forged", "digest": "forged"}],
+            reason="cross agent update",
+            idempotency_key="forged-owned-update",
         )
-    assert store.get_record("r").status == SharedMemoryStatus.ACTIVE
-    monkeypatch.setattr(store, "_insert_rule_decision", original)
+    assert "UNIQUE" not in str(rejected.value)
 
-
-def test_jsonl_failure_reports_committed_degraded(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    monkeypatch.setattr(store, "_append_jsonl", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk")))
-    result = store.apply_rule_create_atomic(
-        _record(),
-        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
-        decision=_decision("r"),
+    existing = memory.get_atom("owned", scope=_scope(tmp_path), include_building=True)
+    assert existing is not None
+    updated, _decision = boundary.put_atom(
+        MemoryAtom.from_value(
+            existing,
+            atom_id=existing.atom_id,
+            body="admin correction",
+            agent_instance_id="agent-b",
+            metadata={"owner_agent_id": "agent-a"},
+        ),
+        context=_context(tmp_path, agent="admin", admin=True, authority="admin"),
+        evidence=[{"source_ref": "atomic/admin", "digest": "admin"}],
+        reason="admin correction",
+        idempotency_key="admin-owned-update",
     )
-    assert result["committed"] is True
-    assert result["backup_status"] == "degraded"
-    assert store.get_record("r") is not None
+    assert updated.body == "admin correction"
+    assert updated.atom_id == existing.atom_id
+    assert memory.get_atom("owned", scope=_scope(tmp_path), include_building=True).metadata["owner_agent_id"] == "agent-a"
+    assert len(memory.list_atoms(scope=_scope(tmp_path), include_building=True)) == 1
 
 
-def test_deduplicated_decision_targets_existing_record(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    store.append_record(
-        _record("original"),
-        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
-    )
-    candidate = _record("candidate")
-    candidate.body = "body-original"
-    decision = _decision("candidate")
-    decision.after = {"record": candidate.to_dict()}
-    result = store.apply_rule_create_atomic(
-        candidate,
-        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
-        decision=decision,
-    )
-    assert result["mutation_kind"] == "deduplicated"
-    assert result["memory_id"] == "original"
-    persisted = store.get_rule_decision("decision-candidate")
-    assert persisted is not None
-    assert persisted.memory_id == "original"
-    assert persisted.rule_id == "original"
-    assert persisted.after["record"]["memory_id"] == "original"
-
-
-def test_owner_agent_column_migrates_from_legacy_table(tmp_path):
-    store = SharedMemoryStore(tmp_path, "legacy")
-    store.append_rule_decision(_decision("old"))
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("DROP INDEX IF EXISTS idx_rule_decisions_owner")
-        conn.execute("ALTER TABLE rule_decisions RENAME TO rule_decisions_old")
+def test_migration_failure_leaves_no_partial_v2_schema(tmp_path: Path):
+    memory, _evidence, _boundary, _groups = _activate_v2(tmp_path)
+    del memory
+    db_path = WorkspaceV2Layout(tmp_path).memory_db
+    with sqlite3.connect(db_path) as conn:
         conn.execute(
-            "CREATE TABLE rule_decisions ("
-            "decision_id TEXT PRIMARY KEY, actor TEXT NOT NULL, "
-            "before_state TEXT NOT NULL DEFAULT '{}', after_state TEXT NOT NULL DEFAULT '{}', "
-            "reason TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 1.0, "
-            "undo_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, "
-            "rule_id TEXT NOT NULL DEFAULT '', action TEXT NOT NULL DEFAULT '', "
-            "target_ids TEXT NOT NULL DEFAULT '[]', metadata TEXT NOT NULL DEFAULT '{}')"
+            "UPDATE memory_schema_meta SET version=99, marker='future-memory-schema' WHERE domain='memory'"
         )
-        conn.execute(
-            "INSERT INTO rule_decisions SELECT decision_id,actor,before_state,after_state,reason,confidence,undo_id,created_at,rule_id,action,target_ids,metadata FROM rule_decisions_old"
-        )
-        conn.execute("DROP TABLE rule_decisions_old")
-    # Keep this migration test focused on SQLite schema compatibility rather
-    # than re-importing the JSONL projection on the next writable open.
-    store.rule_decisions_bak_path.unlink(missing_ok=True)
-    migrated = SharedMemoryStore(tmp_path, "legacy")
-    loaded = migrated.get_rule_decision("decision-old")
-    assert loaded is not None
-    assert loaded.owner_agent_id == ""
-    migrated.append_rule_decision(_decision("new"))
-    assert migrated.get_rule_decision("decision-new").owner_agent_id == "agent-a"
+        conn.commit()
+    corrupted = db_path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="unsupported memory phase2 schema metadata"):
+        MemoryAtomStore(tmp_path)
+    assert corrupted == db_path.read_bytes()
 
 
-def test_migration_failure_leaves_no_partial_feedback_schema(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "legacy-fault")
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("DROP TABLE rule_match_feedbacks")
-        conn.execute(
-            "CREATE TABLE rule_match_feedbacks ("
-            "feedback_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL, "
-            "outcome TEXT NOT NULL, actor TEXT NOT NULL, "
-            "evidence TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT 1.0, "
-            "created_at TEXT NOT NULL, UNIQUE(receipt_id))"
-        )
-
-    original = SharedMemoryStore._migration_checkpoint
-
-    def fail_after_rename(self, name):
-        if name == "feedback_after_rename":
-            raise RuntimeError("migration fault")
-        return original(self, name)
-
-    monkeypatch.setattr(SharedMemoryStore, "_migration_checkpoint", fail_after_rename)
-    with pytest.raises(RuntimeError, match="migration fault"):
-        SharedMemoryStore(tmp_path, "legacy-fault")
-    with sqlite3.connect(store.db_path) as conn:
-        table_sql = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='rule_match_feedbacks'"
-        ).fetchone()[0]
-    assert "UNIQUE(receipt_id)" in table_sql.replace(" ", "")
-
-
-def test_last_sibling_revoke_removes_generated_exclude(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    store.append_record(
-        _record("parent"),
-        assignments=[{"target_type": "agent", "target_id": "agent-a"}],
+def test_last_sibling_unlink_removes_final_evidence_relation(tmp_path: Path):
+    _memory, evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    atom = _seed(tmp_path, boundary, "parent")
+    first, _ = boundary.put_evidence(
+        context=context, source_ref="feedback/1", digest="feedback-1", reason="first sibling"
     )
-    service = RuleCreationService(tmp_path, "atomic", store=store)
-    context = EffectiveAgentContext(
-        agent_instance_id="agent-a", share_group_id="atomic",
-        project_ref=str(tmp_path / "project"), session_id="s1",
+    second, _ = boundary.put_evidence(
+        context=context, source_ref="feedback/2", digest="feedback-2", reason="second sibling"
     )
-    for idx in (1, 2):
-        store.append_rule_match_receipt(RuleMatchReceipt(
-            receipt_id=f"receipt-{idx}", memory_id="parent",
-            share_group_id="atomic", agent_instance_id="agent-a",
-            task_hash=f"task-{idx}", task="task", project_ref=context.project_ref,
-            session_id=f"s{idx}", created_at=_now_iso(),
-        ))
-        decision = service.submit_feedback(
-            f"receipt-{idx}", "exception", f"a{idx}",
-            evidence=f"override {idx}", effective_context=context,
-        )
-        assert decision.status == "created"
-    relations = store.list_rule_exceptions(parent_rule="parent")
-    # Pass the recorded post-create revision explicitly; Store must never
-    # substitute the current hash itself.
-    for relation in relations:
-        expected = relation.rollback["parent_assignments_after_hash"]
-        inverse = RuleDecision(
-            decision_id=f"undo-{relation.exception_id}", actor="agent:agent-a",
-            owner_agent_id="agent-a", action="rule_exception_revoke",
-            rule_id=relation.child_exception, memory_id=relation.child_exception,
-        )
-        store.revert_rule_exception(
-            relation.exception_id, expected_parent_assignment_hash=expected,
-            decision=inverse,
-        )
-        if relation is relations[0]:
-            # First revoke transfers generated ownership to the sibling.
-            assert store.list_rule_assignments("parent")
-    assert not any(
-        item.effect == "exclude" for item in store.list_rule_assignments("parent")
+    boundary.link(first.evidence_id, "atom", atom.atom_id, context=context, reason="first link")
+    boundary.link(second.evidence_id, "atom", atom.atom_id, context=context, reason="second link")
+
+    removed_first, _ = boundary.unlink(first.evidence_id, "atom", atom.atom_id, context=context, reason="revoke first")
+    assert removed_first == 1
+    with sqlite3.connect(evidence.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM evidence_links WHERE subject_id=?", (atom.atom_id,)).fetchone()[0] == 1
+
+    removed_second, _ = boundary.unlink(second.evidence_id, "atom", atom.atom_id, context=context, reason="revoke second")
+    assert removed_second == 1
+    with sqlite3.connect(evidence.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM evidence_links WHERE subject_id=?", (atom.atom_id,)).fetchone()[0] == 0
+
+
+def test_lifecycle_supersede_round_trip_is_atomic(tmp_path: Path):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    old = _seed(tmp_path, boundary, "old")
+    new = _seed(tmp_path, boundary, "new")
+
+    decision = boundary.supersede(old.atom_id, new.atom_id, context=context, reason="newer fact")
+    assert decision.target == {"old": old.atom_id, "new": new.atom_id}
+    assert memory.get_atom("old", scope=_scope(tmp_path), include_building=True).status == "superseded"
+    assert old.memory_id in memory.get_atom("new", scope=_scope(tmp_path), include_building=True).supersedes
+
+    undo = boundary.undo(decision.decision_id, context=context, reason="review reverted")
+    assert undo.operation == "undo"
+    assert memory.get_atom("old", scope=_scope(tmp_path), include_building=True).status == "active"
+    assert memory.get_atom("new", scope=_scope(tmp_path), include_building=True).supersedes == []
+
+
+def test_lifecycle_conflict_resolution_preserves_unrelated_members(tmp_path: Path):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    group = "atomic"
+    _seed(
+        tmp_path, boundary, "conflict-keep", metadata={
+            "conflict_group_id": "group-1",
+            "conflict_status": "unresolved",
+            "conflict_reason": "existing conflict",
+        },
+    )
+    _seed(
+        tmp_path, boundary, "conflict-drop", metadata={
+            "conflict_group_id": "group-1",
+            "conflict_status": "unresolved",
+            "conflict_reason": "existing conflict",
+        },
+    )
+    _seed(
+        tmp_path, boundary, "unrelated", metadata={
+            "conflict_group_id": "group-2",
+            "conflict_status": "unresolved",
+            "conflict_reason": "unrelated conflict",
+        },
+    )
+    _seed(
+        tmp_path, boundary, "unrelated-peer", metadata={
+            "conflict_group_id": "group-2",
+            "conflict_status": "unresolved",
+            "conflict_reason": "unrelated conflict",
+        },
     )
 
-
-def _event(event_id: str, *, raw: str = "candidate") -> MemoryEvent:
-    return MemoryEvent(
-        event_id=event_id,
-        agent_instance_id="agent-a",
-        share_group_id="atomic",
-        raw_content=raw,
-        created_at=_now_iso(),
+    port = _native_port(tmp_path)
+    context = _native_context(tmp_path, group)
+    conflicts = port.dispatch_gui("get_conflicts", [group], context=context, generation=1, state="V2_ACTIVE")
+    assert conflicts["ok"] is True
+    assert {item["group_id"] for item in conflicts["data"]["conflicts"]} == {"group-1", "group-2"}
+    resolved = port.dispatch_gui(
+        "resolve_conflict", ["group-1", "conflict-keep", group],
+        context=context, generation=1, mutation=True, state="V2_ACTIVE",
     )
+    assert resolved["ok"] is True, resolved
+    assert resolved["data"]["deleted_memory_ids"] == ["conflict-drop"]
+    assert memory.get_atom("conflict-keep", scope=_scope(tmp_path), include_building=True).status == "active"
+    assert memory.get_atom("conflict-drop", scope=_scope(tmp_path), include_building=True).status == "deleted"
+    assert memory.get_atom("unrelated", scope=_scope(tmp_path), include_building=True).status == "active"
+    assert memory.get_atom("unrelated-peer", scope=_scope(tmp_path), include_building=True).status == "active"
 
 
-def test_lifecycle_supersede_round_trip_is_atomic(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    store.append_record(_record("old"), assignments=[{"target_type": "agent", "target_id": "agent-a"}])
-    result = store.apply_rule_lifecycle_atomic(
-        _record("new"),
-        _event("event-supersede"),
-        decision=_decision("new"),
-        mutation_kind="superseded",
-        old_record_ids=["old"],
+def test_lifecycle_quarantine_round_trip_writes_release_tombstone(tmp_path: Path):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    _seed(tmp_path, boundary, "quarantine-me")
+    port = _native_port(tmp_path)
+    context = _native_context(tmp_path)
+
+    quarantined = port.dispatch_gui(
+        "neuron_decide", ["quarantine-me", "quarantine", "manual review", True, None, "", ""],
+        context=context, generation=1, mutation=True, state="V2_ACTIVE",
     )
-    assert result["target_ids"] == ["new", "old"]
-    assert store.get_record("new").status == SharedMemoryStatus.ACTIVE
-    assert store.get_record("old").status == SharedMemoryStatus.SHADOWED
-    undo = store.revert_rule_lifecycle_atomic(
-        result["decision"], result["record_hashes"]["new"]
+    assert quarantined["ok"] is True, quarantined
+    assert quarantined["data"]["memory_status"] == "quarantined"
+    queue = port.dispatch_gui("get_quarantine", ["atomic"], context=context, generation=1, state="V2_ACTIVE")
+    assert queue["ok"] is True and queue["data"]["total"] == 1
+    entry = queue["data"]["quarantine"][0]
+    released = port.dispatch_gui(
+        "release_quarantine", [entry["quarantine_id"], "atomic"],
+        context=context, generation=1, mutation=True, state="V2_ACTIVE",
     )
-    assert undo["undone"] is True
-    assert store.get_record("new").status == SharedMemoryStatus.DELETED
-    assert store.get_record("old").status == SharedMemoryStatus.ACTIVE
+    assert released["ok"] is True, released
+    assert memory.get_atom("quarantine-me", scope=_scope(tmp_path), include_building=True).status == "active"
 
 
-def test_lifecycle_conflict_round_trip_preserves_unrelated_members(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    store.append_record(_record("old"), assignments=[{"target_type": "agent", "target_id": "agent-a"}])
-    store.append_record(_record("other"), assignments=[{"target_type": "agent", "target_id": "agent-a"}])
-    group = ConflictGroup(
-        group_id="group-1", member_ids=["old", "other"], reason="existing conflict"
-    )
-    store.append_conflict(group)
-    result = store.apply_rule_lifecycle_atomic(
-        _record("new"),
-        _event("event-conflict"),
-        decision=_decision("new"),
-        mutation_kind="conflicted",
-        old_record_ids=["old"],
-        conflict_group=group,
-    )
-    assert store.get_record("new").status == SharedMemoryStatus.CONFLICTED
-    assert set(store.list_conflicts()[0].member_ids) == {"old", "other", "new"}
-    store.revert_rule_lifecycle_atomic(
-        result["decision"], result["record_hashes"]["new"]
-    )
-    assert store.get_record("new").status == SharedMemoryStatus.DELETED
-    remaining = {item.group_id: set(item.member_ids) for item in store.list_conflicts()}
-    assert remaining["group-1"] == {"old", "other"}
+def test_lifecycle_decision_failure_rolls_back_every_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    context = _context(tmp_path)
+    old = _seed(tmp_path, boundary, "old")
+    new = _seed(tmp_path, boundary, "new")
 
-
-def test_lifecycle_quarantine_round_trip_writes_release_tombstone(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    quarantine = QuarantineEntry(
-        quarantine_id="q-1", memory_id="new", reason="secret",
-        detected_pattern="token", original_content="candidate",
-    )
-    result = store.apply_rule_lifecycle_atomic(
-        _record("new"),
-        _event("event-quarantine"),
-        decision=_decision("new"),
-        mutation_kind="quarantined",
-        quarantine_entry=quarantine,
-    )
-    assert store.get_record("new").status == SharedMemoryStatus.QUARANTINED
-    assert any(item.quarantine_id == "q-1" and not item.released for item in store.list_quarantine())
-    store.revert_rule_lifecycle_atomic(
-        result["decision"], result["record_hashes"]["new"]
-    )
-    assert store.get_record("new").status == SharedMemoryStatus.DELETED
-    assert any(item.memory_id == "new" and item.released for item in store.list_quarantine())
-
-
-def test_lifecycle_decision_failure_rolls_back_every_branch(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    store.append_record(_record("old"), assignments=[{"target_type": "agent", "target_id": "agent-a"}])
-
-    def fail(*args, **kwargs):
+    def fail(*_args, **_kwargs):
         raise RuntimeError("decision fault")
 
-    monkeypatch.setattr(store, "_insert_rule_decision", fail)
+    monkeypatch.setattr(boundary, "_record", fail)
     with pytest.raises(RuntimeError, match="decision fault"):
-        store.apply_rule_lifecycle_atomic(
-            _record("new"), _event("event-failure"),
-            decision=_decision("new"), mutation_kind="superseded",
-            old_record_ids=["old"],
-        )
-    assert store.get_record("new") is None
-    assert store.get_record("old").status == SharedMemoryStatus.ACTIVE
-    assert not store.list_events()
+        boundary.supersede(old.atom_id, new.atom_id, context=context, reason="fault injection")
+    assert memory.get_atom("old", scope=_scope(tmp_path), include_building=True).status == "active"
+    assert memory.get_atom("new", scope=_scope(tmp_path), include_building=True).supersedes == []
 
 
-def test_lifecycle_automatic_scope_guard_and_manual_broad_override(tmp_path):
-    store = SharedMemoryStore(tmp_path, "atomic")
-    broad = [{"target_type": "group", "target_id": "atomic"}]
-    with pytest.raises(ValueError, match="automatic assignment cannot broaden"):
-        store.apply_rule_lifecycle_atomic(
-            _record("auto-broad"), _event("event-auto-broad"),
-            decision=_decision("auto-broad"), mutation_kind="quarantined",
-            assignments=broad, actor_agent_id="agent-a", automatic=True,
-        )
-    assert store.get_record("auto-broad") is None
-
-    result = store.apply_rule_lifecycle_atomic(
-        _record("manual-broad"), _event("event-manual-broad"),
-        decision=_decision("manual-broad"), mutation_kind="quarantined",
-        assignments=broad, actor_agent_id="agent-a", automatic=False,
+def test_lifecycle_automatic_scope_guard_and_manual_broad_override(tmp_path: Path):
+    _memory, _evidence, boundary, _groups = _activate_v2(tmp_path)
+    automatic = V2MutationContext(
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="atomic",
+        agent_instance_id="",
+        project_ref="",
+        actor="automatic-organizer",
+        authority="auto",
+        admin=False,
     )
-    assert result["committed"] is True
-    assert store.get_record("manual-broad") is not None
-    assert store.list_rule_assignments("manual-broad")[0].target_type == "group"
+    with pytest.raises(V2ScopeError):
+        boundary.put_atom(
+            _atom(tmp_path, "auto-broad"),
+            context=automatic,
+            evidence=[{"source_ref": "atomic/auto", "digest": "auto"}],
+            reason="automatic broad scope",
+        )
+
+    manual = _context(tmp_path, agent="admin", admin=True, authority="admin")
+    result, _decision = boundary.put_atom(
+        _atom(tmp_path, "manual-broad", agent="agent-a"),
+        context=manual,
+        evidence=[{"source_ref": "atomic/manual", "digest": "manual"}],
+        reason="manual broad scope",
+        idempotency_key="manual-broad",
+    )
+    assert result.share_group_id == "atomic"
+    assert result.agent_instance_id == "agent-a"
+
+    evidence, _ = boundary.put_evidence(
+        context=automatic,
+        source_ref="atomic/automatic-system",
+        digest="automatic-system",
+        reason="automatic evidence scope",
+    )
+    with pytest.raises(V2ScopeError):
+        boundary.link(evidence.evidence_id, "system", "atomic", context=automatic, reason="automatic system link")

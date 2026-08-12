@@ -14,11 +14,33 @@ def _isolated_test_env(monkeypatch):
     monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 
 
+def _activate_v2_workspace(root: Path) -> None:
+    """Path preview enters through the public V2 upgrade/activation contract."""
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.migration.upgrade import run_upgrade
+
+    ready = run_upgrade(root, data_home=root, apply=True)
+    assert ready["status"] == "V2_READY", ready
+    # The extraction writer requires the V2 governance ledger to exist before
+    # the explicit activation confirmation is accepted.
+    GovernanceV2(root)
+    active = run_upgrade(
+        root,
+        data_home=root,
+        apply=True,
+        confirm="V2_ACTIVE",
+    )
+    assert active["v2_active"] is True, active
+
+
 def test_extract_preview_by_path_allows_discovered_session(tmp_path, monkeypatch):
+    from memoryguard.access_context import AccessContext
     from memoryguard.gui import GovernanceApi
     from memoryguard.agent_locator import AgentLocator
+    from memoryguard.runtime_v2.group_native import GroupControlService, personal_group_id
     from memoryguard.schema_v3 import AgentInstance, DiscoveryLedger, TargetCapability
 
+    _activate_v2_workspace(tmp_path)
     home = tmp_path / "home"
     sess = home / ".codex" / "sessions" / "2026" / "07" / "28"
     sess.mkdir(parents=True)
@@ -88,16 +110,36 @@ def test_extract_preview_by_path_allows_discovered_session(tmp_path, monkeypatch
     )
     monkeypatch.setattr(AgentLocator, "get_selection_tree", fake_tree)
 
-    api = GovernanceApi(tmp_path)
+    agent = "codex-x"
+    GroupControlService(tmp_path, write=True).bind_agent(
+        agent,
+        personal_group_id(agent),
+    )
+    api = GovernanceApi(
+        tmp_path,
+        _trusted_access_context=AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="extract-preview-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+    )
+    added = api.add_source(str(target), "selected_file", "session", True)
+    assert added["ok"] is True, added
     out = api.extract_preview_by_path(str(target), agent_instance_id="codex-x")
-    assert out.get("ok") is True, out
-    assert out.get("extract_id")
-    assert isinstance(out.get("candidates"), list)
+    assert out["ok"] is True, out
+    data = out["data"]
+    assert data.get("extract_id")
+    assert isinstance(data.get("candidates"), list)
 
 
 def test_extract_preview_by_path_rejects_unknown(tmp_path):
     from memoryguard.gui import GovernanceApi
 
+    _activate_v2_workspace(tmp_path)
     orphan = tmp_path / "secret.txt"
     orphan.write_text("api_key = sk-test", encoding="utf-8")
     api = GovernanceApi(tmp_path)

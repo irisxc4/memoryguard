@@ -682,6 +682,12 @@ class V1Reader:
         if self.data_home is not None:
             roots.append(self.data_home)
         self._allowed_roots = tuple(dict.fromkeys(roots))
+        # Preparation stores immutable source snapshots under this control
+        # subtree.  It is never a V1 input, even when a previous batch left a
+        # nested manifest or source file there.  Keep the check relative to
+        # the configured reader root: an explicitly selected source snapshot
+        # remains readable, while its own nested migration-backups subtree is
+        # still excluded.
         if self.workspace_source_pointer != "NOT_CONFIGURED":
             _contained(self.workspace_source_pointer, (self.workspace,))
         if self.global_source_pointer != "NOT_CONFIGURED":
@@ -693,9 +699,36 @@ class V1Reader:
             for key, paths in (legacy_paths or {}).items()
         }
 
+    def _is_migration_backup(self, path: str | Path) -> bool:
+        """Return whether *path* is inside a ``.memoryguard/migration-backups`` subtree.
+
+        Check both the lexical path and the resolved path.  The lexical check
+        prevents a symlinked entry from becoming an input before containment
+        validation; the resolved check covers a path reached through a safe
+        directory link.  The relation is relative to this reader's configured
+        roots so a caller can intentionally read a frozen source snapshot.
+        """
+
+        candidates = (Path(path).expanduser().absolute(), _resolve_no_follow(path))
+        for candidate in candidates:
+            for root in self._allowed_roots:
+                try:
+                    relative = candidate.relative_to(root)
+                except ValueError:
+                    continue
+                parts = tuple(part.casefold() for part in relative.parts)
+                if any(
+                    parts[index] == ".memoryguard"
+                    and index + 1 < len(parts)
+                    and parts[index + 1] == "migration-backups"
+                    for index in range(len(parts))
+                ):
+                    return True
+        return False
+
     def _candidate(self, domain: str) -> list[Path]:
         if domain in self.legacy_paths:
-            return list(self.legacy_paths[domain])
+            return [path for path in self.legacy_paths[domain] if not self._is_migration_backup(path)]
         memory_root = self.workspace / ".memoryguard"
         if domain == "shared_memory":
             bases = [memory_root / "shared-memory", memory_root / "shared_memory", self.workspace / "shared-memory"]
@@ -710,11 +743,14 @@ class V1Reader:
                     paths.extend(child / "memory.db" for child in children if child.is_dir())
             # Keep a canonical missing marker when there is no group.  This is
             # an error in strict mode, never an invitation to create a group.
-            return paths or [_contained(memory_root / "shared-memory" / "memory.db", self._allowed_roots)]
+            candidates = paths or [_contained(memory_root / "shared-memory" / "memory.db", self._allowed_roots)]
+            return [path for path in candidates if not self._is_migration_backup(path)]
         if domain == "rule_intelligence":
-            return [_contained(memory_root / "rule-intelligence" / "memory.db", self._allowed_roots)]
+            candidate = _contained(memory_root / "rule-intelligence" / "memory.db", self._allowed_roots)
+            return [] if self._is_migration_backup(candidate) else [candidate]
         if domain == "conversation_history":
-            return [_contained(memory_root / "history" / "history.sqlite", self._allowed_roots)]
+            candidate = _contained(memory_root / "history" / "history.sqlite", self._allowed_roots)
+            return [] if self._is_migration_backup(candidate) else [candidate]
         if domain == "knowledge":
             candidates = [memory_root / "knowledge" / "knowledge.db", self.workspace / "knowledge" / "knowledge.db"]
             if self.global_source_pointer != "NOT_CONFIGURED":
@@ -725,7 +761,11 @@ class V1Reader:
                 if global_path.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
                     global_path = self.data_home / "knowledge" / "knowledge.db"  # type: ignore[operator]
                 candidates.insert(0, global_path)
-            return [_contained(path, self._allowed_roots) for path in candidates]
+            return [
+                path
+                for path in (_contained(path, self._allowed_roots) for path in candidates)
+                if not self._is_migration_backup(path)
+            ]
         return []
 
     def _manifest_paths(self) -> list[Path]:
@@ -744,12 +784,20 @@ class V1Reader:
                 walker = os.walk(root, followlinks=False)
                 for current, dirs, files in walker:
                     current_path = Path(current)
+                    if self._is_migration_backup(current_path):
+                        dirs[:] = []
+                        continue
                     # V2 artifacts are not V1 sources; this matters when both
                     # generations share a project ``.memoryguard`` root.
                     if self._is_v2_artifact(current_path):
                         dirs[:] = []
                         continue
-                    dirs[:] = [name for name in dirs if name not in {"__pycache__", ".git", "graphify-out"}]
+                    dirs[:] = [
+                        name
+                        for name in dirs
+                        if name not in {"__pycache__", ".git", "graphify-out"}
+                        and not self._is_migration_backup(current_path / name)
+                    ]
                     for name in files:
                         lowered = name.lower()
                         if lowered == "manifest.json" or lowered.endswith(".manifest.json") or (lowered.startswith("manifest") and lowered.endswith(".json")):
@@ -760,7 +808,7 @@ class V1Reader:
                                 # containment ledger; ``_inventory_path``
                                 # records the failure without reading it.
                                 candidate = Path(current_path / name).absolute()
-                            if not self._is_v2_artifact(candidate):
+                            if not self._is_v2_artifact(candidate) and not self._is_migration_backup(candidate):
                                 paths.add(candidate)
             except OSError as exc:
                 # The root itself is represented as an explicit ledger entry by
@@ -843,6 +891,8 @@ class V1Reader:
         seen: set[tuple[str, str]] = set()
         for domain in ("shared_memory", "rule_intelligence", "conversation_history", "knowledge"):
             for path in self._candidate(domain):
+                if self._is_migration_backup(path):
+                    continue
                 key = (domain, str(path))
                 if key in seen:
                     continue

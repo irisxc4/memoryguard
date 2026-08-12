@@ -30,12 +30,10 @@ from pathlib import Path
 from typing import Any
 
 from .adapters import GenericMarkdownTarget, TargetAdapter, ValidationResult
-from .memory_ir import MemoryIR, MemoryNormalizer
 from .schema_v3 import (
     BuildManifest, DecisionEvent, ReleaseChange, ReleaseStatus,
     stable_hash, _now_iso,
 )
-from .source_registry import ScanBudget, SourceRegistry, SourceSnapshot
 
 
 @dataclass
@@ -79,8 +77,8 @@ class ReleaseManager:
         self.releases_dir = self.mg_dir / "releases"
         self.changes_dir = self.mg_dir / "changes"
         self.plans_dir = self.mg_dir / "plans"
-        self.registry = SourceRegistry(workspace)
-        self.normalizer = MemoryNormalizer(workspace)
+        from .runtime_v2.projection_build import V2ReleaseService
+        self.native = V2ReleaseService(self.workspace)
 
     @staticmethod
     def validate_release_binding(
@@ -118,11 +116,13 @@ class ReleaseManager:
     # 完整流程：scan → normalize → build-plan
     # ------------------------------------------------------------------
 
-    def scan_and_normalize(self, budget: ScanBudget | None = None) -> tuple[SourceSnapshot, MemoryIR]:
+    def scan_and_normalize(self, budget: Any | None = None) -> tuple[Any, Any]:
         """扫描 + 规范化为 IR。只读，无副作用。
 
         v3.1 §1.3：必须传 root_map，否则外部来源无法定位文件。
         """
+        del budget
+        raise RuntimeError("v2_release_scan_requires_native_scope")
         snapshot = self.registry.scan(budget)
         # v3.1 §1.3：传 root_map 给 normalizer
         roots = self.registry.list_sources()
@@ -132,12 +132,14 @@ class ReleaseManager:
         self.normalizer.save(ir)
         return snapshot, ir
 
-    def create_build_plan(self, ir: MemoryIR, target: TargetAdapter,
+    def create_build_plan(self, ir: Any, target: TargetAdapter,
                           target_path: Path, decisions: list[DecisionEvent] | None = None,
                           *,
                           governance_scope: dict[str, Any] | None = None,
                           target_root_id: str = "") -> BuildPlan:
-        """生成构建计划（不写目标）。必须绑定 agent scope + target_root_id。"""
+        """The retired IR planner is closed; use the V2 release service."""
+        del ir, target, target_path, decisions, governance_scope, target_root_id
+        raise RuntimeError("v2_release_plan_requires_native_scope")
         scope = dict(governance_scope or {})
         root_id = str(target_root_id or "").strip()
         agent_id = str(scope.get("agent_instance_id", "") or "").strip()
@@ -187,7 +189,9 @@ class ReleaseManager:
                     *,
                     expected_scope: dict[str, Any] | None = None,
                     expected_target_root_id: str = "") -> ReleaseChange:
-        """应用构建计划：备份受管目标 → 原子切换 → 验证。"""
+        """The retired target adapter is closed; use the V2 release service."""
+        del plan_id, target, target_path, approval, expected_scope, expected_target_root_id
+        raise RuntimeError("v2_release_apply_requires_native_scope")
         if not approval:
             raise ValueError("apply requires explicit approval")
         plan_path = self.plans_dir / f"{plan_id}.json"
@@ -257,6 +261,8 @@ class ReleaseManager:
     def verify_release(self, release_id: str, target: TargetAdapter,
                        target_path: Path, manifest: BuildManifest) -> dict[str, Any]:
         """复扫验证已发布的变更。"""
+        del release_id, target, target_path, manifest
+        raise RuntimeError("v2_release_verify_requires_native_scope")
         verify = target.verify(target_path, manifest)
         return {
             "release_id": release_id,
@@ -285,6 +291,8 @@ class ReleaseManager:
 
         传入 expected_* 时强制校验绑定；生产路径必须传入。
         """
+        del release_id, target, target_path, release_override, expected_scope, expected_target_root_id, expected_target_path
+        raise RuntimeError("v2_release_rollback_requires_native_scope")
         from .change_history import get_release
         data = get_release(self.workspace, release_id)
         if data is not None and (
@@ -390,6 +398,7 @@ class ReleaseManager:
         旧 changes/ 中的 rule_change 不在此列；用 list_change_history() 看统一时间线。
         损坏 JSON 不再触发 KeyError，由 change_history.list_change_history 返回 warnings。
         """
+        raise RuntimeError("v2_release_list_requires_native_scope")
         from .change_history import list_change_history, HistoryRecordType
         history = list_change_history(self.workspace)
         return [item for item in history["items"]

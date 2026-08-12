@@ -1,12 +1,13 @@
-import json
-from pathlib import Path
-import sys
+"""Secret detection and V2 native extraction quarantine tests."""
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from __future__ import annotations
 
-from memoryguard.memory_ir import MemoryIR, MemoryNormalizer
-from memoryguard.schema_v3 import MemoryKind, MemoryRecord
+from memoryguard.content import ContentStore
+from memoryguard.memory import MemoryAtomStore
+from memoryguard.runtime_v2.extraction_native import NativeExtractionEnrichmentService
 from memoryguard.secrets import detect_secrets, redact_secrets
+
+from _publish_helpers import native_context
 
 
 def test_redact_incomplete_pem_without_end() -> None:
@@ -36,23 +37,48 @@ def test_short_named_secret_uses_shared_quarantine_threshold() -> None:
     assert "generic_secret" in labels
 
 
-def test_normalize_or_save_does_not_persist_plaintext_secret_in_ir(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+def test_native_extraction_never_accepts_plaintext_secret(tmp_path) -> None:
     secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m-secret",
-        kind=MemoryKind.FACT,
-        title="API key note",
-        body=f"Remember: {secret}",
-        original_title="API key note",
-        original_body=f"Remember: {secret}",
-    )], snapshot_id="snap")
-    normalizer = MemoryNormalizer(workspace)
-    normalizer.save(ir)
+    source = tmp_path / "memory.md"
+    source.write_text(f"# API key note\n\nRemember: {secret}\n", encoding="utf-8")
+    ContentStore(tmp_path).upsert_source_connector(
+        source_id="selected-secret-file",
+        provider="test",
+        source_type="selected_file",
+        external_root_key=str(source.resolve()),
+        workspace_id=str(tmp_path.resolve()),
+        enabled=True,
+    )
 
-    saved = json.loads((workspace / ".memoryguard" / "ir" / "current.json").read_text(encoding="utf-8"))
-    blob = json.dumps(saved, ensure_ascii=False)
+    service = NativeExtractionEnrichmentService(tmp_path)
+    context = native_context(tmp_path)
+    preview = service.extract({"source_path": str(source)}, context=context)
 
-    assert secret not in blob
-    assert "[REDACTED:" in blob
+    assert preview["candidates"]
+    candidate = preview["candidates"][0]
+    assert candidate["secret_redacted"] is True
+    assert secret not in candidate["preview"]
+
+    accepted = service.accept(
+        {
+            "extract_id": preview["extract_id"],
+            "candidate_ids": [candidate["candidate_id"]],
+        },
+        context=context,
+    )
+    assert accepted["total"] == 1
+
+    memory = MemoryAtomStore(tmp_path, readonly=True)
+    atoms = memory.list_atoms(
+        scope={
+            "workspace_id": str(tmp_path.resolve()),
+            "share_group_id": "group-test",
+            "agent_instance_id": "agent-test",
+            "project_ref": str(tmp_path.resolve()),
+            "provider": "test",
+            "runtime_role": "test",
+        },
+        include_building=True,
+    )
+    assert atoms
+    assert all(secret not in atom.body for atom in atoms)

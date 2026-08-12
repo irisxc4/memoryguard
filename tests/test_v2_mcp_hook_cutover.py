@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import builtins
+import importlib
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 import memoryguard.host_hooks as host_hooks
 import memoryguard.mcp_server as mcp_server
 
@@ -48,6 +51,169 @@ def test_mcp_state_matrix_ready_routes_reads_and_blocks_mutations(monkeypatch, t
     assert payload["code"] == "v2_not_active"
     assert len(facade.mcp_calls) == 0
     assert facade.state_calls == 2
+
+
+def test_v2_mcp_and_hook_dispatch_never_import_or_construct_retired_runtime(
+    monkeypatch, tmp_path,
+):
+    """The live entrypoints must survive exploding retired imports/constructors."""
+    retired_modules = {
+        "memoryguard.agent_binding",
+        "memoryguard.shared_memory_store",
+        "memoryguard.conversation_history",
+        "memoryguard.source_registry",
+        "memoryguard.compat_v2",
+    }
+    for module_name, class_name in (
+        ("memoryguard.agent_binding", "AgentBindingStore"),
+        ("memoryguard.shared_memory_store", "SharedMemoryStore"),
+        ("memoryguard.conversation_history", "ConversationHistoryStore"),
+        ("memoryguard.source_registry", "SourceRegistry"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            continue
+        constructor = getattr(module, class_name, None)
+        if constructor is not None:
+            monkeypatch.setattr(
+                constructor,
+                "__init__",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError(f"retired constructor used: {class_name}")
+                ),
+            )
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if any(name == module or name.startswith(module + ".") for module in retired_modules):
+            raise AssertionError(f"retired import used: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    facade = _Facade("V2_ACTIVE")
+    monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
+    monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("group-1", None, None))
+    mcp_result = mcp_server.execute_tool(
+        "memoryguard_list_sources", {"workspace": str(tmp_path)},
+    )
+    assert mcp_result.get("isError") is not True
+    assert len(facade.mcp_calls) == 1
+
+    monkeypatch.setattr(host_hooks, "_v2_runtime_facade_factory", lambda workspace: facade)
+    hook_result = host_hooks.run_hook(
+        provider="claude", event="session_start", workspace=tmp_path,
+        agent_instance_id="agent-1", share_group_id="group-1",
+        payload={"session_id": "session-1"},
+    )
+    assert hook_result["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert len(facade.hook_calls) == 1
+
+
+def test_real_v2_facade_dispatches_mcp_and_hook_ports(monkeypatch, tmp_path):
+    from memoryguard.cutover_v2 import V2RuntimeFacade
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 9}
+
+    class Native:
+        supports_rule_mutation_context = True
+
+        def __init__(self):
+            self.mcp_calls = []
+            self.hook_calls = []
+
+        def dispatch(self, surface, name, args, **kwargs):
+            self.mcp_calls.append((surface, name, dict(args)))
+            return {"ok": True, "path": "native", "name": name}
+
+        def bootstrap_hook(self, request, payload, **kwargs):
+            self.hook_calls.append((request, dict(payload)))
+            return {"packet": {"items": [], "mandatory_items": []}}
+
+    native = Native()
+    facade = V2RuntimeFacade(
+        manifest=Manifest(), v2=native, hook_v2=native, workspace=str(tmp_path),
+    )
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
+    monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
+    monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("group-1", None, None))
+    monkeypatch.setattr(
+        mcp_server,
+        "_effective_agent_context",
+        lambda args, group: {"agent_instance_id": "agent-1", "share_group_id": group},
+    )
+    mcp_result = mcp_server.execute_tool("memoryguard_list_sources", {})
+    assert mcp_result.get("isError") is not True
+    assert native.mcp_calls == [("mcp", "memoryguard_list_sources", {})]
+
+    monkeypatch.setattr(host_hooks, "_v2_runtime_facade_factory", lambda workspace: facade)
+    hook_result = host_hooks.run_hook(
+        provider="claude", event="session_start", workspace=tmp_path,
+        agent_instance_id="agent-1", share_group_id="group-1",
+        payload={"session_id": "session-1"},
+    )
+    assert hook_result["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    assert native.hook_calls and native.hook_calls[0][0] == "session_start"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "memoryguard_history_search",
+        "memoryguard_history_list_sessions",
+        "memoryguard_rule_feedback",
+        "memoryguard_provider_install",
+    ],
+)
+def test_v2_product_surfaces_route_through_native_mcp_facade(
+    monkeypatch, tmp_path, name,
+):
+    facade = _Facade("V2_ACTIVE")
+    monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
+    monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("group-1", None, None))
+
+    @dataclass
+    class _Context:
+        agent_instance_id: str = "agent-1"
+        share_group_id: str = "group-1"
+        provider: str = "codex"
+
+    monkeypatch.setattr(mcp_server, "_effective_agent_context", lambda args, group: _Context())
+    args = {"provider": "cursor"} if name == "memoryguard_provider_install" else {}
+    result = mcp_server.execute_tool(name, args)
+    assert result.get("isError") is not True
+    assert facade.mcp_calls[-1][0] == name
+
+
+def test_v2_hook_stop_does_not_invoke_retired_archive_or_feedback_helpers(
+    monkeypatch, tmp_path,
+):
+    facade = _Facade("V2_ACTIVE")
+    monkeypatch.setattr(host_hooks, "_v2_runtime_facade_factory", lambda workspace: facade)
+    monkeypatch.setattr(
+        host_hooks,
+        "_archive_history_event",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("retired Hook history archive was reached")
+        ),
+    )
+    monkeypatch.setattr(
+        host_hooks,
+        "_flush_pending_rule_feedback",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("retired Hook feedback flush was reached")
+        ),
+    )
+    for event in ("user_prompt", "stop"):
+        host_hooks.run_hook(
+            provider="codex", event=event, workspace=tmp_path,
+            agent_instance_id="agent-1", share_group_id="group-1",
+            payload={"session_id": "session-1", "prompt": "remember", "loop_count": 0},
+        )
+    assert [item[0] for item in facade.hook_calls] == ["user_prompt", "stop"]
 
 
 def test_mcp_accepts_runtime_snapshot_object(monkeypatch, tmp_path):
@@ -101,6 +267,28 @@ def test_mcp_unknown_manifest_fails_closed_without_dispatch(monkeypatch, tmp_pat
     assert payload["code"] == "v2_manifest_state_unavailable"
     assert not facade.mcp_calls
     assert facade.state_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("state", "code"),
+    [("V1_ACTIVE", "v2_upgrade_required"),
+     ("V2_BUILDING", "v2_upgrade_required"),
+     ("FUTURE", "v2_manifest_state_unavailable")],
+)
+def test_hook_state_gate_fails_closed_before_native_dispatch(
+    monkeypatch, tmp_path, state, code,
+):
+    facade = _Facade(state)
+    monkeypatch.setattr(
+        host_hooks, "_v2_runtime_facade_factory", lambda workspace: facade,
+    )
+    result = host_hooks.run_hook(
+        provider="claude", event="session_start", workspace=tmp_path,
+        agent_instance_id="agent-1", share_group_id="group-1",
+        payload={"session_id": "session-1"},
+    )
+    assert result["code"] == code
+    assert not facade.hook_calls
 
 
 def test_mcp_mutation_receives_binding_context_not_payload_identity(monkeypatch, tmp_path):
@@ -171,60 +359,23 @@ def test_mcp_mutation_strips_payload_identity_before_v2_port(monkeypatch, tmp_pa
     assert forwarded == {"body": "x"}
 
 
-def test_legacy_source_reads_require_binding_and_redact_absolute_paths(monkeypatch, tmp_path):
+def test_retired_v1_source_reads_return_upgrade_required(monkeypatch, tmp_path):
     facade = _Facade("V1_ACTIVE")
     monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
-    monkeypatch.setattr(
-        mcp_server,
-        "_resolve_access",
-        lambda args, workspace: ("bound-group", None, None),
-    )
-
-    class Api:
-        def list_sources(self):
-            return {
-                "total": 1,
-                "sources": [{
-                    "root_id": "root-1", "type": "directory",
-                    "display_name": "secret-name", "scope": "project",
-                    "path": str(tmp_path / "private" / "source.md"),
-                }],
-            }
-
-        def scan_sources(self):
-            return {
-                "snapshot_id": "snap-1", "created_at": "now",
-                "source_object_count": 1,
-                "coverage": {
-                    "coverage_status": "complete", "candidate_count": 0,
-                    "read": 1, "unsupported": 0, "unreadable": 0,
-                    "skipped_by_policy": 0, "unaccounted_count": 0,
-                },
-            }
-
-    monkeypatch.setattr(mcp_server, "_get_governance_api", lambda workspace: Api())
     listed = mcp_server.execute_tool("memoryguard_list_sources", {"workspace": str(tmp_path)})
-    listed_text = listed["content"][0]["text"]
-    assert str(tmp_path) not in listed_text
-    assert "source:" in listed_text
-
-    scanned = mcp_server.execute_tool("memoryguard_scan_summary", {"workspace": str(tmp_path)})
-    scanned_text = scanned["content"][0]["text"]
-    assert str(tmp_path) not in scanned_text
+    listed_payload = json.loads(listed["content"][0]["text"])
+    assert listed_payload["code"] == "v2_upgrade_required"
+    assert not facade.mcp_calls
 
 
-def test_legacy_source_reads_reject_missing_binding(monkeypatch, tmp_path):
+def test_retired_building_source_reads_return_upgrade_required(monkeypatch, tmp_path):
     facade = _Facade("V2_BUILDING")
     monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
-    monkeypatch.setattr(
-        mcp_server,
-        "_resolve_access",
-        lambda args, workspace: (None, "active_binding_required", None),
-    )
     result = mcp_server.execute_tool("memoryguard_list_sources", {"workspace": str(tmp_path)})
     assert result["isError"] is True
     payload = json.loads(result["content"][0]["text"])
-    assert payload["code"] == "active_binding_required"
+    assert payload["code"] == "v2_upgrade_required"
+    assert not facade.mcp_calls
 
 
 def test_provider_install_keeps_business_target_but_not_identity_spoof(monkeypatch, tmp_path):
@@ -257,6 +408,142 @@ def test_provider_install_keeps_business_target_but_not_identity_spoof(monkeypat
     assert not facade.mcp_calls
 
 
+def test_public_v2_merge_and_undo_schemas_expose_native_mutation_proof():
+    tools = {item["name"]: item for item in mcp_server.TOOLS}
+    merge_requirements = {
+        "memoryguard_rule_merge_capability_issue": {
+            "proposal_id", "mutation_receipt", "idempotency_key", "recovery_secret",
+        },
+        "memoryguard_rule_merge_approve": {
+            "proposal_id", "capability_token", "expected_definition_revisions",
+            "mutation_receipt", "idempotency_key",
+        },
+        "memoryguard_rule_merge_acknowledge": {
+            "proposal_id", "capability_token", "mutation_receipt", "idempotency_key",
+        },
+        "memoryguard_rule_merge_cooldown_clear": {
+            "proposal_id", "capability_token", "mutation_receipt", "idempotency_key",
+        },
+    }
+    for name, required in merge_requirements.items():
+        schema = tools[name]["inputSchema"]
+        assert required <= set(schema["required"])
+        assert "include_legacy_fields" not in schema["properties"]
+    issue = tools["memoryguard_rule_merge_capability_issue"]["inputSchema"]["properties"]
+    assert issue["recovery_secret"]["pattern"] == "^[A-Za-z0-9_-]+$"
+    assert "never persisted" in issue["recovery_secret"]["description"]
+
+    undo = tools["memoryguard_rule_undo"]["inputSchema"]
+    assert "idempotency_key" in undo["properties"]
+    assert "include_legacy_fields" not in undo["properties"]
+
+
+def test_mcp_merge_secret_validation_is_before_native_and_does_not_reflect_secret(
+    monkeypatch, tmp_path,
+):
+    facade = _Facade("V2_ACTIVE")
+
+    @dataclass
+    class _Context:
+        agent_instance_id: str = "admin-agent"
+        share_group_id: str = "group-1"
+        provider: str = "codex"
+        project_ref: str = "project-1"
+        runtime_role: str = "root"
+
+    monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("group-1", None, None))
+    monkeypatch.setattr(mcp_server, "_effective_agent_context", lambda args, group: _Context())
+    secret = "this is not base64url"
+    rejected = _mcp_call(
+        monkeypatch,
+        tmp_path,
+        facade,
+        "memoryguard_rule_merge_capability_issue",
+        {
+            "proposal_id": "proposal",
+            "mutation_receipt": {"receipt_id": "receipt"},
+            "idempotency_key": "issue-key",
+            "recovery_secret": secret,
+        },
+    )
+    rejected_payload = json.loads(rejected["content"][0]["text"])
+    assert rejected_payload["code"] == "recovery_secret_invalid"
+    assert secret not in rejected["content"][0]["text"]
+    assert not facade.mcp_calls
+
+    accepted = _mcp_call(
+        monkeypatch,
+        tmp_path,
+        facade,
+        "memoryguard_rule_merge_capability_issue",
+        {
+            "proposal_id": "proposal",
+            "mutation_receipt": {"receipt_id": "receipt"},
+            "idempotency_key": "issue-key",
+            "recovery_secret": "A" * 43,
+        },
+    )
+    assert accepted.get("isError") is not True
+    assert facade.mcp_calls[-1][1]["recovery_secret"] == "A" * 43
+
+
+def test_mcp_forwards_v2_context_feedback_and_audience_controls(
+    monkeypatch, tmp_path,
+):
+    facade = _Facade("V2_ACTIVE")
+
+    @dataclass
+    class _Context:
+        agent_instance_id: str = "bound-agent"
+        share_group_id: str = "bound-group"
+        provider: str = "codex"
+        project_ref: str = "bound-project"
+        runtime_role: str = "root"
+
+    monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("bound-group", None, None))
+    monkeypatch.setattr(mcp_server, "_effective_agent_context", lambda args, group: _Context())
+    _mcp_call(
+        monkeypatch,
+        tmp_path,
+        facade,
+        "memoryguard_context_bootstrap",
+        {"task": "task", "max_tokens": 256},
+    )
+    _mcp_call(
+        monkeypatch,
+        tmp_path,
+        facade,
+        "memoryguard_rule_feedback",
+        {
+            "receipt_id": "receipt",
+            "outcome": "not_applicable",
+            "evidence": "digestable evidence",
+            "confidence": 0.8,
+            "idempotency_key": "feedback-retry",
+        },
+    )
+    _mcp_call(
+        monkeypatch,
+        tmp_path,
+        facade,
+        "memoryguard_memory_write",
+        {
+            "memory_id": "audience-memory",
+            "body": "v2 body",
+            "audience": [{"target_type": "agent", "target_id": "bound-agent"}],
+            "idempotency_key": "audience-write",
+        },
+    )
+    calls = {name: args for name, args, _context_value in facade.mcp_calls}
+    assert calls["memoryguard_context_bootstrap"]["max_tokens"] == 256
+    assert calls["memoryguard_rule_feedback"]["outcome"] == "not_applicable"
+    assert calls["memoryguard_rule_feedback"]["evidence"] == "digestable evidence"
+    assert calls["memoryguard_rule_feedback"]["idempotency_key"] == "feedback-retry"
+    assert calls["memoryguard_memory_write"]["audience"] == [
+        {"target_type": "agent", "target_id": "bound-agent"},
+    ]
+
+
 def test_mcp_context_capability_is_required_without_context_port(monkeypatch, tmp_path):
     class _NoContextFacade(_Facade):
         def dispatch_mcp(self, name, args):
@@ -281,7 +568,7 @@ def test_mcp_context_capability_is_required_without_context_port(monkeypatch, tm
     assert not facade.mcp_calls
 
 
-def test_runtime_lease_denial_keeps_legacy_top_level_fields(monkeypatch, tmp_path):
+def test_runtime_lease_denial_is_protocol_payload_only(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "memoryguard.runtime_lease.check_runtime_lease",
         lambda workspace, pid: {
@@ -293,11 +580,13 @@ def test_runtime_lease_denial_keeps_legacy_top_level_fields(monkeypatch, tmp_pat
         "memoryguard_memory_write", {}, tmp_path,
     )
     assert result["isError"] is True
-    assert result["error"] == "runtime_split_brain"
-    assert result["restart_required"] is True
-    assert result["conflicting"] == [{"pid": 4242}]
+    assert "error" not in result
+    assert "restart_required" not in result
+    assert "conflicting" not in result
     payload = json.loads(result["content"][0]["text"])
-    assert payload["error"] == result["error"]
+    assert payload["error"] == "runtime_split_brain"
+    assert payload["restart_required"] is True
+    assert payload["conflicting"] == [{"pid": 4242}]
 
 
 def test_all_mcp_mutations_receive_trusted_context(monkeypatch, tmp_path):
@@ -317,6 +606,20 @@ def test_all_mcp_mutations_receive_trusted_context(monkeypatch, tmp_path):
         payload = {"agent_instance_id": "attacker"}
         if name == "memoryguard_provider_install":
             payload["provider"] = "codex"
+        if name in mcp_server._V2_RULE_MERGE_TOOLS:
+            payload.update(
+                {
+                    "proposal_id": "proposal",
+                    "mutation_receipt": {"receipt_id": f"receipt-{name}"},
+                    "idempotency_key": f"key-{name}",
+                }
+            )
+            if name == "memoryguard_rule_merge_capability_issue":
+                payload["recovery_secret"] = "A" * 43
+            else:
+                payload["capability_token"] = "token"
+            if name == "memoryguard_rule_merge_approve":
+                payload["expected_definition_revisions"] = {"definition": 1}
         _mcp_call(monkeypatch, tmp_path, facade, name, payload)
     assert len(facade.mcp_calls) == len(mcp_server._MUTATING_TOOLS)
     assert all(call[2]["agent_instance_id"] == "bound-agent" for call in facade.mcp_calls)
@@ -493,6 +796,7 @@ def test_mcp_native_transport_binds_access_context_for_write_and_admin_binding(m
     from memoryguard.memory.store import MemoryAtomStore
     from memoryguard.evidence.store import EvidenceStore
     from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.rule_scope import canonical_project_ref
     from memoryguard.runtime_v2.native_ports import NativePortError, bind_native_test_capability
     import pytest
 
@@ -559,11 +863,24 @@ def test_mcp_native_transport_binds_access_context_for_write_and_admin_binding(m
             "share_group_id": "attacker-group",
         },
     )
-    # The native boundary owns memory/evidence mutation; transport context
-    # cannot replace GovernanceV2 with a callback seam.  This fixture has no
-    # active binding for the synthetic group, so the governed write fails
-    # closed rather than invoking an injected service.
-    assert write.get("isError") is True, write
+    assert write.get("isError") is not True, write
+    write_payload = json.loads(write["content"][0]["text"])
+    assert write_payload["ok"] is True
+    atom = write_payload["data"]["atom"]
+    expected_project = canonical_project_ref(str(tmp_path))
+    assert atom["agent_instance_id"] == "bound-agent"
+    assert atom["share_group_id"] == "bound-group"
+    assert atom["project_ref"] == expected_project
+    assert atom["agent_instance_id"] != "attacker"
+    assert atom["share_group_id"] != "attacker-group"
+    assert atom["project_ref"] != "attacker-project"
+    assert atom["metadata"]["owner_agent_id"] == "bound-agent"
+    assert atom["metadata"]["owner_agent_id"] != "attacker"
+    assert atom["provenance"]
+    assert {item["agent_instance_id"] for item in atom["provenance"]} == {"bound-agent"}
+    assert {item["share_group_id"] for item in atom["provenance"]} == {"bound-group"}
+    assert all(item["agent_instance_id"] != "attacker" for item in atom["provenance"])
+    assert all(item["share_group_id"] != "attacker-group" for item in atom["provenance"])
 
     binding = _mcp_call(
         monkeypatch,

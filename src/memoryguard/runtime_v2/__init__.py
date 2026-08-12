@@ -35,10 +35,10 @@ from .working_memory import (
 
 
 def __getattr__(name: str):
-    """Keep the native runtime package independent of the legacy facade.
+    """Keep native runtime imports independent of the convenience facade.
 
-    Importing ``runtime_v2.native_ports`` must not load ``compat_v2`` merely
-    because the convenience facade is re-exported from this package.
+    Importing ``runtime_v2.native_ports`` must not load the facade merely
+    because it is re-exported from this package.
     """
     if name == "V2RuntimeFacade":
         from ..cutover_v2 import V2RuntimeFacade

@@ -1,10 +1,9 @@
-"""Native V2 adapter for the local conversation-history evidence plane.
+"""Native V2 adapter for conversation history in the Content V2 plane.
 
 The adapter is intentionally small at the transport boundary and strict at
 the scope boundary.  It does not import the shared-memory store, and it never
-constructs :class:`ConversationHistoryStore` through its public constructor
-for a read: that constructor creates and repairs a database.  Reads instead
-use a read-only SQLite URI against an already-existing history database.
+opens the legacy history database. Reads use the canonical Content V2
+database in read-only mode; deletes create V2 tombstones and durable receipts.
 
 ``NativeHistoryService.dispatch`` is the registry-facing API.  The seven
 operation methods are also public to keep host integrations easy to inject and
@@ -14,7 +13,6 @@ are emitted by the explicit read/export operations only.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import inspect
@@ -24,22 +22,15 @@ from pathlib import Path
 import sqlite3
 import stat
 from typing import Any, Callable, Mapping
-from urllib.parse import quote
-
-from ..conversation_history import (
-    ConversationHistoryStore,
-    HistoryAccessResolver,
-    HistorySchemaError,
-    HistoryScope,
-    HISTORY_ALLOWED_TABLES,
-    HISTORY_FTS_INTERNAL_TABLES,
-    HISTORY_SCHEMA_VERSION,
-    HISTORY_TABLE_COLUMNS,
+from ..storage.layout import WorkspaceV2Layout
+from .history_store import (
+    ContentHistoryStore,
     MAX_PAGE,
     MAX_TIMELINE_RADIUS,
-    _normalize_project_ref,
+    V2HistoryAccessResolver,
+    V2HistoryScope as HistoryScope,
+    content_history_schema_status,
 )
-from ..storage.layout import WorkspaceV2Layout
 
 try:  # Native authority is process-local and cannot be forged through JSON.
     from .native_ports import (
@@ -87,7 +78,6 @@ _IDENTITY_KEYS = frozenset({
     "scope", "identity", "trusted_identity", "trusted_context",
 })
 _REDACTED_KEYS = frozenset({"content", "content_preview", "body", "raw_content"})
-_REQUIRED_TABLES = frozenset(HISTORY_TABLE_COLUMNS)
 _NATIVE_ERROR_CODES = frozenset({
     "history_schema_future", "history_schema_invalid", "history_schema_partial",
     "history_schema_unsupported", "history_schema_version_invalid",
@@ -190,14 +180,6 @@ def _assert_history_artifacts_safe(db_path: Path) -> None:
 
 def _stable_store_code(exc: BaseException, *, fallback: str = "history_store_failure") -> str:
     """Map dependency/store failures to a bounded, non-leaking code."""
-    if isinstance(exc, HistorySchemaError):
-        candidate = getattr(exc, "code", "") or ""
-        if candidate in _NATIVE_ERROR_CODES:
-            return candidate
-        # Schema errors in this module are constructed from stable literals;
-        # still fail closed if an injected implementation provides arbitrary
-        # exception text.
-        return "history_schema_invalid"
     if isinstance(exc, sqlite3.DatabaseError):
         return "history_store_database_error"
     if isinstance(exc, TypeError):
@@ -207,55 +189,6 @@ def _stable_store_code(exc: BaseException, *, fallback: str = "history_store_fai
     if isinstance(exc, OSError):
         return "history_store_os_error"
     return fallback
-
-
-def _schema_status(conn: sqlite3.Connection) -> str:
-    """Return a stable read-only schema state without running any DDL.
-
-    Native history is deliberately stricter than the writable legacy adapter:
-    only the exact current user_version and canonical columns are readable.
-    A partial/unknown schema must never be interpreted as if it were complete.
-    """
-    try:
-        version_row = conn.execute("PRAGMA user_version").fetchone()
-        version = int(version_row[0]) if version_row is not None else 0
-    except (TypeError, ValueError, IndexError, sqlite3.DatabaseError):
-        return "invalid"
-    if version > HISTORY_SCHEMA_VERSION:
-        return "future"
-    if version != HISTORY_SCHEMA_VERSION:
-        return "unsupported"
-
-    try:
-        objects = conn.execute(
-            "SELECT type,name FROM sqlite_master WHERE type IN ('table','view')"
-        ).fetchall()
-        names = {str(row[1]) for row in objects}
-        # Internal FTS tables are implementation details but their names are
-        # deterministic for this schema.  Any other table/view is a widened
-        # or ambiguous schema and therefore fails closed.
-        if names - HISTORY_ALLOWED_TABLES:
-            return "invalid"
-        if not _REQUIRED_TABLES.issubset(names):
-            return "invalid"
-        object_types = {str(row[1]): str(row[0]) for row in objects}
-        if any(object_types.get(name) != "table" for name in _REQUIRED_TABLES):
-            return "invalid"
-        for table, expected in HISTORY_TABLE_COLUMNS.items():
-            columns = {
-                str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
-            }
-            if columns != set(expected):
-                return "invalid"
-        # Do not accept a database missing any FTS backing table.  We do not
-        # inspect their private column layouts because SQLite may vary those
-        # layouts by minor release; the public virtual-table contract above is
-        # the compatibility boundary.
-        if not HISTORY_FTS_INTERNAL_TABLES.issubset(names):
-            return "invalid"
-    except sqlite3.DatabaseError:
-        return "invalid"
-    return "valid"
 
 
 def _call_with_signature(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -299,49 +232,8 @@ class NativeHistoryError(RuntimeError):
         super().__init__(self.code)
 
 
-class _ReadOnlyHistoryStore(ConversationHistoryStore):
-    """ConversationHistoryStore methods backed by a read-only SQLite URI.
-
-    ``ConversationHistoryStore.__init__`` is deliberately bypassed.  This
-    class therefore cannot create directories, create a missing database, or
-    run schema repair/migrations while serving a read.
-    """
-
-    supports_durable_idempotency = True
-
-    def __init__(self, workspace: str | Path, *, readonly: bool) -> None:
-        self.source_workspace = _assert_safe_lexical_path(workspace)
-        self.workspace = self.source_workspace
-        self.db_path = self.workspace / ".memoryguard" / "history" / "history.sqlite"
-        _assert_history_artifacts_safe(self.db_path)
-        self.readonly = bool(readonly)
-
-    @contextmanager
-    def _connect(self):
-        _assert_history_artifacts_safe(self.db_path)
-        if self.readonly:
-            # quote() keeps Windows drive letters and non-ASCII workspaces
-            # valid in SQLite URI mode while retaining mode=ro semantics.
-            uri = "file:" + quote(str(self.db_path), safe="/:\\") + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=10, isolation_level=None)
-        else:
-            conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
-        try:
-            if self.readonly:
-                status = _schema_status(conn)
-                if status != "valid":
-                    code = "history_schema_future" if status == "future" else "history_schema_invalid"
-                    raise HistorySchemaError(code)
-            conn.row_factory = sqlite3.Row
-            conn.create_function(
-                "history_canonical_project_ref", 1, _normalize_project_ref,
-                deterministic=True,
-            )
-            conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=10000")
-            yield conn
-        finally:
-            conn.close()
+class _ReadOnlyHistoryStore(ContentHistoryStore):
+    """Compatibility name for the V2-native Content history store."""
 
 
 @dataclass(frozen=True)
@@ -354,7 +246,7 @@ class _TrustedScope:
 class NativeHistoryService:
     """Dependency-injected native adapter for seven history operations.
 
-    ``scope_resolver`` may be a ``HistoryAccessResolver`` or a callable with
+    ``scope_resolver`` may be a ``V2HistoryAccessResolver`` or a callable with
     ``(trusted_agent_id, requested_scope)``.  ``history_store`` is optional;
     when omitted the adapter opens only the existing history database, and
     never through the constructor that initializes/repairs it.
@@ -384,12 +276,12 @@ class NativeHistoryService:
             self.source_workspace = _assert_safe_lexical_path(workspace)
             self.layout = None
         self.workspace = self.source_workspace
-        self.db_path = self.workspace / ".memoryguard" / "history" / "history.sqlite"
+        self.db_path = WorkspaceV2Layout(self.workspace).content_db
         _assert_history_artifacts_safe(self.db_path)
         self._history_store = _unwrap_test_capability(history_store, kind="history_store")
         injected_resolver = scope_resolver if scope_resolver is not None else resolver
         self._scope_resolver = _unwrap_test_capability(injected_resolver, kind="scope_resolver")
-        self._scope_resolver = self._scope_resolver or HistoryAccessResolver(self.workspace)
+        self._scope_resolver = self._scope_resolver or V2HistoryAccessResolver(self.workspace)
         self._store_factory = _unwrap_test_capability(store_factory, kind="store_factory")
 
     # ---- context/scope -------------------------------------------------
@@ -473,10 +365,10 @@ class NativeHistoryService:
     def _scope_from_resolution(
         self, resolved: Any, source: Mapping[str, Any], agent: str,
     ) -> HistoryScope | None:
-        if isinstance(resolved, HistoryScope):
+        if all(hasattr(resolved, name) for name in ("agent_instance_id", "project_ref", "provider", "share_group_id")):
             base = resolved
-            active_group = base.share_group_id
-            authorized = base.authorized_agent_ids
+            active_group = str(getattr(base, "share_group_id", "") or "")
+            authorized = tuple(getattr(base, "authorized_agent_ids", ()) or ())
         else:
             ok = getattr(resolved, "ok", None)
             if ok is False:
@@ -516,11 +408,11 @@ class NativeHistoryService:
                 # Resolver output supplies active-group membership only; the
                 # caller identity remains the canonical native authority.
                 agent_instance_id=agent,
-                project_ref=project or base.project_ref,
-                provider=provider or base.provider,
+                project_ref=project or str(getattr(base, "project_ref", "") or ""),
+                provider=provider or str(getattr(base, "provider", "") or ""),
                 share_group_id=active_group,
-                authorized_agent_ids=authorized or base.authorized_agent_ids,
-                shared_read=base.shared_read,
+                authorized_agent_ids=authorized or tuple(getattr(base, "authorized_agent_ids", ()) or ()),
+                shared_read=bool(getattr(base, "shared_read", False)),
             )
         return HistoryScope(
             agent_instance_id=agent,
@@ -537,17 +429,7 @@ class NativeHistoryService:
             _assert_history_artifacts_safe(self.db_path)
         except NativeHistoryError:
             return "invalid"
-        if not self.db_path.is_file():
-            return "missing"
-        try:
-            uri = "file:" + quote(str(self.db_path), safe="/:\\") + "?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=2)
-            try:
-                return _schema_status(conn)
-            finally:
-                conn.close()
-        except (OSError, sqlite3.DatabaseError):
-            return "invalid"
+        return content_history_schema_status(self.db_path)
 
     def _schema_exists(self) -> bool:
         return self._schema_state() == "valid"
@@ -699,8 +581,15 @@ class NativeHistoryService:
                 payload, "radius", default=4, maximum=MAX_TIMELINE_RADIUS,
             )
         elif operation == "read":
+            # MCP/GUI compatibility envelopes may include the inactive
+            # selector as an empty placeholder. Treat it as omitted before
+            # enforcing the one-target read contract.
             session_id = payload.get("session_id")
             turn_id = payload.get("turn_id")
+            if session_id is not None and not cls._text(session_id):
+                session_id = None
+            if turn_id is not None and not cls._text(turn_id):
+                turn_id = None
             if (session_id is None) == (turn_id is None):
                 raise NativeHistoryError("exactly_one_of_session_id_or_turn_id_required")
             if session_id is not None:
@@ -770,8 +659,6 @@ class NativeHistoryService:
                 result = store.export(scope, session_ids=[str(item) for item in (payload.get("session_ids") or [])])
             else:  # pragma: no cover - dispatch validates the operation
                 raise NativeHistoryError("unknown_history_operation")
-        except HistorySchemaError as exc:
-            raise NativeHistoryError(_stable_store_code(exc, fallback="history_schema_invalid")) from exc
         except (sqlite3.DatabaseError, OSError, TypeError, ValueError) as exc:
             # Dependency/store failures are never existence-neutral and never
             # echo exception text.  Validation errors raised above this call
@@ -879,7 +766,12 @@ class NativeHistoryService:
         digest = hashlib.sha256(encoded_facts).hexdigest()
         store = self._store(readonly=False)
         if store is None:
-            raise NativeHistoryError("durable_idempotency_unavailable")
+            # A fully authorized delete against a workspace with no active
+            # History V2 store is an existence-neutral no-op.  All capability,
+            # CAS, confirmation, receipt and idempotency gates above still run;
+            # no database is created merely to record a mutation that changed
+            # nothing.
+            return self._neutral("delete", payload)
         delete = getattr(store, "delete", None)
         if delete is None or not self._durable_mutation_protocol(store):
             raise NativeHistoryError("durable_idempotency_unavailable")

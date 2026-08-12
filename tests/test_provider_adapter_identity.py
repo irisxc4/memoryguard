@@ -1,16 +1,22 @@
 """Provider MCP 配置的可信 Agent 身份传播回归测试。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import sqlite3
 import sys
+import pytest
 from memoryguard import toml_compat as tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.gui import GovernanceApi
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
+from memoryguard.migration.memory import V1GroupReader
+from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.provider_adapters import (
     ClaudeAdapter,
     CodexAdapter,
@@ -19,10 +25,167 @@ from memoryguard.provider_adapters import (
     repair_global_provider_configs,
 )
 from memoryguard.schema_v3 import AgentInstance
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
 def _patch_home(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+
+def _activate_v2_workspace(workspace: Path) -> None:
+    manager = ManifestManager(workspace)
+    if manager.current().state is ManifestState.V2_ACTIVE:
+        return
+    initialize_all(WorkspaceV2Layout(workspace))
+    memory = MemoryAtomStore(workspace)
+    evidence = EvidenceStore(workspace)
+    GovernanceV2(workspace, memory_store=memory, evidence_store=evidence)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="provider-identity-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="provider-identity-source",
+        target_digest="provider-identity-target",
+        manifest_digest="provider-identity-manifest",
+        digests={"validator_passed": True, "checkpoints": {"provider_identity": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def _v2_store(workspace: Path) -> GroupControlService:
+    _activate_v2_workspace(workspace)
+    return GroupControlService(workspace, write=True)
+
+
+def _v2_bind(workspace: Path, agent_id: str, group_id: str) -> dict:
+    return _v2_store(workspace).bind_agent(
+        agent_id,
+        group_id,
+        idempotency_key=f"provider-identity-bind:{agent_id}:{group_id}",
+    )
+
+
+def _v2_bind_agents(workspace: Path, agent_ids: list[str], group_id: str) -> GroupControlService:
+    store = _v2_store(workspace)
+    store.bind_agents(agent_ids, share_group_id=group_id)
+    return store
+
+
+def _legacy_row(memory_id: str, body: str, **extra) -> tuple:
+    values = {
+        "memory_id": memory_id,
+        "body": body,
+        "kind": "fact",
+        "status": "active",
+        "confidence": 0.9,
+        "locked": 0,
+        "injection_policy": "relevant",
+        "priority": 0,
+        "supersedes": "[]",
+        "provenance": "[]",
+        "agent_instance_id": "old-codex",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "canonical_hash": hashlib.sha256(body.encode()).hexdigest(),
+        "dedup_domain": "relevant",
+    }
+    values.update(extra)
+    return tuple(values[key] for key in (
+        "memory_id", "body", "kind", "status", "confidence", "locked",
+        "injection_policy", "priority", "supersedes", "provenance",
+        "agent_instance_id", "created_at", "updated_at", "canonical_hash",
+        "dedup_domain",
+    ))
+
+
+def _legacy_group(root: Path, group_id: str, rows: list[tuple]) -> Path:
+    path = root / ".memoryguard" / "shared-memory" / group_id / "memory.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE records ("
+            "memory_id TEXT PRIMARY KEY, body TEXT, kind TEXT, status TEXT, "
+            "confidence REAL, locked INTEGER, injection_policy TEXT, priority INTEGER, "
+            "supersedes TEXT, provenance TEXT, agent_instance_id TEXT, created_at TEXT, "
+            "updated_at TEXT, canonical_hash TEXT, dedup_domain TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE decisions (event_id TEXT PRIMARY KEY, actor TEXT, "
+            "action TEXT, target_ids TEXT, created_at TEXT)"
+        )
+        conn.executemany("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.execute(
+            "INSERT INTO decisions VALUES (?,?,?,?,?)",
+            (f"decision-{group_id}", "operator", "inventory", "[]", "now"),
+        )
+    return path
+
+
+def _seed_v2_atom(
+    workspace: Path,
+    *,
+    memory_id: str,
+    body: str,
+    agent: str,
+    group: str,
+    source_ref: str | None = None,
+    evidence_authority: str = "system",
+) -> None:
+    _activate_v2_workspace(workspace)
+    memory = MemoryAtomStore(workspace)
+    evidence = EvidenceStore(workspace)
+    governance = GovernanceV2(workspace, memory_store=memory, evidence_store=evidence)
+    workspace_id = str(workspace.resolve())
+    scope = {
+        "workspace_id": workspace_id,
+        "share_group_id": group,
+        "agent_instance_id": agent,
+        "project_ref": workspace_id.casefold(),
+        "provider": "codex",
+        "runtime_role": "root",
+        "actor": "provider-identity-fixture",
+        "authority": "manual",
+    }
+    atom = MemoryAtom(
+        memory_id=memory_id,
+        body=body,
+        kind="fact",
+        status="active",
+        confidence=0.9,
+        workspace_id=workspace_id,
+        share_group_id=group,
+        agent_instance_id=agent,
+        project_ref=workspace_id.casefold(),
+        provider="codex",
+        runtime_role="root",
+    )
+    persisted, _ = governance.put_atom(
+        atom,
+        context=scope,
+        evidence=[{
+            "source_ref": source_ref or f"fixture:{memory_id}",
+            "authority": evidence_authority,
+        }],
+        reason="provider identity V2 fixture",
+        confidence=0.9,
+        idempotency_key=f"provider-identity-memory:{memory_id}",
+    )
+    memory.project_evidence(evidence)
+    memory.set_visibility("active", atom_ids=[persisted.atom_id])
+
+
+@pytest.fixture(autouse=True)
+def _v2_provider_binding_plane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """This module exercises the V2 provider control plane explicitly."""
+    monkeypatch.setattr(
+        "memoryguard.provider_adapters._binding_plane_for_workspace",
+        lambda _workspace: "v2",
+    )
+    monkeypatch.setattr(
+        "memoryguard.host_hooks._binding_plane_for_workspace",
+        lambda _workspace: "v2",
+    )
 
 
 def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
@@ -39,8 +202,8 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     instruction_path = workspace / "CLAUDE.md"
     instruction_path.write_text("# User instructions\n", encoding="utf-8")
 
-    store = AgentBindingStore(workspace)
-    binding = store.bind_agent("claude-real-7", "team-json")
+    binding = _v2_bind(workspace, "claude-real-7", "team-json")
+    store = _v2_store(workspace)
     adapter = ClaudeAdapter(workspace)
     first = adapter.install(
         workspace,
@@ -76,12 +239,12 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     assert "不得把所有 procedure 自动设为强制" in instruction_text
     assert "强制包敏感或超限会失败封闭" in instruction_text
     assert 'query="用户 长期 偏好"' not in instruction_text
-    assert first["binding_id"] == binding.binding_id
-    assert second["binding_id"] == binding.binding_id
+    assert first["binding_id"] == binding["binding_id"]
+    assert second["binding_id"] == binding["binding_id"]
 
-    bindings = store.list_bindings(include_inactive=True)
-    assert [item.agent_instance_id for item in bindings] == ["claude-real-7"]
-    assert not store.find_by_agent("claude", include_inactive=True)
+    bindings = store.list_bindings(include_inactive=True)["bindings"]
+    assert [item["agent_instance_id"] for item in bindings] == ["claude-real-7"]
+    assert store.active_binding_for_agent("claude") is None
     assert adapter.status()["installed"] is True
     adapter.uninstall()
     assert adapter.status()["installed"] is False
@@ -90,7 +253,7 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
         "userSetting": {"keep": True},
     }
     assert "# User instructions" in instruction_path.read_text(encoding="utf-8")
-    assert store.get_binding(binding.binding_id).status.value == "active"
+    assert store.active_binding_for_agent("claude-real-7")["status"] == "active"
 
 
 def test_claude_global_scope_uses_user_config_and_stable_workspace(
@@ -102,7 +265,7 @@ def test_claude_global_scope_uses_user_config_and_stable_workspace(
     workspace.mkdir()
     _patch_home(monkeypatch, home)
     monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
-    AgentBindingStore(workspace).bind_agent("claude-global", "team-global")
+    _v2_bind(workspace, "claude-global", "team-global")
 
     result = ClaudeAdapter(workspace).install(
         workspace,
@@ -149,8 +312,8 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     instruction_path = workspace / "AGENTS.md"
     instruction_path.write_text("# User agents\n", encoding="utf-8")
 
-    store = AgentBindingStore(workspace)
-    binding = store.bind_agent("codex-real-9", "team-toml")
+    binding = _v2_bind(workspace, "codex-real-9", "team-toml")
+    store = _v2_store(workspace)
     adapter = CodexAdapter(workspace)
     result = adapter.install(
         workspace,
@@ -178,8 +341,8 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     )["mcp_servers"]["memoryguard"]["command"] == "legacy-global"
     assert any("旧用户级" in warning for warning in result["warnings"])
     assert config_path.read_text(encoding="utf-8") == first_config
-    assert result["binding_id"] == binding.binding_id
-    assert [item.agent_instance_id for item in store.list_bindings()] == [
+    assert result["binding_id"] == binding["binding_id"]
+    assert [item["agent_instance_id"] for item in store.list_bindings()["bindings"]] == [
         "codex-real-9",
     ]
 
@@ -189,7 +352,7 @@ def test_codex_toml_install_writes_real_identity_and_is_idempotent(
     remaining = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert remaining["mcp_servers"]["other"]["command"] == "other-server"
     assert remaining["features"]["keep"] is True
-    assert store.get_binding(binding.binding_id).status.value == "active"
+    assert store.active_binding_for_agent("codex-real-9")["status"] == "active"
 
 
 def test_codex_global_install_migrates_unmarked_legacy_section(
@@ -201,7 +364,7 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
     workspace.mkdir()
     _patch_home(monkeypatch, home)
     monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
-    AgentBindingStore(workspace).bind_agent("codex-legacy", "team-legacy")
+    _v2_bind(workspace, "codex-legacy", "team-legacy")
 
     config_path = home / ".codex" / "config.toml"
     config_path.parent.mkdir(parents=True)
@@ -256,7 +419,7 @@ def test_repair_global_provider_configs_rebuilds_from_canonical_binding(
     data_home.mkdir()
     _patch_home(monkeypatch, home)
     monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
-    AgentBindingStore(data_home).bind_agent("codex-current", "canonical-group")
+    _v2_bind(data_home, "codex-current", "canonical-group")
 
     monkeypatch.setattr(
         "memoryguard.agent_locator.AgentLocator.detect_instances",
@@ -288,7 +451,10 @@ def test_codex_global_takeover_removes_superseded_project_override(
     project.mkdir()
     _patch_home(monkeypatch, home)
     monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
-    AgentBindingStore(data_home).bind_agent("codex-current", "canonical-group")
+    # A project-initiated global takeover is authorized by the V2 control
+    # workspace that initiated it; the adapter then writes the stable data-home
+    # path into the user-level configuration.
+    _v2_bind(project, "codex-current", "canonical-group")
 
     project_config = project / ".codex" / "config.toml"
     project_config.parent.mkdir(parents=True)
@@ -340,8 +506,8 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
 
-    store = AgentBindingStore(workspace)
-    store.bind_agents_to_group(
+    store = _v2_bind_agents(
+        workspace,
         ["codex-real", "claude-error", "trae-real"],
         "team-mixed",
     )
@@ -363,46 +529,38 @@ def test_governance_configures_trae_and_reports_other_adapter_errors(
         fail_install,
     )
 
-    result = GovernanceApi(workspace).install_shared_group_mcp_redirects(
-        "team-mixed",
-        confirmed=True,
-    )
+    result = store.install_redirects("team-mixed")
 
+    # V2 treats partial host installation as a failed transaction boundary and
+    # rolls back providers newly configured by this attempt.
     assert result["ok"] is False
-    assert result["status"] == "partial"
-    assert result["installed_count"] == 2
+    assert result["status"] == "failure"
+    assert result["installed_count"] == 0
     assert result["skipped_count"] == 0
     assert result["error_count"] == 1
     by_agent = {item["agent_instance_id"]: item for item in result["installed"]}
     assert by_agent["codex-real"]["status"] == "configured"
     assert by_agent["claude-error"]["status"] == "error"
-    assert by_agent["claude-error"]["error"] == "simulated adapter error"
+    assert by_agent["claude-error"]["error"] == "RuntimeError"
     assert by_agent["trae-real"]["status"] == "configured"
     assert by_agent["trae-real"]["provider"] == "trae"
+    # The attempt is atomic from the group command perspective: successful
+    # providers configured earlier in the batch are uninstalled again.
     trae_global_config = appdata / "TRAE SOLO CN" / "User" / "mcp.json"
-    assert json.loads(
-        trae_global_config.read_text(encoding="utf-8")
-    )["mcpServers"]["memoryguard"]["env"] == {
-        "MEMORYGUARD_AGENT_ID": "trae-real",
-        "MEMORYGUARD_PROVIDER": "trae",
-        "MEMORYGUARD_CONTROL_SCOPE": "global",
-        "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
-    }
-
-    parsed = tomllib.loads(
-        (home / ".codex" / "config.toml").read_text(encoding="utf-8")
-    )
-    assert parsed["mcp_servers"]["memoryguard"]["env"] == {
-        "MEMORYGUARD_AGENT_ID": "codex-real",
-        "MEMORYGUARD_PROVIDER": "codex",
-        "MEMORYGUARD_CONTROL_SCOPE": "global",
-        "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
-    }
+    if trae_global_config.exists():
+        assert "memoryguard" not in json.loads(
+            trae_global_config.read_text(encoding="utf-8")
+        ).get("mcpServers", {})
+    codex_config = home / ".codex" / "config.toml"
+    if codex_config.exists():
+        assert "memoryguard" not in tomllib.loads(
+            codex_config.read_text(encoding="utf-8")
+        ).get("mcp_servers", {})
     assert {
-        binding.agent_instance_id
-        for binding in store.list_bindings(include_inactive=True)
+        binding["agent_instance_id"]
+        for binding in store.list_bindings(include_inactive=True)["bindings"]
     } == {"codex-real", "claude-error", "trae-real"}
-    assert not store.find_by_agent("codex", include_inactive=True)
+    assert store.active_binding_for_agent("codex") is None
 
 
 def test_cursor_workspace_install_uses_project_config(tmp_path, monkeypatch):
@@ -418,9 +576,7 @@ def test_cursor_workspace_install_uses_project_config(tmp_path, monkeypatch):
         json.dumps({"mcpServers": {"global-only": {"command": "global"}}}),
         encoding="utf-8",
     )
-    binding = AgentBindingStore(workspace).bind_agent(
-        "cursor-real", "team-cursor"
-    )
+    binding = _v2_bind(workspace, "cursor-real", "team-cursor")
 
     adapter = CursorAdapter(workspace)
     result = adapter.install(
@@ -448,7 +604,7 @@ def test_cursor_workspace_install_uses_project_config(tmp_path, monkeypatch):
     assert json.loads(global_config.read_text(encoding="utf-8")) == {
         "mcpServers": {"global-only": {"command": "global"}},
     }
-    assert result["binding_id"] == binding.binding_id
+    assert result["binding_id"] == binding["binding_id"]
     assert result["status"] == "configured"
     assert result["restart_required"] is True
     assert result["runtime_verified"] is False
@@ -479,9 +635,7 @@ def test_trae_workspace_install_uses_project_config_and_preserves_servers(
         }),
         encoding="utf-8-sig",
     )
-    binding = AgentBindingStore(workspace).bind_agent(
-        "trae-real", "team-trae"
-    )
+    binding = _v2_bind(workspace, "trae-real", "team-trae")
 
     adapter = TraeAdapter(workspace)
     first = adapter.install(
@@ -510,8 +664,8 @@ def test_trae_workspace_install_uses_project_config_and_preserves_servers(
     assert (workspace / "AGENTS.md").read_text(encoding="utf-8").count(
         "<!-- BEGIN memoryguard:provider-redirect -->"
     ) == 1
-    assert first["binding_id"] == binding.binding_id
-    assert second["binding_id"] == binding.binding_id
+    assert first["binding_id"] == binding["binding_id"]
+    assert second["binding_id"] == binding["binding_id"]
     assert adapter.status()["installed"] is True
 
     adapter.uninstall()
@@ -521,9 +675,7 @@ def test_trae_workspace_install_uses_project_config_and_preserves_servers(
         "projectSetting": {"keep": True},
     }
     assert adapter.status()["installed"] is False
-    assert AgentBindingStore(workspace).get_binding(
-        binding.binding_id
-    ).status.value == "active"
+    assert GroupControlService(workspace).active_binding_for_agent("trae-real")["status"] == "active"
 
 
 def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstall(
@@ -538,8 +690,7 @@ def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstal
     monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
     appdata = home / "AppData" / "Roaming"
     monkeypatch.setenv("APPDATA", str(appdata))
-    store = AgentBindingStore(workspace)
-    store.bind_agents_to_group(["codex-real", "trae-real"], "team-shared")
+    store = _v2_bind_agents(workspace, ["codex-real", "trae-real"], "team-shared")
     monkeypatch.setattr(
         "memoryguard.agent_locator.AgentLocator.detect_instances",
         lambda self: ([
@@ -548,13 +699,8 @@ def test_reinstall_is_idempotent_and_shared_agents_rule_survives_single_uninstal
         ], {}),
     )
 
-    api = GovernanceApi(workspace)
-    first = api.install_shared_group_mcp_redirects(
-        "team-shared", confirmed=True,
-    )
-    second = api.install_shared_group_mcp_redirects(
-        "team-shared", confirmed=True,
-    )
+    first = store.install_redirects("team-shared")
+    second = store.install_redirects("team-shared")
 
     assert first["configured_count"] == second["configured_count"] == 2
     agents_text = (home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
@@ -611,7 +757,7 @@ def test_install_rolls_back_first_file_when_second_write_fails(
         json.dumps({"mcpServers": {"other": {"command": "other"}}}),
         encoding="utf-8",
     )
-    AgentBindingStore(workspace).bind_agent("claude-real", "team-rollback")
+    _v2_bind(workspace, "claude-real", "team-rollback")
 
     original_atomic_write = provider_adapters._atomic_write_bytes
     calls = {"count": 0}
@@ -648,7 +794,7 @@ def test_install_refuses_corrupt_existing_config(tmp_path):
     workspace.mkdir()
     config_path = workspace / ".mcp.json"
     config_path.write_text("{broken-json", encoding="utf-8")
-    AgentBindingStore(workspace).bind_agent("claude-real", "team-corrupt")
+    _v2_bind(workspace, "claude-real", "team-corrupt")
 
     try:
         ClaudeAdapter(workspace).install(
@@ -668,81 +814,64 @@ def test_install_refuses_corrupt_existing_config(tmp_path):
 def test_legacy_global_runtime_redirect_requires_migration_evidence(
     tmp_path, monkeypatch,
 ):
-    from memoryguard.mcp_server import (
-        _LEGACY_GLOBAL_REDIRECT_CACHE,
-        _resolve_memory_workspace,
-    )
-    from memoryguard.schema_v3 import (
-        MemoryKind,
-        Provenance,
-        SharedMemoryRecord,
-        SharedMemoryStatus,
-    )
-    from memoryguard.shared_memory_store import SharedMemoryStore
+    from memoryguard.mcp_server import _resolve_memory_workspace
 
     legacy = tmp_path / "legacy-control"
     canonical = tmp_path / "canonical-home"
     legacy.mkdir()
     canonical.mkdir()
-    AgentBindingStore(legacy).bind_agent("old-codex", "legacy-group")
-    AgentBindingStore(canonical).bind_agent("new-codex", "canonical-group")
-    SharedMemoryStore(canonical, "canonical-group").append_record(
-        SharedMemoryRecord(
-            memory_id="migrated-record",
-            body="migrated memory",
-            kind=MemoryKind.FACT,
-            status=SharedMemoryStatus.ACTIVE,
-            provenance=[Provenance(
-                source_object_id="migrated-from:legacy-group",
-                locator="source",
-                excerpt_hash="",
-                source_revision="",
-            )],
-            created_at="2026-08-08T00:00:00+00:00",
-            updated_at="2026-08-08T00:00:00+00:00",
-        )
+    legacy_db = _legacy_group(
+        legacy,
+        "legacy-group",
+        [_legacy_row("migrated-record", "migrated memory")],
+    )
+    _v2_bind(canonical, "new-codex", "canonical-group")
+    _seed_v2_atom(
+        canonical,
+        memory_id="migrated-record",
+        body="migrated memory",
+        agent="new-codex",
+        group="canonical-group",
+        source_ref="migration:legacy-group/migrated-record",
+        evidence_authority="memory_migration",
     )
 
-    def fake_detect(self):
-        root = Path(self.workspace).resolve()
-        if root == legacy.resolve():
-            return ([AgentInstance("old-codex", "codex", "codex")], {})
-        if root == canonical.resolve():
-            return ([AgentInstance("new-codex", "codex", "codex")], {})
-        return ([], {})
+    # The formal immutable reader is the only V1 inspection seam.  Its result
+    # is evidence for the explicit upgrade, not permission for runtime redirect.
+    inventory = V1GroupReader(
+        legacy,
+        "legacy-group",
+        legacy_db,
+        immutable=True,
+    ).inventory()
+    assert inventory.ok and inventory.records == 1 and inventory.active == 1
 
-    monkeypatch.setattr(
-        "memoryguard.agent_locator.AgentLocator.detect_instances", fake_detect,
-    )
     monkeypatch.setenv("MEMORYGUARD_HOME", str(canonical))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(legacy))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "old-codex")
     monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
-    monkeypatch.delenv("MEMORYGUARD_PROVIDER", raising=False)
-    _LEGACY_GLOBAL_REDIRECT_CACHE.clear()
+    assert _resolve_memory_workspace({}) == legacy.resolve()
 
-    resolved = _resolve_memory_workspace({})
-    assert resolved == canonical.resolve()
-    from memoryguard.access_context import effective_provider, load_access_context
-    assert load_access_context().trusted_agent_id == "new-codex"
-    assert effective_provider() == "codex"
-    # The host-owned environment remains untouched; only MemoryGuard's trusted
-    # connection view is normalized.
-    assert os.environ["MEMORYGUARD_AGENT_ID"] == "old-codex"
-    assert "MEMORYGUARD_CONTROL_SCOPE" not in os.environ
-    assert Path(os.environ["MEMORYGUARD_WORKSPACE"]).resolve() == legacy.resolve()
+    monkeypatch.setenv("MEMORYGUARD_CONTROL_SCOPE", "global")
+    assert _resolve_memory_workspace({}) == canonical.resolve()
+    scope = MemoryReadScope(
+        workspace_id=str(canonical.resolve()),
+        share_group_id="canonical-group",
+        agent_instance_id="new-codex",
+        project_ref=str(canonical.resolve()).casefold(),
+        provider="codex",
+        runtime_role="root",
+        admin=True,
+    )
+    atoms = MemoryAtomStore(canonical).list_atoms(scope=scope, include_building=True)
+    assert [atom.memory_id for atom in atoms] == ["migrated-record"]
 
-    # Old project-level configs often carried only the legacy AgentInstance id
-    # and relied on cwd instead of MEMORYGUARD_WORKSPACE.  The same migration
-    # evidence must repair that shape too.
-    from memoryguard.access_context import clear_runtime_connection_override
-    clear_runtime_connection_override()
-    _LEGACY_GLOBAL_REDIRECT_CACHE.clear()
+    # Without an explicit global scope, cwd/workspace remains the caller's V2
+    # project.  A legacy path never silently jumps to the migration target.
+    monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
     monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
     monkeypatch.chdir(legacy)
-    resolved_from_cwd = _resolve_memory_workspace({})
-    assert resolved_from_cwd == canonical.resolve()
-    assert load_access_context().trusted_agent_id == "new-codex"
+    assert _resolve_memory_workspace({}) == legacy.resolve()
 
 
 def test_explicit_project_scope_never_auto_redirects_legacy_workspace(
@@ -766,57 +895,118 @@ def test_explicit_project_scope_never_auto_redirects_legacy_workspace(
 def test_trusted_env_supplies_missing_tool_identity_and_rejects_mismatch(
     tmp_path, monkeypatch,
 ):
-    from memoryguard.mcp_server import (
-        TOOLS,
-        _handle_memory_status,
-        _handle_memory_write,
+    from memoryguard.mcp_server import TOOLS
+    from memoryguard.runtime_v2.native_ports import (
+        NativeV2RuntimePort,
+        bind_native_transport_context,
     )
-    from memoryguard.shared_memory_store import SharedMemoryStore
+    from memoryguard.access_context import AccessContext
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    AgentBindingStore(workspace).bind_agent("trusted-real", "trusted-group")
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-real")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.delenv("MEMORYGUARD_ALLOW_ANON", raising=False)
+    _v2_bind(workspace, "trusted-real", "trusted-group")
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="trusted-real",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="provider-identity-session",
+            session_source="provider-test",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="trusted-group",
+        project_ref=str(workspace.resolve()).casefold(),
+        provider="codex",
+        runtime_role="root",
+        entrypoint="mcp",
+    )
+    port = NativeV2RuntimePort(
+        workspace,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
 
     write_args = {
-        "workspace": str(workspace),
+        "memory_id": "trusted-memory",
         "body": "trusted environment identity",
         "share_group_id": "attacker-selected-group",
+        "agent_instance_id": "attacker-selected-agent",
+        "idempotency_key": "trusted-memory-write",
     }
-    written = _handle_memory_write(write_args)
-    assert not written.get("isError"), written
-    assert write_args["agent_instance_id"] == "trusted-real"
-    memory_id = json.loads(written["content"][0]["text"])["memory_id"]
-    record = SharedMemoryStore(
-        workspace, "trusted-group", read_only=True,
-    ).get_record(memory_id)
-    assert record is not None
-    assert record.agent_instance_id == "trusted-real"
-    assert not (
-        workspace / ".memoryguard" / "shared-memory" / "attacker-selected-group"
-    ).exists()
-
-    status = _handle_memory_status({"workspace": str(workspace)})
-    assert not status.get("isError"), status
-    mismatch = _handle_memory_status({
-        "workspace": str(workspace),
-        "agent_instance_id": "impostor",
-    })
-    assert mismatch.get("isError") is True
-    assert "mismatch" in mismatch["content"][0]["text"]
-
-    schemas = {
-        tool["name"]: tool["inputSchema"]["properties"]
-        for tool in TOOLS
-    }
-    for name in (
-        "memoryguard_memory_read",
-        "memoryguard_memory_search",
+    written = port.dispatch_mcp(
         "memoryguard_memory_write",
-        "memoryguard_memory_update",
-        "memoryguard_memory_delete",
+        write_args,
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert written["ok"] is False
+    assert written["code"] == "context_identity_spoof"
+
+    trusted_args = {
+        "memory_id": "trusted-memory",
+        "body": "trusted environment identity",
+        "idempotency_key": "trusted-memory-write",
+    }
+    written = port.dispatch_mcp(
+        "memoryguard_memory_write",
+        trusted_args,
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert written["ok"] is True, written
+    assert written["data"]["atom"]["agent_instance_id"] == "trusted-real"
+    assert written["data"]["atom"]["share_group_id"] == "trusted-group"
+
+    status = port.dispatch_mcp(
         "memoryguard_memory_status",
-    ):
-        assert "agent_instance_id" in schemas[name]
+        {},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert status["ok"] is True, status
+    mismatch = port.dispatch_mcp(
+        "memoryguard_memory_status",
+        {"agent_instance_id": "impostor"},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert mismatch["ok"] is False
+    assert mismatch["code"] == "context_identity_spoof"
+
+    def identity_properties(schema):
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        merged = dict(properties) if isinstance(properties, dict) else {}
+        for branch_name in ("oneOf", "anyOf", "allOf"):
+            branches = schema.get(branch_name)
+            if isinstance(branches, list):
+                for branch in branches:
+                    merged.update(identity_properties(branch))
+        return merged
+
+    target_names = {
+        "memoryguard_memory_write",
+        "memoryguard_memory_status",
+    }
+    schemas = {
+        tool.get("name"): identity_properties(tool.get("inputSchema"))
+        for tool in TOOLS
+        if isinstance(tool, dict) and tool.get("name") in target_names
+    }
+    assert set(schemas) == target_names
+    for properties in schemas.values():
+        # Group identity is transport-only.  An optional agent field is allowed
+        # only as a consistency check whose description makes the trusted
+        # environment authoritative; the native mismatch assertions above are
+        # the enforcement proof.
+        assert "share_group_id" not in properties
+        if "agent_instance_id" in properties:
+            description = str(properties["agent_instance_id"].get("description", ""))
+            assert "trusted" in description.casefold()
+            assert "authoritative" in description.casefold()

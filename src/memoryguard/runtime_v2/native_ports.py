@@ -13,12 +13,14 @@ store after a read-only schema preflight has succeeded.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
 import os
 import sqlite3
+from threading import Lock, RLock
 import weakref
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -27,9 +29,12 @@ from ..cutover_v2.surfaces import (
     CLI_COMMAND_NAMES,
     GUI_MUTATION_NAMES,
     GUI_METHOD_NAMES,
+    GUI_OPERATION_SPECS,
     MCP_MUTATION_NAMES,
     MCP_TOOL_NAMES,
+    get_gui_operation_spec,
 )
+from ..rule_scope import canonical_project_ref
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.database import connect_database, open_database
 
@@ -47,6 +52,24 @@ _NATIVE_BOUND_CONTEXTS: weakref.WeakValueDictionary[int, "NativeBoundContext"] =
 # capability above authenticates request identity; this token authenticates
 # test/host wiring and must never be accepted from a plain Mapping/JSON value.
 _NATIVE_INJECTION_CAPABILITY = object()
+# Only the GUI mutation adapter can hold this process-local marker.  It lets
+# the state-preserving path retain an existing V2 atom's complete metadata
+# without accepting a forgeable JSON flag from MCP callers.
+_GUI_STATE_PRESERVATION_CAPABILITY = object()
+_NATIVE_MEMORY_LOCK_GUARD = Lock()
+_NATIVE_MEMORY_LOCKS: dict[tuple[str, str], RLock] = {}
+
+
+def _native_memory_mutation_lock(workspace: str | Path, share_group_id: str) -> RLock:
+    key = (str(Path(workspace).expanduser().resolve()), str(share_group_id))
+    with _NATIVE_MEMORY_LOCK_GUARD:
+        lock = _NATIVE_MEMORY_LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _NATIVE_MEMORY_LOCKS[key] = lock
+        return lock
+
+
 _IDENTITY_ALIASES: dict[str, tuple[str, ...]] = {
     "workspace_id": ("workspace_id", "workspace"),
     "agent_instance_id": ("agent_instance_id", "agent_id", "agent", "trusted_agent_id", "trusted_agent"),
@@ -340,6 +363,9 @@ class SurfaceSpec:
     handler: str
     mutation: bool = False
     reason: str = ""
+    canonical_name: str = ""
+    domain: str = ""
+    execution: str = "sync"
 
     def __post_init__(self) -> None:
         if self.status not in {"implemented", "neutral-read", "retired", "blocker"}:
@@ -348,6 +374,8 @@ class SurfaceSpec:
             raise ValueError("retired native surface requires an explicit reason")
         if not self.handler:
             raise ValueError("native surface handler is required")
+        if self.execution not in {"sync", "task"}:
+            raise ValueError("native surface execution must be sync or task")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -356,6 +384,9 @@ class SurfaceSpec:
             "handler": self.handler,
             "mutation": bool(self.mutation),
             "reason": self.reason,
+            "canonical_name": self.canonical_name or self.name,
+            "domain": self.domain,
+            "execution": self.execution,
         }
 
 
@@ -407,110 +438,53 @@ def _payload(value: Any) -> dict[str, Any]:
 
 
 def _phase9_gui_payload(surface: str, name: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Normalize SafeBridge's positional GUI arguments for native services.
+    """Bind historical positional GUI args from the canonical operation spec.
 
-    The browser bridge preserves the historical JS signatures as an ``args``
-    list.  Native MCP callers already send mappings, so this adapter is scoped
-    to the Phase 9 GUI aliases and never treats nested ``scope`` data as an
-    authorization source; canonical authority remains the bound context.
+    Browser-selected identity/scope values are transport compatibility only and
+    are discarded after binding.  Authorization is supplied exclusively by the
+    process-issued ``NativeBoundContext``.
     """
 
     if surface != "gui":
         return dict(payload)
+    operation = get_gui_operation_spec(name)
+    if operation is None:
+        return dict(payload)
     values = payload.get("args")
     if not isinstance(values, (list, tuple)):
+        # Historical SafeBridge flattens a single mapping positional argument.
+        # Scope selection is business input that must be validated against the
+        # trusted binding, not an authority claim to be silently discarded.
+        if operation.canonical_name == "scope_set" and operation.parameters == ("requested_scope",):
+            return {"requested_scope": dict(payload)}
         return dict(payload)
     args = list(values)
-    result: dict[str, Any] = {}
-
-    def assign(names: tuple[str, ...]) -> None:
-        for index, key in enumerate(names):
-            if index < len(args):
-                result[key] = args[index]
-
-    if name == "list_history_sessions":
-        assign(("scope", "limit", "offset", "extracted", "date_from", "date_to"))
-    elif name == "search_history":
-        assign(("query", "scope", "limit", "offset"))
-    elif name == "history_timeline":
-        assign(("session_id", "anchor_turn_id", "scope", "radius"))
-    elif name == "history_read":
-        assign(("session_id", "turn_id", "scope", "limit", "offset"))
-        # The historical GUI signature uses an empty-string placeholder for
-        # whichever selector is not used.  NativeHistoryService distinguishes
-        # omitted/None from an invalid empty identifier.
+    result = {
+        key: args[index]
+        for index, key in enumerate(operation.parameters)
+        if index < len(args)
+    }
+    # Preserve identity-shaped compatibility arguments long enough for
+    # ``_context`` to reject a browser/transport spoof.  The checked dispatch
+    # removes them only after that comparison; they never reach a handler as
+    # an authorization source.  Explicit business target selectors use names
+    # such as ``target_group_id`` and remain ordinary payload fields.
+    for key in ("scope", "identity"):
+        result.pop(key, None)
+    # Import bundles are scoped exclusively by the process-issued GUI
+    # authority.  These three historical positional selectors are retained
+    # in the public signature for compatibility, but must be ignored rather
+    # than treated as a second identity assertion (older GUI callers pass
+    # stale/browser values here).
+    if name == "create_import":
+        for key in ("agent_instance_id", "project_ref", "share_group_id"):
+            result.pop(key, None)
+    # Historical read() uses an empty placeholder for whichever selector is
+    # not active.  NativeHistoryService distinguishes empty from omitted.
+    if name == "history_read":
         for key in ("session_id", "turn_id"):
             if result.get(key) == "":
                 result[key] = None
-    elif name == "history_extract_preview":
-        assign(("session_id", "turn_ids", "scope", "limit"))
-    elif name == "export_history":
-        assign(("session_ids", "scope"))
-    elif name == "delete_history":
-        assign(("session_ids", "scope", "invalidate_evidence", "confirmed", "mutation_receipt", "idempotency_key"))
-    elif name == "list_memory_versions":
-        assign(("share_group_id", "limit", "offset"))
-    elif name == "get_supersede_chain":
-        assign(("memory_id", "share_group_id"))
-    elif name == "edit_memory":
-        assign(("memory_id", "body"))
-    elif name in {"lock_memory", "unlock_memory", "restore_memory", "delete_memory"}:
-        assign(("memory_id",))
-    elif name == "set_memory_injection_policy":
-        assign(("memory_id", "injection_policy", "priority"))
-    elif name == "rollback_memory":
-        assign(("version_id",))
-    elif name == "accept_candidates":
-        assign(("extract_id", "candidate_ids"))
-    elif name == "apply_enrichments":
-        assign(("results",))
-    elif name == "extract_preview":
-        assign(("root_id", "relative_path", "max_segments"))
-    elif name == "extract_preview_by_path":
-        assign(("source_path",))
-    elif name == "create_rule_from_text":
-        assign(("text",))
-    elif name == "submit_rule_feedback":
-        assign(("receipt_id", "outcome", "evidence", "confidence"))
-    elif name == "undo_rule_decision":
-        assign(("decision_id",))
-    elif name == "read_rule_decision":
-        assign(("decision_id",))
-    elif name == "list_rule_match_receipts":
-        assign(("share_group_id", "memory_id", "agent_instance_id", "limit"))
-        result.pop("share_group_id", None)
-        result.pop("agent_instance_id", None)
-    elif name == "list_rule_exceptions":
-        assign(("share_group_id", "parent_rule"))
-        result.pop("share_group_id", None)
-    elif name == "update_rule_audience":
-        assign(("memory_id", "assignments", "share_group_id", "injection_policy", "priority", "confirmed"))
-        result.pop("share_group_id", None)
-    elif name in {"get_rule_scope_options", "preview_effective_rules", "list_rules_habits", "list_rule_cockpit", "list_rule_decisions", "get_rule_auto_scope_metrics"}:
-        # Browser-selected scope/agent fields are intentionally ignored; the
-        # process-issued SafeBridge context is authoritative.
-        return result
-    elif name == "import_external_mcp_entries":
-        assign(("descriptor_json", "server_id"))
-    elif name in {"preview_source", "preview_import"}:
-        if args:
-            result["path"] = args[0]
-        if name == "preview_source" and len(args) > 1:
-            result["source_type"] = args[1]
-    elif name == "add_source":
-        assign(("path", "source_type", "display_name", "confirmed"))
-    elif name == "remove_source":
-        assign(("source_id", "confirmed"))
-    elif name == "pick_path":
-        assign(("for_files",))
-    elif name == "detect_external_mcp":
-        assign(("server_id", "descriptor"))
-    elif name == "preview_external_mcp_import":
-        assign(("server_id", "descriptor"))
-    elif name in {"list_sources", "scan_sources"}:
-        return result
-    else:
-        return dict(payload)
     return result
 
 
@@ -706,9 +680,14 @@ class NativeV2RuntimePort:
         "memoryguard_knowledge_book": ("knowledge_book", "implemented", False),
         "memoryguard_knowledge_candidates": ("knowledge_candidates", "implemented", False),
         "memoryguard_neuron_graph": ("codegraph_graph", "implemented", False),
+        "memoryguard_codegraph_query": ("codegraph_query", "implemented", False),
+        "memoryguard_codegraph_path": ("codegraph_path", "implemented", False),
+        "memoryguard_codegraph_explain": ("codegraph_explain", "implemented", False),
+        "memoryguard_codegraph_affected": ("codegraph_affected", "implemented", False),
+        "memoryguard_codegraph_update": ("codegraph_update", "implemented", True),
         "memoryguard_semantic_check": ("semantic_check", "implemented", False),
         "memoryguard_provider_install": ("provider_install", "implemented", True),
-        "memoryguard_codegraph_status": ("codegraph_status", "neutral-read", False),
+        "memoryguard_codegraph_status": ("codegraph_status", "implemented", False),
         "memoryguard_asset_status": ("asset_status", "neutral-read", False),
         "memoryguard_skill_status": ("skill_status", "neutral-read", False),
     }
@@ -736,11 +715,10 @@ class NativeV2RuntimePort:
         "get_memory_status": ("memory_status", "implemented", False),
         "list_memory_versions": ("memory_versions", "implemented", False),
         "get_supersede_chain": ("memory_supersede_chain", "implemented", False),
-        # Global status is intentionally reduced to the same fixed
-        # availability envelope as the scoped status route.  The native port
-        # must not aggregate every tenant's store merely to satisfy this
-        # compatibility spelling.
-        "get_global_memory_status": ("memory_status", "implemented", False),
+        # Global status is a separate trusted-admin aggregate, not a scoped
+        # status alias.  Non-admin callers are rejected before the aggregate
+        # store is opened so group existence cannot be probed.
+        "get_global_memory_status": ("memory_global_status", "implemented", False),
         "list_bindings": ("binding_list", "implemented", False),
         "get_governance_snapshot": ("diagnostics_snapshot", "implemented", False),
         # The GUI registry endpoint is a read-only native coverage view.  It
@@ -798,75 +776,6 @@ class NativeV2RuntimePort:
         "knowledge_search": ("knowledge_read", "implemented", False),
         "knowledge_read": ("knowledge_read", "implemented", False),
     }
-
-    # Explicit V1-only GUI workflows retained as stable compatibility names.
-    # ``retired`` is a production-safe terminal classification: the method
-    # remains discoverable but dispatch returns v2_operation_retired with this
-    # reason and performs no legacy fallback or write.
-    _GUI_RETIRED_REASONS: dict[str, str] = {}
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "apply_build", "choose_publish_target_path", "create_build_plan",
-        "get_build_progress", "list_native_memory_releases", "list_publish_targets",
-        "list_releases", "publish_reconstructed_memory",
-        "rollback_native_memory_release", "rollback_release", "verify_release",
-    }, "legacy reconstructed/native-memory release workflow is replaced by V2 Memory, Projection and governed domain receipts"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "apply_plan", "generate_plan", "undo_change",
-    }, "legacy report-patch workflow is replaced by V2 ReferenceAudit, validator/readiness and governed domain mutations"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "apply_memoryguard_gc", "plan_memoryguard_gc",
-    }, "legacy artifact GC is replaced by V2 storage lease/sweep/compact maintenance"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "archive_memory_group", "bind_agent", "bind_agents_to_shared_group",
-        "check_binding_drift", "clear_memory_group", "commit_selection",
-        "commit_shared_memory_governance", "dissolve_shared_group",
-        "ensure_personal_memory_group", "enter_multi_agent_mode", "exit_multi_agent_mode",
-        "export_memory_group", "get_shared_group_preview", "import_native_memories_to_group",
-        "install_shared_group_mcp_redirects", "leave_shared_group_to_personal", "unbind_agent",
-    }, "legacy SharedMemoryStore group lifecycle is retired; V2 scope comes from trusted bindings/rules and provider integration"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "build_projection", "cancel_build_projection", "delete_projection",
-        "get_projection_source_map", "neuron_decide", "set_projection_source_enabled",
-        "start_build_projection",
-    }, "legacy reconstructed projection workflow is replaced by V2 Projection/CodeGraph domains"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "create_child_exception", "create_rule_exception", "revoke_rule_exception",
-    }, "direct rule-exception editing is retired; V2 exceptions are evidence/receipt-driven through the native rule lifecycle"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "backfill_local_history", "discover_local_history_sources",
-    }, "legacy history discovery/backfill is replaced by the V2 Content/History synchronization domain"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "create_import",
-    }, "legacy import staging is replaced by V2 Content/History/Knowledge ingestion and extraction surfaces"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "delete_quarantine", "get_auto_actions", "get_conflicts", "get_memory_ir",
-        "get_quarantine", "get_raw_memory", "get_recent_events", "get_source_file_content",
-        "get_supersede_decisions", "release_quarantine", "resolve_conflict",
-    }, "legacy IR/quarantine/raw-body workflow is replaced by V2 governed Memory revisions, source mappings and scoped evidence reads"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "get_request_status", "list_pending_requests", "submit_request",
-    }, "legacy GUI request queue is retired; SafeBridge mutations execute only through the V2 manifest/context gate"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "knowledge_add", "knowledge_candidate_review", "knowledge_candidate_targets",
-        "knowledge_deleted_list", "knowledge_job_status", "knowledge_purge_deleted",
-        "knowledge_rebuild_smart", "knowledge_reingest", "knowledge_remove",
-        "knowledge_restore", "knowledge_update_settings",
-    }, "Knowledge V2 is reference-only by contract; body mutations must enter through Content ingestion/extraction"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "archive_agent_dir", "delete_archived_agent", "discover_agents", "get_agent_data",
-        "get_residual_cleanup", "get_selection_tree", "list_agent_candidates", "list_agents",
-        "list_archived_agents", "list_cleanup_history", "mark_agent_uninstalled",
-        "open_agent_folder", "restore_archived_agent", "unmark_agent_uninstalled",
-    }, "legacy AgentLocator cleanup/selection workflow is retired from the V2 data plane; provider/source control remains available through native control surfaces"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "set_governance_scope",
-    }, "browser scope preferences are not V2 authority; scope is derived from the process-issued trusted binding context"))
-    _GUI_RETIRED_REASONS.update(dict.fromkeys({
-        "set_host_hook_mode", "uninstall_host_hook",
-    }, "GUI hook mutation is retired in V2; use the gated native CLI hooks control surface"))
-    _GUI_RETIRED_REASONS["rollback_memory"] = (
-        "legacy whole-version rollback has no lossless V2 equivalent; use append-only revisions and operation-specific governed compensating mutations"
-    )
 
     _CLI_HANDLERS: Mapping[str, tuple[str, str, bool]] = {
         "audit": ("cli_audit", "implemented", False),
@@ -985,8 +894,33 @@ class NativeV2RuntimePort:
         self._rule_lifecycle_service: Any = None
         self._extraction_service: Any = None
         self._knowledge_service: Any = None
+        self._knowledge_command_service: Any = None
+        self._task_coordinator: Any = None
+        self._projection_build_service: Any = None
+        self._release_service: Any = None
+        self._group_control_service: Any = None
+        self._agent_native_service: Any = None
+        self._governance_native_service: Any = None
+        self._hook_control_service: Any = None
+        self._import_control_service: Any = None
+        self._history_control_service: Any = None
+        self._audit_plan_service: Any = None
         self._native_service_init_errors: dict[str, str] = {}
+        self._governance_boundary_instance: Any = None
+        self._governance_boundary_lock = RLock()
         self.state_provider = state_provider
+        if self.context_engine is None:
+            # The production port owns the default V2 context engine.  It is
+            # deliberately wired to this port's native V2 retrieval seam so
+            # construction never falls back to a retired bootstrap module.
+            from .context_engine import ContextEngine
+
+            self.context_engine = ContextEngine(
+                retriever=self,
+                planner=self.recall_planner,
+                ready=False,
+                state="V2_BUILDING",
+            )
         self._registry = self._make_registry()
 
     @staticmethod
@@ -1059,18 +993,25 @@ class NativeV2RuntimePort:
             )
             reason = "" if status != "blocker" else "v2 operation has no native V2 service"
             registry["mcp"][name] = SurfaceSpec(name, status, handler, mutation, reason)
-        for name in sorted(GUI_METHOD_NAMES):
-            configured = self._GUI_HANDLERS.get(name)
-            if configured is not None:
-                handler, status, mutation = configured
-                reason = "" if status != "blocker" else "v2 GUI semantic handler is not activated"
-            elif name in self._GUI_RETIRED_REASONS:
-                handler, status, mutation = "retired", "retired", name in GUI_MUTATION_NAMES
-                reason = self._GUI_RETIRED_REASONS[name]
-            else:
-                handler, status, mutation = "unsupported", "blocker", name in GUI_MUTATION_NAMES
-                reason = "v2 GUI semantic handler is not activated"
-            registry["gui"][name] = SurfaceSpec(name, status, handler, mutation, reason)
+        for name, operation in sorted(GUI_OPERATION_SPECS.items()):
+            handler = operation.native_handler
+            mutation = operation.mutation
+            # The operation registry is the only GUI truth source.  A method
+            # is implemented only when its canonical native handler resolves;
+            # missing handlers are blockers, never a retired success class.
+            available = self._service("gui", name, handler) or self._builtin(handler)
+            status = "implemented" if callable(available) else "blocker"
+            reason = "" if status == "implemented" else "v2 GUI canonical handler is not activated"
+            registry["gui"][name] = SurfaceSpec(
+                name,
+                status,
+                handler,
+                mutation,
+                reason,
+                canonical_name=operation.canonical_name,
+                domain=operation.domain,
+                execution=operation.execution,
+            )
         for name in sorted(CLI_COMMAND_NAMES):
             handler, status, mutation = self._CLI_HANDLERS.get(
                 name, ("unsupported", "blocker", False),
@@ -1176,6 +1117,16 @@ class NativeV2RuntimePort:
                 payload.setdefault("code", payload.get("error") or "v2_native_handler_failed")
                 payload.setdefault("error", payload.get("code"))
                 return payload
+            # Canonical GUI operations already return the unified operation
+            # envelope. Preserve operation/task/receipt at the top level so
+            # SafeBridge, localhost HTTP, pywebview and direct native calls
+            # observe the same business shape; transport metadata is additive.
+            if "operation" in payload and raw_status in {
+                "accepted", "queued", "running", "succeeded", "cancelled", "ok",
+            }:
+                payload.update({"surface": surface, "name": name, "path": "v2", "generation": generation})
+                payload["ok"] = True
+                return payload
             # Existing V2 service ports (notably MaintenanceRuntimePort) already
             # return a transport envelope.  Preserve its data at the facade's
             # top-level instead of nesting ``data.data`` and losing stable CLI
@@ -1268,8 +1219,13 @@ class NativeV2RuntimePort:
                 raise NativeContextError("context_identity_spoof")
             canonical = next((name for name, aliases in _IDENTITY_ALIASES.items() if key in aliases), "")
             expected = context.get(canonical, "") if canonical else ""
-            if expected and _text(value) != expected:
-                raise NativeContextError("context_identity_spoof")
+            if expected:
+                if canonical == "project_ref":
+                    matches = canonical_project_ref(value) == canonical_project_ref(expected)
+                else:
+                    matches = _text(value) == expected
+                if not matches:
+                    raise NativeContextError("context_identity_spoof")
         # Keep provenance fields available to ContextEngine and governance
         # stores, but they are copied from the trusted context only.
         for key in (
@@ -1309,6 +1265,11 @@ class NativeV2RuntimePort:
             "project_ref": context.get("project_ref", ""),
             "provider": context.get("provider", ""),
             "runtime_role": context.get("runtime_role", ""),
+            # Preserve the separately authenticated admin capability on read
+            # scopes.  Without it, migrated atoms with intentionally empty
+            # project/provider/runtime fields disappear behind the caller's
+            # narrower transport scope during MCP update/read.
+            "admin": self._trusted_admin(context),
         }
 
     def _mutation_context(self, context: Mapping[str, Any]) -> dict[str, Any]:
@@ -1319,6 +1280,122 @@ class NativeV2RuntimePort:
             "authority": str(context.get("authority") or ("admin" if context.get("admin") else "manual")),
         })
         return scope
+
+    def _normalize_memory_audience(
+        self,
+        raw: Any,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize a memory audience against immutable transport identity.
+
+        Atom owner columns remain the trusted writer's exact scope so
+        GovernanceV2 can authorize the mutation.  The normalized marker is
+        then used by the V2 memory read path for project/group visibility.
+        No caller-supplied agent, group, or project is allowed to replace the
+        transport context.
+        """
+
+        if raw is None:
+            requested: dict[str, Any] = {}
+        elif isinstance(raw, str):
+            requested = {"target_type": raw}
+        elif isinstance(raw, Mapping):
+            requested = {str(key): value for key, value in raw.items()}
+        else:
+            raise NativePortError("invalid_memory_audience")
+
+        target_type = _text(
+            requested.get("target_type")
+            or requested.get("type")
+            or requested.get("mode")
+        ).casefold()
+        if target_type in {"share_group", "shared_group"}:
+            target_type = "group"
+        if not target_type:
+            target_type = "agent"
+        if target_type not in {"agent", "agent_project", "project", "group"}:
+            if target_type in {"system", "provider", "runtime", "runtime_role", "runtime-role"}:
+                raise NativePortError("admin_scope_required")
+            raise NativePortError("invalid_memory_audience")
+
+        trusted_agent = _text(context.get("agent_instance_id"))
+        trusted_group = _text(context.get("share_group_id"))
+        trusted_project = _text(context.get("project_ref"))
+        canonical_trusted_project = canonical_project_ref(trusted_project)
+        requested_id = _text(
+            requested.get("target_id")
+            or requested.get("id")
+            or requested.get("agent_instance_id")
+            or requested.get("agent_id")
+        )
+        requested_project = _text(
+            requested.get("project_ref")
+            or requested.get("project_id")
+            or (requested_id if target_type == "project" else "")
+        )
+        if requested_project and canonical_project_ref(requested_project) != canonical_trusted_project:
+            raise NativePortError("other_project_scope_denied")
+
+        if target_type == "agent":
+            target_id = requested_id or trusted_agent
+            if target_id != trusted_agent and not self._trusted_admin(context):
+                raise NativePortError("other_agent_scope_denied")
+            return {
+                "source": "native_v2",
+                "target_type": "agent",
+                "target_id": target_id,
+                "project_ref": canonical_trusted_project,
+                "provider": _text(requested.get("provider")) or _text(context.get("provider")),
+                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")) or _text(context.get("runtime_role")),
+                "effect": "include",
+            }
+
+        if target_type == "agent_project":
+            target_id = requested_id or trusted_agent
+            if target_id != trusted_agent and not self._trusted_admin(context):
+                raise NativePortError("other_agent_scope_denied")
+            if not canonical_trusted_project:
+                raise NativePortError("project_scope_required")
+            return {
+                "source": "native_v2",
+                "target_type": "agent_project",
+                "target_id": target_id,
+                "project_ref": canonical_trusted_project,
+                "provider": _text(requested.get("provider")) or _text(context.get("provider")),
+                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")) or _text(context.get("runtime_role")),
+                "effect": "include",
+            }
+
+        if target_type == "project":
+            if not canonical_trusted_project:
+                raise NativePortError("project_scope_required")
+            return {
+                "source": "native_v2",
+                "target_type": "project",
+                "target_id": canonical_trusted_project,
+                "project_ref": canonical_trusted_project,
+                "provider": _text(requested.get("provider")),
+                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")),
+                "effect": "include",
+            }
+
+        # A group audience expands visibility beyond the writing Agent.  Keep
+        # that capability admin-only, and compare the group after the trusted
+        # capability gate so a caller cannot probe foreign-group existence.
+        if not self._trusted_admin(context):
+            raise NativePortError("admin_scope_required")
+        target_id = requested_id or trusted_group
+        if target_id != trusted_group:
+            raise NativePortError("other_group_scope_denied")
+        return {
+            "source": "native_v2",
+            "target_type": "group",
+            "target_id": trusted_group,
+            "project_ref": "",
+            "provider": _text(requested.get("provider")),
+            "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")),
+            "effect": "include",
+        }
 
     @staticmethod
     def _trusted_admin(context: Mapping[str, Any]) -> bool:
@@ -1472,7 +1549,11 @@ class NativeV2RuntimePort:
 
     def _assert_governance_lease(self, lease: _SchemaLease) -> None:
         try:
-            if self._file_identity(lease.path) != lease.identity:
+            # GovernanceV2 legitimately grows/updates this SQLite file while
+            # another native writer is in flight.  Size and mtime therefore
+            # are not replacement signals here; device/inode still fail
+            # closed if the ledger itself is swapped underneath the lease.
+            if self._file_identity(lease.path)[:2] != lease.identity[:2]:
                 raise self._schema_blocker("v2_governance_ledger_replaced", lease.path)
             tables = {str(row[0]) for row in lease.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             columns = {str(row[1]) for row in lease.connection.execute("PRAGMA table_info(decisions)")}
@@ -1544,7 +1625,23 @@ class NativeV2RuntimePort:
                 preflight = getattr(value, "_preflight", None)
                 if not callable(preflight):
                     raise NativePortError("v2_codegraph_schema_unavailable")
-                preflight()
+                codegraph_state = preflight()
+                if codegraph_state == "v1":
+                    if not write:
+                        raise NativePortError("codegraph_schema_upgrade_required")
+                    migrate = getattr(value, "_migrate_v1_to_v2", None)
+                    if not callable(migrate):
+                        raise NativePortError("codegraph_schema_upgrade_unavailable")
+                    migrate()
+                elif codegraph_state in {"fresh", "needs_aux"}:
+                    if not write:
+                        raise NativePortError("v2_codegraph_schema_unavailable")
+                    ensure_aux = getattr(value, "_ensure_aux_schema", None)
+                    if not callable(ensure_aux):
+                        raise NativePortError("v2_codegraph_schema_unavailable")
+                    ensure_aux()
+                elif codegraph_state != "current":
+                    raise NativePortError("v2_codegraph_schema_unavailable")
             elif domain == "projection":
                 from ..projection_v2.store import ProjectionStore
                 value = ProjectionStore(self.workspace, initialize=False)
@@ -1582,7 +1679,8 @@ class NativeV2RuntimePort:
             "extract_memories", "accept_candidates", "list_pending_enrichments",
             "apply_enrichments", "enrichment_status", "build_and_enrich", "resolve_group",
             "sandbox_status", "host_enrichment_guide", "host_llm_agents",
-            "coverage", "codegraph_graph", "semantic_check", "reference_audit", "provider_install",
+            "coverage", "codegraph_graph", "codegraph_query", "codegraph_path", "codegraph_explain",
+            "codegraph_affected", "codegraph_update", "codegraph_status", "semantic_check", "reference_audit", "provider_install",
             "rule_create_auto", "rule_feedback", "rule_undo", "rule_decision_read", "rule_scope_stats",
         }:
             return None
@@ -1611,24 +1709,30 @@ class NativeV2RuntimePort:
     def _governance_boundary(self) -> Any:
         """Return GovernanceV2 only after all native write preflights pass."""
 
-        from ..governance_v2 import GovernanceV2
+        with self._governance_boundary_lock:
+            if self._governance_boundary_instance is not None:
+                return self._governance_boundary_instance
+            from ..governance_v2 import GovernanceV2
 
-        memory = self._domain_store("memory", write=True)
-        evidence = self._domain_store("evidence", write=True)
-        ledger_path = self.layout.root / "governance_v2" / "decisions.db"
-        ledger = self._open_governance_lease(ledger_path)
-        try:
-            self._assert_governance_lease(ledger)
-            value = GovernanceV2(self.workspace, memory_store=memory, evidence_store=evidence)
-            self._assert_governance_lease(ledger)
-        except NativePortError:
-            raise
-        except Exception as exc:
-            raise NativePortError("v2_governance_unavailable") from exc
-        finally:
-            ledger.close()
-        self._stores["governance"] = value
-        return value
+            memory = self._domain_store("memory", write=True)
+            evidence = self._domain_store("evidence", write=True)
+            ledger_path = self.layout.root / "governance_v2" / "decisions.db"
+            ledger = self._open_governance_lease(ledger_path)
+            try:
+                self._assert_governance_lease(ledger)
+                value = GovernanceV2(self.workspace, memory_store=memory, evidence_store=evidence)
+                self._assert_governance_lease(ledger)
+            except NativePortError:
+                raise
+            except Exception as exc:
+                raise NativePortError("v2_governance_unavailable") from exc
+            finally:
+                ledger.close()
+            # Keep this separate from the injectable ``_stores`` mapping: a
+            # test/host capability must never replace the production writer.
+            self._governance_boundary_instance = value
+            self._stores["governance"] = value
+            return value
 
     # ---- built-in semantic handlers -----------------------------------------
     def _memory_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
@@ -1639,6 +1743,22 @@ class NativeV2RuntimePort:
             raise NativePortError("memory_id_required")
         result = store.get_atom(memory_id, scope=scope, atom_id=_text(payload.get("atom_id")))
         return result
+
+    def _require_memory_owner(self, atom: Any, context: Mapping[str, Any]) -> None:
+        """Keep audience visibility separate from mutation ownership.
+
+        A trusted admin may read the whole bound group, but that read
+        capability must not become an owner override for memory mutations.
+        GovernanceV2 keeps its separate explicit admin path for internal
+        corrections; the public native memory surface remains owner-scoped.
+        """
+
+        metadata = getattr(atom, "metadata", {})
+        owner = _text(metadata.get("owner_agent_id")) if isinstance(metadata, Mapping) else ""
+        owner = owner or _text(getattr(atom, "agent_instance_id", ""))
+        if not owner or owner != _text(context.get("agent_instance_id")):
+            # Do not distinguish an audience-visible atom from a missing one.
+            raise NativePortError("memory_not_found")
 
     def _memory_list(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         store = self._domain_store("memory")
@@ -1701,6 +1821,33 @@ class NativeV2RuntimePort:
         except Exception as exc:
             raise NativePortError("v2_memory_status_unavailable") from exc
 
+    def _memory_global_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        """Return Meitner's authoritative V2 global group/memory aggregate."""
+
+        del payload
+        if (self.layout.memory_db.is_file() or self.layout.manifest_db.is_file()) and not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        try:
+            from .group_native import GroupControlService
+
+            service = self._group_service(write=False)
+            if not isinstance(service, GroupControlService):
+                raise NativePortError("v2_group_control_unavailable")
+            result = dict(service.get_global_memory_status())
+            if not self.layout.memory_db.is_file() and not self.layout.manifest_db.is_file():
+                result.setdefault("scope", {
+                    "share_group_id": _text(context.get("share_group_id")),
+                    "agent_instance_id": _text(context.get("agent_instance_id")),
+                    "project_ref": _text(context.get("project_ref")),
+                })
+            return result
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_memory_global_status_unavailable"
+            ) from exc
+
     def _memory_versions(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         """Read redacted V2 revision metadata for one exact transport scope."""
         store = self._domain_store("memory")
@@ -1730,9 +1877,12 @@ class NativeV2RuntimePort:
             raise NativePortError("memory_not_found")
         return result
 
-    def _memory_write(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        from ..memory.store import MemoryAtom
+    def _memory_write(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
+        scope = self._scope(context)
+        with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]):
+            return self._memory_write_unlocked(payload, context, **kwargs)
 
+    def _memory_write_unlocked(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         clean = dict(payload)
         memory_id = _text(clean.get("memory_id") or clean.get("id"))
         if not memory_id or "body" not in clean:
@@ -1740,41 +1890,153 @@ class NativeV2RuntimePort:
         idempotency_key = _text(clean.pop("idempotency_key", ""))
         if not idempotency_key:
             raise NativePortError("idempotency_key_required")
+        gui_state_marker = clean.pop("_native_gui_state_capability", None)
+        preserve_gui_state = gui_state_marker is _GUI_STATE_PRESERVATION_CAPABILITY
+        gui_state_action = _text(clean.pop("_native_gui_state_action", ""))
+        if preserve_gui_state:
+            # This private flag is generated only after the GUI admin gate;
+            # organizer treats it as an internal complete-state update.
+            clean["_preserve_state"] = True
+            clean["_preserve_provenance"] = gui_state_action in {"lock", "unlock", "policy"}
+        trusted_owner = _text(clean.pop("_trusted_owner_agent_id", ""))
         evidence = clean.pop("evidence", None)
         evidence_ids = clean.pop("evidence_ids", None)
         source_mappings = clean.pop("source_mappings", None)
         reason = _text(clean.pop("reason", "")) or "native memory write"
+        requested_audience = clean.pop("audience", None)
+        requested_scope = clean.pop("scope", None)
+        metadata = clean.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, Mapping):
+            raise NativePortError("invalid_memory_metadata")
+        metadata = dict(metadata)
+        if requested_audience is None:
+            requested_audience = requested_scope
+        if requested_audience is None and isinstance(metadata.get("audience"), Mapping):
+            requested_audience = metadata.get("audience")
+        if not preserve_gui_state:
+            audience = self._normalize_memory_audience(requested_audience, context)
+            # The audience marker is rewritten from trusted context on every
+            # public update, so stale/forged metadata cannot survive a
+            # mutation.  GUI state updates have already loaded the complete
+            # atom and are deliberately metadata-preserving.
+            metadata["audience"] = audience
+            metadata["owner_agent_id"] = trusted_owner or _text(context.get("agent_instance_id"))
+        clean["metadata"] = metadata
         # Atom confidence and governance-decision confidence are different
         # facts.  Keep ``confidence`` on the MemoryAtom; transport adapters
         # may supply a separate internal decision_confidence.
         decision_confidence = clean.pop("decision_confidence", 1.0)
         scope = self._scope(context)
         clean.update({key: value for key, value in scope.items() if value})
-        atom = MemoryAtom.from_value(clean)
-        governance = self._governance_boundary()
+        # Public memory writes use the V2 automatic-organization service as
+        # their sole mutation boundary.  The writable store and GovernanceV2
+        # engine are constructed only after their native schema/lease
+        # preflights; no caller-provided object can replace either one.
         try:
-            persisted, receipt = governance.put_atom(
-                atom,
-                context=self._mutation_context(context),
-                evidence=evidence,
-                evidence_ids=evidence_ids,
-                source_mappings=source_mappings,
-                reason=reason,
-                confidence=decision_confidence,
-                idempotency_key=idempotency_key,
+            from ..memory.store import MemoryReadScope
+            from .dedup import V2SemanticDeduplicator
+            from ..auto_organizer import AutoOrganizer
+
+            dedup_scope = MemoryReadScope(
+                workspace_id=self.workspace,
+                share_group_id=scope["share_group_id"],
+                # Semantic candidate lookup is group-scoped, not caller-
+                # scoped.  The trusted caller identity remains in the
+                # organizer mutation context/provenance; putting it here
+                # would make same-group agents unable to see one another's
+                # duplicate candidates.
+                agent_instance_id="",
+                project_ref="",
+                provider="",
+                runtime_role="",
+                # This is a private, body-consuming candidate lookup inside
+                # the already trusted group boundary.  It needs the store's
+                # minimal group-wide read capability so native audience ACLs
+                # do not hide another member's candidate; it is never exposed
+                # as the caller's authorization or returned as content.
+                admin=True,
+            )
+            deduplicator = V2SemanticDeduplicator(
+                self._domain_store("memory"),
+                dedup_scope,
+            )
+            memory_store = self._domain_store("memory", write=True)
+            governance_v2 = self._governance_boundary()
+            organizer = AutoOrganizer(
+                self.workspace,
+                scope["share_group_id"],
+                store=memory_store,
+                engine=governance_v2,
+                deduplicator=deduplicator,
+            )
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError("v2_memory_organization_unavailable") from exc
+        # Reinsert transport fields consumed above.  They are now service
+        # inputs, while identity/scope fields remain the values derived from
+        # the bound native context rather than request payload claims.
+        clean["idempotency_key"] = idempotency_key
+        clean["reason"] = reason
+        clean["decision_confidence"] = decision_confidence
+        if evidence is not None:
+            clean["evidence"] = evidence
+        if evidence_ids is not None:
+            clean["evidence_ids"] = evidence_ids
+        if source_mappings is not None:
+            clean["source_mappings"] = source_mappings
+        bound_v2_context = self._mutation_context(context)
+        try:
+            result = organizer.service.write(
+                clean,
+                context=bound_v2_context,
             )
         except Exception as exc:
+            code = _text(getattr(exc, "code", ""))
+            if code:
+                raise NativePortError(code) from exc
             raise self._map_governance_error(exc) from exc
-        return {"atom": persisted, "receipt": receipt}
+        if not isinstance(result, Mapping) or "atom" not in result:
+            raise NativePortError("v2_memory_organization_invalid")
+        response = dict(result)
+        response.setdefault("actions", [])
+        response.setdefault("mutation_kind", "created")
+        response.setdefault("receipt", None)
+        response["deduplicated"] = response.get("mutation_kind") == "deduplicated"
+        return response
 
-    def _memory_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+    def _memory_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
+        scope = self._scope(context)
+        with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]):
+            return self._memory_update_unlocked(payload, context, **kwargs)
+
+    def _memory_update_unlocked(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         clean = dict(payload)
         memory_id = _text(clean.get("memory_id") or clean.get("id"))
         if not memory_id:
             raise NativePortError("memory_id_required")
         existing = self._memory_read({"memory_id": memory_id, "atom_id": clean.get("atom_id", "")}, context)
         if existing is None:
-            raise NativePortError("memory_not_found")
+            # Mutation lookup is deliberately existence-neutral: a missing
+            # logical/atom ID must not be distinguishable from a record the
+            # caller is not allowed to mutate.  Non-admin reads hide foreign
+            # rows, so use the same neutral code for both cases.  A trusted
+            # admin read can see same-group foreign rows; its owner rejection
+            # below uses v2_governance_rejected, so missing admin targets use
+            # that same code to preserve neutrality.
+            raise NativePortError(
+                "v2_governance_rejected"
+                if self._trusted_admin(context)
+                else "memory_not_found"
+            )
+        try:
+            self._require_memory_owner(existing, context)
+        except NativePortError as exc:
+            if _text(getattr(exc, "code", "")) == "memory_not_found":
+                raise NativePortError("v2_governance_rejected") from exc
+            raise
         if hasattr(existing, "to_dict"):
             merged = dict(existing.to_dict())
         elif isinstance(existing, Mapping):
@@ -1787,6 +2049,11 @@ class NativeV2RuntimePort:
         # never reset kind/confidence/metadata/scope to constructor defaults.
         merged.update(clean)
         merged["memory_id"] = memory_id
+        metadata = getattr(existing, "metadata", {})
+        if isinstance(metadata, Mapping):
+            owner = _text(metadata.get("owner_agent_id")) or _text(getattr(existing, "agent_instance_id", ""))
+            if owner:
+                merged["_trusted_owner_agent_id"] = owner
         return self._memory_write(merged, context)
 
     def _memory_delete(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
@@ -1797,6 +2064,10 @@ class NativeV2RuntimePort:
         if not idempotency_key:
             raise NativePortError("idempotency_key_required")
         reason = _text(payload.get("reason")) or "native memory delete"
+        existing = self._memory_read({"memory_id": memory_id}, context)
+        if existing is None:
+            raise NativePortError("memory_not_found")
+        self._require_memory_owner(existing, context)
         governance = self._governance_boundary()
         try:
             persisted, receipt = governance.tombstone(
@@ -1811,23 +2082,19 @@ class NativeV2RuntimePort:
         return {"atom": persisted, "receipt": receipt}
 
     def _gui_memory_key(self, action: str, payload: Mapping[str, Any], context: Mapping[str, Any]) -> str:
-        scope = self._scope(context)
+        del context
         memory_id = _text(payload.get("memory_id") or payload.get("id"))
         if not memory_id:
             raise NativePortError("memory_id_required")
-        current = None
-        try:
-            if self.layout.memory_db.is_file():
-                current = self._domain_store("memory").get_atom(memory_id, scope=scope, include_building=True)
-        except Exception:
-            current = None
-        revision = int(getattr(current, "revision", 0) or 0) if current is not None else 0
+        supplied = _text(payload.get("idempotency_key"))
+        if supplied:
+            return "gui:" + supplied
         fingerprint = {
             key: value for key, value in payload.items()
             if key not in {"idempotency_key", "actor", "admin", "is_admin"}
         }
         return "gui:" + hashlib.sha256(
-            _canonical_json({"action": action, "memory_id": memory_id, "revision": revision, "payload": fingerprint}).encode("utf-8")
+            _canonical_json({"action": action, "memory_id": memory_id, "payload": fingerprint}).encode("utf-8")
         ).hexdigest()
 
     def _gui_memory_update(self, action: str, payload: Mapping[str, Any], context: Mapping[str, Any]) -> Any:
@@ -1872,7 +2139,13 @@ class NativeV2RuntimePort:
             raise NativePortError("unknown_memory_mutation")
         clean["reason"] = f"native GUI memory {action}"
         clean["decision_confidence"] = 1.0
-        clean["idempotency_key"] = self._gui_memory_key(action, clean, context)
+        clean["_native_gui_state_action"] = action
+        clean["idempotency_key"] = self._gui_memory_key(
+            action,
+            {**clean, "idempotency_key": payload.get("idempotency_key", "")},
+            context,
+        )
+        clean["_native_gui_state_capability"] = _GUI_STATE_PRESERVATION_CAPABILITY
         return self._memory_update(clean, context)
 
     def _gui_memory_edit(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
@@ -1888,7 +2161,29 @@ class NativeV2RuntimePort:
         return self._gui_memory_update("policy", payload, context)
 
     def _gui_memory_restore(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        return self._gui_memory_update("restore", payload, context)
+        if not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        memory_id = _text(payload.get("memory_id") or payload.get("id"))
+        if not memory_id:
+            raise NativePortError("memory_id_required")
+        reason = _text(payload.get("reason")) or "native GUI memory restore"
+        idempotency_key = self._gui_memory_key(
+            "restore",
+            {"memory_id": memory_id, "idempotency_key": payload.get("idempotency_key", "")},
+            context,
+        )
+        governance = self._governance_boundary()
+        try:
+            persisted, receipt = governance.restore(
+                memory_id,
+                context=self._mutation_context(context),
+                reason=reason,
+                confidence=payload.get("confidence", 1.0),
+                idempotency_key=idempotency_key,
+            )
+        except Exception as exc:
+            raise self._map_governance_error(exc) from exc
+        return {"atom": persisted, "receipt": receipt}
 
     def _gui_memory_delete(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if not self._trusted_admin(context):
@@ -1898,7 +2193,11 @@ class NativeV2RuntimePort:
             raise NativePortError("memory_id_required")
         clean["reason"] = "native GUI memory delete"
         clean["confidence"] = 1.0
-        clean["idempotency_key"] = self._gui_memory_key("delete", clean, context)
+        clean["idempotency_key"] = self._gui_memory_key(
+            "delete",
+            {**clean, "idempotency_key": payload.get("idempotency_key", "")},
+            context,
+        )
         return self._memory_delete(clean, context)
 
     def _gui_memory_rollback(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
@@ -1976,10 +2275,118 @@ class NativeV2RuntimePort:
             "runtime_role": context.get("runtime_role", ""),
         })
         candidates = request.pop("candidates", None)
+        # Keep the engine's readiness/state projection synchronized with the
+        # same trusted manifest provider that gates this native dispatch.  The
+        # engine remains usable in shadow mode while V2 is building, but it
+        # must never claim active readiness from a constructor default.
+        if self.state_provider is not None:
+            try:
+                current_state, _current_generation = self._provider_snapshot(self.state_provider)
+                if hasattr(engine, "state"):
+                    engine.state = _text(current_state).upper()
+                if hasattr(engine, "ready"):
+                    engine.ready = _text(current_state).upper() == "V2_ACTIVE"
+            except Exception:
+                if hasattr(engine, "state"):
+                    engine.state = "UNKNOWN"
+                if hasattr(engine, "ready"):
+                    engine.ready = False
         fn = getattr(engine, "bootstrap", None) or getattr(engine, "build_context", None)
         if not callable(fn):
             raise NativePortError("v2_context_engine_unavailable")
         return fn(request, candidates)
+
+    def retrieve(self, request: Any) -> dict[str, list[dict[str, Any]]]:
+        """Retrieve bounded candidates from native V2 memory/rule stores.
+
+        This is the default :class:`ContextEngine` retrieval port.  It only
+        reads the exact trusted group/Agent/project scope and returns an empty
+        neutral result when V2 storage is absent or not yet ready; no legacy
+        bootstrap or conversation source is consulted.
+        """
+        from .context_engine import ContextRequest
+        from ..memory.store import MemoryReadScope
+
+        req = ContextRequest.from_mapping(request)
+        group = _text(req.share_group_id or req.group)
+        agent = _text(req.agent_instance_id or req.agent)
+        if not group or not agent:
+            return {"mandatory": [], "relevant": []}
+        scope = MemoryReadScope(
+            workspace_id=self.workspace,
+            share_group_id=group,
+            agent_instance_id=agent,
+            project_ref=_text(req.project_ref or req.project),
+            provider=_text(req.provider),
+            runtime_role=_text(req.runtime_role or req.runtime),
+        )
+        result: dict[str, list[dict[str, Any]]] = {"mandatory": [], "relevant": []}
+        scope_public = {
+            "workspace_id": self.workspace,
+            "agent_instance_id": agent,
+            "share_group_id": group,
+            "project_ref": scope.project_ref,
+            "provider": scope.provider,
+            "runtime_role": scope.runtime_role,
+        }
+        try:
+            if self.layout.memory_db.is_file():
+                memory = self._domain_store("memory")
+                atoms = memory.list_atoms(scope=scope, status="active", include_building=False)
+                for atom in atoms:
+                    policy = _text(getattr(atom, "injection_policy", "relevant")).casefold()
+                    layer = "mandatory" if policy == "always" else "relevant"
+                    kind = _text(getattr(atom, "kind", "fact")) or "fact"
+                    result[layer].append({
+                        "item_id": _text(getattr(atom, "atom_id", "")) or _text(getattr(atom, "memory_id", "")),
+                        "body": _text(getattr(atom, "body", "")),
+                        "kind": kind,
+                        "layer": layer,
+                        "source": "native-v2-memory",
+                        "scope": dict(scope_public),
+                        "priority": int(getattr(atom, "priority", 0) or 0),
+                        "score": float(getattr(atom, "confidence", 0.0) or 0.0),
+                        "is_rule": layer == "mandatory" or kind.casefold() in {"rule", "procedure", "instruction"},
+                        "status": _text(getattr(atom, "status", "active")) or "active",
+                    })
+        except Exception:
+            # Context retrieval is a read-only optional port.  Schema and
+            # filesystem failures become a neutral packet; the native
+            # diagnostics/health surfaces remain responsible for reporting
+            # storage availability without leaking exceptions into context.
+            pass
+        try:
+            if self.layout.rules_db.is_file():
+                rules = self._domain_store("rules")
+                definitions = rules.list_definitions(status="active")
+                for definition in definitions:
+                    bindings = rules.list_bindings(
+                        definition_id=definition.definition_id,
+                        share_group_id=group,
+                        status="active",
+                    )
+                    matched = [
+                        binding for binding in bindings
+                        if self._binding_matches_context(binding, scope_public)
+                    ]
+                    if not matched:
+                        continue
+                    layer = "mandatory" if _text(definition.rule_strength).casefold() == "must" or _text(definition.maturity_state).casefold() == "trusted" else "relevant"
+                    result[layer].append({
+                        "item_id": _text(definition.definition_id),
+                        "body": _text(definition.canonical_text),
+                        "kind": _text(definition.rule_kind) or "rule",
+                        "layer": layer,
+                        "source": "native-v2-rule",
+                        "scope": dict(scope_public),
+                        "priority": max((int(getattr(item, "priority", 0) or 0) for item in matched), default=0),
+                        "score": float(getattr(definition, "confidence", 0.0) or 0.0),
+                        "is_rule": True,
+                        "status": _text(definition.status) or "active",
+                    })
+        except Exception:
+            pass
+        return result
 
     def _rule_decision_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         # Decisions are persisted without a share-group scope in the current
@@ -2037,6 +2444,156 @@ class NativeV2RuntimePort:
         clean["owner_agent_id"] = context.get("agent_instance_id", "")
         clean["authorization"] = f"native-admin:{context.get('session_id', '')}"
         return fn(clean)
+
+    def _task_service(self) -> Any:
+        if self._task_coordinator is None:
+            try:
+                from .task_coordinator import TaskCoordinator
+
+                self._task_coordinator = TaskCoordinator(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_task_service_unavailable") from exc
+        return self._task_coordinator
+
+    def _knowledge_command(self) -> Any:
+        if self._knowledge_command_service is None:
+            try:
+                from ..knowledge_v2.command import KnowledgeV2CommandService
+
+                self._knowledge_command_service = KnowledgeV2CommandService(
+                    self.workspace,
+                    tasks=self._task_service(),
+                )
+            except Exception as exc:
+                raise NativePortError("v2_knowledge_command_unavailable") from exc
+        return self._knowledge_command_service
+
+    def _projection_service(self) -> Any:
+        if self._projection_build_service is None:
+            try:
+                from .projection_build import ProjectionBuildService
+
+                self._projection_build_service = ProjectionBuildService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_projection_build_service_unavailable") from exc
+        return self._projection_build_service
+
+    def _release_v2_service(self) -> Any:
+        if self._release_service is None:
+            try:
+                from .projection_build import V2ReleaseService
+
+                self._release_service = V2ReleaseService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_release_service_unavailable") from exc
+        return self._release_service
+
+    def _group_service(self, *, write: bool = False) -> Any:
+        if self._group_control_service is None or write:
+            try:
+                from .group_native import GroupControlService
+
+                service = GroupControlService(self.workspace, write=bool(write))
+                if self._group_control_service is None:
+                    self._group_control_service = service
+                return service
+            except Exception as exc:
+                raise NativePortError("v2_group_control_unavailable") from exc
+        return self._group_control_service
+
+    def _agent_service(self) -> Any:
+        if self._agent_native_service is None:
+            try:
+                from .agent_native import AgentNativeService
+
+                self._agent_native_service = AgentNativeService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_agent_service_unavailable") from exc
+        return self._agent_native_service
+
+    def _governance_native(self) -> Any:
+        if self._governance_native_service is None:
+            try:
+                from .governance_native import GovernanceNativeService
+
+                self._governance_native_service = GovernanceNativeService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_governance_service_unavailable") from exc
+        return self._governance_native_service
+
+    def _hook_control(self) -> Any:
+        if self._hook_control_service is None:
+            try:
+                from .hook_control import HookControlService
+
+                self._hook_control_service = HookControlService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_hook_control_unavailable") from exc
+        return self._hook_control_service
+
+    def _import_control(self) -> Any:
+        if self._import_control_service is None:
+            try:
+                from .import_control import ImportControlService
+
+                self._import_control_service = ImportControlService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_import_control_unavailable") from exc
+        return self._import_control_service
+
+    def _history_control(self) -> Any:
+        if self._history_control_service is None:
+            try:
+                from .history_control import HistoryControlService
+
+                self._history_control_service = HistoryControlService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_history_control_unavailable") from exc
+        return self._history_control_service
+
+    def _audit_plan(self) -> Any:
+        if self._audit_plan_service is None:
+            try:
+                from .audit_plan import AuditPlanService
+
+                self._audit_plan_service = AuditPlanService(self.workspace)
+            except Exception as exc:
+                raise NativePortError("v2_audit_plan_unavailable") from exc
+        return self._audit_plan_service
+
+    def _gui_projection_scope(self, context: Mapping[str, Any]) -> Any:
+        try:
+            authority = resolve_native_transport_context(context)
+        except NativeContextError as exc:
+            raise NativePortError("trusted_context_capability_required") from exc
+        from .projection_build import projection_scope_from_context
+
+        return projection_scope_from_context(self.workspace, authority.to_dict())
+
+    def _gui_knowledge_scope(self, context: Mapping[str, Any]) -> Any:
+        """Create exact Knowledge ACL scope from the process-issued GUI capability."""
+        try:
+            authority = resolve_native_transport_context(context)
+        except NativeContextError as exc:
+            raise NativePortError("trusted_context_capability_required") from exc
+        values = {
+            "namespace_id": _text(authority.namespace_id),
+            "workspace_id": self.workspace,
+            "agent_instance_id": _text(authority.agent_instance_id),
+            "project_ref": _text(authority.project_ref),
+            "provider": _text(authority.provider),
+            "share_group_id": _text(authority.share_group_id),
+            "sensitivity": _text(authority.sensitivity),
+            "policy_class": _text(authority.policy_class),
+        }
+        if not all(values.values()):
+            raise NativePortError("knowledge_scope_required")
+        from ..content.store import ContentReadScope
+
+        try:
+            return ContentReadScope(**values)
+        except (TypeError, ValueError) as exc:
+            raise NativePortError("knowledge_scope_required") from exc
 
     def _knowledge_scope(
         self,
@@ -2124,11 +2681,14 @@ class NativeV2RuntimePort:
         operation: str,
         payload: Mapping[str, Any],
         context: Mapping[str, Any],
+        *,
+        public_name: str = "",
         **_: Any,
     ) -> Any:
         # Validate the native scope before resolving/constructing any service;
-        # invalid selectors must not even reach a service injection seam.
-        scope = self._knowledge_scope(payload, context)
+        # GUI scope comes from the process-issued SafeBridge capability while
+        # MCP/native callers retain exact selector-echo validation.
+        scope = self._gui_knowledge_scope(context) if public_name.startswith("knowledge_") else self._knowledge_scope(payload, context)
         service = self._native_service("knowledge")
         if service is None:
             raise NativePortError("v2_knowledge_service_unavailable")
@@ -2143,14 +2703,65 @@ class NativeV2RuntimePort:
         })
         return self._knowledge_service_result(service, operation, bound_payload, scope=scope)
 
-    def _knowledge_book(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
-        return self._knowledge_operation("memoryguard_knowledge_book", payload, context, **kwargs)
+    def _knowledge_book(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        public_name: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        if public_name == "knowledge_book":
+            scope = self._gui_knowledge_scope(context)
+            try:
+                return self._knowledge_command().book_info(
+                    _text(payload.get("book_id")), scope=scope,
+                )
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "v2_knowledge_book_failed"
+                ) from exc
+        return self._knowledge_operation("memoryguard_knowledge_book", payload, context, public_name=public_name, **kwargs)
 
-    def _knowledge_candidates(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
-        return self._knowledge_operation("memoryguard_knowledge_candidates", payload, context, **kwargs)
+    def _knowledge_candidates(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        public_name: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        # GUI candidate reads use the process-issued capability scope.  MCP
+        # candidate reads retain exact selector validation in
+        # ``_knowledge_operation``; the public operation name distinguishes
+        # those two native contracts.
+        return self._knowledge_operation(
+            "memoryguard_knowledge_candidates",
+            payload,
+            context,
+            public_name=public_name,
+            **kwargs,
+        )
 
-    def _knowledge_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        scope = self._knowledge_scope(payload, context)
+    def _knowledge_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], *, public_name: str = "", **_: Any) -> Any:
+        # GUI list/read are product-facing contracts over the V2 metadata/body
+        # service. MCP/native recall remains reference-only below.
+        if public_name in {"knowledge_list", "knowledge_read"}:
+            scope = self._gui_knowledge_scope(context)
+            service = self._knowledge_command()
+            try:
+                if public_name == "knowledge_list":
+                    return service.list_books(scope=scope)
+                return service.read_occurrence(
+                    _text(payload.get("occurrence_id")), scope=scope,
+                )
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "v2_knowledge_read_failed"
+                ) from exc
+        # Search intentionally remains reference-only: a fuzzy query must not
+        # become a bulk body export surface.
+        scope = self._gui_knowledge_scope(context) if public_name.startswith("knowledge_") else self._knowledge_scope(payload, context)
         adapter = self._stores.get("knowledge")
         if adapter is None:
             content = self._stores.get("content")
@@ -2160,7 +2771,1139 @@ class NativeV2RuntimePort:
             adapter = KnowledgeV2Adapter(content, namespace_id=scope.namespace_id)
             self._stores["knowledge"] = adapter
         occurrence_id = _text(payload.get("occurrence_id")) or None
-        return adapter.read(scope, query=_text(payload.get("query")), limit=payload.get("limit", 100), occurrence_id=occurrence_id)
+        rows = adapter.read(scope, query=_text(payload.get("query")), limit=payload.get("limit", 100), occurrence_id=occurrence_id)
+        if public_name == "knowledge_search":
+            return {
+                "ok": True,
+                "status": "succeeded",
+                "results": [
+                    {
+                        "occurrence_id": str(item.get("ref") or ""),
+                        "summary": str(item.get("summary") or ""),
+                        "hash": str(item.get("hash") or ""),
+                        "trust": "reference_only",
+                    }
+                    for item in rows
+                ],
+                "total": len(rows),
+                "reference_only": True,
+            }
+        return rows
+
+    def _gui_task_scope(self, context: Mapping[str, Any]) -> Any:
+        try:
+            resolve_native_transport_context(context)
+        except NativeContextError as exc:
+            raise NativePortError("trusted_context_capability_required") from exc
+        from .task_coordinator import TaskCoordinator
+
+        return TaskCoordinator.scope_from_context(self.workspace, context)
+
+    @staticmethod
+    def _gui_task_key(operation: str, payload: Mapping[str, Any]) -> str:
+        explicit = _text(payload.get("idempotency_key") or payload.get("request_id"))
+        if explicit:
+            return explicit
+        # No browser identity participates.  A nonce makes this one user action
+        # distinct from later intentional reruns; callers that need retry
+        # deduplication supply an explicit request/idempotency key.
+        import time
+
+        digest = hashlib.sha256(
+            (str(operation) + "\x1f" + _canonical_json(dict(payload)) + "\x1f" + str(time.time_ns())).encode("utf-8")
+        ).hexdigest()
+        return "gui-" + digest
+
+    def _gui_task_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        run_id = _text(payload.get("run_id") or payload.get("job_id") or payload.get("request_id"))
+        if not run_id:
+            raise NativePortError("task_run_id_required")
+        result = self._task_service().status(run_id, self._gui_task_scope(context))
+        if not result.get("ok"):
+            raise NativePortError(_text((result.get("error") or {}).get("code")) or "task_not_found")
+        task = dict(result.get("task") or {})
+        return {
+            **result,
+            "job_id": run_id,
+            "phase": task.get("stage", result.get("status")),
+            "processed": task.get("progress", 0),
+            "total": 100,
+        }
+
+    def _gui_task_list(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        return self._task_service().list_pending(
+            self._gui_task_scope(context),
+            limit=payload.get("limit", 100),
+        )
+
+    def _gui_task_cancel(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("task_cancel_confirmation_required")
+        run_id = _text(payload.get("run_id") or payload.get("job_id") or payload.get("request_id"))
+        if not run_id:
+            raise NativePortError("task_run_id_required")
+        result = self._task_service().cancel(run_id, self._gui_task_scope(context), timeout=5.0)
+        if not result.get("ok"):
+            raise NativePortError(_text((result.get("error") or {}).get("code")) or "task_cancel_failed")
+        return result
+
+    def _gui_knowledge_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_knowledge_scope(context)
+        service = self._knowledge_command()
+        try:
+            return service.dispatch(operation, payload, scope=scope, context=context)
+        except Exception as exc:
+            code = _text(getattr(exc, "code", ""))
+            raise NativePortError(code or "v2_knowledge_command_failed") from exc
+
+    def _gui_knowledge_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_knowledge_scope(context)
+        service = self._knowledge_command()
+        try:
+            result = service.dispatch(operation, payload, scope=scope, context=context)
+        except Exception as exc:
+            code = _text(getattr(exc, "code", ""))
+            raise NativePortError(code or "v2_knowledge_command_failed") from exc
+        if operation in {"knowledge_source_add", "knowledge_reingest", "knowledge_rebuild_smart"}:
+            task = dict(result.get("task") or {}) if isinstance(result, Mapping) else {}
+            if isinstance(result, Mapping):
+                return {
+                    **dict(result),
+                    "accepted": True,
+                    "job_id": task.get("run_id", ""),
+                    "deferred": True,
+                }
+        return result
+
+    def _gui_projection_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_projection_scope(context)
+        try:
+            if operation == "projection_source_map":
+                return self._projection_service().source_map(scope=scope)
+            raise NativePortError("unknown_projection_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_projection_query_failed") from exc
+
+    def _gui_projection_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_projection_scope(context)
+        service = self._projection_service()
+        try:
+            if operation == "projection_source_toggle":
+                return service.set_source_enabled(
+                    _text(payload.get("root_id") or payload.get("source_id")),
+                    bool(payload.get("enabled")),
+                    scope=scope,
+                )
+            if operation == "projection_delete":
+                if payload.get("confirmed") is not True:
+                    raise NativePortError("projection_confirmation_required")
+                return service.delete(scope=scope, mode=_text(payload.get("mode")) or "reconstructed")
+            if operation == "projection_build":
+                if payload.get("confirmed") is not True:
+                    raise NativePortError("projection_confirmation_required")
+                coordinator = self._task_service()
+                task_scope = self._gui_task_scope(context)
+                key = self._gui_task_key(operation, payload)
+                mode = _text(payload.get("mode")) or "reconstructed"
+                llm_provider = (
+                    _text(payload.get("llm_agent"))
+                    or _text(payload.get("llm_cli"))
+                    or _text(payload.get("enrich_mode"))
+                    or "deterministic"
+                )
+
+                def worker(execution: Any) -> Mapping[str, Any]:
+                    return service.build(
+                        scope=scope,
+                        mode=mode,
+                        runtime_role=_text(context.get("runtime_role")),
+                        llm_provider=llm_provider,
+                        execution=execution,
+                    )
+
+                accepted = coordinator.start(
+                    operation="projection_build",
+                    idempotency_key=key,
+                    scope=task_scope,
+                    worker=worker,
+                    goal="background_task",
+                )
+                task = dict(accepted.get("task") or {})
+                return {
+                    **accepted,
+                    "accepted": True,
+                    "job_id": task.get("run_id", ""),
+                    "deferred": True,
+                }
+            raise NativePortError("unknown_projection_command")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_projection_command_failed") from exc
+
+    def _gui_release_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_projection_scope(context)
+        service = self._release_v2_service()
+        try:
+            if operation == "release_list":
+                return service.list_releases(scope=scope, limit=int(payload.get("limit") or 100))
+            if operation == "release_targets":
+                return service.list_targets(scope=scope)
+            if operation == "release_target_choose":
+                return {
+                    "ok": True,
+                    "host_action": "choose_publish_target_path",
+                    "kind": _text(payload.get("kind")) or "file",
+                }
+            if operation == "release_verify":
+                target = service.resolve_target(
+                    scope=scope,
+                    target_path=_text(payload.get("target_path")),
+                    target_root_id=_text(payload.get("target_root_id")),
+                )
+                return service.verify(
+                    _text(payload.get("release_id")),
+                    str(target),
+                    scope=scope,
+                )
+            raise NativePortError("unknown_release_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_release_query_failed") from exc
+
+    def _gui_release_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        scope = self._gui_projection_scope(context)
+        service = self._release_v2_service()
+        try:
+            if operation == "release_plan_create":
+                target = service.resolve_target(
+                    scope=scope,
+                    target_path=_text(payload.get("target_path")),
+                    target_root_id=_text(payload.get("target_root_id")),
+                )
+                return service.create_plan(
+                    str(target),
+                    scope=scope,
+                    llm_provider=_text(payload.get("llm_provider")) or "deterministic",
+                    mode=_text(payload.get("mode")) or "reconstructed",
+                    runtime_role=_text(context.get("runtime_role")),
+                )
+            if operation in {"release_apply", "release_publish"}:
+                if payload.get("confirmed") is not True:
+                    raise NativePortError("release_confirmation_required")
+                target = service.resolve_target(
+                    scope=scope,
+                    target_path=_text(payload.get("target_path") or payload.get("target_file")),
+                    target_root_id=_text(payload.get("target_root_id")),
+                )
+                plan_id = _text(payload.get("plan_id"))
+                if operation == "release_publish":
+                    plan = service.create_plan(
+                        str(target),
+                        scope=scope,
+                        llm_provider="deterministic",
+                        mode="reconstructed",
+                    )
+                    plan_id = _text(plan.get("plan_id"))
+                if not plan_id:
+                    raise NativePortError("release_plan_required")
+                coordinator = self._task_service()
+                task_scope = self._gui_task_scope(context)
+                key = self._gui_task_key("release_apply", payload)
+
+                def worker(execution: Any) -> Mapping[str, Any]:
+                    receipt = service.apply(
+                        plan_id,
+                        str(target),
+                        scope=scope,
+                        execution=execution,
+                        confirmed=True,
+                        runtime_role=_text(context.get("runtime_role")),
+                    )
+                    # RuntimeStore result_ref is intentionally authority/path
+                    # hostile.  Persist only stable release references here;
+                    # the full immutable receipt lives in projection_ledger.
+                    return {
+                        "release_id": _text(receipt.get("release_id")),
+                        "plan_id": _text(receipt.get("plan_id")),
+                        "target_digest": _text(receipt.get("target_digest")),
+                        "projection_id": _text(receipt.get("projection_id")),
+                        "projection_digest": _text(receipt.get("projection_digest")),
+                    }
+
+                accepted = coordinator.start(
+                    operation="release_apply",
+                    idempotency_key=key,
+                    scope=task_scope,
+                    worker=worker,
+                    goal="background_task",
+                )
+                task = dict(accepted.get("task") or {})
+                return {
+                    **accepted,
+                    "accepted": True,
+                    "plan_id": plan_id,
+                    "job_id": task.get("run_id", ""),
+                    "deferred": True,
+                }
+            if operation == "release_rollback":
+                if payload.get("confirmed") is not True:
+                    raise NativePortError("release_confirmation_required")
+                target_path = _text(payload.get("target_path"))
+                target_root_id = _text(payload.get("target_root_id"))
+                target = (
+                    service.resolve_target(
+                        scope=scope,
+                        target_path=target_path,
+                        target_root_id=target_root_id,
+                    )
+                    if target_path or target_root_id
+                    else ""
+                )
+                return service.rollback(
+                    _text(payload.get("release_id")),
+                    str(target),
+                    scope=scope,
+                    confirmed=True,
+                    force=bool(payload.get("force")),
+                )
+            raise NativePortError("unknown_release_command")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_release_command_failed") from exc
+
+    @staticmethod
+    def _gui_authority(context: Mapping[str, Any]) -> Any:
+        try:
+            return resolve_native_transport_context(context)
+        except NativeContextError as exc:
+            raise NativePortError("trusted_context_capability_required") from exc
+
+    def _gui_agent_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        self._gui_authority(context)
+        service = self._agent_service()
+        try:
+            if operation == "discover_agents":
+                return service.discover_agents()
+            if operation == "get_selection_tree":
+                return service.get_selection_tree(_text(payload.get("instance_id")))
+            if operation == "get_agent_data":
+                return service.get_agent_data(_text(payload.get("instance_id")))
+            if operation == "list_agent_candidates":
+                return service.list_candidates(
+                    include_uninstalled=bool(payload.get("include_uninstalled", False)),
+                    include_stale=bool(payload.get("include_stale", True)),
+                    include_unknown=bool(payload.get("include_unknown", True)),
+                )
+            if operation == "list_archived_agents":
+                return service.list_archives()
+            if operation == "list_cleanup_history":
+                return service.cleanup_history()
+            if operation == "list_agents":
+                return service.list_agents()
+            if operation == "get_residual_cleanup":
+                return service.residual_cleanup(
+                    instance_id=_text(payload.get("instance_id")),
+                    candidate_id=_text(payload.get("candidate_id")),
+                )
+            if operation == "open_agent_folder":
+                return service.open_folder(
+                    dir_path=_text(payload.get("dir_path")),
+                    candidate_id=_text(payload.get("candidate_id")),
+                )
+            raise NativePortError("unknown_agent_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_agent_query_failed") from exc
+
+    def _agent_candidate_id(self, service: Any, payload: Mapping[str, Any]) -> str:
+        candidate = _text(payload.get("candidate_id"))
+        if candidate:
+            return candidate
+        product = _text(payload.get("product")).casefold()
+        if not product:
+            raise NativePortError("candidate_id_required")
+        rows = service.list_candidates(include_uninstalled=True).get("candidates", [])
+        matches = [item for item in rows if _text(item.get("product")).casefold() == product]
+        if len(matches) != 1:
+            raise NativePortError("candidate_id_required")
+        return _text(matches[0].get("candidate_id"))
+
+    def _gui_agent_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        authority = self._gui_authority(context)
+        if not bool(authority.admin):
+            raise NativePortError("admin_capability_required")
+        service = self._agent_service()
+        try:
+            if operation == "mark_agent_uninstalled":
+                candidate = self._agent_candidate_id(service, payload)
+                return service.mark_uninstalled(
+                    candidate,
+                    product=_text(payload.get("product")),
+                    dir_path=_text(payload.get("dir_path")),
+                    reason=_text(payload.get("reason")),
+                )
+            if operation == "unmark_agent_uninstalled":
+                candidate = self._agent_candidate_id(service, payload)
+                return service.unmark_uninstalled(candidate, product=_text(payload.get("product")))
+            if operation == "archive_agent_dir":
+                candidate = self._agent_candidate_id(service, payload)
+                return service.archive(
+                    candidate,
+                    dir_path=_text(payload.get("dir_path")),
+                    reason=_text(payload.get("reason")),
+                    dry_run=bool(payload.get("dry_run")),
+                )
+            if operation == "restore_archived_agent":
+                return service.restore(_text(payload.get("archive_id")))
+            if operation == "delete_archived_agent":
+                return service.delete_archive(_text(payload.get("archive_id")))
+            raise NativePortError("unknown_agent_command")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_agent_command_failed") from exc
+
+    def _gui_group_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        authority = self._gui_authority(context)
+        service = self._group_service(write=False)
+        try:
+            if operation == "agent_binding_list":
+                return service.list_bindings(include_inactive=bool(payload.get("include_inactive", True)))
+            if operation == "group_list":
+                return service.list_groups()
+            if operation == "binding_drift":
+                return service.check_drift(_text(payload.get("binding_id")))
+            if operation == "group_preview":
+                return service.group_preview(_text(payload.get("target_group_id")))
+            if operation == "scope_get":
+                state = service.scope_state(_text(authority.agent_instance_id))
+                state["principal_agent_instance_id"] = _text(authority.agent_instance_id)
+                state["active_binding"] = service.active_binding_for_agent(_text(authority.agent_instance_id))
+                state["options"] = service.list_groups().get("groups", [])
+                return state
+            raise NativePortError("unknown_group_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_group_query_failed") from exc
+
+    @staticmethod
+    def _confirmation(payload: Mapping[str, Any]) -> None:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
+
+    def _gui_group_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        authority = self._gui_authority(context)
+        # All binding/group mutations below are administrative.  Check the
+        # process-issued capability before constructing the writable service;
+        # that service may open/inspect the control-plane namespace.
+        admin_operations = {
+            "bind_agent",
+            "bind_agents_to_shared_group",
+            "unbind_agent",
+            "ensure_personal_memory_group",
+            "leave_shared_group_to_personal",
+            "dissolve_shared_group",
+            "export_memory_group",
+            "clear_memory_group",
+            "archive_memory_group",
+            "install_shared_group_mcp_redirects",
+            "import_native_memories_to_group",
+            "commit_shared_memory_governance",
+            "enter_multi_agent_mode",
+            "exit_multi_agent_mode",
+        }
+        if operation in admin_operations and not bool(authority.admin):
+            raise NativePortError("admin_capability_required")
+        service = self._group_service(write=True)
+        trusted = authority.to_dict()
+        try:
+            if operation == "scope_set":
+                requested = payload.get("requested_scope")
+                if not isinstance(requested, Mapping):
+                    raise NativePortError("governance_scope_required")
+                return service.set_scope(
+                    _text(authority.agent_instance_id),
+                    requested,
+                    admin=bool(authority.admin),
+                )
+            if operation == "commit_selection":
+                self._confirmation(payload)
+                selected = payload.get("selected")
+                if not isinstance(selected, (list, tuple)):
+                    raise NativePortError("selection_required")
+                return self._agent_service().commit_selection(
+                    _text(payload.get("instance_id")),
+                    selected,
+                )
+            if operation == "bind_agent":
+                return service.bind_agent(
+                    _text(payload.get("target_agent_id")),
+                    _text(payload.get("target_group_id")),
+                    mcp_server_name=_text(payload.get("mcp_server_name")) or "memoryguard",
+                    native_memory_mode=_text(payload.get("native_memory_mode")) or "observed",
+                    redirect_paths=payload.get("redirect_paths") if isinstance(payload.get("redirect_paths"), (list, tuple)) else (),
+                )
+            if operation == "bind_agents_to_shared_group":
+                agents = payload.get("target_agent_ids")
+                if not isinstance(agents, (list, tuple)):
+                    raise NativePortError("agent_instance_ids_required")
+                return service.bind_agents(
+                    agents,
+                    share_group_id=_text(payload.get("target_group_id")),
+                    mcp_server_name=_text(payload.get("mcp_server_name")) or "memoryguard",
+                    native_memory_modes=payload.get("native_memory_modes") if isinstance(payload.get("native_memory_modes"), Mapping) else {},
+                    redirect_paths=payload.get("redirect_paths") if isinstance(payload.get("redirect_paths"), Mapping) else {},
+                )
+            if operation == "unbind_agent":
+                return service.unbind(_text(payload.get("binding_id")))
+            if operation == "ensure_personal_memory_group":
+                self._confirmation(payload)
+                return service.ensure_personal(_text(payload.get("target_agent_id")))
+            if operation == "leave_shared_group_to_personal":
+                self._confirmation(payload)
+                return service.leave_to_personal(_text(payload.get("target_agent_id")))
+            if operation == "dissolve_shared_group":
+                self._confirmation(payload)
+                return service.dissolve(_text(payload.get("target_group_id")))
+            if operation == "export_memory_group":
+                self._confirmation(payload)
+                return service.export_group(_text(payload.get("target_group_id")))
+            if operation == "clear_memory_group":
+                self._confirmation(payload)
+                return service.clear_group(_text(payload.get("target_group_id")), trusted=trusted)
+            if operation == "archive_memory_group":
+                self._confirmation(payload)
+                return service.archive_group(_text(payload.get("target_group_id")))
+            if operation == "install_shared_group_mcp_redirects":
+                self._confirmation(payload)
+                return service.install_redirects(_text(payload.get("target_group_id")))
+            if operation == "import_native_memories_to_group":
+                self._confirmation(payload)
+                agents = payload.get("target_agent_ids")
+                return service.import_native_memories(
+                    _text(payload.get("target_group_id")),
+                    agent_instance_ids=agents if isinstance(agents, (list, tuple)) else None,
+                    trusted=trusted,
+                )
+            if operation == "commit_shared_memory_governance":
+                self._confirmation(payload)
+                return service.commit_governance(
+                    _text(payload.get("target_group_id")),
+                    reason=_text(payload.get("reason")),
+                    trusted=trusted,
+                )
+            if operation == "enter_multi_agent_mode":
+                return service.set_mode("multi_agent_shared_mcp")
+            if operation == "exit_multi_agent_mode":
+                return service.set_mode("single_agent")
+            raise NativePortError("unknown_group_command")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "v2_group_command_failed") from exc
+
+    def _gui_governance_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        service = self._governance_native()
+        try:
+            if operation == "recent_events":
+                return service.recent_events(context, limit=int(payload.get("limit") or 100))
+            if operation == "auto_actions":
+                return service.auto_actions(context, limit=int(payload.get("limit") or 100))
+            if operation == "supersede_decisions":
+                return service.supersede_decisions(context, limit=int(payload.get("limit") or 100))
+            if operation == "conflicts":
+                return service.conflicts(context)
+            if operation == "quarantine":
+                return service.quarantine(context)
+            if operation == "memory_ir_summary":
+                return service.memory_ir_summary(context)
+            raise NativePortError("unknown_governance_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_governance_query_failed"
+            ) from exc
+
+    def _gui_governance_command(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        # Governance mutations must not instantiate or query the native
+        # governance service until the process-issued admin capability has
+        # been verified.  This keeps all resource names fail-closed.
+        if operation in {
+            "conflict_resolve",
+            "quarantine_release",
+            "quarantine_delete",
+            "neuron_decide",
+        } and not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        service = self._governance_native()
+        try:
+            if operation == "conflict_resolve":
+                return service.resolve_conflict(
+                    _text(payload.get("conflict_group_id") or payload.get("group_id")),
+                    _text(payload.get("keep_id") or payload.get("keep_memory_id")),
+                    context,
+                )
+            if operation == "quarantine_release":
+                return service.release_quarantine(
+                    _text(payload.get("quarantine_id")), context,
+                )
+            if operation == "quarantine_delete":
+                return service.delete_quarantine(
+                    _text(payload.get("quarantine_id")), context,
+                )
+            if operation == "neuron_decide":
+                if payload.get("confirmed") is not True:
+                    raise NativePortError("governance_confirmation_required")
+                target_scope = payload.get("scope")
+                return service.neuron_decide(
+                    _text(payload.get("node_id")),
+                    _text(payload.get("action")),
+                    _text(payload.get("reason")),
+                    context,
+                    target_scope=(target_scope if isinstance(target_scope, Mapping) else None),
+                )
+            raise NativePortError("unknown_governance_command")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_governance_command_failed"
+            ) from exc
+
+    def _gui_audit_plan(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        service = self._audit_plan()
+        try:
+            if operation == "audit_plan_preview":
+                return service.generate(_text(payload.get("finding_id")))
+            if operation == "audit_plan_apply":
+                if not self._trusted_admin(context):
+                    raise NativePortError("admin_capability_required")
+                return service.apply(_text(payload.get("plan_id")))
+            if operation == "audit_plan_undo":
+                if not self._trusted_admin(context):
+                    raise NativePortError("admin_capability_required")
+                return service.undo(_text(payload.get("change_id")))
+            raise NativePortError("unknown_audit_plan_operation")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_audit_plan_failed"
+            ) from exc
+
+    def _gui_history_control(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        service = self._history_control()
+        if operation == "history_source_discover":
+            try:
+                return service.discover()
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "v2_history_discovery_failed"
+                ) from exc
+        if operation != "history_backfill":
+            raise NativePortError("unknown_history_control_operation")
+        task_scope = self._gui_task_scope(context)
+        continuation = payload.get("continuation")
+        if continuation is not None and not isinstance(continuation, Mapping):
+            raise NativePortError("history_continuation_invalid")
+        key = self._gui_task_key(
+            "history_backfill",
+            {"continuation_present": bool(continuation)},
+        )
+
+        def worker(execution: Any) -> Mapping[str, Any]:
+            try:
+                result = service.backfill(
+                    execution=execution,
+                    continuation=(dict(continuation) if isinstance(continuation, Mapping) else None),
+                )
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "history_backfill_failed"
+                ) from exc
+            return {
+                "operation": "history_backfill",
+                "status": "succeeded",
+                "code": "ok",
+                "session_count": int(result.get("imported") or 0),
+                "turn_count": int(result.get("turn_count") or 0),
+                "changed_turn_count": int(result.get("changed_turn_count") or 0),
+                "processed_files": int(result.get("processed_files") or 0),
+                "processed_size": int(result.get("processed_bytes") or 0),
+                "partial_count": int(result.get("partial") or 0),
+                "error_count": int(result.get("errors") or 0),
+                "remaining_files": int(result.get("remaining_files") or 0),
+                "pending_binding_count": len(result.get("pending_binding") or []),
+                "memory_record_count": 0,
+            }
+
+        accepted = self._task_service().start(
+            operation="history_backfill",
+            idempotency_key=key,
+            scope=task_scope,
+            worker=worker,
+            goal="background_task",
+        )
+        task = dict(accepted.get("task") or {})
+        return {
+            **accepted,
+            "accepted": True,
+            "job_id": task.get("run_id", ""),
+            "deferred": True,
+            "writes_long_term_memory": False,
+        }
+
+    def _gui_import_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        service = self._import_control()
+        try:
+            if operation == "import_preview":
+                return service.preview_bundle(_text(payload.get("path")))
+            if operation == "source_memory_summary":
+                return service.source_memory_summary(context)
+            if operation == "source_content_preview":
+                return service.source_content_preview(
+                    _text(payload.get("source_id") or payload.get("root_id")),
+                    _text(payload.get("relative_path")),
+                    context,
+                )
+            raise NativePortError("unknown_import_query")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_import_query_failed"
+            ) from exc
+
+    def _gui_import_control(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        if operation != "import_create":
+            raise NativePortError("unknown_import_control_operation")
+        if payload.get("confirmed") is not True:
+            raise NativePortError("import_confirmation_required")
+        path = _text(payload.get("path"))
+        if not path:
+            raise NativePortError("import_path_required")
+        try:
+            authority = resolve_native_transport_context(context)
+        except NativeContextError as exc:
+            raise NativePortError("trusted_context_capability_required") from exc
+        scope = {
+            "workspace_id": self.workspace,
+            "agent_instance_id": _text(authority.agent_instance_id),
+            "project_ref": _text(authority.project_ref),
+            "share_group_id": _text(authority.share_group_id),
+            "provider": _text(authority.provider) or "gui",
+            "sensitivity": _text(authority.sensitivity) or "normal",
+            "policy_class": _text(authority.policy_class) or "private",
+        }
+        service = self._import_control()
+        task_scope = self._gui_task_scope(context)
+        key = self._gui_task_key(
+            "import_create",
+            {"path_digest": hashlib.sha256(path.encode("utf-8", "replace")).hexdigest()},
+        )
+
+        def worker(execution: Any) -> Mapping[str, Any]:
+            try:
+                result = service.import_bundle(path, scope=scope, execution=execution)
+            except NativePortError:
+                raise
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "import_execution_failed"
+                ) from exc
+            return {
+                "operation": "import_create",
+                "status": "succeeded",
+                "code": "ok",
+                "provider": _text(result.get("provider")),
+                "source_id": _text(result.get("source_id")),
+                "source_revision": int(result.get("source_revision") or 0),
+                "manifest_digest": _text(result.get("manifest_digest")),
+                "coverage_digest": _text(result.get("coverage_digest")),
+                "session_count": int(result.get("conversation_count") or 0),
+                "turn_count": int(result.get("turn_count") or 0),
+                "changed_turn_count": int(result.get("changed_turn_count") or 0),
+                "memory_record_count": 0,
+            }
+
+        accepted = self._task_service().start(
+            operation="import_create",
+            idempotency_key=key,
+            scope=task_scope,
+            worker=worker,
+            goal="background_task",
+        )
+        task = dict(accepted.get("task") or {})
+        return {
+            **accepted,
+            "accepted": True,
+            "job_id": task.get("run_id", ""),
+            "deferred": True,
+            "writes_long_term_memory": False,
+        }
+
+    def _gui_maintenance_control(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        generation: int,
+        **_: Any,
+    ) -> Any:
+        """Expose Reference-Audit planning and guarded Blob sweep to the GUI."""
+        from ..maintenance_v2.reference_audit import ReferenceAudit
+
+        def plan() -> dict[str, Any]:
+            try:
+                public = ReferenceAudit(self.workspace, mode="ro").audit().to_public_dict()
+            except Exception as exc:
+                raise NativePortError("v2_maintenance_plan_unavailable") from exc
+            plan_payload = {
+                "candidate_digest": _text(public.get("candidate_digest")),
+                "candidate_count": int(public.get("candidate_count") or 0),
+                "registry_digest": _text(public.get("registry_digest")),
+                "manifest_generation": public.get("manifest_generation"),
+                "blocker_codes": list(public.get("blocker_codes") or []),
+                "blocked": bool(public.get("blocked")),
+            }
+            plan_id = "gc-plan-" + hashlib.sha256(
+                _canonical_json(plan_payload).encode("utf-8")
+            ).hexdigest()
+            return {
+                "ok": True,
+                "status": "succeeded",
+                "operation": "maintenance_plan",
+                "plan": {"plan_id": plan_id, **plan_payload},
+                "dry_run": True,
+                "age_parameters_ignored": True,
+            }
+
+        if operation == "maintenance_plan":
+            return plan()
+        if operation != "maintenance_apply":
+            raise NativePortError("unknown_maintenance_control_operation")
+        if payload.get("confirmed") is not True:
+            raise NativePortError("maintenance_confirmation_required")
+
+        initial_plan = plan()
+        plan_data = dict(initial_plan.get("plan") or {})
+        if plan_data.get("blocked"):
+            raise NativePortError("maintenance_plan_blocked")
+        task_scope = self._gui_task_scope(context)
+        idempotency_key = self._gui_task_key(
+            "maintenance_apply",
+            {
+                "plan_id": plan_data.get("plan_id", ""),
+                "candidate_digest": plan_data.get("candidate_digest", ""),
+                "generation": generation,
+            },
+        )
+
+        def worker(execution: Any) -> Mapping[str, Any]:
+            execution.progress(5, "audit")
+            execution.check_cancelled()
+            fresh = plan()
+            fresh_data = dict(fresh.get("plan") or {})
+            if fresh_data.get("blocked"):
+                raise NativePortError("maintenance_plan_blocked")
+            if fresh_data.get("candidate_digest") != plan_data.get("candidate_digest"):
+                raise NativePortError("maintenance_plan_stale")
+            execution.progress(20, "lease")
+            execution.check_cancelled()
+            from ..maintenance_v2.runtime_port import (
+                MaintenanceRuntimePort,
+                bind_maintenance_transport_context,
+            )
+
+            runtime = self.maintenance_port
+            if runtime is None:
+                runtime = MaintenanceRuntimePort(self.workspace)
+                self.maintenance_port = runtime
+            maint_context = bind_maintenance_transport_context({
+                "trusted_agent_id": _text(context.get("agent_instance_id")),
+                "session_id": _text(context.get("session_id")) or "gui-maintenance",
+            })
+            lease = runtime.dispatch(
+                "cli",
+                "storage",
+                {"action": "lease-acquire", "ttl_seconds": 300},
+                context=maint_context,
+                generation=generation,
+                mutation=True,
+            )
+            if not lease.get("ok"):
+                raise NativePortError(_text(lease.get("code") or lease.get("error")) or "maintenance_lease_failed")
+            lease_data = lease.get("data") if isinstance(lease.get("data"), Mapping) else {}
+            lease_id = _text(lease_data.get("lease_id"))
+            if not lease_id:
+                raise NativePortError("maintenance_lease_missing")
+            try:
+                execution.progress(45, "sweep", cancellable=False)
+                result = runtime.dispatch(
+                    "cli",
+                    "storage",
+                    {
+                        "action": "sweep",
+                        "apply": True,
+                        "lease_id": lease_id,
+                        "request_key": "gui-gc:" + _text(plan_data.get("plan_id")),
+                    },
+                    context=maint_context,
+                    generation=generation,
+                    mutation=True,
+                )
+                if not result.get("ok"):
+                    raise NativePortError(_text(result.get("code") or result.get("error")) or "maintenance_sweep_failed")
+                data = result.get("data") if isinstance(result.get("data"), Mapping) else {}
+                return {
+                    "operation": "maintenance_apply",
+                    "status": "succeeded",
+                    "code": "ok",
+                    "candidate_count": int(data.get("candidate_count") or 0),
+                    "swept_count": int(data.get("swept_count") or 0),
+                    "skipped_count": int(data.get("skipped_count") or 0),
+                    "final_digest": _text(data.get("final_digest")),
+                }
+            finally:
+                runtime.dispatch(
+                    "cli",
+                    "storage",
+                    {"action": "lease-release", "lease_id": lease_id},
+                    context=maint_context,
+                    generation=generation,
+                    mutation=True,
+                )
+
+        accepted = self._task_service().start(
+            operation="maintenance_apply",
+            idempotency_key=idempotency_key,
+            scope=task_scope,
+            worker=worker,
+            goal="background_task",
+        )
+        task = dict(accepted.get("task") or {})
+        return {
+            **accepted,
+            "accepted": True,
+            "plan_id": plan_data.get("plan_id", ""),
+            "job_id": task.get("run_id", ""),
+            "deferred": True,
+        }
+
+    def _gui_request_compat(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        generation: int,
+        state: Any = None,
+        **_: Any,
+    ) -> Any:
+        """Map the retired RequestQueue contract directly onto TaskRun.
+
+        Task-native operations return their existing run instead of creating a
+        wrapper task.  Synchronous mutations execute inside one TaskCoordinator
+        worker so legacy clients can still poll ``get_request_status`` without
+        preserving a second request queue or a second authorization boundary.
+        """
+        method = _text(payload.get("method"))
+        args = payload.get("args")
+        if not method:
+            raise NativePortError("request_method_required")
+        target = get_gui_operation_spec(method)
+        if target is None or not target.mutation:
+            raise NativePortError("request_target_not_mutation")
+        if method in {"submit_request", "request_mutation", "call_readonly"}:
+            raise NativePortError("request_target_recursive")
+        if not isinstance(args, (list, tuple, Mapping)) and args is not None:
+            raise NativePortError("request_arguments_invalid")
+        target_args: Any = [] if args is None else args
+
+        if target.execution == "task":
+            nested = self.dispatch_gui(
+                method,
+                target_args,
+                context=context,
+                generation=generation,
+                mutation=True,
+                state=state,
+            )
+            if not nested.get("ok"):
+                raise NativePortError(_text(nested.get("code") or nested.get("error")) or "request_target_failed")
+            task = nested.get("task")
+            if not isinstance(task, Mapping):
+                data = nested.get("data")
+                task = data.get("task") if isinstance(data, Mapping) else None
+            if not isinstance(task, Mapping) or not _text(task.get("run_id")):
+                raise NativePortError("request_target_task_missing")
+            return {
+                "ok": True,
+                "status": str(nested.get("status") or "accepted"),
+                "operation": target.canonical_name,
+                "task": dict(task),
+                "request": {"request_id": _text(task.get("run_id")), "status": _text(task.get("state"))},
+                "deferred": True,
+            }
+
+        task_scope = self._gui_task_scope(context)
+        key = self._gui_task_key("request_mutation:" + target.canonical_name, {"method": method, "args": target_args})
+
+        def worker(execution: Any) -> Mapping[str, Any]:
+            execution.progress(10, "dispatch")
+            execution.check_cancelled()
+            nested = self.dispatch_gui(
+                method,
+                target_args,
+                context=context,
+                generation=generation,
+                mutation=True,
+                state=state,
+            )
+            if not nested.get("ok"):
+                raise NativePortError(_text(nested.get("code") or nested.get("error")) or "request_target_failed")
+            execution.progress(90, "receipt", cancellable=False)
+            return {
+                "operation": target.canonical_name,
+                "status": "succeeded",
+                "code": "ok",
+            }
+
+        accepted = self._task_service().start(
+            operation="request_mutation",
+            idempotency_key=key,
+            scope=task_scope,
+            worker=worker,
+            goal="background_task",
+        )
+        task = dict(accepted.get("task") or {})
+        return {
+            **accepted,
+            "accepted": True,
+            "request": {"request_id": task.get("run_id", ""), "status": task.get("state", "")},
+            "job_id": task.get("run_id", ""),
+            "deferred": True,
+        }
 
     @staticmethod
     def _audit_finding_id(code: str, domain: str, table: str) -> str:
@@ -2239,6 +3982,177 @@ class NativeV2RuntimePort:
         except Exception as exc:
             raise NativePortError("v2_explain_unavailable") from exc
 
+    def _codegraph_scope(self, context: Mapping[str, Any]) -> Any:
+        try:
+            from ..codegraph_v2 import CodeGraphScope
+
+            return CodeGraphScope.from_value({**self._scope(context), "trusted_context": True})
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError("codegraph_trusted_scope_required") from exc
+
+    @staticmethod
+    def _codegraph_bounded_int(value: Any, *, default: int, minimum: int, maximum: int, code: str) -> int:
+        if value is None or value == "":
+            return default
+        if isinstance(value, bool):
+            raise NativePortError(code)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise NativePortError(code) from exc
+        return max(minimum, min(parsed, maximum))
+
+    def _codegraph_query(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        query = _text(payload.get("query") or payload.get("q"))
+        if not query:
+            raise NativePortError("codegraph_query_required")
+        scope = self._codegraph_scope(context)
+        limit = self._codegraph_bounded_int(payload.get("limit"), default=100, minimum=1, maximum=1000, code="codegraph_limit_invalid")
+        provenance = _text(payload.get("provenance"))
+        try:
+            store = self._domain_store("codegraph")
+            symbols = store.query_symbols(query, scope=scope, provenance=provenance, limit=limit)
+            return {
+                "scope_digest": scope.digest,
+                "query": query,
+                "provenance": provenance,
+                "count": len(symbols),
+                "symbols": [item.to_dict() for item in symbols],
+            }
+        except NativePortError:
+            raise
+        except ValueError as exc:
+            raise NativePortError("codegraph_provenance_invalid") from exc
+        except Exception as exc:
+            raise NativePortError("codegraph_query_failed") from exc
+
+    def _codegraph_path(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        start_id = _text(payload.get("start_id"))
+        end_id = _text(payload.get("end_id"))
+        if not start_id or not end_id:
+            raise NativePortError("codegraph_path_endpoints_required")
+        scope = self._codegraph_scope(context)
+        depth = self._codegraph_bounded_int(payload.get("max_depth"), default=8, minimum=1, maximum=32, code="codegraph_depth_invalid")
+        try:
+            store = self._domain_store("codegraph")
+            result = store.path_query(
+                start_id,
+                end_id,
+                scope=scope,
+                max_depth=depth,
+                relation=_text(payload.get("relation")),
+                provenance=_text(payload.get("provenance")),
+            )
+            return {"scope_digest": scope.digest, **dict(result)}
+        except NativePortError:
+            raise
+        except ValueError as exc:
+            raise NativePortError("codegraph_provenance_invalid") from exc
+        except Exception as exc:
+            raise NativePortError("codegraph_path_failed") from exc
+
+    def _codegraph_explain(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        symbol_id = _text(payload.get("symbol_id") or payload.get("id"))
+        if not symbol_id:
+            raise NativePortError("codegraph_symbol_id_required")
+        scope = self._codegraph_scope(context)
+        edge_limit = self._codegraph_bounded_int(payload.get("edge_limit"), default=50, minimum=1, maximum=200, code="codegraph_limit_invalid")
+        try:
+            store = self._domain_store("codegraph")
+            result = store.explain_symbol(
+                symbol_id,
+                scope=scope,
+                provenance=_text(payload.get("provenance")),
+                edge_limit=edge_limit,
+            )
+            return {"scope_digest": scope.digest, **dict(result)}
+        except NativePortError:
+            raise
+        except ValueError as exc:
+            raise NativePortError("codegraph_provenance_invalid") from exc
+        except Exception as exc:
+            raise NativePortError("codegraph_explain_failed") from exc
+
+    def _codegraph_affected(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        start_id = _text(payload.get("start_id") or payload.get("symbol_id"))
+        if not start_id:
+            raise NativePortError("codegraph_start_id_required")
+        scope = self._codegraph_scope(context)
+        depth = self._codegraph_bounded_int(payload.get("depth"), default=2, minimum=0, maximum=32, code="codegraph_depth_invalid")
+        limit = self._codegraph_bounded_int(payload.get("limit"), default=100, minimum=1, maximum=10_000, code="codegraph_limit_invalid")
+        try:
+            store = self._domain_store("codegraph")
+            result = store.affected_query(
+                start_id,
+                scope=scope,
+                depth=depth,
+                limit=limit,
+                relation=_text(payload.get("relation")),
+                provenance=_text(payload.get("provenance")),
+            )
+            return result.to_dict()
+        except NativePortError:
+            raise
+        except ValueError as exc:
+            raise NativePortError("codegraph_provenance_invalid") from exc
+        except Exception as exc:
+            raise NativePortError("codegraph_affected_failed") from exc
+
+    def _codegraph_update(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
+        export = payload.get("export")
+        if not isinstance(export, Mapping):
+            raise NativePortError("graphify_metadata_export_required")
+        full_snapshot = payload.get("full_snapshot")
+        if full_snapshot is not None and not isinstance(full_snapshot, bool):
+            raise NativePortError("codegraph_full_snapshot_invalid")
+        scope = self._codegraph_scope(context)
+        try:
+            from ..codegraph_v2.graphify_adapter import GraphifyCapabilityError, GraphifyExportAdapter, GraphifyExportError
+
+            store = self._domain_store("codegraph", write=True)
+            result = GraphifyExportAdapter(store).project(export, scope=scope, full_snapshot=full_snapshot)
+            return {"scope_digest": scope.digest, "status": "UPDATED", **result.to_dict()}
+        except NativePortError:
+            raise
+        except GraphifyCapabilityError as exc:
+            raise NativePortError(_text(getattr(exc, "code", "")) or "graphify_metadata_export_unavailable") from exc
+        except GraphifyExportError as exc:
+            code = _text(getattr(exc, "code", ""))
+            raise NativePortError(code if code and " " not in code else "graphify_metadata_export_invalid") from exc
+        except Exception as exc:
+            # Keep public diagnostics safe while preserving the exception
+            # class that identifies unexpected DB/projection failures.  The
+            # outer dispatcher must not erase every failure as one generic
+            # codegraph_update_failed result.
+            name = "".join(char for char in type(exc).__name__.casefold() if char.isalnum())
+            raise NativePortError(f"codegraph_update_failed_{name or 'unknown'}") from exc
+
+    def _codegraph_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        del payload
+        scope = self._codegraph_scope(context)
+        try:
+            from ..codegraph_v2.graphify_adapter import GraphifyCapability
+
+            capability = GraphifyCapability.detect()
+            store = self._domain_store("codegraph")
+            counts = store.counts(scope=scope)
+            return {
+                "available": True,
+                "scope_digest": scope.digest,
+                "counts": counts,
+                "graphify": capability.to_dict(),
+                "update_ready": bool(capability.available and capability.metadata_export),
+                "capability_error": "" if capability.available and capability.metadata_export else (capability.code or "graphify_metadata_export_unavailable"),
+            }
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError("codegraph_status_failed") from exc
+
     def _codegraph_graph(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         """Read bounded codegraph metadata for one exact trusted scope.
 
@@ -2247,20 +4161,21 @@ class NativeV2RuntimePort:
         hard errors from the store preflight and never trigger initialization.
         """
 
-        scope_data = self._scope(context)
+        graph_scope = self._codegraph_scope(context)
         try:
-            from ..codegraph_v2 import CodeGraphScope
+            from ..codegraph_v2.models import normalize_provenance
 
-            graph_scope = CodeGraphScope.from_value({**scope_data, "trusted_context": True})
             store = self._domain_store("codegraph")
             preflight = getattr(store, "_preflight", None)
             if callable(preflight):
                 preflight()
-            raw_limit = payload.get("limit", 100)
-            if isinstance(raw_limit, bool):
-                raise ValueError("invalid limit")
-            limit = max(1, min(int(raw_limit), 500))
-            files = tuple(store.list_source_files(scope=graph_scope, active_only=True))
+            limit = self._codegraph_bounded_int(payload.get("limit"), default=100, minimum=1, maximum=500, code="codegraph_limit_invalid")
+            provenance = _text(payload.get("provenance"))
+            provenance_filter = normalize_provenance(provenance) if provenance else ""
+            files = tuple(
+                source for source in store.list_source_files(scope=graph_scope, active_only=True)
+                if not provenance_filter or source.provenance == provenance_filter
+            )
             if not files:
                 return {
                     "status": "NO_SOURCE",
@@ -2271,9 +4186,7 @@ class NativeV2RuntimePort:
                     "edge_count": 0,
                 }
             nodes: list[dict[str, Any]] = []
-            file_ids: set[str] = set()
             for source in files[:limit]:
-                file_ids.add(source.file_id)
                 nodes.append({
                     "id": source.file_id,
                     "node_kind": "file",
@@ -2282,12 +4195,16 @@ class NativeV2RuntimePort:
                     "language": source.language,
                     "content_hash": source.content_hash,
                     "source_revision": source.source_revision,
+                    "source_role": source.source_role,
+                    "provenance": source.provenance,
                 })
                 try:
                     symbols = store.get_symbols(source.file_id, scope=graph_scope)
                 except Exception:
                     symbols = ()
                 for symbol in tuple(symbols)[: max(1, min(50, limit))]:
+                    if provenance_filter and symbol.provenance != provenance_filter:
+                        continue
                     nodes.append({
                         "id": symbol.symbol_id,
                         "node_kind": "symbol",
@@ -2297,6 +4214,9 @@ class NativeV2RuntimePort:
                         "file_id": symbol.file_id,
                         "line_start": symbol.line_start,
                         "line_end": symbol.line_end,
+                        "provenance": symbol.provenance,
+                        "source_map": dict(symbol.source_map),
+                        "metadata": dict(symbol.metadata),
                     })
             raw_edges = store.list_edges(scope=graph_scope)
             edges = [
@@ -2305,10 +4225,15 @@ class NativeV2RuntimePort:
                     "from_id": edge.from_id,
                     "to_id": edge.to_id,
                     "relation": edge.relation,
+                    "context": edge.context,
+                    "provenance": edge.provenance,
+                    "source_location": edge.source_location,
+                    "metadata": dict(edge.metadata),
                     "weight": edge.weight,
                 }
                 for edge in tuple(raw_edges)[:limit]
-                if edge.from_id in {node["id"] for node in nodes}
+                if (not provenance_filter or edge.provenance == provenance_filter)
+                and edge.from_id in {node["id"] for node in nodes}
                 and edge.to_id in {node["id"] for node in nodes}
             ]
             return {
@@ -2443,30 +4368,7 @@ class NativeV2RuntimePort:
         relative = _text(payload.get("relative_path"))
         if not root_id:
             raise NativePortError("source_root_required")
-        service = self._native_service("source_read")
-        if service is None:
-            raise NativePortError("v2_source_read_service_unavailable")
-        try:
-            status, roots, code = service._load_roots()
-            if status != "READY":
-                raise NativePortError(code or "no_source")
-            root = next((item for item in roots if _text(getattr(item, "root_id", "")) == root_id), None)
-            if root is None or not service._authorized_for_context(root, context):
-                raise NativePortError("source_root_not_authorized")
-            state, root_path, root_code = service._validate_root(root)
-            if state != "READY" or root_path is None:
-                raise NativePortError(root_code or "source_root_unavailable")
-            target = root_path if root_path.is_file() else (root_path / relative).resolve()
-            try:
-                if root_path.is_dir():
-                    target.relative_to(root_path)
-            except ValueError as exc:
-                raise NativePortError("path_out_of_scope") from exc
-            return self._extract_memories({"source_path": str(target)}, context, **kwargs)
-        except NativePortError:
-            raise
-        except Exception as exc:
-            raise NativePortError("v2_extract_preview_unavailable") from exc
+        return self._extract_memories({"source_id": root_id, "relative_path": relative}, context, **kwargs)
 
     def _gui_extract_by_path(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
         source_path = _text(payload.get("source_path") or payload.get("path"))
@@ -2500,20 +4402,18 @@ class NativeV2RuntimePort:
         return self._extraction_operation("memoryguard_build_and_enrich", payload, context, **kwargs)
 
     def _resolve_group(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        del payload
         agent, _group = self._scoped_read_context(context)
         if not agent:
             raise NativePortError("native_agent_scope_required")
         try:
-            from ..agent_binding import AgentBindingStore, BindingStatus
-
-            bindings = AgentBindingStore(self.workspace).find_by_agent(agent, include_inactive=False)
-            if not bindings:
+            binding = self._group_service(write=False).active_binding_for_agent(agent)
+            if binding is None:
                 return {"share_group_id": None, "binding_id": None, "native_memory_mode": None}
-            binding = bindings[0]
             return {
-                "share_group_id": binding.share_group_id,
-                "binding_id": binding.binding_id,
-                "native_memory_mode": binding.native_memory_mode.value,
+                "share_group_id": binding.get("share_group_id"),
+                "binding_id": binding.get("binding_id"),
+                "native_memory_mode": binding.get("native_memory_mode"),
             }
         except NativePortError:
             raise
@@ -2591,11 +4491,20 @@ class NativeV2RuntimePort:
                 ).fetchone()
             if row is None:
                 return {"status": "NO_SOURCE", "share_group_id": group, "canonical_state": "absent"}
+            read_path = _text(row[1])
+            if read_path not in {"rule-intelligence", "v2", "native"}:
+                return {
+                    "status": "BLOCKED",
+                    "share_group_id": group,
+                    "canonical_state": "unavailable",
+                    "read_path": "unknown",
+                    "reason": "v2_canonical_read_path_unavailable",
+                }
             return {
                 "status": "READY",
                 "share_group_id": group,
                 "canonical_state": str(row[0] or ""),
-                "read_path": str(row[1] or "legacy"),
+                "read_path": read_path,
                 "canonical_digest": str(row[2] or ""),
                 "source_digest": str(row[3] or ""),
                 "effective_digest": str(row[4] or ""),
@@ -2665,8 +4574,48 @@ class NativeV2RuntimePort:
         }
 
     def _hook_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        del payload, context
-        return {"available": True}
+        service = self._hook_control()
+        try:
+            return service.status(
+                provider=_text(payload.get("target_provider") or payload.get("provider")),
+                target_agent_id=_text(payload.get("target_agent_id")),
+            )
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_hook_status_failed"
+            ) from exc
+
+    def _gui_host_control(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("hook_confirmation_required")
+        service = self._hook_control()
+        try:
+            if operation == "host_hook_mode_set":
+                return service.set_mode(
+                    _text(payload.get("target_provider") or payload.get("provider")),
+                    _text(payload.get("target_agent_id")),
+                    _text(payload.get("mode")),
+                    admin=self._trusted_admin(context),
+                )
+            if operation == "host_hook_uninstall":
+                return service.uninstall(
+                    _text(payload.get("target_provider") or payload.get("provider")),
+                    admin=self._trusted_admin(context),
+                )
+            raise NativePortError("unknown_hook_control_operation")
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_hook_control_failed"
+            ) from exc
 
     def _domain_status(self, domain: str, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if domain == "projection":
@@ -2697,18 +4646,10 @@ class NativeV2RuntimePort:
                 from .history_native import NativeHistoryService
 
                 current = NativeHistoryService(self.workspace)
-            elif kind == "source_read":
-                from .safe_services import PureSourceReadService
+            elif kind in {"source_read", "import_preview"}:
+                from .source_control import SourceControlService
 
-                current = PureSourceReadService(self.workspace)
-            elif kind == "import_preview":
-                from .safe_services import ImportPreviewService
-
-                source = self._native_service("source_read")
-                if source is None:
-                    self._native_service_init_errors[kind] = "v2_source_read_service_unavailable"
-                    return None
-                current = ImportPreviewService(self.workspace, source_reader=source)
+                current = SourceControlService(self.workspace)
             elif kind == "runtime_diagnostics":
                 from .safe_services import RuntimeDiagnosticsService
 
@@ -2861,7 +4802,7 @@ class NativeV2RuntimePort:
         service = self._native_service("import_preview")
         if service is None:
             raise NativePortError("v2_import_preview_service_unavailable")
-        return self._service_result(service, "memoryguard_import_preview", payload, context=context)
+        return self._service_result(service, "preview_path", payload, context=context)
 
     def _runtime_processes(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         service = self._native_service("runtime_diagnostics")
@@ -2950,9 +4891,12 @@ class NativeV2RuntimePort:
         if target_type == "agent":
             return target_id == _text(context.get("agent_instance_id"))
         if target_type == "project":
-            return (project_ref or target_id) == _text(context.get("project_ref"))
+            return canonical_project_ref(project_ref or target_id) == canonical_project_ref(context.get("project_ref"))
         if target_type == "agent_project":
-            return target_id == _text(context.get("agent_instance_id")) and project_ref == _text(context.get("project_ref"))
+            return (
+                target_id == _text(context.get("agent_instance_id"))
+                and canonical_project_ref(project_ref) == canonical_project_ref(context.get("project_ref"))
+            )
         if target_type == "provider":
             return target_id.casefold() == _text(context.get("provider")).casefold()
         if target_type == "runtime_role":
@@ -3172,6 +5116,8 @@ class NativeV2RuntimePort:
         policy = _text(payload.get("injection_policy") or "always")
         if policy not in {"always", "relevant"}:
             raise NativePortError("invalid_injection_policy")
+        if policy == "relevant" and payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
         if policy == "relevant" and assignments:
             raise NativePortError("relevant_rule_cannot_have_assignments")
         if policy == "always" and not assignments:
@@ -3192,12 +5138,11 @@ class NativeV2RuntimePort:
             group = _text(context.get("share_group_id"))
             existing = store.list_bindings(definition_id=definition_id, share_group_id=group)
             before = [item.to_dict() for item in existing]
-            # Preserve history by deactivating prior bindings rather than
-            # deleting permission evidence.
-            for binding in existing:
-                if binding.status == "active":
-                    store.upsert_binding(RuleBinding.from_dict({**binding.to_dict(), "status": "inactive", "revision": binding.revision + 1}))
-            created: list[dict[str, Any]] = []
+            # Validate and materialize the complete replacement set before
+            # opening the mutation transaction.  In particular, an unknown
+            # target must not deactivate the previous binding as a side
+            # effect of a rejected request.
+            candidate_bindings: list[RuleBinding] = []
             if policy == "always":
                 options = self._gui_rule_scope_options({}, context)
                 allowed_types = set(options["target_types"])
@@ -3217,14 +5162,32 @@ class NativeV2RuntimePort:
                         "provider": _text(context.get("provider")),
                         "runtime_role": _text(context.get("runtime_role")),
                     }
-                    if target_type == "agent" and target_id != trusted_values["agent"]:
+                    allowed_agent_ids = {trusted_values["agent"]} if trusted_values["agent"] else set()
+                    if target_type in {"agent", "agent_project"} and self._trusted_admin(context):
+                        try:
+                            bindings = self._group_service().list_bindings(include_inactive=False).get("bindings", [])
+                            allowed_agent_ids.update(
+                                _text(item.get("agent_instance_id"))
+                                for item in bindings
+                                if isinstance(item, Mapping)
+                                and _text(item.get("share_group_id")) == group
+                                and _text(item.get("agent_instance_id"))
+                            )
+                        except NativePortError:
+                            pass
+                    if target_type == "agent" and target_id not in allowed_agent_ids:
                         raise NativePortError("unknown_agent_target")
                     if target_type == "group" and target_id not in {"", trusted_values["group"]}:
                         raise NativePortError("unknown_group_target")
-                    if target_type == "project" and (project_ref or target_id) != trusted_values["project"]:
-                        raise NativePortError("unknown_project_target")
-                    if target_type == "agent_project" and (target_id != trusted_values["agent"] or project_ref != trusted_values["project"]):
-                        raise NativePortError("unknown_agent_project_target")
+                    if target_type == "project":
+                        project_ref = canonical_project_ref(project_ref or target_id)
+                        target_id = ""
+                        if project_ref != canonical_project_ref(trusted_values["project"]):
+                            raise NativePortError("unknown_project_target")
+                    if target_type == "agent_project":
+                        project_ref = canonical_project_ref(project_ref)
+                        if target_id not in allowed_agent_ids or project_ref != canonical_project_ref(trusted_values["project"]):
+                            raise NativePortError("unknown_agent_project_target")
                     if target_type == "provider" and target_id.casefold() != trusted_values["provider"].casefold():
                         raise NativePortError("unknown_provider_target")
                     if target_type == "runtime_role" and target_id.casefold() != trusted_values["runtime_role"].casefold():
@@ -3253,27 +5216,35 @@ class NativeV2RuntimePort:
                         authorization=f"native-gui:{_text(context.get('session_id'))}",
                         status="active",
                     )
-                    persisted = store.upsert_binding(binding)
-                    created.append(persisted.to_dict())
-            after = created
-            decision_id = hashlib.sha256(_canonical_json({"operation": "gui_rule_audience_update", "definition_id": definition_id, "before": before, "after": after}).encode("utf-8")).hexdigest()
-            store.record_decision({
-                "decision_id": decision_id,
-                "actor": _text(context.get("agent_instance_id")),
-                "owner_agent_id": _text(context.get("agent_instance_id")),
-                "rule_id": definition_id,
-                "action": "rule_audience_update",
-                "before_hash": hashlib.sha256(_canonical_json(before).encode("utf-8")).hexdigest(),
-                "after_hash": hashlib.sha256(_canonical_json(after).encode("utf-8")).hexdigest(),
-                "before_json": _canonical_json(before),
-                "after_json": _canonical_json(after),
-                "reason": "native GUI rule audience update",
-                "confidence": 1.0,
-                "undo_id": "",
-                "target_ids_json": _canonical_json([item.get("binding_id") for item in after]),
-                "metadata_json": _canonical_json({"injection_policy": policy}),
-                "source_ref": "native-v2:gui:rule_audience_update",
-            })
+                    candidate_bindings.append(binding)
+            # Preserve history by deactivating prior bindings rather than
+            # deleting permission evidence.  All replacement writes and the
+            # decision record share one V2 rules transaction; a failure in any
+            # candidate therefore rolls back the whole audience mutation.
+            with store.transaction():
+                for binding in existing:
+                    if binding.status == "active":
+                        store.upsert_binding(RuleBinding.from_dict({**binding.to_dict(), "status": "inactive", "revision": binding.revision + 1}))
+                created = [store.upsert_binding(binding).to_dict() for binding in candidate_bindings]
+                after = created
+                decision_id = hashlib.sha256(_canonical_json({"operation": "gui_rule_audience_update", "definition_id": definition_id, "before": before, "after": after}).encode("utf-8")).hexdigest()
+                store.record_decision({
+                    "decision_id": decision_id,
+                    "actor": _text(context.get("agent_instance_id")),
+                    "owner_agent_id": _text(context.get("agent_instance_id")),
+                    "rule_id": definition_id,
+                    "action": "rule_audience_update",
+                    "before_hash": hashlib.sha256(_canonical_json(before).encode("utf-8")).hexdigest(),
+                    "after_hash": hashlib.sha256(_canonical_json(after).encode("utf-8")).hexdigest(),
+                    "before_json": _canonical_json(before),
+                    "after_json": _canonical_json(after),
+                    "reason": "native GUI rule audience update",
+                    "confidence": 1.0,
+                    "undo_id": "",
+                    "target_ids_json": _canonical_json([item.get("binding_id") for item in after]),
+                    "metadata_json": _canonical_json({"injection_policy": policy}),
+                    "source_ref": "native-v2:gui:rule_audience_update",
+                })
             return {"ok": True, "definition_id": definition_id, "injection_policy": policy, "bindings": after, "decision_id": decision_id}
         except NativePortError:
             raise
@@ -3310,6 +5281,51 @@ class NativeV2RuntimePort:
             raise NativePortError("decision_id_required")
         return self._rule_lifecycle_operation("rule_undo", {"decision_id": decision_id}, context, **kwargs)
 
+    def _gui_rule_exception(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **kwargs: Any,
+    ) -> Any:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
+        if operation == "rule_exception_revoke":
+            exception_id = _text(payload.get("exception_id"))
+            if not exception_id:
+                raise NativePortError("exception_id_required")
+            return self._rule_lifecycle_operation(
+                "rule_exception_revoke",
+                {"exception_id": exception_id},
+                context,
+                **kwargs,
+            )
+        parent = _text(payload.get("parent_rule") or payload.get("parent_rule_id"))
+        child = _text(payload.get("child_rule") or payload.get("child_exception") or payload.get("text"))
+        if not parent or not child:
+            raise NativePortError("rule_exception_payload_required")
+        return self._rule_lifecycle_operation(
+            "rule_exception_create",
+            {
+                "parent_rule": parent,
+                "child_rule": child,
+                "priority": payload.get("priority", 0),
+                "reason": _text(payload.get("reason")),
+                "idempotency_key": _text(payload.get("idempotency_key")) or "gui-rule-exception:" + hashlib.sha256(
+                    _canonical_json({
+                        "parent": parent,
+                        "child": child,
+                        "priority": payload.get("priority", 0),
+                        "agent": context.get("agent_instance_id", ""),
+                        "project": context.get("project_ref", ""),
+                    }).encode("utf-8")
+                ).hexdigest(),
+            },
+            context,
+            **kwargs,
+        )
+
     def _rule_lifecycle_operation(
         self,
         operation: str,
@@ -3337,52 +5353,18 @@ class NativeV2RuntimePort:
     def _gui_source_add(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if not self._trusted_admin(context):
             raise NativePortError("admin_capability_required")
-        path = _text(payload.get("path"))
-        if not path:
-            raise NativePortError("source_path_required")
-        source_type = _text(payload.get("source_type") or "selected_directory").casefold()
-        try:
-            from ..source_registry import SourceRegistry
-            from ..schema_v3 import SourceRootType
-            aliases = {
-                "directory": SourceRootType.SELECTED_DIRECTORY,
-                "selected_directory": SourceRootType.SELECTED_DIRECTORY,
-                "file": SourceRootType.SELECTED_FILE,
-                "selected_file": SourceRootType.SELECTED_FILE,
-                "obsidian": SourceRootType.OBSIDIAN_VAULT,
-                "obsidian_vault": SourceRootType.OBSIDIAN_VAULT,
-            }
-            enum_type = aliases.get(source_type)
-            if enum_type is None:
-                raise NativePortError("invalid_source_type")
-            if source_type == "directory" and (Path(path).expanduser() / ".obsidian").is_dir():
-                enum_type = SourceRootType.OBSIDIAN_VAULT
-            reg = SourceRegistry(self.workspace)
-            root = reg.add(path, enum_type, display_name=_text(payload.get("display_name")))
-            return {"ok": True, "root_id": root.root_id, "type": root.type.value, "display_name": root.display_name}
-        except NativePortError:
-            raise
-        except FileNotFoundError as exc:
-            raise NativePortError("source_path_not_found") from exc
-        except Exception as exc:
-            raise NativePortError("v2_source_add_failed") from exc
+        service = self._native_service("source_read")
+        if service is None:
+            raise NativePortError("v2_source_read_service_unavailable")
+        return self._service_result(service, "source_add", payload, context=context)
 
     def _gui_source_remove(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         if not self._trusted_admin(context):
             raise NativePortError("admin_capability_required")
-        source_id = _text(payload.get("source_id") or payload.get("root_id"))
-        if not source_id:
-            raise NativePortError("source_id_required")
-        try:
-            from ..source_registry import SourceRegistry
-            ok = SourceRegistry(self.workspace).remove(source_id)
-            if not ok:
-                raise NativePortError("source_not_removable")
-            return {"ok": True, "root_id": source_id}
-        except NativePortError:
-            raise
-        except Exception as exc:
-            raise NativePortError("v2_source_remove_failed") from exc
+        service = self._native_service("source_read")
+        if service is None:
+            raise NativePortError("v2_source_read_service_unavailable")
+        return self._service_result(service, "source_remove", payload, context=context)
 
     def _gui_memory_source_map(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
@@ -3427,7 +5409,24 @@ class NativeV2RuntimePort:
 
     def _gui_groups(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
         del payload, kwargs
-        return self._cli_groups({"action": "list"}, context)
+        if (self.layout.memory_db.is_file() or self.layout.manifest_db.is_file()) and not self._trusted_admin(context):
+            raise NativePortError("admin_capability_required")
+        try:
+            service = self._group_service(write=False)
+            result = dict(service.list_share_groups())
+            if not self.layout.memory_db.is_file() and not self.layout.manifest_db.is_file():
+                result.setdefault("scope", {
+                    "share_group_id": _text(context.get("share_group_id")),
+                    "agent_instance_id": _text(context.get("agent_instance_id")),
+                    "project_ref": _text(context.get("project_ref")),
+                })
+            return result
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_group_control_unavailable"
+            ) from exc
 
     def _cli_audit(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
         return self._reference_audit(payload, context, **kwargs)
@@ -3613,6 +5612,7 @@ class NativeV2RuntimePort:
             "memory_list": self._memory_list,
             "memory_search": self._memory_search,
             "memory_status": self._memory_status,
+            "memory_global_status": self._memory_global_status,
             "memory_versions": self._memory_versions,
             "memory_supersede_chain": self._memory_supersede_chain,
             "coverage": lambda p, context, **k: self.coverage(),
@@ -3636,6 +5636,7 @@ class NativeV2RuntimePort:
             "gui_rule_create": self._gui_rule_create,
             "gui_rule_feedback": self._gui_rule_feedback,
             "gui_rule_undo": self._gui_rule_undo,
+            "gui_rule_exception": self._gui_rule_exception,
             "gui_rule_snapshot": self._gui_rule_snapshot,
             "gui_rule_effective": self._gui_rule_effective,
             "gui_rule_scope_options": self._gui_rule_scope_options,
@@ -3661,9 +5662,36 @@ class NativeV2RuntimePort:
             "knowledge_read": self._knowledge_read,
             "knowledge_book": self._knowledge_book,
             "knowledge_candidates": self._knowledge_candidates,
+            "gui_knowledge_query": self._gui_knowledge_query,
+            "gui_knowledge_command": self._gui_knowledge_command,
+            "gui_projection_query": self._gui_projection_query,
+            "gui_projection_command": self._gui_projection_command,
+            "gui_release_query": self._gui_release_query,
+            "gui_release_command": self._gui_release_command,
+            "gui_governance_query": self._gui_governance_query,
+            "gui_governance_command": self._gui_governance_command,
+            "gui_agent_query": self._gui_agent_query,
+            "gui_agent_command": self._gui_agent_command,
+            "gui_group_query": self._gui_group_query,
+            "gui_group_command": self._gui_group_command,
+            "gui_task_status": self._gui_task_status,
+            "gui_task_list": self._gui_task_list,
+            "gui_task_cancel": self._gui_task_cancel,
+            "gui_request_compat": self._gui_request_compat,
+            "gui_maintenance_control": self._gui_maintenance_control,
+            "gui_import_query": self._gui_import_query,
+            "gui_import_control": self._gui_import_control,
+            "gui_history_control": self._gui_history_control,
+            "gui_audit_plan": self._gui_audit_plan,
             "reference_audit": self._reference_audit,
             "explain": self._explain,
             "codegraph_graph": self._codegraph_graph,
+            "codegraph_query": self._codegraph_query,
+            "codegraph_path": self._codegraph_path,
+            "codegraph_explain": self._codegraph_explain,
+            "codegraph_affected": self._codegraph_affected,
+            "codegraph_update": self._codegraph_update,
+            "codegraph_status": self._codegraph_status,
             "semantic_check": self._semantic_check,
             "provider_install": self._provider_install,
             "status": self._status,
@@ -3673,6 +5701,7 @@ class NativeV2RuntimePort:
             "diagnostics_snapshot": self._diagnostics_snapshot,
             "scope_echo": self._scope_echo,
             "hook_status": self._hook_status,
+            "gui_host_control": self._gui_host_control,
             "bridge_transport": self._bridge_transport,
             "gui_pick_path": self._gui_pick_path,
             "gui_source_add": self._gui_source_add,
@@ -3695,7 +5724,6 @@ class NativeV2RuntimePort:
             "projection_status": self._projection_status,
             "canonical_status": self._canonical_status,
             "diagnostics_status": lambda p, context, **k: self._status(p, context, **k),
-            "codegraph_status": lambda p, context, **k: self._domain_status("codegraph", p, context, **k),
             "asset_status": lambda p, context, **k: self._domain_status("assets", p, context, **k),
             "skill_status": lambda p, context, **k: self._domain_status("skills", p, context, **k),
         }
@@ -3710,6 +5738,8 @@ class NativeV2RuntimePort:
         generation: int,
         mutation: bool,
         state: Any = None,
+        operation: str = "",
+        public_name: str = "",
     ) -> Any:
         try:
             params = inspect.signature(fn).parameters
@@ -3719,13 +5749,23 @@ class NativeV2RuntimePort:
         if (mutation or context) and not accepts_kwargs and "context" not in params:
             raise NativePortError("v2_context_capability_required")
         kwargs = {
-            key: value for key, value in {
+            key: value
+            for key, value in {
                 "context": context,
                 "generation": generation,
                 "mutation": mutation,
                 "state": state,
-            }.items() if accepts_kwargs or key in params
+            }.items()
+            if accepts_kwargs or key in params
         }
+        # Canonical operation metadata is business dispatch input, not generic
+        # transport context.  Only handlers that explicitly declare these
+        # parameters receive them; forwarding through an arbitrary **kwargs
+        # wrapper can duplicate a fixed operation argument downstream.
+        if "operation" in params:
+            kwargs["operation"] = operation
+        if "public_name" in params:
+            kwargs["public_name"] = public_name
         return fn(payload, **kwargs)
 
     @staticmethod
@@ -3927,6 +5967,8 @@ class NativeV2RuntimePort:
                 generation=generation,
                 mutation=effective_mutation,
                 state=state,
+                operation=spec.canonical_name or name,
+                public_name=name,
             )
             return self._result(surface, name, result, generation=generation)
         except NativePortError as exc:
@@ -3941,13 +5983,24 @@ class NativeV2RuntimePort:
         spec = self._registry.get(surface_key, {}).get(operation)
         if spec is None:
             return self._error(surface_key, operation, "unknown_surface_operation")
+        # Dispatch handlers normalize and consume transport fields.  Snapshot
+        # the complete request before mutation classification so direct native
+        # callers receive the same no-alias guarantee as MCP execute_tool.
+        try:
+            request_args = deepcopy(args)
+        except Exception:
+            return self._error(
+                surface_key,
+                operation,
+                "invalid_native_arguments",
+            )
         # Classify command sub-actions before the state/CAS gate.  Otherwise a
         # caller could label a mutating maintenance action as read-only and
         # reach the handler without a trusted provider snapshot.
         effective_mutation = self._classify_mutation(
             surface_key,
             operation,
-            args,
+            request_args,
             bool(mutation),
             spec,
         )
@@ -3959,7 +6012,7 @@ class NativeV2RuntimePort:
         return self._dispatch_checked(
             surface_key,
             operation,
-            args,
+            request_args,
             context=context,
             generation=generation,
             mutation=effective_mutation,
@@ -3999,6 +6052,19 @@ class NativeV2RuntimePort:
 
     def dispatch_cli(self, name: str, args: Any = None, *, context: Any = None, generation: int | None = None, mutation: bool = False, state: Any = None) -> dict[str, Any]:
         return self.dispatch("cli", name, args, context=context, generation=generation, mutation=mutation, state=state)
+
+    def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Stop every worker owned by this native port before GUI/process exit."""
+        stopped = True
+        if self._task_coordinator is not None:
+            try:
+                result = self._task_coordinator.shutdown(timeout=float(timeout))
+                stopped = bool(result.get("ok", True)) if isinstance(result, Mapping) else True
+            except Exception:
+                stopped = False
+        return {"ok": stopped, "owned_workers_stopped": stopped}
+
+    close = shutdown
 
 
 NativeRuntimePort = NativeV2RuntimePort

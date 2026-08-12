@@ -1182,6 +1182,29 @@ class RuleV2Store:
         value = dict(value); value.setdefault("feedback_id", stable_digest((value.get("source_ref", ""), value.get("receipt_id", ""), value.get("outcome", ""))))
         return self._insert_generic("rule_feedback_refs", "feedback_id", value)
 
+    def list_feedback(
+        self,
+        *,
+        receipt_id: str | None = None,
+        definition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read immutable feedback rows without crossing the V2 store boundary."""
+
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            clauses, params = ["1=1"], []
+            for column, value in (("receipt_id", receipt_id), ("definition_id", definition_id)):
+                if value is not None:
+                    clauses.append(column + "=?")
+                    params.append(str(value))
+            rows = conn.execute(
+                "SELECT * FROM rule_feedback_refs WHERE " + " AND ".join(clauses) +
+                " ORDER BY created_at, feedback_id",
+                params,
+            ).fetchall()
+            return [_row_dict(row) for row in rows]
+
+        return self._read(op)
+
     def record_runtime_feedback(self, value: Mapping[str, Any]) -> str:
         value = dict(value); value.setdefault("feedback_id", stable_digest((value.get("source_ref", ""), value.get("receipt_id", ""))))
         return self._insert_generic("rule_runtime_feedback_refs", "feedback_id", value)
@@ -1199,7 +1222,254 @@ class RuleV2Store:
         value = dict(value); value.setdefault("contribution_id", stable_digest(value)); return self._insert_generic("rule_evidence_contributions", "contribution_id", value)
 
     def record_evidence_effective(self, value: Mapping[str, Any]) -> str:
-        value = dict(value); value.setdefault("effective_id", stable_digest(value)); return self._insert_generic("rule_evidence_effective", "effective_id", value)
+        """Upsert one rebuildable effective-evidence projection.
+
+        Contributions and feedback are immutable evidence.  The effective
+        row is intentionally mutable: undo/deactivation must be able to
+        restore the next deterministic runner-up without rewriting history.
+        """
+
+        item = dict(value)
+        definition_id = str(item.get("definition_id") or "")
+        independence_key = str(item.get("independence_key") or "")
+        kind = str(item.get("kind") or "evidence")
+        item.setdefault("effective_id", stable_digest(("effective", definition_id, independence_key)))
+        item.setdefault("updated_at", _now())
+
+        def op(conn: sqlite3.Connection) -> str:
+            conn.execute(
+                "INSERT INTO rule_evidence_effective(effective_id,definition_id,independence_key,kind,winner_contribution_id,polarity,authority,confidence,observed_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(effective_id) DO UPDATE SET definition_id=excluded.definition_id,independence_key=excluded.independence_key,kind=excluded.kind,winner_contribution_id=excluded.winner_contribution_id,polarity=excluded.polarity,authority=excluded.authority,confidence=excluded.confidence,observed_at=excluded.observed_at,updated_at=excluded.updated_at",
+                (
+                    str(item.get("effective_id") or ""), definition_id,
+                    independence_key, kind,
+                    str(item.get("winner_contribution_id") or ""),
+                    str(item.get("polarity") or "positive"),
+                    int(item.get("authority", 0) or 0),
+                    float(item.get("confidence", 1.0) if item.get("confidence") is not None else 1.0),
+                    str(item.get("observed_at") or ""), str(item.get("updated_at") or _now()),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM rule_evidence_effective WHERE definition_id=? AND independence_key=? AND kind=? AND effective_id<>?",
+                (definition_id, independence_key, kind, str(item.get("effective_id") or "")),
+            )
+            return str(item.get("effective_id") or "")
+
+        return str(self._write(op))
+
+    def list_evidence_contributions(
+        self,
+        *,
+        definition_id: str | None = None,
+        independence_key: str | None = None,
+        kind: str | None = None,
+        active: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            clauses, params = ["1=1"], []
+            for column, value in (
+                ("definition_id", definition_id),
+                ("independence_key", independence_key),
+                ("kind", kind),
+            ):
+                if value is not None:
+                    clauses.append(column + "=?")
+                    params.append(str(value))
+            if active is not None:
+                clauses.append("active=?")
+                params.append(int(bool(active)))
+            rows = conn.execute(
+                "SELECT * FROM rule_evidence_contributions WHERE " + " AND ".join(clauses) +
+                " ORDER BY definition_id, independence_key, kind, contribution_id",
+                params,
+            ).fetchall()
+            return [_row_dict(row) for row in rows]
+
+        return self._read(op)
+
+    def deactivate_evidence_contribution(self, contribution_id: str, *, updated_at: str = "") -> bool:
+        """Deactivate one contribution while preserving its immutable row."""
+
+        def op(conn: sqlite3.Connection) -> bool:
+            changed = conn.execute(
+                "UPDATE rule_evidence_contributions SET active=0,updated_at=? WHERE contribution_id=? AND active=1",
+                (str(updated_at or _now()), str(contribution_id or "")),
+            ).rowcount
+            return bool(changed)
+
+        return bool(self._write(op))
+
+    def rebuild_evidence_effective(
+        self,
+        *,
+        definition_id: str,
+        independence_key: str,
+        kind: str = "evidence",
+        updated_at: str = "",
+    ) -> dict[str, Any] | None:
+        """Rebuild one effective group using a deterministic trusted winner.
+
+        Legacy/migrated rows without a trust marker remain eligible.  Native
+        rows explicitly marked ``session_trusted=false`` are retained for
+        audit but cannot affect narrowing/effective state.
+        """
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            rows = conn.execute(
+                "SELECT * FROM rule_evidence_contributions WHERE definition_id=? AND independence_key=? AND kind=? AND active=1",
+                (str(definition_id), str(independence_key), str(kind)),
+            ).fetchall()
+            eligible: list[sqlite3.Row] = []
+            for row in rows:
+                metadata = _json_object(row["metadata_json"])
+                trust = metadata.get("session_trusted")
+                if trust is not None and str(trust).casefold() in {"0", "false", "no", "untrusted"}:
+                    continue
+                eligible.append(row)
+            winner = max(
+                eligible,
+                key=lambda row: (
+                    int(row["authority"] or 0),
+                    float(row["confidence"] if row["confidence"] is not None else 0.0),
+                    str(row["observed_at"] or ""),
+                    str(row["contribution_id"] or ""),
+                ),
+                default=None,
+            )
+            effective_id = stable_digest(("effective", str(definition_id), str(independence_key)))
+            if winner is None:
+                conn.execute(
+                    "DELETE FROM rule_evidence_effective WHERE definition_id=? AND independence_key=? AND kind=?",
+                    (str(definition_id), str(independence_key), str(kind)),
+                )
+                return None
+            now = str(updated_at or _now())
+            conn.execute(
+                "INSERT INTO rule_evidence_effective(effective_id,definition_id,independence_key,kind,winner_contribution_id,polarity,authority,confidence,observed_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(effective_id) DO UPDATE SET definition_id=excluded.definition_id,independence_key=excluded.independence_key,kind=excluded.kind,winner_contribution_id=excluded.winner_contribution_id,polarity=excluded.polarity,authority=excluded.authority,confidence=excluded.confidence,observed_at=excluded.observed_at,updated_at=CASE WHEN rule_evidence_effective.winner_contribution_id=excluded.winner_contribution_id THEN rule_evidence_effective.updated_at ELSE excluded.updated_at END",
+                (
+                    effective_id, str(definition_id), str(independence_key), str(kind),
+                    str(winner["contribution_id"] or ""), str(winner["polarity"] or "positive"),
+                    int(winner["authority"] or 0), float(winner["confidence"] if winner["confidence"] is not None else 1.0),
+                    str(winner["observed_at"] or ""), now,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM rule_evidence_effective WHERE definition_id=? AND independence_key=? AND kind=? AND effective_id<>?",
+                (str(definition_id), str(independence_key), str(kind), effective_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM rule_evidence_effective WHERE effective_id=?", (effective_id,),
+            ).fetchone()
+            return None if row is None else _row_dict(row)
+
+        active = self._active()
+        if active is not None:
+            return op(active)
+        return self._write(op)
+
+    def get_effective_feedback_projection(self, receipt_id: str) -> dict[str, Any] | None:
+        row = self._read(lambda conn: conn.execute(
+            "SELECT * FROM rule_effective_feedback_projection WHERE receipt_id=?",
+            (str(receipt_id or ""),),
+        ).fetchone())
+        return None if row is None else _row_dict(row)
+
+    def upsert_effective_feedback_projection(self, value: Mapping[str, Any]) -> str:
+        item = dict(value)
+        receipt_id = str(item.get("receipt_id") or "")
+        if not receipt_id:
+            raise ValueError("receipt_id is required")
+        projection_digest = str(item.get("projection_digest") or stable_digest({key: value for key, value in item.items() if key != "projection_digest"}))
+        now = str(item.get("updated_at") or _now())
+
+        def op(conn: sqlite3.Connection) -> str:
+            conn.execute(
+                "INSERT INTO rule_effective_feedback_projection(receipt_id,effective_feedback_id,definition_id,outcome,positive_evidence_ref,negative_evidence_ref,projection_digest,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(receipt_id) DO UPDATE SET effective_feedback_id=excluded.effective_feedback_id,definition_id=excluded.definition_id,outcome=excluded.outcome,positive_evidence_ref=excluded.positive_evidence_ref,negative_evidence_ref=excluded.negative_evidence_ref,projection_digest=excluded.projection_digest,updated_at=excluded.updated_at",
+                (
+                    receipt_id, str(item.get("effective_feedback_id") or ""),
+                    str(item.get("definition_id") or ""), str(item.get("outcome") or ""),
+                    str(item.get("positive_evidence_ref") or ""),
+                    str(item.get("negative_evidence_ref") or ""),
+                    projection_digest, now,
+                ),
+            )
+            return receipt_id
+
+        return str(self._write(op))
+
+    def rebuild_effective_feedback_projection(self, receipt_id: str, *, updated_at: str = "") -> dict[str, Any] | None:
+        """Rebuild the per-receipt projection from trusted feedback rows."""
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            rows = conn.execute(
+                "SELECT * FROM rule_feedback_refs WHERE receipt_id=? ORDER BY created_at, feedback_id",
+                (str(receipt_id or ""),),
+            ).fetchall()
+            eligible: list[sqlite3.Row] = []
+            for row in rows:
+                metadata = _json_object(row["metadata_json"])
+                trust = metadata.get("session_trusted")
+                if trust is not None and str(trust).casefold() in {"0", "false", "no", "untrusted"}:
+                    continue
+                if str(row["outcome"] or "").casefold() in {"", "ignored", "unobserved"}:
+                    continue
+                eligible.append(row)
+            winner = max(
+                eligible,
+                key=lambda row: (
+                    int(row["authority"] or 0),
+                    float(_json_object(row["metadata_json"]).get("confidence", 0.0) or 0.0),
+                    str(row["created_at"] or ""),
+                    str(row["feedback_id"] or ""),
+                ),
+                default=None,
+            )
+            if winner is None:
+                conn.execute(
+                    "DELETE FROM rule_effective_feedback_projection WHERE receipt_id=?",
+                    (str(receipt_id or ""),),
+                )
+                return None
+            contribution = conn.execute(
+                "SELECT contribution_id,polarity FROM rule_evidence_contributions WHERE feedback_id=? AND active=1 ORDER BY contribution_id LIMIT 1",
+                (str(winner["feedback_id"] or ""),),
+            ).fetchone()
+            contribution_id = str(contribution["contribution_id"] or "") if contribution is not None else ""
+            polarity = str(contribution["polarity"] or "") if contribution is not None else ""
+            now = str(updated_at or _now())
+            projection = {
+                "receipt_id": str(receipt_id),
+                "effective_feedback_id": str(winner["feedback_id"] or ""),
+                "definition_id": str(winner["definition_id"] or ""),
+                "outcome": str(winner["outcome"] or ""),
+                "positive_evidence_ref": contribution_id if polarity == "positive" else "",
+                "negative_evidence_ref": contribution_id if polarity == "negative" else "",
+                "updated_at": now,
+            }
+            projection["projection_digest"] = stable_digest(projection)
+            conn.execute(
+                "INSERT INTO rule_effective_feedback_projection(receipt_id,effective_feedback_id,definition_id,outcome,positive_evidence_ref,negative_evidence_ref,projection_digest,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(receipt_id) DO UPDATE SET effective_feedback_id=excluded.effective_feedback_id,definition_id=excluded.definition_id,outcome=excluded.outcome,positive_evidence_ref=excluded.positive_evidence_ref,negative_evidence_ref=excluded.negative_evidence_ref,projection_digest=excluded.projection_digest,updated_at=excluded.updated_at",
+                (
+                    projection["receipt_id"], projection["effective_feedback_id"],
+                    projection["definition_id"], projection["outcome"],
+                    projection["positive_evidence_ref"], projection["negative_evidence_ref"],
+                    projection["projection_digest"], projection["updated_at"],
+                ),
+            )
+            return projection
+
+        active = self._active()
+        if active is not None:
+            return op(active)
+        return self._write(op)
 
     def record_governance_capability(self, value: Mapping[str, Any]) -> str:
         value = dict(value); value.setdefault("capability_id", stable_digest(value)); return self._insert_generic("rule_governance_capabilities", "capability_id", value)

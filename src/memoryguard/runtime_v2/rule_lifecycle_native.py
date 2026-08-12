@@ -17,6 +17,8 @@ from typing import Any, Mapping
 
 from ..governance_v2.rules import RuleMutationContext, RuleAuthorizationError
 from ..rule_definition import build_definition
+from ..rule_exception_core import RuleExceptionPlanError, plan_rule_exception_scope
+from ..rule_scope import canonical_project_ref
 from ..rules.v2_store import RuleV2Store, stable_digest
 from ..security import feedback_authority
 from .native_ports import NativeContextError, resolve_native_transport_context
@@ -113,6 +115,13 @@ class NativeRuleLifecycleService:
         if not target_type:
             target_type = "agent"
             target_id = target_id or context.agent
+        requested_project = str(scope.get("project_ref") or "").strip()
+        if requested_project and canonical_project_ref(requested_project) != canonical_project_ref(context.project):
+            # ``target_id`` is normalized to the trusted project below for
+            # authorization.  Compare the caller's explicit project first so
+            # that normalization cannot turn a foreign-project request into a
+            # valid local project scope.
+            raise NativeRuleLifecycleError("other_project_scope_denied")
         auth_scope = dict(scope)
         auth_scope["target_type"] = "project" if target_type == "agent_project" else target_type
         if target_type in {"project", "agent_project"}:
@@ -307,6 +316,15 @@ class NativeRuleLifecycleService:
             raise NativeRuleLifecycleError("rule_receipt_project_mismatch")
         evidence = str(payload.get("evidence") or "")
         evidence_digest = _digest_text(evidence) if evidence else ""
+        # Feedback is always retained as an audit row, but only a trusted host
+        # or transport session may affect the effective evidence projection.
+        # This preserves the old cross-session narrowing rule without letting
+        # an untrusted direct/MCP caller narrow a binding.
+        trusted_session = bool(
+            authority.session_trusted is True
+            and bool(authority.session_id)
+            and authority.session_source.casefold() in {"host", "transport"}
+        )
         clean_payload = dict(payload)
         clean_payload["evidence"] = evidence_digest
         key, fingerprint, replay = self._replay("rule_feedback", clean_payload, trusted)
@@ -344,7 +362,12 @@ class NativeRuleLifecycleService:
             self.store.record_evidence_contribution({
                 "contribution_id": stable_digest(("native-v2-feedback-evidence", feedback_id)),
                 "definition_id": definition_id,
-                "independence_key": stable_digest((trusted.group, receipt_id, authority.session_id or receipt_id)),
+                # One receipt is one independent observation.  Session ID is
+                # intentionally not part of this key: the same matched rule
+                # replayed in another trusted session must collapse to one
+                # effective winner, while distinct receipts remain distinct
+                # cross-session evidence.
+                "independence_key": stable_digest(("native-v2-feedback", trusted.group, definition_id, receipt_id)),
                 "kind": "feedback",
                 "polarity": polarity,
                 "authority": producer_authority,
@@ -356,10 +379,25 @@ class NativeRuleLifecycleService:
                 "source_evidence_id": "",
                 "source_memory_id": str(receipt.get("source_rule_id") or ""),
                 "source_ids_json": _json([receipt_id]),
-                "metadata_json": _json({"outcome": outcome, "evidence_digest": evidence_digest}),
+                "metadata_json": _json({
+                    "outcome": outcome,
+                    "evidence_digest": evidence_digest,
+                    "session_id": authority.session_id,
+                    "session_source": authority.session_source,
+                    "session_trusted": trusted_session,
+                }),
                 "created_at": now,
                 "updated_at": now,
             })
+            effective = None
+            if trusted_session:
+                effective = self.store.rebuild_evidence_effective(
+                    definition_id=definition_id,
+                    independence_key=stable_digest(("native-v2-feedback", trusted.group, definition_id, receipt_id)),
+                    kind="feedback",
+                    updated_at=now,
+                )
+                self.store.rebuild_effective_feedback_projection(receipt_id, updated_at=now)
             after = {"feedback_id": feedback_id, "receipt_id": receipt_id, "outcome": outcome, "definition_id": definition_id}
             self.store.record_decision({
                 "decision_id": decision_id,
@@ -381,7 +419,15 @@ class NativeRuleLifecycleService:
             })
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=definition_id)
         decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
-        return self._decision_result(decision, feedback_id=feedback_id, receipt_id=receipt_id, outcome=outcome, undo_id=undo_id)
+        return self._decision_result(
+            decision,
+            feedback_id=feedback_id,
+            receipt_id=receipt_id,
+            outcome=outcome,
+            undo_id=undo_id,
+            effective_evidence_id=str((effective or {}).get("effective_id") or ""),
+            trusted_session=trusted_session,
+        )
 
     def undo(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
         _authority, trusted = self._context(context, automatic=False)
@@ -428,6 +474,24 @@ class NativeRuleLifecycleService:
                 definition_id = str(original_after.get("definition_id") or original.get("rule_id") or "")
                 if not feedback_id or not receipt_id or not definition_id:
                     raise NativeRuleLifecycleError("rule_undo_snapshot_incomplete")
+                contribution_id = stable_digest(("native-v2-feedback-evidence", feedback_id))
+                contribution = next(
+                    (
+                        item for item in self.store.list_evidence_contributions()
+                        if str(item.get("contribution_id") or "") == contribution_id
+                        or str(item.get("feedback_id") or "") == feedback_id
+                    ),
+                    None,
+                )
+                if contribution is not None:
+                    contribution_id = str(contribution.get("contribution_id") or contribution_id)
+                    self.store.deactivate_evidence_contribution(contribution_id, updated_at=now)
+                    self.store.rebuild_evidence_effective(
+                        definition_id=str(contribution.get("definition_id") or definition_id),
+                        independence_key=str(contribution.get("independence_key") or ""),
+                        kind=str(contribution.get("kind") or "feedback"),
+                        updated_at=now,
+                    )
                 compensating_id = stable_digest(("native-v2-feedback-compensation", feedback_id, new_decision_id))
                 self.store.record_feedback({
                     "feedback_id": compensating_id,
@@ -439,6 +503,7 @@ class NativeRuleLifecycleService:
                     "metadata_json": _json({"compensates_feedback_id": feedback_id, "original_decision_id": str(original.get("decision_id") or "")}),
                     "created_at": now,
                 })
+                self.store.rebuild_effective_feedback_projection(receipt_id, updated_at=now)
                 compensation.update({"feedback_id": feedback_id, "compensating_feedback_id": compensating_id, "receipt_id": receipt_id, "definition_id": definition_id})
             else:
                 raise NativeRuleLifecycleError("rule_undo_action_unsupported")
@@ -463,6 +528,302 @@ class NativeRuleLifecycleService:
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=new_decision_id, memory_id=str(original.get("rule_id") or ""))
         decision = self.store.get_decision(new_decision_id) or {"decision_id": new_decision_id}
         return self._decision_result(decision, compensation=compensation)
+
+    def _resolve_definition_id(self, value: str, group: str) -> str:
+        candidate = str(value or "").strip()
+        if not candidate:
+            raise NativeRuleLifecycleError("parent_rule_required")
+        if self.store.get_definition(candidate) is not None:
+            return candidate
+        with self.store.transaction() as conn:
+            row = conn.execute(
+                "SELECT canonical_definition_id FROM rule_source_links "
+                "WHERE share_group_id=? AND (memory_id=? OR canonical_definition_id=?) "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (group, candidate, candidate),
+            ).fetchone()
+        definition_id = str(row[0] or "") if row is not None else ""
+        if not definition_id or self.store.get_definition(definition_id) is None:
+            raise NativeRuleLifecycleError("parent_rule_not_found")
+        return definition_id
+
+    def create_exception(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        authority, trusted = self._context(context, automatic=False)
+        parent_value = str(payload.get("parent_rule") or payload.get("parent_rule_id") or "").strip()
+        child_text = str(payload.get("child_rule") or payload.get("child_exception") or payload.get("text") or "").strip()
+        if not child_text:
+            raise NativeRuleLifecycleError("child_exception_required")
+        try:
+            priority = int(payload.get("priority", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise NativeRuleLifecycleError("invalid_rule_priority") from exc
+        if priority < -100 or priority > 100:
+            raise NativeRuleLifecycleError("invalid_rule_priority")
+        reason = str(payload.get("reason") or "native V2 rule exception").strip()[:1024]
+        parent_id = self._resolve_definition_id(parent_value, trusted.group)
+        parent = self.store.get_definition(parent_id)
+        if parent is None or parent.status != "active":
+            raise NativeRuleLifecycleError("parent_rule_not_active")
+        parent_bindings = self.store.list_bindings(
+            definition_id=parent_id,
+            share_group_id=trusted.group,
+            status="active",
+        )
+        try:
+            plan = plan_rule_exception_scope(
+                parent_bindings,
+                agent_instance_id=trusted.agent,
+                project_ref=trusted.project,
+            )
+        except RuleExceptionPlanError as exc:
+            raise NativeRuleLifecycleError(exc.code) from exc
+
+        clean_payload = {
+            "parent_rule_id": parent_id,
+            "child_text_digest": _digest_text(child_text),
+            "priority": priority,
+            "reason_digest": _digest_text(reason),
+        }
+        key, fingerprint, replay = self._replay("rule_exception_create", clean_payload, trusted)
+        if replay is not None:
+            decision = replay.get("decision") or {}
+            try:
+                after = _object(decision.get("after_json"))
+            except Exception:
+                after = {}
+            return {**replay, "exception_id": str(after.get("exception_id") or ""), "child_definition_id": str(after.get("child_definition_id") or "")}
+
+        now = _now()
+        child = build_definition(child_text, kind=parent.rule_kind, created_at=now)
+        if child.definition_id == parent_id:
+            raise NativeRuleLifecycleError("exception_cannot_equal_parent")
+        child_binding_id = stable_digest((
+            "native-v2-rule-exception-child", child.definition_id, trusted.group,
+            plan.child_binding["target_type"], plan.child_binding["target_id"],
+            plan.child_binding["project_ref"], priority,
+        ))
+        exclude_binding_id = stable_digest((
+            "native-v2-rule-exception-parent-exclude", parent_id, trusted.group,
+            plan.parent_exclude["target_type"], plan.parent_exclude["target_id"],
+            plan.parent_exclude["project_ref"],
+        )) if plan.exclude_required else ""
+        exception_id = stable_digest((
+            "native-v2-rule-exception", parent_id, child.definition_id,
+            trusted.group, trusted.agent, trusted.project,
+        ))
+        decision_id = stable_digest(("native-v2-rule-exception-decision", trusted.group, key, fingerprint))
+        undo_id = stable_digest(("native-v2-rule-exception-undo", decision_id))
+        evidence_id = stable_digest(("native-v2-rule-exception-evidence", exception_id, _digest_text(child_text)))
+        source_ref = f"native-v2:rule-exception:{exception_id}"
+
+        previous_child = self.store.get_definition(child.definition_id)
+        previous_child_binding = next(
+            (item for item in self.store.list_bindings(definition_id=child.definition_id, share_group_id=trusted.group) if item.binding_id == child_binding_id),
+            None,
+        )
+        previous_exclude = next(
+            (item for item in parent_bindings if item.binding_id == exclude_binding_id),
+            None,
+        ) if exclude_binding_id else None
+        before = {
+            "child_definition_status": previous_child.status if previous_child else "missing",
+            "child_binding_status": previous_child_binding.status if previous_child_binding else "missing",
+            "parent_exclude_status": previous_exclude.status if previous_exclude else "missing",
+        }
+        rollback = {
+            "child_definition_id": child.definition_id,
+            "child_binding_id": child_binding_id,
+            "child_definition_previous_status": before["child_definition_status"],
+            "child_binding_previous_status": before["child_binding_status"],
+            "parent_exclude_binding_id": exclude_binding_id,
+            "parent_exclude_previous_status": before["parent_exclude_status"],
+            "generated_parent_exclude": bool(plan.exclude_required),
+        }
+        with self.store.transaction():
+            persisted_child = self.store.upsert_definition(child)
+            child_binding = self.store.upsert_binding({
+                "binding_id": child_binding_id,
+                "definition_id": persisted_child.definition_id,
+                "share_group_id": trusted.group,
+                **dict(plan.child_binding),
+                "priority": priority,
+                "owner_agent_id": trusted.agent,
+                "created_by": "admin" if trusted.admin else "manual",
+                "authorization": f"native:{authority.session_source}:{authority.session_id}",
+                "status": "active",
+                "revision": previous_child_binding.revision + 1 if previous_child_binding and previous_child_binding.status != "active" else (previous_child_binding.revision if previous_child_binding else 1),
+                "created_at": previous_child_binding.created_at if previous_child_binding else now,
+                "updated_at": now,
+            })
+            parent_exclude = None
+            if plan.exclude_required:
+                parent_exclude = self.store.upsert_binding({
+                    "binding_id": exclude_binding_id,
+                    "definition_id": parent_id,
+                    "share_group_id": trusted.group,
+                    **dict(plan.parent_exclude),
+                    "priority": priority,
+                    "owner_agent_id": trusted.agent,
+                    "created_by": "admin" if trusted.admin else "manual",
+                    "authorization": f"native:{authority.session_source}:{authority.session_id}",
+                    "status": "active",
+                    "revision": previous_exclude.revision + 1 if previous_exclude and previous_exclude.status != "active" else (previous_exclude.revision if previous_exclude else 1),
+                    "created_at": previous_exclude.created_at if previous_exclude else now,
+                    "updated_at": now,
+                })
+            self.store.upsert_exception({
+                "exception_id": exception_id,
+                "parent_rule_id": parent_id,
+                "child_exception_id": child.definition_id,
+                "parent_rule": parent.canonical_text,
+                "child_exception": child.canonical_text,
+                "priority": priority,
+                "reason": reason,
+                "rollback_json": _json(rollback),
+                "active": 1,
+                "source_ref": source_ref,
+                "created_at": now,
+                "updated_at": now,
+            })
+            after = {
+                "exception_id": exception_id,
+                "parent_rule_id": parent_id,
+                "child_definition_id": child.definition_id,
+                "child_binding_id": child_binding.binding_id,
+                "parent_exclude_binding_id": parent_exclude.binding_id if parent_exclude else "",
+                "scope": plan.to_dict(),
+            }
+            self.store.record_decision({
+                "decision_id": decision_id,
+                "actor": trusted.agent,
+                "owner_agent_id": trusted.agent,
+                "rule_id": parent_id,
+                "action": "rule_exception_create",
+                "before_hash": stable_digest(before),
+                "after_hash": stable_digest(after),
+                "before_json": _json(before),
+                "after_json": _json(after),
+                "reason": reason,
+                "confidence": 1.0,
+                "undo_id": undo_id,
+                "target_ids_json": _json([exception_id, child.definition_id, child_binding_id, exclude_binding_id]),
+                "metadata_json": _json({"idempotency_key": key}),
+                "source_ref": source_ref,
+                "created_at": now,
+            })
+            self.store.append_evidence_outbox({
+                "event_id": stable_digest(("rule-exception-evidence-event", exception_id)),
+                "migration_id": "native-v2",
+                "evidence_id": evidence_id,
+                "definition_id": child.definition_id,
+                "evidence_ref": source_ref,
+                "content_digest": _digest_text(child_text),
+                "polarity": "positive",
+                "source_kind": "rule_exception",
+                "source_group_id": trusted.group,
+                "payload_json": _json({"exception_id": exception_id, "parent_rule_id": parent_id}),
+                "created_at": now,
+            })
+            self.store.append_domain_outbox({
+                "event_id": stable_digest(("rule-exception-domain-event", exception_id)),
+                "migration_id": "native-v2",
+                "event_type": "rule_exception_created",
+                "source_kind": "rule_exception",
+                "source_group_id": trusted.group,
+                "source_ref": source_ref,
+                "payload_digest": stable_digest(after),
+                "payload_json": _json({"exception_id": exception_id, "definition_id": child.definition_id}),
+                "created_at": now,
+            })
+            self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=parent_id)
+        decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
+        return self._decision_result(
+            decision,
+            exception_id=exception_id,
+            child_definition_id=child.definition_id,
+            child_binding_id=child_binding_id,
+            parent_exclude_binding_id=exclude_binding_id,
+            undo_id=undo_id,
+        )
+
+    def revoke_exception(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        _authority, trusted = self._context(context, automatic=False)
+        exception_id = str(payload.get("exception_id") or "").strip()
+        if not exception_id:
+            raise NativeRuleLifecycleError("exception_id_required")
+        clean_payload = {"exception_id": exception_id}
+        key, fingerprint, replay = self._replay("rule_exception_revoke", clean_payload, trusted)
+        if replay is not None:
+            return {**replay, "exception_id": exception_id}
+        with self.store.transaction() as conn:
+            row = conn.execute("SELECT * FROM rule_exceptions WHERE exception_id=?", (exception_id,)).fetchone()
+        if row is None:
+            raise NativeRuleLifecycleError("rule_exception_not_found")
+        item = {str(key): row[key] for key in row.keys()}
+        if int(item.get("active") or 0) != 1:
+            raise NativeRuleLifecycleError("rule_exception_not_active")
+        parent_id = str(item.get("parent_rule_id") or "")
+        allowed = self.store.list_bindings(definition_id=parent_id, share_group_id=trusted.group)
+        if not allowed:
+            raise NativeRuleLifecycleError("rule_exception_scope_mismatch")
+        try:
+            rollback = _object(item.get("rollback_json"))
+        except Exception as exc:
+            raise NativeRuleLifecycleError("rule_exception_rollback_corrupt") from exc
+        child_definition_id = str(rollback.get("child_definition_id") or item.get("child_exception_id") or "")
+        child_binding_id = str(rollback.get("child_binding_id") or "")
+        exclude_binding_id = str(rollback.get("parent_exclude_binding_id") or "")
+        now = _now()
+        decision_id = stable_digest(("native-v2-rule-exception-revoke", trusted.group, key, fingerprint))
+        after = {
+            "exception_id": exception_id,
+            "child_binding_status": "inactive",
+            "parent_exclude_status": "inactive" if bool(rollback.get("generated_parent_exclude")) else "preserved",
+        }
+        with self.store.transaction() as conn:
+            child_binding = next((item for item in self.store.list_bindings(definition_id=child_definition_id) if item.binding_id == child_binding_id), None)
+            if child_binding is not None and child_binding.status == "active":
+                self.store.upsert_binding({**child_binding.to_dict(), "status": "inactive", "revision": child_binding.revision + 1, "updated_at": now})
+            if bool(rollback.get("generated_parent_exclude")) and exclude_binding_id:
+                exclude = next((item for item in self.store.list_bindings(definition_id=parent_id) if item.binding_id == exclude_binding_id), None)
+                if exclude is not None and exclude.status == "active":
+                    self.store.upsert_binding({**exclude.to_dict(), "status": "inactive", "revision": exclude.revision + 1, "updated_at": now})
+            child_def = self.store.get_definition(child_definition_id)
+            if child_def is not None and not self.store.list_bindings(definition_id=child_definition_id, status="active"):
+                self.store.upsert_definition(replace(child_def, status="inactive", revision=child_def.revision + 1, updated_at=now))
+            conn.execute("UPDATE rule_exceptions SET active=0,updated_at=? WHERE exception_id=? AND active=1", (now, exception_id))
+            self.store.record_decision({
+                "decision_id": decision_id,
+                "actor": trusted.agent,
+                "owner_agent_id": trusted.agent,
+                "rule_id": parent_id,
+                "action": "rule_exception_revoke",
+                "before_hash": stable_digest(item),
+                "after_hash": stable_digest(after),
+                "before_json": _json({"exception_id": exception_id, "active": 1}),
+                "after_json": _json(after),
+                "reason": "native V2 rule exception revoke",
+                "confidence": 1.0,
+                "undo_id": stable_digest(("native-v2-rule-exception-revoke-undo", decision_id)),
+                "target_ids_json": _json([exception_id, child_binding_id, exclude_binding_id]),
+                "metadata_json": _json({"idempotency_key": key}),
+                "source_ref": f"native-v2:rule-exception:{exception_id}",
+                "created_at": now,
+            })
+            self.store.append_domain_outbox({
+                "event_id": stable_digest(("rule-exception-revoked-event", exception_id, decision_id)),
+                "migration_id": "native-v2",
+                "event_type": "rule_exception_revoked",
+                "source_kind": "rule_exception",
+                "source_group_id": trusted.group,
+                "source_ref": f"native-v2:rule-exception:{exception_id}",
+                "payload_digest": stable_digest(after),
+                "payload_json": _json({"exception_id": exception_id}),
+                "created_at": now,
+            })
+            self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=parent_id)
+        decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
+        return self._decision_result(decision, exception_id=exception_id, revoked=True)
 
     def decision_read(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
         _authority, trusted = self._context(context, automatic=False)
@@ -506,6 +867,8 @@ class NativeRuleLifecycleService:
             "memoryguard_rule_decision_read": self.decision_read,
             "rule_scope_stats": self.scope_stats,
             "memoryguard_rule_scope_stats": self.scope_stats,
+            "rule_exception_create": self.create_exception,
+            "rule_exception_revoke": self.revoke_exception,
         }
         handler = handlers.get(str(operation or ""))
         if handler is None:

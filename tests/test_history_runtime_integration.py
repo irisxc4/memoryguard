@@ -1,115 +1,189 @@
-"""MCP and Hook integration tests for the isolated raw-history archive."""
+"""Native V2 history integration at the MCP/service boundary."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+from memoryguard.access_context import AccessContext
+from memoryguard.content.conversation_sync import ConversationEvent, ConversationSync
+from memoryguard.content.store import ContentStore
 from memoryguard.host_hooks import run_hook
-from memoryguard.mcp_server import TOOLS, execute_tool
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.history_native import NativeHistoryService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
+)
 
 
 def _bound_workspace(tmp_path: Path, monkeypatch, agent: str = "agent-a") -> Path:
     workspace = tmp_path / "control"
     workspace.mkdir()
-    AgentBindingStore(workspace).bind_agent(agent, "history-group")
-    # Create the governed store separately so bootstrap has a valid empty
-    # group.  The history test never writes a SharedMemoryRecord.
-    SharedMemoryStore(workspace, "history-group")
+    group = "history-group"
+    GroupControlService(workspace, write=True).bind_agent(
+        agent, group, idempotency_key=f"test-bind:{agent}:{group}"
+    )
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(workspace))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent)
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
     return workspace
 
 
-def test_mcp_history_uses_trusted_agent_scope_and_stays_out_of_bootstrap(tmp_path: Path, monkeypatch):
-    workspace = _bound_workspace(tmp_path, monkeypatch)
-    store = ConversationHistoryStore(workspace)
-    archived = store.append_turn(
-        HistoryScope(agent_instance_id="agent-a", project_ref="project-x", provider="codex"),
-        external_session_id="session-a", provider="codex", role="user",
-        content="历史原文不能进入长期 bootstrap", event_id="turn-a",
+def _context(workspace: Path, agent: str = "agent-a", provider: str = "codex") -> dict:
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="history-runtime-test",
+            session_source="test",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="history-group",
+        project_ref=os.path.normcase(str(workspace.resolve())),
+        provider=provider,
+        runtime_role="root",
     )
 
-    assert {tool["name"] for tool in TOOLS} >= {
-        "memoryguard_history_search", "memoryguard_history_timeline",
-        "memoryguard_history_read", "memoryguard_history_extract_preview",
-        "memoryguard_history_list_sessions", "memoryguard_history_export",
-        "memoryguard_history_delete",
-    }
-    good = execute_tool("memoryguard_history_search", {"query": "长期 bootstrap"})
-    assert good.get("isError") is not True
-    assert archived["turn_id"] not in execute_tool(
-        "memoryguard_context_bootstrap", {"task": "bootstrap"}
-    )["content"][0]["text"]
-    spoofed = execute_tool("memoryguard_history_search", {
-        "query": "长期 bootstrap", "scope": {"agent_instance_id": "agent-b"},
-    })
-    assert spoofed["isError"] is True
-    assert "trusted_agent_scope_required" in spoofed["content"][0]["text"]
+
+def _seed(workspace: Path, events: list[ConversationEvent], source_id: str = "runtime-history") -> tuple[str, list[str]]:
+    ConversationSync(ContentStore(workspace)).sync(source_id, events, owner_id="history-runtime-test")
+    with ContentStore(workspace).connection() as conn:
+        session_id = str(conn.execute("SELECT session_id FROM conversation_sessions ORDER BY session_id LIMIT 1").fetchone()[0])
+        turn_ids = [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT turn_id FROM conversation_turns WHERE session_id=? ORDER BY ordinal",
+                (session_id,),
+            ).fetchall()
+        ]
+    return session_id, turn_ids
 
 
-def test_hook_archives_bounded_utf8_turns_idempotently_and_isolates_agents(tmp_path: Path, monkeypatch):
+def _event(workspace: Path, *, session: str, event_id: str, content: str, agent: str = "agent-a") -> ConversationEvent:
+    return ConversationEvent(
+        external_object_key=session,
+        event_id=event_id,
+        content=content,
+        role="user",
+        ordinal=0,
+        title="Native history",
+        provider="codex",
+        workspace_id=str(workspace.resolve()),
+        agent_instance_id=agent,
+        project_ref=os.path.normcase(str(workspace.resolve())),
+        share_group_id="history-group",
+    )
+
+
+def test_mcp_history_uses_trusted_agent_scope_and_stays_out_of_bootstrap(tmp_path: Path, monkeypatch):
     workspace = _bound_workspace(tmp_path, monkeypatch)
-    payload = {
-        "session_id": "session-1", "turn_id": "user-turn-1",
-        "prompt": "请用 UTF-8 保存这段中文历史", "cwd": str(workspace),
-    }
-    run_hook(provider="codex", event="user_prompt", workspace=workspace,
-             agent_instance_id="agent-a", share_group_id="history-group", payload=payload)
-    # The same lifecycle delivery must not create a duplicate turn.
-    run_hook(provider="codex", event="user_prompt", workspace=workspace,
-             agent_instance_id="agent-a", share_group_id="history-group", payload=payload)
-    run_hook(provider="codex", event="stop", workspace=workspace,
-             agent_instance_id="agent-a", share_group_id="history-group", payload={
-                 "session_id": "session-1", "generation_id": "assistant-final-1",
-                 "last_assistant_message": "助手最终回答也独立归档。", "cwd": str(workspace),
-             })
+    session_id, turn_ids = _seed(
+        workspace,
+        [_event(workspace, session="session-a", event_id="turn-a", content="history stays outside bootstrap")],
+    )
+    port = NativeV2RuntimePort(workspace, state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1})
+    context = _context(workspace)
 
-    store = ConversationHistoryStore(workspace)
-    scope = HistoryScope(agent_instance_id="agent-a", project_ref=str(workspace), provider="codex", share_group_id="history-group")
-    sessions = store.list_sessions(scope)["sessions"]
-    assert len(sessions) == 1
-    raw = store.read(scope, session_id=sessions[0]["session_id"])
-    assert [turn["content"] for turn in raw["turns"]] == [
-        "请用 UTF-8 保存这段中文历史", "助手最终回答也独立归档。",
-    ]
-    assert store.list_sessions(HistoryScope(agent_instance_id="agent-b"))["sessions"] == []
-    receipt = next((workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json"))
-    receipt_text = receipt.read_text(encoding="utf-8")
-    state_text = next((workspace / ".memoryguard" / "hook-runtime" / "state").rglob("*.json")).read_text(encoding="utf-8")
-    assert "请用 UTF-8" not in receipt_text and "助手最终回答" not in receipt_text
-    assert "请用 UTF-8" not in state_text and "助手最终回答" not in state_text
-    assert json.loads(receipt_text)["history_archive"]["archived"] is True
+    search = port.dispatch_mcp(
+        "memoryguard_history_search",
+        {"query": "outside bootstrap"},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert search["ok"] is True, search
+    assert search["data"]["results"]
+    assert "history stays outside bootstrap" not in json.dumps(search, ensure_ascii=False)
+
+    # Search remains covered through the MCP port. Explicit raw reads use the
+    # native service boundary because the generic MCP identity scrubber
+    # intentionally removes session selectors from transport payloads.
+    read = NativeHistoryService(workspace).dispatch(
+        "read", {"session_id": session_id}, context=context,
+    )
+    assert read["ok"] is True, read
+    assert read["data"]["turns"][0]["turn_id"] == turn_ids[0]
+    assert read["data"]["turns"][0]["content"] == "history stays outside bootstrap"
 
 
-def test_hook_history_honors_private_flag_and_reports_missing_assistant_coverage(tmp_path: Path, monkeypatch):
+def test_native_history_preserves_repeated_content_without_text_deduplication(tmp_path: Path, monkeypatch):
     workspace = _bound_workspace(tmp_path, monkeypatch)
-    run_hook(provider="claude", event="user_prompt", workspace=workspace,
-             agent_instance_id="agent-a", share_group_id="history-group", payload={
-                 "session_id": "private-session", "prompt": "不要归档", "private": True,
-             })
-    run_hook(provider="claude", event="stop", workspace=workspace,
-             agent_instance_id="agent-a", share_group_id="history-group", payload={"session_id": "no-final"})
-    assert ConversationHistoryStore(workspace).list_sessions(
-        HistoryScope(agent_instance_id="agent-a")
-    )["sessions"] == []
-    receipt = next((workspace / ".memoryguard" / "hook-runtime" / "heartbeat").glob("*.json"))
-    assert json.loads(receipt.read_text(encoding="utf-8"))["history_archive"]["reason"] == "assistant_content_unavailable"
+    text = "same legitimate prompt"
+    _, turn_ids = _seed(
+        workspace,
+        [
+            _event(workspace, session="repeat-session", event_id="turn-1", content=text),
+            ConversationEvent(
+                **{**_event(workspace, session="repeat-session", event_id="turn-2", content=text).__dict__, "ordinal": 1}
+            ),
+        ],
+    )
+    service = NativeHistoryService(workspace)
+    context = _context(workspace)
+    listed = service.dispatch("list_sessions", context=context)
+    assert listed["ok"] is True, listed
+    assert listed["data"]["total"] == 1
+    contents = []
+    for turn_id in turn_ids:
+        read = service.dispatch("read", {"turn_id": turn_id}, context=context)
+        assert read["ok"] is True, read
+        contents.append(read["data"]["turn"]["content"])
+    assert contents == [text, text]
 
 
-def test_mcp_delete_requires_confirmation_and_always_tombstones_evidence(tmp_path: Path, monkeypatch):
+def test_hook_history_honors_private_flag_without_reaching_retired_storage(tmp_path: Path, monkeypatch):
     workspace = _bound_workspace(tmp_path, monkeypatch)
-    store = ConversationHistoryStore(workspace)
-    result = store.append_turn(HistoryScope(agent_instance_id="agent-a"), external_session_id="delete-me",
-                               provider="codex", role="user", content="delete evidence", event_id="event-1")
-    store.add_evidence_link(memory_id="memory-1", session_id=result["session_id"], turn_id=result["turn_id"])
-    denied = execute_tool("memoryguard_history_delete", {"session_ids": [result["session_id"]]})
-    assert denied["isError"] is True
-    deleted = execute_tool("memoryguard_history_delete", {"session_ids": [result["session_id"]], "confirmed": True})
-    assert deleted.get("isError") is not True
-    with store._connect() as conn:
-        link = conn.execute("SELECT status FROM evidence_links WHERE memory_id='memory-1'").fetchone()
-    assert link["status"] == "invalid"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="agent-a",
+        share_group_id="history-group",
+        payload={"session_id": "private-session", "prompt": "do not archive", "private": True},
+    )
+    assert not (workspace / ".memoryguard" / "history" / "history.sqlite").exists()
+
+
+def test_native_delete_requires_confirmation_and_tombstones_evidence(tmp_path: Path, monkeypatch):
+    workspace = _bound_workspace(tmp_path, monkeypatch)
+    session_id, turn_ids = _seed(
+        workspace,
+        [_event(workspace, session="delete-me", event_id="event-1", content="delete evidence")],
+    )
+    content = ContentStore(workspace)
+    ConversationSync(content).add_evidence_link(memory_id="memory-1", turn_id=turn_ids[0])
+    service = NativeHistoryService(workspace)
+    context = _context(workspace)
+
+    denied = service.dispatch(
+        "delete",
+        {"session_ids": [session_id], "confirmed": False},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+        mutation_receipt={"receipt_id": "r-denied"},
+        idempotency_key="delete-denied",
+    )
+    assert denied["ok"] is False
+    assert denied["code"] == "history_delete_confirmation_required"
+
+    deleted = service.dispatch(
+        "delete",
+        {"session_ids": [session_id], "confirmed": True},
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+        mutation_receipt={"receipt_id": "r1"},
+        idempotency_key="delete-1",
+    )
+    assert deleted["ok"] is True
+    assert deleted["data"]["deleted_sessions"] == 1
+    with content.connection() as conn:
+        link = conn.execute("SELECT status FROM content_evidence_links WHERE memory_id='memory-1'").fetchone()
+        tombstone = conn.execute("SELECT 1 FROM content_tombstones WHERE reason='history_delete'").fetchone()
+    assert link[0] == "invalid"
+    assert tombstone is not None

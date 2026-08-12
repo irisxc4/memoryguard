@@ -1850,71 +1850,35 @@ class RuleCreationService:
         }
         if context["agent_instance_id"] != receipt.agent_instance_id:
             return self._blocked(action="rule_exception", reason="feedback agent does not match receipt agent", receipt_id=receipt_id, feedback_id=feedback_id)
-        # An exception must *actually* narrow the parent.  The child and the
-        # parent exclude are persisted by one mutation bundle below.
+        # An exception must *actually* narrow the parent.  V1 and V2 share one
+        # storage-neutral scope planner so the audience rules cannot drift.
         project_ref = context["project_ref"] or receipt.project_ref
         parent_assignments = self.store.list_rule_assignments(parent.memory_id)
-        for parent_assignment in parent_assignments:
-            if parent_assignment.effect != "include":
-                continue
-            if parent_assignment.target_type == "agent" and parent_assignment.target_id != receipt.agent_instance_id:
-                return self._blocked(action="rule_exception", reason="exception scope is outside parent agent audience", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-            if parent_assignment.target_type == "agent_project":
-                if (
-                    parent_assignment.target_id != receipt.agent_instance_id
-                    or parent_assignment.project_ref != project_ref
-                ):
-                    return self._blocked(action="rule_exception", reason="exception scope is outside parent agent_project audience", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-            if parent_assignment.target_type == "project" and parent_assignment.project_ref != project_ref:
-                return self._blocked(action="rule_exception", reason="exception project differs from parent project audience", memory_id=parent.memory_id, receipt_id=receipt_id, feedback_id=feedback_id)
-        # A project-scoped exception needs an exclude on the parent for that
-        # project.  Without a project context there is no narrower audience to
-        # split into, so the exception cannot change actual coverage.
-        if project_ref:
-            target_type = "agent_project"
-            assignment = {
-                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
-                "project_ref": project_ref, "effect": "include",
-            }
-        else:
+        try:
+            from .rule_exception_core import RuleExceptionPlanError, plan_rule_exception_scope
+
+            scope_plan = plan_rule_exception_scope(
+                parent_assignments,
+                agent_instance_id=receipt.agent_instance_id,
+                project_ref=project_ref,
+            )
+        except RuleExceptionPlanError as exc:
             return self._blocked(
-                action="rule_exception",
-                reason="exception requires trusted project context to narrow coverage",
+                action="rule_exception", reason=exc.code,
                 memory_id=parent.memory_id, receipt_id=receipt_id,
                 feedback_id=feedback_id,
             )
-        # Add the parent exclude for the exception project so the original
-        # rule stops applying there.  The child with higher priority then
-        # covers the exception context alone.
+        assignment = dict(scope_plan.child_binding)
         before_assignments = [
             item.to_dict() if hasattr(item, "to_dict") else dict(item)
             for item in parent_assignments
         ]
         updated_assignments = list(before_assignments)
-        existing_keys = {
-            (
-                str(item.get("target_type", "")),
-                str(item.get("target_id", "")),
-                canonical_project_ref(item.get("project_ref", "")),
-                str(item.get("effect", "include")),
-            )
-            for item in updated_assignments
-        }
-        exclude_key = (
-            "agent_project", str(receipt.agent_instance_id),
-            canonical_project_ref(project_ref), "exclude",
-        )
-        exclude_added = exclude_key not in existing_keys
+        exclude_added = bool(scope_plan.exclude_required)
         if exclude_added:
-            updated_assignments.append({
-                "target_type": "agent_project", "target_id": receipt.agent_instance_id,
-                "project_ref": project_ref, "effect": "exclude",
-            })
+            updated_assignments.append(dict(scope_plan.parent_exclude))
         after_assignments = [dict(item) for item in updated_assignments]
-        generated_parent_assignment = {
-            "target_type": "agent_project", "target_id": receipt.agent_instance_id,
-            "project_ref": project_ref, "effect": "exclude",
-        } if exclude_added else {}
+        generated_parent_assignment = dict(scope_plan.parent_exclude) if exclude_added else {}
         generated_parent_assignment_id = (
             stable_hash(
                 "rule-assignment", parent.memory_id, "agent_project",

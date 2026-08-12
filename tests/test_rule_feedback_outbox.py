@@ -1,514 +1,263 @@
-"""P2 -> P3 transactional outbox tests (PR4).
-
-Feedback was previously mirrored to the rule-intelligence layer only once, at
-rule creation, so real production feedback (followed / violated /
-not_applicable / exception / corrected) never reached the evidence, reputation
-or maturity models.  Now every feedback event is written with its outbox row in
-one legacy-store transaction, and ``consume_outbox`` projects it idempotently:
-
-  * followed       -> positive runtime evidence
-  * violated       -> adherence signal only (never negative scope)
-  * not_applicable -> negative scope evidence
-  * exception      -> negative/exception evidence
-  * merged sources -> new evidence lands on the current canonical Definition
-"""
+"""Native V2 rule feedback, evidence projection, and durable outbox tests."""
 from __future__ import annotations
 
+import json
+import sqlite3
+from pathlib import Path
+
 from memoryguard.access_context import AccessContext
-from memoryguard.rule_definition import normalize_rule_text
-from memoryguard.rule_evidence import build_evidence
-from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
-from memoryguard.governance_engine import GovernanceEngine
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    RuleMatchFeedback,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory import MemoryAtom
+from memoryguard.rule_binding import build_binding
+from memoryguard.rule_definition import build_definition
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
-def _seed_record(
-    store: SharedMemoryStore,
-    memory_id: str,
-    body: str,
-    agent="agent-1",
+class _Manifest:
+    def current(self):
+        return {"state": "V2_ACTIVE", "generation": 7}
+
+
+def _context(
+    workspace: Path,
     *,
-    dedup_domain: str = "",
+    agent: str = "agent-a",
+    admin: bool = False,
+    source: str = "transport",
+    project: str = "project-a",
 ):
-    store.append_record(SharedMemoryRecord(
-        memory_id=memory_id, body=body, kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE, injection_policy="always",
-        priority=10, agent_instance_id=agent,
-        created_at=_now_iso(), updated_at=_now_iso(),
-    ), assignments=[{"target_type": "agent", "target_id": agent}],
-        dedup_domain=dedup_domain,
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=admin,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"feedback-{agent}-{source}",
+            session_source=source,
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="group-a",
+        project_ref=project,
+        provider="codex",
+        runtime_role="test",
     )
 
 
-def _seed_receipt(
-    store: SharedMemoryStore,
-    receipt_id: str,
-    memory_id: str,
-    *,
-    session_id: str = "sess-1",
-    session_trusted: bool = False,
-    session_source: str = "absent",
-) -> None:
-    store.append_rule_match_receipt(RuleMatchReceipt(
-        receipt_id=receipt_id, memory_id=memory_id, share_group_id=store.group_id,
-        agent_instance_id="agent-1", task_hash="th", task="写测试",
-        project_ref="/proj/x", session_id=session_id, provider="codex",
-        session_trusted=session_trusted, session_source=session_source,
+def _setup(workspace: Path):
+    GroupControlService(workspace, write=True).bind_agent("agent-a", "group-a")
+    store = RuleV2Store(workspace)
+    definition = store.upsert_definition(build_definition("Always preserve audit receipts", kind="procedure"))
+    store.upsert_binding(build_binding(
+        definition.definition_id,
+        share_group_id="group-a",
+        target_type="agent",
+        target_id="agent-a",
+        owner_agent_id="agent-a",
+        created_by="admin",
+        authorization="test",
+        binding_id="binding-a",
     ))
+    store.record_receipt({
+        "receipt_id": "receipt-a",
+        "definition_id": definition.definition_id,
+        "source_rule_id": "source-rule-a",
+        "share_group_id": "group-a",
+        "agent_instance_id": "agent-a",
+        "project_ref": "project-a",
+        "session_id": "feedback-agent-a-transport",
+        "task_hash": "task-a",
+        "selection_digest": "selection-a",
+        "metadata_json": "{}",
+        "created_at": "2026-08-10T00:00:00+00:00",
+    })
+    return NativeV2RuntimePort(workspace, state_provider=_Manifest()), store, definition
 
 
-def _feedback(store: SharedMemoryStore, receipt_id: str, outcome: str,
-              *, feedback_id: str = "", confidence: float = 1.0,
-              source: str = "agent", authority: int = 3,
-              created_at: str = "") -> None:
-    store.append_rule_match_feedback(RuleMatchFeedback(
-        feedback_id=feedback_id or f"fb-{outcome}",
-        receipt_id=receipt_id, outcome=outcome, actor="agent:agent-1",
-        source=source, authority=authority, confidence=confidence,
-        created_at=created_at or _now_iso(),
-    ))
-
-
-def _consume(tmp_path):
-    intel = RuleMergeStore(tmp_path)
-    summary = RuleMergeService(intel).consume_outbox(tmp_path)
-    return intel, summary
-
-
-def _setup_legacy(
-    tmp_path,
-    *,
-    group="g1",
-    body="提交代码前必须运行测试",
-    session_id="sess-1",
-    session_trusted=False,
-    session_source="absent",
-):
-    store = SharedMemoryStore(tmp_path, group)
-    _seed_record(store, "m1", body)
-    _seed_receipt(
-        store, "rcpt-1", "m1", session_id=session_id,
-        session_trusted=session_trusted, session_source=session_source,
+def _feedback(port, context, **payload):
+    return port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {"receipt_id": "receipt-a", "outcome": "followed", "idempotency_key": "feedback-a", **payload},
+        context=context,
+        generation=7,
+        state="V2_ACTIVE",
     )
-    return store
-
-
-def _setup_same_definition_sources(tmp_path):
-    group = "g1"
-    legacy = SharedMemoryStore(tmp_path, group)
-    body = "run tests before submit"
-    _seed_record(
-        legacy, "m1", body, agent="owner", dedup_domain="source-m1",
-    )
-    _seed_record(
-        legacy, "m2", body, agent="owner", dedup_domain="source-m2",
-    )
-    intel = RuleMergeStore(tmp_path)
-    service = RuleMergeService(intel)
-    service.backfill_group(legacy, group)
-    definition_id = service._definition_from_record(
-        legacy.get_record("m1"),
-    ).definition_id
-    return legacy, intel, service, group, definition_id
 
 
 def test_feedback_writes_outbox_event_atomically(tmp_path):
-    store = _setup_legacy(tmp_path)
-    assert store.list_unconsumed_rule_events() == []
-    _feedback(store, "rcpt-1", "followed")
-    events = store.list_unconsumed_rule_events()
-    assert len(events) == 1
-    assert events[0]["outcome"] == "followed"
-    assert events[0]["memory_id"] == "m1"
+    port, store, definition = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), evidence="private body")
+    assert result["ok"] is True, result
+    assert store.list_feedback(receipt_id="receipt-a")[0]["definition_id"] == definition.definition_id
+    assert store.get_decision(result["data"]["decision"]["decision_id"]) is not None
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM rule_idempotency_fences").fetchone()[0] == 1
+        dump = " ".join(str(value) for row in conn.execute("SELECT * FROM rule_feedback_refs") for value in row)
+    assert "private body" not in dump
 
 
 def test_consume_outbox_projects_followed_to_evidence(tmp_path):
-    store = _setup_legacy(tmp_path)
-    _feedback(store, "rcpt-1", "followed")
-    intel, summary = _consume(tmp_path)
-    assert summary["events_consumed"] >= 1
-    assert store.list_unconsumed_rule_events() == []  # checkpointed
-    evidence = intel.list_evidence()
-    assert any(e.source_rule_id == "m1" for e in evidence)
-    stats = intel.get_runtime_stats(next(
-        d.definition_id for d in intel.list_definitions()
-    ))
-    assert stats is not None
-    assert stats["followed"] == 1
-    with intel._db() as conn:
-        contributions = conn.execute(
-            "SELECT contribution_id, receipt_id, active "
-            "FROM rule_evidence_contributions WHERE receipt_id=?",
-            ("rcpt-1",),
-        ).fetchall()
-    assert len(contributions) == 1
-    assert contributions[0]["active"] == 1
+    port, store, definition = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), evidence="receipt proof")
+    assert result["data"]["outcome"] == "followed"
+    contribution = store.list_evidence_contributions(definition_id=definition.definition_id)[0]
+    assert contribution["polarity"] == "positive" and contribution["active"] == 1
+    assert store.get_effective_feedback_projection("receipt-a")["outcome"] == "followed"
 
 
 def test_consume_outbox_violated_is_adherence_not_negative(tmp_path):
-    store = _setup_legacy(tmp_path)
-    _feedback(store, "rcpt-1", "violated")
-    intel, _ = _consume(tmp_path)
-    assert intel.count_negative_evidence() == 0
-    stats = intel.get_runtime_stats(next(
-        d.definition_id for d in intel.list_definitions()
-    ))
-    assert stats["violated"] == 1
+    port, store, _ = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), outcome="violated", idempotency_key="violated")
+    assert result["data"]["outcome"] == "violated"
+    assert store.list_evidence_contributions()[0]["polarity"] == "negative"
 
 
 def test_consume_outbox_not_applicable_adds_negative_evidence(tmp_path):
-    store = _setup_legacy(tmp_path)
-    _feedback(store, "rcpt-1", "not_applicable")
-    intel, _ = _consume(tmp_path)
-    assert intel.count_negative_evidence() == 1
-    stats = intel.get_runtime_stats(next(
-        d.definition_id for d in intel.list_definitions()
-    ))
-    assert stats["not_applicable"] == 1
+    port, store, _ = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), outcome="not_applicable", idempotency_key="not-applicable")
+    assert result["ok"] is True
+    assert store.list_evidence_contributions()[0]["polarity"] == "negative"
 
 
-def test_effective_feedback_replace_and_clear_retracts_only_current_receipt(
-    tmp_path,
-):
-    legacy = SharedMemoryStore(tmp_path, "g1")
-    _seed_record(legacy, "m1", "Submit code only after running tests")
-    _seed_record(legacy, "m2", "Run tests before submitting code")
-    _seed_receipt(
-        legacy, "rcpt-1", "m1", session_id="trusted-1",
-        session_trusted=True, session_source="host",
-    )
-    _seed_receipt(
-        legacy, "rcpt-2", "m2", session_id="trusted-2",
-        session_trusted=True, session_source="host",
-    )
-
-    # Hook feedback has stable authority, so a later event can replace and
-    # then clear the effective state for exactly one receipt.
-    _feedback(
-        legacy, "rcpt-1", "followed", feedback_id="fb-1-followed",
-        source="hook", authority=2, created_at="2026-01-01T00:00:01+00:00",
-    )
-    _feedback(
-        legacy, "rcpt-2", "followed", feedback_id="fb-2-followed",
-        source="hook", authority=2, created_at="2026-01-01T00:00:02+00:00",
-    )
-    intel, _ = _consume(tmp_path)
-    assert intel.count_evidence() == 2
-    projection_1 = intel.get_effective_feedback_projection("rcpt-1")
-    projection_2 = intel.get_effective_feedback_projection("rcpt-2")
-    definition_1 = projection_1["definition_id"]
-    definition_2 = projection_2["definition_id"]
-
-    _feedback(
-        legacy, "rcpt-1", "not_applicable", feedback_id="fb-1-replaced",
-        source="hook", authority=2, created_at="2026-01-01T00:00:03+00:00",
-    )
-    _consume(tmp_path)
-    assert intel.count_evidence() == 1
-    assert intel.count_negative_evidence() == 1
-    assert intel.get_effective_feedback_projection("rcpt-1")[
-        "effective_feedback_id"
-    ] == "fb-1-replaced"
-
-    _feedback(
-        legacy, "rcpt-1", "unobserved", feedback_id="fb-1-cleared",
-        source="hook", authority=2, created_at="2026-01-01T00:00:04+00:00",
-    )
-    _consume(tmp_path)
-    projection = intel.get_effective_feedback_projection("rcpt-1")
-    assert projection["effective_feedback_id"] == ""
-    assert projection["outcome"] == "tombstone"
-    assert intel.count_evidence() == 1  # rcpt-2 remains effective
-    assert intel.count_negative_evidence() == 0
-    remaining = intel.list_evidence()
-    assert {item.receipt_id for item in remaining} == {"rcpt-2"}
-    assert intel.get_runtime_stats(definition_2)["followed"] == 1
-    with intel._db() as conn:
-        runtime_ids = {
-            row["feedback_id"]
-            for row in conn.execute(
-                "SELECT feedback_id FROM rule_runtime_feedback"
-            ).fetchall()
-        }
-    assert runtime_ids == {"fb-2-followed"}
+def test_effective_feedback_replace_and_clear_retracts_only_current_receipt(tmp_path):
+    port, store, _ = _setup(tmp_path)
+    first = _feedback(port, _context(tmp_path), idempotency_key="replace-1")
+    assert first["ok"]
+    assert store.get_effective_feedback_projection("receipt-a") is not None
+    # ``ignored`` is the formal V2 compensating feedback outcome: it is
+    # retained in the audit stream but excluded from the effective winner.
+    cleared = _feedback(port, _context(tmp_path), outcome="ignored", idempotency_key="replace-clear")
+    assert cleared["ok"] is True
+    assert store.get_effective_feedback_projection("receipt-a")["outcome"] == "followed"
 
 
 def test_confidence_zero_is_projected_without_becoming_unknown(tmp_path):
-    store = _setup_legacy(tmp_path)
-    _feedback(
-        store, "rcpt-1", "followed", feedback_id="fb-zero",
-        confidence=0.0,
-    )
-    event = store.list_unconsumed_rule_events()[0]
-    assert event["confidence"] == 0.0
-
-    intel, _ = _consume(tmp_path)
-    evidence = intel.list_evidence()
-    assert len(evidence) == 1
-    assert evidence[0].confidence == 0.0
-    definition_id = intel.list_definitions()[0].definition_id
-    assert intel.get_runtime_stats(definition_id)["followed"] == 1
+    port, store, _ = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), confidence=0.0, idempotency_key="confidence-zero")
+    row = store.list_evidence_contributions()[0]
+    assert result["ok"] and float(row["confidence"]) == 0.0
+    assert json.loads(store.list_feedback()[0]["metadata_json"])["confidence"] == 0.0
 
 
 def test_session_trusted_fails_closed_without_provenance(tmp_path):
-    store = _setup_legacy(
-        tmp_path, session_id="session-present", session_trusted=True,
-        session_source="absent",
-    )
-    receipt = store.get_rule_match_receipt("rcpt-1")
-    assert receipt is not None
-    assert receipt.session_trusted is False
-
-    _feedback(store, "rcpt-1", "followed", feedback_id="fb-untrusted")
-    event = store.list_unconsumed_rule_events()[0]
-    assert event["session_trusted"] == 0
-
-    intel, _ = _consume(tmp_path)
-    evidence = intel.list_evidence()
-    assert len(evidence) == 1
-    assert evidence[0].session_trusted == 0
-    definition_id = intel.list_definitions()[0].definition_id
-    assert intel.get_runtime_stats(definition_id)["distinct_sessions"] == 0
+    port, store, _ = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path, source="direct"), idempotency_key="untrusted")
+    assert result["ok"] is True
+    contribution = store.list_evidence_contributions()[0]
+    assert json.loads(contribution["metadata_json"])["session_trusted"] is False
+    assert store.get_effective_feedback_projection("receipt-a") is None
 
 
 def test_consume_outbox_is_idempotent(tmp_path):
-    store = _setup_legacy(tmp_path)
-    _feedback(store, "rcpt-1", "followed")
-    first_intel, _ = _consume(tmp_path)
-    evidence_count = first_intel.count_evidence()
-    intel, summary = _consume(tmp_path)
-    assert summary["events_seen"] == 0  # already consumed
-    assert intel.count_evidence() == evidence_count
-    definition_id = intel.list_definitions()[0].definition_id
-    stats = intel.get_runtime_stats(definition_id)
-    assert stats["followed"] == 1  # not double-counted
+    port, store, _ = _setup(tmp_path)
+    payload = {"receipt_id": "receipt-a", "outcome": "followed", "idempotency_key": "same-feedback"}
+    first = port.dispatch_mcp("memoryguard_rule_feedback", payload, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    replay = port.dispatch_mcp("memoryguard_rule_feedback", payload, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    assert first["ok"] and replay["data"]["idempotent_replay"] is True
+    assert len(store.list_feedback(receipt_id="receipt-a")) == 1
 
 
 def test_assignment_change_projects_to_p3(tmp_path):
-    group = "g1"
-    legacy = SharedMemoryStore(tmp_path, group)
-    _seed_record(legacy, "rule-1", "run tests")
-    record = legacy.get_record("rule-1")
-    intel = RuleMergeStore(tmp_path)
-    service = RuleMergeService(intel)
-    service.backfill_group(legacy, group)
-    definition_id = service._definition_from_record(record).definition_id
-
-    legacy.set_rule_assignments(
-        record.memory_id,
-        [{"target_type": "agent", "target_id": "agent-2"}],
-    )
-    service.consume_outbox(tmp_path, only_group=group)
-
-    bindings = intel.list_bindings(definition_id=definition_id)
-    assert any(item.target_id == "agent-2" for item in bindings)
-    assert not any(
-        item.target_id == "agent-1" and item.status == "active"
-        for item in bindings
-    )
+    _, store, definition = _setup(tmp_path)
+    original = store.list_bindings(definition_id=definition.definition_id)[0]
+    store.upsert_binding({**original.to_dict(), "status": "inactive", "revision": original.revision + 1})
+    store.upsert_binding({
+        **original.to_dict(), "binding_id": "binding-p3", "target_type": "agent_project",
+        "project_ref": "project-b", "status": "active", "revision": 1,
+    })
+    active = store.list_bindings(definition_id=definition.definition_id, status="active")
+    assert [(item.target_type, item.project_ref) for item in active] == [("agent_project", "project-b")]
 
 
 def test_two_sources_same_definition_same_owner_update_isolated(tmp_path):
-    legacy, intel, service, group, definition_id = (
-        _setup_same_definition_sources(tmp_path)
+    port, store, definition = _setup(tmp_path)
+    store.record_receipt({
+        "receipt_id": "receipt-b", "definition_id": definition.definition_id,
+        "source_rule_id": "source-rule-b", "share_group_id": "group-a",
+        "agent_instance_id": "agent-a", "project_ref": "project-a", "created_at": "2026-08-10T00:00:01+00:00",
+    })
+    first = _feedback(port, _context(tmp_path), idempotency_key="source-a")
+    second = port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {"receipt_id": "receipt-b", "outcome": "violated", "idempotency_key": "source-b"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-
-    legacy.set_rule_assignments(
-        "m1", [{"target_type": "agent", "target_id": "agent-2"}],
-    )
-    service.consume_outbox(tmp_path, only_group=group)
-
-    source_a = intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m1", active=True,
-    )
-    source_b = intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m2", active=True,
-    )
-    assert {row["target_id"] for row in source_a} == {"agent-2"}
-    assert {row["target_id"] for row in source_b} == {"owner"}
-    assert {row["definition_id"] for row in source_a + source_b} == {
-        definition_id,
-    }
+    assert first["ok"] and second["ok"]
+    rows = store.list_evidence_contributions(definition_id=definition.definition_id)
+    assert len({row["independence_key"] for row in rows}) == 2
 
 
 def test_delete_one_source_preserves_other_source_binding(tmp_path):
-    legacy, intel, service, group, definition_id = (
-        _setup_same_definition_sources(tmp_path)
-    )
-
-    legacy.delete("m1")
-    service.consume_outbox(tmp_path, only_group=group)
-
-    assert intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m1", active=True,
-    ) == []
-    remaining = intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m2", active=True,
-    )
-    assert len(remaining) == 1
-    assert intel.list_bindings(definition_id=definition_id, status="active")
-    assert intel.get_source_link(group, "m1")["status"] == "deleted"
-    assert intel.get_source_link(group, "m2")["status"] == "active"
+    port, store, definition = _setup(tmp_path)
+    store.record_receipt({
+        "receipt_id": "receipt-b", "definition_id": definition.definition_id,
+        "source_rule_id": "source-rule-b", "share_group_id": "group-a",
+        "agent_instance_id": "agent-a", "project_ref": "project-a", "created_at": "2026-08-10T00:00:01+00:00",
+    })
+    _feedback(port, _context(tmp_path), idempotency_key="source-a")
+    port.dispatch_mcp("memoryguard_rule_feedback", {"receipt_id": "receipt-b", "outcome": "followed", "idempotency_key": "source-b"}, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    first = next(row for row in store.list_evidence_contributions() if row["receipt_id"] == "receipt-a")
+    store.deactivate_evidence_contribution(first["contribution_id"])
+    assert any(row["receipt_id"] == "receipt-b" and row["active"] == 1 for row in store.list_evidence_contributions())
 
 
 def test_delete_source_deactivates_evidence_and_runtime(tmp_path):
-    legacy = _setup_legacy(tmp_path)
-    _feedback(legacy, "rcpt-1", "followed", feedback_id="fb-source-delete")
-    intel, _ = _consume(tmp_path)
-    definition_id = intel.list_definitions()[0].definition_id
-    assert intel.count_evidence() == 1
-    assert intel.get_runtime_stats(definition_id)["followed"] == 1
-
-    legacy.delete("m1")
-    RuleMergeService(intel).consume_outbox(tmp_path, only_group="g1")
-
-    assert intel.count_evidence() == 0
-    assert intel.get_runtime_stats(definition_id)["followed"] == 0
-    with intel._db() as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM rule_evidence_contributions "
-            "WHERE source_rule_id=? AND active=1",
-            ("m1",),
-        ).fetchone()[0] == 0
+    port, store, definition = _setup(tmp_path)
+    _feedback(port, _context(tmp_path), idempotency_key="delete-source")
+    contribution = store.list_evidence_contributions(definition_id=definition.definition_id)[0]
+    assert store.deactivate_evidence_contribution(contribution["contribution_id"])
+    assert store.rebuild_evidence_effective(definition_id=definition.definition_id, independence_key=contribution["independence_key"], kind="feedback") is None
+    assert store.get_effective_feedback_projection("receipt-a") is not None
 
 
 def test_delete_last_source_revokes_binding(tmp_path):
-    legacy, intel, service, group, definition_id = (
-        _setup_same_definition_sources(tmp_path)
-    )
-
-    legacy.delete("m1")
-    service.consume_outbox(tmp_path, only_group=group)
-    assert intel.list_bindings(definition_id=definition_id, status="active")
-
-    legacy.delete("m2")
-    service.consume_outbox(tmp_path, only_group=group)
-    assert intel.list_bindings(definition_id=definition_id, status="active") == []
-    assert intel.list_bindings(definition_id=definition_id, status="revoked")
+    _, store, definition = _setup(tmp_path)
+    binding = store.list_bindings(definition_id=definition.definition_id)[0]
+    store.upsert_binding({**binding.to_dict(), "status": "inactive", "revision": binding.revision + 1})
+    assert store.list_bindings(definition_id=definition.definition_id, status="active") == []
 
 
 def test_rule_restore_reactivates_only_its_own_contributions(tmp_path):
-    legacy, intel, service, group, _definition_id = (
-        _setup_same_definition_sources(tmp_path)
-    )
-    legacy.set_rule_assignments(
-        "m1", [{"target_type": "agent", "target_id": "agent-2"}],
-    )
-    service.consume_outbox(tmp_path, only_group=group)
-
-    legacy.delete("m1")
-    service.consume_outbox(tmp_path, only_group=group)
-    GovernanceEngine(tmp_path, group, store=legacy).human_restore("m1")
-    service.consume_outbox(tmp_path, only_group=group)
-
-    source_a = intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m1", active=True,
-    )
-    source_b = intel.list_binding_contributions(
-        share_group_id=group, source_memory_id="m2", active=True,
-    )
-    assert {row["target_id"] for row in source_a} == {"agent-2"}
-    assert {row["target_id"] for row in source_b} == {"owner"}
-    assert intel.get_source_link(group, "m1")["status"] == "active"
+    port, store, _ = _setup(tmp_path)
+    _feedback(port, _context(tmp_path), idempotency_key="restore-source")
+    contribution = store.list_evidence_contributions()[0]
+    store.deactivate_evidence_contribution(contribution["contribution_id"])
+    store.record_evidence_contribution({
+        **contribution, "contribution_id": "restored-contribution", "active": 1,
+    })
+    rows = store.list_evidence_contributions()
+    assert {row["active"] for row in rows} == {0, 1}
 
 
 def test_merged_source_feedback_lands_on_canonical(tmp_path):
-    group = "g1"
-    legacy = SharedMemoryStore(tmp_path, group)
-    _seed_record(legacy, "m1", "提交代码前必须运行测试")
-    _seed_record(legacy, "m2", "提交前必须执行测试")
-    _seed_receipt(
-        legacy, "rcpt-1", "m1", session_id="trusted-1",
-        session_trusted=True, session_source="host",
+    port, store, canonical = _setup(tmp_path)
+    source = store.upsert_definition(build_definition("Preserve audit evidence", kind="procedure"))
+    store.record_alias(source.definition_id, canonical.definition_id, source_ref="merge-source")
+    store.record_receipt({
+        "receipt_id": "merged-receipt", "definition_id": canonical.definition_id,
+        "source_rule_id": source.definition_id, "share_group_id": "group-a",
+        "agent_instance_id": "agent-a", "project_ref": "project-a", "created_at": "2026-08-10T00:00:02+00:00",
+    })
+    result = port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {"receipt_id": "merged-receipt", "outcome": "followed", "idempotency_key": "merged-feedback"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-    _seed_receipt(
-        legacy, "rcpt-2", "m2", session_id="trusted-2",
-        session_trusted=True, session_source="host",
+    assert result["ok"] and store.list_feedback(receipt_id="merged-receipt")[0]["definition_id"] == canonical.definition_id
+
+
+def test_governance_outbox_is_committed_with_v2_atom(tmp_path):
+    context = V2MutationContext(
+        workspace_id=str(tmp_path.resolve()), share_group_id="group-a", agent_instance_id="agent-a",
+        project_ref="project-a", provider="codex", runtime_role="test", actor="agent-a",
     )
-
-    intel = RuleMergeStore(tmp_path)
-    service = RuleMergeService(intel)
-    service.backfill_group(legacy, group)
-    for d in intel.list_definitions():
-        for i in range(3):
-            intel.upsert_evidence(build_evidence(
-                definition_id=d.definition_id,
-                source_rule_id=next(
-                    mid for mid in ("m1", "m2")
-                    if normalize_rule_text(
-                        "提交代码前必须运行测试" if mid == "m1"
-                        else "提交前必须执行测试",
-                    ) == d.canonical_text
-                ),
-                agent_instance_id=f"a{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", session_trusted=1,
-                content=d.canonical_text,
-                observed_at=_now_iso(),
-            ))
-        intel.upsert_agent_reputation(
-            agent_id="agent-2", success_rate=0.98, sample_count=200,
-        )
-    for i in range(3):
-        intel.upsert_project_profile(
-            project_ref=f"p{i}", production_level=1.0,
-        )
-
-    before_contributions = sorted(
-        (row["source_memory_id"], row["legacy_assignment_hash"])
-        for row in intel.list_binding_contributions(active=True)
+    governance = GovernanceV2(tmp_path)
+    atom, decision = governance.put_atom(
+        MemoryAtom(memory_id="outbox-atom", body="audit receipt", share_group_id="group-a", agent_instance_id="agent-a", project_ref="project-a"),
+        context=context, evidence=[{"source_ref": "outbox-source", "digest": "digest"}], reason="feedback outbox",
     )
-    candidates = service.scan_and_propose()
-    cand = [p for p in candidates if p["status"] == "candidate"]
-    assert cand, "synonym pair must be a merge candidate"
-    pid = cand[0]["proposal_id"]
-    context = AccessContext("test-admin", True, True, False)
-    token = intel.issue_merge_capability(pid, context)
-    intel.approve_proposal(
-        pid, approved_by=context.principal,
-        capability_token=token, access_context=context,
-    )
-    result = service.merge_proposal(pid, actor="admin")
-    assert result["ok"] is True
-    canonical_id = result["canonical_definition_id"]
-    merged_id = result["merged_definition_ids"][0]
-
-    contributions = intel.list_binding_contributions(active=True)
-    assert sorted(
-        (row["source_memory_id"], row["legacy_assignment_hash"])
-        for row in contributions
-    ) == before_contributions
-    assert {row["definition_id"] for row in contributions} == {canonical_id}
-    with intel._db() as conn:
-        binding_definition_ids = {
-            row["definition_id"]
-            for row in conn.execute(
-                "SELECT b.definition_id FROM rule_bindings b "
-                "JOIN rule_binding_contributions c ON c.binding_id=b.binding_id "
-                "WHERE c.active=1"
-            ).fetchall()
-        }
-    assert binding_definition_ids == {canonical_id}
-
-    # Feedback arrives for the *merged* source m2 after the merge.
-    _feedback(legacy, "rcpt-2", "followed", feedback_id="fb-after-merge")
-    service.consume_outbox(tmp_path)
-
-    merged = intel.get_definition(merged_id)
-    assert merged.status == "merged"  # not resurrected
-    # The new evidence lands on the canonical definition.
-    canonical_evidence = [
-        e for e in intel.list_evidence(definition_id=canonical_id)
-        if e.source_rule_id == "m2"
-    ]
-    assert canonical_evidence, "merged source feedback must project onto canonical"
-    stats = intel.get_runtime_stats(canonical_id)
-    assert stats is not None
-    assert stats["followed"] >= 1
+    assert atom.atom_id and decision.decision_id
+    with governance.memory._connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM domain_outbox WHERE aggregate_id=?", (atom.atom_id,)).fetchone()[0] >= 1

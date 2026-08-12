@@ -8,31 +8,68 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from memoryguard.gui import GovernanceApi  # noqa: E402
+from memoryguard.access_context import AccessContext  # noqa: E402
+from memoryguard.migration.upgrade import run_upgrade  # noqa: E402
+from memoryguard.runtime_v2.group_native import (  # noqa: E402
+    GroupControlService,
+    personal_group_id,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FIXTURE_WORKSPACE = Path(__file__).resolve().parent / "fixtures" / "workspace"
 
 
-def test_run_audit_returns_report_summary() -> None:
-    api = GovernanceApi(str(FIXTURE_WORKSPACE))
+def _active_gui_api(root: Path) -> GovernanceApi:
+    """Use the public upgrade contract before entering the V2 GUI surface."""
+    ready = run_upgrade(root, data_home=root, apply=True)
+    assert ready["status"] == "V2_READY", ready
+    active = run_upgrade(
+        root,
+        data_home=root,
+        apply=True,
+        confirm="V2_ACTIVE",
+    )
+    assert active["v2_active"] is True, active
+
+    agent = "api-test-agent"
+    group = personal_group_id(agent)
+    GroupControlService(root, write=True).bind_agent(agent, group)
+    return GovernanceApi(
+        str(root),
+        _trusted_access_context=AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="api-test-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+    )
+
+
+def test_run_audit_returns_v2_report_summary(tmp_path) -> None:
+    api = _active_gui_api(tmp_path)
 
     result = api.run_audit()
 
-    assert "summary" in result
-    assert "findings" in result
-    assert "health_score" in result
-    assert isinstance(result["findings"], list)
+    assert result["ok"] is True
+    assert result["path"] == "v2"
+    assert isinstance(result["data"]["domains"], list)
+    assert isinstance(result["data"]["blocker_codes"], list)
+    assert isinstance(result["data"]["candidate_count"], int)
 
 
-def test_get_neuron_graph_supports_empty_projection() -> None:
-    api = GovernanceApi(str(FIXTURE_WORKSPACE))
+def test_get_neuron_graph_supports_empty_projection(tmp_path) -> None:
+    api = _active_gui_api(tmp_path)
 
     graph = api.get_neuron_graph()
 
-    assert isinstance(graph, dict)
-    assert graph.get("empty") is True
-    assert graph.get("reason") == "missing_governance_scope" or graph.get("error") == "missing_governance_scope"
+    assert graph["ok"] is True
+    assert graph["path"] == "v2"
+    assert graph["data"]["status"] == "NO_SOURCE"
+    assert graph["data"]["nodes"] == []
+    assert graph["data"]["edges"] == []
 
 
 def test_pyproject_declares_windowed_gui_entry() -> None:
@@ -59,8 +96,8 @@ def test_safe_bridge_preserves_trusted_gui_context(tmp_path) -> None:
     )
     bridge = SafeBridgeApi(str(tmp_path), _trusted_access_context=context)
 
-    assert bridge._inner._trusted_access_context is context
-    assert bridge._inner._trusted_access_context.require_admin() == (True, "")
+    assert bridge._trusted_access_context is context
+    assert bridge._trusted_access_context.require_admin() == (True, "")
 
 
 def test_native_window_uses_packaged_brand_icon(monkeypatch) -> None:

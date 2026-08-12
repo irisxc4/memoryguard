@@ -34,11 +34,63 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.6.2 更新内容
+## v0.7.0 更新（V2-only；local release acceptance passed）
 
-- **Python 3.10 SQLite 热修：** Memory、Evidence 与 Content schema preflight 会先检查包含 `-wal`/`-shm` 的私有副本，再创建任何可写 WAL 连接；旧版 SQLite 的 checkpoint 不会改动 live database。
-- **物理只写验收：** schema preflight 与验证基线隔离旧版 SQLite 的 WAL checkpoint 行为，确保失败关闭路径不修改原数据库。
-- **V2 行为不变：** v0.6.0 已交付的 production cutover、frozen-source 迁移、native routing、readiness gate 与显式 `memoryguard-v2` 运维流程均保持不变。
+v0.7.0 是 V2-only。local release acceptance passed；ready for
+commit/publish, not yet published。本节说明本地验收结果。Graphify 结果是
+真实全仓 export/projection，不表示 upstream Graphify 的全仓测试套件通过。
+
+- **V1 runtime 已物理淘汰：** 生产入口导入闭包不再包含 V1 runtime/store
+  模块。`V1_ACTIVE` 只是迁移起点，不是可运行 fallback；旧格式只允许由
+  `memoryguard.migration` 读取，其他入口统一 fail-closed 返回
+  `v2_upgrade_required`。V1 数据与 migration-backups 只作为回滚/审计证据，
+  不再是 V2 runtime 写入目标。
+- **V2 六个控制面：** Memory、Evidence、History、Source、Binding、Group
+  全部走 V2-native 边界。Memory atom 与 evidence/decision receipt 和原始
+  History 分离；授权 Source 文件/文件夹与 runtime 分离；可信 Agent Binding
+  决定所属治理 Group。
+- **Canonical governance：** canonical reconciliation 生成
+  `shared_baseline`、`agent_overlay`、`project_overlay`，保留 durable source
+  link，完成 parity 校验后才激活 canonical read path，再把旧重复项可恢复地
+  shadow。V2 自动整理在同一 share group 内做 exact/semantic 去重，结果明确为
+  deduplicated、superseded、conflicted 或 quarantined。规则重复扫描生成受治理
+  merge proposal；merge 与 supersede 均保留 evidence、scope、幂等和 undo receipt。
+- **跨 Agent 同组治理：** 同一可信 `share_group_id` 的成员共享有界候选与治理
+  视图，其他 Group 无法进入；Agent identity 仍保留在 provenance。
+- **知识库文件/文件夹：** 选中文件夹可建 book，选中文件可作为 document 入库；
+  Content Plane 独占正文，Knowledge 只保留 metadata/reference。支持 re-ingest、
+  remove/restore/purge，候选必须显式 review 后才进入长期记忆。
+- **GUI Agent 与 Group：** native GUI 可发现 Agent 名称/实例、保存来源选择、
+  查看 binding、把成员加入 shared/personal group、检查 drift、离开或解散 Group；
+  变更通过事务 receipt 与 system outbox 提交。
+- **GUI 构建与后台收尾：** projection、Knowledge、import、history、maintenance、
+  release、compatibility 使用持久 V2 `TaskRun`；状态可恢复，取消协作且有界，
+  shutdown 前必须完成 owned worker/process 清理。
+- **CodeGraph / Graphify：** Graphify 只提供可信、无正文 metadata export；CodeGraph
+  保留 source role、provenance、source map、revision、tombstone、outbox，并提供
+  有界 query/path/explain/affected 与 production-only 过滤。
+- **安全与回滚：** unknown/corrupt state、缺失 scope、非法 provenance、reparse
+  路径、不安全 metadata、过期幂等请求均 fail-closed。公共 receipt 脱敏正文和路径；
+  governance/audit/outbox 保留决策。release rollback 通过有 scope 的 receipt 恢复
+  Content Plane blob 与 held occurrence，不信任未绑定 backup path。
+- **本地发布验收证据：** `1761 / 1761`，无 skip/xfail；V1 retirement + CodeGraph
+  `15 / 15`；Graphify 专项 `3 / 3`；canonical reconciliation `ACCEPTED`；
+  RuleMerge `46 / 46`；v3.2 `27 / 27`。真实全仓 Graphify export/projection 为
+  `486 files / 11672 nodes / 38714 edges → 11667 canonical symbols / 38714 edges`；
+  query/path/affected 通过，失败原子性全为 `0`。
+- **最终制品证据：** clean wheel `206 files`、`legacy bad=0`；隔离包、CLI、MCP
+  均报告 `0.7.0`；desktop help 通过。
+
+local release acceptance passed。v0.7.0 ready for commit/publish, not yet
+published。上述 Graphify 仅表示专项 `3 / 3` 与真实全仓 export/projection 通过，
+不表示 upstream Graphify 的全仓测试套件通过。详见
+[v0.7.0 发布记录](docs/releases/v0.7.0.md)。
+
+### v0.6.2 兼容基线
+
+Python 3.10 SQLite 修复仍是 v0.7.0 升级基线：Memory、Evidence、Content 的 schema
+preflight 检查包含 `-wal`/`-shm` 的私有副本，物理只写验证不会观察或 checkpoint live
+database。历史发布说明保留在 [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md)。
 
 ## v0.6.0 重大 V2 重构
 
@@ -185,10 +237,38 @@ memoryguard doctor
 python -m pip install --upgrade "agent-memguard[gui]"
 ```
 
-目前**没有**独立的 `memoryguard update` 自更新命令。包管理器是正式升级入口；
-包升级本身不会自动把已有工作区切到 V2。
+目前**没有**包级自更新命令。包管理器是正式升级入口；下面的
+`memoryguard upgrade` 是工作区迁移，不是包自更新。
 
-### 从 v0.5.x 显式切换到 V2
+### 从 v0.6.2 升级：显式 V2-only 迁移
+
+先升级包，再预览工作区迁移。预览必须零写入，并返回
+`status=PREVIEW`、`writes_performed=false`：
+
+```bash
+python -m pip install --upgrade agent-memguard
+memoryguard --version                    # 0.7.0
+memoryguard upgrade --workspace .        # 只读预览
+```
+
+如果 v0.6.2 使用独立用户数据目录，每次 `memoryguard upgrade` 都传入相同的
+`--data-home <path>`。分两步执行：
+
+```bash
+memoryguard upgrade --workspace . --apply
+# 要求：status=V2_READY、activation_required=true
+memoryguard upgrade --workspace . --apply --confirm V2_ACTIVE
+memoryguard doctor
+```
+
+`--apply` 只通过 `memoryguard.migration` 读取旧输入，构建 V2 shadow，迁移
+Agent/Group control，校验 frozen-source 与 live-source 证据，并停在 `V2_READY`。
+只有精确的 `V2_ACTIVE` 确认和新鲜 drift check 才能激活。control 或 validator
+失败必须保持非 active，不得静默 fallback 或自动激活。release gate 明确允许前，
+保留 V1 数据、migration-backups、receipt 和审计证据；重复执行 active upgrade
+应保持幂等。
+
+### 更早的 pre-V2 工作区：显式切换到 V2
 
 v0.6.0 随包安装 `memoryguard-v2` 运维命令：
 
@@ -210,12 +290,13 @@ manifest 前还会再检查一次 drift。升级过程中不要删除 legacy V1 
 
 ## 知识库
 
-桌面治理台可以把你选择的文件夹统一加入本地知识库。源文件保持原位，MemoryGuard
-把检索索引写入用户数据目录，不会给每个被选中的资料项目复制一套知识库数据库。
+桌面治理台可以把你选择的文件夹或文件集合加入本地知识库。源文件保持原位，
+MemoryGuard 把检索索引写入用户数据目录，不会给每个资料项目复制一套知识库数据库；
+Knowledge metadata 不会变成第二个正文存储。
 
 | 能力 | 当前行为 |
 |---|---|
-| 文件夹入库 | 一个文件夹作为一本书，支持文件作为文档进入索引 |
+| 文件/文件夹入库 | 文件夹作为一本书，选中文件作为文档进入索引 |
 | 结构化处理 | 解析文档、保留章节/小节上下文、生成可追溯切片 |
 | 检索 | 全文检索、可选 Embedding、分层知识图谱 |
 | 自然同步 | 重新整理变更文件；部分扫描或失败不会误删以前已索引内容 |
@@ -269,8 +350,10 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 - 知识库数据库位于 `MEMORYGUARD_HOME` 或平台用户数据目录；被选中的源文件夹不会
   获得一套独立知识库数据库。
 - V2 权威工作区状态按 Memory、Rules、Evidence、Content、Runtime、Projection、
-  Assets、CodeGraph、Skills 与 System 分域保存在 `.memoryguard/`。切换后 legacy
-  V1 产物继续保留为本地回滚/审计证据，但不再是 V2 运行时写入目标。
+  Assets、CodeGraph、Skills 与 System 分域保存在 `.memoryguard/`；History、Source、
+  Binding、Group control 也全部是 V2-native surface。切换后 legacy V1 产物继续保留
+  为本地回滚/审计证据，但不再是 V2 runtime 写入目标，且只有 `memoryguard.migration`
+  可以读取。
 - 来源扫描默认只读；变更路径带有校验、明确作用域、来源证据和可逆状态。
 - 隔离记录不会进入活跃共享记忆。
 - 原始对话历史永不自动注入 bootstrap。
@@ -295,8 +378,10 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 | `gui [path]` | 启动交互式治理台 |
 | `desktop` | 启动可信桌面执行器 |
 
-旧 V1 的 `plan`、`apply`、`verify`、`undo`、`import` 与 `gc` 命令仍可被解析，
-但在 `V2_ACTIVE` 下属于显式 retired surface，会返回稳定 retired 结果，不会写回 legacy store。
+旧 V1 的 `plan`、`apply`、`verify`、`undo`、`import` 与 `gc` 命令名可能仍被解析，
+但它们只是显式 retired compatibility surface，不是 V1 runtime path；在 `V2_ACTIVE`
+下返回稳定 retired 结果，不会写回 legacy store。旧数据输入只接受
+`memoryguard.migration` 的显式升级流程。
 
 以 `memoryguard --help` 和 `memoryguard <command> --help` 为当前安装版本的命令真相源。
 
@@ -320,6 +405,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.0 发布门禁](docs/releases/v0.7.0.md)
 - [长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)
 - [贡献指南](CONTRIBUTING.md)
 - [贡献者许可协议](CLA.md)
@@ -327,11 +413,14 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前：** 已激活的 V2 数据面、frozen-source 迁移与 cutover、Native
-  MCP/CLI/GUI/Hook、范围 Memory/Rules、Content/Evidence、对话档案、Provider
-  适配器、Reference Audit、Maintenance 与治理 UI。
-- **下一步：** 更丰富的 Scenario/Profile Projection、CodeGraph/Skills ingestion、
-  更友好的维护报告和更细的迁移可观测性。长期记录不会仅仅因为存在时间长而被淘汰。
+- **当前发布线：** V2-only runtime boundary、GUI Agent/Group control、持久 TaskRun、
+  native governance/release、知识库文件/文件夹入库，以及可信 scope 的 CodeGraph
+  query/path/explain/affected metadata projection。本地发布验收已通过；v0.7.0
+  ready for commit/publish, not yet published。
+- **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
+  export/projection；不表示 upstream Graphify 的全仓测试套件通过。
+- **发布后下一步：** 扩展 CodeGraph/Skills ingestion、维护报告和迁移可观测性。
+  长期记录不会仅仅因为存在时间长而被淘汰。
 - **以后：** 只在需求被验证后扩展团队和企业能力。
 
 详细设计见[长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)。

@@ -18,9 +18,9 @@ def _fixture(root: Path, *, omit: str | None = None) -> Path:
         if spec.name == omit:
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        version = spec.version if isinstance(spec.version, int) else spec.version[0]
+        user_version = spec.supported_user_versions[0]
         with sqlite3.connect(path) as conn:
-            conn.execute(f"PRAGMA user_version={version}")
+            conn.execute(f"PRAGMA user_version={user_version}")
             for table, table_spec in spec.tables.items():
                 extra = {
                     "task_runs": {"run_id", "task_type", "state"},
@@ -33,7 +33,7 @@ def _fixture(root: Path, *, omit: str | None = None) -> Path:
                 numeric = {"generation", "version", "sequence", "last_sequence", "active", "user_version"}
                 columns = ", ".join(f'"{column}" {"INTEGER" if column in numeric else "TEXT"}' for column in sorted(table_spec.required_columns or extra or {"dummy_id"}))
                 conn.execute(f'CREATE TABLE "{table}" ({columns})')
-            for metadata in ("schema_meta", f"{spec.name}_schema_meta", "asset_schema_meta", "codegraph_schema_meta", "runtime_v2_schema_meta", "content_schema_meta", "projection_schema_meta"):
+            for metadata in ("schema_meta", f"{spec.name}_schema_meta", "asset_schema_meta", "codegraph_schema_meta", "runtime_v2_schema_meta", "content_schema_meta", "projection_schema_meta", "gui_control_schema_meta"):
                 if metadata not in spec.tables:
                     continue
                 expected = next(((marker, marker_version) for table, marker, marker_version in _METADATA_MARKERS[spec.name] if table == metadata), None)

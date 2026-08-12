@@ -18,6 +18,148 @@ from memoryguard.knowledge_retriever import search, read_chunk, list_books, get_
 from memoryguard.knowledge_mcp import handle_knowledge_tool
 
 
+def _ensure_v2_knowledge_workspace(root: Path) -> None:
+    """Create the explicitly active V2 stores used by GUI knowledge tests."""
+    from memoryguard.assets_v2.store import AssetStore
+    from memoryguard.codegraph_v2.store import CodeGraphStore
+    from memoryguard.content.store import ContentStore
+    from memoryguard.evidence.store import EvidenceStore
+    from memoryguard.governance_v2 import GovernanceV2
+    from memoryguard.memory.store import MemoryAtomStore
+    from memoryguard.projection_v2.store import ProjectionStore
+    from memoryguard.rules.v2_store import RuleV2Store
+    from memoryguard.runtime_v2.working_memory import RuntimeStore
+    from memoryguard.skills_v2.store import SkillStore
+    from memoryguard.storage.layout import WorkspaceV2Layout
+    from memoryguard.storage.schema import initialize_all
+    from memoryguard.system.manifest import ManifestManager, ManifestState
+
+    manager = ManifestManager(root)
+    if manager.current().state is ManifestState.V2_ACTIVE:
+        return
+    initialize_all(WorkspaceV2Layout(root))
+    MemoryAtomStore(root)
+    EvidenceStore(root)
+    RuleV2Store(root)
+    ProjectionStore(root)
+    ContentStore(root)
+    RuntimeStore(root)
+    CodeGraphStore(root)
+    AssetStore(root)
+    SkillStore(root)
+    GovernanceV2(
+        root,
+        memory_store=MemoryAtomStore(root),
+        evidence_store=EvidenceStore(root),
+    )
+    manager.transition(ManifestState.V2_BUILDING, migration_id="knowledge-library-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="knowledge-library-source",
+        target_digest="knowledge-library-target",
+        manifest_digest="knowledge-library-manifest",
+        digests={"validator_passed": True, "checkpoints": {"knowledge": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def _knowledge_v2_gui_fixture(root: Path):
+    """Return a trusted GUI bridge and its same-process native V2 transport."""
+    from memoryguard.access_context import AccessContext
+    from memoryguard.gui import GovernanceApi
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    workspace = root.resolve()
+    _ensure_v2_knowledge_workspace(workspace)
+    agent = "knowledge-library-agent"
+    group = "knowledge-library-group"
+    GroupControlService(workspace, write=True).bind_agent(agent, group)
+    access = AccessContext(
+        trusted_agent_id=agent,
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id="knowledge-library-gui-session",
+        session_source="transport",
+        session_trusted=True,
+    )
+    bridge = GovernanceApi(str(workspace), _trusted_access_context=access)
+    runtime = bridge._get_v2_runtime()
+    snapshot = runtime.state_snapshot()
+    assert snapshot.state.value == "V2_ACTIVE"
+    context = bridge._trusted_bridge_context()
+    assert context.get("__native_bound_context") is not None
+    port = runtime.ports.v2
+    assert port is not None
+    return bridge, port, context, snapshot, group
+
+
+def _wait_for_knowledge_job(bridge, run_id: str) -> dict:
+    import time
+
+    latest = {}
+    for _ in range(500):
+        latest = bridge.knowledge_job_status(run_id)
+        if latest.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.02)
+    assert latest.get("status") == "succeeded", latest
+    assert latest.get("task", {}).get("run_id") == run_id, latest
+    return latest
+
+
+def _seed_v2_knowledge_candidate(workspace: Path, context) -> str:
+    """Stage one real V2 occurrence as a reference-only candidate."""
+    import json
+    import sqlite3
+
+    from memoryguard.knowledge_v2.service import KNOWLEDGE_CANDIDATE_TABLE
+    from memoryguard.storage.layout import WorkspaceV2Layout
+
+    layout = WorkspaceV2Layout(workspace)
+    with sqlite3.connect(layout.knowledge_db) as conn:
+        row = conn.execute(
+            "SELECT metadata_json FROM knowledge_documents WHERE status='active' ORDER BY path LIMIT 1",
+        ).fetchone()
+        assert row is not None
+        metadata = json.loads(str(row[0]))
+        occurrence_id = str(metadata["occurrence_ids"][0])
+        content_hash = str(metadata["content_hash"])
+        candidate_id = "knowledge-library-candidate"
+        conn.execute(
+            f"INSERT INTO {KNOWLEDGE_CANDIDATE_TABLE} "
+            "(candidate_id,namespace_id,workspace_id,agent_instance_id,project_ref,"
+            "provider,share_group_id,sensitivity,policy_class,status,summary,reference,"
+            "content_hash,source_occurrence_id,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'),datetime('now'))",
+            (
+                candidate_id,
+                str(context["namespace_id"]),
+                str(context["workspace_id"]),
+                str(context["agent_instance_id"]),
+                str(context["project_ref"]),
+                str(context["provider"]),
+                str(context["share_group_id"]),
+                str(context["sensitivity"]),
+                str(context["policy_class"]),
+                "pending",
+                "战斗候选",
+                occurrence_id,
+                content_hash,
+                occurrence_id,
+            ),
+        )
+        conn.commit()
+    return candidate_id
+
+
+def _knowledge_mcp_scope(context) -> dict[str, str]:
+    return {
+        key: str(context[key])
+        for key in ("namespace_id", "sensitivity", "policy_class")
+    }
+
+
 @pytest.fixture
 def tmp_book_dir():
     """创建临时文件夹模拟一本书。"""
@@ -485,54 +627,79 @@ class TestSharedKnowledge:
         data_home = tmp_path / "data_home"
         monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
         root = self._make_book_dir(tmp_path)
+        workspace = tmp_path / "v2-workspace"
+        bridge, port, context, snapshot, _group = _knowledge_v2_gui_fixture(workspace)
+        try:
+            # GUI writes through the trusted AccessContext/native bridge.
+            accepted = bridge.knowledge_add(str(root), "游戏设计")
+            assert accepted.get("ok") is True, accepted
+            assert accepted.get("deferred") is True
+            run_id = accepted["task"]["run_id"]
+            _wait_for_knowledge_job(bridge, run_id)
 
-        from memoryguard.knowledge_ingestion import create_book, ingest_book
-        from memoryguard.knowledge_store import open_shared_knowledge_store
+            selectors = _knowledge_mcp_scope(context)
+            mcp_search = port.dispatch_mcp(
+                "memoryguard_knowledge_search",
+                {**selectors, "query": "战斗属性", "limit": 20},
+                context=context,
+                generation=snapshot.generation,
+                state=snapshot.state,
+            )
+            assert mcp_search.get("ok") is True, mcp_search
+            references = mcp_search.get("data", [])
+            assert references
+            # The query hit is represented by a non-empty V2 reference list;
+            # public MCP summaries intentionally do not echo body/section
+            # text such as “战斗属性”.
+            assert any(item.get("summary") == "attributes" for item in references)
+            assert all(item.get("trust") == "reference_only" for item in references)
 
-        # 1. GUI 添加书（写全局库）
-        with open_shared_knowledge_store() as store:
-            book = create_book(store, str(root), title="游戏设计")
-            ingest_book(store, book.book_id)
+            # Repeated MCP reads and GUI list are served by the same V2 store.
+            mcp_list = port.dispatch_mcp(
+                "memoryguard_knowledge_list",
+                {**selectors, "limit": 50},
+                context=context,
+                generation=snapshot.generation,
+                state=snapshot.state,
+            )
+            assert mcp_list.get("ok") is True, mcp_list
+            assert mcp_list.get("data")
+            gui_list = bridge.knowledge_list("", 50)
+            assert gui_list.get("ok") is True, gui_list
+            books = gui_list.get("data", {}).get("books", [])
+            assert any(book["title"] == "游戏设计" for book in books)
+        finally:
+            port.shutdown(timeout=5.0)
 
-        # 2. MCP 连续两次只读搜索（回归缓存关闭 bug）
-        r1 = handle_knowledge_tool("memoryguard_knowledge_search", {"query": "战斗属性"})
-        assert r1 is not None and not r1.get("isError")
-        assert "战斗属性" in r1["content"][0]["text"]
-        r2 = handle_knowledge_tool("memoryguard_knowledge_list", {})
-        assert r2 is not None and not r2.get("isError")
-        assert "游戏设计" in r2["content"][0]["text"]
-
-        # 3. GUI knowledge_list 走同一个库
-        from memoryguard.knowledge_gui import handle_knowledge_api
-        gui_list = handle_knowledge_api("knowledge_list", [], ".")
-        assert gui_list.get("total", 0) >= 1
-        assert any(b["title"] == "游戏设计" for b in gui_list.get("books", []))
-
-    def test_bootstrap_knowledge_items_reference_only(self, tmp_path, monkeypatch):
-        """Bootstrap 召回同一库，且控制面文件不注入、知识项带 trust=reference_only。"""
-        data_home = tmp_path / "data_home"
-        monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+    def test_bootstrap_knowledge_items_reference_only(self, tmp_path):
+        """V2 知识引用带 reference_only，且控制面文件不进入公开结果。"""
         root = self._make_book_dir(tmp_path)
+        workspace = tmp_path / "v2-bootstrap-workspace"
+        bridge, port, context, snapshot, _group = _knowledge_v2_gui_fixture(workspace)
+        try:
+            accepted = bridge.knowledge_add(str(root), "游戏设计")
+            assert accepted.get("ok") is True, accepted
+            run_id = accepted["task"]["run_id"]
+            _wait_for_knowledge_job(bridge, run_id)
 
-        from memoryguard.knowledge_ingestion import create_book, ingest_book
-        from memoryguard.knowledge_store import open_shared_knowledge_store
-        with open_shared_knowledge_store() as store:
-            book = create_book(store, str(root), title="游戏设计")
-            ingest_book(store, book.book_id)
-
-        from memoryguard.context_bootstrap import build_context_packet
-        from memoryguard.schema_v3 import EffectiveAgentContext
-        from memoryguard.shared_memory_store import SharedMemoryStore
-        sm = SharedMemoryStore(tmp_path / "sm", "default")
-        packet = build_context_packet(
-            sm, task="战斗属性",
-            effective_context=EffectiveAgentContext("agent-1", "default"),
-        )
-        k_items = packet["context_packet"].get("knowledge_items", [])
-        assert len(k_items) > 0
-        assert all(i.get("trust") == "reference_only" for i in k_items)
-        # 控制面文件（AGENTS.md）不出现在 knowledge_items
-        assert not any("删除所有旧数据库" in i.get("text", "") for i in k_items)
+            selectors = _knowledge_mcp_scope(context)
+            mcp_search = port.dispatch_mcp(
+                "memoryguard_knowledge_search",
+                {**selectors, "query": "战斗属性", "limit": 20},
+                context=context,
+                generation=snapshot.generation,
+                state=snapshot.state,
+            )
+            assert mcp_search.get("ok") is True, mcp_search
+            references = mcp_search.get("data", [])
+            assert references
+            assert all(item.get("trust") == "reference_only" for item in references)
+            assert not any(
+                "删除所有旧数据库" in str(item)
+                for item in references
+            )
+        finally:
+            port.shutdown(timeout=5.0)
 
     def test_readonly_mcp_does_not_create_db(self, tmp_path, monkeypatch):
         """只读 MCP 在知识库不存在时不创建任何文件（P0-3）。"""
@@ -548,26 +715,21 @@ class TestSharedKnowledge:
         data_home = tmp_path / "data_home"
         monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
         root = self._make_book_dir(tmp_path)
+        workspace = tmp_path / "v2-workspace"
+        bridge, port, _context, _snapshot, _group = _knowledge_v2_gui_fixture(workspace)
+        try:
+            response = bridge.knowledge_add(str(root), "异步书")
+            assert response.get("ok") is True, response
+            assert response.get("deferred") is True
+            assert response.get("job_id") == response.get("task", {}).get("run_id")
+            _wait_for_knowledge_job(bridge, response["job_id"])
 
-        from memoryguard.knowledge_gui import handle_knowledge_api
-        resp = handle_knowledge_api("knowledge_add", [str(root), "异步书"], ".")
-        assert resp.get("ok") is True
-        assert resp.get("deferred") is True
-        assert resp.get("job_id")
-        # 等待后台线程完成
-        import time as _t
-        from memoryguard.knowledge_store import open_shared_knowledge_store
-        for _ in range(50):
-            with open_shared_knowledge_store(read_only=True, must_exist=True) as s:
-                job = s.get_job(resp["job_id"])
-            if job and job["status"] in ("done", "failed"):
-                break
-            _t.sleep(0.1)
-        assert job is not None and job["status"] == "done"
-        # 书已入库
-        with open_shared_knowledge_store(read_only=True, must_exist=True) as s:
-            books = [b.title for b in s.list_books()]
-        assert "异步书" in books
+            gui_list = bridge.knowledge_list("", 50)
+            assert gui_list.get("ok") is True, gui_list
+            books = gui_list.get("data", {}).get("books", [])
+            assert any(book["title"] == "异步书" for book in books)
+        finally:
+            port.shutdown(timeout=5.0)
 
 
 class TestP12RRF:
@@ -754,29 +916,32 @@ class TestP14Candidates:
             "# 战斗系统\n\n力量影响物理攻击，敏捷影响闪避，智力影响魔法。\n"
             "这套属性系统驱动整个战斗循环。\n" * 3, encoding="utf-8",
         )
-        from memoryguard.knowledge_ingestion import create_book, ingest_book
-        from memoryguard.knowledge_store import open_shared_knowledge_store
-        from memoryguard.knowledge_gui import handle_knowledge_api
-        with open_shared_knowledge_store() as store:
-            book = create_book(store, str(root), title="战斗书")
-            ingest_book(store, book.book_id)
-        lst = handle_knowledge_api("knowledge_candidates_list", [], ".")
-        assert lst.get("total", 0) > 0
-        cid = lst["candidates"][0]["candidate_id"]
-        from memoryguard.agent_binding import AgentBindingStore
-        control_workspace = tmp_path / "control"
-        control_workspace.mkdir()
-        target_group = AgentBindingStore(
-            control_workspace,
-        ).ensure_personal_memory_group("candidate-test-agent")["group_id"]
-        r = handle_knowledge_api(
-            "knowledge_candidate_review",
-            [cid, "approve", target_group],
-            control_workspace,
-        )
-        assert r.get("ok") is True
-        lst2 = handle_knowledge_api("knowledge_candidates_list", ["", "approved"], ".")
-        assert lst2.get("total", 0) >= 1
+        workspace = tmp_path / "v2-workspace"
+        bridge, port, _context, _snapshot, target_group = _knowledge_v2_gui_fixture(workspace)
+        try:
+            accepted = bridge.knowledge_add(str(root), "战斗书")
+            assert accepted.get("ok") is True, accepted
+            _wait_for_knowledge_job(bridge, accepted["job_id"])
+            candidate_id = _seed_v2_knowledge_candidate(workspace, _context)
+
+            pending = bridge.knowledge_candidates_list("", "pending")
+            assert pending.get("ok") is True, pending
+            references = pending.get("data", {}).get("references", [])
+            assert references
+            assert any(item["candidate_id"] == candidate_id for item in references)
+            cid = candidate_id
+
+            reviewed = bridge.knowledge_candidate_review(cid, "approve", target_group)
+            assert reviewed.get("ok") is True, reviewed
+            assert reviewed.get("status") == "succeeded", reviewed
+            assert reviewed.get("operation") == "knowledge_candidate_review"
+
+            approved = bridge.knowledge_candidates_list("", "approved")
+            assert approved.get("ok") is True, approved
+            approved_refs = approved.get("data", {}).get("references", [])
+            assert any(item["candidate_id"] == cid and item["status"] == "approved" for item in approved_refs)
+        finally:
+            port.shutdown(timeout=5.0)
 
 
 class TestP0IndexConsistency:
@@ -799,7 +964,7 @@ class TestP0IndexConsistency:
                                                      ingest_book,
                                                      KnowledgeScanResult,
                                                      ScanTruncation)
-        from memoryguard.source_registry import ScanBudget as SB
+        from memoryguard.runtime_v2.source_native import ScanBudget as SB
         from memoryguard.knowledge_store import KnowledgeStore
         root = self._make_multi(tmp_path, 4)
 
@@ -917,7 +1082,7 @@ class TestP0IndexConsistency:
     def test_max_files_truncation_records_reason(self, tmp_path):
         """max_files 截断会记录截断原因并标记不完整。"""
         from memoryguard.knowledge_ingestion import _scan_files, ScanBudget
-        from memoryguard.source_registry import ScanBudget as SB
+        from memoryguard.runtime_v2.source_native import ScanBudget as SB
         root = self._make_multi(tmp_path, 5)
         budget = SB(max_files=2, max_total_size=10**9, max_single_file=10**7,
                     max_depth=20, timeout_seconds=60)
@@ -929,7 +1094,7 @@ class TestP0IndexConsistency:
     def test_max_depth_truncation_records_reason(self, tmp_path):
         """Directories beyond max_depth make the scan explicitly incomplete."""
         from memoryguard.knowledge_ingestion import _scan_files
-        from memoryguard.source_registry import ScanBudget as SB
+        from memoryguard.runtime_v2.source_native import ScanBudget as SB
 
         root = tmp_path / "deep"
         deep = root / "one" / "two" / "three"
@@ -1032,7 +1197,7 @@ class TestP0IndexConsistency:
             ingest_book,
         )
         from memoryguard.knowledge_store import KnowledgeStore
-        from memoryguard.source_registry import ScanBudget as SB
+        from memoryguard.runtime_v2.source_native import ScanBudget as SB
 
         root = tmp_path / "size-book"
         root.mkdir()

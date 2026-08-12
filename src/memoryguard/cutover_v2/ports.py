@@ -22,11 +22,6 @@ class DispatchPort(Protocol):
 
 
 @runtime_checkable
-class LegacyPort(DispatchPort, Protocol):
-    """Explicit legacy route; facade never discovers a legacy implementation."""
-
-
-@runtime_checkable
 class V2Port(DispatchPort, Protocol):
     """Explicit V2 route; implementations may consume generation/CAS metadata."""
 
@@ -47,14 +42,14 @@ class RuntimePorts:
 
     Ports are intentionally typed as ``Any`` at runtime: adapters may be
     callables, protocol objects, or test doubles.  The facade validates each
-    operation before invoking it and fails closed when a method is missing.
+    native V2 operation before invoking it and fails closed when a method is
+    missing.  A missing native port is an explicit cutover configuration
+    error; it is never filled from a retired route.
     """
 
     manifest: Any
     v2: Any = None
-    legacy: Any = None
     hook_v2: Any = None
-    hook_legacy: Any = None
     readiness: Any = None
     context_engine: Any = None
     recall_planner: Any = None
@@ -72,8 +67,6 @@ class RuntimePorts:
             "system_manifest": "manifest",
             "v2_port": "v2",
             "v2_runtime": "v2",
-            "legacy_port": "legacy",
-            "legacy_adapter": "legacy",
             "hook": "hook_v2",
             "hook_port": "hook_v2",
             "readiness_gate": "readiness",
@@ -89,11 +82,11 @@ class RuntimePorts:
         normalized = {name: data.get(name) for name in cls.__dataclass_fields__}
         # ``None`` is an explicit "cutover not configured" port.  The state
         # factory maps it to trusted ``V1_ACTIVE`` generation 0 without
-        # creating a database; callers can still fail closed on malformed
-        # non-None ports.
+        # creating a database; the facade returns the stable upgrade error
+        # rather than executing a retired V1 route.
         return cls(**normalized)
 
 
 __all__ = [
-    "ManifestPort", "DispatchPort", "LegacyPort", "V2Port", "HookPort", "ReadinessPort", "RuntimePorts",
+    "ManifestPort", "DispatchPort", "V2Port", "HookPort", "ReadinessPort", "RuntimePorts",
 ]

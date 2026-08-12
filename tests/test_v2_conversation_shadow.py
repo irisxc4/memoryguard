@@ -4,12 +4,12 @@ from types import SimpleNamespace
 from pathlib import Path
 
 from memoryguard.content import ContentStore, ConversationShadowBridge, ConversationSync
-from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+from memoryguard.runtime_v2.history_store import ContentHistoryStore, V2HistoryScope
 from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
-def _scope() -> HistoryScope:
-    return HistoryScope(agent_instance_id="agent-a", provider="codex", share_group_id="share-a")
+def _scope() -> V2HistoryScope:
+    return V2HistoryScope(agent_instance_id="agent-a", provider="codex", share_group_id="share-a")
 
 
 def _bridge(root: Path) -> tuple[ContentStore, ConversationShadowBridge]:
@@ -29,20 +29,20 @@ def test_shadow_requires_explicit_store_and_manifest(tmp_path: Path):
     assert not (tmp_path / ".memoryguard").exists()
 
 
-def test_dual_write_replay_and_v1_primary(tmp_path: Path):
+def test_shadow_replay_is_idempotent_on_the_v2_content_plane(tmp_path: Path):
     content, bridge = _bridge(tmp_path)
-    history = ConversationHistoryStore(tmp_path)
     conversation = SimpleNamespace(
         conv_id="session-1", title="", project_ref="",
         messages=[{"role": "user", "content": "hello", "event_id": "e1"}],
     )
-    first = history.import_conversations([conversation], provider="codex", scope=_scope(), shadow=bridge)
+    first = bridge.sync_conversation(conversation, provider="codex", scope=_scope())
     before = content.counts()
-    replay = history.import_conversations([conversation], provider="codex", scope=_scope(), shadow=bridge)
-    assert first["conversation_count"] == replay["conversation_count"] == 1
-    assert first["shadow"][0]["status"] == "complete"
-    assert replay["shadow"][0]["status"] == "complete"
+    replay = bridge.sync_conversation(conversation, provider="codex", scope=_scope())
+    assert first["status"] == replay["status"] == "complete"
     assert content.counts() == before
+    listed = ContentHistoryStore(tmp_path, readonly=True).list_sessions(_scope())
+    assert listed["total"] == 1
+    assert listed["sessions"][0]["turn_count"] == 1
 
 
 def test_shadow_outbox_retry_after_projection_failure(tmp_path: Path):

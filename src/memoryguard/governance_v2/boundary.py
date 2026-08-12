@@ -107,6 +107,12 @@ class V2GovernanceBoundary:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS request_ledger(actor TEXT NOT NULL,idempotency_key TEXT NOT NULL,operation TEXT NOT NULL,context_json TEXT NOT NULL,request_fingerprint TEXT NOT NULL,decision_id TEXT, state TEXT NOT NULL,claim_token TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,failure_code TEXT NOT NULL DEFAULT '',PRIMARY KEY(actor,idempotency_key))"
             )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS decision_outbox(event_id TEXT PRIMARY KEY,decision_id TEXT NOT NULL UNIQUE,operation TEXT NOT NULL,target_digest TEXT NOT NULL,scope_digest TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','projected','failed')),attempts INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,projected_at TEXT NOT NULL DEFAULT '',error_code TEXT NOT NULL DEFAULT '')"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_governance_decision_outbox_status ON decision_outbox(status,created_at,event_id)"
+            )
             # Upgrade an older decisions-only ledger so its receipts remain
             # replayable after enabling the request fence.
             for row in conn.execute("SELECT decision_id,operation,context_json,idempotency_key,request_fingerprint,status,created_at FROM decisions WHERE idempotency_key <> ''"):
@@ -173,9 +179,33 @@ class V2GovernanceBoundary:
         context: V2MutationContext,
         idempotency_key: str | None,
     ) -> tuple[str, str]:
-        """Return a durable request key/fingerprint independent of post-state."""
+        """Return a durable request key/fingerprint independent of post-state.
 
-        fingerprint = _digest({"operation": operation, "payload": dict(payload)})
+        ``put`` callers can take different internal branches for the same
+        user request (for example, create versus explicit-memory-id replay).
+        Their governance ``reason`` is a decision annotation selected by that
+        branch, not request intent, so it must not change the idempotency
+        fingerprint.  The remaining payload plus the trusted mutation scope
+        is stable request identity; changed body/evidence/atom fields still
+        produce a conflict for the same key.
+        """
+
+        stable_payload = dict(payload)
+        if operation == "put":
+            stable_payload.pop("reason", None)
+        trusted_scope = {
+            "workspace_id": context.workspace_id,
+            "share_group_id": context.share_group_id,
+            "agent_instance_id": context.agent_instance_id,
+            "project_ref": context.project_ref,
+            "provider": context.provider,
+            "runtime_role": context.runtime_role,
+        }
+        fingerprint = _digest({
+            "operation": operation,
+            "payload": stable_payload,
+            "trusted_scope": trusted_scope,
+        })
         supplied = str(idempotency_key or "").strip()
         key = supplied or _digest({"operation": operation, "caller": context.actor, "request_fingerprint": fingerprint})
         return key, fingerprint
@@ -332,6 +362,25 @@ class V2GovernanceBoundary:
             existing_decision = self._decision_from_row(existing)
             if existing_decision.operation != operation or existing_decision.target != dict(target) or existing_decision.context != context.to_dict() or existing_decision.request_fingerprint != str(request_fingerprint):
                 raise V2GovernanceError("idempotency request conflict")
+            event_id = _digest({"event": "governance.decision", "decision_id": decision_id})
+            conn.execute(
+                "INSERT INTO decision_outbox(event_id,decision_id,operation,target_digest,scope_digest,status,attempts,created_at) VALUES(?,?,?,?,?,'pending',0,?) ON CONFLICT(decision_id) DO NOTHING",
+                (
+                    event_id,
+                    decision_id,
+                    operation,
+                    _digest(dict(target)),
+                    _digest({
+                        "workspace_id": context.workspace_id,
+                        "share_group_id": context.share_group_id,
+                        "agent_instance_id": context.agent_instance_id,
+                        "project_ref": context.project_ref,
+                        "provider": context.provider,
+                        "runtime_role": context.runtime_role,
+                    }),
+                    now,
+                ),
+            )
             if claim is not None:
                 request = conn.execute(
                     "SELECT state,claim_token,decision_id FROM request_ledger WHERE actor=? AND idempotency_key=?",
@@ -402,6 +451,42 @@ class V2GovernanceBoundary:
         )
         return item
 
+    def _resolve_logical_atom(
+        self,
+        item: MemoryAtom,
+        context: V2MutationContext,
+    ) -> MemoryAtom | None:
+        """Resolve the logical V2 record before claiming a mutation.
+
+        The store repeats this lookup inside its write transaction.  This
+        boundary-side preflight makes the governance decision and undo
+        snapshot refer to the canonical atom when a caller supplies a fresh
+        atom ID for an existing ``(share_group_id, memory_id)`` record.
+        """
+
+        existing = self.memory._get_atom_unscoped(
+            item.memory_id,
+            share_group_id=item.share_group_id,
+            include_building=True,
+        )
+        if existing is None:
+            return None
+        if not context.admin:
+            try:
+                context.check_scope(
+                    workspace_id=existing.workspace_id,
+                    share_group_id=existing.share_group_id,
+                    agent_instance_id=existing.agent_instance_id,
+                    project_ref=existing.project_ref,
+                    provider=existing.provider,
+                    runtime_role=existing.runtime_role,
+                )
+            except V2ScopeError:
+                # Do not reveal an existing owner or a storage constraint.
+                raise V2ScopeError("mutation logical record is outside context") from None
+        item.atom_id = existing.atom_id
+        return existing
+
     @staticmethod
     def _atom_request_payload(item: MemoryAtom) -> dict[str, Any]:
         value = item.to_dict()
@@ -424,26 +509,31 @@ class V2GovernanceBoundary:
         reason: str = "atom mutation",
         confidence: float = 1.0,
         idempotency_key: str | None = None,
+        request_payload: Mapping[str, Any] | None = None,
     ) -> tuple[MemoryAtom, V2Decision]:
         ctx = self._context(context)
         reason, confidence = self._decision_args(reason, confidence)
         item = self._normalize_atom(atom, ctx)
-        request_payload = {
-            "atom": self._atom_request_payload(item),
-            "evidence": list(evidence or ()),
-            "evidence_ids": list(evidence_ids or ()),
-            "source_mappings": [dict(value) for value in (source_mappings or ())],
-            "reason": reason,
-            "confidence": confidence,
-        }
-        request_key, request_fingerprint = self._request_identity("put", request_payload, ctx, idempotency_key)
+        before_atom = self._resolve_logical_atom(item, ctx)
+        identity_payload = (
+            {"request": dict(request_payload)}
+            if request_payload is not None
+            else {
+                "atom": self._atom_request_payload(item),
+                "evidence": list(evidence or ()),
+                "evidence_ids": list(evidence_ids or ()),
+                "source_mappings": [dict(value) for value in (source_mappings or ())],
+                "reason": reason,
+                "confidence": confidence,
+            }
+        )
+        request_key, request_fingerprint = self._request_identity("put", identity_payload, ctx, idempotency_key)
         replay, claim = self._claim_request(ctx, "put", request_key, request_fingerprint)
         if replay is not None:
             current = self.memory._get_atom_unscoped(item.memory_id, share_group_id=item.share_group_id, include_building=True, atom_id=item.atom_id if item.atom_id else "")
             if current is None:
                 raise V2GovernanceError("idempotency receipt has no corresponding atom")
             return current, replay
-        before_atom = self.memory._get_atom_unscoped(item.memory_id, share_group_id=item.share_group_id, include_building=True, atom_id=item.atom_id if item.atom_id else "")
         try:
             if before_atom is None and not (evidence or evidence_ids):
                 raise V2GovernanceError("new atom requires at least one evidence reference")
@@ -462,6 +552,62 @@ class V2GovernanceBoundary:
                     pass
             raise
         return persisted, decision
+
+    def record_deduplication(
+        self,
+        atom: MemoryAtom,
+        *,
+        context: V2MutationContext | Mapping[str, Any],
+        request_payload: Mapping[str, Any] | None = None,
+        reason: str = "native V2 automatic deduplication",
+        confidence: float = 1.0,
+        idempotency_key: str | None = None,
+    ) -> V2Decision:
+        """Record an idempotent no-op when a scoped atom is deduplicated.
+
+        Deduplication is still a governed mutation event even though it does
+        not rewrite the winning atom.  Keeping the request fence in the same
+        V2 decision ledger makes retries and changed-payload reuse fail or
+        replay deterministically instead of silently creating a duplicate.
+        """
+
+        ctx = self._context(context)
+        reason, confidence = self._decision_args(reason, confidence)
+        visible = self.memory._get_atom_scoped(
+            atom.memory_id,
+            MemoryAtomStoreScope(ctx),
+            include_building=True,
+            atom_id=atom.atom_id if atom.atom_id else "",
+        )
+        if visible is None or visible.atom_id != atom.atom_id:
+            raise V2ScopeError("deduplication candidate is outside context")
+        target = {"atom_id": atom.atom_id, "memory_id": atom.memory_id}
+        request = {"candidate": target, "request": dict(request_payload or {})}
+        request_key, request_fingerprint = self._request_identity("deduplicate", request, ctx, idempotency_key)
+        replay, claim = self._claim_request(ctx, "deduplicate", request_key, request_fingerprint)
+        if replay is not None:
+            return replay
+        try:
+            decision = self._record(
+                "deduplicate",
+                target,
+                ctx,
+                self._atom_snapshot(visible),
+                self._atom_snapshot(visible),
+                reason=reason,
+                confidence=confidence,
+                idempotency_key=request_key,
+                request_fingerprint=request_fingerprint,
+                claim=claim,
+            )
+        except Exception:
+            if claim is not None:
+                try:
+                    self._fail_request(ctx, claim)
+                except Exception:
+                    pass
+            raise
+        return decision
 
     update_atom = put_atom
 
@@ -494,6 +640,129 @@ class V2GovernanceBoundary:
                     pass
             raise
         return persisted, decision
+
+    def restore(
+        self,
+        memory_id: str,
+        *,
+        context: V2MutationContext | Mapping[str, Any],
+        reason: str,
+        confidence: float = 1.0,
+        idempotency_key: str | None = None,
+    ) -> tuple[MemoryAtom, V2Decision]:
+        """Govern a restore of one atom and its supersession descendants."""
+
+        ctx = self._context(context)
+        reason, confidence = self._decision_args(reason, confidence)
+        request_key, request_fingerprint = self._request_identity(
+            "restore",
+            {"memory_id": str(memory_id), "reason": reason, "confidence": confidence},
+            ctx,
+            idempotency_key,
+        )
+        replay, claim = self._claim_request(ctx, "restore", request_key, request_fingerprint)
+        if replay is not None:
+            current = self.memory._get_atom_scoped(
+                memory_id,
+                MemoryAtomStoreScope(ctx),
+                include_building=True,
+            )
+            if current is None:
+                raise V2GovernanceError("idempotency receipt has no corresponding atom")
+            return current, replay
+
+        before_target = self.memory._get_atom_scoped(
+            memory_id,
+            MemoryAtomStoreScope(ctx),
+            include_building=True,
+        )
+        if before_target is None:
+            if claim is not None:
+                self._fail_request(ctx, claim)
+            raise KeyError(memory_id)
+        before_atoms = {
+            atom.atom_id: atom
+            for atom in self.memory.list_atoms(
+                scope=ctx.to_dict(),
+                include_building=True,
+            )
+        }
+        try:
+            restored, shadowed = self.memory.restore(
+                memory_id,
+                context=ctx,
+                reason=reason,
+            )
+            shadowed_ids = [item.atom_id for item in shadowed]
+            before = {
+                "target": self._atom_snapshot(before_target),
+                "descendants": {
+                    atom_id: self._atom_snapshot(before_atoms[atom_id])
+                    for atom_id in shadowed_ids
+                    if atom_id in before_atoms
+                },
+            }
+            after = {
+                "target": self._atom_snapshot(restored),
+                "descendants": {
+                    item.atom_id: self._atom_snapshot(item)
+                    for item in shadowed
+                },
+            }
+            target = {
+                "atom_id": restored.atom_id,
+                "memory_id": restored.memory_id,
+                "descendants_shadowed": [item.memory_id for item in shadowed],
+            }
+            decision = self._record(
+                "restore",
+                target,
+                ctx,
+                before,
+                after,
+                reason=reason,
+                confidence=confidence,
+                idempotency_key=request_key,
+                request_fingerprint=request_fingerprint,
+                claim=claim,
+            )
+        except Exception:
+            # The memory-domain mutation is atomic.  If receipt publication
+            # fails after that commit, compensate only the lifecycle fields
+            # touched by this restore; bodies and evidence remain intact.
+            try:
+                for atom_id, snapshot in {
+                    before_target.atom_id: self._atom_snapshot(before_target),
+                    **{
+                        atom_id: self._atom_snapshot(atom)
+                        for atom_id, atom in before_atoms.items()
+                        if atom_id != before_target.atom_id and atom.status == "active"
+                    },
+                }.items():
+                    current = self.memory._get_atom_scoped(
+                        atom_id,
+                        MemoryAtomStoreScope(ctx),
+                        include_building=True,
+                        atom_id=atom_id,
+                    )
+                    if current is None:
+                        continue
+                    current.status = str(snapshot.get("status") or current.status)
+                    current.locked = bool(snapshot.get("locked", current.locked))
+                    current.supersedes = list(snapshot.get("supersedes") or current.supersedes)
+                    current.provenance = list(snapshot.get("provenance") or current.provenance)
+                    current.metadata = dict(snapshot.get("metadata") or current.metadata)
+                    current.visibility = str(snapshot.get("visibility") or current.visibility)
+                    self.memory.put_atom(current, context=ctx)
+            except Exception:
+                pass
+            if claim is not None:
+                try:
+                    self._fail_request(ctx, claim)
+                except Exception:
+                    pass
+            raise
+        return restored, decision
 
     def supersede(self, old: str, new: str, *, context: V2MutationContext | Mapping[str, Any], reason: str, confidence: float = 1.0, source_ref: str = "", idempotency_key: str | None = None) -> V2Decision:
         ctx = self._context(context)

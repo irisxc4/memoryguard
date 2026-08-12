@@ -1,284 +1,317 @@
-"""性能基准 + 功能闭环验证:重构->接管->衍生->自更新。
+"""V2 performance benchmark for the governed ingestion/projection path.
 
-测试维度:
-1. 扫描+规范化耗时(不同数据规模)
-2. 去重 TF-IDF 耗时(记录数增长)
-3. 发布+Loader 复读耗时
-4. AutoOrganizer 衍生触发条件
-5. 端到端闭环:从原始记忆到接管验证
+The benchmark intentionally measures the public V2 services together:
+SourceControlService -> NativeExtractionEnrichmentService -> MemoryAtomStore
+-> ProjectionBuildService/ProjectionStore.  It is executable as a script so
+that the size targets remain useful outside pytest.
 """
-import sys
-import json
-import time
-import tempfile
-import os
+from __future__ import annotations
+
+from collections import Counter
 from pathlib import Path
-import pytest
+import shutil
+import sys
+import tempfile
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-@pytest.fixture(autouse=True)
-def _isolated_test_env(monkeypatch):
-    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
-    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
+from memoryguard.access_context import AccessContext
+from memoryguard.content import ContentStore
+from memoryguard.evidence import EvidenceStore
+from memoryguard.memory import MemoryAtomStore, MemoryReadScope
+from memoryguard.projection_v2 import ProjectionReadScope, ProjectionStore
+from memoryguard.runtime_v2.extraction_native import NativeExtractionEnrichmentService
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import bind_native_transport_context
+from memoryguard.runtime_v2.projection_build import ProjectionBuildService
+from memoryguard.runtime_v2.source_control import SourceControlService
 
 
-def make_test_workspace(record_count: int = 50, dup_ratio: float = 0.2) -> Path:
-    """创建测试工作区,含指定规模的记忆文件。"""
-    ws = Path(tempfile.mkdtemp())
-    docs = ws / "docs"
-    docs.mkdir()
-
-    # 生成记忆文件(部分重复)
-    titles = [
-        "用户偏好 Python", "项目部署流程", "代码审查规则", "API 设计规范",
-        "数据库迁移步骤", "用户偏好 Go", "测试覆盖率要求", "文档编写标准",
-    ]
-    bodies = [
-        "用户偏好使用 Python 编程语言进行开发,喜欢类型注解和 dataclass",
-        "项目部署需要先跑测试,再构建 Docker 镜像,最后 kubectl apply",
-        "代码审查必须检查:错误处理、日志、测试覆盖、安全输入校验",
-        "API 设计遵循 RESTful 规范,资源用复数,版本放 URL,错误用标准状态码",
-        "数据库迁移步骤:1. 写 migration 2. 本地测试 3. staging 验证 4. 生产",
-        "用户偏好使用 Go 语言,喜欢 goroutine 和 channel",
-        "测试覆盖率不低于 80%,关键路径必须 100%,用 pytest-cov 测量",
-        "文档用中文编写,代码注释用英文,README 含安装和使用说明",
-    ]
-
-    files_per_doc = max(1, record_count // 8)
-    for i in range(8):
-        content = f"# {titles[i]}\n\n"
-        for j in range(files_per_doc):
-            # 重复内容占 dup_ratio
-            if j < int(files_per_doc * dup_ratio):
-                content += f"## {titles[i]}\n{bodies[i]}\n\n"
-            else:
-                content += f"## {titles[i]} 变体{j}\n{bodies[i]} 变体内容{j}\n\n"
-        (docs / f"memory_{i}.md").write_text(content, encoding="utf-8")
-
-    # 注册数据源
-    from memoryguard.source_registry import SourceRegistry, SourceRootType
-    reg = SourceRegistry(ws)
-    reg.add(str(docs), SourceRootType.SELECTED_DIRECTORY, "Test Memory",
-            scope="project")
-    return ws
+AGENT = "agent-bench"
+GROUP = "benchmark-group"
+PROVIDER = "benchmark"
+RUNTIME_ROLE = "benchmark"
 
 
-def bench_scan_normalize(ws: Path) -> dict:
-    """基准:扫描+规范化。"""
-    from memoryguard.source_registry import SourceRegistry, ScanBudget
-    from memoryguard.memory_ir import MemoryNormalizer
-
-    t0 = time.perf_counter()
-    reg = SourceRegistry(ws)
-    snap = reg.scan(ScanBudget())
-    roots = reg.list_sources()
-    root_map = {r.root_id: r.path for r in roots}
-    root_policies = {r.root_id: {"source_category": r.source_category,
-                                 "ingestion_policy": r.ingestion_policy} for r in roots}
-    norm = MemoryNormalizer(ws)
-    ir = norm.normalize(snap, root_map=root_map, root_policies=root_policies)
-    norm.save(ir)
-    t1 = time.perf_counter()
-
-    return {
-        "scan_normalize_ms": round((t1 - t0) * 1000, 2),
-        "source_objects": len(snap.source_objects),
-        "ir_records": len(ir.records),
-        "duplicate_groups": len(ir.duplicate_groups),
-    }
-
-
-def bench_publish_loader(ws: Path) -> dict:
-    """基准:发布 + Loader 复读。"""
-    from memoryguard.gui import GovernanceApi
-
-    api = GovernanceApi(str(ws))
-    target_file = ws / "native_memory" / "memory.md"
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    target_file.write_text("# 旧记忆\n\n旧内容\n", encoding="utf-8")
-
-    # 注册为 native_memory 数据源
-    from memoryguard.source_registry import SourceRegistry, SourceRootType
-    reg = SourceRegistry(ws)
-    root = reg.add(str(target_file), SourceRootType.SELECTED_FILE, "Native Memory",
-                   scope="user")
-    root.source_category = "native_memory"
-    root.ownership = "agent_managed"
-    root.target_role = "takeover_input"
-    root.surface_id = "trae_user_profile"
-    root.enabled = True
-    from memoryguard.governance_scope import grant_root_to_agent
-    from memoryguard.managed_store import ManagedStore
-    from memoryguard.memory_ir import MemoryNormalizer
-    grant_root_to_agent(root, "agent-bench")
-    reg._save()
-    ir = MemoryNormalizer(ws).load()
-    if ir and ir.records:
-        store = ManagedStore(ws, "agent-bench")
-        if store.get_active_version_id() is None:
-            store.create_initial_version(list(ir.records))
-
-    t0 = time.perf_counter()
-    result = api.publish_reconstructed_memory(
-        "", True, True,
-        {"mode": "agent", "agent_instance_id": "agent-bench"},
-        "agent-bench",
-        root.root_id,
+def _native_context(workspace: Path):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=AGENT,
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="benchmark-session",
+            session_source="pytest",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id=GROUP,
+        project_ref=str(workspace.resolve()),
+        provider=PROVIDER,
+        runtime_role=RUNTIME_ROLE,
     )
-    t1 = time.perf_counter()
-
-    return {
-        "publish_ms": round((t1 - t0) * 1000, 2),
-        "publish_ok": result.get("ok", False),
-        "published_count": result.get("published_record_count", 0),
-        "takeover_verify": result.get("takeover_verify", {}),
-    }
 
 
-def bench_autocomplete_derive(ws: Path) -> dict:
-    """基准:AutoOrganizer 衍生触发。"""
-    from memoryguard.auto_organizer import AutoOrganizer
-    from memoryguard.schema_v3 import MemoryEvent
+def _source_context() -> dict[str, object]:
+    return {"admin": True, "agent_instance_id": AGENT}
 
-    org = AutoOrganizer(ws, "default")
-    # 写入 3 条相似 episode(应触发衍生)
-    actions_all = []
-    t0 = time.perf_counter()
-    for i in range(3):
-        event = MemoryEvent(
-            event_id=f"evt-{i}", agent_instance_id="a1", share_group_id="default",
-            raw_content=f"用户偏好 Python 编程,喜欢用 pytest 做测试",
-            metadata={},
+
+def _projection_scope(workspace: Path) -> ProjectionReadScope:
+    return ProjectionReadScope(
+        workspace_id=str(workspace.resolve()),
+        agent_instance_id=AGENT,
+        project_ref=str(workspace.resolve()),
+        provider=PROVIDER,
+        share_group_id=GROUP,
+        sensitivity="normal",
+        policy_class="private",
+    )
+
+
+def make_test_workspace(record_count: int = 50) -> Path:
+    """Create a V2 workspace with exactly ``record_count`` extractable segments.
+
+    Native extraction intentionally caps one file at 20 segments.  The fixture
+    therefore spreads records across enough files instead of silently clipping
+    200/500-record runs.  Repeated bodies are intentional: the benchmark checks
+    the real canonical-hash duplicate signal rather than confusing it with data
+    loss.
+    """
+    workspace = Path(tempfile.mkdtemp(prefix="memoryguard-v2-bench-"))
+    docs = workspace / "docs"
+    docs.mkdir()
+    ContentStore(workspace)
+    MemoryAtomStore(workspace)
+    EvidenceStore(workspace)
+    GroupControlService(workspace, write=True).bind_agent(AGENT, GROUP)
+
+    bodies = [
+        "Prefer Python dataclasses and explicit type annotations.",
+        "Run tests before building the container and deploying it.",
+        "Review errors, logs, tests, and untrusted input handling.",
+        "Use stable resource URLs and standard status codes.",
+        "Validate the migration locally before staging and production.",
+        "Use Go channels only when they make ownership explicit.",
+        "Keep critical paths fully covered by regression tests.",
+        "Document setup, usage, and operational recovery steps.",
+    ]
+    file_count = max(1, (record_count + 19) // 20)
+    next_record = 0
+    for index in range(file_count):
+        segment_count = min(20, record_count - next_record)
+        chunks: list[str] = []
+        for offset in range(segment_count):
+            ordinal = next_record + offset
+            family = ordinal % len(bodies)
+            title = f"Benchmark memory family {family}"
+            # Keep the body stable within a family so canonical-hash duplicate
+            # groups are genuine.  Candidate/memory ids remain unique.
+            body = bodies[family]
+            if offset == 0:
+                chunks.append(f"# {title}\n\n{body}\n")
+            else:
+                chunks.append(f"## {title}\n{body}\n")
+        (docs / f"memory-{index}.md").write_text(
+            "\n".join(chunks), encoding="utf-8",
         )
-        record, actions = org.organize(event)
-        actions_all.append(actions)
-    t1 = time.perf_counter()
+        next_record += segment_count
+    SourceControlService(workspace).add(
+        str(docs),
+        "selected_directory",
+        _source_context(),
+        display_name="V2 benchmark documents",
+    )
+    return workspace
 
-    derive_actions = [a for actions in actions_all for a in actions if a.get("action") == "derive"]
+
+def bench_scan_extract(workspace: Path) -> dict[str, object]:
+    """Measure source inventory plus staged extraction and explicit acceptance."""
+    control = SourceControlService(workspace)
+    native = NativeExtractionEnrichmentService(workspace)
+    context = _native_context(workspace)
+    # Constructor/schema work and one read-only status call are the single
+    # explainable warmup.  The timed path reuses these V2 services for all files.
+    native.enrichment_status({}, context=context)
+    started = time.perf_counter()
+    scan_started = time.perf_counter()
+    scan = control.scan_summary(_source_context())
+    scan_ms = (time.perf_counter() - scan_started) * 1000
+    raw_started = time.perf_counter()
+    raw = control.raw_summary(_source_context())
+    raw_ms = (time.perf_counter() - raw_started) * 1000
+    extraction_started = time.perf_counter()
+    batches: list[dict[str, object]] = []
+    for group in raw.get("groups", []):
+        source_id = str(group.get("root_id") or "")
+        for item in group.get("files", []):
+            preview = native.extract(
+                {"source_id": source_id, "relative_path": item["relative_path"]},
+                context=context,
+            )
+            candidates = list(preview.get("candidates") or [])
+            if not candidates:
+                continue
+            batches.append({
+                "extract_id": preview["extract_id"],
+                "candidate_ids": [item["candidate_id"] for item in candidates],
+            })
+    extraction_ms = (time.perf_counter() - extraction_started) * 1000
+    accept_started = time.perf_counter()
+    result = native.accept_batch(
+        {"batches": batches},
+        context=context,
+    ) if batches else {"total": 0}
+    accept_ms = (time.perf_counter() - accept_started) * 1000
+    accepted = int(result.get("total", 0))
+    elapsed = (time.perf_counter() - started) * 1000
+
+    scope = MemoryReadScope(
+        workspace_id=str(workspace.resolve()),
+        share_group_id=GROUP,
+        agent_instance_id=AGENT,
+        project_ref=str(workspace.resolve()),
+        provider=PROVIDER,
+        runtime_role=RUNTIME_ROLE,
+    )
+    atoms = MemoryAtomStore(workspace, readonly=True).list_atoms(scope=scope)
+    hashes = Counter(atom.canonical_hash for atom in atoms if atom.canonical_hash)
     return {
-        "organize_3_events_ms": round((t1 - t0) * 1000, 2),
-        "derive_triggered": len(derive_actions) > 0,
-        "derive_count": len(derive_actions),
+        "scan_extract_ms": round(elapsed, 2),
+        "scan_ms": round(scan_ms, 2),
+        "raw_ms": round(raw_ms, 2),
+        "extract_ms": round(extraction_ms, 2),
+        "accept_ms": round(accept_ms, 2),
+        "accept_batches": len(batches),
+        "source_objects": int(scan["coverage"]["candidate_count"]),
+        "accepted": accepted,
+        "atom_count": len(atoms),
+        "duplicate_groups": sum(1 for count in hashes.values() if count > 1),
     }
 
 
-def bench_gc_plan(ws: Path) -> dict:
-    """基准:GC 计划生成。"""
-    from memoryguard.gc import MemoryGuardGc
-
-    t0 = time.perf_counter()
-    gc = MemoryGuardGc(ws, keep_releases=5, older_than_days=30)
-    plan = gc.plan(dry_run=True)
-    t1 = time.perf_counter()
-
+def bench_projection_build(workspace: Path) -> dict[str, object]:
+    """Measure deterministic reference-only projection creation and reread."""
+    service = ProjectionBuildService(workspace)
+    scope = _projection_scope(workspace)
+    started = time.perf_counter()
+    result = service.build(
+        mode="reconstructed",
+        scope=scope,
+        runtime_role=RUNTIME_ROLE,
+    )
+    elapsed = (time.perf_counter() - started) * 1000
+    summary = result.get("projection") or {}
+    key = str(summary.get("key") or "")
+    record = ProjectionStore(workspace, initialize=False).get_projection(
+        "scenario", key, scope=scope,
+    ) if key else None
+    payload = record.payload if record is not None else {}
+    metadata = payload.get("metadata") if isinstance(payload, dict) else {}
+    graph = metadata.get("derived_graph") if isinstance(metadata, dict) else {}
+    second = service.build(
+        mode="reconstructed",
+        scope=scope,
+        runtime_role=RUNTIME_ROLE,
+    )
     return {
-        "gc_plan_ms": round((t1 - t0) * 1000, 2),
-        "gc_items": len(plan.items),
-        "gc_total_bytes": plan.total_bytes,
+        "projection_ms": round(elapsed, 2),
+        "projection_ok": result.get("status") == "succeeded" and record is not None,
+        "projection_id": record.projection_id if record is not None else "",
+        "idempotent": (second.get("projection") or {}).get("projection_id") == summary.get("projection_id"),
+        "graph_nodes": len(graph.get("nodes", [])) if isinstance(graph, dict) else 0,
+        "body_free": not any(key in str(payload).lower() for key in ("body", "raw_content", "full_text")),
     }
 
 
-def run_benchmarks():
-    """运行全部基准。"""
-    print("=" * 60)
-    print("MemoryGuard 性能基准 + 功能闭环验证")
-    print("=" * 60)
-
-    # 小规模(50 条)
-    print("\n--- 小规模(~50 条记忆) ---")
-    ws50 = make_test_workspace(50)
-    r1 = bench_scan_normalize(ws50)
-    print(f"扫描+规范化: {r1['scan_normalize_ms']}ms | "
-          f"源对象={r1['source_objects']} IR记录={r1['ir_records']} "
-          f"重复组={r1['duplicate_groups']}")
-
-    r2 = bench_publish_loader(ws50)
-    print(f"发布+复读: {r2['publish_ms']}ms | ok={r2['publish_ok']} "
-          f"发布={r2['published_count']}条 | "
-          f"takeover={r2['takeover_verify'].get('verified', 'N/A')}")
-
-    r3 = bench_autocomplete_derive(ws50)
-    print(f"衍生触发: {r3['organize_3_events_ms']}ms | "
-          f"衍生触发={r3['derive_triggered']} 衍生数={r3['derive_count']}")
-
-    r4 = bench_gc_plan(ws50)
-    print(f"GC计划: {r4['gc_plan_ms']}ms | 条目={r4['gc_items']} "
-          f"可回收={r4['gc_total_bytes']}bytes")
-
-    # 中规模(200 条)
-    print("\n--- 中规模(~200 条记忆) ---")
-    ws200 = make_test_workspace(200)
-    r5 = bench_scan_normalize(ws200)
-    print(f"扫描+规范化: {r5['scan_normalize_ms']}ms | "
-          f"源对象={r5['source_objects']} IR记录={r5['ir_records']} "
-          f"重复组={r5['duplicate_groups']}")
-
-    r6 = bench_publish_loader(ws200)
-    print(f"发布+复读: {r6['publish_ms']}ms | ok={r6['publish_ok']} "
-          f"发布={r6['published_count']}条")
-
-    # 大规模(500 条)
-    print("\n--- 大规模(~500 条记忆) ---")
-    ws500 = make_test_workspace(500)
-    r7 = bench_scan_normalize(ws500)
-    print(f"扫描+规范化: {r7['scan_normalize_ms']}ms | "
-          f"源对象={r7['source_objects']} IR记录={r7['ir_records']} "
-          f"重复组={r7['duplicate_groups']}")
-
-    r8 = bench_publish_loader(ws500)
-    print(f"发布+复读: {r8['publish_ms']}ms | ok={r8['publish_ok']} "
-          f"发布={r8['published_count']}条")
-
-    # 性能要求评估
-    print("\n" + "=" * 60)
-    print("性能评估")
-    print("=" * 60)
-    targets = {
-        "扫描+规范化(50条)": (r1["scan_normalize_ms"], 2000, "ms"),
-        "扫描+规范化(200条)": (r5["scan_normalize_ms"], 5000, "ms"),
-        "扫描+规范化(500条)": (r7["scan_normalize_ms"], 15000, "ms"),
-        "发布+复读(50条)": (r2["publish_ms"], 3000, "ms"),
-        "发布+复读(200条)": (r6["publish_ms"], 8000, "ms"),
-        "发布+复读(500条)": (r8["publish_ms"], 20000, "ms"),
-        "衍生检测(3事件)": (r3["organize_3_events_ms"], 2000, "ms"),
-        "GC计划": (r4["gc_plan_ms"], 1000, "ms"),
+def bench_native_enrichment(workspace: Path) -> dict[str, object]:
+    """Measure V2 host-enrichment task discovery without provider calls."""
+    service = NativeExtractionEnrichmentService(workspace)
+    started = time.perf_counter()
+    result = service.build_and_enrich({}, context=_native_context(workspace))
+    return {
+        "enrichment_ms": round((time.perf_counter() - started) * 1000, 2),
+        "scoped_record_count": int(result.get("scoped_record_count", 0)),
+        "pending_tasks": len(result.get("pending_tasks") or []),
     }
-    all_pass = True
-    for name, (actual, target, unit) in targets.items():
-        status = "PASS" if actual < target else "FAIL"
-        if status == "FAIL":
-            all_pass = False
-        print(f"  [{status}] {name}: {actual}{unit} < {target}{unit}")
 
-    # 功能闭环评估
-    print("\n" + "=" * 60)
-    print("功能闭环评估:重构->接管->衍生->自更新")
-    print("=" * 60)
-    checks = {
-        "重构(扫描->IR->去重)": r1["ir_records"] > 0 and r1["duplicate_groups"] >= 0,
-        "发布到原生记忆": r2["publish_ok"],
-        "Loader 复读验证": r2["takeover_verify"].get("verified") is True,
-        "runtime_verified 驱动": r2["takeover_verify"].get("runtime_verified") is True,
-        "衍生触发(3条相似)": r3["derive_triggered"],
-        "GC 可执行": r4["gc_items"] >= 0,
+
+def bench_group_status(workspace: Path) -> dict[str, object]:
+    started = time.perf_counter()
+    result = GroupControlService(workspace, write=False).get_global_memory_status()
+    return {
+        "group_status_ms": round((time.perf_counter() - started) * 1000, 2),
+        "total_records": int(result.get("total_records", 0)),
+        "total_groups": int(result.get("total_groups", 0)),
     }
-    for name, passed in checks.items():
-        status = "PASS" if passed else "FAIL"
-        if not passed:
-            all_pass = False
-        print(f"  [{status}] {name}: {passed}")
 
-    print("\n" + "=" * 60)
-    if all_pass:
-        print("结论:全部达标,可合理重构整理接管记忆并自更新衍生")
-    else:
-        print("结论:部分未达标,需优化")
-    print("=" * 60)
 
-    return all_pass
+def _run_size(record_count: int) -> tuple[Path, dict[str, object]]:
+    workspace = make_test_workspace(record_count)
+    ingestion = bench_scan_extract(workspace)
+    projection = bench_projection_build(workspace)
+    enrichment = bench_native_enrichment(workspace)
+    groups = bench_group_status(workspace)
+    return workspace, {
+        "ingestion": ingestion,
+        "projection": projection,
+        "enrichment": enrichment,
+        "groups": groups,
+    }
+
+
+def run_benchmarks() -> bool:
+    print("MemoryGuard V2 performance benchmark")
+    runs: dict[int, dict[str, object]] = {}
+    workspaces: list[Path] = []
+    try:
+        for size in (50, 200, 500):
+            workspace, result = _run_size(size)
+            workspaces.append(workspace)
+            runs[size] = result
+            ingestion = result["ingestion"]
+            projection = result["projection"]
+            print(
+                f"{size:>3} records: ingest={ingestion['scan_extract_ms']}ms "
+                f"atoms={ingestion['atom_count']} "
+                f"projection={projection['projection_ms']}ms "
+                f"nodes={projection['graph_nodes']} "
+                f"stages(scan/raw/extract/accept)="
+                f"{ingestion['scan_ms']}/{ingestion['raw_ms']}/"
+                f"{ingestion['extract_ms']}/{ingestion['accept_ms']}ms "
+                f"batches={ingestion['accept_batches']}"
+            )
+
+        limits = {50: (5000, 5000), 200: (15000, 10000), 500: (45000, 20000)}
+        passed = True
+        for size, (ingestion_limit, projection_limit) in limits.items():
+            result = runs[size]
+            ingestion = result["ingestion"]
+            projection = result["projection"]
+            enrichment = result["enrichment"]
+            groups = result["groups"]
+            checks = {
+                "ingestion target": ingestion["scan_extract_ms"] < ingestion_limit,
+                "projection target": projection["projection_ms"] < projection_limit,
+                "accepted atoms": (
+                    ingestion["accepted"] == size
+                    and ingestion["atom_count"] == size
+                ),
+                "real duplicate groups": ingestion["duplicate_groups"] > 0,
+                "projection committed": projection["projection_ok"],
+                "projection idempotent": projection["idempotent"],
+                "reference-only payload": projection["body_free"],
+                "enrichment scoped": enrichment["scoped_record_count"] == ingestion["atom_count"],
+                "group aggregate": groups["total_records"] == ingestion["atom_count"],
+            }
+            for label, ok in checks.items():
+                print(f"  [{('PASS' if ok else 'FAIL')}] {size}: {label}")
+                passed = passed and bool(ok)
+        return passed
+    finally:
+        for workspace in workspaces:
+            shutil.rmtree(workspace, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    run_benchmarks()
+    raise SystemExit(0 if run_benchmarks() else 1)

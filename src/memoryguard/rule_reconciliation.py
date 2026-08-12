@@ -39,6 +39,7 @@ from .schema_v3 import (
     _now_iso,
     stable_hash,
 )
+from .runtime_v2.group_native import GroupControlService
 
 # Persisted job lifecycle (Req2).  ``superseded`` marks a job whose source
 # state was replaced by a newer reconciliation run; ``terminal_failed`` is
@@ -426,12 +427,12 @@ def build_bundles(
     binding_workspace = workspace or (store.workspace if store is not None else None)
     if binding_workspace is not None:
         try:
-            from .agent_binding import AgentBindingStore
             group_agent_ids = {
-                str(binding.agent_instance_id or "")
-                for binding in AgentBindingStore(binding_workspace).find_by_group(
-                    share_group_id, include_inactive=False,
-                )
+                str(binding.get("agent_instance_id") or "")
+                for binding in GroupControlService(binding_workspace).list_bindings(
+                    include_inactive=False,
+                ).get("bindings", [])
+                if str(binding.get("share_group_id") or "") == str(share_group_id)
             }
         except Exception:  # noqa: BLE001 - binding store must never break planning
             group_agent_ids = set()
@@ -585,16 +586,8 @@ class RuleReconciliationService:
     def _legacy(
         self, share_group_id: str, *, read_only: bool = False,
     ) -> Any:
-        from .shared_memory_store import SharedMemoryStore
-        if read_only:
-            return SharedMemoryStore(
-                self.workspace, share_group_id, read_only=True,
-            )
-        if share_group_id not in self._legacy_cache:
-            self._legacy_cache[share_group_id] = SharedMemoryStore(
-                self.workspace, share_group_id,
-            )
-        return self._legacy_cache[share_group_id]
+        del share_group_id, read_only
+        raise RuntimeError("v2_native_reconciliation_required")
 
     # ------------------------------------------------------------- digests
 
@@ -1164,8 +1157,8 @@ class RuleReconciliationService:
 
         This is the canonical authority boundary.  Caller-supplied bodies,
         audience labels, priority and provider fields are never trusted until
-        they match the actual ``SharedMemoryStore`` records/assignments and
-        active ``AgentBindingStore`` group membership.
+        they match the canonical V2 records/assignments and active group
+        membership.
         """
         legacy = self._legacy(share_group_id)
         active = _plan_mandatory(
@@ -1181,12 +1174,12 @@ class RuleReconciliationService:
         records = {str(record.memory_id): record for record in active}
         group_agents: set[str] = set()
         try:
-            from .agent_binding import AgentBindingStore
             group_agents = {
-                str(binding.agent_instance_id or "")
-                for binding in AgentBindingStore(self.workspace).find_by_group(
-                    share_group_id, include_inactive=False,
-                )
+                str(binding.get("agent_instance_id") or "")
+                for binding in GroupControlService(self.workspace).list_bindings(
+                    include_inactive=False,
+                ).get("bindings", [])
+                if str(binding.get("share_group_id") or "") == str(share_group_id)
             }
         except Exception:  # noqa: BLE001 - membership read is best-effort below
             group_agents = set()
@@ -1709,6 +1702,9 @@ def _applied_enrichment_is_scope_bundle(
     ``task_type``/``kind`` says so.  ``get_status`` only exposes counts, so the
     raw lines are scanned here.
     """
+    del workspace, share_group_id
+    return False
+
     from .host_enrichment import _pending_path
     ppath = _pending_path(workspace)
     if not ppath.exists():
@@ -1755,11 +1751,17 @@ def ensure_reconciliation_job(
     job, but a changed source digest must create a new generation instead of
     silently returning the old one.
     """
-    from .shared_memory_store import SharedMemoryStore
+    del workspace, share_group_id, store
+    return {
+        "created": False,
+        "status": "blocked",
+        "reason": "v2_native_reconciliation_required",
+    }
+
     workspace = Path(workspace).resolve()
     store = store or RuleMergeStore(workspace)
     jobs = RuleReconciliationStore(store)
-    legacy = SharedMemoryStore(workspace, share_group_id)
+    legacy = None
     existing_links = store.list_source_links(
         share_group_id=share_group_id, status="active",
     )
@@ -1984,11 +1986,19 @@ def canonical_reconciliation_status(
     group while *it* is the ``applying`` job: the in-flight gate must not flag
     the very job performing the verification.
     """
+    del workspace, store, exclude_job_id
+    return {
+        "share_group_id": str(share_group_id or ""),
+        "canonical_ready": False,
+        "read_path": "v2",
+        "failures": ["v2_native_reconciliation_required"],
+        "checks": {"native_rule_service": False},
+    }
+
     from .governance_scope import (
         GovernanceScope,
         share_group_projection_path,
     )
-    from .shared_memory_store import SharedMemoryStore
     workspace = Path(workspace).resolve()
     rule_db = workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
     if not rule_db.exists():
@@ -2003,9 +2013,7 @@ def canonical_reconciliation_status(
     recon = RuleReconciliationService(store, workspace=workspace)
     jobs = RuleReconciliationStore(store)
     try:
-        legacy = SharedMemoryStore(
-            workspace, share_group_id, read_only=True,
-        )
+        legacy = None
     except RuntimeError as exc:
         message = str(exc)
         if "schema_upgrade_required" not in message:

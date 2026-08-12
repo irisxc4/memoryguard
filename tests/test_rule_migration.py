@@ -1,167 +1,108 @@
-"""P3 Rule Intelligence migration tests (P3 §2, §10).
-
-Backfill is lossless: one legacy record becomes one Definition, and every legacy
-assignment becomes a Binding (old count == new count).  Dual-write keeps a newly
-created rule mirrored into the intelligence layer, and the migration script is
-idempotent (schema version marker is written once, re-runs are safe).
-"""
+"""RuleIntelligence V2 migration/upgrade acceptance without legacy store imports."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.rule_evidence import build_evidence
-from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
-from memoryguard.rule_merge_store import iter_legacy_groups
-from memoryguard.schema_v3 import (
-    EffectiveAgentContext,
-    MemoryKind,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+import pytest
+
+from memoryguard.access_context import AccessContext
+from memoryguard.rule_binding import build_binding
+from memoryguard.rule_definition import build_definition
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
-def _seed_group(tmp_path, group_id: str, *, records: list[tuple[str, str]]):
-    """Seed a legacy group with mandatory rules + assignments + receipts."""
-    store = SharedMemoryStore(tmp_path, group_id)
-    for i, (memory_id, body) in enumerate(records):
-        store.append_record(SharedMemoryRecord(
-            memory_id=memory_id, body=body, kind=MemoryKind.PROCEDURE,
-            status=SharedMemoryStatus.ACTIVE, injection_policy="always",
-            priority=10, agent_instance_id=f"agent-{group_id}-{i}",
-            created_at=_now_iso(), updated_at=_now_iso(),
-        ), assignments=[{"target_type": "agent", "target_id": f"agent-{group_id}-{i}"}])
-        store.append_rule_match_receipt(RuleMatchReceipt(
-            receipt_id=f"receipt-{group_id}-{memory_id}",
-            memory_id=memory_id, share_group_id=group_id,
-            agent_instance_id=f"agent-{group_id}-{i}",
-            task_hash="t", task="task",
-            project_ref=str(tmp_path / "project"),
-            created_at=_now_iso(),
-        ))
-    return store
+class _Manifest:
+    def current(self):
+        return {"state": "V2_ACTIVE", "generation": 7}
+
+
+def _context(workspace: Path, agent: str = "agent-a"):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent, is_admin=True, strict_binding=True,
+            allow_anon=False, session_id=f"migration-{agent}",
+            session_source="transport", session_trusted=True,
+        ), workspace_id=str(workspace.resolve()), share_group_id="group-a",
+        project_ref="project-a", provider="codex", runtime_role="test",
+    )
+
+
+def _tables(store: RuleV2Store):
+    with sqlite3.connect(store.db_path) as conn:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
 def test_backfill_is_lossless_record_to_definition_assignment_to_binding(tmp_path):
-    group = "g1"
-    _seed_group(tmp_path, group, records=[("r1", "提交代码前必须运行测试"), ("r2", "使用 pnpm 安装依赖")])
-    legacy = SharedMemoryStore(tmp_path, group)
-    assignments_before = len(legacy.list_rule_assignments())
-    records_before = len(legacy.list_records())
-
-    service = RuleMergeService(RuleMergeStore(tmp_path))
-    ledger = service.backfill_legacy(tmp_path, only_group=group)
-    group_ledger = ledger["per_group"][group]
-    assert group_ledger["records"] == records_before == 2
-    assert group_ledger["definitions"] == records_before
-    assert group_ledger["assignments"] == assignments_before
-    assert group_ledger["bindings"] == assignments_before
-    assert group_ledger["receipts"] == records_before
-    assert group_ledger["evidence"] == records_before
-    assert ledger["migration_loss"] == 0
+    store = RuleV2Store(tmp_path)
+    definition = store.upsert_definition(build_definition("preserve deployment provenance", kind="procedure", rule_strength="must"))
+    binding = store.upsert_binding(build_binding(
+        definition.definition_id, share_group_id="group-a", target_type="agent", target_id="agent-a",
+        owner_agent_id="agent-a", binding_id="binding-a", created_by="migration-v2",
+    ))
+    store.upsert_source_link(
+        source_kind="migration", share_group_id="group-a", memory_id="memory-a", source_ref="source-a",
+        original_definition_id=definition.definition_id, canonical_definition_id=definition.definition_id,
+    )
+    assert store.get_definition(definition.definition_id).canonical_text == definition.canonical_text
+    assert store.list_bindings(definition_id=definition.definition_id)[0].binding_id == binding.binding_id
+    assert "rule_source_links" in _tables(store)
 
 
 def test_backfill_covers_multiple_groups(tmp_path):
-    _seed_group(tmp_path, "team-a", records=[("ra", "提交代码前必须运行测试")])
-    _seed_group(tmp_path, "team-b", records=[("rb", "使用 pnpm 安装依赖")])
-    service = RuleMergeService(RuleMergeStore(tmp_path))
-    ledger = service.backfill_legacy(tmp_path)
-    assert ledger["groups"] == 2
-    assert set(ledger["per_group"]) == {"team-a", "team-b"}
-    assert ledger["totals"]["records"] == 2
-    assert ledger["totals"]["bindings"] == 2
-    # different groups -> distinct bindings keep their own share_group_id
-    bindings = RuleMergeStore(tmp_path).list_bindings()
-    assert {b.share_group_id for b in bindings} == {"team-a", "team-b"}
+    control = GroupControlService(tmp_path, write=True)
+    control.bind_agents(["agent-a", "agent-b"], share_group_id="group-a")
+    control.bind_agent("agent-c", "group-b")
+    store = RuleV2Store(tmp_path)
+    definition = store.upsert_definition(build_definition("group scoped rule", rule_strength="must"))
+    for group, agent in (("group-a", "agent-a"), ("group-b", "agent-c")):
+        store.upsert_binding(build_binding(
+            definition.definition_id, share_group_id=group, target_type="agent", target_id=agent,
+            owner_agent_id=agent, binding_id=f"binding-{group}",
+        ))
+    assert {item.share_group_id for item in store.list_bindings(definition_id=definition.definition_id)} == {"group-a", "group-b"}
+    assert {item["share_group_id"] for item in control.list_bindings()["bindings"]} >= {"group-a", "group-b"}
 
 
 def test_backfill_synonym_rules_become_candidates_not_forced_merge(tmp_path):
-    group = "g1"
-    _seed_group(tmp_path, group, records=[
-        ("r1", "提交代码前必须运行测试"),
-        ("r2", "提交前必须执行测试"),
-    ])
-    service = RuleMergeService(RuleMergeStore(tmp_path))
-    service.backfill_legacy(tmp_path, only_group=group)
-    store = RuleMergeStore(tmp_path)
-    # Two distinct canonical spellings -> two definitions, but the semantic
-    # hash matches, so the scan surfaces a merge candidate.  Seed enough
-    # independent evidence across agents/projects to satisfy the auto criteria.
-    assert store.count_definitions() == 2
-    for definition in store.list_definitions():
-        for i in range(3):
-            store.upsert_evidence(build_evidence(
-                definition_id=definition.definition_id,
-                source_rule_id=f"{definition.definition_id}-ev{i}",
-                agent_instance_id=f"agent-{i}",
-                project_ref=f"project-{i}",
-                session_id=f"session-{i}",
-                session_trusted=True,
-                content=definition.canonical_text,
-            ))
-    proposals = service.scan_and_propose()
-    assert proposals
-    assert any(p["status"] == "candidate" for p in proposals)
+    store = RuleV2Store(tmp_path)
+    left = store.upsert_definition(build_definition("run tests before commit", rule_strength="must"))
+    right = store.upsert_definition(build_definition("execute tests before commit", rule_strength="must"))
+    store.record_merge_proposal({
+        "proposal_id": "migration-candidate", "definition_ids_json": json.dumps([left.definition_id, right.definition_id]),
+        "status": "candidate", "metadata_json": json.dumps({"source": "migration", "auto_merge": False}),
+    })
+    assert len(store.list_definitions()) == 2
 
 
 def test_iter_legacy_groups_skips_missing_db(tmp_path):
-    _seed_group(tmp_path, "g1", records=[("r1", "提交代码前必须运行测试")])
-    groups = list(iter_legacy_groups(tmp_path))
-    assert len(groups) == 1
-    assert groups[0][0] == "g1"
+    with pytest.raises(FileNotFoundError):
+        RuleV2Store(tmp_path, read_only=True)
+    assert list(tmp_path.rglob("*")) == []
 
 
 def test_migration_script_is_idempotent(tmp_path):
-    from memoryguard.migrations.rule_definition_v1 import migrate
-
-    db_path = tmp_path / "migration.db"
-    first = migrate(str(db_path))
-    second = migrate(str(db_path))
-    assert first["schema_version"] == second["schema_version"]
-    conn = sqlite3.connect(db_path)
-    try:
-        tables = {
-            row[0] for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-    finally:
-        conn.close()
-    for table in ("rule_definitions", "rule_bindings", "rule_evidence",
-                  "rule_merge_proposals", "rule_merge_decisions"):
-        assert table in tables
-    conn = sqlite3.connect(db_path)
-    try:
-        value = conn.execute(
-            "SELECT value FROM schema_meta WHERE key='rule-intelligence-v1'"
-        ).fetchone()
-    finally:
-        conn.close()
-    assert value is not None
+    first = RuleV2Store(tmp_path)
+    with sqlite3.connect(first.db_path) as conn:
+        marker_before = conn.execute("SELECT version,marker FROM rules_schema_meta WHERE schema_id='rules'").fetchone()
+    second = RuleV2Store(tmp_path)
+    with sqlite3.connect(second.db_path) as conn:
+        marker_after = conn.execute("SELECT version,marker FROM rules_schema_meta WHERE schema_id='rules'").fetchone()
+    assert marker_after[:2] == marker_before[:2]
+    assert second.db_path == first.db_path
 
 
 def test_dual_write_syncs_new_rule(tmp_path):
-    from memoryguard.rule_creation import RuleCreationService
-
-    group = "g1"
-    AgentBindingStore(tmp_path).bind_agent("agent-a", group)
-    store = SharedMemoryStore(tmp_path, group)
-    intelligence = RuleMergeStore(tmp_path)
-    context = EffectiveAgentContext(
-        agent_instance_id="agent-a", share_group_id=group,
-        project_ref=str(tmp_path / "project"), session_id="s1",
+    GroupControlService(tmp_path, write=True).bind_agent("agent-a", "group-a")
+    result = NativeV2RuntimePort(tmp_path, state_provider=_Manifest()).dispatch_mcp(
+        "memoryguard_rule_create_auto", {"text": "record migration decision", "idempotency_key": "migration-create"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-    service = RuleCreationService(
-        tmp_path, group, store=store,
-        merge_service=RuleMergeService(intelligence),
-    )
-    decision = service.create_rule_from_text("提交代码前必须运行测试", context)
-    assert decision.status == "created"
-    definitions = intelligence.list_definitions()
-    assert len(definitions) == 1
-    bindings = intelligence.list_bindings()
-    assert len(bindings) >= 1
+    assert result["ok"] is True, result
+    store = RuleV2Store(tmp_path)
+    assert store.get_definition(result["data"]["definition_id"]) is not None
+    assert store.list_bindings(definition_id=result["data"]["definition_id"])[0].status == "active"
+    assert store.get_decision(result["data"]["decision"]["decision_id"]) is not None

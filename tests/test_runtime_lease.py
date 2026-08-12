@@ -9,6 +9,7 @@ Covers the four required scenarios:
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
@@ -16,6 +17,10 @@ import sys
 import time
 from pathlib import Path
 
+import memoryguard.runtime_lease as runtime_lease
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtomStore
 from memoryguard.runtime_lease import (
     RuntimeLeaseStore,
     _pid_alive,
@@ -23,6 +28,10 @@ from memoryguard.runtime_lease import (
     default_database_paths,
     release_runtime_lease,
 )
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 # Impossible pid: guaranteed to be dead on any real OS.
 DEAD_PID = 2**30 + 7
@@ -42,10 +51,46 @@ def test_norm_path_normalizes_windows_case(tmp_path):
         assert upper != lower
 
 
-def _lease(store: RuntimeLeaseStore, *, pid: int, version: str, fingerprint: str) -> None:
+def test_default_database_paths_follow_formal_v2_layout(tmp_path):
+    expected = sorted(str(path.resolve()) for path in WorkspaceV2Layout(tmp_path).all_db_paths)
+    assert default_database_paths(tmp_path) == expected
+
+
+def _activate_v2_workspace(workspace: Path) -> None:
+    """Build the real V2 schema and persist the active cutover manifest."""
+    initialize_all(WorkspaceV2Layout(workspace))
+    memory = MemoryAtomStore(workspace)
+    evidence = EvidenceStore(workspace)
+    GovernanceV2(workspace, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(workspace)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="runtime-lease-tests")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="runtime-lease-source",
+        target_digest="runtime-lease-target",
+        manifest_digest="runtime-lease-manifest",
+        digests={"validator_passed": True, "checkpoints": {"runtime": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+    GroupControlService(workspace, write=True).bind_agent(
+        "test-agent", "default", idempotency_key="runtime-lease-test-binding",
+    )
+
+
+def _lease(
+    store: RuntimeLeaseStore,
+    *,
+    pid: int,
+    version: str,
+    fingerprint: str,
+    started_at: str | None = None,
+) -> None:
+    if started_at is None:
+        observed = getattr(runtime_lease, "_process_started_at_for_pid", lambda _pid: None)(pid)
+        started_at = observed.isoformat() if observed is not None else runtime_lease.process_started_at()
     store.upsert({
         "pid": pid,
-        "process_started_at": "2026-08-07T00:00:00+00:00",
+        "process_started_at": started_at,
         "memoryguard_version": version,
         "code_fingerprint": fingerprint,
         "control_workspace": str(store.control_workspace),
@@ -88,8 +133,7 @@ def test_same_build_multiple_acquires_coexist(tmp_path):
 
 
 def test_reuse_same_process_lease(tmp_path):
-    """No-conflict: re-acquiring from the same pid replaces its own lease
-    (single entry) and stays granted."""
+    """A matching process instance reuses its lease; a reused PID does not."""
     r1 = check_runtime_lease(
         tmp_path, [], version=VERSION, code_fingerprint=FP, pid=os.getpid(),
     )
@@ -100,6 +144,20 @@ def test_reuse_same_process_lease(tmp_path):
     assert r2["granted"] is True and r2["split_brain"] is False
     leases = RuntimeLeaseStore(tmp_path).load()
     assert len([l for l in leases if int(l["pid"]) == os.getpid()]) == 1
+
+    reused = dict(leases[0])
+    reused["process_started_at"] = "2000-01-01T00:00:00+00:00"
+    reused["memoryguard_version"] = "9.9.9"
+    RuntimeLeaseStore(tmp_path).save([reused])
+    r3 = check_runtime_lease(
+        tmp_path, [], version=VERSION, code_fingerprint=FP, pid=os.getpid(),
+    )
+    assert r3["granted"] is True and r3["split_brain"] is False
+    assert r3["pruned"] == 1
+    current = RuntimeLeaseStore(tmp_path).load()
+    assert len(current) == 1
+    assert current[0]["process_started_at"] != reused["process_started_at"]
+    assert current[0]["memoryguard_version"] == VERSION
 
 
 def test_split_brain_different_version(tmp_path):
@@ -138,9 +196,30 @@ def test_split_brain_different_fingerprint(tmp_path):
     assert _pid_alive(os.getpid())
 
 
-def test_stale_lease_is_pruned(tmp_path):
+def test_stale_lease_is_pruned(monkeypatch, tmp_path):
     """Stale: a lease whose pid is dead is cleaned up and never causes a
     conflict; the check proceeds and grants."""
+    if os.name == "nt":
+        ghost_pid = 35092
+
+        class _Call:
+            def __init__(self, result):
+                self.result = result
+
+            def __call__(self, *_args):
+                return self.result
+
+        class _Kernel32:
+            OpenProcess = _Call(None)
+            GetExitCodeProcess = _Call(False)
+            CloseHandle = _Call(True)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_lease, "_win_process_ids", lambda: set())
+            patch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: _Kernel32())
+            patch.setattr(ctypes, "get_last_error", lambda: 5)
+            assert runtime_lease._win_pid_alive(ghost_pid) is False
+
     store = RuntimeLeaseStore(tmp_path)
     _lease(store, pid=DEAD_PID, version="9.9.9", fingerprint=FP)
     assert not _pid_alive(DEAD_PID)
@@ -219,7 +298,9 @@ def _write_request(workspace):
             "name": "memoryguard_memory_write",
             "arguments": {
                 "workspace": str(workspace),
+                "memory_id": "runtime-lease-subprocess",
                 "body": "runtime lease subprocess write",
+                "idempotency_key": "runtime-lease-subprocess-write",
             },
         },
     }
@@ -229,6 +310,7 @@ def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
     """The mutating-tool lease guard must be wired into execute_tool(), not
     only into runtime_lease unit checks.  A live conflicting build is rejected
     by a real ``serve_stdio()`` subprocess without killing the other process."""
+    _activate_v2_workspace(tmp_path)
     store = RuntimeLeaseStore(tmp_path)
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -240,9 +322,11 @@ def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
     )
     try:
         assert _pid_alive(proc.pid)
+        peer_started = runtime_lease._process_started_at_for_pid(proc.pid)
+        assert peer_started is not None
         store.upsert({
             "pid": proc.pid,
-            "process_started_at": "2026-08-07T00:00:00+00:00",
+            "process_started_at": peer_started.isoformat(),
             "memoryguard_version": "9.9.9",
             "code_fingerprint": "f" * 64,
             "control_workspace": str(tmp_path.resolve()),
@@ -250,7 +334,16 @@ def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
         })
         responses, run = _mcp_call(
             tmp_path, [_write_request(tmp_path)],
-            {"MEMORYGUARD_WORKSPACE": ""},
+            {
+                "MEMORYGUARD_WORKSPACE": str(tmp_path),
+                "MEMORYGUARD_AGENT_ID": "test-agent",
+                "MEMORYGUARD_STRICT_BINDING": "1",
+                "MEMORYGUARD_ALLOW_ANON": "0",
+                "MEMORYGUARD_SESSION_ID": "runtime-lease-session",
+                "MEMORYGUARD_SESSION_SOURCE": "transport",
+                "MEMORYGUARD_SESSION_TRUSTED": "1",
+                "MEMORYGUARD_PROJECT_CWD": str(tmp_path),
+            },
         )
         assert run.returncode == 0, run.stderr[-2000:]
         assert len(responses) == 1, (responses, run.stderr[-2000:])
@@ -274,12 +367,18 @@ def test_execute_tool_rejects_split_brain_in_real_mcp_subprocess(tmp_path):
 def test_execute_tool_acquires_lease_and_writes_in_real_mcp_subprocess(tmp_path):
     """With no conflict, a real MCP subprocess write passes the guard, takes
     its lease, and persists the memory through the normal tool handler."""
+    _activate_v2_workspace(tmp_path)
     responses, run = _mcp_call(
         tmp_path, [_write_request(tmp_path)],
         {
-            "MEMORYGUARD_WORKSPACE": "",
-            "MEMORYGUARD_AGENT_ID": "",
-            "MEMORYGUARD_ALLOW_ANON": "1",
+            "MEMORYGUARD_WORKSPACE": str(tmp_path),
+            "MEMORYGUARD_AGENT_ID": "test-agent",
+            "MEMORYGUARD_STRICT_BINDING": "1",
+            "MEMORYGUARD_ALLOW_ANON": "0",
+            "MEMORYGUARD_SESSION_ID": "runtime-lease-session",
+            "MEMORYGUARD_SESSION_SOURCE": "transport",
+            "MEMORYGUARD_SESSION_TRUSTED": "1",
+            "MEMORYGUARD_PROJECT_CWD": str(tmp_path),
         },
     )
     assert run.returncode == 0, run.stderr[-2000:]

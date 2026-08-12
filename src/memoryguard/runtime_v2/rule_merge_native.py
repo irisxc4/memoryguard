@@ -1,9 +1,9 @@
 """Native V2 transport service for the four rule-merge governance writes.
 
-This module is deliberately a transport boundary, not another merge store.  It
-uses :class:`RuleMergeStore` for the policy/transaction implementation and adds
-the native authority, manifest CAS, receipt and idempotency gates that a raw
-MCP payload cannot provide.
+This module is deliberately a transport boundary. Production merge policy and
+transactions are owned by the V2 Rules database adapter in this module; no
+retired merge store participates in the runtime path. Native authority,
+manifest CAS, receipts and idempotency gates remain at this boundary.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import stat
 from typing import Any, Mapping
 
 from ..access_context import AccessContext
-from ..rule_merge_store import RuleMergeStore
 from ..rules.v2_store import RuleV2Store, RULES_SCHEMA_MARKER, RULES_SCHEMA_VERSION, stable_digest
 from ..governance_capability import (
     CAPABILITY_SCOPE,
@@ -64,19 +63,6 @@ _IDENTITY_KEYS = frozenset(
         "admin", "is_admin", "authority", "trusted_identity", "trusted_context", "identity",
     }
 )
-_REQUIRED_TABLES: dict[str, frozenset[str]] = {
-    "rule_definitions": frozenset({"definition_id", "revision", "status"}),
-    "rule_merge_proposals": frozenset(
-        {"proposal_id", "definition_ids", "status", "definition_revision_a", "definition_revision_b"}
-    ),
-    "rule_merge_approvals": frozenset({"approval_id", "proposal_id", "capability_id"}),
-    "governance_capabilities": frozenset(
-        {"token_hash", "principal", "scope", "proposal_id", "expires_at", "consumed"}
-    ),
-    "rule_merge_native_requests": frozenset(
-        {"request_key", "request_fingerprint", "operation", "schema_version", "status", "result_json"}
-    ),
-}
 _V2_REQUIRED_TABLES: dict[str, frozenset[str]] = {
     "rules_schema_meta": frozenset({"schema_id", "version", "marker"}),
     "rule_definitions": frozenset({"definition_id", "revision", "status"}),
@@ -87,7 +73,6 @@ _V2_REQUIRED_TABLES: dict[str, frozenset[str]] = {
     "rule_merge_native_requests": frozenset({"request_key", "request_fingerprint", "operation", "schema_version", "status", "result_json"}),
 }
 _NATIVE_REQUEST_SCHEMA_VERSION = 2
-_NATIVE_REQUEST_LEGACY_VERSIONS = frozenset({1})
 CAPABILITY_ISSUE_REPLAY_SAFE = True
 _REPARSE_POINT = 0x0400
 
@@ -256,13 +241,12 @@ class _V2RuleMergeStore:
         except (TypeError, ValueError, json.JSONDecodeError):
             definition_ids = []
         metadata = cls._metadata(row)
-        legacy = metadata.get("legacy") if isinstance(metadata.get("legacy"), Mapping) else {}
         return {
             "proposal_id": str(row["proposal_id"] or ""),
             "definition_ids": list(definition_ids) if isinstance(definition_ids, list) else [],
             "status": str(row["status"] or ""),
-            "definition_revision_a": int(metadata.get("definition_revision_a", legacy.get("definition_revision_a", 0)) or 0),
-            "definition_revision_b": int(metadata.get("definition_revision_b", legacy.get("definition_revision_b", 0)) or 0),
+            "definition_revision_a": int(metadata.get("definition_revision_a", 0) or 0),
+            "definition_revision_b": int(metadata.get("definition_revision_b", 0) or 0),
             "metadata": metadata,
         }
 
@@ -516,13 +500,8 @@ class NativeRuleMergeService:
     ) -> None:
         self.workspace = _assert_safe_path(workspace)
         self.db_path = self.workspace / ".memoryguard" / "rules" / "rules.db"
-        self._legacy_db_path = self.workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
         self._rule_store = self._unwrap_store(
             rule_store if rule_store is not None else merge_store,
-        )
-        self._legacy_injected = bool(
-            self._rule_store is not None
-            and _assert_safe_path(getattr(self._rule_store, "db_path"), allow_missing=True) == self._legacy_db_path
         )
         self.state_provider = state_provider
         # The request ledger lives in the same SQLite file as capabilities and
@@ -546,8 +525,7 @@ class NativeRuleMergeService:
             if isinstance(exc, NativeRuleMergeError):
                 raise NativeRuleMergeError("native_test_store_identity_required") from exc
             raise NativeRuleMergeError("native_test_store_identity_required") from exc
-        allowed_db_paths = {self.db_path, self._legacy_db_path}
-        if store_workspace != self.workspace or store_db not in allowed_db_paths:
+        if store_workspace != self.workspace or store_db != self.db_path:
             raise NativeRuleMergeError("injected_store_identity_mismatch")
         if getattr(store, "read_only", False) is True or getattr(store, "readonly", False) is True:
             raise NativeRuleMergeError("writable_rule_store_required")
@@ -619,7 +597,7 @@ class NativeRuleMergeService:
 
     # ---- safe store lifecycle -------------------------------------------
     def _preflight_schema(self) -> None:
-        db_path = _assert_safe_path(self._legacy_db_path if self._legacy_injected else self.db_path, allow_missing=True)
+        db_path = _assert_safe_path(self.db_path, allow_missing=True)
         for suffix in ("", "-wal", "-shm", "-journal"):
             sidecar = Path(str(db_path) + suffix)
             if _is_reparse_or_symlink(sidecar):
@@ -634,25 +612,22 @@ class NativeRuleMergeService:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if type(version) is not int or version < 0:
                 raise NativeRuleMergeError("rule_merge_schema_invalid")
-            if self._legacy_injected and version > 1:
-                raise NativeRuleMergeError("rule_merge_schema_future")
             tables = {
                 str(row[0]) for row in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-            required_tables = _REQUIRED_TABLES if self._legacy_injected else _V2_REQUIRED_TABLES
-            if not self._legacy_injected:
-                marker = conn.execute(
-                    "SELECT version,marker FROM rules_schema_meta WHERE schema_id='rules'"
-                ).fetchone() if "rules_schema_meta" in tables else None
-                if marker is None:
-                    raise NativeRuleMergeError("rule_merge_schema_invalid")
-                marker_version = int(marker["version"] or 0)
-                if marker_version > RULES_SCHEMA_VERSION:
-                    raise NativeRuleMergeError("rule_merge_schema_future")
-                if str(marker["marker"] or "") != RULES_SCHEMA_MARKER or marker_version != RULES_SCHEMA_VERSION:
-                    raise NativeRuleMergeError("rule_merge_schema_invalid")
+            required_tables = _V2_REQUIRED_TABLES
+            marker = conn.execute(
+                "SELECT version,marker FROM rules_schema_meta WHERE schema_id='rules'"
+            ).fetchone() if "rules_schema_meta" in tables else None
+            if marker is None:
+                raise NativeRuleMergeError("rule_merge_schema_invalid")
+            marker_version = int(marker["version"] or 0)
+            if marker_version > RULES_SCHEMA_VERSION:
+                raise NativeRuleMergeError("rule_merge_schema_future")
+            if str(marker["marker"] or "") != RULES_SCHEMA_MARKER or marker_version != RULES_SCHEMA_VERSION:
+                raise NativeRuleMergeError("rule_merge_schema_invalid")
             for table, required in required_tables.items():
                 if table not in tables:
                     raise NativeRuleMergeError("rule_merge_schema_partial")
@@ -875,7 +850,7 @@ class NativeRuleMergeService:
         ).fetchone()
         if row is not None:
             schema_version = int(row["schema_version"] or 0)
-            if schema_version not in {_NATIVE_REQUEST_SCHEMA_VERSION, *_NATIVE_REQUEST_LEGACY_VERSIONS}:
+            if schema_version != _NATIVE_REQUEST_SCHEMA_VERSION:
                 raise NativeRuleMergeError("idempotency_ledger_invalid")
             if str(row["request_fingerprint"] or "") != fingerprint:
                 raise NativeRuleMergeError("idempotency_conflict")

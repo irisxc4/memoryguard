@@ -17,9 +17,10 @@ import re
 
 
 CODEGRAPH_DB_NAME = "codegraph.db"
-CODEGRAPH_SCHEMA_VERSION = 1
-CODEGRAPH_SCHEMA_MARKER = "memoryguard-v2-phase5-codegraph"
+CODEGRAPH_SCHEMA_VERSION = 2
+CODEGRAPH_SCHEMA_MARKER = "memoryguard-v2-phase10-codegraph"
 UNKNOWN = "__UNKNOWN__"
+PROVENANCE_VALUES = frozenset({"production", "test", "fixture", "generated", "vendor", "unknown"})
 
 # Metadata accepted by the graph plane is deliberately small and bounded.
 # Hash/digest fields are structural identities and are explicitly allowed;
@@ -94,6 +95,15 @@ _METADATA_STRUCTURAL_FIELDS = frozenset(
         "source_digest",
         "content_role",
         "object_type",
+        "source_role",
+        "source_map",
+        "source_location",
+        "context",
+        "provenance",
+        "semantic_kind",
+        "host_symbol",
+        "region_id",
+        "virtual_document_id",
     }
 )
 
@@ -167,6 +177,13 @@ def stable_digest(value: Any) -> str:
 def stable_id(prefix: str, *parts: object) -> str:
     payload = "\x1f".join(str(item) for item in (prefix, *parts))
     return f"{prefix}-{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def normalize_provenance(value: Any, *, field_name: str = "provenance") -> str:
+    text = _text(value or "unknown").casefold()
+    if text not in PROVENANCE_VALUES:
+        raise ValueError(f"{field_name} must be one of: {', '.join(sorted(PROVENANCE_VALUES))}")
+    return text
 
 
 def _strict_bool(value: Any, *, field_name: str) -> bool:
@@ -299,6 +316,8 @@ class SourceFile:
     scope: CodeGraphScope
     source_revision: str = ""
     language: str = ""
+    source_role: str = "production"
+    provenance: str = "production"
     active: bool = True
     revision_id: str = ""
     file_id: str = ""
@@ -309,6 +328,8 @@ class SourceFile:
         object.__setattr__(self, "content_hash", _text(self.content_hash))
         object.__setattr__(self, "source_revision", _text(self.source_revision))
         object.__setattr__(self, "language", _text(self.language))
+        object.__setattr__(self, "source_role", normalize_provenance(self.source_role, field_name="source_role"))
+        object.__setattr__(self, "provenance", normalize_provenance(self.provenance))
         object.__setattr__(self, "revision_id", _text(self.revision_id))
         object.__setattr__(self, "file_id", _text(self.file_id) or stable_id("file", self.scope.digest, self.path))
         if not self.path:
@@ -328,6 +349,8 @@ class SourceFile:
             "content_hash": self.content_hash,
             "source_revision": self.source_revision,
             "language": self.language,
+            "source_role": self.source_role,
+            "provenance": self.provenance,
             "active": self.active,
             "revision_id": self.revision_id,
             "scope": self.scope.to_dict(),
@@ -344,6 +367,9 @@ class Symbol:
     symbol_hash: str = ""
     line_start: int = 0
     line_end: int = 0
+    provenance: str = "production"
+    source_map: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     scope: CodeGraphScope | None = None
     revision_id: str = ""
     active: bool = True
@@ -353,6 +379,11 @@ class Symbol:
             object.__setattr__(self, name, _text(getattr(self, name)))
         if not self.symbol_id or not self.file_id or not self.name:
             raise ValueError("symbol_id, file_id and name are required")
+        object.__setattr__(self, "provenance", normalize_provenance(self.provenance))
+        validate_metadata(self.source_map)
+        validate_metadata(self.metadata)
+        object.__setattr__(self, "source_map", dict(self.source_map or {}))
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
         if int(self.line_start) < 0 or int(self.line_end) < 0:
             raise ValueError("symbol line range must be non-negative")
         if self.line_end and self.line_start and self.line_end < self.line_start:
@@ -374,6 +405,9 @@ class Symbol:
             "symbol_hash": self.symbol_hash,
             "line_start": self.line_start,
             "line_end": self.line_end,
+            "provenance": self.provenance,
+            "source_map": dict(self.source_map),
+            "metadata": dict(self.metadata),
             "revision_id": self.revision_id,
             "active": self.active,
             "scope": self.scope.to_dict() if self.scope else None,
@@ -388,14 +422,21 @@ class Edge:
     relation: str = "related"
     scope: CodeGraphScope | None = None
     revision_id: str = ""
+    context: str = ""
+    provenance: str = "production"
+    source_location: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     weight: float = 1.0
     active: bool = True
 
     def __post_init__(self) -> None:
-        for name in ("edge_id", "from_id", "to_id", "relation", "revision_id"):
+        for name in ("edge_id", "from_id", "to_id", "relation", "revision_id", "context", "source_location"):
             object.__setattr__(self, name, _text(getattr(self, name)))
         if not self.edge_id or not self.from_id or not self.to_id:
             raise ValueError("edge_id, from_id and to_id are required")
+        object.__setattr__(self, "provenance", normalize_provenance(self.provenance))
+        validate_metadata(self.metadata)
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
         object.__setattr__(self, "weight", float(self.weight))
 
     @property
@@ -408,6 +449,10 @@ class Edge:
             "from_id": self.from_id,
             "to_id": self.to_id,
             "relation": self.relation,
+            "context": self.context,
+            "provenance": self.provenance,
+            "source_location": self.source_location,
+            "metadata": dict(self.metadata),
             "weight": self.weight,
             "revision_id": self.revision_id,
             "active": self.active,
@@ -444,6 +489,8 @@ class AffectedQuery:
     start_id: str
     depth: int
     limit: int
+    relation_filter: str = ""
+    provenance_filter: str = ""
     result_ids: tuple[str, ...] = ()
     digest: str = ""
     created_at: str = ""
@@ -452,6 +499,11 @@ class AffectedQuery:
         object.__setattr__(self, "start_id", _text(self.start_id))
         object.__setattr__(self, "depth", max(0, int(self.depth)))
         object.__setattr__(self, "limit", max(1, int(self.limit)))
+        object.__setattr__(self, "relation_filter", _text(self.relation_filter))
+        provenance = _text(self.provenance_filter).casefold()
+        if provenance:
+            provenance = normalize_provenance(provenance, field_name="provenance_filter")
+        object.__setattr__(self, "provenance_filter", provenance)
         object.__setattr__(self, "result_ids", tuple(str(value) for value in self.result_ids))
 
     def to_dict(self) -> dict[str, Any]:
@@ -461,6 +513,8 @@ class AffectedQuery:
             "start_id": self.start_id,
             "depth": self.depth,
             "limit": self.limit,
+            "relation_filter": self.relation_filter,
+            "provenance_filter": self.provenance_filter,
             "result_ids": list(self.result_ids),
             "digest": self.digest,
             "created_at": self.created_at,
@@ -552,11 +606,13 @@ __all__ = [
     "CodeGraphScopeError",
     "Edge",
     "OutboxEvent",
+    "PROVENANCE_VALUES",
     "Revision",
     "SourceFile",
     "Symbol",
     "UNKNOWN",
     "UnknownLedgerEntry",
+    "normalize_provenance",
     "stable_digest",
     "stable_id",
     "validate_metadata",

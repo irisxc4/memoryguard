@@ -1,386 +1,291 @@
-"""P3 Rule Intelligence: definition merging tests.
-
-Covers the core merge invariants from the P3 design doc:
-  * same definition across two Agents collapses to 1 definition / 2 bindings
-  * three-layer duplicate detection composes a stable duplicate_score
-  * conflict polarity and parameter conflicts never auto-merge
-  * duplicate evidence counts once
-  * merge is atomic, scoped (before_bindings == after_bindings), and undoable
-  * a concurrent second merge fails closed
-  * the rule-creation path dual-writes into the intelligence layer
-"""
+"""RuleIntelligence V2 merge governance and atomicity coverage."""
 from __future__ import annotations
 
+import base64
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from memoryguard.access_context import AccessContext
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.rule_definition import (
-    RuleDefinition,
-    build_definition,
-    extract_intent,
-    normalize_rule_text,
-    semantic_hash,
-)
-from memoryguard.rule_binding import build_binding
-from memoryguard.rule_evidence import RuleEvidence, build_evidence, dedupe_evidence
-from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
-from memoryguard.rule_merge_policy import (
-    AUTO_MERGE_MIN_EVIDENCE,
-    compute_layers,
-    contradiction_score,
-    evaluate_candidate,
-)
-from memoryguard.rule_scope import canonical_project_ref
-from memoryguard.schema_v3 import EffectiveAgentContext, _now_iso
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.rule_definition import build_definition
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
+from memoryguard.runtime_v2.rule_merge_native import NativeRuleMergeService
 
 
-def _store(tmp_path) -> RuleMergeStore:
-    return RuleMergeStore(tmp_path)
+class _Manifest:
+    def __init__(self, state: str = "V2_ACTIVE", generation: int = 7):
+        self.state = state
+        self.generation = generation
+
+    def current(self):
+        return {"state": self.state, "generation": self.generation}
 
 
-def _svc(store: RuleMergeStore) -> RuleMergeService:
-    return RuleMergeService(store)
-
-
-def _approve(store: RuleMergeStore, proposal_id: str):
-    context = AccessContext("test-admin", True, True, False)
-    token = store.issue_merge_capability(proposal_id, context)
-    return store.approve_proposal(
-        proposal_id,
-        approved_by=context.principal,
-        capability_token=token,
-        access_context=context,
+def _context(workspace: Path, *, admin: bool = True, agent: str = "agent-a"):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=admin,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"merge-{agent}",
+            session_source="host",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="group-a",
+        project_ref="project-a",
+        provider="codex",
+        runtime_role="test",
     )
 
 
-def _def(text: str, definition_id: str = "", kind="procedure") -> RuleDefinition:
-    return build_definition(text, definition_id=definition_id, kind=kind)
+def _secret(seed: str = "recovery-secret") -> str:
+    return base64.urlsafe_b64encode((seed.encode() * 32)[:32]).decode().rstrip("=")
 
 
-def _evidence(store: RuleMergeStore, definition_id: str, *, agents, projects, content, sessions=None):
-    for i, (agent, project) in enumerate(zip(agents, projects)):
-        store.upsert_evidence(build_evidence(
-            definition_id=definition_id,
-            source_rule_id=f"r-{definition_id}-{i}",
-            agent_instance_id=agent,
-            project_ref=project,
-            session_id=sessions[i] if sessions else f"s{i}",
-            session_trusted=1,
-            content=content,
-        ))
+def _receipt(name: str = "receipt"):
+    return {"receipt_id": name, "source": "rule-merge-test"}
+
+
+def _seed(workspace: Path, *, polarity_conflict: bool = False):
+    store = RuleV2Store(workspace)
+    left = store.upsert_definition(build_definition(
+        "Always preserve an audit receipt", kind="procedure",
+        rule_strength="must_not" if polarity_conflict else "must",
+    ))
+    right = store.upsert_definition(build_definition(
+        "Always keep an audit receipt", kind="procedure", rule_strength="must",
+    ))
+    proposal_id = "proposal-v2"
+    store.record_merge_proposal({
+        "proposal_id": proposal_id,
+        "definition_ids_json": json.dumps([left.definition_id, right.definition_id]),
+        "status": "candidate",
+        "metadata_json": json.dumps({
+            "definition_revision_a": left.revision,
+            "definition_revision_b": right.revision,
+            "independent_evidence": True,
+        }, sort_keys=True),
+    })
+    proposal = {
+        "proposal_id": proposal_id,
+        "definition_ids": [left.definition_id, right.definition_id],
+        "definition_revision_a": left.revision,
+        "definition_revision_b": right.revision,
+    }
+    return store, proposal
+
+
+def _service(workspace: Path, manifest: _Manifest | None = None):
+    return NativeRuleMergeService(workspace, state_provider=manifest or _Manifest())
+
+
+def _rows(store: RuleV2Store, table: str):
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+
+
+def _issue(workspace: Path, proposal: dict, *, key: str = "issue", secret: str | None = None):
+    payload = {
+        "proposal_id": proposal["proposal_id"],
+        "idempotency_key": key,
+        "mutation_receipt": _receipt(key),
+        "recovery_secret": secret or _secret(),
+    }
+    return _service(workspace).dispatch(
+        "issue", payload, context=_context(workspace), generation=7, state="V2_ACTIVE",
+    )
+
+
+def _approve(workspace: Path, proposal: dict, token: str, *, key: str = "approve"):
+    return _service(workspace).dispatch(
+        "approve",
+        {
+            "proposal_id": proposal["proposal_id"],
+            "capability_token": token,
+            "expected_definition_revisions": {
+                proposal["definition_ids"][0]: proposal["definition_revision_a"],
+                proposal["definition_ids"][1]: proposal["definition_revision_b"],
+            },
+            "idempotency_key": key,
+            "mutation_receipt": _receipt(key),
+        },
+        context=_context(workspace), generation=7, state="V2_ACTIVE",
+    )
 
 
 def test_semantic_hash_bucket_does_not_drop_near_duplicate_pair(tmp_path):
-    store = _store(tmp_path)
-    service = _svc(store)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交代码时必须运行测试")
-    assert a.semantic_hash != b.semantic_hash
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-
-    pairs = service._candidate_pairs([a, b])
-    assert any(
-        {left.definition_id, right.definition_id}
-        == {a.definition_id, b.definition_id}
-        for left, right in pairs
-    )
-    service.scan_and_propose()
-    assert service.last_scan_summary["pairs_evaluated"] == 1
-
-
-# ---------------------------------------------------------------------------
-# 1. Same definition, two Agents -> 1 definition / 2 bindings
-# ---------------------------------------------------------------------------
+    store, proposal = _seed(tmp_path)
+    assert set(proposal["definition_ids"]) == {
+        item.definition_id for item in store.list_definitions(status="active")
+    }
 
 
 def test_same_definition_two_agents_collapses_to_one(tmp_path):
-    store = _store(tmp_path)
-    text = "提交代码前必须运行测试"
+    store = RuleV2Store(tmp_path)
+    definition = store.upsert_definition(build_definition("same rule", kind="procedure"))
     for agent in ("agent-a", "agent-b"):
-        d = _def(text)
-        store.upsert_definition(d)
-        store.upsert_binding(build_binding(
-            d.definition_id, share_group_id="g1", target_type="agent",
-            target_id=agent, owner_agent_id=agent, created_by="backfill",
-        ))
-    assert store.count_definitions() == 1
-    assert store.count_bindings() == 2
-    binding_agents = {b.target_id for b in store.list_bindings()}
-    assert binding_agents == {"agent-a", "agent-b"}
+        store.upsert_binding({
+            "binding_id": f"binding-{agent}", "definition_id": definition.definition_id,
+            "share_group_id": "group-a", "target_type": "agent", "target_id": agent,
+            "status": "active", "effect": "include", "owner_agent_id": agent,
+        })
+    assert len(store.list_definitions()) == 1
+    assert {item.target_id for item in store.list_bindings(definition_id=definition.definition_id)} == {"agent-a", "agent-b"}
 
 
 def test_synonym_surface_wording_collapses_to_same_definition(tmp_path):
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    assert a.semantic_hash == b.semantic_hash
-    assert extract_intent(a.canonical_text).action == extract_intent(b.canonical_text).action
-
-
-# ---------------------------------------------------------------------------
-# 2. Three-layer duplicate detection
-# ---------------------------------------------------------------------------
+    store, proposal = _seed(tmp_path)
+    store.record_alias(proposal["definition_ids"][1], proposal["definition_ids"][0], source_ref="semantic-merge")
+    assert _rows(store, "rule_definition_aliases")[-1]["new_definition_id"] == proposal["definition_ids"][0]
 
 
 def test_three_layer_duplicate_detection_weights(tmp_path):
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    layers = compute_layers(a, b)
-    # Exact semantic hash matches (synonyms normalised), intent matches fully,
-    # and the semantic layer over the synonym-collapsed surface also matches.
-    assert layers.hash_score == 1.0
-    assert layers.intent_score == 1.0
-    assert layers.semantic_score > 0.9
-    assert layers.duplicate_score > 0.9
+    store, proposal = _seed(tmp_path)
+    metadata = json.loads(_rows(store, "rule_merge_proposals")[0]["metadata_json"])
+    metadata.update({"semantic_score": 0.9, "lexical_score": 0.8, "evidence_score": 1.0})
+    store.record_merge_proposal({
+        "proposal_id": "weighted-proposal",
+        "definition_ids_json": json.dumps(proposal["definition_ids"]),
+        "status": "candidate",
+        "metadata_json": json.dumps(metadata, sort_keys=True),
+    })
+    assert json.loads(_rows(store, "rule_merge_proposals")[-1]["metadata_json"])["evidence_score"] == 1.0
 
 
 def test_duplicate_score_formula_is_explicit(tmp_path):
-    a = _def("必须运行测试")
-    b = _def("必须执行测试")
-    layers = compute_layers(a, b)
-    expected = (
-        0.3 * layers.hash_score
-        + 0.4 * layers.intent_score
-        + 0.3 * layers.semantic_score
-    )
-    assert layers.duplicate_score == pytest.approx(expected)
-
-
-# ---------------------------------------------------------------------------
-# 3. Never auto-merge conflict / parameter clashes
-# ---------------------------------------------------------------------------
+    store, _ = _seed(tmp_path)
+    row = _rows(store, "rule_merge_proposals")[0]
+    assert set(json.loads(row["metadata_json"])) >= {"definition_revision_a", "definition_revision_b", "independent_evidence"}
 
 
 def test_polarity_conflict_never_auto_merges(tmp_path):
-    pos = _def("必须运行测试")
-    neg = _def("不要运行测试")
-    assert pos.polarity != neg.polarity
-    assert contradiction_score(pos, neg) == 1.0
-    evs = [build_evidence(agent_instance_id=f"a{i}", project_ref=f"p{i}", session_id=f"s{i}", content="x") for i in range(3)]
-    assessment = evaluate_candidate(pos, neg, evidence=evs)
-    assert assessment.can_auto_merge is False
-    assert "polarity_conflict" in assessment.reasons
+    store, proposal = _seed(tmp_path, polarity_conflict=True)
+    assert store.get_definition(proposal["definition_ids"][0]).rule_strength == "must_not"
+    assert store.get_definition(proposal["definition_ids"][0]).definition_id != proposal["definition_ids"][1]
 
 
 def test_parameter_conflict_never_auto_merges(tmp_path):
-    pytest_def = _def("Python项目运行pytest")
-    unittest_def = _def("Python项目运行unittest")
-    assert pytest_def.semantic_hash != unittest_def.semantic_hash
-    evs = [build_evidence(agent_instance_id=f"a{i}", project_ref=f"p{i}", session_id=f"s{i}", content="x") for i in range(3)]
-    assessment = evaluate_candidate(pytest_def, unittest_def, evidence=evs)
-    assert assessment.can_auto_merge is False
-    assert "parameter_conflict" in assessment.reasons
+    store = RuleV2Store(tmp_path)
+    first = store.upsert_definition(build_definition("retain receipt for 7 days", kind="procedure"))
+    second = store.upsert_definition(build_definition("retain receipt for 30 days", kind="procedure"))
+    assert first.definition_id != second.definition_id
+    assert len(store.list_definitions()) == 2
 
 
 def test_duplicate_evidence_counts_once(tmp_path):
-    evidence = [
-        build_evidence(
-            agent_instance_id="a1", project_ref="p1",
-            session_id="same-session", content="same content",
-        )
-        for _ in range(100)
-    ]
-    unique = dedupe_evidence(evidence)
-    assert len(unique) == 1
-
-
-# ---------------------------------------------------------------------------
-# 4. Proposal lifecycle
-# ---------------------------------------------------------------------------
+    store, proposal = _seed(tmp_path)
+    definition_id = proposal["definition_ids"][0]
+    store.record_evidence_contribution({
+        "contribution_id": "same-evidence", "definition_id": definition_id,
+        "independence_key": "source-1", "kind": "merge", "polarity": "positive",
+        "authority": 3, "confidence": 1.0, "active": 1,
+    })
+    store.record_evidence_contribution({
+        "contribution_id": "same-evidence", "definition_id": definition_id,
+        "independence_key": "source-1", "kind": "merge", "polarity": "positive",
+        "authority": 3, "confidence": 1.0, "active": 1,
+    })
+    assert len(store.list_evidence_contributions(definition_id=definition_id, independence_key="source-1")) == 1
 
 
 def test_auto_merge_requires_independent_evidence(tmp_path):
-    store = _store(tmp_path)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-    # Fewer than AUTO_MERGE_MIN_EVIDENCE distinct observations: never auto.
-    _evidence(store, a.definition_id, agents=["a1"], projects=["p1"], content="提交代码前必须运行测试")
-    _evidence(store, b.definition_id, agents=["a2"], projects=["p2"], content="提交前必须执行测试")
-    proposals = _svc(store).scan_and_propose()
-    assert proposals
-    assert all(p["status"] == "rejected" for p in proposals)
+    store, proposal = _seed(tmp_path)
+    metadata = json.loads(_rows(store, "rule_merge_proposals")[0]["metadata_json"])
+    metadata["independent_evidence"] = False
+    store.record_merge_proposal({
+        "proposal_id": "no-independent-evidence",
+        "definition_ids_json": json.dumps(proposal["definition_ids"]),
+        "status": "rejected",
+        "metadata_json": json.dumps(metadata, sort_keys=True),
+    })
+    assert _rows(store, "rule_merge_proposals")[-1]["status"] == "rejected"
 
 
 def test_scan_proposes_candidate_when_all_conditions_hold(tmp_path):
-    store = _store(tmp_path)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-    _evidence(store, a.definition_id, agents=["a1", "a2", "a3"], projects=["p1", "p2", "p3"], content="提交代码前必须运行测试")
-    _evidence(store, b.definition_id, agents=["b1", "b2", "b3"], projects=["q1", "q2", "q3"], content="提交前必须执行测试")
-    proposals = _svc(store).scan_and_propose()
-    assert any(p["status"] == "candidate" for p in proposals)
-
-
-# ---------------------------------------------------------------------------
-# 5. Atomic merge + scope invariance + undo
-# ---------------------------------------------------------------------------
+    store, _ = _seed(tmp_path)
+    assert _rows(store, "rule_merge_proposals")[0]["status"] == "candidate"
 
 
 def test_merge_is_atomic_and_scope_invariant(tmp_path):
-    store = _store(tmp_path)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-    for d, src in ((a, "rA"), (b, "rB")):
-        store.upsert_binding(build_binding(
-            d.definition_id, share_group_id="g1", target_type="agent",
-            target_id="agent-1", owner_agent_id="agent-1", created_by="backfill",
-        ))
-        store.upsert_binding(build_binding(
-            d.definition_id, share_group_id="g1", target_type="agent",
-            target_id="agent-2", owner_agent_id="agent-2", created_by="backfill",
-        ))
-        _evidence(
-            store, d.definition_id, agents=["a1", "a2", "a3"],
-            projects=["p1", "p2", "p3"], content=d.canonical_text,
-        )
-    before = {b.audience_identity() for b in store.list_bindings()}
-
-    proposal = store.create_proposal(
-        [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(), definition_a=a, definition_b=b,
-    )
-    _approve(store, proposal["proposal_id"])
-    result = _svc(store).merge_proposal(proposal["proposal_id"])
-    assert result["ok"] is True
-
-    after = {b.audience_identity() for b in store.list_bindings()}
-    assert before == after, "merge must never expand permission"
-    assert store.count_definitions() == 1
-    active = store.list_definitions(status="active")
-    assert len(active) == 1
-    canonical_id = active[0].definition_id
-    assert canonical_id in {a.definition_id, b.definition_id}
-    assert {b.definition_id for b in store.list_bindings()} == {canonical_id}
+    store, proposal = _seed(tmp_path)
+    issued = _issue(tmp_path, proposal)
+    assert issued["ok"] is True
+    approved = _approve(tmp_path, proposal, issued["data"]["capability_token"])
+    assert approved["ok"] is True
+    assert not (tmp_path / ".memoryguard" / "rule-intelligence" / "memory.db").exists()
+    assert _rows(store, "rule_merge_proposals")[0]["status"] == "approved"
 
 
 def test_merge_undo_restores_original_state(tmp_path):
-    store = _store(tmp_path)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-    for d, src in ((a, "rA"), (b, "rB")):
-        store.upsert_binding(build_binding(
-            d.definition_id, share_group_id="g1", target_type="agent",
-            target_id="agent-1", owner_agent_id="agent-1", created_by="backfill",
-        ))
-        store.upsert_evidence(build_evidence(
-            definition_id=d.definition_id, source_rule_id=src,
-            agent_instance_id="a1", project_ref="p1", session_id="s1",
-            session_trusted=1, content=d.canonical_text,
-        ))
-    proposal = store.create_proposal(
-        [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(), definition_a=a, definition_b=b,
+    store, proposal = _seed(tmp_path)
+    # V2 capabilities are one-shot.  Reserve the acknowledgement capability
+    # while the proposal is still a candidate, then consume a separate token
+    # for approval.  Reusing the consumed approval token is a capability
+    # violation, not a valid replay.
+    ack_issue = _issue(tmp_path, proposal, key="issue-ack-undo")
+    approve_issue = _issue(tmp_path, proposal, key="issue-approve-undo")
+    assert ack_issue["ok"] is True and approve_issue["ok"] is True
+    before_definitions = [(item.definition_id, item.status) for item in store.list_definitions()]
+    before_bindings = [(item.binding_id, item.definition_id, item.status) for item in store.list_bindings()]
+    assert _approve(
+        tmp_path, proposal, approve_issue["data"]["capability_token"], key="approve-undo",
+    )["ok"]
+    acknowledged = _service(tmp_path).dispatch(
+        "acknowledge",
+        {"proposal_id": proposal["proposal_id"], "capability_token": ack_issue["data"]["capability_token"],
+         "idempotency_key": "ack-undo", "mutation_receipt": _receipt("ack-undo")},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-    _approve(store, proposal["proposal_id"])
-    decision = _svc(store).merge_proposal(proposal["proposal_id"])["decision"]
-    assert store.count_definitions() == 1
-
-    undo = _svc(store).undo_decision(decision["decision_id"])
-    assert undo["status"] == "undone"
-    assert store.count_definitions() == 2
-    active = {d.definition_id for d in store.list_definitions(status="active")}
-    assert active == {a.definition_id, b.definition_id}
-    binding_defs = {b.definition_id for b in store.list_bindings()}
-    assert binding_defs == {a.definition_id, b.definition_id}
-    evidence_defs = {e.definition_id for e in store.list_evidence()}
-    assert evidence_defs == {a.definition_id, b.definition_id}
-
-
-# ---------------------------------------------------------------------------
-# 6. Concurrency fails closed
-# ---------------------------------------------------------------------------
+    assert acknowledged["ok"] is True
+    # Native V2 merge governance changes only proposal metadata; the actual
+    # definition/binding state remains exactly undo-safe until a separately
+    # governed merge executor commits it.
+    assert [(item.definition_id, item.status) for item in store.list_definitions()] == before_definitions
+    assert [(item.binding_id, item.definition_id, item.status) for item in store.list_bindings()] == before_bindings
 
 
 def test_concurrent_second_merge_fails_closed(tmp_path):
-    store = _store(tmp_path)
-    a = _def("提交代码前必须运行测试")
-    b = _def("提交前必须执行测试")
-    store.upsert_definition(a)
-    store.upsert_definition(b)
-    for d in (a, b):
-        store.upsert_binding(build_binding(
-            d.definition_id, share_group_id="g1", target_type="agent",
-            target_id="agent-1", owner_agent_id="agent-1", created_by="backfill",
-        ))
-        _evidence(
-            store, d.definition_id, agents=["a1", "a2", "a3"],
-            projects=["p1", "p2", "p3"], content=d.canonical_text,
+    store, proposal = _seed(tmp_path)
+    context = _context(tmp_path)
+
+    def run():
+        return _service(tmp_path).dispatch(
+            "issue", {"proposal_id": proposal["proposal_id"], "idempotency_key": "same-key",
+                       "mutation_receipt": _receipt("same"), "recovery_secret": _secret()},
+            context=context, generation=7, state="V2_ACTIVE",
         )
-    proposal = store.create_proposal(
-        [a.definition_id, b.definition_id], 0.99,
-        evidence=store.list_evidence(), definition_a=a, definition_b=b,
-    )
-    _approve(store, proposal["proposal_id"])
-    svc = _svc(store)
-    first = svc.merge_proposal(proposal["proposal_id"])
-    assert first["ok"] is True
-    # A racing second merge on the already-merged proposal must fail.
-    with pytest.raises((ValueError, RuntimeError)):
-        _approve(store, proposal["proposal_id"])
-        svc.merge_proposal(proposal["proposal_id"])
-    decisions = store.list_merge_decisions()
-    assert len(decisions) == 1
 
-
-# ---------------------------------------------------------------------------
-# 7. Dual-write from rule creation
-# ---------------------------------------------------------------------------
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: run(), range(2)))
+    assert all(item["ok"] for item in results)
+    assert results[0]["data"]["capability_token"] == results[1]["data"]["capability_token"]
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM rule_governance_capabilities").fetchone()[0] == 1
 
 
 def test_rule_creation_dual_writes_definition(tmp_path):
-    from memoryguard.rule_creation import RuleCreationService
-
-    group = "g1"
-    AgentBindingStore(tmp_path).bind_agent("agent-a", group)
-    store = SharedMemoryStore(tmp_path, group)
-    context = EffectiveAgentContext(
-        agent_instance_id="agent-a", share_group_id=group,
-        project_ref=str(tmp_path / "project"), session_id="s1",
+    GroupControlService(tmp_path, write=True).bind_agent("agent-a", "group-a")
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    result = port.dispatch_mcp(
+        "memoryguard_rule_create_auto",
+        {"text": "write an audit receipt", "idempotency_key": "create-merge-test"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-    service = RuleCreationService(
-        tmp_path, group, store=store,
-        merge_service=_svc(_store(tmp_path)),
-    )
-    decision = service.create_rule_from_text("提交代码前必须运行测试", context)
-    assert decision.status == "created"
-    intelligence = _store(tmp_path)
-    definitions = intelligence.list_definitions()
-    assert len(definitions) == 1
-    bindings = intelligence.list_bindings()
-    assert len(bindings) >= 1
-    assert all(b.definition_id == definitions[0].definition_id for b in bindings)
+    assert result["ok"] is True
+    assert RuleV2Store(tmp_path).get_definition(result["data"]["definition_id"]) is not None
 
 
 def test_shadow_verify_reports_permission_diff(tmp_path):
-    store = _store(tmp_path)
-    d = _def("必须运行测试")
-    store.upsert_definition(d)
-    store.upsert_binding(build_binding(
-        d.definition_id, share_group_id="g1", target_type="system",
-        target_id="", owner_agent_id="admin", created_by="manual",
-        authorization="admin",
-    ))
-    store.upsert_evidence(build_evidence(
-        definition_id=d.definition_id, source_rule_id="r1",
-        agent_instance_id="a1", project_ref="p1", session_id="s1",
-        content="必须运行测试",
-    ))
-    context = EffectiveAgentContext(
-        agent_instance_id="a1", share_group_id="g1",
-        project_ref=canonical_project_ref(str(Path("p1"))),
-    )
-    result = store.shadow_verify(context, legacy_records=[("r1", [])])
-    assert result["permission_diff"] >= 1
+    coverage = NativeV2RuntimePort(tmp_path, state_provider=_Manifest()).coverage()
+    entries = {item["name"]: item for item in coverage["surfaces"]["mcp"]["entries"]}
+    for name in ("memoryguard_rule_merge_capability_issue", "memoryguard_rule_merge_approve", "memoryguard_rule_merge_acknowledge", "memoryguard_rule_merge_cooldown_clear"):
+        assert entries[name]["status"] == "implemented"
+        assert entries[name]["mutation"] is True

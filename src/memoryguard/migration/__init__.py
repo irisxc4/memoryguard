@@ -20,7 +20,12 @@ from .framework import (
     ValidationResult,
 )
 from .content import ContentMigrationError, MigrationReport, V1ContentMigrator
-from .memory import MigrationResult as MemoryMigrationReport, V1MemoryMigrator
+from .memory import (
+    MigrationResult as MemoryMigrationReport,
+    V1GroupInventory,
+    V1GroupReader,
+    V1MemoryMigrator,
+)
 from .rules import RulesMigrationError, RulesMigrationReport, V1RulesMigrator
 from .v2_coordinator import V2CoordinatorResult, V2MigrationCoordinator, V2MigrationError
 from .v2_validator import DomainValidation, V2MigrationValidator, V2ValidationResult
@@ -61,6 +66,8 @@ __all__ = [
     "MigrationReport",
     "V1ContentMigrator",
     "MemoryMigrationReport",
+    "V1GroupInventory",
+    "V1GroupReader",
     "V1MemoryMigrator",
     "RulesMigrationError",
     "RulesMigrationReport",

@@ -19,6 +19,7 @@ from .context_budget import (
     DeterministicTokenCounter,
     TokenCounter,
 )
+from ..sensitive_content import contains_sensitive_content
 
 
 class ContextEngineError(ValueError):
@@ -254,6 +255,9 @@ class ContextCandidate:
     summary: str = ""
     reference: str = ""
     content_hash: str = ""
+    injection_policy: str = ""
+    rule_strength: str = ""
+    semantic_identity: str = ""
 
     @staticmethod
     def _strict_flag(value: Any) -> bool | None:
@@ -372,8 +376,20 @@ class ContextCandidate:
                 scope[f"__top_{alias}"] = data[alias]
         evidence = data.get("evidence", data.get("evidence_ref", data.get("evidence_digest")))
         kind = _text(data.get("kind", "fact")).casefold() or "fact"
-        explicit_rule = bool(data.get("is_rule", False)) or kind in {"rule", "mandatory_rule", "always"}
         source = _text(data.get("source", data.get("source_type", "retrieval"))) or "retrieval"
+        injection_policy = _text(data.get("injection_policy", data.get("dedup_domain", ""))).casefold()
+        rule_strength = _text(data.get("rule_strength", data.get("strength", ""))).casefold()
+        if source.casefold() == "native-v2-memory" and not injection_policy:
+            injection_policy = "always" if layer == "mandatory" else "relevant"
+        if source.casefold() == "native-v2-rule" and not rule_strength:
+            rule_strength = "must" if layer == "mandatory" else "observation"
+        semantic_identity = ""
+        for identity_key in ("semantic_identity", "stable_identity", "dedup_identity", "semantic_id"):
+            value = data.get(identity_key)
+            if isinstance(value, (str, int, float, bool)) and _text(value):
+                semantic_identity = _text(value)
+                break
+        explicit_rule = bool(data.get("is_rule", False)) or kind in {"rule", "mandatory_rule", "always"}
         risk = _text(data.get("risk_level", "")).casefold()
         sensitive = data.get("sensitive") is True or risk in {"high", "critical", "secret"}
         try:
@@ -468,13 +484,46 @@ class ContextCandidate:
             summary=summary,
             reference=reference,
             content_hash=content_hash,
+            injection_policy=injection_policy,
+            rule_strength=rule_strength,
+            semantic_identity=semantic_identity,
         )
 
     @property
     def digest(self) -> str:
-        # Content digest deduplicates equivalent text across retrieval layers;
-        # layer/kind differences must not duplicate context tokens.
+        # Rendered content digest stays body-based for compatibility.  It is
+        # not the authority used for candidate deduplication.
         return hashlib.sha256(self.body.encode("utf-8")).hexdigest()
+
+    @property
+    def has_governance_semantics(self) -> bool:
+        return bool(self.injection_policy or self.rule_strength or self.semantic_identity)
+
+    @property
+    def dedup_key(self) -> str:
+        """Return content identity plus governed injection semantics.
+
+        Legacy adapters may provide only body text; those candidates retain
+        body-level cross-layer deduplication through the compatibility body
+        set.  Once an adapter provides governed semantics,
+        layer/kind/policy/strength become part of identity so a mandatory and
+        relevant representation of the same body can both survive when their
+        obligations differ.
+        """
+        if not self.has_governance_semantics:
+            parts = ("content", self.body, self.layer, self.kind)
+        else:
+            parts = (
+                "governed",
+                self.body,
+                self.layer,
+                self.kind,
+                self.injection_policy,
+                self.rule_strength,
+                self.semantic_identity,
+            )
+        material = "".join(f"{len(part)}:{part}" for part in parts)
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def public(self) -> dict[str, Any]:
         return {
@@ -677,7 +726,7 @@ class ContextEngine:
 
     def _ordered(self, candidates: list[ContextCandidate], request: ContextRequest) -> list[ContextCandidate]:
         if self.planner is None:
-            return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest))
+            return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest, c.dedup_key))
         try:
             planner = self.planner
             method = getattr(planner, "plan", None)
@@ -689,13 +738,13 @@ class ContextEngine:
             else:
                 order = result
             if not isinstance(order, (list, tuple)):
-                return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest))
+                return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest, c.dedup_key))
             positions = {str(item_id): index for index, item_id in enumerate(order)}
             # Planner only reorders known IDs; it cannot create or elevate a
             # candidate into mandatory scope.
-            return sorted(candidates, key=lambda c: (positions.get(c.item_id, len(positions)), -c.priority, -c.score, c.item_id, c.digest))
+            return sorted(candidates, key=lambda c: (positions.get(c.item_id, len(positions)), -c.priority, -c.score, c.item_id, c.digest, c.dedup_key))
         except Exception:
-            return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest))
+            return sorted(candidates, key=lambda c: (-c.priority, -c.score, c.item_id, c.digest, c.dedup_key))
 
     @staticmethod
     def _scope_public(scope: Mapping[str, Any]) -> dict[str, Any]:
@@ -824,7 +873,15 @@ class ContextEngine:
 
     @staticmethod
     def _is_sensitive(candidate: ContextCandidate) -> bool:
-        return candidate.sensitive or bool(_SECRET_RE.search(candidate.body))
+        # Use the shared production detector for unmarked historical rows;
+        # retain the narrow legacy key forms for compatibility with already
+        # persisted V2 candidates.  The body is never copied into the blocked
+        # packet or receipt.
+        return (
+            candidate.sensitive
+            or contains_sensitive_content(candidate.body)
+            or bool(_SECRET_RE.search(candidate.body))
+        )
 
     def _render(self, candidate: ContextCandidate, text: str, *, layer: str, truncated: bool = False) -> dict[str, Any]:
         if layer == "reference_only":
@@ -925,12 +982,13 @@ class ContextEngine:
             # rules remain priority/digest ordered and cannot be elevated.
             for layer in ("relevant", "knowledge", "reference_only"):
                 groups[layer] = self._ordered(groups[layer], req)
-            groups["mandatory"] = sorted(groups["mandatory"], key=lambda c: (-c.priority, c.item_id, c.digest))
+            groups["mandatory"] = sorted(groups["mandatory"], key=lambda c: (-c.priority, c.item_id, c.digest, c.dedup_key))
 
             selected: dict[str, list[dict[str, Any]]] = {layer: [] for layer in groups}
             seen: set[str] = set()
+            seen_bodies: set[str] = set()
             for candidate in groups["mandatory"]:
-                if candidate.digest in seen:
+                if candidate.dedup_key in seen or (not candidate.has_governance_semantics and candidate.digest in seen_bodies):
                     receipts.append(ContextReceipt(candidate.item_id, "mandatory", False, "duplicate", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence)))
                     ledger.omit("duplicate")
                     continue
@@ -949,7 +1007,8 @@ class ContextEngine:
                 if ledger.mandatory_chars + char_cost > active_budget.mandatory_max_chars or ledger.mandatory_tokens + token_cost > active_budget.mandatory_max_tokens:
                     raise ContextSafetyError("mandatory_budget_exceeded")
                 selected["mandatory"].append(self._render(candidate, text, layer="mandatory"))
-                seen.add(candidate.digest)
+                seen.add(candidate.dedup_key)
+                seen_bodies.add(candidate.digest)
                 ledger.mandatory_items += 1
                 ledger.mandatory_chars += char_cost
                 ledger.mandatory_tokens += token_cost
@@ -957,7 +1016,7 @@ class ContextEngine:
 
             for layer in ("relevant", "knowledge", "reference_only"):
                 for candidate in groups[layer]:
-                    if candidate.digest in seen:
+                    if candidate.dedup_key in seen or (not candidate.has_governance_semantics and candidate.digest in seen_bodies):
                         receipts.append(ContextReceipt(candidate.item_id, layer, False, "duplicate", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence)))
                         ledger.omit("duplicate")
                         continue
@@ -980,7 +1039,8 @@ class ContextEngine:
                         ledger.omit("budget")
                         continue
                     selected[layer].append(self._render(candidate, text, layer=layer, truncated=truncated))
-                    seen.add(candidate.digest)
+                    seen.add(candidate.dedup_key)
+                    seen_bodies.add(candidate.digest)
                     ledger.optional_items += 1
                     ledger.optional_chars += char_cost
                     ledger.optional_tokens += token_cost

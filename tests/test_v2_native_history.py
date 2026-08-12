@@ -8,14 +8,16 @@ from pathlib import Path
 import pytest
 
 from memoryguard.access_context import AccessContext
-from memoryguard.adapters import ImportedConversation
-from memoryguard.conversation_history import ConversationHistoryStore, HistoryScope
+from memoryguard.content.conversation_sync import ConversationEvent, ConversationSync
+from memoryguard.content.store import ContentStore
 from memoryguard.runtime_v2.history_native import (
     NativeHistoryError,
     NativeHistoryService,
     _native_history_test_capability,
 )
+from memoryguard.runtime_v2.history_store import ContentHistoryStore, V2HistoryScope as HistoryScope
 from memoryguard.runtime_v2.native_ports import bind_native_transport_context
+from memoryguard.storage.layout import WorkspaceV2Layout
 
 
 class _Resolver:
@@ -56,17 +58,29 @@ def _seed(workspace: Path) -> tuple[HistoryScope, str, str]:
         agent_instance_id="agent-a", project_ref="project-a", provider="codex",
         share_group_id="group-a",
     )
-    store = ConversationHistoryStore(workspace)
-    store.import_conversations([
-        ImportedConversation(
-            conv_id="native-session", title="native history", messages=[
-                {"role": "user", "content": "secret user body"},
-                {"role": "assistant", "content": "secret assistant body"},
-            ],
-        ),
-    ], provider="codex", scope=scope)
-    session_id = store.list_sessions(scope)["sessions"][0]["session_id"]
-    turn_id = store.read(scope, session_id=session_id)["turns"][0]["turn_id"]
+    store = ContentStore(workspace)
+    ConversationSync(store).sync(
+        "codex-native-history",
+        [
+            ConversationEvent(
+                external_object_key="native-session", event_id="event-1",
+                title="native history", role="user", ordinal=0,
+                content="secret user body", provider="codex",
+                workspace_id=str(workspace.resolve()), agent_instance_id="agent-a",
+                project_ref=scope.project_ref, share_group_id="group-a",
+            ),
+            ConversationEvent(
+                external_object_key="native-session", event_id="event-2",
+                title="native history", role="assistant", ordinal=1,
+                content="secret assistant body", provider="codex",
+                workspace_id=str(workspace.resolve()), agent_instance_id="agent-a",
+                project_ref=scope.project_ref, share_group_id="group-a",
+            ),
+        ],
+    )
+    with store.connection() as conn:
+        session_id = str(conn.execute("SELECT session_id FROM conversation_sessions").fetchone()[0])
+        turn_id = str(conn.execute("SELECT turn_id FROM conversation_turns ORDER BY ordinal").fetchone()[0])
     return scope, session_id, turn_id
 
 
@@ -75,7 +89,23 @@ def test_native_history_read_does_not_create_or_repair_missing_db(tmp_path: Path
     service = NativeHistoryService(tmp_path, scope_resolver=_di(_Resolver(scope)))
     result = service.dispatch("search", {"query": "secret"}, context=_context(tmp_path))
     assert result["ok"] is True and result["status"] == "neutral"
-    assert not (tmp_path / ".memoryguard" / "history" / "history.sqlite").exists()
+    assert not WorkspaceV2Layout(tmp_path).content_db.exists()
+
+
+def test_native_history_never_imports_retired_history_store(tmp_path: Path, monkeypatch) -> None:
+    scope, _, _ = _seed(tmp_path)
+    real_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "memoryguard.conversation_history" or name.startswith("memoryguard.conversation_history."):
+            raise AssertionError("retired history runtime was reached")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+    result = NativeHistoryService(
+        tmp_path, scope_resolver=_di(_Resolver(scope)),
+    ).dispatch("search", {"query": "secret"}, context=_context(tmp_path))
+    assert result["ok"] is True and result["data"]["results"]
 
 
 def test_native_history_derives_scope_and_keeps_previews_body_free(tmp_path: Path):
@@ -133,8 +163,8 @@ def test_native_history_missing_active_binding_is_existence_neutral(tmp_path: Pa
 
 def test_native_history_delete_requires_capability_state_receipt_and_is_atomic(tmp_path: Path):
     scope, session_id, _ = _seed(tmp_path)
-    store = ConversationHistoryStore(tmp_path)
-    store.add_evidence_link(memory_id="memory-1", session_id=session_id)
+    store = ContentStore(tmp_path)
+    ConversationSync(store).add_evidence_link(memory_id="memory-1", turn_id=_)
     service = NativeHistoryService(tmp_path, scope_resolver=_di(_Resolver(scope)))
 
     # A plain AccessContext has identity but not the native transport sentinel.
@@ -161,9 +191,9 @@ def test_native_history_delete_requires_capability_state_receipt_and_is_atomic(t
     )
     assert done["ok"] is True and done["data"]["deleted_sessions"] == 1
     assert "secret-receipt" not in json.dumps(done)
-    with store._connect() as conn:
-        row = conn.execute("SELECT status FROM evidence_links WHERE memory_id='memory-1'").fetchone()
-    assert row["status"] == "invalid"
+    with store.connection() as conn:
+        row = conn.execute("SELECT status FROM content_evidence_links WHERE memory_id='memory-1'").fetchone()
+    assert row[0] == "invalid"
 
     replay = service.dispatch(
         "delete", {"session_ids": [session_id]}, context=context,
@@ -213,8 +243,8 @@ def test_native_history_delete_rejects_sentinel_only_or_tampered_bound_context(t
     listed = service.dispatch("list_sessions", context=public_tamper)
     assert listed["ok"] is True and listed["data"]["total"] == 1
 
-    store = ConversationHistoryStore(tmp_path)
-    assert store.list_sessions(scope)["total"] == 1
+    with ContentStore(tmp_path).connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM conversation_sessions WHERE active=1").fetchone()[0] == 1
 
 
 def test_native_history_resolver_internal_typeerror_is_not_retried(tmp_path: Path):
@@ -263,7 +293,7 @@ def test_native_history_factory_internal_typeerror_is_not_retried(tmp_path: Path
     [ValueError("/private/secret.sqlite"), TypeError("secret type"), sqlite3.DatabaseError("SQL /private/secret")],
 )
 def test_native_history_external_store_failures_use_stable_non_leaking_codes(tmp_path: Path, failure):
-    ConversationHistoryStore(tmp_path)
+    ContentStore(tmp_path)
 
     class BrokenStore:
         readonly = True
@@ -271,7 +301,7 @@ def test_native_history_external_store_failures_use_stable_non_leaking_codes(tmp
 
         def __init__(self):
             self.workspace = tmp_path
-            self.db_path = tmp_path / ".memoryguard" / "history" / "history.sqlite"
+            self.db_path = WorkspaceV2Layout(tmp_path).content_db
 
         def search(self, *args, **kwargs):
             raise failure
@@ -293,7 +323,7 @@ def test_native_history_rejects_writable_dependency_injection(tmp_path: Path):
     scope, _, _ = _seed(tmp_path)
     service = NativeHistoryService(
         tmp_path,
-        history_store=_di(ConversationHistoryStore(tmp_path)),
+        history_store=_di(ContentHistoryStore(tmp_path, readonly=False)),
         scope_resolver=_di(_Resolver(scope)),
     )
     result = service.dispatch("list_sessions", context=_context(tmp_path))
@@ -333,8 +363,8 @@ def test_native_history_delete_replays_after_service_restart(tmp_path: Path):
 
 def test_native_history_delete_blocks_without_durable_receipt_table(tmp_path: Path):
     scope, session_id, _ = _seed(tmp_path)
-    store = ConversationHistoryStore(tmp_path)
-    with store._transaction() as conn:
+    store = ContentStore(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
         conn.execute("DROP TABLE history_mutation_receipts")
     service = NativeHistoryService(tmp_path, scope_resolver=_di(_Resolver(scope)))
     result = service.dispatch(
@@ -343,16 +373,16 @@ def test_native_history_delete_blocks_without_durable_receipt_table(tmp_path: Pa
         idempotency_key="no-receipt-table",
     )
     assert result["ok"] is False and result["code"] == "history_schema_invalid"
-    with store._connect() as conn:
+    with sqlite3.connect(store.db_path) as conn:
         assert conn.execute("SELECT 1 FROM conversation_sessions WHERE session_id=?", (session_id,)).fetchone()
 
 
 def test_native_history_future_schema_blocks_reads_and_deletes_without_writes(tmp_path: Path):
     scope, session_id, _ = _seed(tmp_path)
     context = _context(tmp_path)
-    db = tmp_path / ".memoryguard" / "history" / "history.sqlite"
+    db = WorkspaceV2Layout(tmp_path).content_db
     with sqlite3.connect(db) as conn:
-        conn.execute("PRAGMA user_version=99")
+        conn.execute("UPDATE content_schema_meta SET value='99' WHERE key='version'")
     before = db.read_bytes()
     service = NativeHistoryService(tmp_path, scope_resolver=_di(_Resolver(scope)))
     read = service.dispatch("search", {"query": "secret"}, context=context)
@@ -410,11 +440,13 @@ def test_native_history_delete_concurrent_replay_is_single_durable_mutation(tmp_
 
 def test_native_history_delete_fault_rolls_back_evidence_and_receipt(tmp_path: Path):
     scope, session_id, _ = _seed(tmp_path)
-    store = ConversationHistoryStore(tmp_path)
-    store.add_evidence_link(memory_id="memory-fault", session_id=session_id)
-    with store._transaction() as conn:
+    store = ContentStore(tmp_path)
+    with store.connection() as conn:
+        turn_id = str(conn.execute("SELECT turn_id FROM conversation_turns WHERE session_id=? ORDER BY ordinal LIMIT 1", (session_id,)).fetchone()[0])
+    ConversationSync(store).add_evidence_link(memory_id="memory-fault", turn_id=turn_id)
+    with sqlite3.connect(store.db_path) as conn:
         conn.execute(
-            "CREATE TRIGGER fail_history_delete BEFORE DELETE ON conversation_sessions "
+            "CREATE TRIGGER fail_history_delete BEFORE UPDATE OF active ON conversation_sessions "
             "BEGIN SELECT RAISE(ABORT, 'injected fault'); END"
         )
     service = NativeHistoryService(tmp_path, scope_resolver=_di(_Resolver(scope)))
@@ -425,9 +457,9 @@ def test_native_history_delete_fault_rolls_back_evidence_and_receipt(tmp_path: P
         idempotency_key="fault-delete",
     )
     assert failed["ok"] is False and failed["code"] == "history_delete_failed"
-    with store._connect() as conn:
+    with sqlite3.connect(store.db_path) as conn:
         assert conn.execute("SELECT 1 FROM conversation_sessions WHERE session_id=?", (session_id,)).fetchone()
-        assert conn.execute("SELECT 1 FROM evidence_links WHERE memory_id='memory-fault' AND status='valid'").fetchone()
+        assert conn.execute("SELECT 1 FROM content_evidence_links WHERE memory_id='memory-fault' AND status='valid'").fetchone()
         assert conn.execute("SELECT 1 FROM history_mutation_receipts WHERE idempotency_key='fault-delete'").fetchone() is None
 
 
@@ -444,7 +476,7 @@ def test_native_history_rejects_unwrapped_dependency_injection(tmp_path: Path, f
 
 
 def test_native_history_injected_store_requires_exact_readonly_schema_and_path(tmp_path: Path):
-    ConversationHistoryStore(tmp_path)
+    ContentStore(tmp_path)
     scope = HistoryScope(agent_instance_id="agent-a", share_group_id="group-a")
 
     class FakeStore:
@@ -479,8 +511,8 @@ def test_native_history_rejects_workspace_and_history_symlink_sidecars_without_t
         NativeHistoryService(alias)
 
     workspace = tmp_path / "workspace"
-    ConversationHistoryStore(workspace)
-    db = workspace / ".memoryguard" / "history" / "history.sqlite"
+    ContentStore(workspace)
+    db = WorkspaceV2Layout(workspace).content_db
     sidecar_target = tmp_path / "sidecar-target"
     sidecar_target.write_bytes(b"sidecar-secret")
     sidecar = Path(str(db) + "-wal")

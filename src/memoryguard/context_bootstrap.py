@@ -29,11 +29,12 @@ from .rule_read_path import (
     MODE_RULE_INTELLIGENCE,
     resolve_read_path_mode,
 )
-from .shared_memory_store import (
-    MANDATORY_MAX_CHARS,
-    MANDATORY_MAX_ITEMS,
-    SharedMemoryStore,
-)
+
+# Native V2 memory stores use the same bounded bootstrap contract.  Keep the
+# limits local so importing this read-only helper cannot re-open the retired
+# store module.
+MANDATORY_MAX_ITEMS = 20
+MANDATORY_MAX_CHARS = 12000
 
 
 DEFAULT_MAX_ITEMS = 12
@@ -141,7 +142,7 @@ def _folded_source_ids(store: Any, group_id: str) -> set[str]:
 
 
 def build_context_packet(
-    store: SharedMemoryStore,
+    store: Any,
     *,
     task: str,
     project_hint: str = "",

@@ -284,16 +284,13 @@ class MergeGovernanceCoordinator:
         return stores
 
     def _discover_legacy_stores(self) -> list[Any]:
-        base = self.workspace / ".memoryguard" / "shared-memory"
-        if not base.exists():
-            return []
-        from .shared_memory_store import SharedMemoryStore
-        from .rule_merge_store import iter_legacy_groups
+        """Return no implicit stores after the V1 runtime retirement.
 
-        return [
-            SharedMemoryStore(self.workspace, group_id, must_exist=True)
-            for group_id, _db_path in iter_legacy_groups(self.workspace)
-        ]
+        A barrier may still be used with explicitly injected native adapters,
+        but production code must never discover a retired per-group database
+        on behalf of a caller.  This neutral result keeps old state fail closed.
+        """
+        return []
 
     def _capture(self, stores: Iterable[Any]) -> ProjectionBarrierSnapshot:
         committed: dict[str, dict[str, Any]] = {}

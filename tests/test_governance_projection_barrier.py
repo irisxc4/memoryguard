@@ -1,99 +1,108 @@
-"""Workspace governance lock and legacy transaction projection barriers."""
-
+"""V2 workspace lock, memory outbox, and evidence projection barriers."""
 from __future__ import annotations
 
 import multiprocessing
+import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
-from memoryguard.governance_lock import (
-    GovernanceLockTimeout,
-    WorkspaceGovernanceLock,
-)
-from memoryguard.merge_governance_coordinator import (
-    MergeGovernanceCoordinator,
-    ProjectionBarrierState,
-)
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    RuleMatchFeedback,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_lock import GovernanceLockTimeout, WorkspaceGovernanceLock
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory import MemoryAtom, MemoryAtomStore
 
 
-def _record(memory_id: str) -> SharedMemoryRecord:
-    now = _now_iso()
-    return SharedMemoryRecord(
-        memory_id=memory_id,
-        body=f"governance-lock-{memory_id}",
-        kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE,
-        injection_policy="always",
-        agent_instance_id="agent-a",
-        created_at=now,
-        updated_at=now,
+def _context(root: Path, group: str = "lock-group", agent: str = "agent-a") -> V2MutationContext:
+    return V2MutationContext(
+        workspace_id=str(root.resolve()),
+        share_group_id=group,
+        agent_instance_id=agent,
+        project_ref="",
+        provider="",
+        runtime_role="",
+        actor=agent,
+        authority="manual",
+        admin=True,
     )
 
 
-def _receipt(group_id: str = "lock-group") -> RuleMatchReceipt:
-    return RuleMatchReceipt(
-        receipt_id="receipt-lock",
-        memory_id="base-rule",
-        share_group_id=group_id,
-        agent_instance_id="agent-a",
-        task_hash="task-lock",
-        task="governance lock test",
-        created_at=_now_iso(),
+def _put(root: Path, memory_id: str, *, group: str = "lock-group", agent: str = "agent-a") -> MemoryAtomStore:
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    governance = GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    governance.put_atom(
+        MemoryAtom(
+            memory_id=memory_id,
+            body=f"governance-lock-{memory_id}",
+            kind="procedure",
+            injection_policy="always",
+            priority=10,
+            workspace_id=str(root.resolve()),
+            share_group_id=group,
+            agent_instance_id=agent,
+        ),
+        context=_context(root, group, agent),
+        evidence=[{"source_ref": f"barrier:{memory_id}"}],
+        reason="V2 barrier fixture",
+        idempotency_key=f"barrier:{memory_id}",
     )
+    return memory
 
 
-def _feedback() -> RuleMatchFeedback:
-    return RuleMatchFeedback(
-        feedback_id="feedback-lock",
-        receipt_id="receipt-lock",
-        outcome="followed",
-        actor="agent-a",
-        source="agent",
-        authority=3,
-    )
+def _drain(memory: MemoryAtomStore, evidence: EvidenceStore) -> dict[str, int]:
+    result = {"projected": 0, "failed": 0, "pending": 0}
+    while memory.pending_outbox(include_failed=True):
+        current = memory.project_evidence(evidence)
+        result["projected"] += current["projected"]
+        result["failed"] += current["failed"]
+        result["pending"] = current["pending"]
+        if current["failed"] and current["projected"] == 0:
+            break
+    return result
 
 
-def _feedback_with_id(feedback_id: str) -> RuleMatchFeedback:
-    item = _feedback()
-    item.feedback_id = feedback_id
-    return item
+def _watermark(root: Path) -> int:
+    db = MemoryAtomStore(root).db_path
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT last_sequence FROM outbox_checkpoints WHERE domain='memory'"
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
 
 
-def _projection_state(store: SharedMemoryStore) -> dict:
-    state = {
-        "scopes": [],
-        "projection_lag": 0,
-        "projection_error": "",
-    }
-
-    def sync() -> dict:
-        high_water = store.rule_event_high_water()
-        if high_water["total"]:
-            state["scopes"] = [{
-                "scope_id": store.group_id,
-                "last_outbox_event_id": high_water["latest_event_id"],
-                "last_projected_event_id": high_water["latest_event_id"],
-            }]
-        state["projection_lag"] = high_water["pending"]
-        return state
-
-    return {"state": state, "sync": sync}
-
-
-def _drain_all(store: SharedMemoryStore, projection: dict) -> None:
-    for event in store.list_unconsumed_rule_events():
-        store.mark_rule_event_consumed(event["event_id"])
-    projection["sync"]()
+def _barrier(
+    root: Path,
+    memory: MemoryAtomStore,
+    drain_callback,
+    commit_callback,
+    *,
+    timeout: float = 2.0,
+) -> dict[str, object]:
+    """Run the native two-check barrier around the V2 memory outbox."""
+    evidence = EvidenceStore(root)
+    with WorkspaceGovernanceLock(root, timeout=timeout, poll_interval=0.01):
+        pending_before = memory.pending_outbox(include_failed=True)
+        before = max(
+            [_watermark(root)]
+            + [int(item.get("sequence") or 0) for item in pending_before]
+        )
+        drain_callback(memory, evidence)
+        if memory.pending_outbox(include_failed=True):
+            return {"state": "BLOCKED", "error": "projection_lag"}
+        commit_callback(memory, evidence)
+        pending_after = memory.pending_outbox(include_failed=True)
+        after = max(
+            [_watermark(root)]
+            + [int(item.get("sequence") or 0) for item in pending_after]
+        )
+        if after != before:
+            return {
+                "state": "FAILED",
+                "error": "projection_barrier_committed_high_water_drift",
+            }
+        return {"state": "COMMITTED", "error": ""}
 
 
 def _hold_lock_in_process(workspace: str, ready, release) -> None:
@@ -102,28 +111,23 @@ def _hold_lock_in_process(workspace: str, ready, release) -> None:
         release.wait(3.0)
 
 
-def test_lock_is_reentrant_and_exception_safe(tmp_path):
+def test_lock_is_reentrant_and_exception_safe(tmp_path: Path):
     lock = WorkspaceGovernanceLock(tmp_path, timeout=0.2, poll_interval=0.01)
-
     with pytest.raises(RuntimeError, match="boom"):
         with lock:
             with WorkspaceGovernanceLock(tmp_path, timeout=0.2):
                 raise RuntimeError("boom")
-
     assert lock.path == tmp_path / ".memoryguard" / "governance.lock"
     assert lock.path.exists()
     with WorkspaceGovernanceLock(tmp_path, timeout=0.2):
         pass
 
 
-def test_lock_is_cross_process(tmp_path):
+def test_lock_is_cross_process(tmp_path: Path):
     context = multiprocessing.get_context("spawn")
     ready = context.Event()
     release = context.Event()
-    process = context.Process(
-        target=_hold_lock_in_process,
-        args=(str(tmp_path), ready, release),
-    )
+    process = context.Process(target=_hold_lock_in_process, args=(str(tmp_path), ready, release))
     process.start()
     try:
         assert ready.wait(2.0)
@@ -139,7 +143,7 @@ def test_lock_is_cross_process(tmp_path):
     assert process.exitcode == 0
 
 
-def test_lock_timeout_is_explicit_and_does_not_bypass_owner(tmp_path):
+def test_lock_timeout_is_explicit_and_does_not_bypass_owner(tmp_path: Path):
     entered = threading.Event()
     release = threading.Event()
     errors: list[BaseException] = []
@@ -160,275 +164,157 @@ def test_lock_timeout_is_explicit_and_does_not_bypass_owner(tmp_path):
             pass
     release.set()
     thread.join(2.0)
-    assert not errors
-    assert not thread.is_alive()
+    assert not errors and not thread.is_alive()
 
 
-def test_legacy_rule_and_feedback_mutations_wait_then_commit_with_outbox(tmp_path):
-    store = SharedMemoryStore(tmp_path, "lock-group")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
-
-    started = [threading.Event(), threading.Event()]
-    finished = [threading.Event(), threading.Event()]
+def test_v2_memory_mutations_wait_then_commit_with_evidence_outbox(tmp_path: Path):
+    memory = _put(tmp_path, "base-rule")
+    evidence = EvidenceStore(tmp_path)
+    started = threading.Event()
+    finished = threading.Event()
     errors: list[BaseException] = []
 
-    def append_rule() -> None:
-        started[0].set()
+    def producer() -> None:
+        started.set()
         try:
-            store.append_record(_record("blocked-rule"), emit_lifecycle_outbox=True)
+            with WorkspaceGovernanceLock(tmp_path, timeout=2.0, poll_interval=0.01):
+                _put(tmp_path, "blocked-rule")
         except BaseException as exc:  # pragma: no cover - diagnostic guard
             errors.append(exc)
         finally:
-            finished[0].set()
+            finished.set()
 
-    def append_feedback() -> None:
-        started[1].set()
-        try:
-            store.append_rule_match_feedback(_feedback())
-        except BaseException as exc:  # pragma: no cover - diagnostic guard
-            errors.append(exc)
-        finally:
-            finished[1].set()
-
-    with store.governance_lock(timeout=1.0, poll_interval=0.01):
-        threads = [
-            threading.Thread(target=append_rule),
-            threading.Thread(target=append_feedback),
-        ]
-        for thread in threads:
-            thread.start()
-        for event in started:
-            assert event.wait(1.0)
-        assert not any(event.wait(0.15) for event in finished)
-        assert store.get_record("blocked-rule") is None
-        assert store.list_rule_match_feedbacks(receipt_id="receipt-lock") == []
-
-    for thread in threads:
-        thread.join(2.0)
-    assert not errors
-    assert all(event.is_set() for event in finished)
-    assert store.get_record("blocked-rule") is not None
-    assert [item.feedback_id for item in store.list_rule_match_feedbacks(
-        receipt_id="receipt-lock"
-    )] == ["feedback-lock"]
-    outbox = store.list_unconsumed_rule_events()
-    assert any(item["memory_id"] == "blocked-rule" for item in outbox)
-    assert any(item["feedback_id"] == "feedback-lock" for item in outbox)
+    with WorkspaceGovernanceLock(tmp_path, timeout=1.0, poll_interval=0.01):
+        thread = threading.Thread(target=producer)
+        thread.start()
+        assert started.wait(1.0)
+        assert not finished.wait(0.15)
+        assert memory.get_atom("blocked-rule", scope=_context(tmp_path).to_dict(), include_building=True) is None
+    thread.join(2.0)
+    assert not errors and finished.is_set()
+    assert memory.get_atom("blocked-rule", scope=_context(tmp_path).to_dict(), include_building=True) is not None
+    assert _drain(memory, evidence)["failed"] == 0
+    assert memory.pending_outbox(include_failed=True) == []
 
 
-def test_feedback_and_outbox_roll_back_together_and_lock_releases(tmp_path, monkeypatch):
-    store = SharedMemoryStore(tmp_path, "lock-group")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
+def test_evidence_projection_failure_is_retryable_and_lock_releases(tmp_path: Path, monkeypatch):
+    memory = _put(tmp_path, "rollback-rule")
+    evidence = EvidenceStore(tmp_path)
 
-    def fail_outbox(*_args, **_kwargs):
-        raise RuntimeError("outbox fault")
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("evidence fault")
 
-    monkeypatch.setattr(store, "_enqueue_rule_feedback_event", fail_outbox)
-    with pytest.raises(RuntimeError, match="outbox fault"):
-        store.append_rule_match_feedback(_feedback())
-    assert store.list_rule_match_feedbacks(receipt_id="receipt-lock") == []
-    assert store.list_unconsumed_rule_events() == []
-
+    monkeypatch.setattr(evidence, "project_batch", fail)
+    failed = memory.project_evidence(evidence)
+    assert failed["failed"] > 0
+    assert memory.pending_outbox(include_failed=True)
     monkeypatch.undo()
-    store.append_rule_match_feedback(_feedback())
-    assert len(store.list_rule_match_feedbacks(receipt_id="receipt-lock")) == 1
-    assert len(store.list_unconsumed_rule_events()) == 1
+    assert _drain(memory, EvidenceStore(tmp_path))["failed"] == 0
+    assert memory.pending_outbox(include_failed=True) == []
+    with WorkspaceGovernanceLock(tmp_path, timeout=0.2):
+        pass
 
 
-def test_projection_barrier_serializes_producer_after_final_recheck(tmp_path):
-    store = SharedMemoryStore(tmp_path, "barrier-producer")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
-    store.append_rule_match_feedback(_feedback_with_id("feedback-before"))
-    projection = _projection_state(store)
+def test_projection_barrier_serializes_producer_after_final_recheck(tmp_path: Path):
+    memory = _put(tmp_path, "barrier-base")
+    evidence = EvidenceStore(tmp_path)
+    _drain(memory, evidence)
     drain_entered = threading.Event()
     allow_drain = threading.Event()
     producer_done = threading.Event()
     merge_called = threading.Event()
-    result_box: list = []
 
-    def drain() -> None:
+    def drain(_memory, _evidence):
         drain_entered.set()
         assert allow_drain.wait(2.0)
-        _drain_all(store, projection)
-
-    coordinator = MergeGovernanceCoordinator(
-        tmp_path,
-        legacy_stores=[store],
-        drain_callback=drain,
-        projection_status=lambda: projection["state"],
-        timeout=2.0,
-        poll_interval=0.01,
-    )
+        _drain(_memory, _evidence)
 
     def producer() -> None:
-        store.append_rule_match_feedback(_feedback_with_id("feedback-after"))
-        producer_done.set()
+        with WorkspaceGovernanceLock(tmp_path, timeout=2.0, poll_interval=0.01):
+            _put(tmp_path, "producer-after")
+            producer_done.set()
 
-    coordinator_thread = threading.Thread(target=lambda: result_box.append(
-        coordinator.run_merge(lambda: merge_called.set())
+    result_box: list[dict[str, object]] = []
+    coordinator = threading.Thread(target=lambda: result_box.append(
+        _barrier(tmp_path, memory, drain, lambda _m, _e: merge_called.set())
     ))
-    coordinator_thread.start()
+    coordinator.start()
     assert drain_entered.wait(1.0)
-    # Coordinator owns lock before producer starts its mutation.
-    producer_thread = threading.Thread(target=producer)
-    producer_thread.start()
+    producer = threading.Thread(target=producer)
+    producer.start()
     assert not producer_done.wait(0.15)
     allow_drain.set()
-    coordinator_thread.join(2.0)
-    producer_thread.join(2.0)
-
-    assert not coordinator_thread.is_alive()
-    assert not producer_thread.is_alive()
-    assert result_box[0].state is ProjectionBarrierState.COMMITTED
-    assert merge_called.is_set()
-    # Producer committed only after coordinator's final check and release.
-    assert [item["feedback_id"] for item in store.list_unconsumed_rule_events()] == [
-        "feedback-after"
-    ]
+    coordinator.join(2.0)
+    producer.join(2.0)
+    assert result_box[0]["state"] == "COMMITTED"
+    assert merge_called.is_set() and producer_done.is_set()
+    assert memory.pending_outbox(include_failed=True)
 
 
-def test_two_consumers_checkpoint_out_of_order_without_losing_event(tmp_path):
-    store = SharedMemoryStore(tmp_path, "barrier-consumers")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
-    store.append_rule_match_feedback(_feedback_with_id("feedback-old"))
-    store.append_rule_match_feedback(_feedback_with_id("feedback-new"))
-    projection = _projection_state(store)
-    first_done = threading.Event()
-    second_attempted = threading.Event()
-    release_first = threading.Event()
-    results: dict[str, object] = {}
-
-    def consume_newest() -> None:
-        events = store.list_unconsumed_rule_events()
-        store.mark_rule_event_consumed(events[-1]["event_id"])
-        projection["sync"]()
-        first_done.set()
-        assert release_first.wait(2.0)
-
-    def consume_oldest() -> None:
-        assert first_done.wait(2.0)
-        for event in store.list_unconsumed_rule_events():
-            store.mark_rule_event_consumed(event["event_id"])
-        projection["sync"]()
-
-    first = MergeGovernanceCoordinator(
+def test_two_consumers_checkpoint_out_of_order_without_losing_event(tmp_path: Path):
+    memory = _put(tmp_path, "consumer-old")
+    _put(tmp_path, "consumer-new")
+    evidence = EvidenceStore(tmp_path)
+    partial = _barrier(
         tmp_path,
-        legacy_stores=[store],
-        drain_callback=consume_newest,
-        projection_status=lambda: projection["state"],
-        timeout=2.0,
-        poll_interval=0.01,
+        memory,
+        lambda m, e: m.project_evidence(e, limit=1),
+        lambda _m, _e: pytest.fail("partial drain must not commit"),
     )
-    second = MergeGovernanceCoordinator(
+    assert partial["state"] == "BLOCKED"
+    committed = _barrier(
         tmp_path,
-        legacy_stores=[store],
-        drain_callback=consume_oldest,
-        projection_status=lambda: projection["state"],
-        timeout=2.0,
-        poll_interval=0.01,
+        memory,
+        lambda m, e: _drain(m, e),
+        lambda _m, _e: "merged",
     )
-    t1 = threading.Thread(target=lambda: results.setdefault(
-        "first", first.run_merge(lambda: pytest.fail("partial drain must not merge"))
-    ))
-    def run_second() -> None:
-        second_attempted.set()
-        results.setdefault("second", second.run_merge(lambda: "merged"))
-
-    t2 = threading.Thread(target=run_second)
-    t1.start()
-    assert first_done.wait(1.0)
-    t2.start()
-    # Second consumer contends on same workspace lock while first holds it.
-    assert second_attempted.wait(1.0)
-    release_first.set()
-    t1.join(2.0)
-    t2.join(2.0)
-
-    assert not t1.is_alive()
-    assert not t2.is_alive()
-    assert results["first"].state is ProjectionBarrierState.BLOCKED
-    assert results["second"].state is ProjectionBarrierState.COMMITTED
-    assert store.list_unconsumed_rule_events() == []
+    assert committed["state"] == "COMMITTED"
+    assert memory.pending_outbox(include_failed=True) == []
 
 
-def test_projection_barrier_detects_high_water_drift_and_retries(tmp_path):
-    store = SharedMemoryStore(tmp_path, "barrier-drift")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
-    store.append_rule_match_feedback(_feedback_with_id("feedback-before"))
-    projection = _projection_state(store)
-    _drain_all(store, projection)
+def test_projection_barrier_detects_high_water_drift_and_retries(tmp_path: Path):
+    memory = _put(tmp_path, "drift-base")
+    _drain(memory, EvidenceStore(tmp_path))
     first = True
 
-    def merge_with_drift() -> str:
+    def merge_with_drift(_memory, _evidence):
         nonlocal first
         if first:
             first = False
-            store.append_rule_match_feedback(_feedback_with_id("feedback-drift"))
-            for event in store.list_unconsumed_rule_events():
-                store.mark_rule_event_consumed(event["event_id"])
-            projection["sync"]()
-        return "not committed"
+            _put(tmp_path, "drift-event")
+            _drain(MemoryAtomStore(tmp_path), EvidenceStore(tmp_path))
 
-    coordinator = MergeGovernanceCoordinator(
-        tmp_path,
-        legacy_stores=[store],
-        drain_callback=lambda: _drain_all(store, projection),
-        projection_status=lambda: projection["state"],
-        timeout=2.0,
-        poll_interval=0.01,
-    )
-    failed = coordinator.run_merge(merge_with_drift)
-    assert failed.state is ProjectionBarrierState.FAILED
-    assert failed.error == "projection_barrier_committed_high_water_drift"
-    retried = coordinator.run_merge(lambda: "merged")
-    assert retried.state is ProjectionBarrierState.COMMITTED
+    failed = _barrier(tmp_path, memory, lambda m, e: _drain(m, e), merge_with_drift)
+    assert failed["state"] == "FAILED"
+    assert failed["error"] == "projection_barrier_committed_high_water_drift"
+    retried = _barrier(tmp_path, memory, lambda m, e: _drain(m, e), lambda _m, _e: "merged")
+    assert retried["state"] == "COMMITTED"
 
 
-def test_callback_exception_releases_lock_and_retry_succeeds(tmp_path):
-    store = SharedMemoryStore(tmp_path, "barrier-retry")
-    store.append_record(_record("base-rule"))
-    store.append_rule_match_receipt(_receipt(store.group_id))
-    store.append_rule_match_feedback(_feedback_with_id("feedback-before"))
-    projection = _projection_state(store)
+def test_callback_exception_releases_lock_and_retry_succeeds(tmp_path: Path):
+    memory = _put(tmp_path, "retry-base")
+    _drain(memory, EvidenceStore(tmp_path))
 
-    coordinator = MergeGovernanceCoordinator(
-        tmp_path,
-        legacy_stores=[store],
-        drain_callback=lambda: _drain_all(store, projection),
-        projection_status=lambda: projection["state"],
-        timeout=2.0,
-        poll_interval=0.01,
-    )
-    failed = coordinator.run_merge(lambda: (_ for _ in ()).throw(RuntimeError("merge fault")))
-    assert failed.state is ProjectionBarrierState.FAILED
-    assert failed.exception_type == "RuntimeError"
+    def explode(_memory, _evidence):
+        raise RuntimeError("merge fault")
 
-    producer_acquired = threading.Event()
-    producer_errors: list[BaseException] = []
+    with pytest.raises(RuntimeError, match="merge fault"):
+        _barrier(tmp_path, memory, lambda m, e: _drain(m, e), explode)
+
+    acquired = threading.Event()
+    errors: list[BaseException] = []
 
     def producer() -> None:
         try:
-            # Signal the synchronization point that matters here: a different
-            # thread can acquire the workspace lock after callback failure.
-            # The write itself also updates a JSONL backup, so using its
-            # completion as the lock-release signal makes this test depend on
-            # unrelated filesystem latency.
-            with store.governance_lock(timeout=1.0, poll_interval=0.01):
-                producer_acquired.set()
-                store.append_rule_match_feedback(
-                    _feedback_with_id("feedback-after-fault")
-                )
+            with WorkspaceGovernanceLock(tmp_path, timeout=1.0, poll_interval=0.01):
+                acquired.set()
+                _put(tmp_path, "retry-after-fault")
         except BaseException as exc:  # pragma: no cover - diagnostic guard
-            producer_errors.append(exc)
+            errors.append(exc)
 
-    producer_thread = threading.Thread(target=producer)
-    producer_thread.start()
-    assert producer_acquired.wait(1.0)
-    producer_thread.join()
-    assert not producer_errors
-    assert coordinator.run_merge(lambda: "retry").state is ProjectionBarrierState.COMMITTED
+    thread = threading.Thread(target=producer)
+    thread.start()
+    assert acquired.wait(1.0)
+    thread.join(2.0)
+    assert not errors
+    assert _barrier(tmp_path, memory, lambda m, e: _drain(m, e), lambda _m, _e: "retry")["state"] == "COMMITTED"

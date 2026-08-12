@@ -1,168 +1,245 @@
-from pathlib import Path
+from __future__ import annotations
+
+import hashlib
 import json
+from pathlib import Path
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from _publish_helpers import (
+    build_projection,
+    projection_scope,
+    publish,
+    register_publish_target,
+    seed_atom,
+)
+from memoryguard.governance_v2 import GovernanceV2
 from memoryguard.gui import GovernanceApi
-from memoryguard.memory_ir import MemoryIR, MemoryNormalizer
-from memoryguard.schema_v3 import MemoryKind, MemoryRecord, SourceRootType
+from memoryguard.memory import MemoryAtomStore
+from memoryguard.projection_v2 import ProjectionStore
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.organizer import V2MemoryOrganizer
+from memoryguard.runtime_v2.projection_build import (
+    ProjectionBuildError,
+    ProjectionBuildService,
+    V2ReleaseService,
+)
+from memoryguard.runtime_v2.source_control import SourceControlService
 from memoryguard.security import MUTATION_API_METHODS, READONLY_API_METHODS
-from memoryguard.source_registry import SourceRegistry
-from memoryguard.governance_scope import grant_root_to_agent
-from _publish_helpers import prepare_publish_target, publish
 
 
-def test_publish_reconstructed_memory_writes_real_file_and_rollback_restores(tmp_path) -> None:
+def _fixture(
+    tmp_path: Path,
+    *,
+    target_name: str = "memory.md",
+    initial: str = "# Memory\n\nold\n",
+    source_id: str = "publish-target",
+) -> tuple[Path, Path, object]:
     workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
     workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="重构事实",
-        body="这是自动治理后的记忆",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
+    target = tmp_path / "native" / target_name
+    target.parent.mkdir()
+    target.write_text(initial, encoding="utf-8")
+    scope = projection_scope(workspace)
+    register_publish_target(workspace, target, source_id=source_id)
+    return workspace, target, scope
 
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
 
-    assert published["ok"] is True
-    release_list = api.list_native_memory_releases(scope=scope, agent_instance_id=scope["agent_instance_id"])
-    assert any(item["release_id"] == published["release_id"] for item in release_list["releases"])
-    assert "重构事实" in target.read_text(encoding="utf-8")
-    assert "这是自动治理后的记忆" in target.read_text(encoding="utf-8")
-
-    rolled_back = api.rollback_native_memory_release(
-        published["release_id"], confirmed=True,
-        scope=scope, agent_instance_id=scope["agent_instance_id"], target_root_id=root_id,
+def _seed_and_publish(
+    tmp_path: Path,
+    body: str,
+    *,
+    memory_id: str = "m1",
+    title: str = "V2 fixture",
+    target_name: str = "memory.md",
+    initial: str = "# Memory\n\nold\n",
+) -> tuple[Path, Path, object, dict, dict]:
+    workspace, target, scope = _fixture(
+        tmp_path,
+        target_name=target_name,
+        initial=initial,
     )
+    seed_atom(
+        workspace,
+        memory_id,
+        body,
+        metadata={"title": title, "scope": "project"},
+    )
+    built = build_projection(workspace, scope=scope)
+    published = publish(workspace, target, scope=scope)
+    return workspace, target, scope, built, published
+
+
+def _rollback(workspace: Path, target: Path, scope: object, release_id: str) -> dict:
+    return V2ReleaseService(workspace).rollback(
+        release_id,
+        str(target),
+        scope=scope,
+        confirmed=True,
+    )
+
+
+def _organize_sensitive(workspace: Path, memory_id: str, body: str) -> dict:
+    memory = MemoryAtomStore(workspace, readonly=False)
+    organizer = V2MemoryOrganizer(
+        workspace,
+        "group-test",
+        memory_store=memory,
+        governance=GovernanceV2(workspace, memory_store=memory),
+    )
+    return organizer.write(
+        {
+            "memory_id": memory_id,
+            "event_id": f"event-{memory_id}",
+            "body": body,
+            "kind": "fact",
+            "agent_instance_id": "agent-test",
+            "share_group_id": "group-test",
+            "project_ref": str(workspace.resolve()),
+            "provider": "test",
+            "runtime_role": "test",
+            "visibility": "active",
+            "idempotency_key": f"fixture-{memory_id}",
+        },
+    )
+
+
+def test_publish_reconstructed_memory_writes_real_file_and_rollback_restores(tmp_path: Path) -> None:
+    workspace, target, scope, built, published = _seed_and_publish(
+        tmp_path,
+        "这是自动治理后的记忆",
+        title="重构事实",
+    )
+
+    assert built["status"] == "succeeded"
+    assert published["ok"] is True
+    releases = V2ReleaseService(workspace).list_releases(scope=scope)
+    assert any(item["release_id"] == published["release_id"] for item in releases["releases"])
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["schema"] == "memoryguard-v2-native-release-1"
+    assert document["memories"][0]["memory_id"] == "m1"
+    assert document["memories"][0]["body"] == "这是自动治理后的记忆"
+
+    rolled_back = _rollback(workspace, target, scope, published["release_id"])
 
     assert rolled_back["ok"] is True
-    assert target.read_text(encoding="utf-8") == "# Memory\n\n旧原生记忆\n"
+    assert target.read_text(encoding="utf-8") == "# Memory\n\nold\n"
 
 
-def test_publish_redacts_secrets_in_body(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    secret_body = "Store credentials safely: api_key=super-secret-value and sk-abcdefghijklmnopqrstuvwxyz123456"
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m-secret",
-        kind=MemoryKind.FACT,
-        title="Deployment notes",
-        body=secret_body,
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
-    written = target.read_text(encoding="utf-8")
-
-    assert published["ok"] is True
-    assert "super-secret-value" not in written
-    assert "sk-abcdefghijklmnopqrstuvwxyz123456" not in written
-    assert "[REDACTED:" in written
-    assert published.get("redactions")
-    assert published["redactions"][0]["memory_id"] == "m-secret"
-    assert "body" in published["redactions"][0]["fields"]
-
-
-def test_publish_redacts_pem_private_key_block(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    pem_body = (
-        "Deploy key:\n"
-        "-----BEGIN RSA PRIVATE KEY-----\n"
-        "MIIEpAIBAAKCAQEA7fakebase64line1\n"
-        "MIIEpAIBAAKCAQEA7fakebase64line2\n"
-        "-----END RSA PRIVATE KEY-----\n"
-        "End of notes."
+def test_publish_quarantines_secrets_before_release(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(tmp_path)
+    result = _organize_sensitive(
+        workspace,
+        "m-secret",
+        "Store credentials safely: api_key=super-secret-value and sk-abcdefghijklmnopqrstuvwxyz123456",
     )
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m-pem",
-        kind=MemoryKind.FACT,
-        title="SSH deploy key",
-        body=pem_body,
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
 
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
-    written = target.read_text(encoding="utf-8")
+    published = publish(workspace, target, scope=scope)
 
-    assert published["ok"] is True
-    assert "MIIEpAIBAAKCAQEA7fakebase64line1" not in written
-    assert "MIIEpAIBAAKCAQEA7fakebase64line2" not in written
-    assert "[REDACTED:private_key]" in written
-    assert "private_key" in published["redactions"][0]["patterns"]
+    assert result["mutation_kind"] == "quarantined"
+    assert result["status"] == "quarantined"
+    assert published == {
+        "ok": False,
+        "status": "NO_SOURCE",
+        "error": "projection_required",
+    }
+    assert target.read_text(encoding="utf-8") == "# Memory\n\nold\n"
 
 
-def test_list_publish_targets_returns_enabled_native_sources(tmp_path) -> None:
+def test_publish_quarantines_pem_private_key_before_release(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(tmp_path)
+    result = _organize_sensitive(
+        workspace,
+        "m-pem",
+        (
+            "Deploy key:\n"
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEpAIBAAKCAQEA7fakebase64line1\n"
+            "MIIEpAIBAAKCAQEA7fakebase64line2\n"
+            "-----END RSA PRIVATE KEY-----\n"
+            "End of notes."
+        ),
+    )
+
+    published = publish(workspace, target, scope=scope)
+
+    assert result["mutation_kind"] == "quarantined"
+    assert result["status"] == "quarantined"
+    assert published["status"] == "NO_SOURCE"
+    assert not target.read_text(encoding="utf-8").startswith("{")
+
+
+def test_list_publish_targets_returns_enabled_v2_sources(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     file_target = tmp_path / "native.md"
-    folder_target = tmp_path / "native-folder"
     file_target.write_text("old", encoding="utf-8")
+    folder_target = tmp_path / "native-folder"
     folder_target.mkdir()
     docs_target = tmp_path / "docs"
     docs_target.mkdir()
-    reg = SourceRegistry(tmp_path)
-    file_root = reg.add(str(file_target), SourceRootType.SELECTED_FILE, "Native File", scope="user")
-    file_root.source_category = "native_memory"
-    file_root.enabled = True
-    grant_root_to_agent(file_root, "agent-1")
-    folder_root = reg.add(str(folder_target), SourceRootType.SELECTED_DIRECTORY, "Native Folder", scope="project")
-    folder_root.source_category = "project_memory"
-    folder_root.enabled = True
-    grant_root_to_agent(folder_root, "agent-1")
-    ignored = reg.add(str(docs_target), SourceRootType.SELECTED_DIRECTORY, "Docs", scope="project")
-    ignored.source_category = "knowledge_source"
-    ignored.enabled = True
-    grant_root_to_agent(ignored, "agent-1")
-    reg._save()
 
-    targets = GovernanceApi(str(tmp_path)).list_publish_targets(agent_instance_id="agent-1")["targets"]
-    by_name = {target["display_name"]: target for target in targets}
+    file_id = register_publish_target(workspace, file_target, source_id="native-file")
+    folder_id = register_publish_target(
+        workspace,
+        folder_target,
+        source_id="native-folder",
+        source_type="selected_directory",
+    )
+    docs_id = register_publish_target(
+        workspace,
+        docs_target,
+        source_id="docs",
+        source_type="selected_directory",
+    )
 
-    assert by_name["Native File"]["target_file"] == str(file_target.resolve())
-    assert by_name["Native File"]["is_agent_native_memory"] is False
-    assert by_name["Native Folder"]["target_file"] == str((folder_target / "memory.md").resolve())
-    assert by_name["Native Folder"]["is_agent_native_memory"] is False
-    assert "Docs" not in by_name
+    source_control = SourceControlService(workspace)
+    visible = source_control.list_sources({"is_admin": True})
+    by_id = {item["source_id"]: item for item in visible["sources"]}
+    assert {file_id, folder_id, docs_id} <= set(by_id)
+    assert by_id[file_id]["type"] == "selected_file"
+    assert by_id[folder_id]["type"] == "selected_directory"
+    assert all(by_id[item]["state"] == "READY" for item in (file_id, folder_id, docs_id))
 
-
-def test_list_publish_targets_marks_agent_native_memory_entry(tmp_path) -> None:
-    native_file = tmp_path / "user_profile.md"
-    native_file.write_text("old", encoding="utf-8")
-    reg = SourceRegistry(tmp_path)
-    root = reg.add(str(native_file), SourceRootType.SELECTED_FILE, "TRAE Profile", scope="user")
-    root.source_category = "native_memory"
-    root.ownership = "agent_managed"
-    root.target_role = "takeover_input"
-    grant_root_to_agent(root, "agent-1")
-    root.surface_id = "trae_user_profile"
-    root.enabled = True
-    reg._save()
-
-    targets = GovernanceApi(str(tmp_path)).list_publish_targets(agent_instance_id="agent-1")["targets"]
-    target = next(item for item in targets if item["root_id"] == root.root_id)
-
-    assert target["is_agent_native_memory"] is True
-    assert target["ownership"] == "agent_managed"
-    assert target["target_role"] == "takeover_input"
+    targets = V2ReleaseService(workspace).list_targets(scope=projection_scope(workspace))
+    assert {item["target_root_id"] for item in targets["targets"]} >= {
+        file_id,
+        folder_id,
+        docs_id,
+    }
+    assert source_control.remove(docs_id, {"is_admin": True})["ok"] is True
+    remaining = V2ReleaseService(workspace).list_targets(scope=projection_scope(workspace))
+    assert docs_id not in {item["target_root_id"] for item in remaining["targets"]}
 
 
-def test_choose_publish_target_path_uses_windows_dialog_without_tkinter(tmp_path, monkeypatch) -> None:
+def test_source_control_publish_target_visibility_is_agent_scoped(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "user_profile.md"
+    target.write_text("old", encoding="utf-8")
+    source_id = register_publish_target(workspace, target, source_id="agent-native")
+    GroupControlService(workspace, write=True).record_selection(
+        "agent-1", [source_id], "selection-agent-1-agent-native",
+    )
+
+    selected = SourceControlService(workspace).list_sources(
+        {"is_admin": False, "trusted_agent_id": "agent-1"},
+    )
+    other = SourceControlService(workspace).list_sources(
+        {"is_admin": False, "trusted_agent_id": "agent-2"},
+    )
+
+    assert {item["source_id"] for item in selected["sources"]} == {source_id}
+    assert other["sources"] == []
+
+
+def test_choose_publish_target_path_uses_windows_dialog_without_tkinter(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
     selected_folder = tmp_path / "selected"
     selected_folder.mkdir()
 
@@ -171,328 +248,213 @@ def test_choose_publish_target_path_uses_windows_dialog_without_tkinter(tmp_path
         stdout = str(selected_folder) + "\n"
         stderr = ""
 
-    import platform
-    import subprocess
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
-    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: Completed())
+    class V2HostPort:
+        def state_snapshot(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
 
-    result = GovernanceApi(str(tmp_path)).choose_publish_target_path("folder")
+        def dispatch_gui(self, method, args, **_kwargs):
+            assert method == "choose_publish_target_path"
+            return {
+                "ok": True,
+                "path": "v2",
+                "data": {
+                    "host_action": "choose_publish_target_path",
+                    "kind": args[0],
+                },
+            }
+
+    import memoryguard.gui as gui_module
+
+    monkeypatch.setattr(gui_module.sys, "platform", "win32")
+    monkeypatch.setattr(gui_module.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    result = GovernanceApi(str(tmp_path), _v2_port=V2HostPort()).choose_publish_target_path(
+        "folder",
+    )
 
     assert result["ok"] is True
     assert result["target_file"] == str(selected_folder / "memory.md")
 
 
 def test_publish_and_rollback_native_memory_apis_are_registered_as_mutations() -> None:
-    assert "publish_reconstructed_memory" not in MUTATION_API_METHODS
-    assert "rollback_native_memory_release" not in MUTATION_API_METHODS
+    assert "publish_reconstructed_memory" in MUTATION_API_METHODS
+    assert "rollback_native_memory_release" in MUTATION_API_METHODS
+    assert "publish_reconstructed_memory" not in READONLY_API_METHODS
+    assert "rollback_native_memory_release" not in READONLY_API_METHODS
     assert "list_native_memory_releases" in READONLY_API_METHODS
     assert "list_publish_targets" in READONLY_API_METHODS
     assert "choose_publish_target_path" in READONLY_API_METHODS
 
 
-def test_publish_writes_release_under_releases_dir(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="重构事实",
-        body="这是自动治理后的记忆",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
+def test_publish_writes_release_to_projection_ledger(tmp_path: Path) -> None:
+    workspace, target, scope, _built, published = _seed_and_publish(
+        tmp_path,
+        "这是自动治理后的记忆",
+    )
 
     assert published["ok"] is True
-    assert published["release_id"].startswith("rel-")
-    release_path = workspace / ".memoryguard" / "releases" / f"{published['release_id']}.json"
-    assert release_path.exists()
-    release_data = json.loads(release_path.read_text(encoding="utf-8"))
-    assert release_data["record_type"] == "memory_release"
-    assert release_data["schema_version"] == "3.1"
+    assert published["release_id"].startswith("release-")
+    counts = ProjectionStore(workspace, initialize=False).counts("scenario")
+    assert counts["ledger"] >= 2
+    assert not (workspace / ".memoryguard" / "releases").exists()
+    releases = V2ReleaseService(workspace).list_releases(scope=scope)
+    assert releases["total"] == 1
+    assert releases["releases"][0]["release_id"] == published["release_id"]
+    assert str(target.resolve()) not in releases["releases"][0]
 
 
-def test_publish_build_manifest_has_record_mappings(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="重构事实",
-        body="这是自动治理后的记忆",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
+def test_publish_projection_record_has_scoped_evidence(tmp_path: Path) -> None:
+    workspace, target, scope, built, published = _seed_and_publish(
+        tmp_path,
+        "这是自动治理后的记忆",
+    )
+    projection = built["projection"]
+    record = ProjectionStore(workspace, initialize=False).get_projection(
+        "scenario",
+        projection["key"],
+        scope=scope,
+    )
 
     assert published["ok"] is True
-    assert published.get("published_record_count", 0) > 0
-    assert published.get("record_mapping_count", 0) > 0
+    assert record is not None
+    assert record.projection_id == projection["projection_id"]
+    assert record.projection_digest == projection["projection_digest"]
+    assert len(record.evidence_links) >= 1
+    document = json.loads(target.read_text(encoding="utf-8"))
+    assert document["projection_id"] == record.projection_id
+    assert {item["memory_id"] for item in document["memories"]} == {"m1"}
 
 
-def test_publish_writes_requested_non_memory_md_file(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "agent-home"
-    workspace.mkdir()
-    target_dir.mkdir()
-    user_profile = target_dir / "user_profile.md"
-    user_profile.write_text("# Profile\n\n旧 profile\n", encoding="utf-8")
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
+def test_publish_writes_requested_non_memory_md_file(tmp_path: Path) -> None:
+    workspace, target, scope, _built, published = _seed_and_publish(
+        tmp_path,
+        "喜欢深色主题界面",
         title="用户偏好",
-        body="喜欢深色主题界面",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, user_profile, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
+        target_name="user_profile.md",
+        initial="# Profile\n\nold profile\n",
+    )
 
     assert published["ok"] is True
-    assert published.get("published_target_file") == str(user_profile.resolve())
-    profile_text = user_profile.read_text(encoding="utf-8")
-    memory_md = target_dir / "memory.md"
-    assert memory_md.exists()
-    assert "用户偏好" in profile_text
-    assert "喜欢深色主题界面" in profile_text
-    assert profile_text == memory_md.read_text(encoding="utf-8")
-
-    release_path = workspace / ".memoryguard" / "releases" / f"{published['release_id']}.json"
-    release_data = json.loads(release_path.read_text(encoding="utf-8"))
-    assert str(user_profile.resolve()) in release_data["changed_paths"]
-    assert release_data.get("published_target_file") == str(user_profile.resolve())
-    assert release_data.get("exact_file_existed_before") is True
+    assert target.name == "user_profile.md"
+    profile = json.loads(target.read_text(encoding="utf-8"))
+    assert profile["schema"] == "memoryguard-v2-native-release-1"
+    assert profile["memories"][0]["body"] == "喜欢深色主题界面"
+    assert not (target.parent / "memory.md").exists()
+    assert V2ReleaseService(workspace).list_releases(scope=scope)["total"] == 1
 
 
-def test_exact_file_sync_rewrite_failure_rolls_back_orphan(tmp_path, monkeypatch) -> None:
-    """rewrite 在 exact_file 已写入后失败时，整单回滚须清掉 orphan。"""
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "agent-home"
-    workspace.mkdir()
-    target_dir.mkdir()
-    user_profile = target_dir / "user_profile.md"
-    assert not user_profile.exists()
+def test_v2_release_rejects_target_drift_without_writing(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(tmp_path)
+    seed_atom(workspace, "m-drift", "target drift fixture")
+    build_projection(workspace, scope=scope)
+    release = V2ReleaseService(workspace)
+    plan = release.create_plan(str(target), scope=scope)
+    target.write_text("changed after plan", encoding="utf-8")
 
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="rewrite 失败",
-        body="sync rewrite 失败后不应留下 orphan",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
+    with pytest.raises(ProjectionBuildError, match="release_target_drift"):
+        release.apply(
+            str(plan["plan_id"]),
+            str(target),
+            scope=scope,
+            confirmed=True,
+        )
 
-    def boom(*_a, **_k):
-        raise OSError("rewrite failed")
+    assert target.read_text(encoding="utf-8") == "changed after plan"
 
-    # Order: backup → copy exact_file → update paths → rewrite.
-    # Patching rewrite leaves exact_file on disk; rollback must remove it.
-    monkeypatch.setattr(
-        "memoryguard.gui._rewrite_release_json_for_exact_file", boom,
+
+def test_v2_release_rejects_projection_drift_without_writing(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(tmp_path)
+    seed_atom(workspace, "m-first", "first projection fixture")
+    build_projection(workspace, scope=scope)
+    release = V2ReleaseService(workspace)
+    plan = release.create_plan(str(target), scope=scope)
+    seed_atom(workspace, "m-second", "second projection fixture")
+    assert build_projection(workspace, scope=scope)["status"] == "succeeded"
+
+    with pytest.raises(ProjectionBuildError, match="release_plan_stale"):
+        release.apply(
+            str(plan["plan_id"]),
+            str(target),
+            scope=scope,
+            confirmed=True,
+        )
+
+    assert target.read_text(encoding="utf-8") == "# Memory\n\nold\n"
+
+
+def test_publish_first_create_rollback_deletes_new_file(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(
+        tmp_path,
+        target_name="user_profile.md",
     )
-
-    user_profile.write_text("# tmp\n", encoding="utf-8")
-    api, root_id, scope = prepare_publish_target(workspace, user_profile, ir)
-    user_profile.unlink()
-    published = publish(api, scope=scope, target_root_id=root_id)
-
-    assert published["ok"] is False
-    assert "exact_file sync failed" in published.get("errors", [""])[0]
-    assert not user_profile.exists()
-    assert not (target_dir / "memory.md").exists()
-    assert not (target_dir / "index.json").exists()
-
-
-def test_exact_file_sync_corrupt_release_json_still_rolls_back_orphan(
-    tmp_path, monkeypatch,
-) -> None:
-    """rewrite 把 release JSON 截断写坏后再失败时，publish 不抛异常且清掉 orphan。"""
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "agent-home"
-    workspace.mkdir()
-    target_dir.mkdir()
-    user_profile = target_dir / "user_profile.md"
-    assert not user_profile.exists()
-
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="JSON 截断",
-        body="release JSON 损坏后仍应回滚 orphan",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    def corrupt_then_boom(release, workspace_arg, **_k):
-        releases_dir = Path(workspace_arg) / ".memoryguard" / "releases"
-        release_path = releases_dir / f"{release.release_id}.json"
-        # Truncate live release JSON (simulates mid-write corruption).
-        release_path.write_text("{", encoding="utf-8")
-        raise OSError("rewrite failed after corrupt")
-
-    monkeypatch.setattr(
-        "memoryguard.gui._rewrite_release_json_for_exact_file",
-        corrupt_then_boom,
-    )
-
-    user_profile.write_text("# tmp\n", encoding="utf-8")
-    api, root_id, scope = prepare_publish_target(workspace, user_profile, ir)
-    user_profile.unlink()
-    published = publish(api, scope=scope, target_root_id=root_id)
-
-    assert isinstance(published, dict)
-    assert published["ok"] is False
-    assert "exact_file sync failed" in published.get("errors", [""])[0]
-    assert not user_profile.exists()
-    assert not (target_dir / "memory.md").exists()
-    assert not (target_dir / "index.json").exists()
-
-
-def test_publish_exact_file_first_create_rollback_deletes_it(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "agent-home"
-    workspace.mkdir()
-    target_dir.mkdir()
-    user_profile = target_dir / "user_profile.md"
-
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="首次 sidecar",
-        body="新建 exact_file 应可回滚删除",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    user_profile.write_text("# tmp\n", encoding="utf-8")
-    api, root_id, scope = prepare_publish_target(workspace, user_profile, ir)
-    user_profile.unlink()
-    published = publish(api, scope=scope, target_root_id=root_id)
+    target.unlink()
+    seed_atom(workspace, "m-first", "首次写入原生记忆")
+    published = publish(workspace, target, scope=scope)
 
     assert published["ok"] is True
-    assert user_profile.exists()
-    assert (target_dir / "memory.md").exists()
-    release_path = workspace / ".memoryguard" / "releases" / f"{published['release_id']}.json"
-    release_data = json.loads(release_path.read_text(encoding="utf-8"))
-    assert str(user_profile.resolve()) in release_data["changed_paths"]
-    assert release_data.get("exact_file_existed_before") is False
-
-    rolled_back = api.rollback_native_memory_release(
-        published["release_id"], confirmed=True,
-        scope=scope, agent_instance_id=scope["agent_instance_id"], target_root_id=root_id,
-    )
+    assert target.exists()
+    rolled_back = _rollback(workspace, target, scope, published["release_id"])
 
     assert rolled_back["ok"] is True
-    assert not rolled_back.get("errors")
-    assert not user_profile.exists()
-    assert not (target_dir / "memory.md").exists()
-    assert not (target_dir / "index.json").exists()
+    assert not target.exists()
+    assert not (target.parent / "memory.md").exists()
+    assert not (target.parent / "index.json").exists()
 
 
-def test_publish_exact_file_existing_rollback_restores_content(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "agent-home"
-    workspace.mkdir()
-    target_dir.mkdir()
-    user_profile = target_dir / "user_profile.md"
+def test_publish_existing_target_rollback_restores_content(tmp_path: Path) -> None:
     old_content = "# Profile\n\n旧 profile 内容\n"
-    user_profile.write_text(old_content, encoding="utf-8")
-
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="覆盖 sidecar",
-        body="发布后回滚应恢复旧内容",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, user_profile, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
+    workspace, target, scope = _fixture(
+        tmp_path,
+        target_name="user_profile.md",
+        initial=old_content,
+    )
+    previous_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    seed_atom(workspace, "m-existing", "发布后应恢复旧内容")
+    published = publish(workspace, target, scope=scope)
+    receipt = V2ReleaseService(workspace).list_releases(scope=scope)["releases"][0]
 
     assert published["ok"] is True
-    assert "覆盖 sidecar" in user_profile.read_text(encoding="utf-8")
-    release_path = workspace / ".memoryguard" / "releases" / f"{published['release_id']}.json"
-    release_data = json.loads(release_path.read_text(encoding="utf-8"))
-    assert str(user_profile.resolve()) in release_data["changed_paths"]
-    assert release_data.get("exact_file_existed_before") is True
-    assert any(
-        Path(bp).name.startswith("user_profile.md.") and bp.endswith(".bak")
-        for bp in release_data.get("backup_paths", [])
-    )
+    assert receipt["existed_before"] is True
+    assert receipt["previous_blob_id"]
+    assert receipt["previous_occurrence_id"]
+    assert receipt["previous_digest"] == previous_digest
+    assert "发布后应恢复旧内容" in target.read_text(encoding="utf-8")
 
-    rolled_back = api.rollback_native_memory_release(
-        published["release_id"], confirmed=True,
-        scope=scope, agent_instance_id=scope["agent_instance_id"], target_root_id=root_id,
-    )
+    rolled_back = _rollback(workspace, target, scope, published["release_id"])
 
     assert rolled_back["ok"] is True
-    assert not rolled_back.get("errors")
-    assert user_profile.exists()
-    assert user_profile.read_text(encoding="utf-8") == old_content
+    assert target.read_text(encoding="utf-8") == old_content
 
 
-def test_rollback_first_publish_deletes_new_files(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    assert not (target_dir / "memory.md").exists()
-    assert not (target_dir / "index.json").exists()
-
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="首次发布",
-        body="第一次写入原生记忆",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
-
-    api, root_id, scope = prepare_publish_target(workspace, target_dir, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
+def test_rollback_first_publish_deletes_new_files(tmp_path: Path) -> None:
+    workspace, target, scope = _fixture(
+        tmp_path,
+        target_name="memory.md",
+    )
+    target.unlink()
+    seed_atom(workspace, "m-new", "第一次写入原生记忆")
+    published = publish(workspace, target, scope=scope)
 
     assert published["ok"] is True
-    assert (target_dir / "memory.md").exists()
-    assert (target_dir / "index.json").exists()
-
-    rolled_back = api.rollback_native_memory_release(
-        published["release_id"], confirmed=True,
-        scope=scope, agent_instance_id=scope["agent_instance_id"], target_root_id=root_id,
-    )
+    assert target.exists()
+    rolled_back = _rollback(workspace, target, scope, published["release_id"])
 
     assert rolled_back["ok"] is True
-    assert not rolled_back.get("errors")
-    assert not (target_dir / "memory.md").exists()
-    assert not (target_dir / "index.json").exists()
+    assert not target.exists()
+    assert not (target.parent / "index.json").exists()
 
 
-def test_release_json_embeds_build_manifest(tmp_path) -> None:
-    workspace = tmp_path / "workspace"
-    target_dir = tmp_path / "native"
-    workspace.mkdir()
-    target_dir.mkdir()
-    target = target_dir / "memory.md"
-    target.write_text("# Memory\n\n旧原生记忆\n", encoding="utf-8")
-    ir = MemoryIR(records=[MemoryRecord(
-        memory_id="m1",
-        kind=MemoryKind.FACT,
-        title="重构事实",
-        body="这是自动治理后的记忆",
-    )], snapshot_id="snap")
-    MemoryNormalizer(workspace).save(ir)
+def test_release_document_embeds_projection_manifest(tmp_path: Path) -> None:
+    workspace, target, _scope, built, published = _seed_and_publish(
+        tmp_path,
+        "这是自动治理后的记忆",
+    )
+    document = json.loads(target.read_text(encoding="utf-8"))
 
-    api, root_id, scope = prepare_publish_target(workspace, target, ir)
-    published = publish(api, scope=scope, target_root_id=root_id)
-
-    release_path = workspace / ".memoryguard" / "releases" / f"{published['release_id']}.json"
-    release_data = json.loads(release_path.read_text(encoding="utf-8"))
-    manifest = release_data.get("manifest", {})
-
-    assert manifest.get("record_mappings")
-    assert manifest.get("published_record_count", 0) > 0
+    assert published["ok"] is True
+    assert document["schema"] == "memoryguard-v2-native-release-1"
+    assert document["projection_id"] == built["projection"]["projection_id"]
+    assert document["projection_digest"] == built["projection"]["projection_digest"]
+    assert document["scope_digest"]
+    assert document["memories"]
+    assert document["memories"][0]["memory_id"] == "m1"

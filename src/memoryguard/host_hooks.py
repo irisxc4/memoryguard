@@ -8,6 +8,8 @@ prompt or memory bodies.
 
 from __future__ import annotations
 
+_V2_READ_STATES = frozenset({"V2_READY", "V2_ACTIVE"})
+
 import argparse
 import hashlib
 import inspect
@@ -23,6 +25,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .runtime_v2.public_safety import v2_upgrade_message, v2_upgrade_payload
 
 
 HOOK_VERSION = "1"
@@ -444,6 +448,29 @@ def _owned_agent_ids(data: dict[str, Any]) -> set[str]:
     return result
 
 
+def _binding_plane_for_workspace(workspace: Path) -> str:
+    """Return the authoritative binding plane for the current cutover state.
+
+    V1_ACTIVE/V2_BUILDING are retired for host binding resolution.  They remain
+    distinguishable for diagnostics, but callers must not use that result to
+    construct or query a retired binding plane.
+    """
+    from .system.manifest import ManifestManager
+
+    state = ManifestManager(workspace).current().state
+    marker = str(getattr(state, "value", state) or "").strip().upper()
+    if marker in {"V1_ACTIVE", "V2_BUILDING"}:
+        raise ValueError(
+            f"v2_upgrade_required: {v2_upgrade_message(marker, surface='Hook')}"
+        )
+    if marker in {"V2_READY", "V2_ACTIVE"}:
+        return "v2"
+    raise ValueError(
+        "v2_manifest_state_unavailable: "
+        f"{v2_upgrade_message('UNKNOWN', surface='Hook')}"
+    )
+
+
 def _validate_binding(
     workspace: Path,
     agent_instance_id: str,
@@ -453,12 +480,23 @@ def _validate_binding(
         raise ValueError("agent_instance_id is required for hook installation")
     if not share_group_id:
         raise ValueError("share_group_id is required for hook installation")
-    from .agent_binding import AgentBindingStore
 
-    bindings = AgentBindingStore(workspace).find_by_agent(
-        agent_instance_id, include_inactive=False,
+    plane = _binding_plane_for_workspace(workspace)
+    if plane != "v2":
+        raise ValueError(v2_upgrade_message(plane, surface="Hook"))
+
+    from .runtime_v2.group_native import GroupControlService
+
+    binding = GroupControlService(workspace, write=False).active_binding_for_agent(
+        agent_instance_id
     )
-    if not any(binding.share_group_id == share_group_id for binding in bindings):
+    matched = (
+        binding is not None
+        and str(binding.get("status") or "") == "active"
+        and str(binding.get("share_group_id") or "") == str(share_group_id)
+    )
+
+    if not matched:
         raise ValueError(
             "active binding not found for "
             f"agent_instance_id={agent_instance_id!r}, "
@@ -1082,6 +1120,7 @@ def _record_heartbeat(
     event: str,
     error: str = "",
     mandatory_rule_ids: list[str] | None = None,
+    mandatory_match_receipts: list[dict[str, Any]] | None = None,
     mandatory_overflow: bool = False,
 ) -> bool:
     path = _heartbeat_path(workspace, provider, agent_instance_id)
@@ -1096,6 +1135,7 @@ def _record_heartbeat(
             "at": _now_iso(),
             "error": (error or "")[:500],
             "mandatory_rule_ids": list(mandatory_rule_ids or []),
+            "mandatory_match_receipts": list(mandatory_match_receipts or []),
             "mandatory_overflow": bool(mandatory_overflow),
         }
         if isinstance(previous.get("history_archive"), dict):
@@ -1476,97 +1516,14 @@ def _archive_history_event(
     share_group_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Best-effort raw turn archive for verified lifecycle seams.
+    """Retired compatibility seam; history persistence is V2-native only."""
+    return {
+        "attempted": False,
+        "archived": False,
+        "reason": "v2_native_only",
+        "event": event,
+    }
 
-    This never calls the long-term-memory store or bootstrap. Strict replay
-    idempotency is promised only when the host supplies a stable event ID or
-    sequence. Otherwise each observed call is preserved and coverage is marked
-    degraded. Failures never affect the host's normal conversation flow.
-    """
-    if event not in {"user_prompt", "stop"}:
-        return {"attempted": False, "reason": "event_not_archived"}
-    enabled, enabled_reason = _history_capture_enabled(workspace)
-    if not enabled:
-        return {"attempted": False, "reason": enabled_reason, "capture_enabled": False}
-    if _history_opted_out(payload):
-        return {"attempted": False, "reason": "private_or_disabled"}
-    external_session_id = _hook_history_session_id(payload)
-    if not external_session_id:
-        return {"attempted": False, "reason": "session_identity_missing"}
-    if event == "user_prompt":
-        role, content = "user", _prompt(payload)
-    else:
-        role = "assistant"
-        # A Stop event does not universally expose model text.  Do not invent
-        # it, scrape state, or claim full host coverage when it is absent.
-        content = str(
-            payload.get("last_assistant_message")
-            or payload.get("assistant_message")
-            or payload.get("final_response")
-            or ""
-        )
-    if not content.strip():
-        return {
-            "attempted": False,
-            "reason": "assistant_content_unavailable" if event == "stop" else "prompt_content_unavailable",
-            "session_hash": _short_hash(external_session_id),
-        }
-    if _contains_obvious_secret(content):
-        return {
-            "attempted": False, "archived": False,
-            "reason": "secret_detected_blocked", "secret_blocked": True,
-            "session_hash": _short_hash(external_session_id),
-        }
-    try:
-        from .conversation_history import ConversationHistoryStore, HistoryScope, MAX_TURN_CHARS
-
-        # Persist-boundary mojibake guard: repair pervasively corrupt content;
-        # raise (fail-closed, swallowed here) rather than persist garbage.
-        from .encoding_guard import guard_persist_content
-
-        content = guard_persist_content(content)
-        truncated = len(content) > MAX_TURN_CHARS
-        if truncated:
-            content = content[:MAX_TURN_CHARS]
-        host_event_id, event_stable, event_source = _stable_history_event_id(payload, event)
-        result = ConversationHistoryStore(workspace).append_turn(
-            HistoryScope(
-                agent_instance_id=agent_instance_id,
-                project_ref=str(payload.get("project_ref") or payload.get("cwd") or ""),
-                provider=provider,
-                share_group_id=share_group_id,
-            ),
-            external_session_id=external_session_id,
-            provider=provider,
-            role=role,
-            content=content,
-            event_id=host_event_id,
-            event_stable=event_stable,
-            title=str(payload.get("title") or payload.get("conversation_title") or ""),
-            created_at=str(payload.get("timestamp") or payload.get("created_at") or ""),
-        )
-        return {
-            "attempted": True,
-            "archived": bool(result.get("inserted")),
-            "replayed": bool(result.get("replayed")),
-            "event_conflict": bool(result.get("event_conflict")),
-            "event": event,
-            "role": role,
-            "session_hash": _short_hash(external_session_id),
-            "truncated": truncated,
-            "capture_enabled": True,
-            "idempotency": result.get("idempotency", "degraded"),
-            "coverage_degraded": not event_stable,
-            "event_identity_source": event_source,
-        }
-    except Exception as exc:
-        return {
-            "attempted": True,
-            "archived": False,
-            "event": event,
-            "reason": f"history_archive_failed:{type(exc).__name__}",
-            "session_hash": _short_hash(external_session_id),
-        }
 
 
 def _durable_candidate(text: str) -> bool:
@@ -1673,10 +1630,7 @@ def _load_store(
     agent_instance_id: str,
     share_group_id: str,
 ):
-    _validate_binding(workspace, agent_instance_id, share_group_id)
-    from .shared_memory_store import SharedMemoryStore
-
-    return SharedMemoryStore(workspace, share_group_id)
+    raise RuntimeError(v2_upgrade_message("UNKNOWN", surface="Hook"))
 
 
 def _render_context(packet: dict[str, Any]) -> str:
@@ -1767,27 +1721,13 @@ def _normalize_feedback_receipts(raw: Any) -> list[dict[str, str]]:
 
 def _persist_mandatory_match_receipts(
     *,
-    store: "SharedMemoryStore",
+    store: Any,
     receipts: list[dict[str, Any]],
     provider: str,
     event: str,
 ) -> None:
-    if not receipts:
-        return
-    from .schema_v3 import RuleMatchReceipt
-
-    for raw in receipts:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            store.append_rule_match_receipt(RuleMatchReceipt.from_dict(raw))
-        except Exception as exc:
-            _emit_runtime_write_diagnostic(
-                "mandatory_receipt_write_failed",
-                provider,
-                event,
-                exc,
-            )
+    """Retired compatibility seam; native V2 owns receipt persistence."""
+    return None
 
 
 def _flush_pending_rule_feedback(
@@ -1800,93 +1740,9 @@ def _flush_pending_rule_feedback(
     actor: str,
     trigger: str,
 ) -> None:
-    state = _load_state(workspace, provider, session_id)
-    receipts = _normalize_feedback_receipts(state.get("mandatory_match_receipts", []))
-    if not receipts:
-        return
+    """Retired compatibility seam; native V2 owns feedback persistence."""
+    return None
 
-    try:
-        store = _load_store(workspace, agent_instance_id, share_group_id)
-    except Exception as exc:
-        _emit_runtime_write_diagnostic(
-            "rule_feedback_fallback_store_open_failed",
-            provider,
-            "stop",
-            exc,
-        )
-        return
-
-    from .schema_v3 import RuleMatchFeedback, stable_hash
-
-    for raw in receipts:
-        receipt_id = raw["receipt_id"]
-        # Do not re-write ``unobserved`` for the same receipt on every Stop.
-        # ``get_rule_match_feedback_by_receipt`` resolves the *effective*
-        # feedback and returns None while only unobserved events exist, so
-        # check the raw event history for an existing unobserved marker too.
-        try:
-            existing_events = store.list_rule_match_feedbacks(
-                receipt_id=receipt_id,
-            )
-        except Exception as exc:
-            _emit_runtime_write_diagnostic(
-                "rule_feedback_fallback_lookup_failed",
-                provider,
-                "stop",
-                exc,
-            )
-            continue
-        existing = store.get_rule_match_feedback_by_receipt(receipt_id)
-        if existing is not None:
-            continue
-        if any(item.source == "hook" and item.outcome == "unobserved" for item in existing_events):
-            continue
-        # v2: absence of observation must never be recorded as
-        # "not_applicable".  No feedback may mean the rule was followed but
-        # unobserved, violated, deferred, or simply unknown.  Write an
-        # ``unobserved`` event with confidence 0.0 so the rule lifecycle does
-        # not treat the absence as scope-error evidence and never poisons the
-        # auto-scope accuracy counters.
-        feedback = RuleMatchFeedback(
-            feedback_id=stable_hash(
-                "rule-feedback", "unobserved", receipt_id, actor, trigger,
-            ),
-            receipt_id=receipt_id,
-            outcome="unobserved",
-            actor=actor,
-            evidence=f"no observation reported before stop: {trigger}",
-            confidence=0.0,
-            source="hook",
-            authority=2,
-            created_at=_now_iso(),
-        )
-        # Model normalizes ``unobserved`` to authority 1 for generic callers;
-        # Hook transport is trusted producer metadata and must remain explicit
-        # hook authority 2 even when actor text happens to be ``user``.
-        feedback.authority = 2
-        try:
-            store.append_rule_match_feedback(feedback)
-            # ``SharedMemoryStore`` reconstructs model objects on its public
-            # append path; older model semantics normalize unobserved events
-            # to authority 1.  Re-assert trusted Hook transport metadata at
-            # persistence boundary so actor text cannot alter producer rank.
-            with store._tx() as conn:
-                conn.execute(
-                    "UPDATE rule_match_feedbacks SET source='hook', authority=2 "
-                    "WHERE feedback_id=?",
-                    (feedback.feedback_id,),
-                )
-        except Exception as exc:
-            _emit_runtime_write_diagnostic(
-                "rule_feedback_fallback_write_failed",
-                provider,
-                "stop",
-                exc,
-            )
-            continue
-
-    state["mandatory_match_receipts"] = []
-    _save_state(workspace, provider, session_id, state)
 
 
 def _deny_output(provider: str, reason: str) -> dict[str, Any]:
@@ -1917,39 +1773,60 @@ def _allow_output(provider: str, event: str) -> dict[str, Any]:
     return {}
 
 
+def _v2_upgrade_output(provider: str, event: str, state: str) -> dict[str, Any]:
+    """Fail closed with stable retirement guidance for every non-V2 state."""
+    payload = v2_upgrade_payload(state, surface="Hook")
+    reason = v2_upgrade_message(state, surface="Hook")
+    if event == "pre_tool":
+        result = _deny_output(provider, reason)
+    elif event == "stop":
+        result = _stop_continue_output(provider, reason)
+    elif provider == "cursor" and event == "user_prompt":
+        result = {"continue": False}
+    else:
+        result = _context_output(provider, event, reason)
+    result.update(payload)
+    nested = result.get("hookSpecificOutput")
+    if isinstance(nested, dict):
+        nested.update({
+            "code": payload["code"],
+            "error": payload["error"],
+            "state": payload["state"],
+            "next_step": payload["next_step"],
+        })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Phase6 V2 host-hook seam
 # ---------------------------------------------------------------------------
 
 _V2_STATES = frozenset({"V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"})
+_V2_READ_STATES = frozenset({"V2_READY", "V2_ACTIVE"})
 _V2_FACADE_MISSING = object()
 _v2_runtime_facade_factory: Any = None
 
 
 def _load_v2_runtime_facade(workspace: Path) -> Any:
+    """Load the native V2 facade; never fall back to retired storage."""
     factory = globals().get("_v2_runtime_facade_factory")
-    if factory is None:
-        factory = globals().get("V2RuntimeFacade")
     if callable(factory):
         try:
-            return factory(workspace)
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("v2_runtime_factory_signature_unavailable") from exc
+        try:
+            signature.bind(workspace)
         except TypeError:
+            try:
+                signature.bind(workspace=workspace)
+            except TypeError as exc:
+                raise RuntimeError("v2_runtime_factory_signature_unavailable") from exc
             return factory(workspace=workspace)
-    try:
-        from .cutover_v2.facade import V2RuntimeFacade
-    except ModuleNotFoundError as exc:
-        missing = str(getattr(exc, "name", "") or "")
-        if missing.startswith("memoryguard.cutover_v2"):
-            return _V2_FACADE_MISSING
-        raise
-    try:
-        from .system.manifest import ManifestManager
-        return V2RuntimeFacade(
-            manifest=ManifestManager(workspace),
-            workspace=str(workspace),
-        )
-    except TypeError:
-        return V2RuntimeFacade(workspace=workspace)
+        return factory(workspace)
+
+    from .cutover_v2.facade import get_v2_runtime_facade
+    return get_v2_runtime_facade(str(workspace))
 
 
 def _v2_state(value: Any) -> str:
@@ -2003,17 +1880,182 @@ def _v2_facade_snapshot(facade: Any) -> tuple[str, Any]:
         return "UNKNOWN", None
 
 
+
+def _v2_facade_snapshot(facade: Any) -> tuple[str, Any]:
+    fn = getattr(facade, "state_snapshot", None)
+    if not callable(fn):
+        fn = getattr(facade, "status", None)
+    if not callable(fn):
+        return "UNKNOWN", None
+    try:
+        value = fn()
+        return _v2_state(value), value
+    except Exception:
+        return "UNKNOWN", None
+
+
+def _plain_hook_context(context: Any) -> dict[str, Any]:
+    if isinstance(context, dict):
+        return dict(context)
+    try:
+        value = asdict(context)
+    except (TypeError, ValueError):
+        try:
+            value = dict(vars(context))
+        except (TypeError, AttributeError):
+            value = {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _v2_hook_context(
     provider: str,
     agent_instance_id: str,
     share_group_id: str,
     payload: dict[str, Any],
     event: str,
-) -> dict[str, Any]:
+    workspace: Path,
+) -> Any:
     context = _effective_agent_context(
         provider, agent_instance_id, share_group_id, payload, event=event,
     )
-    return asdict(context)
+    plain = _plain_hook_context(context)
+    try:
+        from .access_context import AccessContext, load_access_context
+        from .runtime_v2.group_native import GroupControlService
+        from .runtime_v2.native_ports import bind_native_transport_context
+
+        access = load_access_context()
+        resolved_agent, error = access.resolve_agent(agent_instance_id)
+        if error or resolved_agent != agent_instance_id:
+            raise ValueError("trusted hook agent unavailable")
+        binding = GroupControlService(workspace, write=False).active_binding_for_agent(
+            agent_instance_id,
+        )
+        if (
+            not binding
+            or str(binding.get("status") or "") != "active"
+            or str(binding.get("share_group_id") or "") != str(share_group_id)
+        ):
+            raise ValueError("active V2 hook binding unavailable")
+        if type(access) is not AccessContext:
+            raise ValueError("trusted hook context capability unavailable")
+        return bind_native_transport_context(
+            access,
+            workspace_id=str(workspace),
+            share_group_id=str(share_group_id),
+            project_ref=str(getattr(context, "project_ref", "") or ""),
+            provider=str(getattr(context, "provider", provider) or provider),
+            runtime_role=str(getattr(context, "runtime_role", "") or ""),
+            runtime_agent_id=str(getattr(context, "runtime_agent_id", "") or ""),
+            parent_agent_id=str(getattr(context, "parent_agent_id", "") or ""),
+            context_hash=str(getattr(context, "context_hash", "") or ""),
+            entrypoint="hook",
+        )
+    except Exception:
+        # Injected test facades may intentionally accept the serializable
+        # context form.  A real native port rejects that form before mutation.
+        return plain
+
+
+def _hook_data(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    data = dict(result)
+    embedded = data.get("data")
+    if isinstance(embedded, dict):
+        # The outer transport envelope is always ``status=ok`` when dispatch
+        # itself succeeded.  The ContextPacket inside ``data`` owns the
+        # semantic status/error (including mandatory overflow), so it must win
+        # for those fields rather than being hidden by the transport status.
+        data = {**data, **embedded}
+    packet = data.get("packet") or data.get("context_packet")
+    if not isinstance(packet, dict) and any(
+        key in data for key in ("mandatory", "relevant", "receipts", "ready", "effective_agent")
+    ):
+        packet = {
+            key: data[key]
+            for key in (
+                "mandatory", "relevant", "knowledge", "reference_only",
+                "budget", "effective_agent", "receipts", "ready", "state",
+                "status", "error",
+            )
+            if key in data
+        }
+    return data, packet if isinstance(packet, dict) else {}
+
+
+def _normalize_native_v2_packet(
+    packet: dict[str, Any],
+    *,
+    workspace: Path,
+    provider: str,
+    agent_instance_id: str,
+    share_group_id: str,
+    session_id: str,
+    event: str,
+) -> dict[str, Any]:
+    """Project a native ContextPacket onto the Hook receipt boundary.
+
+    V2 deliberately does not expose the old rule-store receipt object.  Its
+    bounded ContextEngine receipts are the authoritative match evidence.  The
+    Hook keeps only opaque, deterministic IDs and public metadata, never rule
+    bodies or raw evidence, so Cursor session injection and the next-tool gate
+    share one fail-closed receipt shape.
+    """
+    if not any(key in packet for key in ("mandatory", "relevant", "receipts")):
+        return packet
+    normalized = dict(packet)
+    mandatory = [item for item in packet.get("mandatory", []) if isinstance(item, dict)]
+    relevant = [item for item in packet.get("relevant", []) if isinstance(item, dict)]
+    normalized["mandatory_items"] = mandatory
+    normalized["items"] = relevant
+    rule_ids = [
+        str(item.get("item_id") or item.get("memory_id") or "").strip()
+        for item in mandatory
+    ]
+    rule_ids = [value for value in rule_ids if value]
+    receipts: list[dict[str, Any]] = []
+    for item in packet.get("receipts", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("hit") is not True or str(item.get("layer") or "") != "mandatory":
+            continue
+        item_id = str(item.get("item_id") or item.get("memory_id") or "").strip()
+        if not item_id:
+            continue
+        receipt_id = "v2-" + _short_hash(json.dumps(
+            {
+                "workspace": str(workspace),
+                "provider": provider,
+                "agent": agent_instance_id,
+                "group": share_group_id,
+                "session": session_id,
+                "event": event,
+                "item": item_id,
+                "digest": item.get("digest") or item.get("item_hash") or "",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
+        receipts.append({
+            "receipt_id": receipt_id,
+            "memory_id": item_id,
+            "item_id": item_id,
+            "layer": "mandatory",
+            "source": "native-v2-context",
+        })
+    normalized["mandatory_rule_ids"] = rule_ids
+    normalized["mandatory_match_receipts"] = receipts
+    status = str(packet.get("status") or "").casefold()
+    error = str(packet.get("error") or "").strip()
+    normalized["mandatory_overflow"] = bool(
+        packet.get("mandatory_overflow")
+        or status in {"blocked", "error", "failed"}
+        or error.startswith("mandatory_")
+    )
+    normalized["mandatory_invalid_reason"] = str(
+        packet.get("mandatory_invalid_reason") or error or ""
+    )
+    return normalized
 
 
 def _v2_hook_cutover(
@@ -2025,39 +2067,26 @@ def _v2_hook_cutover(
     share_group_id: str,
     session_id: str,
     payload: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Route V2 bootstrap/Stop events without touching legacy stores.
-
-    ``None`` means the Phase6 facade is not installed or V1/BUILDING is still
-    active; callers then execute the byte-compatible legacy hook path.
-    """
-    facade = _load_v2_runtime_facade(workspace)
+) -> dict[str, Any]:
+    """Route every Hook event through the V2 state gate and native hook port."""
+    try:
+        facade = _load_v2_runtime_facade(workspace)
+    except Exception:
+        return _v2_upgrade_output(provider, event, "UNKNOWN")
     if facade is _V2_FACADE_MISSING:
-        return None
+        return _v2_upgrade_output(provider, event, "UNKNOWN")
     state, snapshot = _v2_facade_snapshot(facade)
-    if state in {"V1_ACTIVE", "V2_BUILDING"}:
-        return None
-    if state == "UNKNOWN":
-        if event == "pre_tool":
-            return _deny_output(provider, "MemoryGuard V2 manifest state unavailable; tool execution denied.")
-        return _context_output(provider, event, "MemoryGuard V2 manifest state unavailable; bootstrap blocked.")
-
-    # pre/post-tool and compact guard logic remains local and byte-compatible.
-    # Only bootstrap and Stop feedback cross the V2 runtime port.
-    if event not in {"session_start", "subagent_start", "user_prompt", "stop"}:
-        return None
+    if state not in _V2_READ_STATES:
+        return _v2_upgrade_output(provider, event, state)
     if state == "V2_READY" and event == "stop":
-        # Stop feedback is a mutation. READY must not call either V2 or legacy.
-        if provider == "codex":
-            _best_effort_codex_reconcile(
-                workspace=workspace,
-                agent_instance_id=agent_instance_id,
-                payload=payload,
-            )
         return {}
+
     hook = getattr(facade, "bootstrap_hook", None)
     if not callable(hook):
-        return _context_output(provider, event, "MemoryGuard V2 hook capability unavailable; bootstrap blocked.")
+        return _context_output(
+            provider, event,
+            "MemoryGuard V2 hook capability unavailable; bootstrap blocked.",
+        )
     try:
         params = inspect.signature(hook).parameters
         has_context = "context" in params or any(
@@ -2070,10 +2099,13 @@ def _v2_hook_cutover(
         has_context = False
         accepts_snapshot = False
     if not has_context:
-        return _context_output(provider, event, "MemoryGuard V2 hook context capability unavailable; bootstrap blocked.")
+        return _context_output(
+            provider, event,
+            "MemoryGuard V2 hook context capability unavailable; bootstrap blocked.",
+        )
     try:
         context = _v2_hook_context(
-            provider, agent_instance_id, share_group_id, payload, event,
+            provider, agent_instance_id, share_group_id, payload, event, workspace,
         )
         kwargs: dict[str, Any] = {"context": context}
         if accepts_snapshot:
@@ -2082,91 +2114,130 @@ def _v2_hook_cutover(
     except Exception as exc:
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,
-            error=f"v2 hook dispatch failed: {type(exc).__name__}",
+            error=f"v2_hook_dispatch_failed:{type(exc).__name__}",
         )
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
         return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
 
-    # A facade envelope is part of the trusted bootstrap contract.  Do not
-    # treat an explicit failure (or a malformed result) as an empty, successful
-    # packet: that would silently bypass mandatory context injection.
     if not isinstance(result, dict):
-        invalid_reason = "v2 hook returned invalid envelope"
-        failed_state = _load_state(workspace, provider, session_id)
-        failed_state.update({
+        reason = "v2 hook returned invalid envelope"
+        state_payload = _load_state(workspace, provider, session_id)
+        state_payload.update({
             "bootstrap_ok": False,
-            "bootstrap_error": invalid_reason,
+            "bootstrap_error": reason,
             "mandatory_overflow": True,
-            "mandatory_invalid_reason": invalid_reason,
+            "mandatory_invalid_reason": reason,
             "mandatory_match_receipts": [],
         })
-        _save_state(workspace, provider, session_id, failed_state)
+        _save_state(workspace, provider, session_id, state_payload)
         _record_heartbeat(
-            workspace, provider, agent_instance_id, event=event,
-            error=invalid_reason,
+            workspace, provider, agent_instance_id, event=event, error=reason,
+            mandatory_overflow=True,
         )
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
         return _context_output(provider, event, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
-    result_status = str(result.get("status", "") or "").strip().casefold()
-    if result.get("ok") is False or result_status in {"error", "blocked", "failed"} or result.get("error"):
-        reason = str(result.get("error") or result.get("code") or "v2 hook bootstrap failed")
-        failed_state = _load_state(workspace, provider, session_id)
-        failed_state.update({
+
+    data, packet = _hook_data(result)
+    packet = _normalize_native_v2_packet(
+        packet,
+        workspace=workspace,
+        provider=provider,
+        agent_instance_id=agent_instance_id,
+        share_group_id=share_group_id,
+        session_id=session_id,
+        event=event,
+    )
+    status = str(data.get("status", "") or "").strip().casefold()
+    if data.get("ok") is False or status in {"error", "blocked", "failed"} or data.get("error"):
+        reason = str(data.get("error") or data.get("code") or "v2_hook_bootstrap_failed")
+        state_payload = _load_state(workspace, provider, session_id)
+        state_payload.update({
             "bootstrap_ok": False,
             "bootstrap_error": reason[:500],
             "mandatory_overflow": True,
             "mandatory_invalid_reason": reason[:500],
             "mandatory_match_receipts": [],
         })
-        _save_state(workspace, provider, session_id, failed_state)
+        _save_state(workspace, provider, session_id, state_payload)
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,
-            error=f"v2 hook envelope failed: {reason}",
+            error=f"v2_hook_envelope_failed:{reason}",
+            mandatory_overflow=True,
         )
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
+        if event == "stop":
+            return _stop_continue_output(provider, "MemoryGuard V2 hook failed; stop blocked.")
+        if packet.get("mandatory_overflow"):
+            return _context_output(
+                provider,
+                event,
+                _render_context({"context_packet": packet, **packet}),
+            )
         return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
 
-    if provider == "codex" and event == "stop":
-        # Reconciliation remains observational/best-effort and is deliberately
-        # independent of the V2 receipt/feedback result.
-        _best_effort_codex_reconcile(
-            workspace=workspace,
-            agent_instance_id=agent_instance_id,
-            payload=payload,
+    if event in {"session_start", "subagent_start", "user_prompt", "stop"}:
+        receipts = packet.get(
+            "mandatory_match_receipts",
+            data.get("mandatory_match_receipts", []),
         )
-
-    data = dict(result) if isinstance(result, dict) else {}
-    embedded = data.get("data")
-    if isinstance(embedded, dict):
-        # Facade envelopes may carry the hook packet under ``data``; preserve
-        # top-level status/path fields while exposing the packet uniformly.
-        data = {**embedded, **data}
-    packet = data.get("packet") or data.get("context_packet")
-    if not isinstance(packet, dict):
-        packet = {}
-    receipts = packet.get("mandatory_match_receipts", data.get("mandatory_match_receipts", []))
-    state_payload = _load_state(workspace, provider, session_id)
-    state_payload.update({
-        "bootstrap_ok": not bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
-        "mandatory_overflow": bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
-        "mandatory_invalid_reason": str(packet.get("mandatory_invalid_reason", data.get("error", "")) or ""),
-        "mandatory_rule_ids": list(packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []),
-        "mandatory_match_receipts": receipts if isinstance(receipts, list) else [],
-    })
-    if event == "user_prompt":
+        state_payload = _load_state(workspace, provider, session_id)
+        bootstrap_ok = not bool(
+            packet.get("mandatory_overflow", data.get("mandatory_overflow", False))
+        )
+        # Cursor's beforeSubmitPrompt hook is only the conversation receipt
+        # boundary.  Its first ordinary tool must remain locked until the
+        # host has actually executed memoryguard_context_bootstrap through
+        # CallMcpTool; otherwise a successful prompt hook would silently
+        # bypass the provider's explicit bootstrap gate.
+        if provider == "cursor" and event == "user_prompt":
+            bootstrap_ok = False
         state_payload.update({
-            "prompt_hash": _short_hash(_prompt(payload)),
-            "durable_candidate": _durable_candidate(_prompt(payload)),
-            "write_seen": False,
-            "stop_continued": False,
+            "bootstrap_ok": bootstrap_ok,
+            "mandatory_overflow": bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
+            "mandatory_invalid_reason": str(
+                packet.get("mandatory_invalid_reason", data.get("error", "")) or ""
+            ),
+            "mandatory_rule_ids": list(
+                packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []
+            ),
+            "mandatory_match_receipts": receipts if isinstance(receipts, list) else [],
         })
-    _save_state(workspace, provider, session_id, state_payload)
+        if event == "user_prompt":
+            state_payload.update({
+                "prompt_hash": _short_hash(_prompt(payload)),
+                "durable_candidate": _durable_candidate(_prompt(payload)),
+                "write_seen": False,
+                "stop_continued": False,
+            })
+        _save_state(workspace, provider, session_id, state_payload)
+
+    heartbeat_overflow = bool(
+        packet.get("mandatory_overflow", data.get("mandatory_overflow", False))
+    )
+    if event == "pre_tool":
+        # A pre-tool request may resolve a different runtime role than the
+        # lifecycle event that discovered an overflow (notably a subagent
+        # start followed by the parent host's tool gate).  Preserve the
+        # session's fail-closed overflow receipt instead of overwriting it
+        # with the empty packet from that unrelated scope.
+        heartbeat_overflow = heartbeat_overflow or bool(
+            _load_state(workspace, provider, session_id).get("mandatory_overflow")
+        )
     _record_heartbeat(
         workspace, provider, agent_instance_id, event=event,
         error=str(packet.get("error", data.get("error", "")) or ""),
-        mandatory_rule_ids=state_payload.get("mandatory_rule_ids", []),
-        mandatory_overflow=bool(state_payload.get("mandatory_overflow")),
+        mandatory_rule_ids=list(
+            packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []
+        ),
+        mandatory_match_receipts=(
+            packet.get("mandatory_match_receipts", data.get("mandatory_match_receipts", []))
+            if isinstance(packet.get("mandatory_match_receipts", data.get("mandatory_match_receipts", [])), list)
+            else []
+        ),
+        mandatory_overflow=heartbeat_overflow,
     )
 
     direct_output = data.get("output") or data.get("host_output")
@@ -2179,10 +2250,15 @@ def _v2_hook_cutover(
         text = _static_session_context(provider) + ("\n" + text if text else "")
         return _context_output(provider, event, text)
     if event == "subagent_start":
-        return _context_output(provider, event, _static_session_context(provider) + ("\n" + text if text else ""))
+        return _context_output(
+            provider,
+            event,
+            _static_session_context(provider) + ("\n" + text if text else ""),
+        )
     if event == "user_prompt":
         return _context_output(provider, event, text) if text else _allow_output(provider, event)
     return {}
+
 
 
 def run_hook(
@@ -2194,7 +2270,7 @@ def run_hook(
     share_group_id: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Run one host hook.  Returned data is the host's stdout JSON."""
+    """Run one host Hook event through the V2 state gate."""
     normalized_provider = provider.strip().lower()
     if normalized_provider == "claude-code":
         normalized_provider = "claude"
@@ -2206,26 +2282,25 @@ def run_hook(
     root = Path(workspace).expanduser().resolve()
     session_id = _session_id(payload)
     mode = get_hook_mode(root, normalized_provider, agent_instance_id)
-    _record_heartbeat(
-        root,
-        normalized_provider,
-        agent_instance_id,
-        event=event,
-    )
-    if mode == "paused":
-        return _allow_output(normalized_provider, event)
 
-    if normalized_provider == "codex" and event == "session_start":
-        # Recover terminal child tasks left open by a prior crash or missed
-        # Stop hook before any V1/V2 routing can return early.
-        _best_effort_codex_global_reconcile(
-            workspace=root,
-            agent_instance_id=agent_instance_id,
-            payload=payload,
-        )
+    # Codex thread cleanup is a host-owned lifecycle side effect.  Run it
+    # before the V2 memory data-plane gate so stale terminal edges are repaired
+    # even when the workspace still needs upgrade.  Stop remains observational
+    # and best-effort; an upgrade response must not block host shutdown.
+    if normalized_provider == "codex":
+        if event == "session_start":
+            _best_effort_codex_global_reconcile(
+                workspace=root,
+                agent_instance_id=agent_instance_id,
+                payload=payload,
+            )
+        elif event == "stop":
+            _best_effort_codex_reconcile(
+                workspace=root,
+                agent_instance_id=agent_instance_id,
+                payload=payload,
+            )
 
-    # Phase6 cutover reads the manifest once per event. READY/ACTIVE bootstrap
-    # and Stop feedback return here before any legacy SharedMemoryStore path.
     v2_result = _v2_hook_cutover(
         provider=normalized_provider,
         event=event,
@@ -2235,292 +2310,32 @@ def run_hook(
         session_id=session_id,
         payload=payload,
     )
-    if v2_result is not None:
+
+    # Retired/unknown states already carry the stable public error.  Return
+    # before any local guard or compatibility helper can run.
+    result_code = str(v2_result.get("code", "") or "")
+    if result_code in {
+        "v2_upgrade_required",
+        "v2_manifest_state_unavailable",
+    }:
+        if normalized_provider == "codex" and event == "stop":
+            return {}
         return v2_result
 
-    # V1/BUILDING only: raw-history capture is a legacy persistence seam.  A
-    # READY/ACTIVE request has already returned through the V2 hook above and
-    # must never fall through to this writer (or to any legacy mutation).
-    if event in {"user_prompt", "stop"}:
-        # Provider is argv-stamped today; the payload shape is an independent
-        # check (B1).  Only the history archive provider is corrected -- state,
-        # heartbeat and mandatory-rule paths keep the argv provider untouched.
-        history_provider = derive_host_provider(payload) or normalized_provider
-        archive_result = _archive_history_event(
-            workspace=root,
-            provider=history_provider,
-            event=event,
-            agent_instance_id=agent_instance_id,
-            share_group_id=share_group_id,
-            payload=payload,
-        )
-        if history_provider != normalized_provider:
-            archive_result = dict(archive_result)
-            archive_result["host_provider_conflict"] = True
-            archive_result["argv_provider"] = normalized_provider
-            archive_result["payload_provider"] = history_provider
-        _record_history_diagnostic(
-            root,
-            history_provider,
-            agent_instance_id,
-            archive_result,
-        )
-
-    if event == "session_start":
-        text = _static_session_context(normalized_provider)
-        if normalized_provider == "cursor":
-            try:
-                store = _load_store(root, agent_instance_id, share_group_id)
-                from .context_bootstrap import build_context_packet
-
-                packet = build_context_packet(
-                    store,
-                    task="MemoryGuard session preferences",
-                    max_items=5,
-                    max_chars=2400,
-                    effective_context=_effective_agent_context(
-                        normalized_provider, agent_instance_id,
-                        share_group_id, payload, event=event,
-                    ),
-                )
-                _record_heartbeat(
-                    root, normalized_provider, agent_instance_id, event=event,
-                    error=str(packet.get("error", "")),
-                    mandatory_rule_ids=packet.get("mandatory_rule_ids", []),
-                    mandatory_overflow=bool(packet.get("mandatory_overflow")),
-                )
-                _save_state(root, normalized_provider, session_id, {
-                    "mandatory_rule_ids": packet.get("mandatory_rule_ids", []),
-                    "mandatory_overflow": bool(packet.get("mandatory_overflow")),
-                    "mandatory_invalid_reason": packet.get("mandatory_invalid_reason", ""),
-                    "mandatory_match_receipts": packet.get(
-                        "mandatory_match_receipts", [],
-                    ),
-                    "bootstrap_ok": not bool(packet.get("mandatory_overflow")),
-                })
-                _persist_mandatory_match_receipts(
-                    store=store,
-                    receipts=packet.get("mandatory_match_receipts", []),
-                    provider=normalized_provider,
-                    event="session_start",
-                )
-                text = text + "\n" + _render_context(packet)
-            except Exception as exc:
-                _save_state(root, normalized_provider, session_id, {
-                    "mandatory_overflow": True,
-                    "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
-                    "mandatory_match_receipts": [],
-                    "bootstrap_ok": False,
-                })
-                _record_heartbeat(
-                    root,
-                    normalized_provider,
-                    agent_instance_id,
-                    event=event,
-                    error=f"context bootstrap failed: {exc}",
-                )
-        elif (
-            normalized_provider == "codex"
-            and str(payload.get("source", "") or "").casefold() == "compact"
-        ):
-            state = _load_state(root, normalized_provider, session_id)
-            if state.get("durable_candidate") and not state.get("write_seen"):
-                text = text + "\n" + _COMPACT_REMINDER
-        return _context_output(normalized_provider, event, text)
-
-    if event == "subagent_start":
-        task = str(
-            payload.get("task")
-            or payload.get("prompt")
-            or payload.get("agent_prompt")
-            or "subagent task"
-        )
-        try:
-            store = _load_store(root, agent_instance_id, share_group_id)
-            from .context_bootstrap import build_context_packet
-
-            packet = build_context_packet(
-                store,
-                task=task,
-                project_hint=str(payload.get("cwd", "") or ""),
-                max_items=6,
-                max_chars=3000,
-                effective_context=_effective_agent_context(
-                    normalized_provider, agent_instance_id,
-                    share_group_id, payload, event=event,
-                ),
-            )
-            effective = packet.get("effective_agent", {})
-            receipt = packet.get("assignment_receipt", {})
-            _save_state(root, normalized_provider, session_id, {
-                "bootstrap_ok": not bool(packet.get("mandatory_overflow")),
-                "mandatory_overflow": bool(packet.get("mandatory_overflow")),
-                "mandatory_invalid_reason": packet.get(
-                    "mandatory_invalid_reason", ""
-                ),
-                "mandatory_rule_ids": packet.get("mandatory_rule_ids", []),
-                "mandatory_match_receipts": packet.get(
-                    "mandatory_match_receipts", [],
-                ),
-                "effective_agent": effective,
-                "assignment_receipt": receipt,
-            })
-            _persist_mandatory_match_receipts(
-                store=store,
-                receipts=packet.get("mandatory_match_receipts", []),
-                provider=normalized_provider,
-                event="subagent_start",
-            )
-            _record_heartbeat(
-                root, normalized_provider, agent_instance_id, event=event,
-                error=str(packet.get("error", "")),
-                mandatory_rule_ids=packet.get("mandatory_rule_ids", []),
-                mandatory_overflow=bool(packet.get("mandatory_overflow")),
-            )
-            return _context_output(
-                normalized_provider,
-                event,
-                _static_session_context(normalized_provider)
-                + "\n"
-                + _render_context(packet),
-            )
-        except Exception as exc:
-            state = _load_state(root, normalized_provider, session_id)
-            state.update({
-                "mandatory_overflow": True,
-                "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
-                "mandatory_match_receipts": [],
-                "bootstrap_ok": False,
-            })
-            _save_state(root, normalized_provider, session_id, state)
-            _record_heartbeat(
-                root,
-                normalized_provider,
-                agent_instance_id,
-                event=event,
-                error=f"subagent context bootstrap failed: {exc}",
-            )
-            return _context_output(
-                normalized_provider,
-                event,
-                "MemoryGuard 子代理上下文加载失败；不得写入宿主原生记忆。",
-            )
-
-    if event == "user_prompt":
-        prompt = _prompt(payload)
-        previous_state = _load_state(root, normalized_provider, session_id)
-        state = {
-            "prompt_hash": _short_hash(prompt),
-            "durable_candidate": _durable_candidate(prompt),
-            "bootstrap_ok": False,
-            "write_seen": False,
-            "stop_continued": False,
-        }
-        if normalized_provider == "cursor":
-            try:
-                store = _load_store(root, agent_instance_id, share_group_id)
-                from .context_bootstrap import build_context_packet
-                packet = build_context_packet(
-                    store, task="MemoryGuard session mandatory verification",
-                    max_items=5, max_chars=2400,
-                    effective_context=_effective_agent_context(
-                        normalized_provider, agent_instance_id,
-                        share_group_id, payload, event=event,
-                    ),
-                )
-                state.update({
-                    "mandatory_rule_ids": packet.get("mandatory_rule_ids", previous_state.get("mandatory_rule_ids", [])),
-                    "mandatory_overflow": bool(packet.get("mandatory_overflow")),
-                    "mandatory_invalid_reason": packet.get("mandatory_invalid_reason", ""),
-                    "mandatory_match_receipts": packet.get(
-                        "mandatory_match_receipts", [],
-                    ),
-                })
-                _persist_mandatory_match_receipts(
-                    store=store,
-                    receipts=packet.get("mandatory_match_receipts", []),
-                    provider=normalized_provider,
-                    event="user_prompt",
-                )
-            except Exception as exc:
-                state.update({
-                    "mandatory_overflow": True,
-                    "mandatory_invalid_reason": f"context bootstrap failed: {exc}",
-                    "mandatory_match_receipts": [],
-                })
-            _save_state(root, normalized_provider, session_id, state)
-            return {"continue": True}
-        try:
-            store = _load_store(root, agent_instance_id, share_group_id)
-            from .context_bootstrap import build_context_packet
-
-            packet = build_context_packet(
-                store,
-                task=prompt or "current task",
-                project_hint=str(payload.get("cwd", "") or ""),
-                max_items=8,
-                max_chars=4000,
-                effective_context=_effective_agent_context(
-                    normalized_provider, agent_instance_id,
-                    share_group_id, payload, event=event,
-                ),
-            )
-            state["mandatory_rule_ids"] = packet.get("mandatory_rule_ids", [])
-            state["mandatory_overflow"] = bool(packet.get("mandatory_overflow"))
-            state["mandatory_match_receipts"] = packet.get(
-                "mandatory_match_receipts", [],
-            )
-            state["bootstrap_ok"] = not state["mandatory_overflow"]
-            state["selected_count"] = int(
-                packet.get("selection", {}).get("selected_count", 0)
-            )
-            _persist_mandatory_match_receipts(
-                store=store,
-                receipts=packet.get("mandatory_match_receipts", []),
-                provider=normalized_provider,
-                event="user_prompt",
-            )
-            _save_state(root, normalized_provider, session_id, state)
-            _record_heartbeat(
-                root, normalized_provider, agent_instance_id, event=event,
-                error=str(packet.get("error", "")),
-                mandatory_rule_ids=state["mandatory_rule_ids"],
-                mandatory_overflow=state["mandatory_overflow"],
-            )
-            return _context_output(
-                normalized_provider,
-                event,
-                _render_context(packet),
-            )
-        except Exception as exc:
-            state["bootstrap_error"] = str(exc)[:500]
-            state["mandatory_overflow"] = True
-            state["mandatory_invalid_reason"] = state["bootstrap_error"]
-            state["mandatory_match_receipts"] = []
-            _save_state(root, normalized_provider, session_id, state)
-            _record_heartbeat(
-                root,
-                normalized_provider,
-                agent_instance_id,
-                event=event,
-                error=f"context bootstrap failed: {exc}",
-            )
-            return _context_output(
-                normalized_provider,
-                event,
-                "MemoryGuard 本轮上下文加载失败；请先修复绑定或运行 "
-                "`memoryguard hooks status`。在修复前不得回退写入宿主原生记忆。",
-            )
-
     if event == "pre_tool":
-        tool_name = str(payload.get("tool_name", "") or "")
-        tool_input = payload.get("tool_input", {})
         state = _load_state(root, normalized_provider, session_id)
-        if (state.get("mandatory_overflow") or state.get("bootstrap_error")) and mode == "enforce":
+        if state.get("mandatory_overflow") and mode == "enforce":
             return _deny_output(
                 normalized_provider,
                 "MemoryGuard 强制规则包异常，停止继续执行。请先修复共享记忆中的强制规则。",
             )
+        if state.get("bootstrap_error") and mode == "enforce":
+            return _deny_output(
+                normalized_provider,
+                "MemoryGuard 上下文加载不可用，工具执行已安全停止。请检查绑定或 Hook 状态。",
+            )
+        tool_name = str(payload.get("tool_name", "") or "")
+        tool_input = payload.get("tool_input", {})
         if _targets_native_memory(tool_name, tool_input):
             reason = (
                 "MemoryGuard 已接管长期记忆：禁止 Agent 写入宿主原生记忆路径。"
@@ -2528,57 +2343,40 @@ def run_hook(
             )
             if mode == "enforce":
                 return _deny_output(normalized_provider, reason)
-            return {}
-        if _is_other_memory_write(tool_name):
+        elif _is_other_memory_write(tool_name):
             reason = (
                 "检测到其他记忆 MCP 写入。正式接管模式只允许 "
                 "MemoryGuard 作为长期记忆写入端。"
             )
             if mode == "enforce":
                 return _deny_output(normalized_provider, reason)
-            return {}
         if normalized_provider == "cursor":
-            state = _load_state(root, normalized_provider, session_id)
-            is_subagent = bool(
-                payload.get("subagent_id") or payload.get("agent_id")
-            )
-            if not state and is_subagent:
-                state = {
-                    "durable_candidate": False,
-                    "bootstrap_ok": False,
-                    "write_seen": False,
-                    "stop_continued": False,
-                }
-                _save_state(root, normalized_provider, session_id, state)
-            # Cursor: mark bootstrap on pre_tool (CallMcpTool-aware).
-            # Install/upgrade ships CallMcpTool bootstrap recognition;
             if _is_memoryguard_bootstrap(tool_name, tool_input):
-                if not isinstance(state, dict):
-                    state = {}
                 if not state.get("mandatory_overflow"):
                     state["bootstrap_ok"] = True
                     _save_state(root, normalized_provider, session_id, state)
-                return {}
+                return v2_result
+            is_subagent = bool(
+                payload.get("subagent_id") or payload.get("agent_id")
+            )
             if (
-                isinstance(state, dict)
+                mode == "enforce"
                 and state
                 and not state.get("bootstrap_ok")
-                and mode == "enforce"
+                and not is_subagent
             ):
                 return _deny_output(
                     normalized_provider,
                     "开始本轮工具操作前，先调用 "
-                    "memoryguard_context_bootstrap(task=当前用户请求)。"
+                    "memoryguard_context_bootstrap(task=当前用户请求)。",
                 )
-        return {}
+        return v2_result
 
     if event == "post_tool":
+        state = _load_state(root, normalized_provider, session_id)
         tool_name = str(payload.get("tool_name", "") or "")
         tool_input = payload.get("tool_input", {})
-        tool_result = payload.get("tool_result")
-        if tool_result is None:
-            tool_result = payload.get("result")
-        state = _load_state(root, normalized_provider, session_id)
+        tool_result = payload.get("tool_result", payload.get("result"))
         changed = False
         if _is_memoryguard_bootstrap(tool_name, tool_input):
             if not state.get("mandatory_overflow"):
@@ -2592,78 +2390,24 @@ def run_hook(
                 state.pop("write_error", None)
                 changed = True
             elif success is False:
-                if not state.get("write_seen"):
-                    state["write_seen"] = False
                 state["write_failed"] = True
                 state["write_error"] = reason or "memoryguard write tool reported failure"
                 changed = True
-            else:
-                state.pop("write_failed", None)
-                state.pop("write_error", None)
-                if not state.get("write_seen"):
-                    # Unknown result; do not mark as success.
-                    pass
         if changed:
             _save_state(root, normalized_provider, session_id, state)
-        return {}
+        return v2_result
 
-    if event == "pre_compact":
+    if event == "pre_compact" and not v2_result:
         state = _load_state(root, normalized_provider, session_id)
         if state.get("durable_candidate") and not state.get("write_seen"):
             if normalized_provider == "codex":
                 return {}
             return _context_output(
-                normalized_provider,
-                event,
-                _COMPACT_REMINDER,
+                normalized_provider, event, _COMPACT_REMINDER,
             )
-        return {}
 
-    if event == "stop" and normalized_provider == "codex":
-        # Codex's UI index can retain open child edges after a real agent has
-        # stopped.  Reconcile only from the host-owned CODEX_THREAD_ID and
-        # swallow every failure so MemoryGuard's mandatory-feedback path stays
-        # authoritative for the Stop hook.
-        _best_effort_codex_reconcile(
-            workspace=root,
-            agent_instance_id=agent_instance_id,
-            payload=payload,
-        )
+    return v2_result
 
-    state = _load_state(root, normalized_provider, session_id)
-    _flush_pending_rule_feedback(
-        workspace=root,
-        provider=normalized_provider,
-        agent_instance_id=agent_instance_id,
-        share_group_id=share_group_id,
-        session_id=session_id,
-        actor=f"hook:{normalized_provider}:{agent_instance_id}",
-        trigger="stop_event",
-    )
-    last_message = str(payload.get("last_assistant_message", "") or "")
-    candidate = bool(state.get("durable_candidate")) or _durable_candidate(
-        last_message
-    )
-    already_continued = bool(
-        state.get("stop_continued")
-        or payload.get("stop_hook_active")
-        or int(payload.get("loop_count", 0) or 0) > 0
-    )
-    if (
-        mode == "enforce"
-        and candidate
-        and not state.get("write_seen")
-        and not already_continued
-    ):
-        state["stop_continued"] = True
-        _save_state(root, normalized_provider, session_id, state)
-        return _stop_continue_output(
-            normalized_provider,
-            "本轮包含可能长期有效的偏好、纠正或默认规则，但尚无 "
-            "MemoryGuard 写入回执。请只萃取稳定事实，调用一次 "
-            "memoryguard_memory_write；不要保存整段对话，然后结束。",
-        )
-    return {}
 
 
 def _read_stdin_json() -> dict[str, Any]:

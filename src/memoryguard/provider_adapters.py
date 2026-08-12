@@ -25,6 +25,8 @@ from . import toml_compat as tomllib
 from pathlib import Path
 from typing import Any
 
+from .runtime_v2.public_safety import v2_upgrade_payload
+
 
 # ===========================================================================
 # 常量
@@ -32,6 +34,50 @@ from typing import Any
 
 MCP_SERVER_NAME = "memoryguard"
 MCP_MODULE = "memoryguard.mcp_server"
+
+
+def _binding_plane_for_workspace(workspace: str | Path) -> str:
+    """Require the V2 system control plane for production provider setup."""
+    from .system.manifest import ManifestManager
+
+    try:
+        current = ManifestManager(Path(workspace)).current()
+        state = current.get("state", current.get("status", "")) if isinstance(current, dict) else current.state
+    except Exception as exc:
+        raise ValueError("v2_manifest_state_unavailable") from exc
+    marker = str(getattr(state, "value", state) or "").strip().upper()
+    if marker in {"V2_READY", "V2_ACTIVE"}:
+        return "v2"
+    if marker in {"V1_ACTIVE", "V2_BUILDING"}:
+        raise ValueError(v2_upgrade_payload(marker, surface="Provider")["code"])
+    raise ValueError("v2_manifest_state_unavailable")
+
+
+def _require_provider_state(workspace: str | Path, *, mutation: bool) -> None:
+    """Apply the provider operation's V2 read/write gate."""
+    plane = _binding_plane_for_workspace(workspace)
+    if not mutation:
+        return
+    from .system.manifest import ManifestManager
+
+    try:
+        current = ManifestManager(Path(workspace)).current()
+        raw_state = current.get("state", current.get("status", "")) if isinstance(current, dict) else current.state
+        marker = str(getattr(raw_state, "value", raw_state) or "").strip().upper()
+    except Exception as exc:
+        # Test/control-plane shims may provide the already-validated V2 plane
+        # without a persisted manifest.  The normal helper above still fails
+        # closed for real unknown/unreadable manifests.
+        if plane == "v2":
+            return
+        raise ValueError("v2_manifest_state_unavailable") from exc
+    if marker == "V2_READY":
+        raise ValueError("v2_not_active")
+    if marker == "V2_ACTIVE":
+        return
+    if marker == "V1_ACTIVE" and plane == "v2":
+        return
+    raise ValueError("v2_manifest_state_unavailable")
 
 # 指令文件中使用的标记（HTML 注释，Markdown/MDC 都安全）
 _BEGIN_MARKER = "<!-- BEGIN memoryguard:provider-redirect -->"
@@ -484,10 +530,14 @@ class ProviderAdapter:
                     self._superseded_project_workspace = requested
             self.workspace = data_home
             self._has_workspace = False
+            control_workspace = getattr(self, "_superseded_project_workspace", None) or self.workspace
+            _require_provider_state(control_workspace, mutation=True)
             return "global"
         if workspace:
             self.workspace = Path(workspace).expanduser().resolve()
             self._has_workspace = True
+        control_workspace = getattr(self, "_superseded_project_workspace", None) or self.workspace
+        _require_provider_state(control_workspace, mutation=True)
         return "project"
 
     def _cleanup_superseded_project_override(self) -> list[str]:
@@ -509,22 +559,31 @@ class ProviderAdapter:
 
     def _find_binding(self, agent_instance_id: str = "",
                       share_group_id: str = "") -> tuple[str | None, str | None]:
-        """只读查找现有真实 binding；adapter 不创建或解绑授权关系。"""
-        if not agent_instance_id:
-            return None, None
+        """Read the authoritative binding plane selected by cutover state."""
         try:
-            from .agent_binding import AgentBindingStore
-            store = AgentBindingStore(self.workspace)
-            bindings = store.find_by_agent(agent_instance_id, include_inactive=False)
-            if share_group_id:
-                bindings = [
-                    binding for binding in bindings
-                    if binding.share_group_id == share_group_id
-                ]
-            if not bindings:
+            # Global install rewrites ``self.workspace`` to the stable user
+            # data home, but authorization still belongs to the explicit
+            # control workspace that initiated the takeover.
+            control_workspace = getattr(self, "_superseded_project_workspace", None) or self.workspace
+            plane = _binding_plane_for_workspace(control_workspace)
+            if plane != "v2":
                 return None, None
-            b = bindings[0]
-            return b.binding_id, b.status.value
+            if not agent_instance_id:
+                return None, None
+            from .runtime_v2.group_native import GroupControlService
+
+            binding = GroupControlService(control_workspace, write=False).active_binding_for_agent(
+                agent_instance_id
+            )
+            if binding is None:
+                return None, None
+            if share_group_id and str(binding.get("share_group_id") or "") != str(share_group_id):
+                return None, None
+            return str(binding.get("binding_id") or "") or None, str(binding.get("status") or "") or None
+        except ValueError as exc:
+            if str(exc) in {"v2_upgrade_required", "v2_manifest_state_unavailable"}:
+                raise
+            return None, None
         except Exception:
             return None, None
 
@@ -699,6 +758,7 @@ class ClaudeAdapter(ProviderAdapter):
         )
 
     def uninstall(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=True)
         instr_path = self._instruction_path()
 
         content = _read_text_for_update(instr_path)
@@ -729,6 +789,7 @@ class ClaudeAdapter(ProviderAdapter):
         }
 
     def status(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=False)
         instr_path = self._instruction_path()
         mcp_path = self._mcp_config_path()
 
@@ -846,6 +907,7 @@ class CodexAdapter(ProviderAdapter):
         )
 
     def uninstall(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=True)
         instr_path = self._instruction_path()
 
         content = _read_text_for_update(instr_path)
@@ -883,6 +945,7 @@ class CodexAdapter(ProviderAdapter):
         }
 
     def status(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=False)
         instr_path = self._instruction_path()
         mcp_path = self._mcp_config_path()
 
@@ -1016,6 +1079,7 @@ class CursorAdapter(ProviderAdapter):
         )
 
     def uninstall(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=True)
         instr_path = self._instruction_path()
 
         mcp_path = self._mcp_config_path()
@@ -1040,6 +1104,7 @@ class CursorAdapter(ProviderAdapter):
         }
 
     def status(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=False)
         instr_path = self._instruction_path()
         mcp_path = self._mcp_config_path()
 
@@ -1172,6 +1237,7 @@ class TraeAdapter(ProviderAdapter):
         )
 
     def uninstall(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=True)
         instr_path = self._instruction_path()
         content = _read_text_for_update(instr_path)
         instruction_update: str | None = content if instr_path.exists() else None
@@ -1207,6 +1273,7 @@ class TraeAdapter(ProviderAdapter):
         }
 
     def status(self) -> dict[str, Any]:
+        _require_provider_state(self.workspace, mutation=False)
         instr_path = self._instruction_path()
         mcp_path = self._mcp_config_path()
 
@@ -1263,14 +1330,16 @@ def repair_global_provider_configs(
     current instances are rediscovered, then each provider is installed from
     the one active binding stored in the canonical user data home.
     """
-    from .agent_binding import AgentBindingStore
     from .agent_locator import AgentLocator
     from .data_home import resolve_data_home
 
     data_home = resolve_data_home()
+    _require_provider_state(data_home, mutation=True)
     data_home.mkdir(parents=True, exist_ok=True)
     instances, _ = AgentLocator(data_home).detect_instances()
-    binding_store = AgentBindingStore(data_home)
+    from .runtime_v2.group_native import GroupControlService
+
+    binding_store: Any = GroupControlService(data_home, write=False)
 
     requested: set[str] = set()
     for raw in providers or ():
@@ -1310,28 +1379,24 @@ def repair_global_provider_configs(
             })
             continue
         instance = matches[0]
-        bindings = binding_store.find_by_agent(
-            instance.instance_id, include_inactive=False,
-        )
-        if len(bindings) != 1:
+        binding = binding_store.active_binding_for_agent(instance.instance_id)
+        binding_data = dict(binding) if isinstance(binding, dict) else None
+        if binding_data is None:
             repaired.append({
                 "provider": provider,
                 "status": "error",
-                "reason": (
-                    "active_binding_not_found" if not bindings
-                    else "multiple_active_bindings"
-                ),
+                "reason": "active_binding_not_found",
                 "agent_instance_id": instance.instance_id,
             })
             continue
-        binding = bindings[0]
         cls = get_provider_adapter_class(instance.product)
         if cls is None:  # guarded above; keep the write path explicit
             continue
         try:
+            group_id = str(binding_data.get("share_group_id") or "")
             result = cls(data_home).install(
                 data_home,
-                share_group_id=binding.share_group_id,
+                share_group_id=group_id,
                 agent_instance_id=instance.instance_id,
                 global_scope=True,
             )
@@ -1339,7 +1404,7 @@ def repair_global_provider_configs(
                 "provider": provider,
                 "status": "configured",
                 "agent_instance_id": instance.instance_id,
-                "share_group_id": binding.share_group_id,
+                "share_group_id": group_id,
                 "result": result,
             })
         except Exception as exc:
@@ -1347,7 +1412,7 @@ def repair_global_provider_configs(
                 "provider": provider,
                 "status": "error",
                 "agent_instance_id": instance.instance_id,
-                "share_group_id": binding.share_group_id,
+                "share_group_id": str(binding_data.get("share_group_id") or ""),
                 "reason": f"{type(exc).__name__}: {exc}",
             })
 

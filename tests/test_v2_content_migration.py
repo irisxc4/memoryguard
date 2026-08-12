@@ -345,7 +345,7 @@ def test_non_allowlisted_acl_and_unknown_provider_are_unreadable_until_registere
         ).fetchone()[0] >= 2
 
 
-@pytest.mark.parametrize("marker_rows", [[("version", "999")], [("version", "2"), ("future", "x")]])
+@pytest.mark.parametrize("marker_rows", [[("version", "999")], [("version", "3"), ("future", "x")]])
 def test_content_schema_marker_preflight_is_fail_closed_without_target_mutation(
     tmp_path: Path, marker_rows: list[tuple[str, str]]
 ) -> None:
@@ -374,6 +374,21 @@ def test_partial_aux_schema_without_marker_is_not_inferred(tmp_path: Path) -> No
         conn.commit()
     with pytest.raises(ContentError, match="content_schema_meta|marker is missing"):
         ContentStore(tmp_path)
+
+
+def test_content_schema_v2_to_v3_adds_history_receipts_without_rewriting_data(tmp_path: Path) -> None:
+    store = ContentStore(tmp_path)
+    blob_id = store.put_blob("preserve existing V2 content")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DROP TABLE history_mutation_receipts")
+        conn.execute("UPDATE content_schema_meta SET value='2' WHERE key='version'")
+        before = conn.execute("SELECT blob_id,text FROM content_blobs WHERE blob_id=?", (blob_id,)).fetchone()
+
+    upgraded = ContentStore(tmp_path)
+    with sqlite3.connect(upgraded.db_path) as conn:
+        assert conn.execute("SELECT value FROM content_schema_meta WHERE key='version'").fetchone()[0] == "3"
+        assert conn.execute("SELECT blob_id,text FROM content_blobs WHERE blob_id=?", (blob_id,)).fetchone() == before
+        assert conn.execute("SELECT COUNT(*) FROM history_mutation_receipts").fetchone()[0] == 0
 
 
 def test_content_store_rejects_workspace_and_ancestor_symlinks(tmp_path: Path) -> None:

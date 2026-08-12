@@ -142,13 +142,13 @@ _METADATA_MARKERS: dict[str, tuple[tuple[str, str, int], ...]] = {
     "memory": (("schema_meta", "memoryguard-v2-phase1", 1), ("memory_schema_meta", "memoryguard-v2-phase2-memory", 1)),
     "rules": (("schema_meta", "memoryguard-v2-phase1", 1), ("rules_schema_meta", "memoryguard-v2-phase2-rules", 2)),
     "evidence": (("schema_meta", "memoryguard-v2-phase1", 1), ("evidence_schema_meta", "memoryguard-v2-phase2-evidence", 1)),
-    "content": (("schema_meta", "memoryguard-v2-phase1", 1), ("content_schema_meta", "2", 2)),
+    "content": (("schema_meta", "memoryguard-v2-phase1", 1), ("content_schema_meta", "3", 3)),
     "knowledge": (("schema_meta", "memoryguard-v2-phase1", 1),),
-    "codegraph": (("schema_meta", "memoryguard-v2-phase1", 1), ("codegraph_schema_meta", "1", 1)),
+    "codegraph": (("schema_meta", "memoryguard-v2-phase1", 1), ("codegraph_schema_meta", "2", 2)),
     "assets": (("schema_meta", "memoryguard-v2-phase1", 1), ("asset_schema_meta", "1", 1)),
     "scenario": (("schema_meta", "memoryguard-v2-phase1", 1), ("projection_schema_meta", "1", 1)),
     "profile": (("schema_meta", "memoryguard-v2-phase1", 1), ("projection_schema_meta", "1", 1)),
-    "system": (("schema_meta", "memoryguard-v2-phase1", 1),),
+    "system": (("schema_meta", "memoryguard-v2-phase1", 1), ("gui_control_schema_meta", "1", 1)),
     "skills": (("schema_meta", "memoryguard-v2-phase5-skills", 1),),
 }
 
@@ -312,7 +312,16 @@ class ReferenceAudit:
                         # authoritative reference graphs.  They retain event
                         # identities and projection metadata which may look
                         # like *_id keys but are not logical foreign keys.
-                        opaque_event_payload = table in {"domain_outbox", "rule_domain_outbox", "rule_evidence_outbox"} and column in {"payload_json", "metadata_json"}
+                        opaque_event_payload = (
+                            table in {"domain_outbox", "rule_domain_outbox", "rule_evidence_outbox", "group_outbox"}
+                            and column in {"payload_json", "metadata_json"}
+                        ) or (
+                            table in {
+                                "group_operation_receipts", "control_preferences",
+                                "selection_manifests", "agent_cleanup_history",
+                            }
+                            and column in {"result_json", "value_json", "source_ids_json", "detail_json"}
+                        )
                         if not (column.endswith("_json") or column in spec.json_columns):
                             continue
                         try:

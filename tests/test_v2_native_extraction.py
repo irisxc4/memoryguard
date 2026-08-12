@@ -9,6 +9,7 @@ from memoryguard.content.store import ContentStore
 from memoryguard.evidence.store import EvidenceStore
 from memoryguard.governance_v2 import GovernanceV2
 from memoryguard.memory.store import MemoryAtomStore
+from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
@@ -22,29 +23,20 @@ class _Manifest:
 
 
 def _prepare(tmp_path: Path) -> None:
-    ContentStore(tmp_path)
+    content = ContentStore(tmp_path)
     MemoryAtomStore(tmp_path)
     EvidenceStore(tmp_path)
     GovernanceV2(tmp_path)
-    mg = tmp_path / ".memoryguard"
-    config = {
-        "sources": [{
-            "root_id": "project-root",
-            "type": "project_directory",
-            "display_name": "project",
-            "path": str(tmp_path),
-            "scope": "project",
-            "recursive": True,
-            "follow_symlinks": False,
-            "include": [],
-            "exclude": [],
-            "enabled": True,
-            "authorized_agent_ids": ["agent-a"],
-            "agent_enabled": {"agent-a": True},
-            "project_ref": "project-a",
-        }]
-    }
-    (mg / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    content.upsert_source_connector(
+        source_id="project-root",
+        provider="memoryguard-test",
+        source_type="selected_directory",
+        external_root_key=str(tmp_path.resolve()),
+        workspace_id=str(tmp_path.resolve()),
+        enabled=True,
+    )
+    control = GroupControlService(tmp_path, write=True)
+    control.record_selection("agent-a", ["project-root"], "selection-project-root")
 
 
 def _context(tmp_path: Path):

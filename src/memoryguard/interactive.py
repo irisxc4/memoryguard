@@ -893,80 +893,110 @@ async function callApiRaw(method, ...args) {
   return await resp.json();
 }
 
+function normalizeApiResult(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw || {};
+  const nested = raw.data && typeof raw.data === 'object' && !Array.isArray(raw.data)
+    ? raw.data : {};
+  // Business data overlays transport metadata so callers see the semantic
+  // status (succeeded/running/failed) instead of an outer compatibility "ok".
+  const merged = {...raw, ...nested};
+  if (raw.ok === false) merged.ok = false;
+  if (raw.task && typeof raw.task === 'object') merged.task = raw.task;
+  if (nested.task && typeof nested.task === 'object') merged.task = nested.task;
+  if (raw.receipt && typeof raw.receipt === 'object') merged.receipt = raw.receipt;
+  if (nested.receipt && typeof nested.receipt === 'object') merged.receipt = nested.receipt;
+  if (raw.result_ref && typeof raw.result_ref === 'object') merged.result_ref = raw.result_ref;
+  if (nested.result_ref && typeof nested.result_ref === 'object') merged.result_ref = nested.result_ref;
+  return merged;
+}
+
+function apiErrorMessage(result, fallback = '操作失败') {
+  if (!result) return fallback;
+  const error = result.error;
+  if (typeof error === 'string' && error) return error;
+  if (error && typeof error === 'object') return error.message || error.code || fallback;
+  if (typeof result.code === 'string' && result.code && result.code !== 'ok') return result.code;
+  return fallback;
+}
+
+function normalizeTaskState(result) {
+  const task = result && result.task && typeof result.task === 'object' ? result.task : {};
+  let state = String(task.state || result.status || result.state || '').toLowerCase();
+  const legacy = {done:'succeeded', error:'failed', rejected:'failed', expired:'failed', cancelling:'cancelling'};
+  state = legacy[state] || state || 'unknown';
+  const progress = Number(task.progress != null ? task.progress : (result.processed != null ? result.processed : result.percent));
+  return {
+    state,
+    run_id: task.run_id || result.job_id || result.request_id || '',
+    progress: Number.isFinite(progress) ? Math.max(0, Math.min(100, progress)) : 0,
+    stage: task.stage || result.phase || result.stage || state,
+    result_ref: result.result_ref && typeof result.result_ref === 'object'
+      ? result.result_ref : (result.result && typeof result.result === 'object' ? result.result : {}),
+    error: result.error || {},
+  };
+}
+
 async function callApi(method, ...args) {
-  // pywebview 模式：通过 call_readonly / request_mutation 桥接
+  let raw;
+  // pywebview 和 localhost 都只经过 SafeBridge；HTTP 不再维护第二套请求队列。
   const bridge = window.pywebview && window.pywebview.api;
-  if (bridge && typeof bridge.call_readonly === 'function'
+  if (bridge && typeof bridge.dispatch_api === 'function') {
+    raw = await bridge.dispatch_api(method, args);
+  } else if (bridge && typeof bridge.call_readonly === 'function'
       && typeof bridge.request_mutation === 'function') {
+    // Backward-compatible shell fallback. Current desktop builds use dispatch_api
+    // so mutation/read classification lives only in the server registry.
     const mutMethods = await getMutationMethods();
-    if (mutMethods.has(method)) {
-      // 变更方法：走 request_mutation 桥接
-      const result = await bridge.request_mutation(method, args);
-      if (result && result.deferred) {
-        showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
-      }
-      return result;
-    }
-    // 只读方法：走 call_readonly 桥接
-    return await bridge.call_readonly(method, args);
+    raw = mutMethods.has(method)
+      ? await bridge.request_mutation(method, args)
+      : await bridge.call_readonly(method, args);
+  } else {
+    const headers = {'Content-Type': 'application/json'};
+    if (window.__MG_SESSION__) headers['X-Session-Token'] = window.__MG_SESSION__;
+    const resp = await fetch('/api/' + method, { method: 'POST', headers, body: JSON.stringify(args) });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(apiErrorMessage(body, 'API ' + method + ' 返回 ' + resp.status));
+    raw = body;
   }
-  // localhost 模式
-  const headers = {'Content-Type': 'application/json'};
-  if (window.__MG_SESSION__) headers['X-Session-Token'] = window.__MG_SESSION__;
-  const resp = await fetch('/api/' + method, { method: 'POST', headers, body: JSON.stringify(args) });
-  if (!resp.ok) {
-    const errBody = await resp.json().catch(() => ({}));
-    throw new Error(errBody.error || ('API ' + method + ' 返回 ' + resp.status));
-  }
-  const result = await resp.json();
-  if (result && result.deferred) {
-    showToast('请求已提交，已尝试唤醒桌面执行器。如未弹出确认窗口，请手动运行 memoryguard desktop', 'info');
-  }
-  return result;
+  return normalizeApiResult(raw);
 }
 
 function sleepMs(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function waitForMutation(result, label = '操作', timeoutMs = 120000) {
-  if (!result || !result.deferred) return result || {};
-  const request = result.request || {};
-  const requestId = request.request_id || result.request_id || '';
-  if (!requestId) {
-    return {ok: false, error: `${label}未返回可追踪的桌面请求编号`};
-  }
+async function waitForTask(runId, label = '任务', timeoutMs = 120000, onProgress = null) {
+  if (!runId) return {ok:false, error:`${label}未返回可追踪的 TaskRun`};
   const deadline = Date.now() + timeoutMs;
-  let latest = request;
+  let latest = {};
   while (Date.now() < deadline) {
     try {
-      latest = await callApi('get_request_status', requestId);
+      latest = await callApi('get_request_status', runId);
     } catch (error) {
-      return {ok: false, error: `${label}状态查询失败：${error}`, request: latest};
+      return {ok:false, error:`${label}状态查询失败：${error}`, execution_status:'failed'};
     }
-    const status = String(latest && latest.status || '').toLowerCase();
-    if (status === 'done') {
-      const payload = latest && latest.result && typeof latest.result === 'object'
-        ? latest.result : {};
-      return {...payload, request_id: requestId, execution_status: status};
+    const task = normalizeTaskState(latest);
+    if (typeof onProgress === 'function') onProgress(latest, task);
+    if (task.state === 'succeeded') {
+      return {...task.result_ref, ...latest, ok:true, request_id:runId, job_id:runId, execution_status:'succeeded'};
     }
-    if (['failed', 'rejected', 'expired'].includes(status)) {
-      return {
-        ok: false,
-        error: latest.error || `${label}${status === 'rejected' ? '已拒绝' : '未完成（' + status + '）'}`,
-        request: latest,
-        execution_status: status,
-      };
+    if (task.state === 'cancelled') {
+      return {...latest, ok:false, cancelled:true, error:apiErrorMessage(latest, `${label}已取消`), execution_status:'cancelled'};
+    }
+    if (task.state === 'failed') {
+      return {...latest, ok:false, error:apiErrorMessage(latest, `${label}失败`), execution_status:'failed'};
     }
     await sleepMs(300);
   }
-  return {
-    ok: false,
-    pending: true,
-    error: `${label}等待桌面确认超时，请查看桌面执行器`,
-    request: latest,
-    execution_status: String(latest && latest.status || 'pending'),
-  };
+  return {...latest, ok:false, pending:true, error:`${label}等待超时`, execution_status:normalizeTaskState(latest).state};
+}
+
+async function waitForMutation(result, label = '操作', timeoutMs = 120000) {
+  result = normalizeApiResult(result || {});
+  const task = normalizeTaskState(result);
+  const runId = task.run_id || (result.request && result.request.request_id) || '';
+  if (!result.deferred && !runId) return result;
+  return await waitForTask(runId, label, timeoutMs);
 }
 
 // 知识书库入口：跳转到书架页（localhost / pywebview 均可用）。
@@ -2720,45 +2750,36 @@ async function refreshNeuronGraph(message = '') {
 }
 
 async function pollBuildProgress(jobId) {
-  const maxWaitMs = 10 * 60 * 1000;
-  const started = Date.now();
   const phases = [
     { id: 'scan', label: '扫描' },
-    { id: 'normalize', label: '规范化' },
     { id: 'scope', label: '范围' },
-    { id: 'enrich_queue', label: '入队' },
-    { id: 'enrich', label: 'LLM 整理' },
+    { id: 'evidence', label: '证据' },
     { id: 'graph', label: '出图' },
     { id: 'save', label: '保存' },
-    { id: 'done', label: '完成' },
+    { id: 'complete', label: '完成' },
   ];
-  while (Date.now() - started < maxWaitMs) {
-    const prog = await callApi('get_build_progress', jobId);
-    renderBuildProgressPage(prog, phases);
-    renderBuildStatusRail(prog);
-    if (prog.status === 'done') {
-      if (prog.error) return showToast(prog.error, 'error');
-      const enr = (prog.result && prog.result.enrichment) || {};
-      const applied = enr.auto_applied || 0;
-      if (enr.host_action_required || enr.enrich_mode === 'host' || enr.engine === 'host_deferred') {
-        const n = enr.pending_count || (enr.pending_tasks || []).length || 0;
-        await refreshNeuronGraph(n ? `投影已出图，${n} 条待对话 Skill 整理` : '投影已出图（宿主 Skill 未调用模型）');
-        showToast(
-          n
-            ? `宿主 Skill 未在本对话执行。请在 Cursor 聊天说「整理 MemoryGuard pending」或选 Cursor Agent CLI 重建。`
-            : '选了宿主 Skill，但 GUI 不能唤起聊天；图上内容多半是旧启发式，不是本次模型整理。',
-          'info',
-        );
-        return;
-      }
-      await refreshNeuronGraph(applied ? `投影构建完成（已整理 ${applied} 条）` : '投影构建完成');
-      return;
-    }
-    if (prog.status === 'error') return showToast(prog.error || prog.message || '构建失败', 'error');
-    if (prog.status === 'cancelled') return showToast('构建已取消', 'info');
-    await new Promise(r => setTimeout(r, 400));
+  const result = await waitForTask(jobId, '投影构建', 10 * 60 * 1000, (raw, task) => {
+    const view = {
+      ...raw,
+      job_id: task.run_id || jobId,
+      status: task.state,
+      phase: task.stage,
+      percent: task.progress,
+      message: raw.message || (task.state === 'cancelling' ? '正在取消…' : '构建中…'),
+      result: task.result_ref,
+    };
+    renderBuildProgressPage(view, phases);
+    renderBuildStatusRail(view);
+  });
+  if (result.execution_status === 'cancelled') {
+    showToast('构建已取消', 'info');
+    return;
   }
-  showToast('构建超时，请稍后刷新神经图', 'error');
+  if (!result.ok) {
+    showToast(apiErrorMessage(result, '构建失败'), 'error');
+    return;
+  }
+  await refreshNeuronGraph('投影构建完成');
 }
 
 function renderBuildProgressPage(prog, phases) {

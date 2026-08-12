@@ -19,10 +19,12 @@ from ..maintenance_v2.registry import DEFAULT_REGISTRY, DomainRegistry
 from ..maintenance_v2.store import MaintenanceStore
 from ..migration.v2_validator import V2MigrationValidator
 from ..system.manifest import ManifestManager
+from .gui_contract import visible_registry_issues
 from .readiness import ReadinessEvidence, ReadinessGate, ReadinessResult, stable_digest
 from .surfaces import (
     CLI_COMMAND_NAMES,
     GUI_METHOD_NAMES,
+    GUI_MUTATION_NAMES,
     MCP_MUTATION_NAMES,
     MCP_TOOL_NAMES,
     RULE_MUTATION_GUI_NAMES,
@@ -41,8 +43,13 @@ EXPECTED_NATIVE_NAMES = MappingProxyType({
     "cli": frozenset(CLI_COMMAND_NAMES),
     "hook": frozenset({"bootstrap_hook"}),
 })
-EXPECTED_NATIVE_COUNTS = MappingProxyType({"mcp": 51, "gui": 162, "cli": 19, "hook": 1})
-_NATIVE_ENTRY_KEYS = frozenset({"name", "status", "handler", "mutation", "reason"})
+EXPECTED_NATIVE_COUNTS = MappingProxyType({
+    surface: len(names) for surface, names in EXPECTED_NATIVE_NAMES.items()
+})
+_NATIVE_ENTRY_KEYS = frozenset({
+    "name", "status", "handler", "mutation", "reason",
+    "canonical_name", "domain", "execution",
+})
 REQUIRED_CHECKPOINTS = (
     "phase2_sources",
     "v2_initialized",
@@ -748,8 +755,19 @@ class ReadinessEvidenceAssembler:
                 handler = entry.get("handler")
                 mutation = entry.get("mutation")
                 reason = entry.get("reason")
+                canonical_name = entry.get("canonical_name")
+                domain = entry.get("domain")
+                execution = entry.get("execution")
                 names.append(name)
-                if not name or not isinstance(handler, str) or not handler or type(mutation) is not bool or not isinstance(reason, str):
+                if (
+                    not name
+                    or not isinstance(handler, str) or not handler
+                    or type(mutation) is not bool
+                    or not isinstance(reason, str)
+                    or not isinstance(canonical_name, str) or not canonical_name
+                    or not isinstance(domain, str)
+                    or execution not in {"sync", "task"}
+                ):
                     self._block(blockers, "native_entry_shape_invalid", "native_coverage", surface=surface, name=name)
                     continue
                 if marker not in KNOWN_NATIVE_STATUSES:
@@ -762,14 +780,20 @@ class ReadinessEvidenceAssembler:
                     self._block(blockers, "native_retired_reason_missing", "native_coverage", surface=surface, name=name)
                 if marker not in SAFE_NATIVE_STATUSES:
                     self._block(blockers, "native_operation_blocked", "native_coverage", surface=surface, name=name)
+                if surface == "gui" and marker != "implemented":
+                    self._block(
+                        blockers,
+                        "native_gui_operation_not_implemented",
+                        "native_coverage",
+                        surface=surface,
+                        name=name,
+                        status=marker,
+                    )
                 expected_mutation: bool | None = None
                 if surface == "mcp":
                     expected_mutation = name in MCP_MUTATION_NAMES
                 elif surface == "gui":
-                    if name in RULE_MUTATION_GUI_NAMES or name == "request_mutation":
-                        expected_mutation = True
-                    elif name in SAFE_BRIDGE_METHOD_NAMES:
-                        expected_mutation = False
+                    expected_mutation = name in GUI_MUTATION_NAMES
                 elif surface == "hook":
                     expected_mutation = False
                 if expected_mutation is not None and mutation is not expected_mutation:
@@ -786,6 +810,9 @@ class ReadinessEvidenceAssembler:
                     "handler": handler,
                     "mutation": mutation,
                     "reason": reason,
+                    "canonical_name": canonical_name,
+                    "domain": domain,
+                    "execution": execution,
                 })
             total_entries += len(entry_values)
             expected_names = EXPECTED_NATIVE_NAMES[surface]
@@ -812,6 +839,29 @@ class ReadinessEvidenceAssembler:
                 self._block(blockers, "native_surface_counts_mismatch", "native_coverage", surface=surface)
             if not entry_values:
                 self._block(blockers, "native_surface_empty", "native_coverage", surface=surface)
+        visible_issues: tuple[dict[str, str], ...] = ()
+        if "gui" in canonical_registry:
+            try:
+                gui_by_name = {str(entry["name"]): entry for entry in canonical_registry["gui"]}
+                visible_issues = visible_registry_issues(gui_by_name)
+                for issue in visible_issues:
+                    self._block(
+                        blockers,
+                        str(issue.get("code") or "visible_gui_method_invalid"),
+                        "native_coverage",
+                        surface="gui",
+                        name=str(issue.get("name") or ""),
+                        status=str(issue.get("status") or ""),
+                    )
+            except Exception:
+                self._block(
+                    blockers,
+                    "visible_gui_scan_unavailable",
+                    "native_coverage",
+                    surface="gui",
+                    status="NOT_EVALUATED",
+                )
+
         declared_counts = data.get("counts")
         if not isinstance(declared_counts, Mapping):
             self._block(blockers, "native_counts_missing", "native_coverage", status="NOT_EVALUATED")
@@ -838,7 +888,14 @@ class ReadinessEvidenceAssembler:
         if type(complete) is not bool or complete is not expected_complete:
             self._block(blockers, "native_complete_mismatch", "native_coverage")
         production_complete = data.get("production_complete", _MISSING)
-        expected_production_complete = expected_complete and totals["neutral"] == 0
+        gui_item = surfaces.get("gui") if isinstance(surfaces, Mapping) else None
+        gui_entries = gui_item.get("entries") if isinstance(gui_item, Mapping) else None
+        gui_all_implemented = bool(gui_entries) and all(
+            isinstance(entry, Mapping)
+            and str(entry.get("status") or "").casefold() == "implemented"
+            for entry in gui_entries
+        )
+        expected_production_complete = expected_complete and totals["neutral"] == 0 and gui_all_implemented
         if production_complete is _MISSING:
             self._block(blockers, "native_production_complete_missing", "native_coverage", status="NOT_EVALUATED")
         elif type(production_complete) is not bool or production_complete is not expected_production_complete:
@@ -852,6 +909,7 @@ class ReadinessEvidenceAssembler:
             "canonical_registry_digest": canonical_digest,
             "surfaces": _plain(surfaces),
             "counts": _plain(data.get("counts") or {}),
+            "visible_gui_issues": [dict(item) for item in visible_issues],
             "complete": complete,
             "production_complete": None if production_complete is _MISSING else production_complete,
         }

@@ -51,14 +51,12 @@ def _facade(state):
 
 
 def test_state_matrix_routes_once_and_ready_mutations_never_fallback():
-    facade, manifest, legacy, v2 = _facade("V1_ACTIVE")
-    result = facade.dispatch_mcp("memoryguard_memory_read", {"memory_id": "m"})
-    assert result["path"] == "legacy" and len(legacy.calls) == 1 and not v2.calls
-    assert manifest.calls == 1
-
-    facade, manifest, legacy, v2 = _facade("V2_BUILDING")
-    facade.dispatch_mcp("memoryguard_memory_read", {})
-    assert len(legacy.calls) == 1 and not v2.calls
+    for state in ("V1_ACTIVE", "V2_BUILDING"):
+        facade, manifest, legacy, v2 = _facade(state)
+        result = facade.dispatch_mcp("memoryguard_memory_read", {"memory_id": "m"})
+        assert result["code"] == "v2_upgrade_required"
+        assert not legacy.calls and not v2.calls
+        assert manifest.calls == 1
 
     facade, manifest, legacy, v2 = _facade("V2_READY")
     assert facade.dispatch_mcp("memoryguard_memory_read", {})["path"] == "v2"
@@ -214,8 +212,6 @@ def test_existing_empty_manifest_database_is_corrupt_not_v1(tmp_path):
 
 
 def test_ready_and_active_never_construct_legacy_and_surface_ports_receive_cas():
-    import memoryguard.cutover_v2.facade as facade_module
-
     class SurfacePort:
         supports_rule_mutation_context = True
 
@@ -234,22 +230,51 @@ def test_ready_and_active_never_construct_legacy_and_surface_ports_receive_cas()
             self.calls.append(("cli", name, args, context, generation, mutation))
             return {"ok": True}
 
-    class Boom:
-        def __init__(self, *args, **kwargs):
-            raise AssertionError("legacy adapter must not be constructed")
+    class ExplodingLegacy:
+        def dispatch(self, *args, **kwargs):
+            raise AssertionError("retired legacy dispatch must not run")
 
-    original = facade_module.LegacyV2Adapter
-    facade_module.LegacyV2Adapter = Boom
-    try:
-        port = SurfacePort()
-        facade = V2RuntimeFacade(manifest=Manifest("V2_READY", 8), legacy=Port("legacy"), v2=port)
-        assert facade.dispatch_mcp("memoryguard_memory_read", {}, context={"agent": "a"})["path"] == "v2"
-        assert facade.dispatch_gui("lock_memory", {}, mutation=False)["code"] == "v2_not_active"
-        assert facade.dispatch_cli("audit", {}, context={"agent": "a"})["path"] == "v2"
-        assert port.calls[0][4] == 8 and port.calls[0][3] == {"agent": "a"}
-        assert port.calls[1][5] is False
-    finally:
-        facade_module.LegacyV2Adapter = original
+        def bootstrap_hook(self, *args, **kwargs):
+            raise AssertionError("retired legacy hook must not run")
+
+    port = SurfacePort()
+    legacy = ExplodingLegacy()
+    facade = V2RuntimeFacade(
+        manifest=Manifest("V2_READY", 8),
+        legacy=legacy,
+        legacy_port=legacy,
+        hook_legacy=legacy,
+        legacy_adapter=legacy,
+        v2=port,
+    )
+    assert facade.dispatch_mcp("memoryguard_memory_read", {}, context={"agent": "a"})["path"] == "v2"
+    assert facade.dispatch_gui("lock_memory", {}, mutation=False)["code"] == "v2_not_active"
+    assert facade.dispatch_cli("audit", {}, context={"agent": "a"})["path"] == "v2"
+    assert facade.bootstrap_hook("session_start", {})["code"] == "bootstrap_failed"
+    assert port.calls[0][4] == 8 and port.calls[0][3] == {"agent": "a"}
+    assert port.calls[1][5] is False
+
+
+@pytest.mark.parametrize("state", ["V1_ACTIVE", "V2_BUILDING"])
+def test_retired_states_never_invoke_exploding_legacy_or_hook(state):
+    class ExplodingLegacy:
+        def dispatch(self, *args, **kwargs):
+            raise AssertionError("retired legacy dispatch must not run")
+
+        def bootstrap_hook(self, *args, **kwargs):
+            raise AssertionError("retired legacy hook must not run")
+
+    legacy = ExplodingLegacy()
+    facade = V2RuntimeFacade(
+        manifest=Manifest(state),
+        legacy=legacy,
+        hook_legacy=legacy,
+        v2=Port("v2"),
+    )
+    assert facade.dispatch_mcp("memoryguard_memory_read", {})["code"] == "v2_upgrade_required"
+    assert facade.dispatch_gui("get_memory", {})["code"] == "v2_upgrade_required"
+    assert facade.dispatch_cli("audit", {})["code"] == "v2_upgrade_required"
+    assert facade.bootstrap_hook("session_start", {})["code"] == "v2_upgrade_required"
 
 
 def test_manifest_transition_commit_cas_and_rollback_audit(tmp_path):

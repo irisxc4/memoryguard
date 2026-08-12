@@ -14,7 +14,7 @@ Lease file layout (JSON array, one entry per live process)::
     workspace/.memoryguard/runtime_leases.json
       [ {"pid": 1234, "process_started_at": "...", "memoryguard_version": "0.5.2",
          "code_fingerprint": "<sha256>", "control_workspace": "C:/...",
-         "database_paths": ["C:/.../rule-intelligence/memory.db", ...]}, ... ]
+         "database_paths": ["C:/.../.memoryguard/memory/memory.db", ...]}, ... ]
 
 ``check_runtime_lease`` is the single entry point: no conflicting live lease →
 it upserts this process's lease and returns ``granted=True``; a conflicting
@@ -33,12 +33,13 @@ from pathlib import Path
 from typing import Any
 
 from .governance_lock import WorkspaceGovernanceLock
+from .storage.layout import WorkspaceV2Layout
 
 LEASE_FILE_NAME = "runtime_leases.json"
 _LEASE_VERSION = 1
-# ``process_started_at`` is captured once when the module is first imported
-# (≈ process start, before any request is handled).
+# Fallback used only when the OS cannot expose the process creation time.
 _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
+_PROCESS_START_TOLERANCE_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +48,9 @@ _PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 
 def process_started_at() -> str:
-    """ISO-8601 start time of the current process (module-import proxy)."""
-    return _PROCESS_STARTED_AT
+    """ISO-8601 OS start time of the current process when available."""
+    observed = _process_started_at_for_pid(os.getpid())
+    return observed.isoformat() if observed is not None else _PROCESS_STARTED_AT
 
 
 def memoryguard_version() -> str:
@@ -121,29 +123,48 @@ def compute_code_fingerprint(package_dir: str | Path | None = None) -> str:
 
 
 def default_database_paths(control_workspace: str | Path) -> list[str]:
-    """DB files a process controls for one workspace: the rule-intelligence
-    DB plus the shared-memory group DBs (the default group and any existing
-    groups).  Deterministic and stable across processes on the same
-    workspace, which is what lease identity needs."""
+    """Return every formal V2 database path controlled by a workspace.
+
+    The layout is path-only and does not create directories or databases.
+    Keeping the lease set aligned with ``WorkspaceV2Layout`` prevents a
+    V2 process from silently leasing only the retired V1 database paths.
+    """
     workspace = Path(control_workspace).resolve()
-    paths = {
-        str((workspace / ".memoryguard" / "rule-intelligence" / "memory.db").resolve()),
-        str((workspace / ".memoryguard" / "shared-memory" / "default" / "memory.db").resolve()),
-    }
-    base = workspace / ".memoryguard" / "shared-memory"
-    if base.exists():
-        for child in sorted(base.iterdir()):
-            if not child.is_dir():
-                continue
-            db = child / "memory.db"
-            if db.exists():
-                paths.add(str(db.resolve()))
-    return sorted(paths)
+    return sorted(str(path.resolve()) for path in WorkspaceV2Layout(workspace).all_db_paths)
 
 
 # ---------------------------------------------------------------------------
 # liveness + path helpers
 # ---------------------------------------------------------------------------
+
+
+def _win_process_ids() -> set[int] | None:
+    """Return the Windows process table, or ``None`` when enumeration fails."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.EnumProcesses.argtypes = [
+            ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        psapi.EnumProcesses.restype = wintypes.BOOL
+        capacity = 1024
+        while capacity <= 1 << 20:
+            process_ids = (wintypes.DWORD * capacity)()
+            returned = wintypes.DWORD()
+            if not psapi.EnumProcesses(
+                process_ids, ctypes.sizeof(process_ids), ctypes.byref(returned),
+            ):
+                return None
+            count = returned.value // ctypes.sizeof(wintypes.DWORD)
+            if count < capacity:
+                return {int(process_ids[index]) for index in range(count)}
+            capacity *= 2
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return None
 
 
 def _win_pid_alive(pid: int) -> bool:
@@ -152,9 +173,14 @@ def _win_pid_alive(pid: int) -> bool:
     Python's ``os.kill(pid, 0)`` is *not* a signal-0 probe on Windows; any
     non-ctrl signal calls ``TerminateProcess`` and would kill the peer we are
     checking.  OpenProcess + GetExitCodeProcess only reads process state.
-    Access-denied is treated as alive so elevated peers are not mistaken for
-    stale leases.
+    Process-table enumeration is authoritative for absence.  OpenProcess is
+    only a fallback when enumeration itself is unavailable; this avoids
+    treating an access-denied response for a vanished PID as a live process.
     """
+    process_ids = _win_process_ids()
+    if process_ids is not None:
+        return pid in process_ids
+
     import ctypes
     from ctypes import wintypes
 
@@ -185,6 +211,127 @@ def _win_pid_alive(pid: int) -> bool:
         return exit_code.value == STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _win_process_started_at(pid: int) -> datetime | None:
+    """Return a live Windows process creation time as UTC."""
+    if not _win_pid_alive(pid):
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    WINDOWS_EPOCH_TICKS = 116_444_736_000_000_000
+    TICKS_PER_SECOND = 10_000_000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+    )
+    if not handle:
+        return None
+    try:
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            return None
+        ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        if ticks <= WINDOWS_EPOCH_TICKS:
+            return None
+        timestamp = (ticks - WINDOWS_EPOCH_TICKS) / TICKS_PER_SECOND
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _linux_process_started_at(pid: int) -> datetime | None:
+    """Return a Linux process start time from procfs as UTC."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        _, separator, tail = stat.rpartition(")")
+        if not separator:
+            return None
+        fields = tail.strip().split()
+        start_ticks = int(fields[19])  # field 22; tail starts at field 3
+        ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+        boot_time = None
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                boot_time = int(line.split()[1])
+                break
+        if boot_time is None or ticks_per_second <= 0:
+            return None
+        return datetime.fromtimestamp(
+            boot_time + (start_ticks / ticks_per_second), tz=timezone.utc,
+        )
+    except (IndexError, OSError, TypeError, ValueError):
+        return None
+
+
+def _process_started_at_for_pid(pid: Any) -> datetime | None:
+    """Best-effort OS creation time for one currently live process."""
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0:
+        return None
+    if os.name == "nt":
+        return _win_process_started_at(pid_int)
+    if sys.platform.startswith("linux"):
+        return _linux_process_started_at(pid_int)
+    return None
+
+
+def _parse_process_started_at(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _lease_is_live(lease: dict[str, Any]) -> bool:
+    """True only when the PID still names the recorded process instance."""
+    pid = lease.get("pid")
+    if not _pid_alive(pid):
+        return False
+    recorded_start = _parse_process_started_at(lease.get("process_started_at"))
+    if recorded_start is None:
+        return False
+    observed_start = _process_started_at_for_pid(pid)
+    if observed_start is None:
+        # The PID is present but this platform cannot expose its creation time.
+        # Preserve fail-closed behavior rather than pruning a possibly live peer.
+        return True
+    return abs((observed_start - recorded_start).total_seconds()) <= (
+        _PROCESS_START_TOLERANCE_SECONDS
+    )
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -318,16 +465,16 @@ class RuntimeLeaseStore:
         return removed
 
     def prune_stale(self) -> int:
-        """Drop leases whose pid is no longer alive; persist only on change."""
+        """Drop leases whose recorded process instance is no longer alive."""
         leases = self.load()
-        live = [l for l in leases if _pid_alive(l.get("pid"))]
+        live = [lease for lease in leases if _lease_is_live(lease)]
         pruned = len(leases) - len(live)
         if pruned:
             self.save(live)
         return pruned
 
     def list_live(self) -> list[dict[str, Any]]:
-        return [l for l in self.load() if _pid_alive(l.get("pid"))]
+        return [lease for lease in self.load() if _lease_is_live(lease)]
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +513,10 @@ def check_runtime_lease(
     ver = str(version or "") or memoryguard_version()
     fp = str(code_fingerprint or "") if code_fingerprint else compute_code_fingerprint()
     my_pid = int(pid or os.getpid())
-    started = process_started_at or _PROCESS_STARTED_AT
+    observed_start = _process_started_at_for_pid(my_pid)
+    started = process_started_at or (
+        observed_start.isoformat() if observed_start is not None else _PROCESS_STARTED_AT
+    )
 
     with WorkspaceGovernanceLock(workspace):
         pruned = store.prune_stale()
@@ -434,8 +584,9 @@ def runtime_lease_status(
     workspace = Path(control_workspace).resolve()
     store = RuntimeLeaseStore(workspace, leases_path=leases_path)
     leases = store.load()
-    stale = [l for l in leases if not _pid_alive(l.get("pid"))]
-    live = [l for l in leases if _pid_alive(l.get("pid"))]
+    lease_states = [(lease, _lease_is_live(lease)) for lease in leases]
+    stale = [lease for lease, is_live in lease_states if not is_live]
+    live = [lease for lease, is_live in lease_states if is_live]
     ver = str(version or "") or memoryguard_version()
     fp = str(code_fingerprint or "") if code_fingerprint else compute_code_fingerprint()
     our_paths = {_norm_path(p) for p in default_database_paths(workspace)}

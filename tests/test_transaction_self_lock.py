@@ -1,131 +1,178 @@
 # -*- coding: utf-8 -*-
-"""Req1: one ``backfill_group()`` uses exactly one transaction connection.
-
-SQLite self-lock: opening a *second* connection to the same database file
-while the same thread holds ``BEGIN IMMEDIATE`` on the active write
-connection can raise ``OperationalError: database is locked`` against our own
-transaction (the rule-intelligence DB is rollback-journal, not WAL, so there
-is no concurrency escape hatch).  ``_read_conn()`` reuses the active write
-connection for in-transaction reads, and the atomic backfill passes its
-transaction's connection explicitly to the source-link query instead of
-re-opening the database.
-
-This test proves that a real ``backfill_group()`` over a P3 database with all
-three interesting states present -- an un-consumed legacy outbox, an existing
-source link, and a legacy Definition -- opens only the one transaction
-connection and never a second ``_db()`` connection while the write transaction
-is active.
-"""
+"""V2 migration batch does not re-open its target connection while writing."""
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
+import sqlite3
+from pathlib import Path
 
-from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    RuleMatchFeedback,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
-
-
-def _seed_record(store, memory_id, body, *, agent="agent-1"):
-    store.append_record(SharedMemoryRecord(
-        memory_id=memory_id, body=body, kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE, injection_policy="always",
-        priority=10, agent_instance_id=agent,
-        created_at=_now_iso(), updated_at=_now_iso(),
-    ), assignments=[{"target_type": "agent", "target_id": agent}])
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtomStore, MemoryReadScope
+from memoryguard.migration.memory import V1GroupReader, V1MemoryMigrator
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
-def _pend_feedback(legacy: SharedMemoryStore, group_id: str, memory_id: str) -> None:
-    """Create one trusted receipt + feedback -> a pending outbox event."""
-    receipt = RuleMatchReceipt(
-        receipt_id=f"sl-receipt-{memory_id}", memory_id=memory_id,
-        share_group_id=group_id, agent_instance_id="agent-1",
-        task_hash=f"sl-task-{memory_id}", task="self-lock probe",
-        session_id=f"sl-session-{memory_id}", session_trusted=True,
-        session_source="host", project_ref="project-1", provider="codex",
-        runtime_role="worker", context_hash=f"sl-context-{memory_id}",
-        created_at=_now_iso(),
+def _legacy_row(memory_id: str, body: str, **extra) -> tuple:
+    values = {
+        "memory_id": memory_id,
+        "body": body,
+        "kind": "fact",
+        "status": "active",
+        "confidence": 0.9,
+        "locked": 0,
+        "injection_policy": "relevant",
+        "priority": 0,
+        "supersedes": "[]",
+        "provenance": "[]",
+        "agent_instance_id": "agent-0",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "canonical_hash": hashlib.sha256(body.encode()).hexdigest(),
+        "dedup_domain": "relevant",
+    }
+    values.update(extra)
+    return tuple(
+        values[key]
+        for key in (
+            "memory_id", "body", "kind", "status", "confidence", "locked",
+            "injection_policy", "priority", "supersedes", "provenance",
+            "agent_instance_id", "created_at", "updated_at", "canonical_hash",
+            "dedup_domain",
+        )
     )
-    legacy.append_rule_match_receipt(receipt)
-    legacy.append_rule_match_feedback(RuleMatchFeedback(
-        feedback_id=f"sl-feedback-{memory_id}", receipt_id=receipt.receipt_id,
-        outcome="followed", actor="agent-1", source="agent", authority=3,
-    ))
 
 
-def test_backfill_group_uses_single_transaction_connection(monkeypatch, tmp_path):
-    group = "self-lock-group"
-    legacy = SharedMemoryStore(tmp_path, group)
-    _seed_record(legacy, "sl-1", "must run tests before commit")
-    _seed_record(legacy, "sl-2", "must run lint before commit")
+def _legacy_group(root: Path, group_id: str, rows: list[tuple]) -> Path:
+    path = root / ".memoryguard" / "shared-memory" / group_id / "memory.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE records ("
+            "memory_id TEXT PRIMARY KEY, body TEXT, kind TEXT, status TEXT, "
+            "confidence REAL, locked INTEGER, injection_policy TEXT, priority INTEGER, "
+            "supersedes TEXT, provenance TEXT, agent_instance_id TEXT, created_at TEXT, "
+            "updated_at TEXT, canonical_hash TEXT, dedup_domain TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE decisions (event_id TEXT PRIMARY KEY, actor TEXT, "
+            "action TEXT, target_ids TEXT, created_at TEXT)"
+        )
+        conn.executemany("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        conn.execute(
+            "INSERT INTO decisions VALUES (?,?,?,?,?)",
+            (f"decision-{group_id}", "operator", "inventory", "[]", "now"),
+        )
+    return path
 
-    store = RuleMergeStore(tmp_path)
-    service = RuleMergeService(store)
 
-    # First pass establishes the "legacy Definition" and "existing source
-    # link" states that a real re-run must read inside its transaction.
-    service.backfill_group(legacy, group)
-    assert store.get_source_link(group, "sl-1") is not None
-    assert len(store.list_definitions()) >= 1
+def _activate_v2(root: Path) -> None:
+    initialize_all(WorkspaceV2Layout(root))
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="transaction-self-lock")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="transaction-self-lock-source",
+        target_digest="transaction-self-lock-target",
+        manifest_digest="transaction-self-lock-manifest",
+        digests={"validator_passed": True, "checkpoints": {"core": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
 
-    # A pending, un-consumed outbox event.  Re-running backfill with live
-    # source links, legacy definitions and an unconsumed outbox is the exact
-    # state that used to open a second _db() connection per record.
-    _pend_feedback(legacy, group, "sl-2")
-    assert legacy.list_unconsumed_rule_events(), "outbox must be pending"
 
-    # Instrument every _db() open that happens while the write transaction is
-    # active: only the transaction's own connection is allowed.
-    opened = {"during_txn": 0, "extra": 0}
-    real_write_conn = RuleMergeStore._write_conn
+def _migrator(source: Path, target: Path, source_path: Path) -> V1MemoryMigrator:
+    GroupControlService(target, write=True).bind_agent("migration-agent", "self-lock-v2")
+    return V1MemoryMigrator(
+        source,
+        target=target,
+        groups={"self-lock-v1": source_path},
+        group_targets={"self-lock-v1": "self-lock-v2"},
+        include_managed=False,
+        immutable_sources=True,
+    )
+
+
+def test_v2_migration_batch_uses_one_target_connection(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    source_path = _legacy_group(
+        source,
+        "self-lock-v1",
+        [
+            _legacy_row("sl-1", "must run tests before commit"),
+            _legacy_row("sl-2", "must run lint before commit"),
+        ],
+    )
+    _activate_v2(target)
+    migrator = _migrator(source, target, source_path)
+
+    first = migrator.migrate()
+    assert first.ok, first.to_dict()
+    assert V1GroupReader(source, "self-lock-v1", source_path, immutable=True).inventory().records == 2
+
+    opened = {"batches": 0, "nested_target_connections": 0}
+    real_batch = MemoryAtomStore.migration_batch
+    real_connect = MemoryAtomStore._checked_connect
 
     @contextmanager
-    def tracking_write_conn(self):
-        with real_write_conn(self) as conn:
-            real_db = self._db
+    def tracking_batch(self):
+        opened["batches"] += 1
+        with real_batch(self) as conn:
+            yield conn
 
-            def counting_db():
-                fresh = real_db()
-                opened["during_txn"] += 1
-                if fresh is not conn:
-                    opened["extra"] += 1
-                return fresh
+    def tracking_connect(self, *args, **kwargs):
+        if getattr(self._migration_state, "conn", None) is not None:
+            opened["nested_target_connections"] += 1
+        return real_connect(self, *args, **kwargs)
 
-            self._db = counting_db
-            try:
-                yield conn
-            finally:
-                self._db = real_db
+    monkeypatch.setattr(MemoryAtomStore, "migration_batch", tracking_batch)
+    monkeypatch.setattr(MemoryAtomStore, "_checked_connect", tracking_connect)
 
-    monkeypatch.setattr(RuleMergeStore, "_write_conn", tracking_write_conn)
+    second = migrator.migrate()
 
-    ledger = service.backfill_group(legacy, group)
-
-    assert ledger["records"] == 2
-    # The write transaction opened exactly one connection (inside
-    # ``real_write_conn``); every read during the transaction reused it, so no
-    # second ``_db()`` connection was opened against the P3 database.
-    assert opened["during_txn"] == 0
-    assert opened["extra"] == 0
-    # Both sources keep their durable canonical route after the re-run.
-    assert store.get_source_link(group, "sl-1") is not None
-    assert store.get_source_link(group, "sl-2") is not None
+    assert second.ok, second.to_dict()
+    assert opened == {"batches": 1, "nested_target_connections": 0}
+    memory = MemoryAtomStore(target)
+    assert len(memory.list_source_mappings()) == 2
+    assert memory.validate(migrator.evidence_store, include_building=True).orphan_count == 0
 
 
-def test_source_link_read_works_outside_transaction(tmp_path):
-    """The independent-read branch of ``_read_conn()`` still works."""
-    group = "self-lock-read"
-    legacy = SharedMemoryStore(tmp_path, group)
-    _seed_record(legacy, "slr-1", "must run tests before commit")
-    store = RuleMergeStore(tmp_path)
-    RuleMergeService(store).backfill_group(legacy, group)
-    link = store.get_source_link(group, "slr-1")
-    assert link is not None
-    assert link["status"] == "active"
-    assert store.list_source_links(share_group_id=group, status="active")
+def test_v2_migration_source_mapping_read_works_outside_batch(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    source_path = _legacy_group(source, "self-lock-read-v1", [_legacy_row("slr-1", "read after migration")])
+    _activate_v2(target)
+    GroupControlService(target, write=True).bind_agent("migration-agent", "self-lock-read-v2")
+    migrator = V1MemoryMigrator(
+        source,
+        target=target,
+        groups={"self-lock-read-v1": source_path},
+        group_targets={"self-lock-read-v1": "self-lock-read-v2"},
+        include_managed=False,
+        immutable_sources=True,
+    )
+
+    result = migrator.migrate()
+    assert result.ok, result.to_dict()
+
+    memory = MemoryAtomStore(target)
+    scope = MemoryReadScope(
+        workspace_id=str(target.resolve()),
+        share_group_id="self-lock-read-v2",
+        admin=True,
+    )
+    atoms = memory.list_atoms(scope=scope, include_building=True)
+    assert [(atom.memory_id, atom.body) for atom in atoms] == [("slr-1", "read after migration")]
+    mappings = memory.list_source_mappings()
+    assert mappings and mappings[0]["source_record_id"] == "slr-1"

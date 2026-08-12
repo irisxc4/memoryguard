@@ -7,7 +7,8 @@ import sys
 from io import BytesIO
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
 from memoryguard.host_hooks import (
     _is_memoryguard_bootstrap,
     _is_memoryguard_write,
@@ -15,10 +16,29 @@ from memoryguard.host_hooks import (
     read_hook_stdin_json,
     run_hook,
 )
+from memoryguard.memory import MemoryAtomStore
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
 def _bind(workspace: Path, agent_id: str, group_id: str) -> None:
-    AgentBindingStore(workspace).bind_agent(agent_id, group_id)
+    initialize_all(WorkspaceV2Layout(workspace))
+    memory = MemoryAtomStore(workspace)
+    evidence = EvidenceStore(workspace)
+    GovernanceV2(workspace, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(workspace)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="cursor-bootstrap-gate")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="cursor-source",
+        target_digest="cursor-target",
+        manifest_digest="cursor-manifest",
+        digests={"validator_passed": True, "checkpoints": {"cursor": True}},
+    )
+    manager.transition(ManifestState.V2_ACTIVE)
+    GroupControlService(workspace, write=True).bind_agent(agent_id, group_id)
 
 
 def test_direct_bootstrap_name():

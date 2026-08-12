@@ -18,6 +18,15 @@ import stat
 import time
 from typing import Any, Callable, Mapping
 
+from .source_native import (
+    INSTRUCTION_FILES,
+    META_EXTS,
+    TEXT_EXTS,
+    TEXT_MEDIA_TYPES,
+    ScanBudget,
+    make_adapter,
+)
+
 
 _IDENTITY_KEYS = frozenset(
     {
@@ -326,10 +335,8 @@ def _bounded_candidates(
     return accepted, skipped, deadline
 
 
-def _scan_budget(limits: Mapping[str, int]) -> Any:
-    """Build a source-registry ScanBudget without importing it at module load."""
-    from ..source_registry import ScanBudget
-
+def _scan_budget(limits: Mapping[str, int]) -> ScanBudget:
+    """Build the native adapter budget from the caller's bounded limits."""
     return ScanBudget(
         max_files=limits["max_files"],
         max_total_size=limits["max_total_size"],
@@ -551,10 +558,8 @@ class PureSourceReadService:
             return {"state": "BLOCKED", "code": "symlink_traversal_disabled", "candidate_count": 0}
         safe_root = replace(root, follow_symlinks=False)
         try:
-            from ..source_registry import _make_adapter
-
             limits = _budget(payload)
-            adapter = _make_adapter(safe_root)
+            adapter = make_adapter(safe_root)
             accepted, skipped, _ = _bounded_candidates(adapter, path, limits)
         except SafeServiceError as exc:
             return {"state": "BLOCKED", "code": exc.code, "candidate_count": 0}
@@ -568,7 +573,6 @@ class PureSourceReadService:
             "skipped_by_policy": skipped,
             "unaccounted_count": 0,
         }
-        from ..source_registry import INSTRUCTION_FILES, META_EXTS, TEXT_EXTS
         references: list[str] = []
         for candidate, _size in accepted:
             counts["candidate_count"] += 1
@@ -719,10 +723,9 @@ class ImportPreviewService:
             target = self._target(raw)
             root, _ = self._authorized_root(target, context)
             limits = _budget(raw)
-            from ..source_registry import _make_adapter
             if bool(getattr(root, "follow_symlinks", False)):
                 raise SafeServiceError("symlink_traversal_disabled")
-            adapter = _make_adapter(replace(root, follow_symlinks=False))
+            adapter = make_adapter(replace(root, follow_symlinks=False))
             accepted, skipped, _ = _bounded_candidates(adapter, target, limits)
             refs = []
             total_size = 0
@@ -752,10 +755,9 @@ class ImportPreviewService:
             target = self._target(raw)
             root, _ = self._authorized_root(target, context)
             limits = _budget(raw)
-            from ..source_registry import _make_adapter, INSTRUCTION_FILES, META_EXTS, TEXT_EXTS, TEXT_MEDIA_TYPES
             if bool(getattr(root, "follow_symlinks", False)):
                 raise SafeServiceError("symlink_traversal_disabled")
-            adapter = _make_adapter(replace(root, follow_symlinks=False))
+            adapter = make_adapter(replace(root, follow_symlinks=False))
             accepted, skipped, deadline = _bounded_candidates(adapter, target, limits)
             items: list[dict[str, Any]] = []
             total_size = 0

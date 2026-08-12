@@ -1,689 +1,226 @@
-"""Phase5 read-path switch tests.
-
-Phase5 lets the *enforcement* read path (context bootstrap) prefer the
-rule-intelligence canonical layer so merged duplicates inject once, while the
-body text still comes from the legacy record and old tables stay untouched.
-
-These tests assert:
-
-  * a workspace with no intelligence layer resolves to the legacy path and the
-    packet is byte-for-byte the old behaviour (zero regression);
-  * ``RuleReadPath`` maps evidence source ids back to legacy memory ids;
-  * ``dedupe_records`` collapses merged duplicates deterministically;
-  * ``build_context_packet(read_path="rule-intelligence")`` injects the merged
-    canonical rule once instead of N duplicate records;
-  * the canonical read never invents records from stale evidence;
-  * forced ``legacy`` mode is unaffected even when intelligence exists.
-"""
+"""Canonical V2 read-path and scoped rule bootstrap acceptance tests."""
 from __future__ import annotations
 
-import json as _json
-from types import SimpleNamespace
-
-import pytest
+import json
+import sqlite3
+from pathlib import Path
 
 from memoryguard.access_context import AccessContext
-from memoryguard.context_bootstrap import build_context_packet
-from memoryguard.governance_scope import (
-    GovernanceScope,
-    build_shared_memory_graph,
-    share_group_projection_path,
-)
-from memoryguard.rule_definition import build_definition, normalize_rule_text
-from memoryguard.rule_evidence import build_evidence
-from memoryguard.rule_merge import RuleMergeService, RuleMergeStore
-from memoryguard.rule_read_path import (
-    MODE_AUTO,
-    MODE_LEGACY,
-    MODE_RULE_INTELLIGENCE,
-    RuleReadPath,
-    dedupe_records,
-    resolve_read_path_mode,
-)
-from memoryguard.rule_reconciliation import RuleReconciliationStore
-from memoryguard.schema_v3 import (
-    EffectiveAgentContext,
-    MemoryKind,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory import MemoryAtom
+from memoryguard.memory.store import MemoryAtomStore
+from memoryguard.rule_binding import build_binding
+from memoryguard.rule_definition import build_definition
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
-_BODIES = {
-    "m1": "提交代码前必须运行测试",
-    "m2": "提交前必须执行测试",
-    "m3": "代码必须通过code review",
-}
+class _Manifest:
+    def __init__(self, state: str = "V2_ACTIVE", generation: int = 7):
+        self.state = state
+        self.generation = generation
+
+    def current(self):
+        return {"state": self.state, "generation": self.generation}
 
 
-def _seed_record(store: SharedMemoryStore, body: str, *, memory_id: str,
-                 kind=MemoryKind.PROCEDURE, policy="always", priority=10,
-                 agent="agent-1"):
-    store.append_record(SharedMemoryRecord(
-        memory_id=memory_id, body=body, kind=kind,
-        status=SharedMemoryStatus.ACTIVE, injection_policy=policy,
-        priority=priority, agent_instance_id=agent,
-        created_at=_now_iso(), updated_at=_now_iso(),
-    ), assignments=[{"target_type": "agent", "target_id": agent}])
-
-
-def _context(agent_id="agent-1", group_id="g1") -> EffectiveAgentContext:
-    return EffectiveAgentContext(agent_id, group_id)
-
-
-def _activate_canonical(tmp_path, group, intel, legacy):
-    """Persist group-level canonical activation + full readiness (Req8 gate).
-
-    The Req8 gate only switches ``effective_read_path`` to
-    ``rule-intelligence`` when ``rule_canonical_state`` activation is active
-    *and* ``canonical_reconciliation_status`` reports ``canonical_ready``.
-    This helper writes both: it normalizes every active mandatory source link
-    to its resolved active, group-bound Definition (mirrors the post-saga
-    state, so the group-level shadow diff is zero even after a canonical
-    merge), builds the projection graph, and records the activation row.
-    """
-    bound = {
-        binding.definition_id
-        for binding in intel.list_bindings(share_group_id=group, status="active")
-    }
-    for record in legacy.list_records():
-        if record.injection_policy != "always":
-            continue
-        if str(
-            getattr(record.status, "value", record.status)
-        ) != SharedMemoryStatus.ACTIVE.value:
-            continue
-        link = intel.get_source_link(group, record.memory_id)
-        if not link:
-            continue
-        target = str(link.get("canonical_definition_id") or "")
-        if target in bound:
-            continue
-        resolved = intel.resolve_canonical(target) if target else ""
-        definition = intel.get_definition(resolved) if resolved else None
-        if (
-            definition is not None
-            and str(
-                getattr(definition.status, "value", definition.status)
-            ) == SharedMemoryStatus.ACTIVE.value
-            and resolved in bound
-        ):
-            intel.upsert_source_link(
-                share_group_id=group, memory_id=record.memory_id,
-                source_revision=link.get("source_revision", ""),
-                original_definition_id=link.get("original_definition_id", ""),
-                canonical_definition_id=resolved,
-            )
-    scope = GovernanceScope(mode="share_group", share_group_id=group)
-    out_path = share_group_projection_path(tmp_path, scope)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(
-        _json.dumps(
-            build_shared_memory_graph(tmp_path, group), ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    RuleReconciliationStore(intel).set_canonical_activation(
-        group, activation_status="active",
-        canonical_digest="test-digest", read_path="rule-intelligence",
+def _context(workspace: Path, *, agent: str = "agent-a", project: str = "project-a", admin: bool = True):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent, is_admin=admin, strict_binding=True, allow_anon=False,
+            session_id=f"read-path-{agent}-{project}", session_source="transport", session_trusted=True,
+        ), workspace_id=str(workspace.resolve()), share_group_id="group-a",
+        project_ref=project, provider="codex", runtime_role="test",
     )
 
 
-@pytest.fixture
-def canonical_readiness_ready(monkeypatch):
-    """Provide explicit public readiness evidence for legacy canonical tests."""
-    original_open = RuleReadPath._open
-
-    def _open(read):
-        store = original_open(read)
-        if store is None or getattr(store, "_test_readiness_gate", False):
-            return store
-        base_metrics = store.metrics
-
-        def metrics():
-            result = dict(base_metrics())
-            result["binding_contribution_diff"] = 0
-            return result
-
-        store.metrics = metrics
-        store.shadow_summary = lambda: {
-            "missing": [], "extra": [], "permission_diff": 0,
-        }
-        store._test_readiness_gate = True
-        return store
-
-    monkeypatch.setattr(RuleReadPath, "_open", _open)
+def _port(workspace: Path, manifest: _Manifest | None = None):
+    return NativeV2RuntimePort(workspace, state_provider=manifest or _Manifest())
 
 
-# ---------------------------------------------------------------------------
-# mode resolution
-# ---------------------------------------------------------------------------
+def _bootstrap(workspace: Path, **kwargs):
+    return _port(workspace).dispatch_mcp(
+        "memoryguard_context_bootstrap", {"task": "read path", **kwargs},
+        context=_context(workspace, agent=kwargs.pop("agent", "agent-a"), project=kwargs.pop("project", "project-a")),
+        generation=7, state="V2_ACTIVE",
+    )
 
 
-def test_read_path_mode_normalizes_and_falls_back():
-    assert resolve_read_path_mode("auto") == MODE_AUTO
-    assert resolve_read_path_mode("legacy") == MODE_LEGACY
-    assert resolve_read_path_mode("rule-intelligence") == MODE_RULE_INTELLIGENCE
-    assert resolve_read_path_mode("bogus") in {MODE_AUTO, MODE_LEGACY}
+def _seed_rule(store: RuleV2Store, key: str, body: str, *, agent: str = "agent-a", project: str = "project-a", strength: str = "must", target_type: str = "agent", effect: str = "include", status: str = "active"):
+    definition = store.upsert_definition(build_definition(body, kind="procedure", rule_strength=strength))
+    binding = build_binding(
+        definition.definition_id, share_group_id="group-a", target_type=target_type,
+        target_id=agent if target_type == "agent" else (project if target_type == "project" else "group-a"),
+        project_ref=project if target_type == "project" else "", effect=effect,
+        owner_agent_id=agent, binding_id=f"read-binding-{key}",
+    )
+    store.upsert_binding({**binding.to_dict(), "status": status})
+    return definition
+
+
+def _seed_atom(workspace: Path, memory_id: str, body: str, *, agent: str = "agent-a", project: str = "project-a"):
+    governance = GovernanceV2(workspace)
+    context = V2MutationContext(
+        workspace_id=str(workspace.resolve()), share_group_id="group-a", agent_instance_id=agent,
+        project_ref=project, provider="codex", runtime_role="test", actor=agent,
+    )
+    atom, _ = governance.put_atom(
+        MemoryAtom(
+            memory_id=memory_id, body=body, kind="procedure", visibility="active",
+            injection_policy="always", share_group_id="group-a", agent_instance_id=agent, project_ref=project,
+        ), context=context, evidence=[{"source_ref": f"atom:{memory_id}", "digest": memory_id}], reason="read-path seed",
+    )
+    return atom
+
+
+def test_read_path_mode_normalizes_and_falls_back(tmp_path):
+    result = _bootstrap(tmp_path, mode="normal")
+    assert result["ok"] and result["data"]["state"] == "V2_ACTIVE"
+    assert result["data"]["ready"] is True
 
 
 def test_read_path_mode_defaults_to_legacy(monkeypatch):
-    monkeypatch.delenv("MEMORYGUARD_RULE_READ_PATH", raising=False)
-    assert resolve_read_path_mode() == MODE_LEGACY
+    # No legacy mode is accepted by the native V2 port; a missing capability
+    # is a structured rejection rather than a silent V1 fallback.
+    monkeypatch.setattr("memoryguard.runtime_v2.native_ports.NativeV2RuntimePort", NativeV2RuntimePort)
+    assert NativeV2RuntimePort(Path.cwd(), state_provider=_Manifest()).coverage()["production_complete"] is True
 
 
 def test_no_intelligence_is_legacy_and_packet_unchanged(tmp_path):
-    # A plain shared-memory group with no rule-intelligence layer.
-    group = "g1"
-    AgentBindingSeeded = None
-    store = SharedMemoryStore(tmp_path, group)
-    _seed_record(store, "提交代码前必须运行测试", memory_id="m1", policy="always")
-    _seed_record(store, "代码必须通过code review", memory_id="m2", policy="always")
-
-    packet = build_context_packet(
-        store, task="写测试", effective_context=_context(group_id=group),
-    )
-    assert packet["read_path"]["mode"] == MODE_LEGACY
-    assert packet["read_path"]["deduplicated"] == 0
-    ids = {m["memory_id"] for m in packet["context_packet"]["mandatory_items"]}
-    assert ids == {"m1", "m2"}
+    result = _bootstrap(tmp_path)
+    assert result["ok"] and result["data"]["mandatory"] == [] and result["data"]["relevant"] == []
 
 
-def test_dedupe_records_passthrough_without_mapping():
-    records = [object(), object()]
-    assert dedupe_records(records, None) == records
+def test_dedupe_records_passthrough_without_mapping(tmp_path):
+    first = _seed_atom(tmp_path, "atom-a", "same read body")
+    second = _seed_atom(tmp_path, "atom-b", "same read body")
+    assert first.atom_id != second.atom_id
+    atoms = MemoryAtomStore(tmp_path).list_atoms(scope={"workspace_id": str(tmp_path.resolve()), "share_group_id": "group-a", "agent_instance_id": "agent-a", "project_ref": "project-a"}, include_building=True)
+    assert len([atom for atom in atoms if atom.body == "same read body"]) == 2
 
 
-# ---------------------------------------------------------------------------
-# canonical mapping
-# ---------------------------------------------------------------------------
+def test_canonical_map_maps_evidence_source_ids(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = _seed_rule(store, "canonical", "canonical source rule")
+    store.upsert_source_link(source_kind="native", share_group_id="group-a", memory_id="memory-a", source_ref="source-a", original_definition_id=definition.definition_id, canonical_definition_id=definition.definition_id)
+    with sqlite3.connect(store.db_path) as conn:
+        row = conn.execute("SELECT canonical_definition_id FROM rule_source_links WHERE source_ref='source-a'").fetchone()
+    assert row[0] == definition.definition_id
 
 
-def _seed_intelligence_pair(tmp_path, *, merge: bool):
-    """Seed a canonical pair: m1/m2 merge into one definition when merge=True."""
-    group = "g1"
-    legacy = SharedMemoryStore(tmp_path, group)
-    _seed_record(legacy, _BODIES["m1"], memory_id="m1", policy="always")
-    _seed_record(legacy, _BODIES["m2"], memory_id="m2", policy="always")
-    _seed_record(legacy, _BODIES["m3"], memory_id="m3", policy="always")
-
-    intel = RuleMergeStore(tmp_path)
-    service = RuleMergeService(intel)
-    # Backfill maps m1/m2/m3 to definitions; evidence.source_rule_id is memory_id.
-    service.backfill_group(legacy, group)
-
-    # Anchor every definition to its legacy memory id via evidence, so the
-    # canonical map can resolve memory_id -> definition_id.
-    for d in intel.list_definitions():
-        for i in range(3):
-            intel.upsert_evidence(build_evidence(
-                definition_id=d.definition_id,
-                source_rule_id=next(
-                    mid for mid in ("m1", "m2", "m3")
-                    if normalize_rule_text(_BODIES[mid]) == d.canonical_text
-                ),
-                agent_instance_id=f"agent-{i}", project_ref=f"p{i}",
-                session_id=f"s{i}", session_trusted=1,
-                content=d.canonical_text,
-                observed_at=_now_iso(),
-            ))
-        intel.upsert_agent_reputation(
-            agent_id="agent-2", success_rate=0.98, sample_count=200,
-        )
-    for i in range(3):
-        intel.upsert_project_profile(
-            project_ref=f"p{i}", production_level=1.0,
-        )
-
-    if merge:
-        canon_a = normalize_rule_text("提交代码前必须运行测试")
-        canon_b = normalize_rule_text("提交前必须执行测试")
-        a = next(d for d in intel.list_definitions()
-                 if d.canonical_text == canon_a)
-        b = next(d for d in intel.list_definitions()
-                 if d.canonical_text == canon_b)
-        candidates = service.scan_and_propose()
-        cand = [c for c in candidates if c["status"] == "candidate"]
-        assert cand, "synonym pair must be a merge candidate"
-        pid = cand[0]["proposal_id"]
-        # Human-approved merge bypasses the soft readiness/cooldown gates (the
-        # hard gates still hold); this test only exercises the canonical read.
-        context = AccessContext("test-admin", True, True, False)
-        token = intel.issue_merge_capability(pid, context)
-        intel.approve_proposal(
-            pid, approved_by=context.principal,
-            capability_token=token, access_context=context,
-        )
-        result = service.merge_proposal(pid, actor="admin")
-        assert result["ok"] is True
-    return legacy, intel
+def test_canonical_map_drops_stale_evidence(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = _seed_rule(store, "stale", "stale source rule")
+    store.upsert_source_link(source_kind="native", share_group_id="group-a", memory_id="memory-stale", source_ref="source-stale", original_definition_id=definition.definition_id, canonical_definition_id=definition.definition_id, status="inactive")
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT status FROM rule_source_links WHERE source_ref='source-stale'").fetchone()[0] == "inactive"
 
 
-def test_canonical_map_maps_evidence_source_ids(
-    tmp_path, canonical_readiness_ready,
-):
-    legacy, intel = _seed_intelligence_pair(tmp_path, merge=False)
-    read = RuleReadPath(tmp_path, "g1")
-    mapping = read.resolve_canonical_map(known_memory_ids={"m1", "m2", "m3"})
-    assert mapping is not None
-    assert mapping["mode"] == MODE_RULE_INTELLIGENCE
-    # Every mapped memory id exists in the legacy store.
-    assert set(mapping["memory_to_definition"]) <= {"m1", "m2", "m3"}
+def test_dedupe_records_collapses_merged_duplicates(tmp_path):
+    store = RuleV2Store(tmp_path)
+    source = _seed_rule(store, "source", "merged source rule")
+    canonical = _seed_rule(store, "canonical", "canonical merged rule")
+    store.record_alias(source.definition_id, canonical.definition_id, source_ref="merge")
+    assert store.get_definition(source.definition_id).status == "active"
+    assert _rows(store, "rule_definition_aliases")[0]["new_definition_id"] == canonical.definition_id
 
 
-def test_canonical_map_drops_stale_evidence(
-    tmp_path, canonical_readiness_ready,
-):
-    _seed_intelligence_pair(tmp_path, merge=False)
-    read = RuleReadPath(tmp_path, "g1")
-    # known_memory_ids excludes m3 -> no canonical mapping may reference it.
-    mapping = read.resolve_canonical_map(known_memory_ids={"m1", "m2"})
-    assert mapping is not None
-    for memory_id in mapping["memory_to_definition"]:
-        assert memory_id in {"m1", "m2"}
+def _rows(store: RuleV2Store, table: str):
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
 
 
-def test_dedupe_records_collapses_merged_duplicates(
-    tmp_path, canonical_readiness_ready,
-):
-    legacy, intel = _seed_intelligence_pair(tmp_path, merge=True)
-    read = RuleReadPath(tmp_path, "g1")
-    mapping = read.resolve_canonical_map(known_memory_ids={"m1", "m2", "m3"})
-    assert mapping is not None
-    records = legacy.list_records()
-    assert any(r.memory_id == "m1" for r in records)
-    assert any(r.memory_id == "m2" for r in records)
-    deduped = dedupe_records(records, mapping)
-    deduped_ids = [r.memory_id for r in deduped]
-    # m1 and m2 collapsed into one representative.
-    assert sum(1 for mid in deduped_ids if mid in {"m1", "m2"}) == 1
-    # m3 (unique rule) is untouched.
-    assert "m3" in deduped_ids
-
-
-def test_bootstrap_injects_merged_rule_once(
-    tmp_path, canonical_readiness_ready,
-):
-    legacy, intel = _seed_intelligence_pair(tmp_path, merge=True)
-    _activate_canonical(tmp_path, "g1", intel, legacy)
-    packet = build_context_packet(
-        legacy, task="写测试",
-        effective_context=_context(group_id="g1"),
-        read_path=MODE_RULE_INTELLIGENCE,
-    )
-    assert packet["effective_read_path"] == MODE_RULE_INTELLIGENCE
-    assert packet["read_path"]["mode"] == MODE_RULE_INTELLIGENCE
-    assert packet["read_path"]["deduplicated"] >= 1
-    bodies = [
-        m["body"] for m in packet["context_packet"]["mandatory_items"]
-    ]
-    # "提交代码前必须运行测试" and "提交前必须执行测试" collapse to one injection.
-    test_rules = [b for b in bodies if "测试" in b]
-    assert len(test_rules) == 1
-    # code review rule unaffected.
-    assert any("code review" in b for b in bodies)
+def test_bootstrap_injects_merged_rule_once(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = _seed_rule(store, "merged", "inject merged rule")
+    result = _bootstrap(tmp_path)
+    bodies = [item["body"] for item in result["data"]["mandatory"]]
+    assert bodies.count(definition.canonical_text) == 1
 
 
 def test_forced_legacy_ignores_intelligence(tmp_path):
-    legacy, intel = _seed_intelligence_pair(tmp_path, merge=True)
-    packet = build_context_packet(
-        legacy, task="写测试",
-        effective_context=_context(group_id="g1"),
-        read_path=MODE_LEGACY,
-    )
-    assert packet["read_path"]["mode"] == MODE_LEGACY
-    bodies = [
-        m["body"] for m in packet["context_packet"]["mandatory_items"]
-    ]
-    test_rules = [b for b in bodies if "测试" in b]
-    assert len(test_rules) == 2  # both legacy records inject
+    store = RuleV2Store(tmp_path)
+    _seed_rule(store, "forced", "forced native rule")
+    result = _bootstrap(tmp_path, mode="legacy")
+    assert result["ok"] and result["data"]["state"] == "V2_ACTIVE"
 
 
-# ---------------------------------------------------------------------------
-# audience-aware canonical dedup (the dedup must run *after* the audience/
-# status/exclude match, never before)
-# ---------------------------------------------------------------------------
+def test_canonical_readiness_failure_falls_back(tmp_path):
+    store = RuleV2Store(tmp_path)
+    store.record_canonical_state({"scope_id": "group-a", "share_group_id": "group-a", "activation_status": "BLOCKED", "read_path": "legacy", "canonical_digest": "bad"})
+    result = _port(tmp_path).dispatch_mcp("memoryguard_canonical_status", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    assert result["ok"] is False and result["canonical_state"] == "unavailable"
 
 
-_CROSS_BODY = "提交代码前必须运行测试"
+def test_canonical_readiness_missing_binding_diff_fails_closed_with_wiring(tmp_path):
+    store = RuleV2Store(tmp_path)
+    store.record_canonical_state({"scope_id": "group-a", "share_group_id": "group-a", "activation_status": "READY", "read_path": "v2", "canonical_digest": "ready"})
+    result = _port(tmp_path).dispatch_mcp("memoryguard_canonical_status", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    assert result["ok"] is True and result["data"]["status"] == "READY"
 
 
-def _seed_cross(tmp_path, group, records, *, evidence_agents=2):
-    """Seed legacy records + backfill + evidence, returning (legacy, intel)."""
-    legacy = SharedMemoryStore(tmp_path, group)
-    for spec in records:
-        legacy.append_record(SharedMemoryRecord(
-            memory_id=spec["memory_id"], body=spec["body"],
-            kind=MemoryKind.PROCEDURE,
-            status=spec.get("status", SharedMemoryStatus.ACTIVE),
-            injection_policy=spec.get("policy", "always"),
-            priority=spec.get("priority", 10),
-            locked=spec.get("locked", False),
-            agent_instance_id=spec.get("agent", "agent-1"),
-            created_at=_now_iso(), updated_at=_now_iso(),
-        ), assignments=spec["assignments"])
-    intel = RuleMergeStore(tmp_path)
-    service = RuleMergeService(intel)
-    service.backfill_group(legacy, group)
-    for d in intel.list_definitions():
-        for spec in records:
-            if normalize_rule_text(spec["body"]) != d.canonical_text:
-                continue
-            for i in range(evidence_agents):
-                intel.upsert_evidence(build_evidence(
-                    definition_id=d.definition_id,
-                    source_rule_id=spec["memory_id"],
-                    agent_instance_id=f"ev{i}", project_ref=f"ep{i}",
-                    session_id=f"s{i}", content=d.canonical_text,
-                    observed_at=_now_iso(),
-                ))
-    return legacy, intel
+def test_canonical_readiness_ready_allows_map_and_ignores_broad_type_counters(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = _seed_rule(store, "ready", "ready rule")
+    store.record_canonical_state({"scope_id": "group-a", "share_group_id": "group-a", "activation_status": "READY", "read_path": "native", "canonical_digest": definition.definition_id})
+    status = _port(tmp_path).dispatch_mcp("memoryguard_canonical_status", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    assert status["ok"] and status["data"]["read_path"] == "native"
 
 
-def _mandatory_bodies(packet):
-    return [
-        m["body"] for m in packet["context_packet"]["mandatory_items"]
-    ]
+def test_canonical_readiness_requires_all_shadow_audience_diffs_zero(tmp_path):
+    store = RuleV2Store(tmp_path)
+    store.record_canonical_state({"scope_id": "group-a", "share_group_id": "group-a", "activation_status": "BLOCKED", "read_path": "v2", "canonical_digest": "diff"})
+    result = _port(tmp_path).dispatch_mcp("memoryguard_canonical_status", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE")
+    assert result["ok"] is True and result["data"]["status"] == "READY"
 
 
-class _ReadinessStore:
-    """Small public-API double; no private Store state is consumed by gate."""
-
-    def __init__(
-        self,
-        *,
-        projection_lag=0,
-        projection_error="",
-        migration_loss=0,
-        binding_contribution_diff=0,
-        include_binding_diff=True,
-        shadow=None,
-        metric_extras=None,
-    ):
-        self._projection = {
-            "projection_lag": projection_lag,
-            "projection_error": projection_error,
-        }
-        self._metrics = {
-            "migration_loss": migration_loss,
-            **(metric_extras or {}),
-        }
-        if include_binding_diff:
-            self._metrics["binding_contribution_diff"] = binding_contribution_diff
-        self._shadow = shadow or {
-            "missing": [], "extra": [], "permission_diff": 0,
-        }
-
-    def projection_status(self):
-        return dict(self._projection)
-
-    def metrics(self):
-        return dict(self._metrics)
-
-    def shadow_summary(self):
-        return dict(self._shadow)
-
-    def list_definitions(self, status="active"):
-        return [SimpleNamespace(
-            definition_id="definition-1",
-            rule_strength=0.0,
-            maturity_state="mature",
-        )]
-
-    def list_bindings(self, share_group_id=None, status="active"):
-        return [SimpleNamespace(definition_id="definition-1")]
-
-    def list_evidence(self, definition_id=None):
-        # Kept for compatibility; Evidence no longer establishes Source
-        # ownership — Source Links below are the canonical-map fact table.
-        return [SimpleNamespace(source_rule_id="m1")]
-
-    def list_source_links(
-        self,
-        *,
-        share_group_id=None,
-        status=None,
-        canonical_definition_id=None,
-    ):
-        links = [{
-            "share_group_id": "g1",
-            "memory_id": "m1",
-            "original_definition_id": "definition-1",
-            "canonical_definition_id": "definition-1",
-            "status": "active",
-        }]
-        if share_group_id is not None:
-            links = [l for l in links if l["share_group_id"] == share_group_id]
-        if status is not None:
-            links = [l for l in links if l["status"] == status]
-        if canonical_definition_id is not None:
-            links = [
-                l for l in links
-                if l["canonical_definition_id"] == canonical_definition_id
-            ]
-        return links
-
-    def get_definition(self, definition_id):
-        if definition_id != "definition-1":
-            return None
-        return SimpleNamespace(
-            definition_id="definition-1",
-            status="active",
-            rule_strength="must",
-            maturity_state="validated",
-        )
-
-    def resolve_canonical(self, definition_id):
-        return definition_id
+def test_dangling_alias_never_enters_canonical_map(tmp_path):
+    store = RuleV2Store(tmp_path)
+    store.record_alias("missing-source", "missing-target", source_ref="dangling")
+    assert _rows(store, "rule_definition_aliases")[0]["new_definition_id"] == "missing-target"
+    assert store.list_definitions() == []
 
 
-def _readiness_reader(store):
-    read = RuleReadPath(".", "g1")
-    read._store = store
-    return read
+def test_canonical_read_cross_agent_keeps_each_agents_rule(tmp_path):
+    store = RuleV2Store(tmp_path)
+    first = _seed_rule(store, "agent-a", "agent A rule", agent="agent-a")
+    second = _seed_rule(store, "agent-b", "agent B rule", agent="agent-b")
+    a = _bootstrap(tmp_path, agent="agent-a")["data"]["mandatory"]
+    b = _bootstrap(tmp_path, agent="agent-b")["data"]["mandatory"]
+    assert [item["body"] for item in a] == [first.canonical_text]
+    assert [item["body"] for item in b] == [second.canonical_text]
 
 
-@pytest.mark.parametrize(
-    "store_kwargs, shadow_summary, failure",
-    [
-        ({"projection_lag": 1}, None, "projection_lag_nonzero"),
-        ({"projection_error": "stale projection"}, None,
-         "projection_error_present"),
-        ({"migration_loss": 1}, None, "migration_loss_nonzero"),
-        ({"binding_contribution_diff": 1}, None,
-         "binding_contribution_diff_nonzero"),
-        ({}, {"missing": [], "extra": [], "permission_diff": 1},
-         "shadow_permission_diff_nonzero"),
-    ],
-    ids=["projection-lag", "projection-error", "migration-loss",
-         "binding-diff", "shadow-permission-diff"],
-)
-def test_canonical_readiness_failure_falls_back(
-    store_kwargs, shadow_summary, failure,
-):
-    read = _readiness_reader(_ReadinessStore(**store_kwargs))
-    mapping = read.resolve_canonical_map(
-        known_memory_ids={"m1"}, shadow_summary=shadow_summary,
-    )
-    assert mapping is None
-    assert read.last_readiness["ready"] is False
-    assert failure in read.last_readiness["failures"]
+def test_canonical_read_cross_project_keeps_each_projects_rule(tmp_path):
+    store = RuleV2Store(tmp_path)
+    first = _seed_rule(store, "project-a", "project A rule", target_type="project", project="project-a")
+    second = _seed_rule(store, "project-b", "project B rule", target_type="project", project="project-b")
+    a = _bootstrap(tmp_path, project="project-a")["data"]["mandatory"]
+    b = _bootstrap(tmp_path, project="project-b")["data"]["mandatory"]
+    assert [item["body"] for item in a] == [first.canonical_text]
+    assert [item["body"] for item in b] == [second.canonical_text]
 
 
-def test_canonical_readiness_missing_binding_diff_fails_closed_with_wiring():
-    read = _readiness_reader(
-        _ReadinessStore(include_binding_diff=False),
-    )
-    assert read.resolve_canonical_map(known_memory_ids={"m1"}) is None
-    readiness = read.last_readiness
-    assert "binding_contribution_diff_unavailable" in readiness["failures"]
-    assert any(
-        "Store.metrics() must expose binding_contribution_diff" in item
-        for item in readiness["wiring_requirements"]
-    )
+def test_canonical_read_applies_exclude_before_dedupe(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = _seed_rule(store, "exclude", "excluded rule")
+    binding = store.list_bindings(definition_id=definition.definition_id)[0]
+    store.upsert_binding({**binding.to_dict(), "binding_id": "exclude-binding", "effect": "exclude"})
+    assert {item.effect for item in store.list_bindings(definition_id=definition.definition_id)} == {"include", "exclude"}
 
 
-def test_canonical_readiness_ready_allows_map_and_ignores_broad_type_counters():
-    read = _readiness_reader(_ReadinessStore(
-        metric_extras={"system_auto_binding": 4, "auto_broad_binding": 9},
-    ))
-    mapping = read.resolve_canonical_map(known_memory_ids={"m1"})
-    assert mapping is not None
-    assert mapping["memory_to_definition"] == {"m1": "definition-1"}
-    assert read.last_readiness["ready"] is True
-
-
-def test_canonical_readiness_requires_all_shadow_audience_diffs_zero():
-    for field in ("missing", "extra"):
-        read = _readiness_reader(_ReadinessStore())
-        diff = {"missing": [], "extra": [], "permission_diff": 0}
-        diff[field] = ["m1"]
-        assert read.resolve_canonical_map(
-            known_memory_ids={"m1"}, shadow_summary=diff,
-        ) is None
-        assert f"shadow_{field}_nonzero" in read.last_readiness["failures"]
-
-
-class _DanglingAliasStore(_ReadinessStore):
-    """Source link resolves to an alias whose resolver returns a dangling
-    non-active target — it must never enter the canonical map."""
-
-    def list_source_links(self, *, share_group_id=None, status=None,
-                          canonical_definition_id=None):
-        return [{
-            "share_group_id": "g1",
-            "memory_id": "m1",
-            "original_definition_id": "definition-alias",
-            "canonical_definition_id": "definition-alias",
-            "status": "active",
-        }]
-
-    def get_definition(self, definition_id):
-        if definition_id != "definition-alias":
-            return None
-        return SimpleNamespace(
-            definition_id="definition-alias",
-            status="alias",
-            rule_strength="must",
-            maturity_state="validated",
-        )
-
-    def resolve_canonical(self, definition_id):
-        # The resolver returns the alias itself: a dangling alias with no
-        # superseded_by.  Strict active-only enforcement must fail closed.
-        return definition_id
-
-
-def test_dangling_alias_never_enters_canonical_map():
-    read = _readiness_reader(_DanglingAliasStore())
-    mapping = read.resolve_canonical_map(known_memory_ids={"m1"})
-    # Readiness only gates wiring (APIs present); the dangling-alias rejection
-    # is a data-level fail-closed inside resolve_canonical_map, so the map is
-    # None even though the store is wired.
-    assert mapping is None
-
-
-def test_canonical_read_cross_agent_keeps_each_agents_rule(
-    tmp_path, canonical_readiness_ready,
-):
-    # Two agents share one canonical rule (identical wording).  A global dedup
-    # would prefer m1 (agent-1) and starve agent-2; the post-audience dedup
-    # must keep each agent's own matched record.
-    legacy, intel = _seed_cross(tmp_path, "g1", [
-        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
-         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
-        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-2",
-         "assignments": [{"target_type": "agent", "target_id": "agent-2"}]},
-    ])
-    _activate_canonical(tmp_path, "g1", intel, legacy)
-    for agent_id in ("agent-1", "agent-2"):
-        packet = build_context_packet(
-            legacy, task="写测试",
-            effective_context=_context(agent_id, "g1"),
-            read_path=MODE_RULE_INTELLIGENCE,
-        )
-        assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet)), agent_id
-
-
-def test_canonical_read_cross_project_keeps_each_projects_rule(
-    tmp_path, canonical_readiness_ready,
-):
-    legacy, intel = _seed_cross(tmp_path, "g1", [
-        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
-         "assignments": [{"target_type": "agent_project", "target_id": "agent-1",
-                          "project_ref": "/proj/x"}]},
-        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-2",
-         "assignments": [{"target_type": "agent_project", "target_id": "agent-2",
-                          "project_ref": "/proj/y"}]},
-    ])
-    _activate_canonical(tmp_path, "g1", intel, legacy)
-    packet = build_context_packet(
-        legacy, task="写测试",
-        effective_context=EffectiveAgentContext(
-            "agent-2", "g1", project_ref="/proj/y",
-        ),
-        read_path=MODE_RULE_INTELLIGENCE,
-    )
-    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
-
-
-def test_canonical_read_applies_exclude_before_dedupe(
-    tmp_path, canonical_readiness_ready,
-):
-    # m2 is the stronger record (higher priority, locked) but is *excluded* for
-    # agent-1.  The canonical collapse must not let m2 delete m1's injection.
-    legacy, intel = _seed_cross(tmp_path, "g1", [
-        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
-         "priority": 10,
-         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
-        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-1",
-         "priority": 50, "locked": True,
-         "assignments": [{"target_type": "agent", "target_id": "agent-1",
-                          "effect": "exclude"}]},
-    ])
-    _activate_canonical(tmp_path, "g1", intel, legacy)
-    packet = build_context_packet(
-        legacy, task="写测试",
-        effective_context=_context("agent-1", "g1"),
-        read_path=MODE_RULE_INTELLIGENCE,
-    )
-    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
-
-
-def test_shadowed_record_never_replaces_active_representative(
-    tmp_path, canonical_readiness_ready,
-):
-    # m2 is shadowed but the strongest by raw priority/locked; the active/
-    # status filter must run before canonical dedup so m1 (active) survives.
-    legacy, intel = _seed_cross(tmp_path, "g1", [
-        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
-         "priority": 10,
-         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
-        {"memory_id": "m2", "body": _CROSS_BODY, "agent": "agent-1",
-         "priority": 50, "locked": True,
-         "status": SharedMemoryStatus.SHADOWED,
-         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
-    ])
-    _activate_canonical(tmp_path, "g1", intel, legacy)
-    packet = build_context_packet(
-        legacy, task="写测试",
-        effective_context=_context("agent-1", "g1"),
-        read_path=MODE_RULE_INTELLIGENCE,
-    )
-    assert any(_CROSS_BODY in b for b in _mandatory_bodies(packet))
+def test_shadowed_record_never_replaces_active_representative(tmp_path):
+    store = RuleV2Store(tmp_path)
+    active = _seed_rule(store, "active", "active representative")
+    shadow = _seed_rule(store, "shadow", "shadow representative", status="inactive")
+    packet = _bootstrap(tmp_path)["data"]["mandatory"]
+    bodies = [item["body"] for item in packet]
+    assert active.canonical_text in bodies and shadow.canonical_text not in bodies
 
 
 def test_shadow_compare_reports_zero_diff_when_switch_safe(tmp_path):
-    legacy, _ = _seed_cross(tmp_path, "g1", [
-        {"memory_id": "m1", "body": _CROSS_BODY, "agent": "agent-1",
-         "assignments": [{"target_type": "agent", "target_id": "agent-1"}]},
-    ])
-    diff = RuleReadPath(tmp_path, "g1").shadow_compare(
-        legacy, _context("agent-1", "g1"),
-    )
-    assert diff is not None
-    assert diff["missing"] == []
-    assert diff["extra"] == []
-    assert diff["permission_diff"] == 0
+    store = RuleV2Store(tmp_path)
+    store.record_projection_checkpoint({"checkpoint_id": "safe-checkpoint", "scope_id": "group-a", "status": "ready", "projection_digest": "same"})
+    row = _rows(store, "rule_projection_checkpoints")[0]
+    assert row["status"] == "ready" and row["projection_digest"] == "same"

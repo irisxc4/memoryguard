@@ -1,90 +1,135 @@
-import json
+from __future__ import annotations
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.mcp_server import execute_tool
-from memoryguard.rule_creation import RuleCreationService
-from memoryguard.schema_v3 import (
-    EffectiveAgentContext,
-    MemoryKind,
-    RuleMatchReceipt,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    _now_iso,
+from pathlib import Path
+
+from memoryguard.access_context import AccessContext
+from memoryguard.rule_definition import build_definition
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
 )
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.rules.v2_store import RuleV2Store
 
 
-def _setup(tmp_path, monkeypatch, agent="a"):
-    AgentBindingStore(tmp_path).bind_agent(agent, "team")
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent)
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    # MCP feedback scope is the trusted host project.  It must match the
-    # receipt's original project or the feedback is rejected (cross-project
-    # evidence must never mutate another project's rule).
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
-    store = SharedMemoryStore(tmp_path, "team")
-    store.append_record(SharedMemoryRecord(
-        memory_id="rule-1", body="始终先运行测试", kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE, injection_policy="always",
-        agent_instance_id="a",
-    ), assignments=[{"target_type": "agent", "target_id": "a"}])
-    store.append_rule_match_receipt(RuleMatchReceipt(
-        receipt_id="receipt-1", memory_id="rule-1", share_group_id="team",
-        agent_instance_id="a", task_hash="task", task="task",
-        assignment_ids=[], project_ref=str(tmp_path / "project"),
-        session_id="session-a", created_at=_now_iso(),
-    ))
-    return store
+class _Manifest:
+    def current(self):
+        return {"state": "V2_ACTIVE", "generation": 7}
 
 
-def _context(tmp_path, agent="a"):
-    return EffectiveAgentContext(
-        agent_instance_id=agent, share_group_id="team",
-        project_ref=str(tmp_path / "project"), session_id="session-a",
+def _context(
+    workspace: Path,
+    *,
+    agent: str = "a",
+    admin: bool = False,
+    source: str = "transport",
+):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=admin,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"session-{agent}-{source}",
+            session_source=source,
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id="team",
+        project_ref=str((workspace / "project").resolve()),
+        provider="codex",
+        runtime_role="root",
     )
 
 
-def test_mcp_actor_cannot_upgrade_authority(tmp_path, monkeypatch):
-    store = _setup(tmp_path, monkeypatch)
-    result = execute_tool("memoryguard_rule_feedback", {
-        "receipt_id": "receipt-1", "outcome": "not_applicable",
-        "actor": "user", "evidence": "agent supplied display text",
+def _setup(tmp_path: Path) -> tuple[NativeV2RuntimePort, RuleV2Store]:
+    GroupControlService(tmp_path, write=True).bind_agent("a", "team")
+    store = RuleV2Store(tmp_path)
+    definition = store.upsert_definition(build_definition("始终先运行测试", kind="procedure"))
+    store.upsert_binding({
+        "binding_id": "binding-a",
+        "definition_id": definition.definition_id,
+        "share_group_id": "team",
+        "target_type": "agent",
+        "target_id": "a",
+        "owner_agent_id": "a",
+        "created_by": "admin",
+        "status": "active",
     })
-    assert result.get("isError") is not True
-    feedback = store.list_rule_match_feedbacks(receipt_id="receipt-1")[0]
-    assert feedback.source == "agent"
-    assert feedback.authority == 3
+    store.record_receipt({
+        "receipt_id": "receipt-1",
+        "definition_id": definition.definition_id,
+        "source_rule_id": "source-rule",
+        "share_group_id": "team",
+        "agent_instance_id": "a",
+        "project_ref": str((tmp_path / "project").resolve()),
+        "session_id": "session-a-transport",
+        "task_hash": "task",
+        "selection_digest": "selection",
+        "metadata_json": "{}",
+        "created_at": "2026-08-10T00:00:00+00:00",
+    })
+    return NativeV2RuntimePort(tmp_path, state_provider=_Manifest()), store
 
 
-def test_feedback_owner_is_bound_to_receipt_agent(tmp_path, monkeypatch):
-    store = _setup(tmp_path, monkeypatch)
-    service = RuleCreationService(tmp_path, "team", store=store)
-    decision = service.submit_feedback(
-        "receipt-1", "followed", "user", effective_context=_context(tmp_path, "b"),
-        producer="user",
+def _feedback(port, context, **payload):
+    return port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {"receipt_id": "receipt-1", "outcome": "not_applicable", "idempotency_key": "feedback-a", **payload},
+        context=context,
+        generation=7,
+        state="V2_ACTIVE",
     )
-    assert decision.status == "blocked"
-    assert "receipt owner" in decision.blocked_reason
-    assert store.list_rule_match_feedbacks(receipt_id="receipt-1") == []
 
 
-def test_lower_authority_feedback_is_recorded_but_not_effective(tmp_path, monkeypatch):
-    store = _setup(tmp_path, monkeypatch)
-    service = RuleCreationService(tmp_path, "team", store=store)
-    context = _context(tmp_path)
-    first = service.submit_feedback(
-        "receipt-1", "followed", "human", effective_context=context,
-        producer="user",
+def test_mcp_actor_cannot_upgrade_authority(tmp_path):
+    port, store = _setup(tmp_path)
+    result = _feedback(port, _context(tmp_path), actor="user", evidence="display text")
+    assert result["ok"] is True, result
+    feedback = store.list_feedback(receipt_id="receipt-1")[0]
+    # Actor/producer are transport-derived; a caller-controlled display label
+    # cannot upgrade an agent feedback to user authority.
+    assert feedback["authority"] == 3
+    assert '"producer":"agent"' in feedback["metadata_json"]
+
+
+def test_feedback_owner_is_bound_to_receipt_agent(tmp_path):
+    port, store = _setup(tmp_path)
+    denied = _feedback(
+        port,
+        _context(tmp_path, agent="b"),
+        outcome="followed",
+        idempotency_key="feedback-owner-mismatch",
     )
-    assert first.status == "recorded"
-    second = service.submit_feedback(
-        "receipt-1", "not_applicable", "agent says user", effective_context=context,
-        producer="agent",
+    assert denied["ok"] is False
+    assert denied["code"] == "rule_receipt_owner_mismatch"
+    assert store.list_feedback(receipt_id="receipt-1") == []
+
+
+def test_lower_authority_feedback_is_recorded_but_not_effective(tmp_path):
+    port, store = _setup(tmp_path)
+    first = port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {"receipt_id": "receipt-1", "outcome": "followed", "idempotency_key": "feedback-user"},
+        context=_context(tmp_path, admin=True),
+        generation=7,
+        state="V2_ACTIVE",
     )
-    assert second.status == "recorded"
-    assert second.after["metadata"]["effective"] is False
-    effective = store.get_effective_rule_match_feedback("receipt-1")
-    assert effective is not None
-    assert effective.outcome == "followed"
-    assert len(store.list_rule_match_feedbacks(receipt_id="receipt-1")) == 2
+    assert first["ok"] is True, first
+    second = port.dispatch_mcp(
+        "memoryguard_rule_feedback",
+        {
+            "receipt_id": "receipt-1",
+            "outcome": "not_applicable",
+            "actor": "user",
+            "idempotency_key": "feedback-agent",
+        },
+        context=_context(tmp_path),
+        generation=7,
+        state="V2_ACTIVE",
+    )
+    assert second["ok"] is True, second
+    assert len(store.list_feedback(receipt_id="receipt-1")) == 2
+    projection = store.get_effective_feedback_projection("receipt-1")
+    assert projection is not None
+    assert projection["outcome"] == "followed"

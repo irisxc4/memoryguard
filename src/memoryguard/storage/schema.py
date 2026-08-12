@@ -358,6 +358,110 @@ CREATE TABLE IF NOT EXISTS profile_projections (
 """
 
 
+GUI_CONTROL_SCHEMA_VERSION = 1
+GUI_CONTROL_SCHEMA_MARKER = "memoryguard-v2-gui-control-1"
+GUI_CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gui_control_schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT INTO gui_control_schema_meta(key,value) VALUES('version','1')
+    ON CONFLICT(key) DO NOTHING;
+CREATE TABLE IF NOT EXISTS agent_group_bindings (
+    binding_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    share_group_id TEXT NOT NULL,
+    group_kind TEXT NOT NULL CHECK(group_kind IN ('personal','shared')),
+    mcp_server_name TEXT NOT NULL DEFAULT 'memoryguard',
+    native_memory_mode TEXT NOT NULL DEFAULT 'observed',
+    redirect_paths_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','inactive','drifted')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_group_active_agent
+    ON agent_group_bindings(agent_instance_id) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_agent_group_group
+    ON agent_group_bindings(share_group_id,status,agent_instance_id);
+CREATE TABLE IF NOT EXISTS governance_scopes (
+    scope_id TEXT PRIMARY KEY,
+    principal_agent_id TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('agent','share_group')),
+    agent_instance_id TEXT NOT NULL DEFAULT '',
+    share_group_id TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(principal_agent_id)
+);
+CREATE TABLE IF NOT EXISTS selection_manifests (
+    selection_id TEXT PRIMARY KEY,
+    agent_instance_id TEXT NOT NULL,
+    selection_digest TEXT NOT NULL,
+    source_ids_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_selection_agent
+    ON selection_manifests(agent_instance_id,status,updated_at);
+CREATE TABLE IF NOT EXISTS control_preferences (
+    pref_key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS group_operation_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(operation,idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS group_outbox (
+    event_id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'projected' CHECK(status IN ('pending','projected','failed')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    projected_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS agent_lifecycle_marks (
+    candidate_id TEXT PRIMARY KEY,
+    product TEXT NOT NULL DEFAULT '',
+    dir_path TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','uninstalled')),
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_archives (
+    archive_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    product TEXT NOT NULL DEFAULT '',
+    original_path TEXT NOT NULL,
+    archive_path TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','restored','deleted')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_cleanup_history (
+    event_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    candidate_id TEXT NOT NULL DEFAULT '',
+    archive_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+"""
+
+
 SYSTEM_SCHEMA = """
 CREATE TABLE IF NOT EXISTS manifest (
     manifest_id TEXT PRIMARY KEY,
@@ -398,7 +502,7 @@ CREATE TABLE IF NOT EXISTS outbox_checkpoints (
     last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
     updated_at TEXT NOT NULL
 );
-"""
+""" + GUI_CONTROL_SCHEMA
 
 
 DOMAIN_SCHEMAS: Mapping[str, str] = {

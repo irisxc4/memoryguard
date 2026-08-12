@@ -24,6 +24,7 @@ from ..storage.database import connect_database, open_database_snapshot
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.schema import SCHEMA_MARKER as BASE_SCHEMA_MARKER
 from ..storage.transaction import transaction
+from ..rule_scope import canonical_project_ref
 
 
 def _now() -> str:
@@ -584,12 +585,18 @@ class MemoryAtomStore:
             atom.updated_at = atom.created_at
         return atom
 
-    def _authorize_v2_context(self, context: Any, atom: MemoryAtom) -> Any:
+    def _authorize_v2_context(
+        self,
+        context: Any,
+        atom: MemoryAtom,
+        *,
+        existing: MemoryAtom | None = None,
+    ) -> Any:
         """Validate an optional V2 governance context at the store boundary."""
 
         if context is None:
             return None
-        from ..governance_v2.context import V2MutationContext
+        from ..governance_v2.context import V2MutationContext, V2ScopeError
 
         resolved = V2MutationContext.from_value(context)
         resolved.check_scope(
@@ -600,6 +607,25 @@ class MemoryAtomStore:
             provider=atom.provider,
             runtime_role=atom.runtime_role,
         )
+        if existing is not None and not resolved.admin:
+            # ``(share_group_id, memory_id)`` is the logical-record identity,
+            # while ``atom_id`` is only the physical V2 row identity.  An
+            # incoming atom can therefore pass the field-level check while
+            # still attempting to replace another agent's logical record.
+            # Keep this refusal deliberately neutral: callers must not learn
+            # the existing owner's identity or SQLite constraint details.
+            owner_fields = (
+                "agent_instance_id",
+                "project_ref",
+                "provider",
+                "runtime_role",
+            )
+            if any(
+                str(getattr(existing, field) or "")
+                != str(getattr(atom, field) or "")
+                for field in owner_fields
+            ):
+                raise V2ScopeError("mutation logical record is outside context")
         return resolved
 
     def _next_sequence(self, conn: sqlite3.Connection) -> int:
@@ -666,16 +692,47 @@ class MemoryAtomStore:
             if isinstance(value, Mapping):
                 evidence_payload.append(dict(value))
             else:
-                evidence_payload.append({"evidence_id": str(value)})
+                evidence_id = str(value)
+                evidence_payload.append({
+                    "evidence_id": evidence_id,
+                    "source_ref": f"memoryguard:evidence:{evidence_id}",
+                    "digest": stable_digest({"evidence_id": evidence_id}),
+                    "authority": "observed",
+                    "status": "valid",
+                    "evidence_type": "reference",
+                })
         for value in evidence_ids or ():
-            evidence_payload.append({"evidence_id": str(value)})
+            evidence_id = str(value)
+            evidence_payload.append({
+                "evidence_id": evidence_id,
+                "source_ref": f"memoryguard:evidence:{evidence_id}",
+                "digest": stable_digest({"evidence_id": evidence_id}),
+                "authority": "observed",
+                "status": "valid",
+                "evidence_type": "reference",
+            })
         # Evidence records are projected separately.  Keep only references in
         # memory.db; full evidence payloads are deliberately not stored here.
         migration_conn = getattr(self._migration_state, "conn", None)
         conn = migration_conn or self._checked_connect(readonly=False)
         try:
             with (nullcontext(conn) if migration_conn is not None else transaction(conn)):
-                existing = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (item.atom_id,)).fetchone()
+                existing_by_id = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (item.atom_id,)).fetchone()
+                logical_existing = conn.execute(
+                    "SELECT * FROM atoms WHERE share_group_id=? AND memory_id=?",
+                    (item.share_group_id, item.memory_id),
+                ).fetchone()
+                logical_atom = self._row_to_atom(logical_existing) if logical_existing is not None else None
+                owner_atom = logical_atom
+                if owner_atom is None and existing_by_id is not None:
+                    owner_atom = self._row_to_atom(existing_by_id)
+                self._authorize_v2_context(context, item, existing=owner_atom)
+                # Resolve every update through the logical key.  This makes
+                # admin corrections and retries converge on the existing
+                # physical atom instead of attempting a second UNIQUE row.
+                existing = logical_existing or existing_by_id
+                if logical_existing is not None:
+                    item.atom_id = str(logical_existing["atom_id"])
                 if existing is not None and not replace:
                     return self._row_to_atom(existing)
                 if existing is not None:
@@ -912,21 +969,96 @@ class MemoryAtomStore:
 
     def _get_atom_scoped(self, memory_id: str, scope: MemoryReadScope, *, atom_id: str = "", include_building: bool = False) -> MemoryAtom | None:
         query = "SELECT * FROM atoms WHERE " + ("atom_id=?" if atom_id else "memory_id=?")
-        params: list[Any] = [atom_id or memory_id]
-        for column, value in (("workspace_id", scope.workspace_id), ("share_group_id", scope.share_group_id), ("agent_instance_id", scope.agent_instance_id), ("project_ref", scope.project_ref), ("provider", scope.provider), ("runtime_role", scope.runtime_role)):
-            # Workspace and group are mandatory scope dimensions.  The
-            # remaining dimensions are opt-in filters; an empty value means
-            # "any" rather than an exact empty-column match.
-            if scope.admin and column not in {"workspace_id", "share_group_id"}:
-                continue
-            if column in {"workspace_id", "share_group_id"} or value:
-                query += f" AND {column}=?"
-                params.append(value)
+        params: list[Any] = [atom_id or memory_id, scope.workspace_id, scope.share_group_id]
+        query += " AND workspace_id=? AND share_group_id=?"
         if not include_building:
             query += " AND visibility IN ('ready','active')"
+        query += " ORDER BY revision DESC, updated_at DESC, created_at DESC, atom_id"
         with self._connection() as conn:
-            row = conn.execute(query, params).fetchone()
-        return self._row_to_atom(row) if row is not None else None
+            rows = conn.execute(query, params).fetchall()
+        for row in rows:
+            atom = self._row_to_atom(row)
+            if self._atom_visible_to_scope(atom, scope):
+                return atom
+        return None
+
+    @staticmethod
+    def _native_audience(atom: MemoryAtom) -> dict[str, Any] | None:
+        """Return only the native, validated audience marker, if present.
+
+        Arbitrary user metadata is never treated as an ACL.  Native writes
+        stamp ``source=native_v2`` after validating the target against the
+        trusted transport context; legacy/migration metadata therefore falls
+        back to the atom's exact owner scope.
+        """
+
+        metadata = atom.metadata if isinstance(atom.metadata, Mapping) else {}
+        raw = metadata.get("audience")
+        if not isinstance(raw, Mapping) or str(raw.get("source") or "") != "native_v2":
+            return None
+        target_type = str(raw.get("target_type") or "").strip().casefold()
+        if target_type not in {"agent", "agent_project", "project", "group"}:
+            return None
+        effect = str(raw.get("effect") or "include").strip().casefold()
+        if effect not in {"include", "exclude"}:
+            return None
+        return {
+            "target_type": target_type,
+            "target_id": str(raw.get("target_id") or ""),
+            "project_ref": str(raw.get("project_ref") or ""),
+            "provider": str(raw.get("provider") or ""),
+            "runtime_role": str(raw.get("runtime_role") or ""),
+            "effect": effect,
+        }
+
+    @classmethod
+    def _atom_visible_to_scope(cls, atom: MemoryAtom, scope: MemoryReadScope) -> bool:
+        """Apply V2 agent/group/project audience visibility after group ACL."""
+
+        if atom.workspace_id != scope.workspace_id or atom.share_group_id != scope.share_group_id:
+            return False
+        if scope.admin:
+            return True
+        audience = cls._native_audience(atom)
+        if audience is None:
+            # Existing V2 atoms without a native audience remain exact-scope
+            # records; an arbitrary metadata field cannot broaden them.
+            return all(
+                not value or str(getattr(atom, field) or "") == str(value)
+                for field, value in (
+                    ("agent_instance_id", scope.agent_instance_id),
+                    ("project_ref", scope.project_ref),
+                    ("provider", scope.provider),
+                    ("runtime_role", scope.runtime_role),
+                )
+            )
+
+        target_type = audience["target_type"]
+        target_id = audience["target_id"]
+        project = audience["project_ref"]
+        matches = False
+        if target_type == "agent":
+            matches = target_id == scope.agent_instance_id
+        elif target_type == "agent_project":
+            matches = (
+                target_id == scope.agent_instance_id
+                and bool(project)
+                and canonical_project_ref(project) == canonical_project_ref(scope.project_ref)
+            )
+        elif target_type == "project":
+            matches = (
+                bool(project)
+                and canonical_project_ref(project) == canonical_project_ref(scope.project_ref)
+            )
+        elif target_type == "group":
+            matches = target_id == scope.share_group_id
+        if matches and audience["provider"]:
+            matches = audience["provider"] == scope.provider
+        if matches and audience["runtime_role"]:
+            matches = audience["runtime_role"] == scope.runtime_role
+        if audience["effect"] == "exclude":
+            return not matches
+        return matches
 
     def _list_atoms_unscoped(self, *, share_group_id: str | None = None, status: str | None = None, include_building: bool = False, visibility: str | None = None) -> list[MemoryAtom]:
         query = "SELECT * FROM atoms WHERE 1=1"
@@ -942,7 +1074,7 @@ class MemoryAtomStore:
         if status:
             query += " AND status=?"
             params.append(str(status))
-        query += " ORDER BY created_at, atom_id"
+        query += " ORDER BY revision DESC, updated_at DESC, created_at DESC, atom_id"
         with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_atom(row) for row in rows]
@@ -970,14 +1102,8 @@ class MemoryAtomStore:
         )
         if resolved is None:
             return []
-        query = "SELECT * FROM atoms WHERE 1=1"
-        params: list[Any] = []
-        for column, value in (("workspace_id", resolved.workspace_id), ("share_group_id", resolved.share_group_id), ("agent_instance_id", resolved.agent_instance_id), ("project_ref", resolved.project_ref), ("provider", resolved.provider), ("runtime_role", resolved.runtime_role)):
-            if resolved.admin and column not in {"workspace_id", "share_group_id"}:
-                continue
-            if column in {"workspace_id", "share_group_id"} or value:
-                query += f" AND {column}=?"
-                params.append(value)
+        query = "SELECT * FROM atoms WHERE workspace_id=? AND share_group_id=?"
+        params: list[Any] = [resolved.workspace_id, resolved.share_group_id]
         if status:
             query += " AND status=?"
             params.append(str(status))
@@ -989,7 +1115,10 @@ class MemoryAtomStore:
         query += " ORDER BY created_at, atom_id"
         with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [self._row_to_atom(row) for row in rows]
+        return [
+            atom for row in rows
+            if self._atom_visible_to_scope(atom := self._row_to_atom(row), resolved)
+        ]
 
     def list_building_atoms(self, *, scope: MemoryReadScope | Mapping[str, Any] | None = None, **kwargs: Any) -> list[MemoryAtom]:
         kwargs["include_building"] = True
@@ -1040,6 +1169,133 @@ class MemoryAtomStore:
         return self._delete_scoped(memory_id, resolved, reason=reason)
 
     tombstone = delete
+
+    def restore(
+        self,
+        memory_id: str,
+        *,
+        scope: MemoryMutationScope | MemoryReadScope | Mapping[str, Any] | None = None,
+        share_group_id: str = "",
+        reason: str = "",
+        context: Any | None = None,
+    ) -> tuple[MemoryAtom, list[MemoryAtom]]:
+        """Restore one logical atom and shadow its active descendants atomically.
+
+        Restore is a memory-domain lifecycle mutation, not a partial organizer
+        update.  The target and every active descendant in its supersession
+        graph receive revisions and local outbox events in one SQLite
+        transaction.  GovernanceV2 owns the durable request/receipt fence
+        around this method.
+        """
+
+        if self.readonly:
+            raise PermissionError("memory store is read-only")
+        if context is not None:
+            if scope is not None:
+                raise ValueError("provide either context or scope, not both")
+            scope = context
+        resolved = self._require_mutation_scope(scope, share_group_id=share_group_id)
+        mutation_context = context if context is not None else resolved
+        initial = self._get_atom_scoped(str(memory_id), resolved, include_building=True)
+        if initial is None:
+            raise KeyError(memory_id)
+
+        conn = self._checked_connect(readonly=False)
+        try:
+            with transaction(conn):
+                rows = conn.execute(
+                    "SELECT * FROM atoms WHERE workspace_id=? AND share_group_id=?",
+                    (resolved.workspace_id, resolved.share_group_id),
+                ).fetchall()
+                atoms = {
+                    str(row["atom_id"]): self._row_to_atom(row)
+                    for row in rows
+                }
+                target = atoms.get(initial.atom_id)
+                if target is None or not self._atom_visible_to_scope(target, resolved):
+                    raise KeyError(memory_id)
+
+                edges = conn.execute(
+                    "SELECT e.old_atom_id,e.new_atom_id "
+                    "FROM supersession_edges e "
+                    "JOIN atoms old ON old.atom_id=e.old_atom_id "
+                    "JOIN atoms new ON new.atom_id=e.new_atom_id "
+                    "WHERE old.workspace_id=? AND old.share_group_id=? "
+                    "AND new.workspace_id=? AND new.share_group_id=?",
+                    (
+                        resolved.workspace_id,
+                        resolved.share_group_id,
+                        resolved.workspace_id,
+                        resolved.share_group_id,
+                    ),
+                ).fetchall()
+                descendants_by_id: dict[str, list[str]] = {}
+                for row in edges:
+                    descendants_by_id.setdefault(str(row["old_atom_id"]), []).append(str(row["new_atom_id"]))
+                pending = list(descendants_by_id.get(target.atom_id, ()))
+                descendant_ids: list[str] = []
+                seen = {target.atom_id}
+                while pending:
+                    atom_id = pending.pop(0)
+                    if atom_id in seen:
+                        continue
+                    seen.add(atom_id)
+                    if atom_id in atoms and self._atom_visible_to_scope(atoms[atom_id], resolved):
+                        descendant_ids.append(atom_id)
+                        pending.extend(descendants_by_id.get(atom_id, ()))
+
+                changed: list[tuple[MemoryAtom, str]] = []
+                if target.status != "active" or not target.locked:
+                    target.status = "active"
+                    target.locked = True
+                    changed.append((target, ""))
+                for atom_id in descendant_ids:
+                    descendant = atoms[atom_id]
+                    if descendant.status != "active":
+                        continue
+                    descendant.status = "shadowed"
+                    descendant.metadata = {
+                        **dict(descendant.metadata),
+                        "shadowed_by_restore": target.memory_id,
+                    }
+                    changed.append((descendant, target.memory_id))
+
+                self._migration_state.conn = conn
+                self._migration_state.sequence = None
+                persisted: dict[str, MemoryAtom] = {}
+                try:
+                    for item, shadowed_by in changed:
+                        before_revision = int(item.revision)
+                        item.revision = before_revision + 1
+                        item.updated_at = _now()
+                        saved = self._put_atom_impl(item, context=mutation_context)
+                        persisted[saved.atom_id] = saved
+                        self._queue_event(
+                            conn,
+                            "atom.restore",
+                            saved.atom_id,
+                            {
+                                "operation": "restore",
+                                "memory_id": saved.memory_id,
+                                "revision": saved.revision,
+                                "status": saved.status,
+                                "shadowed_by": shadowed_by,
+                                "reason": str(reason or ""),
+                            },
+                        )
+                finally:
+                    self._migration_state.conn = None
+                    self._migration_state.sequence = None
+
+                restored = persisted.get(target.atom_id, target)
+                shadowed = [
+                    persisted[atom_id]
+                    for atom_id in descendant_ids
+                    if atom_id in persisted and persisted[atom_id].status == "shadowed"
+                ]
+                return restored, shadowed
+        finally:
+            conn.close()
 
     def _supersede_scoped(self, old: str, new: str, scope: MemoryReadScope, *, reason: str = "", source_ref: str = "") -> None:
         old_atom = self._get_atom_scoped(old, scope, include_building=True, atom_id=old if old and len(old) > 30 else "")

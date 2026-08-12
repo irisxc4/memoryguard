@@ -19,11 +19,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memoryguard.compat_v2 import (  # noqa: E402
-    CLI_COMMAND_NAMES,
-    make_cutover_adapter,
+from memoryguard import gui  # noqa: E402
+from memoryguard.cutover_v2.facade import (  # noqa: E402
+    V2RuntimeFacade as NativeV2RuntimeFacade,
+    _cli_is_mutation,
 )
-from memoryguard.gui import SafeBridgeApi, _redact_gui_paths  # noqa: E402
+from memoryguard.cutover_v2.surfaces import CLI_COMMAND_NAMES  # noqa: E402
+from memoryguard.gui import SafeBridgeApi, _dispatch_gui_api_call, _redact_gui_paths  # noqa: E402
 from memoryguard.cli import build_parser  # noqa: E402
 
 
@@ -48,7 +50,7 @@ class Port:
         return {"ok": True, "value": self.value}
 
 
-class V2RuntimeFacade:
+class FacadeDouble:
     """Minimal native facade double; class name exercises the native shim."""
 
     def __init__(self, state: str) -> None:
@@ -69,63 +71,48 @@ class V2RuntimeFacade:
         return {"ok": True, "path": "v2"}
 
 
-class Legacy:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-
-    def dispatch(self, surface, name, args):
-        self.calls.append((surface, name, args))
-        return {"ok": True, "path": "legacy"}
-
-
 @pytest.mark.parametrize("state", ["V1_ACTIVE", "V2_BUILDING"])
-def test_legacy_states_have_one_legacy_route(tmp_path, state):
-    manifest = Manifest(state)
-    legacy = Legacy()
-    # Generic fixture uses the stable adapter with an explicit V2 port whose
-    # status is read exactly once per dispatch.
-    class V2:
-        def __init__(self):
-            self.status_calls = 0
-            self.calls = []
+def test_non_v2_gui_states_require_upgrade_without_constructing_legacy(
+    tmp_path, state, monkeypatch,
+):
+    class ExplodingFallbackApi:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("GUI must not construct a fallback API")
 
-        def status(self, workspace):
-            self.status_calls += 1
-            return {"state": state}
+    monkeypatch.setattr(gui, "GovernanceApi", ExplodingFallbackApi)
+    v2 = FacadeDouble(state)
+    bridge = SafeBridgeApi(str(tmp_path), _v2_port=v2)
 
-        def dispatch_gui(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return {"ok": True}
+    result = bridge.call_readonly("get_audit", [])
 
-    v2 = V2()
-    adapter = make_cutover_adapter(tmp_path, legacy_port=legacy, v2_port=v2)
-    result = adapter.dispatch_gui("get_audit", [], mutation=False)
-    assert result["path"] == "legacy"
-    assert len(legacy.calls) == 1
-    assert not v2.calls
+    assert result["ok"] is False
+    assert result["code"] == "v2_upgrade_required"
+    assert result["state"] == state
+    assert result["surface"] == "GUI"
+    assert result["path"] == "v2"
+    assert result["status"] == "blocked"
+    assert result["next_step"] == "Run `memoryguard upgrade` before retrying."
+    assert v2.calls == []
     assert v2.status_calls == 1
 
 
-def test_ready_read_only_v2_and_mutation_has_no_fallback(tmp_path):
-    class V2:
-        def __init__(self):
-            self.calls = []
+def test_gui_source_uses_the_v2_bridge_dispatch_contract():
+    source = (ROOT / "src" / "memoryguard" / "gui.py").read_text(encoding="utf-8")
+    assert "class SafeBridgeApi" in source
+    assert "def _dispatch_v2" in source
+    assert "def dispatch_api" in source
 
-        def status(self, workspace):
-            return {"state": "V2_READY"}
 
-        def dispatch_gui(self, *args, **kwargs):
-            self.calls.append((args, kwargs))
-            return {"ok": True}
-
-    legacy = Legacy()
-    v2 = V2()
-    adapter = make_cutover_adapter(tmp_path, legacy_port=legacy, v2_port=v2)
-    assert adapter.dispatch_gui("get_audit", [], mutation=False)["path"] == "v2"
-    denied = adapter.dispatch_gui("lock_memory", [], mutation=True)
+def test_v2_ready_is_read_only_and_never_dispatches_mutations(tmp_path):
+    manifest = Manifest("V2_READY")
+    v2 = Port("v2")
+    facade = NativeV2RuntimeFacade(
+        manifest=manifest, v2=v2, workspace=str(tmp_path),
+    )
+    assert facade.dispatch_gui("get_audit", [], mutation=False)["path"] == "v2"
+    denied = facade.dispatch_gui("lock_memory", [], mutation=True)
     assert denied["code"] == "v2_not_active"
     assert len(v2.calls) == 1
-    assert not legacy.calls
 
 
 def test_unknown_state_fails_closed(tmp_path):
@@ -136,14 +123,19 @@ def test_unknown_state_fails_closed(tmp_path):
         def dispatch_gui(self, *args, **kwargs):
             raise AssertionError("unknown state must not dispatch")
 
-    result = make_cutover_adapter(tmp_path, legacy_port=Legacy(), v2_port=Unknown()).dispatch_gui(
+    v2 = Port("v2")
+    facade = NativeV2RuntimeFacade(
+        manifest=Unknown(), v2=v2, workspace=str(tmp_path),
+    )
+    result = facade.dispatch_gui(
         "get_audit", [], mutation=False,
     )
     assert result["code"] == "v2_manifest_state_unavailable"
+    assert not v2.calls
 
 
 def test_safe_bridge_passes_trusted_context_and_never_uses_actor(tmp_path):
-    facade = V2RuntimeFacade("V2_ACTIVE")
+    facade = FacadeDouble("V2_ACTIVE")
     from memoryguard.access_context import AccessContext
 
     context = AccessContext(
@@ -168,7 +160,6 @@ def test_safe_bridge_passes_trusted_context_and_never_uses_actor(tmp_path):
 
 def test_safe_bridge_non_rule_mutation_context_reaches_v2_port(tmp_path):
     from memoryguard.access_context import AccessContext
-    from memoryguard.cutover_v2.facade import V2RuntimeFacade
 
     class Manifest:
         def __init__(self):
@@ -187,7 +178,7 @@ def test_safe_bridge_non_rule_mutation_context_reaches_v2_port(tmp_path):
             return {"ok": True}
 
     manifest, v2 = Manifest(), Port()
-    facade = V2RuntimeFacade(manifest=manifest, legacy=Port(), v2=v2, workspace=str(tmp_path))
+    facade = NativeV2RuntimeFacade(manifest=manifest, v2=v2, workspace=str(tmp_path))
     context = AccessContext(
         trusted_agent_id="bridge-agent", is_admin=True, strict_binding=True,
         allow_anon=False, session_id="bridge-session",
@@ -206,7 +197,7 @@ def test_safe_bridge_non_rule_mutation_context_reaches_v2_port(tmp_path):
 def test_safe_bridge_readonly_carries_bound_context_without_payload_identity(tmp_path):
     from memoryguard.access_context import AccessContext
 
-    facade = V2RuntimeFacade("V2_ACTIVE")
+    facade = FacadeDouble("V2_ACTIVE")
     context = AccessContext(
         trusted_agent_id="bridge-agent", is_admin=False, strict_binding=True,
         allow_anon=False, session_id="bridge-session",
@@ -223,14 +214,47 @@ def test_safe_bridge_readonly_carries_bound_context_without_payload_identity(tmp
     assert trusted["__native_transport_capability"] is not None
 
 
+@pytest.mark.parametrize(
+    ("method", "args", "mutation"),
+    [
+        ("get_memory", ["memory-1"], False),
+        ("lock_memory", ["memory-1"], True),
+        ("knowledge_add", ["C:/fixture/source", "Fixture"], True),
+    ],
+)
+def test_pywebview_and_localhost_share_exact_business_dispatch(tmp_path, method, args, mutation):
+    """Both transports call the same server-side classifier and envelope path."""
+    from memoryguard.access_context import AccessContext
+
+    facade = FacadeDouble("V2_ACTIVE")
+    bridge = SafeBridgeApi(
+        str(tmp_path),
+        direct_mutations=True,
+        _v2_port=facade,
+        _trusted_access_context=AccessContext(
+            trusted_agent_id="bridge-agent",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="bridge-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+    )
+    webview = bridge.dispatch_api(method, args)
+    localhost = _dispatch_gui_api_call(bridge, method, args)
+    assert webview == localhost
+    assert facade.calls
+    assert all(call[3] is mutation for call in facade.calls[-2:])
+
+
 def test_safe_bridge_real_native_read_uses_binding_scope_and_strips_payload_identity(tmp_path):
     from memoryguard.access_context import AccessContext
-    from memoryguard.agent_binding import AgentBindingStore, personal_group_id
-    from memoryguard.cutover_v2.facade import V2RuntimeFacade
+    from memoryguard.runtime_v2.group_native import GroupControlService, personal_group_id
     from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_test_services
 
     group_id = personal_group_id("bridge-agent")
-    AgentBindingStore(tmp_path).bind_agent("bridge-agent", group_id)
+    GroupControlService(tmp_path, write=True).bind_agent("bridge-agent", group_id)
 
     class Manifest:
         def current(self):
@@ -244,7 +268,7 @@ def test_safe_bridge_real_native_read_uses_binding_scope_and_strips_payload_iden
             "get_memory": lambda payload, **kwargs: calls.append((payload, kwargs)) or {"record": True},
         }),
     )
-    facade = V2RuntimeFacade(manifest=Manifest(), v2=native, workspace=str(tmp_path))
+    facade = NativeV2RuntimeFacade(manifest=Manifest(), v2=native, workspace=str(tmp_path))
     bridge = SafeBridgeApi(
         str(tmp_path), _v2_port=facade,
         _trusted_access_context=AccessContext(
@@ -270,17 +294,15 @@ def test_cli_snapshot_matches_all_commands_and_namespace_subactions_survive(tmp_
     choices = set(parser._subparsers._group_actions[0].choices)
     assert choices == set(CLI_COMMAND_NAMES)
 
-    legacy = Legacy()
-    class V2:
-        def status(self, workspace):
-            return {"state": "V1_ACTIVE"}
-
     ns = argparse.Namespace(action="migrate", apply=False, workspace=str(tmp_path), func=None)
-    adapter = make_cutover_adapter(tmp_path, legacy_port=legacy, v2_port=V2())
-    result = adapter.dispatch_cli("groups", ns)
-    assert result["path"] == "legacy"
-    assert legacy.calls[0][2]["action"] == "migrate"
-    assert legacy.calls[0][2]["apply"] is False
+    v2 = Port("v2")
+    facade = NativeV2RuntimeFacade(
+        manifest=Manifest("V2_ACTIVE"), v2=v2, workspace=str(tmp_path),
+    )
+    result = facade.dispatch_cli("groups", ns)
+    assert result["path"] == "v2"
+    assert v2.calls[0][2].action == "migrate"
+    assert v2.calls[0][2].apply is False
 
 
 @pytest.mark.parametrize(
@@ -307,34 +329,7 @@ def test_cli_snapshot_matches_all_commands_and_namespace_subactions_survive(tmp_
     ],
 )
 def test_cli_mutation_classifier_preserves_subaction(command, payload, expected):
-    from memoryguard.compat_v2 import LegacyV2Adapter
-
-    assert LegacyV2Adapter._cli_is_mutation(command, argparse.Namespace(**payload)) is expected
-
-
-def test_gui_legacy_source_output_redacts_paths_and_requires_binding(tmp_path):
-    bridge = SafeBridgeApi(str(tmp_path))
-    denied = bridge.call_readonly("list_sources", [])
-    assert denied["code"] == "active_binding_required"
-
-    class Adapter:
-        def dispatch_gui(self, method, args=None, *, mutation=False):
-            return {
-                "status": "not_ready", "path": "legacy", "ok": False,
-                "legacy": {
-                    "sources": [{
-                        "root_id": "root-1", "type": "directory", "scope": "project",
-                        "path": str(tmp_path / "private" / "secret.md"),
-                    }],
-                },
-            }
-
-    bridge._source_scope = lambda: ("bound-group", "")
-    bridge._cutover = lambda: Adapter()
-    listed = bridge.call_readonly("list_sources", [])
-    rendered = str(listed)
-    assert str(tmp_path) not in rendered
-    assert "source:" in rendered
+    assert _cli_is_mutation(command, argparse.Namespace(**payload)) is expected
 
 
 def test_gui_recursive_path_redactor_is_stable_and_preserves_bytes(tmp_path):

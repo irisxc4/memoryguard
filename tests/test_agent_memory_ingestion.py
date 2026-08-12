@@ -1,23 +1,27 @@
-"""Agent 记忆发现/勾选/IR 摄取端到端硬断言。"""
+"""Agent discovery and V2-native memory ingestion coverage."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
 
+from memoryguard.access_context import AccessContext
 from memoryguard.agent_locator import AgentLocator
 from memoryguard.agent_profiles import (
-    AgentProfileRegistry, _claude_code_profile, _codex_profile,
-    _cursor_profile, _trae_profile, expand_path,
+    _claude_code_profile,
+    _codex_profile,
+    _cursor_profile,
+    _trae_profile,
 )
-from memoryguard.content_parsers import parse_file
-from memoryguard.memory_ir import MemoryNormalizer
-from memoryguard.schema_v3 import (
-    CoverageLedger, IngestionPolicy, SourceCategory, SourceObject, SourceSnapshot,
-    stable_hash,
-)
-from memoryguard.source_registry import DirectoryAdapter, META_EXTS, ScanBudget
-from memoryguard.schema_v3 import SourceRoot, SourceRootType
+from memoryguard.content.store import ContentStore
+from memoryguard.evidence.store import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtomStore, MemoryReadScope
+from memoryguard.runtime_v2.extraction_native import NativeExtractionEnrichmentService
+from memoryguard.runtime_v2.native_ports import bind_native_transport_context
+from memoryguard.runtime_v2.source_control import SourceControlError, SourceControlService
+from memoryguard.schema_v3 import IngestionPolicy, SourceCategory
+
 
 FIXTURES = Path(__file__).parent / "fixtures" / "agent_memories"
 HOME = FIXTURES / "home"
@@ -27,6 +31,7 @@ APPDATA = FIXTURES / "appdata"
 @pytest.fixture(scope="module", autouse=True)
 def _ensure_fixtures():
     from _build_agent_memory_fixtures import main
+
     main()
 
 
@@ -39,292 +44,228 @@ def fake_home(monkeypatch):
     return home
 
 
+def _context(tmp_path: Path, agent: str = "agent-a", group: str = "group-a"):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"session-{agent}",
+            session_source="pytest",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id=group,
+        project_ref=str(tmp_path.resolve()),
+        provider="pytest",
+        runtime_role="test",
+    )
+
+
+def _read_scope(tmp_path: Path, agent: str = "agent-a", group: str = "group-a") -> MemoryReadScope:
+    return MemoryReadScope(
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id=group,
+        agent_instance_id=agent,
+        project_ref=str(tmp_path.resolve()),
+        provider="pytest",
+        runtime_role="test",
+    )
+
+
+def _native_service(tmp_path: Path, source: Path, *, agent: str = "agent-a", group: str = "group-a"):
+    ContentStore(tmp_path)
+    MemoryAtomStore(tmp_path)
+    EvidenceStore(tmp_path)
+    GovernanceV2(tmp_path)
+    SourceControlService(tmp_path).add(
+        str(source),
+        "selected_file" if source.is_file() else "selected_directory",
+        {"admin": True, "agent_instance_id": agent},
+        display_name=source.name,
+    )
+    return NativeExtractionEnrichmentService(tmp_path), _context(tmp_path, agent, group)
+
+
 def test_claude_native_memory_import_verbatim_default(fake_home, tmp_path):
     profile = _claude_code_profile()
-    mem = next(s for s in profile.surfaces if s.surface_id == "claude_project_native_memory")
-    assert mem.ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
-    assert mem.category == SourceCategory.NATIVE_MEMORY
+    memory = next(item for item in profile.surfaces if item.surface_id == "claude_project_native_memory")
+    assert memory.ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
+    assert memory.category == SourceCategory.NATIVE_MEMORY
 
     locator = AgentLocator(tmp_path)
-    # inject surfaces with fake home resolution
     instances, _ = locator.detect_instances()
-    claude = next((i for i in instances if i.product == "claude-code"), None)
+    claude = next((item for item in instances if item.product == "claude-code"), None)
     assert claude is not None
     tree = locator.get_selection_tree(claude.instance_id)
     files = []
     for scope in tree.get("scopes", []):
-        for proj in scope.get("projects", []):
-            for cat in proj.get("categories", []):
-                files.extend(cat.get("files", []))
-        for cat in scope.get("categories", []):
-            files.extend(cat.get("files", []))
-    mem_files = [f for f in files if "memory" in f.get("path", "").replace("\\", "/") and f.get("path", "").endswith(".md")]
-    assert mem_files, f"expected memory md files in tree, got {[f.get('path') for f in files][:20]}"
-    assert any(f.get("default_selected") for f in mem_files if f.get("ingestion_policy") == "import_verbatim")
+        for project in scope.get("projects", []):
+            for category in project.get("categories", []):
+                files.extend(category.get("files", []))
+        for category in scope.get("categories", []):
+            files.extend(category.get("files", []))
+    memory_files = [
+        item for item in files
+        if "memory" in item.get("path", "").replace("\\", "/") and item.get("path", "").endswith(".md")
+    ]
+    assert memory_files
+    assert any(item.get("default_selected") for item in memory_files if item.get("ingestion_policy") == "import_verbatim")
 
 
 def test_selection_tree_lists_second_third_level_files(fake_home, tmp_path):
     locator = AgentLocator(tmp_path)
     instances, _ = locator.detect_instances()
-    by_product = {i.product: i for i in instances}
-    assert "claude-code" in by_product
-    assert "cursor" in by_product
-    assert "codex" in by_product
-    assert "trae" in by_product
+    by_product = {item.product: item for item in instances}
+    assert {"claude-code", "cursor", "codex", "trae"}.issubset(by_product)
 
     def collect(instance_id: str) -> list[str]:
-        tree = locator.get_selection_tree(instance_id)
         paths = []
+        tree = locator.get_selection_tree(instance_id)
         for scope in tree.get("scopes", []):
-            for proj in scope.get("projects", []):
-                for cat in proj.get("categories", []):
-                    for f in cat.get("files", []):
-                        paths.append(f.get("path", "").replace("\\", "/"))
-            for cat in scope.get("categories", []):
-                for f in cat.get("files", []):
-                    paths.append(f.get("path", "").replace("\\", "/"))
+            for project in scope.get("projects", []):
+                for category in project.get("categories", []):
+                    paths.extend(item.get("path", "").replace("\\", "/") for item in category.get("files", []))
+            for category in scope.get("categories", []):
+                paths.extend(item.get("path", "").replace("\\", "/") for item in category.get("files", []))
         return paths
 
-    claude_paths = collect(by_product["claude-code"].instance_id)
-    assert any("/memory/user.md" in p for p in claude_paths)
-    assert any("sess-1.jsonl" in p for p in claude_paths)
-    assert any("subagents/agent-1.jsonl" in p for p in claude_paths)
-
-    cursor_paths = collect(by_product["cursor"].instance_id)
-    assert any("agent-transcripts" in p and p.endswith(".jsonl") for p in cursor_paths)
-
-    def collect_files(instance_id: str) -> list[dict]:
-        tree = locator.get_selection_tree(instance_id)
-        files: list[dict] = []
-        for scope in tree.get("scopes", []):
-            for proj in scope.get("projects", []):
-                for cat in proj.get("categories", []):
-                    files.extend(cat.get("files", []))
-            for cat in scope.get("categories", []):
-                files.extend(cat.get("files", []))
-        return files
-
+    assert any("/memory/user.md" in path for path in collect(by_product["claude-code"].instance_id))
+    assert any("agent-transcripts" in path for path in collect(by_product["cursor"].instance_id))
     codex_paths = collect(by_product["codex"].instance_id)
-    assert any("rollout-demo.jsonl" in p for p in codex_paths)
-    assert any("/memories/preferences.md" in p.replace("\\", "/") for p in codex_paths)
-    codex_files = collect_files(by_product["codex"].instance_id)
-    assert any(
-        f.get("default_selected")
-        for f in codex_files
-        if "memories" in f.get("path", "").replace("\\", "/")
-        and f.get("ingestion_policy") == "import_verbatim"
-    )
-
+    assert any("rollout-demo.jsonl" in path for path in codex_paths)
+    assert any("/memories/preferences.md" in path for path in codex_paths)
     trae_paths = collect(by_product["trae"].instance_id)
-    assert any(p.endswith("project_memory.md") for p in trae_paths)
-    assert any("session_memory_1.jsonl" in p for p in trae_paths)
-    assert any(p.endswith("topics.md") for p in trae_paths)
+    assert any(path.endswith("project_memory.md") for path in trae_paths)
+    assert any("session_memory_1.jsonl" in path for path in trae_paths)
 
 
-def test_session_jsonl_extract_candidates_enters_ir(tmp_path):
-    p = FIXTURES / "home/.claude/projects/demo-proj/sess-1.jsonl"
-    content = p.read_text(encoding="utf-8")
-    root_id = "sess-root"
-    obj = SourceObject(
-        source_object_id=stable_hash(root_id, "sess-1.jsonl"),
-        source_root_id=root_id,
-        relative_path="sess-1.jsonl",
-        content_hash=stable_hash(content),
-        media_type="application/x-jsonlines",
-    )
-    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=[obj], coverage=CoverageLedger())
-    ir = MemoryNormalizer(tmp_path).normalize(
-        snap,
-        root_map={root_id: str(p.parent)},
-        root_policies={root_id: {
-            "source_category": "conversation_history",
-            "ingestion_policy": "extract_candidates",
-        }},
-    )
-    assert ir.records, "high-signal session lines must enter IR"
-    bodies = "\n".join(r.body for r in ir.records).lower()
+def test_session_jsonl_extract_candidates_are_staged_by_native_extraction(tmp_path):
+    source = FIXTURES / "home/.claude/projects/demo-proj/sess-1.jsonl"
+    service, context = _native_service(tmp_path, source)
+    preview = service.extract({"source_path": str(source)}, context=context)
+    assert preview["staging"] == "v2_content_plane"
+    assert preview["candidates"]
+    bodies = "\n".join(item["preview"] for item in preview["candidates"]).lower()
     assert "prefer short" in bodies
-    assert all("bash" not in r.body.lower() for r in ir.records)
+    assert all("bash" not in item["preview"].lower() for item in preview["candidates"])
+    assert MemoryAtomStore(tmp_path, readonly=True).list_atoms(scope=_read_scope(tmp_path)) == []
 
 
-def test_evidence_only_still_blocked(tmp_path):
-    p = FIXTURES / "home/.claude/projects/demo-proj/sess-1.jsonl"
-    content = p.read_text(encoding="utf-8")
-    root_id = "ev"
-    obj = SourceObject(
-        source_object_id=stable_hash(root_id, "sess-1.jsonl"),
-        source_root_id=root_id,
-        relative_path="sess-1.jsonl",
-        content_hash=stable_hash(content),
-    )
-    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=[obj], coverage=CoverageLedger())
-    ir = MemoryNormalizer(tmp_path).normalize(
-        snap,
-        root_map={root_id: str(p.parent)},
-        root_policies={root_id: {
-            "source_category": "conversation_history",
-            "ingestion_policy": "evidence_only",
-        }},
-    )
-    assert ir.records == []
+def test_native_extraction_preview_does_not_auto_commit(tmp_path):
+    source = FIXTURES / "home/.claude/projects/demo-proj/sess-1.jsonl"
+    service, context = _native_service(tmp_path, source)
+    preview = service.extract({"source_path": str(source)}, context=context)
+    assert preview["candidates"]
+    assert not (tmp_path / ".memoryguard" / "shared-memory").exists()
+    assert MemoryAtomStore(tmp_path, readonly=True).list_atoms(scope=_read_scope(tmp_path)) == []
 
 
 def test_plan_docs_and_project_extract_do_not_auto_ingest(tmp_path):
-    """项目目录 + extract_candidates 不得把 .plan.md / 任务台账灌进 IR。"""
-    plans = tmp_path / ".cursor" / "plans"
+    project = tmp_path / "project"
+    plans = project / ".cursor" / "plans"
     plans.mkdir(parents=True)
     plan = plans / "ship.plan.md"
     plan.write_text("# Ship\n\nDo the thing.\n", encoding="utf-8")
-    knowledge = tmp_path / "docs" / "notes.md"
-    knowledge.parent.mkdir(parents=True)
-    knowledge.write_text("# Notes\n\nUseful fact.\n", encoding="utf-8")
+    notes = project / "docs" / "notes.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("# Notes\n\nUseful fact.\n", encoding="utf-8")
+    service, context = _native_service(tmp_path, project)
+    previews = [service.extract({"source_path": str(path)}, context=context) for path in (plan, notes)]
+    assert all(item["staging"] == "v2_content_plane" and item["candidates"] for item in previews)
+    assert MemoryAtomStore(tmp_path, readonly=True).list_atoms(scope=_read_scope(tmp_path)) == []
 
-    root_id = "proj"
-    objs = []
-    for rel, path in (
-        (".cursor/plans/ship.plan.md", plan),
-        ("docs/notes.md", knowledge),
-    ):
-        content = path.read_text(encoding="utf-8")
-        objs.append(SourceObject(
-            source_object_id=stable_hash(root_id, rel),
-            source_root_id=root_id,
-            relative_path=rel,
-            content_hash=stable_hash(content),
-            media_type="text/markdown",
-        ))
-    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=objs, coverage=CoverageLedger())
-    ir = MemoryNormalizer(tmp_path).normalize(
-        snap,
-        root_map={root_id: str(tmp_path)},
-        root_policies={root_id: {
-            "source_category": "knowledge_source",
-            "ingestion_policy": "extract_candidates",
-        }},
+
+def test_frontmatter_kind_survives_native_extraction(tmp_path):
+    source = FIXTURES / "home/.claude/projects/demo-proj/memory/user.md"
+    service, context = _native_service(tmp_path, source)
+    preview = service.extract({"source_path": str(source)}, context=context)
+    assert preview["candidates"]
+    assert any(item["kind"] == "preference" for item in preview["candidates"])
+    accepted = service.accept(
+        {"extract_id": preview["extract_id"], "candidate_ids": [item["candidate_id"] for item in preview["candidates"]]},
+        context=context,
     )
-    assert ir.records == []
+    assert accepted["total"] == len(preview["candidates"])
+    atoms = MemoryAtomStore(tmp_path, readonly=True).list_atoms(scope=_read_scope(tmp_path))
+    assert any(atom.kind == "preference" for atom in atoms)
 
 
-def test_frontmatter_kind_survives_normalize(tmp_path):
-    p = FIXTURES / "home/.claude/projects/demo-proj/memory/user.md"
-    content = p.read_text(encoding="utf-8")
-    root_id = "mem"
-    obj = SourceObject(
-        source_object_id=stable_hash(root_id, "user.md"),
-        source_root_id=root_id,
-        relative_path="user.md",
-        content_hash=stable_hash(content),
-        media_type="text/markdown",
+def test_sqlite_source_is_reported_as_unsupported_by_source_control(tmp_path):
+    database = FIXTURES / "home/.codex/state_5.sqlite"
+    ContentStore(tmp_path)
+    source = SourceControlService(tmp_path).add(
+        str(database), "selected_file", {"admin": True, "agent_instance_id": "agent-a"}, display_name="state"
     )
-    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=[obj], coverage=CoverageLedger())
-    ir = MemoryNormalizer(tmp_path).normalize(
-        snap,
-        root_map={root_id: str(p.parent)},
-        root_policies={root_id: {
-            "source_category": "native_memory",
-            "ingestion_policy": "import_verbatim",
-        }},
-    )
-    assert ir.records
-    assert any(r.kind.value == "preference" for r in ir.records)
-
-
-def test_sqlite_meta_read_via_adapter(tmp_path):
-    db = FIXTURES / "home/.codex/state_5.sqlite"
-    root = SourceRoot(
-        root_id="sqlite-root",
-        type=SourceRootType.SELECTED_FILE,
-        display_name="state",
-        path=str(db),
-        enabled=True,
-    )
-    from memoryguard.source_registry import SelectedFileAdapter
-    adapter = SelectedFileAdapter(root)
-    objs, entry = adapter.read(db, db)
-    assert objs is not None
-    assert objs.read_status == "meta"
-    assert objs.media_type.endswith("sqlite3")
-    segs = parse_file(db, media_type=objs.media_type)
-    assert segs[0].signal_level == "meta"
+    control = SourceControlService(tmp_path)
+    summary = control.scan_summary({"admin": True})
+    assert summary["coverage"]["candidate_count"] == 1
+    assert summary["coverage"]["unsupported"] == 1
+    item = control.raw_summary({"admin": True})["groups"][0]["files"][0]
+    assert item["read_status"] == "unsupported"
+    assert item["media_type"] == "application/octet-stream"
+    with pytest.raises(SourceControlError, match="source_file_unsupported"):
+        control.content_preview(source["source_id"], "", {"admin": True})
 
 
 def test_trae_policies():
     profile = _trae_profile()
-    by_id = {s.surface_id: s for s in profile.surfaces}
+    by_id = {surface.surface_id: surface for surface in profile.surfaces}
     assert by_id["trae_user_profile"].ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
     assert by_id["trae_project_memory"].ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
     assert by_id["trae_session_memory"].ingestion_policy == IngestionPolicy.EXTRACT_CANDIDATES
     assert by_id["trae_topics"].category == SourceCategory.CONVERSATION_HISTORY
-    assert by_id["trae_topics"].ingestion_policy == IngestionPolicy.EXTRACT_CANDIDATES
 
 
 def test_codex_native_memories_surface():
-    profile = _codex_profile()
-    by_id = {s.surface_id: s for s in profile.surfaces}
-    mem = by_id["codex_native_memories"]
-    assert mem.category == SourceCategory.NATIVE_MEMORY
-    assert mem.ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
-    assert "MEMORY.md" in (mem.file_globs or [])
-    assert any("rollout_summaries" in g for g in (mem.file_globs or []))
+    surface = {item.surface_id: item for item in _codex_profile().surfaces}["codex_native_memories"]
+    assert surface.category == SourceCategory.NATIVE_MEMORY
+    assert surface.ingestion_policy == IngestionPolicy.IMPORT_VERBATIM
+    assert "MEMORY.md" in surface.file_globs
+    assert any("rollout_summaries" in glob for glob in surface.file_globs)
 
 
 def test_empty_native_memory_dir_still_selectable(tmp_path, monkeypatch):
-    """专用记忆目录存在但 glob 无匹配时，仍应露出可勾选目录节点。"""
     from memoryguard.schema_v3 import AgentInstance, DiscoveryLedger, TargetCapability
 
     home = tmp_path / "home"
-    mem = home / ".codex" / "memories"
-    mem.mkdir(parents=True)
+    memories = home / ".codex" / "memories"
+    memories.mkdir(parents=True)
     (home / ".codex" / "config.toml").write_text(
-        "[memories]\ngenerate_memories = false\nuse_memories = false\n",
-        encoding="utf-8",
+        "[memories]\ngenerate_memories = false\nuse_memories = false\n", encoding="utf-8"
     )
     monkeypatch.setattr(Path, "home", lambda: home)
-
-    mem_info = {
-        "surface_id": "codex_native_memories",
-        "resolved_path": str(mem),
-        "status": "found",
-        "scope": "user",
-        "category": "native_memory",
-        "ingestion_policy": "import_verbatim",
-        "ownership": "agent_managed",
-        "target_role": "takeover_input",
-        "classification_confidence": 0.95,
-        "file_globs": ["MEMORY.md", "memory_summary.md", "raw_memories.md", "*.md"],
-    }
-    inst = AgentInstance(
+    instance = AgentInstance(
         instance_id="codex-test",
         profile_id="codex@profile-1",
         product="codex",
         profile_version="2",
-        surfaces=[mem_info],
+        surfaces=[{
+            "surface_id": "codex_native_memories",
+            "resolved_path": str(memories),
+            "status": "found",
+            "scope": "user",
+            "category": "native_memory",
+            "ingestion_policy": "import_verbatim",
+            "ownership": "agent_managed",
+            "target_role": "takeover_input",
+            "classification_confidence": 0.95,
+            "file_globs": ["MEMORY.md", "memory_summary.md", "raw_memories.md", "*.md"],
+        }],
         target_capability=TargetCapability.EXPORT_ONLY,
     )
     locator = AgentLocator(tmp_path)
-    monkeypatch.setattr(
-        AgentLocator,
-        "detect_instances",
-        lambda self: ([inst], {"codex-test": DiscoveryLedger(instance_id="codex-test")}),
-    )
+    monkeypatch.setattr(AgentLocator, "detect_instances", lambda self: ([instance], {"codex-test": DiscoveryLedger(instance_id="codex-test")}))
     tree = locator.get_selection_tree("codex-test")
-    files = []
-    for scope in tree.get("scopes", []):
-        for cat in scope.get("categories", []):
-            files.extend(cat.get("files", []))
-    assert files, "empty memories dir must still appear"
-    assert any(f.get("empty_glob_match") for f in files)
-    assert any(f.get("selectable") for f in files)
-    notes = tree.get("discovery_notes", [])
-    assert any(n.get("code") == "codex_memories_disabled" for n in notes)
-    assert any(n.get("code") == "codex_memories_empty" for n in notes)
+    files = [file for scope in tree.get("scopes", []) for category in scope.get("categories", []) for file in category.get("files", [])]
+    assert files
+    assert any(file.get("empty_glob_match") and file.get("selectable") for file in files)
+    assert any(item.get("code") == "codex_memories_empty" for item in tree.get("discovery_notes", []))
 
 
 def test_empty_file_globs_do_not_fallback_to_directory(fake_home, tmp_path):
-    """声明 file_globs 但无匹配时，不得回退授权整目录。"""
     locator = AgentLocator(tmp_path)
-    instances, _ = locator.detect_instances()
-    # 构造假 surface：指向 projects 但 glob 无匹配
     surface = {
         "surface_id": "empty_glob",
         "resolved_path": str(HOME / ".claude" / "projects"),
@@ -333,58 +274,38 @@ def test_empty_file_globs_do_not_fallback_to_directory(fake_home, tmp_path):
         "category": "native_memory",
         "ingestion_policy": "import_verbatim",
         "file_globs": ["memory/DOES_NOT_EXIST_*.md"],
-        "ownership": "agent_managed",
-        "target_role": "takeover_input",
-        "classification_confidence": 0.9,
     }
-    expanded = locator._expand_project_root(surface["resolved_path"], surface)
-    assert expanded == []
-    # get_selection_tree 路径：has_globs 时 effective=expanded=[]，不暴露目录
-    effective = expanded if surface.get("file_globs") else [surface]
-    assert effective == []
+    assert locator._expand_project_root(surface["resolved_path"], surface) == []
 
 
-def test_import_verbatim_preserves_body(tmp_path):
-    p = FIXTURES / "home/.claude/projects/demo-proj/memory/user.md"
-    content = p.read_text(encoding="utf-8")
-    # 取 frontmatter 后正文
-    body_only = content.split("---", 2)[-1].strip()
-    root_id = "mem"
-    obj = SourceObject(
-        source_object_id=stable_hash(root_id, "user.md"),
-        source_root_id=root_id,
-        relative_path="user.md",
-        content_hash=stable_hash(content),
-        media_type="text/markdown",
+def test_native_accept_preserves_imported_body(tmp_path):
+    source = FIXTURES / "home/.claude/projects/demo-proj/memory/user.md"
+    content = source.read_text(encoding="utf-8")
+    expected = content.split("---", 2)[-1].strip()
+    service, context = _native_service(tmp_path, source)
+    preview = service.extract({"source_path": str(source)}, context=context)
+    accepted = service.accept(
+        {"extract_id": preview["extract_id"], "candidate_ids": [item["candidate_id"] for item in preview["candidates"]]},
+        context=context,
     )
-    snap = SourceSnapshot(snapshot_id="s", created_at="", source_objects=[obj], coverage=CoverageLedger())
-    ir = MemoryNormalizer(tmp_path).normalize(
-        snap,
-        root_map={root_id: str(p.parent)},
-        root_policies={root_id: {
-            "source_category": "native_memory",
-            "ingestion_policy": "import_verbatim",
-        }},
-    )
-    assert ir.records
-    assert ir.records[0].body == body_only
-    assert ir.records[0].original_body == body_only
+    atoms = MemoryAtomStore(tmp_path, readonly=True).list_atoms(scope=_read_scope(tmp_path))
+    assert accepted["total"] == len(atoms) > 0
+    assert expected in {atom.body for atom in atoms}
 
 
 def test_codex_sessions_not_year_as_project(fake_home, tmp_path):
     locator = AgentLocator(tmp_path)
     instances, _ = locator.detect_instances()
-    codex = next(i for i in instances if i.product == "codex")
+    codex = next(item for item in instances if item.product == "codex")
     tree = locator.get_selection_tree(codex.instance_id)
     refs = []
     for scope in tree.get("scopes", []):
-        for proj in scope.get("projects", []):
-            refs.append(proj.get("project_ref"))
-        for cat in scope.get("categories", []):
-            for f in cat.get("files", []):
-                if "rollout" in f.get("path", ""):
-                    refs.append(f.get("project_ref", ""))
+        for project in scope.get("projects", []):
+            refs.append(project.get("project_ref"))
+        for category in scope.get("categories", []):
+            refs.extend(file.get("project_ref", "") for file in category.get("files", []) if "rollout" in file.get("path", ""))
     assert "2026" not in refs
+
 
 def test_profile_versions_bumped():
     assert _claude_code_profile().profile_version == "2"
@@ -394,8 +315,8 @@ def test_profile_versions_bumped():
 
 
 def test_interactive_renders_user_scope_projects():
-    src = Path(__file__).resolve().parents[1] / "src" / "memoryguard" / "interactive.py"
-    text = src.read_text(encoding="utf-8")
+    source = Path(__file__).resolve().parents[1] / "src" / "memoryguard" / "interactive.py"
+    text = source.read_text(encoding="utf-8")
     assert "MEMORY_SELECT_CATS" in text
     assert "renderScopeCategories" in text
     assert "for (const proj of projects)" in text

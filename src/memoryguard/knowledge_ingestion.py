@@ -17,13 +17,13 @@ from .knowledge_chunker import chunk_document
 from .knowledge_parser import parse_content, SUPPORTED_EXTENSIONS, CODE_EXTENSIONS
 from .knowledge_store import Book, Chunk, KnowledgeStore, _stable_hash
 from .knowledge_policy import KnowledgeAccessPolicy
-from .source_registry import (
+from .runtime_v2.source_native import (
     DEFAULT_PROJECT_EXCLUDE,
     INSTRUCTION_FILES,
     ScanBudget,
 )
 
-# 知识库扫描默认预算（复用 SourceRegistry 的预算语义，防止失控）
+# 知识库扫描默认预算（复用 V2 source scan 语义，防止失控）
 KNOWLEDGE_SCAN_BUDGET = ScanBudget(
     max_files=20000,
     max_total_size=500 * 1024 * 1024,
@@ -582,7 +582,7 @@ def _scan_files(root: Path, include_globs: str, exclude_globs: str,
     """扫描目录下所有支持的文件（带预算与安全边界）。
 
     返回 KnowledgeScanResult：含文件列表、是否完整、截断原因。
-    复用 SourceRegistry 的默认排除与预算语义：文件数、总大小、单文件大小、
+    复用 V2 source scan 的默认排除与预算语义：文件数、总大小、单文件大小、
     深度、超时、符号链接逃逸、默认排除目录。
     """
     budget = budget or KNOWLEDGE_SCAN_BUDGET

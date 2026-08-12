@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .adapters import ImportedConversation
-from .agent_binding import AgentBindingStore
-from .conversation_history import ConversationHistoryStore, HistoryScope
+from .content.conversation_sync import ConversationEvent, ConversationSync
+from .content.store import ContentStore, stable_id
+from .runtime_v2.group_native import GroupControlService
+from .runtime_v2.history_store import V2HistoryScope
 
 
 SUPPORTED_PROVIDERS = ("codex", "claude", "cursor")
@@ -253,6 +255,18 @@ def _parse_jsonl(source: HistoryImportSource) -> ParsedHistoryFile:
     # decoded within the budget.  No synthetic body is created.
     if not external_id:
         return ParsedHistoryFile(None, read_bytes, truncated)
+    if not title:
+        # V2 stores do not infer a title while opening a read-only history
+        # projection.  Preserve the first visible user message as the
+        # provider-neutral session label when the host omitted one; transcript
+        # payloads remain event content and are never written to receipts.
+        first_user = next(
+            (str(item.get("content") or "").strip() for item in messages
+             if str(item.get("role") or "").casefold() == "user"
+             and str(item.get("content") or "").strip()),
+            "",
+        )
+        title = first_user.splitlines()[0].strip() if first_user else ""
     if truncated:
         # Do not turn a rollout filename into the user-facing session title.
         # The history store derives a readable first-user/fallback title.
@@ -334,7 +348,7 @@ def _active_scope(
     provider: str,
     agent_ids_by_provider: dict[str, str],
     detected_providers: dict[str, str] | None = None,
-) -> HistoryScope | None:
+) -> V2HistoryScope | None:
     if workspace is None:
         return None
     agent_id = str(agent_ids_by_provider.get(provider) or "").strip()
@@ -343,11 +357,22 @@ def _active_scope(
     detected_providers = detected_providers if detected_providers is not None else _detected_provider_by_agent(workspace)
     if detected_providers.get(agent_id) != _provider_product(provider):
         return None
-    bindings = AgentBindingStore(workspace).find_by_agent(agent_id, include_inactive=False)
-    if len(bindings) != 1:
+    try:
+        binding = GroupControlService(workspace, write=False).active_binding_for_agent(agent_id)
+    except Exception:
         return None
-    binding = bindings[0]
-    return HistoryScope(agent_instance_id=agent_id, provider=provider, share_group_id=binding.share_group_id)
+    if not isinstance(binding, dict):
+        return None
+    group = str(binding.get("share_group_id") or "").strip()
+    if not group:
+        return None
+    return V2HistoryScope(
+        agent_instance_id=agent_id,
+        provider=provider,
+        share_group_id=group,
+        authorized_agent_ids=(agent_id,),
+        shared_read=not group.startswith("personal-"),
+    )
 
 
 def backfill_local_history(
@@ -389,7 +414,6 @@ def backfill_local_history(
         item.provider for item in ready
         if _active_scope(root, item.provider, agent_ids_by_provider, detected_providers) is None
     })
-    store = ConversationHistoryStore(root)
     for source in ready:
         if source.provider in pending_binding:
             continue
@@ -417,15 +441,48 @@ def backfill_local_history(
         if scope is None:  # binding may have changed during a long batch
             pending_binding = sorted(set(pending_binding) | {source.provider})
             continue
-        result = store.import_conversations(
-            [parsed.conversation], provider=source.provider, scope=scope,
-            shadow=shadow, shadow_max_turns=shadow_max_turns,
-            shadow_max_chars=shadow_max_chars,
+        conversation = parsed.conversation
+        events = [
+            ConversationEvent(
+                external_object_key=str(conversation.conv_id),
+                content=str(message.get("content") or ""),
+                role=str(message.get("role") or "user"),
+                ordinal=index,
+                event_id=str(message.get("event_id") or message.get("id") or ""),
+                source_revision=fingerprint,
+                title=str(conversation.title or "")[:512],
+                provider=source.provider,
+                workspace_id=str(root),
+                agent_instance_id=scope.agent_instance_id,
+                project_ref=str(conversation.project_ref or scope.project_ref or ""),
+                share_group_id=scope.share_group_id,
+                metadata={"source_path": str(source.path)},
+                locator={"message_index": index},
+            )
+            for index, message in enumerate(conversation.messages)
+            if isinstance(message, dict) and str(message.get("content") or "").strip()
+            and str(message.get("role") or "").casefold() in {"user", "assistant"}
+        ]
+        if not events:
+            skipped += 1
+            state[state_key] = fingerprint
+            continue
+        content = ContentStore(
+            root,
+            workspace_id=str(root),
+            trust_domain="conversation-import",
+            sensitivity="normal",
+            retention_authority="workspace",
         )
-        if isinstance(result.get("shadow"), list):
-            shadow_results.extend(item for item in result["shadow"] if isinstance(item, dict))
-        imported += int(result["conversation_count"])
-        imported_by_provider[source.provider] = imported_by_provider.get(source.provider, 0) + int(result["conversation_count"])
+        result = ConversationSync(content).sync(
+            stable_id("history-import", source.provider, str(source.path)),
+            events,
+            owner_id="history-import:" + scope.agent_instance_id,
+            max_turns=max(1, len(events)),
+            max_chars=max(1, sum(len(str(event.content)) for event in events)),
+        )
+        imported += 1
+        imported_by_provider[source.provider] = imported_by_provider.get(source.provider, 0) + 1
         if parsed.truncated:
             partial += 1
             state[state_key] = f"partial:{fingerprint}"

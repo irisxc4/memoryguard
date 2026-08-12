@@ -1,9 +1,13 @@
-"""本地知识库卡片与删除映射的行为验收。"""
+"""V2 本地知识库卡片与删除映射的行为验收。"""
 
-from memoryguard.gui import GovernanceApi
+from memoryguard.content.store import ContentStore
 from memoryguard.interactive import render_interactive_html
-from memoryguard.schema_v3 import SourceRootType
-from memoryguard.source_registry import SourceRegistry
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.source_control import SourceControlService
+
+
+def _admin_context() -> dict[str, bool]:
+    return {"is_admin": True}
 
 
 def test_data_page_renders_local_knowledge_library_controls() -> None:
@@ -24,25 +28,27 @@ def test_remove_source_deletes_mapping_but_preserves_original_folder(tmp_path) -
     knowledge.mkdir()
     note = knowledge / "decision.md"
     note.write_text("MemoryGuard 只接管长期记忆。", encoding="utf-8")
-    api = GovernanceApi(str(workspace))
+    service = SourceControlService(workspace)
 
-    added = api.add_source(
-        str(knowledge), "selected_directory", "项目知识库", confirmed=True,
+    added = service.add(
+        str(knowledge), "selected_directory", _admin_context(),
+        display_name="项目知识库",
     )
     root_id = added["root_id"]
-    listed = api.list_sources()["sources"]
+    listed = service.list_sources(_admin_context())["sources"]
     source = next(item for item in listed if item["root_id"] == root_id)
 
     assert source["path_exists"] is True
-    assert source["path_kind"] == "directory"
+    assert source["type"] == "selected_directory"
 
-    removed = api.remove_source(root_id, confirmed=True)
+    removed = service.remove(root_id, _admin_context())
 
-    assert removed == {"ok": True}
+    assert removed["ok"] is True
+    assert removed["source_id"] == root_id
     assert knowledge.is_dir()
     assert note.read_text(encoding="utf-8") == "MemoryGuard 只接管长期记忆。"
     assert root_id not in {
-        item["root_id"] for item in api.list_sources()["sources"]
+        item["root_id"] for item in service.list_sources(_admin_context())["sources"]
     }
 
 
@@ -58,32 +64,33 @@ def test_manual_libraries_are_independent_of_agent_scopes(tmp_path) -> None:
     (vault / ".obsidian").mkdir()
     (vault / "vault-note.md").write_text("Obsidian note", encoding="utf-8")
     document.write_text("普通文档", encoding="utf-8")
-    api = GovernanceApi(str(workspace))
+    service = SourceControlService(workspace)
 
     roots = [
-        api.add_source(str(library), "selected_directory", confirmed=True)["root_id"],
-        api.add_source(str(document), "selected_file", confirmed=True)["root_id"],
-        api.add_source(str(vault), "directory", confirmed=True)["root_id"],
+        service.add(str(library), "selected_directory", _admin_context())["root_id"],
+        service.add(str(document), "selected_file", _admin_context())["root_id"],
+        service.add(str(vault), "directory", _admin_context())["root_id"],
     ]
-    sources = {item["root_id"]: item for item in api.list_sources()["sources"]}
+    sources = {
+        item["root_id"]: item
+        for item in service.list_sources(_admin_context())["sources"]
+    }
 
-    assert "src-project-default" in sources
-    assert sources["src-project-default"]["type"] == "project_directory"
     assert [sources[root_id]["type"] for root_id in roots] == [
         "selected_directory", "selected_file", "obsidian_vault",
     ]
-    assert all(sources[root_id]["source_category"] == "knowledge_source" for root_id in roots)
-    assert all(sources[root_id]["agent_instance_id"] == "" for root_id in roots)
-    assert all(sources[root_id]["scope_source"] == "fallback" for root_id in roots)
+    assert all(sources[root_id]["scope"] == "workspace" for root_id in roots)
+    assert all(sources[root_id]["enabled"] is True for root_id in roots)
 
-    scanned_roots = {group["root_id"] for group in api.get_raw_memory()["groups"]}
+    scanned_roots = {
+        group["root_id"]
+        for group in service.raw_summary(_admin_context())["groups"]
+    }
     assert set(roots) <= scanned_roots
-    agent_files = [
-        file_info
-        for category in api.get_agent_data("manual-user-root")["categories"].values()
-        for file_info in category
-    ]
-    assert not ({file_info["root_id"] for file_info in agent_files} & set(roots))
+    agent_view = service.list_sources(
+        {"is_admin": False, "trusted_agent_id": "manual-user-root"}
+    )
+    assert agent_view["sources"] == []
 
 
 def test_add_source_preserves_existing_agent_owned_unknown_root(tmp_path) -> None:
@@ -91,20 +98,29 @@ def test_add_source_preserves_existing_agent_owned_unknown_root(tmp_path) -> Non
     document = tmp_path / "agent-memory.md"
     workspace.mkdir()
     document.write_text("Agent-managed source", encoding="utf-8")
-    registry = SourceRegistry(workspace)
-    existing = registry.add(str(document), SourceRootType.SELECTED_FILE, "Agent memory")
-    existing.agent_instance_id = "agent-1"
-    existing.source_category = "unknown"
-    registry._save()
+    source_id = "agent-source-existing"
+    ContentStore(workspace).upsert_source_connector(
+        source_id=source_id,
+        provider="codex",
+        source_type="file",
+        external_root_key=str(document.resolve()),
+        workspace_id=str(workspace.resolve()),
+        enabled=True,
+    )
+    GroupControlService(workspace, write=True).record_selection(
+        "agent-1", [source_id], "agent-selection",
+    )
 
-    result = GovernanceApi(str(workspace)).add_source(
-        str(document), "selected_file", confirmed=True,
+    result = SourceControlService(workspace).add(
+        str(document), "selected_file", _admin_context(),
     )
     source = next(
-        item for item in GovernanceApi(str(workspace)).list_sources()["sources"]
+        item
+        for item in SourceControlService(workspace).list_sources(_admin_context())["sources"]
         if item["root_id"] == result["root_id"]
     )
 
-    assert result["root_id"] == existing.root_id
-    assert source["agent_instance_id"] == "agent-1"
-    assert source["source_category"] == "unknown"
+    assert result["root_id"] == source_id
+    assert result["changed"] is False
+    assert source["type"] == "selected_file"
+    assert GroupControlService(workspace).selected_source_ids("agent-1") == [source_id]

@@ -21,11 +21,11 @@ from ..content.store import ContentStore
 from ..content_parsers import parse_file
 from ..governance_v2 import GovernanceV2
 from ..memory.store import MemoryAtom, MemoryAtomStore
-from ..policies import _VALID_KINDS, classify_kind
 from ..storage.database import open_database
 from ..storage.transaction import transaction
 from .native_ports import NativePortError, resolve_native_transport_context
-from .safe_services import ImportPreviewService, PureSourceReadService
+from .source_control import SourceControlError, SourceControlService
+from .text_native import VALID_KINDS as _VALID_KINDS, classify_kind, looks_english_text
 
 
 _CANDIDATE_SOURCE = "native_extraction_candidates"
@@ -107,8 +107,7 @@ class NativeExtractionEnrichmentService:
             raise NativePortError("v2_content_schema_invalid")
         self.memory = memory_store or MemoryAtomStore(self.workspace, readonly=False)
         self.governance = governance or GovernanceV2(self.workspace, memory_store=self.memory)
-        self.source_reader = PureSourceReadService(self.workspace)
-        self.import_preview = ImportPreviewService(self.workspace, source_reader=self.source_reader)
+        self.sources = SourceControlService(self.workspace)
 
     # ------------------------------------------------------------------
     # Content-plane staging helpers
@@ -124,24 +123,48 @@ class NativeExtractionEnrichmentService:
         metadata: Mapping[str, Any],
         preserve_terminal: bool = False,
     ) -> str:
-        record_id = _digest(source_table, source_pk, record_type)[:32]
+        return self._put_records([{
+            "source_table": source_table,
+            "source_pk": source_pk,
+            "record_type": record_type,
+            "blob_id": blob_id,
+            "status": status,
+            "metadata": metadata,
+            "preserve_terminal": preserve_terminal,
+        }])[0]
+
+    def _put_records(self, records: Sequence[Mapping[str, Any]]) -> list[str]:
+        """Stage a native extraction batch in one Content Plane transaction."""
+        if not records:
+            return []
+        record_ids: list[str] = []
         with open_database(self.content.db_path) as conn:
             with transaction(conn):
-                existing = conn.execute(
-                    "SELECT status FROM knowledge_records WHERE source_table=? AND source_pk=? AND record_type=?",
-                    (source_table, source_pk, record_type),
-                ).fetchone()
-                effective = status
-                if preserve_terminal and existing is not None and str(existing[0] or "") in {"accepted", "applied"}:
-                    effective = str(existing[0])
-                conn.execute(
-                    "INSERT INTO knowledge_records(record_id,source_table,source_pk,record_type,content_blob_id,status,derived_status,metadata_json) "
-                    "VALUES(?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(source_table,source_pk,record_type) DO UPDATE SET "
-                    "content_blob_id=excluded.content_blob_id,status=excluded.status,derived_status=excluded.derived_status,metadata_json=excluded.metadata_json",
-                    (record_id, source_table, source_pk, record_type, blob_id, effective, "CANONICAL", _json(metadata)),
-                )
-        return record_id
+                for item in records:
+                    source_table = str(item.get("source_table") or "")
+                    source_pk = str(item.get("source_pk") or "")
+                    record_type = str(item.get("record_type") or "")
+                    blob_id = str(item.get("blob_id") or "")
+                    status = str(item.get("status") or "")
+                    metadata = item.get("metadata") or {}
+                    preserve_terminal = bool(item.get("preserve_terminal"))
+                    record_id = _digest(source_table, source_pk, record_type)[:32]
+                    existing = conn.execute(
+                        "SELECT status FROM knowledge_records WHERE source_table=? AND source_pk=? AND record_type=?",
+                        (source_table, source_pk, record_type),
+                    ).fetchone()
+                    effective = status
+                    if preserve_terminal and existing is not None and str(existing[0] or "") in {"accepted", "applied"}:
+                        effective = str(existing[0])
+                    conn.execute(
+                        "INSERT INTO knowledge_records(record_id,source_table,source_pk,record_type,content_blob_id,status,derived_status,metadata_json) "
+                        "VALUES(?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(source_table,source_pk,record_type) DO UPDATE SET "
+                        "content_blob_id=excluded.content_blob_id,status=excluded.status,derived_status=excluded.derived_status,metadata_json=excluded.metadata_json",
+                        (record_id, source_table, source_pk, record_type, blob_id, effective, "CANONICAL", _json(metadata)),
+                    )
+                    record_ids.append(record_id)
+        return record_ids
 
     def _records(self, source_table: str, scope: Mapping[str, Any]) -> list[dict[str, Any]]:
         scope_hash = _scope_digest(scope)
@@ -170,33 +193,43 @@ class NativeExtractionEnrichmentService:
         return result
 
     def _update_record_status(self, record_id: str, status: str, metadata: Mapping[str, Any]) -> None:
+        self._update_record_statuses([(record_id, status, metadata)])
+
+    def _update_record_statuses(
+        self,
+        updates: Sequence[tuple[str, str, Mapping[str, Any]]],
+    ) -> None:
+        """Update accepted staging rows in one Content Plane transaction."""
+        if not updates:
+            return
         with open_database(self.content.db_path) as conn:
             with transaction(conn):
-                changed = conn.execute(
-                    "UPDATE knowledge_records SET status=?,metadata_json=? WHERE record_id=?",
-                    (status, _json(metadata), record_id),
-                ).rowcount
-                if changed != 1:
-                    raise NativePortError("v2_staging_record_missing")
+                for record_id, status, metadata in updates:
+                    changed = conn.execute(
+                        "UPDATE knowledge_records SET status=?,metadata_json=? WHERE record_id=?",
+                        (status, _json(metadata), record_id),
+                    ).rowcount
+                    if changed != 1:
+                        raise NativePortError("v2_staging_record_missing")
 
     # ------------------------------------------------------------------
     # Extraction
     # ------------------------------------------------------------------
     def extract(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
         scope = _scope(context)
+        source_id = str(payload.get("source_id") or payload.get("root_id") or "").strip()
+        relative_path = str(payload.get("relative_path") or "").strip()
         raw_path = payload.get("source_path") or payload.get("path")
-        if not isinstance(raw_path, str) or not raw_path.strip():
-            raise NativePortError("source_path_required")
-        requested = Path(raw_path).expanduser()
-        if not requested.is_absolute():
-            requested = self.workspace / requested
-        # ImportPreviewService owns the source-root/reparse/containment check.
         try:
-            target = self.import_preview._target({"path": str(requested)})
-            root, _root_path = self.import_preview._authorized_root(target, context)
-        except Exception as exc:
-            code = str(getattr(exc, "code", "") or "path_out_of_scope")
-            raise NativePortError(code) from exc
+            if source_id:
+                _root_path, target = self.sources.resolve_file(source_id, relative_path, context)
+                resolved_source_id = source_id
+            else:
+                if not isinstance(raw_path, str) or not raw_path.strip():
+                    raise NativePortError("source_path_required")
+                resolved_source_id, _root_path, target = self.sources.resolve_path(raw_path, context)
+        except SourceControlError as exc:
+            raise NativePortError(exc.code) from exc
         if not target.is_file():
             raise NativePortError("source_file_required")
         try:
@@ -210,12 +243,13 @@ class NativeExtractionEnrichmentService:
         except OSError as exc:
             raise NativePortError("source_unavailable") from exc
         source_digest = hashlib.sha256(raw).hexdigest()
-        source_reference = f"source:{_digest(str(getattr(root, 'root_id', '')), target.name, source_digest)[:24]}"
+        source_reference = f"source:{_digest(resolved_source_id, target.name, source_digest)[:24]}"
         segments = parse_file(target, content=raw)
         if not segments:
             return {"extract_id": _digest("empty", source_reference, source_digest)[:32], "candidates": [], "total": 0}
         extract_id = _digest("extract", _scope_digest(scope), source_reference, source_digest)[:32]
         candidates: list[dict[str, Any]] = []
+        staged_records: list[dict[str, Any]] = []
         for index, segment in enumerate(segments[:_MAX_EXTRACT_SEGMENTS]):
             safe_body, secret_hit = _redact_secret(str(segment.body or ""))
             body = safe_body.strip()
@@ -237,7 +271,7 @@ class NativeExtractionEnrichmentService:
                 "scope_digest": _scope_digest(scope),
                 "source_reference": source_reference,
                 "source_digest": source_digest,
-                "source_root_id": str(getattr(root, "root_id", "") or ""),
+                "source_root_id": resolved_source_id,
                 "locator": str(segment.locator or ""),
                 "title": str(segment.title or "")[:160],
                 "kind": kind,
@@ -246,15 +280,15 @@ class NativeExtractionEnrichmentService:
                 "secret_redacted": bool(secret_hit),
                 "created_at": _now(),
             }
-            self._put_record(
-                source_table=_CANDIDATE_SOURCE,
-                source_pk=f"{extract_id}:{candidate_id}",
-                record_type="memory_candidate",
-                blob_id=blob_id,
-                status="staged",
-                metadata=meta,
-                preserve_terminal=True,
-            )
+            staged_records.append({
+                "source_table": _CANDIDATE_SOURCE,
+                "source_pk": f"{extract_id}:{candidate_id}",
+                "record_type": "memory_candidate",
+                "blob_id": blob_id,
+                "status": "staged",
+                "metadata": meta,
+                "preserve_terminal": True,
+            })
             candidates.append({
                 "candidate_id": candidate_id,
                 "kind": kind,
@@ -264,6 +298,7 @@ class NativeExtractionEnrichmentService:
                 "locator": str(segment.locator or ""),
                 "secret_redacted": bool(secret_hit),
             })
+        self._put_records(staged_records)
         return {
             "ok": True,
             "extract_id": extract_id,
@@ -273,35 +308,60 @@ class NativeExtractionEnrichmentService:
             "staging": "v2_content_plane",
         }
 
-    def accept(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
-        scope = _scope(context)
-        extract_id = str(payload.get("extract_id") or "").strip()
-        raw_ids = payload.get("candidate_ids")
-        if not extract_id:
-            raise NativePortError("extract_id_required")
-        if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
-            raise NativePortError("candidate_ids_required")
-        candidate_ids = [str(item).strip() for item in raw_ids]
-        if any(not item for item in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
-            raise NativePortError("candidate_ids_invalid")
-        rows = [
-            row for row in self._records(_CANDIDATE_SOURCE, scope)
-            if str(row["metadata"].get("extract_id") or "") == extract_id
-        ]
-        by_id = {str(row["metadata"].get("candidate_id") or ""): row for row in rows}
-        missing = [item for item in candidate_ids if item not in by_id]
-        if missing:
-            raise NativePortError("candidate_not_found")
-        # Validate the whole batch before the first memory write.  Each write is
-        # independently idempotent, so an unexpected process failure is safely
-        # retryable without duplicating already-accepted atoms.
-        for candidate_id in candidate_ids:
-            row = by_id[candidate_id]
-            if row["status"] not in {"staged", "accepted"} or not row["body"]:
-                raise NativePortError("candidate_not_acceptible")
-        results: list[dict[str, Any]] = []
-        for candidate_id in candidate_ids:
-            row = by_id[candidate_id]
+    def _validated_candidate_rows(
+        self,
+        batches: list[tuple[str, list[str]]],
+        *,
+        scope: Mapping[str, Any],
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        """Resolve and validate a native extraction batch before any write.
+
+        The public batch API deliberately keeps candidate ids and extraction ids
+        explicit.  Resolution is done once for the whole request so accepting a
+        multi-file extraction does not repeatedly scan the V2 candidate plane.
+        """
+        records = self._records(_CANDIDATE_SOURCE, scope)
+        by_extract: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in records:
+            meta = row["metadata"]
+            extract_id = str(meta.get("extract_id") or "")
+            candidate_id = str(meta.get("candidate_id") or "")
+            if extract_id and candidate_id:
+                by_extract.setdefault(extract_id, {})[candidate_id] = row
+
+        resolved: list[tuple[str, str, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        for extract_id, candidate_ids in batches:
+            if not extract_id:
+                raise NativePortError("extract_id_required")
+            if not candidate_ids:
+                raise NativePortError("candidate_ids_required")
+            if any(not item for item in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+                raise NativePortError("candidate_ids_invalid")
+            by_id = by_extract.get(extract_id, {})
+            missing = [item for item in candidate_ids if item not in by_id]
+            if missing:
+                raise NativePortError("candidate_not_found")
+            for candidate_id in candidate_ids:
+                key = (extract_id, candidate_id)
+                if key in seen:
+                    raise NativePortError("candidate_ids_invalid")
+                seen.add(key)
+                row = by_id[candidate_id]
+                if row["status"] not in {"staged", "accepted"} or not row["body"]:
+                    raise NativePortError("candidate_not_acceptible")
+                resolved.append((extract_id, candidate_id, row))
+        return resolved
+
+    def _accept_candidate_rows(
+        self,
+        rows: list[tuple[str, str, dict[str, Any]]],
+        *,
+        scope: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Commit one or more extraction batches through the V2 public stores."""
+        accepted_rows: list[tuple[dict[str, Any], dict[str, Any], MemoryAtom, Any]] = []
+        for extract_id, candidate_id, row in rows:
             meta = dict(row["metadata"])
             memory_id = str(meta.get("memory_id") or f"extract-{candidate_id}")
             atom = MemoryAtom(
@@ -335,7 +395,12 @@ class NativeExtractionEnrichmentService:
                 "revision": str(meta.get("source_digest") or ""),
                 "digest": str(row["body_digest"] or hashlib.sha256(row["body"].encode("utf-8")).hexdigest()),
                 "authority": "governance",
-                "metadata": {
+                # Evidence identity excludes metadata.  Candidate-specific
+                # provenance therefore belongs on the atom/evidence link; a
+                # repeated canonical body must be allowed to share one
+                # immutable evidence row without an identity conflict.
+                "metadata": {},
+                "link_metadata": {
                     "extract_id": extract_id,
                     "candidate_id": candidate_id,
                     "source_reference": str(meta.get("source_reference") or ""),
@@ -363,30 +428,81 @@ class NativeExtractionEnrichmentService:
                     confidence=1.0,
                     idempotency_key=f"accept_extract:{extract_id}:{candidate_id}",
                 )
-                # Runtime acceptance is a complete commit, not a shadow-stage
-                # write. Project the reference-only evidence before exposing
-                # the atom; set_visibility itself re-checks that proof.
-                self.memory.project_evidence(self.governance.evidence)
-                self.memory.set_visibility("active", atom_ids=[persisted.atom_id])
-                persisted = self.memory.get_atom(
-                    persisted.memory_id, scope=scope, include_building=True,
-                ) or persisted
             except Exception as exc:
                 raise NativePortError("v2_extract_accept_failed") from exc
-            meta["memory_id"] = persisted.memory_id
-            meta["accepted_at"] = meta.get("accepted_at") or _now()
-            meta["decision_id"] = decision.decision_id
-            self._update_record_status(row["record_id"], "accepted", meta)
-            results.append({
-                "candidate_id": candidate_id,
-                "memory_id": persisted.memory_id,
-                "kind": persisted.kind,
-                "status": persisted.status,
-                "decision_id": decision.decision_id,
-            })
+            accepted_rows.append((row, meta, persisted, decision))
+
+        try:
+            # Runtime acceptance is a complete commit, not a shadow-stage write.
+            # A multi-file request projects evidence and opens visibility once.
+            self.memory.project_evidence(self.governance.evidence)
+            self.memory.set_visibility(
+                "active",
+                atom_ids=[persisted.atom_id for _, _, persisted, _ in accepted_rows],
+            )
+            results: list[dict[str, Any]] = []
+            status_updates: list[tuple[str, str, Mapping[str, Any]]] = []
+            for row, meta, persisted, decision in accepted_rows:
+                # ``set_visibility`` has already committed the same atom ids;
+                # the governed put result is authoritative, so avoid one
+                # read-only SQLite connection per candidate here.
+                meta["memory_id"] = persisted.memory_id
+                meta["accepted_at"] = meta.get("accepted_at") or _now()
+                meta["decision_id"] = decision.decision_id
+                status_updates.append((row["record_id"], "accepted", meta))
+                results.append({
+                    "candidate_id": str(meta.get("candidate_id") or ""),
+                    "memory_id": persisted.memory_id,
+                    "kind": persisted.kind,
+                    "status": persisted.status,
+                    "decision_id": decision.decision_id,
+                })
+            self._update_record_statuses(status_updates)
+        except Exception as exc:
+            raise NativePortError("v2_extract_accept_failed") from exc
+        return results
+
+    def accept(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        scope = _scope(context)
+        extract_id = str(payload.get("extract_id") or "").strip()
+        raw_ids = payload.get("candidate_ids")
+        if not extract_id:
+            raise NativePortError("extract_id_required")
+        if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+            raise NativePortError("candidate_ids_required")
+        candidate_ids = [str(item).strip() for item in raw_ids]
+        rows = self._validated_candidate_rows([(extract_id, candidate_ids)], scope=scope)
+        results = self._accept_candidate_rows(rows, scope=scope)
         return {
             "ok": True,
             "extract_id": extract_id,
+            "accepted": results,
+            "total": len(results),
+            "storage": "v2_memory",
+        }
+
+    def accept_batch(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        """Accept candidate ids from multiple extracts in one V2 ingestion commit."""
+        scope = _scope(context)
+        raw_batches = payload.get("batches")
+        if not isinstance(raw_batches, (list, tuple)) or not raw_batches:
+            raise NativePortError("batches_required")
+        batches: list[tuple[str, list[str]]] = []
+        for raw_batch in raw_batches:
+            if not isinstance(raw_batch, Mapping):
+                raise NativePortError("batch_invalid")
+            extract_id = str(raw_batch.get("extract_id") or "").strip()
+            raw_ids = raw_batch.get("candidate_ids")
+            if not extract_id:
+                raise NativePortError("extract_id_required")
+            if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                raise NativePortError("candidate_ids_required")
+            batches.append((extract_id, [str(item).strip() for item in raw_ids]))
+        rows = self._validated_candidate_rows(batches, scope=scope)
+        results = self._accept_candidate_rows(rows, scope=scope)
+        return {
+            "ok": True,
+            "extract_ids": [extract_id for extract_id, _ in batches],
             "accepted": results,
             "total": len(results),
             "storage": "v2_memory",
@@ -398,7 +514,6 @@ class NativeExtractionEnrichmentService:
     @staticmethod
     def _needs_enrichment(atom: MemoryAtom) -> bool:
         try:
-            from ..memory_ir import looks_english_text
             english = looks_english_text(str(atom.body or ""))
         except Exception:
             english = False
@@ -600,6 +715,8 @@ class NativeExtractionEnrichmentService:
             "memoryguard_extract_memories": self.extract,
             "accept": self.accept,
             "memoryguard_accept_candidates": self.accept,
+            "accept_batch": self.accept_batch,
+            "memoryguard_accept_candidate_batches": self.accept_batch,
             "list_pending": self.list_pending,
             "memoryguard_list_pending_enrichments": self.list_pending,
             "status": self.enrichment_status,

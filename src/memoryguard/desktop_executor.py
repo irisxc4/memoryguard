@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any
 
 
+SERVER_ADMIN_AGENT_ID = "memoryguard-server-admin"
+SERVER_ADMIN_GROUP_ID = "memoryguard-server-control"
+
+
 def _is_wsl() -> bool:
     if sys.platform != "linux":
         return False
@@ -81,12 +85,22 @@ class RequestExecutor:
 
     DISABLED_METHODS = frozenset({"purge_agent_dir"})
 
-    def __init__(self, workspace: str | Path, *, trusted_desktop: bool = False):
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        trusted_desktop: bool = False,
+        v2_port: Any = None,
+    ):
         self.workspace = Path(workspace).resolve()
         # Only the real desktop executor entrypoint may opt into the
         # server-owned admin context. Direct/unit-test construction remains
         # unprivileged, so a caller cannot forge admin through request args.
         self.trusted_desktop = bool(trusted_desktop)
+        # Same-process host/test seam.  The trusted desktop context is still
+        # constructed here; only the already-owned native V2 transport is
+        # supplied by the caller so GUI and executor share one task owner.
+        self.v2_port = v2_port
         from .security import RequestQueue
         self.queue = RequestQueue(self.workspace)
 
@@ -142,7 +156,10 @@ class RequestExecutor:
         if self.trusted_desktop:
             from .access_context import AccessContext
             access_context = AccessContext(
-                trusted_agent_id="",
+                # The desktop process is the server-owned principal.  It is
+                # not read from request args or the caller environment; the
+                # native port still requires its process-issued capability.
+                trusted_agent_id=SERVER_ADMIN_AGENT_ID,
                 is_admin=True,
                 strict_binding=True,
                 allow_anon=False,
@@ -150,13 +167,12 @@ class RequestExecutor:
                 session_source="transport",
                 session_trusted=True,
             )
-        if access_context is None:
-            api = GovernanceApi(str(self.workspace))
-        else:
-            api = GovernanceApi(
-                str(self.workspace),
-                _trusted_access_context=access_context,
-            )
+        api_kwargs: dict[str, Any] = {}
+        if access_context is not None:
+            api_kwargs["_trusted_access_context"] = access_context
+        if self.v2_port is not None:
+            api_kwargs["_v2_port"] = self.v2_port
+        api = GovernanceApi(str(self.workspace), **api_kwargs)
 
         fn = getattr(api, req.method, None)
         if not callable(fn):
@@ -187,8 +203,21 @@ class RequestExecutor:
                 kwargs["_admin_override"] = True
             result = fn(*args, **kwargs) if args else fn(**kwargs)
             result = result if result is not None else {}
-            if isinstance(result, dict) and result.get("error"):
-                return {"ok": False, "result": result, "error": result["error"]}
+            if isinstance(result, dict):
+                result_status = str(result.get("status") or "").strip().casefold()
+                failed = (
+                    result.get("ok") is False
+                    or result_status in {"error", "blocked", "failed"}
+                    or (
+                        result.get("ok") is not True
+                        and bool(result.get("error"))
+                    )
+                )
+            else:
+                failed = False
+            if failed:
+                error = str(result.get("error") or result.get("code") or "runtime_dispatch_failed")
+                return {"ok": False, "result": result, "error": error}
             return {"ok": True, "result": result, "error": ""}
         except Exception as e:
             return {"ok": False, "result": {}, "error": str(e)}

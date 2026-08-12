@@ -22,7 +22,6 @@ from .state import (
 from .ports import (
     DispatchPort,
     HookPort,
-    LegacyPort,
     ManifestPort,
     ReadinessPort,
     RuntimePorts,
@@ -47,7 +46,7 @@ def __getattr__(name: str):
 __all__ = [
     "CutoverState", "RuntimeState", "ManifestState", "V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE", "UNKNOWN", "KNOWN_STATES",
     "CutoverError", "ManifestUnavailable", "GenerationConflict", "RuntimeSnapshot", "StateSnapshot", "CutoverSnapshot", "snapshot_from_port", "state_snapshot",
-    "ManifestPort", "DispatchPort", "LegacyPort", "V2Port", "HookPort", "ReadinessPort", "RuntimePorts",
+    "ManifestPort", "DispatchPort", "V2Port", "HookPort", "ReadinessPort", "RuntimePorts",
     "ReadinessError", "ReadinessEvidence", "ReadinessGate", "ReadinessResult", "stable_digest",
     "EvidenceBlocker", "ReadinessEvidenceAssembler", "ReadinessEvidenceAssembly",
     "source_set_digest", "target_snapshot_digest", "manifest_snapshot_digest",

@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from .memory_ir import MemoryIR
 from .schema_v3 import (
     DuplicateGroup,
     MemoryRecord,
@@ -122,37 +121,43 @@ def resolve_active_scope(
         )
 
     trusted = str(trusted_agent_id or "").strip()
-    from .agent_binding import AgentBindingStore, is_personal_group_id
+    from .runtime_v2.group_native import GroupControlError, GroupControlService
 
-    bindings = AgentBindingStore(workspace)
+    try:
+        bindings = GroupControlService(workspace, write=False)
+        active = bindings.list_bindings(include_inactive=False).get("bindings", [])
+    except GroupControlError as exc:
+        return ActiveScopeResolution(scope=parsed, status="invalid_binding", error=exc.code)
+    active = [item for item in active if isinstance(item, dict)]
     if parsed.mode == "agent":
         if trusted and parsed.agent_instance_id != trusted:
             return ActiveScopeResolution(
                 scope=parsed, status="forbidden",
                 error="trusted_agent_scope_required",
             )
-        active = bindings.find_by_agent(parsed.agent_instance_id, include_inactive=False)
-        if len(active) == 0:
+        selected = [
+            item for item in active
+            if str(item.get("agent_instance_id") or "") == parsed.agent_instance_id
+        ]
+        if len(selected) == 0:
             return ActiveScopeResolution(
                 scope=parsed, status="stale_selection",
                 error="active_binding_required",
             )
-        if len(active) != 1:
+        if len(selected) != 1:
             return ActiveScopeResolution(
                 scope=parsed, status="invalid_binding",
                 error="multiple_active_bindings",
-                binding_ids=tuple(sorted(b.binding_id for b in active)),
+                binding_ids=tuple(sorted(str(b.get("binding_id") or "") for b in selected)),
             )
-        binding = active[0]
-        if not is_personal_group_id(binding.share_group_id):
-            group_active = bindings.find_by_group(
-                binding.share_group_id,
-                include_inactive=False,
-            )
+        binding = selected[0]
+        group_id = str(binding.get("share_group_id") or "")
+        if str(binding.get("group_kind") or "") != "personal":
+            group_active = [item for item in active if str(item.get("share_group_id") or "") == group_id]
             authorized = tuple(sorted({
-                str(member.agent_instance_id)
+                str(member.get("agent_instance_id") or "")
                 for member in group_active
-                if str(member.agent_instance_id or "").strip()
+                if str(member.get("agent_instance_id") or "").strip()
             }))
             if trusted and trusted not in authorized:
                 return ActiveScopeResolution(
@@ -161,18 +166,18 @@ def resolve_active_scope(
                     error="trusted_share_group_scope_required",
                     authorized_agent_ids=authorized,
                     binding_ids=tuple(sorted(
-                        member.binding_id for member in group_active
+                        str(member.get("binding_id") or "") for member in group_active
                     )),
                 )
             return ActiveScopeResolution(
                 scope=GovernanceScope(
                     mode="share_group",
-                    share_group_id=binding.share_group_id,
+                    share_group_id=group_id,
                 ),
                 principal_agent_id=parsed.agent_instance_id,
                 authorized_agent_ids=authorized,
                 binding_ids=tuple(sorted(
-                    member.binding_id for member in group_active
+                    str(member.get("binding_id") or "") for member in group_active
                 )),
                 status="active",
             )
@@ -180,14 +185,17 @@ def resolve_active_scope(
             scope=parsed,
             principal_agent_id=parsed.agent_instance_id,
             authorized_agent_ids=(parsed.agent_instance_id,),
-            binding_ids=(binding.binding_id,),
+            binding_ids=(str(binding.get("binding_id") or ""),),
             status="active",
         )
 
-    active = bindings.find_by_group(parsed.share_group_id, include_inactive=False)
+    active = [
+        item for item in active
+        if str(item.get("share_group_id") or "") == parsed.share_group_id
+    ]
     authorized = tuple(sorted({
-        str(binding.agent_instance_id)
-        for binding in active if str(binding.agent_instance_id or "").strip()
+        str(binding.get("agent_instance_id") or "")
+        for binding in active if str(binding.get("agent_instance_id") or "").strip()
     }))
     if trusted and trusted not in authorized:
         return ActiveScopeResolution(
@@ -195,7 +203,7 @@ def resolve_active_scope(
             status="forbidden",
             error="trusted_share_group_scope_required",
             authorized_agent_ids=authorized,
-            binding_ids=tuple(sorted(b.binding_id for b in active)),
+            binding_ids=tuple(sorted(str(b.get("binding_id") or "") for b in active)),
         )
     if not active:
         return ActiveScopeResolution(
@@ -205,20 +213,22 @@ def resolve_active_scope(
     principal = trusted or authorized[0]
     principal_bindings = [
         binding for binding in active
-        if binding.agent_instance_id == principal
+        if str(binding.get("agent_instance_id") or "") == principal
     ]
     if len(principal_bindings) != 1:
         return ActiveScopeResolution(
             scope=parsed, status="invalid_binding",
             error="multiple_active_bindings",
             authorized_agent_ids=authorized,
-            binding_ids=tuple(sorted(b.binding_id for b in active)),
+            binding_ids=tuple(sorted(str(b.get("binding_id") or "") for b in active)),
         )
     return ActiveScopeResolution(
         scope=parsed,
         principal_agent_id=principal,
         authorized_agent_ids=authorized,
-        binding_ids=tuple(sorted(b.binding_id for b in active)),
+        binding_ids=tuple(
+            sorted(str(binding.get("binding_id") or "") for binding in active)
+        ),
         status="active",
     )
 
@@ -229,21 +239,22 @@ def list_active_scope_options(
     trusted_agent_id: str = "",
 ) -> dict[str, list[dict[str, Any]]]:
     """Return selectable active agents/groups for the desktop scope picker."""
-    from .agent_binding import AgentBindingStore, is_personal_group_id
+    from .runtime_v2.group_native import GroupControlService
 
     trusted = str(trusted_agent_id or "").strip()
-    active = AgentBindingStore(workspace).list_bindings(include_inactive=False)
+    active = GroupControlService(workspace, write=False).list_bindings(include_inactive=False).get("bindings", [])
+    active = [item for item in active if isinstance(item, dict)]
     if trusted:
-        active = [binding for binding in active if binding.agent_instance_id == trusted]
+        active = [binding for binding in active if str(binding.get("agent_instance_id") or "") == trusted]
     agents = sorted({
-        str(binding.agent_instance_id)
-        for binding in active if str(binding.agent_instance_id or "").strip()
+        str(binding.get("agent_instance_id") or "")
+        for binding in active if str(binding.get("agent_instance_id") or "").strip()
     })
     groups: dict[str, set[str]] = {}
     for binding in active:
-        group_id = str(binding.share_group_id or "").strip()
-        agent_id = str(binding.agent_instance_id or "").strip()
-        if group_id and agent_id and not is_personal_group_id(group_id):
+        group_id = str(binding.get("share_group_id") or "").strip()
+        agent_id = str(binding.get("agent_instance_id") or "").strip()
+        if group_id and agent_id and str(binding.get("group_kind") or "") != "personal":
             groups.setdefault(group_id, set()).add(agent_id)
     return {
         "agents": [
@@ -534,12 +545,12 @@ def record_belongs_to_roots(
 
 
 def filter_ir_for_agent(
-    ir: MemoryIR,
+    ir: Any,
     allowed_root_ids: set[str],
     snapshot: SourceSnapshot | None = None,
     *,
     obj_to_root: dict[str, str] | None = None,
-) -> MemoryIR:
+) -> Any:
     """深拷贝过滤：不修改原 IR；裁剪 duplicate_groups。"""
     mapping = dict(obj_to_root or {})
     if not mapping:
@@ -562,13 +573,10 @@ def filter_ir_for_agent(
         if g.scores and len(g.scores) != len(members):
             g.scores = list(g.scores[: len(members)])
         groups.append(g)
-    return MemoryIR(
-        records=kept,
-        duplicate_groups=groups,
-        decisions=list(ir.decisions),
-        snapshot_id=ir.snapshot_id,
-        created_at=ir.created_at,
-    )
+    result = copy.deepcopy(ir)
+    result.records = kept
+    result.duplicate_groups = groups
+    return result
 
 
 def projection_path(workspace: str | Path, mode: str, scope: GovernanceScope) -> Path:
@@ -639,34 +647,32 @@ def share_group_status_meta(workspace: str | Path, share_group_id: str) -> dict[
     release_count = 0
     product_map = _load_instance_product_map(workspace)
     try:
-        from .agent_binding import AgentBindingStore
-        for b in AgentBindingStore(workspace).find_by_group(gid, include_inactive=False):
-            aid = str(getattr(b, "agent_instance_id", "") or "")
+        from .runtime_v2.group_native import GroupControlService
+        bindings = GroupControlService(workspace, write=False).list_bindings(include_inactive=False).get("bindings", [])
+        for item in bindings:
+            if not isinstance(item, dict) or str(item.get("share_group_id") or "") != gid:
+                continue
+            aid = str(item.get("agent_instance_id") or "")
             display = _agent_display_name(aid, product_map)
             bound.append({
                 "agent_instance_id": aid,
                 "product": display,
                 "display_name": display,
-                "status": getattr(getattr(b, "status", None), "value", str(getattr(b, "status", "") or "")),
+                "status": str(item.get("status") or "active"),
             })
     except Exception:
         pass
     try:
-        from .shared_memory_store import SharedMemoryStore
-        store = SharedMemoryStore(workspace, gid, read_only=True)
-        active_records = len(store.list_records(status="active"))
-        try:
-            conflict_count = len(store.list_conflicts())
-        except Exception:
-            conflict_count = 0
-        try:
-            quarantine_count = len(store.list_quarantine())
-        except Exception:
-            quarantine_count = 0
-        try:
-            release_count = len(store.list_versions()) if hasattr(store, "list_versions") else 0
-        except Exception:
-            release_count = 0
+        from .memory import MemoryAtomStore, MemoryReadScope
+        scope = MemoryReadScope(
+            workspace_id=str(Path(workspace).expanduser().resolve()),
+            share_group_id=gid,
+        )
+        store = MemoryAtomStore(scope.workspace_id, readonly=True)
+        atoms = store.list_atoms(scope=scope, status="active")
+        active_records = len(atoms)
+        conflict_count = sum(bool((item.metadata or {}).get("conflict_group_id")) for item in atoms)
+        quarantine_count = sum(str(item.status) == "quarantined" for item in atoms)
     except Exception:
         pass
     return {
@@ -767,150 +773,41 @@ def build_shared_memory_graph(
     *,
     status: str = "active",
 ) -> dict[str, Any]:
-    """从 SharedMemoryStore 生成神经图：复用单 Agent ProjectionBuilder 美化衍生。"""
-    from .projection import ProjectionBuilder
-    from .schema_v3 import (
-        Completeness,
-        DuplicateDecision,
-        MemoryKind,
-        Provenance,
-    )
-    from .shared_memory_store import SharedMemoryStore
-    from .source_registry import SourceRegistry
+    """Read the V2 projection for a shared group.
 
-    scope = GovernanceScope(mode="share_group", share_group_id=share_group_id)
-    try:
-        store = SharedMemoryStore(workspace, share_group_id, read_only=True)
-    except FileNotFoundError:
+    Projection reconstruction belongs to the V2 projection service.  A
+    missing, incomplete, or incompatible V2 projection is an empty result;
+    this helper never reconstructs from an older record store.
+    """
+    del status
+    group = str(share_group_id or "").strip()
+    scope = GovernanceScope(mode="share_group", share_group_id=group)
+    if not group:
         return {
             "empty": True,
-            "reason": "share_group_not_found",
-            "projection_kind": "shared_memory_projection",
+            "reason": "share_group_required",
+            "projection_kind": "v2_projection",
             "mode": "share_group",
             "scope": scope.to_dict(),
         }
-    records = store.list_records(status=status or None)
-    # 旧导入：provenance=event_id；用 events.metadata 还原同文件同源键
-    event_by_id = {ev.event_id: ev for ev in store.list_events()}
-    roots_by_id = {
-        root.root_id: root
-        for root in SourceRegistry(workspace).list_all_sources()
-    }
-
-    def _record_scope(rec) -> str:
-        """从入库事件/SourceRoot 恢复来源层级；无导入根才算 MCP 共享写入。"""
-        for provenance in list(getattr(rec, "provenance", None) or []):
-            event = event_by_id.get(provenance.source_object_id)
-            metadata = (
-                event.metadata
-                if event is not None and isinstance(event.metadata, dict)
-                else {}
-            )
-            root_id = str(metadata.get("source_root_id", "") or "")
-            root = roots_by_id.get(root_id)
-            if root is not None:
-                if str(root.project_ref or "").strip():
-                    return "project"
-                root_scope = str(root.scope or "").strip().lower()
-                if root_scope in {
-                    "project", "user", "agent", "session", "share_group",
-                }:
-                    return root_scope
-            category = str(metadata.get("source_category", "") or "")
-            if category == "conversation_history":
-                return "session"
-        return "share_group"
-
-    ir_records: list[MemoryRecord] = []
-    for rec in records:
-        body_text = (rec.body or "").strip()
-        title = body_text.split("\n", 1)[0][:80] if body_text else rec.memory_id[:8]
-        raw_kind = getattr(rec.kind, "value", rec.kind) if rec.kind is not None else "fact"
-        try:
-            kind = rec.kind if isinstance(rec.kind, MemoryKind) else MemoryKind(str(raw_kind or "fact"))
-        except ValueError:
-            kind = MemoryKind.FACT
-        provs = _rewrite_share_provenance_for_hubs(
-            list(getattr(rec, "provenance", None) or []),
-            event_by_id=event_by_id,
-            share_group_id=share_group_id,
-            memory_id=rec.memory_id,
-            body_text=body_text,
-            Provenance=Provenance,
+    root = Path(workspace).expanduser().resolve()
+    try:
+        from .projection_v2.store import ProjectionReadScope
+        from .runtime_v2.projection_build import ProjectionBuildService
+        projection_scope = ProjectionReadScope(
+            workspace_id=str(root),
+            share_group_id=group,
         )
-        ir_records.append(MemoryRecord(
-            memory_id=rec.memory_id,
-            kind=kind,
-            title=title,
-            body=rec.body or "",
-            scope=_record_scope(rec),
-            confidence=float(getattr(rec, "confidence", 0.5) or 0.5),
-            provenance=provs,
-            status=MemoryStatus.CANDIDATE,
-            completeness=Completeness.VERIFIABLE,
+        data = dict(ProjectionBuildService(root).current(
+            mode="reconstructed", scope=projection_scope,
         ))
-
-    # 轻量相似组 → related 虚线（与单 Agent KEEP_ALL 语义一致）
-    dup_groups: list[DuplicateGroup] = []
-    token_cache: dict[str, set[str]] = {}
-    _tok_re = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*|[\u4e00-\u9fff]")
-
-    def _tok(text: str) -> set[str]:
-        return set(_tok_re.findall((text or "").lower()))
-
-    # 控制 O(n²)：同 kind 内最多扫前 80 条做相似边；阈值略降以照顾短标题段落
-    by_kind_ids: dict[str, list[MemoryRecord]] = {}
-    for rec in ir_records:
-        by_kind_ids.setdefault(rec.kind.value, []).append(rec)
-    for kind_recs in by_kind_ids.values():
-        subset = kind_recs[:80]
-        for i, a in enumerate(subset):
-            ta = token_cache.setdefault(a.memory_id, _tok(f"{a.title} {a.body}"))
-            if len(ta) < 2:
-                continue
-            for b in subset[i + 1:]:
-                tb = token_cache.setdefault(b.memory_id, _tok(f"{b.title} {b.body}"))
-                if len(tb) < 2:
-                    continue
-                inter = len(ta & tb)
-                union = len(ta | tb) or 1
-                if inter / union < 0.42:
-                    continue
-                dup_groups.append(DuplicateGroup(
-                    group_id=stable_hash("share-dup", a.memory_id, b.memory_id)[:16],
-                    member_ids=[a.memory_id, b.memory_id],
-                    decision=DuplicateDecision.KEEP_ALL,
-                ))
-
-    record_ids = sorted(r.memory_id for r in records)
-    ir = MemoryIR(
-        snapshot_id=stable_hash("share", share_group_id, status, *record_ids),
-        records=ir_records,
-        duplicate_groups=dup_groups,
-        created_at=_now_iso(),
-    )
-    status_meta = share_group_status_meta(workspace, share_group_id)
-    pb = ProjectionBuilder(workspace, "reconstructed")
-    proj = pb.build(
-        ir,
-        meta={
-            "projection_mode": "share_group",
-            "share_group_id": share_group_id,
-            "llm_used": False,
-            "derivation_engine": "deterministic_v3_shared",
-            "authorized_roots_digest": authorized_roots_digest([f"share:{share_group_id}"]),
-            "source_record_ids": record_ids,
-            "source_record_digest": stable_hash("share-recs", *record_ids),
-            **status_meta,
-        },
-        root_label="共享胞体",
-        root_body=f"共享组 {share_group_id} 的 active 记忆视图；与单 Agent 共用同源突触 / 跨类型连线美化。",
-    )
-    data = proj.to_dict()
-    data["empty"] = len(records) == 0
-    if not records:
-        data["reason"] = "share_group_empty"
-    data["projection_kind"] = "shared_memory_projection"
+    except Exception:
+        data = {
+            "status": "NO_SOURCE",
+            "reason": "v2_projection_unavailable",
+        }
+    data["empty"] = str(data.get("status") or "").upper() in {"NO_SOURCE", "EMPTY"}
+    data["projection_kind"] = "v2_projection"
     data["mode"] = "share_group"
     data["scope"] = scope.to_dict()
     return data

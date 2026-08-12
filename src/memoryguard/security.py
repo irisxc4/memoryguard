@@ -18,147 +18,36 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# API 方法分类
+# API 方法分类（兼容导出；唯一事实源在 cutover_v2.surfaces）
 # ---------------------------------------------------------------------------
 
-# 只读 API：扫描、查看、列表，不修改任何文件或状态
-READONLY_API_METHODS: frozenset[str] = frozenset({
-    # 审计
-    "get_audit", "run_audit", "generate_plan",
-    # Agent 发现 / 选择树
-    "discover_agents", "get_selection_tree", "get_agent_data",
-    # 神经元图（只读）
-    "get_neuron_graph", "get_projection_source_map", "get_governance_scope",
-    "get_governance_scope_state",
-    "list_native_memory_releases", "list_publish_targets", "choose_publish_target_path",
-    # 来源管理（只读）
-    "list_sources", "preview_source", "scan_sources",
-    "get_raw_memory", "get_source_file_content",
-    # Agent 候选 / 清理（只读）
-    "list_agent_candidates", "list_archived_agents",
-    "list_cleanup_history", "list_agents", "get_residual_cleanup", "open_agent_folder",
-    # 绑定（只读）
-    "list_bindings", "check_binding_drift", "get_shared_group_preview",
-    "get_host_hook_status",
-    # 外部 MCP（只读）
-    "list_external_mcp_servers", "preview_external_mcp_import",
-    "detect_external_mcp",
-    # 记忆治理（只读）
-    "list_memory", "get_memory", "search_memory",
-    "list_memory_versions", "get_recent_events", "get_auto_actions",
-    "get_supersede_chain", "get_conflicts", "get_quarantine",
-    "get_governance_snapshot", "get_memory_status", "get_supersede_decisions",
-    "list_share_groups", "get_global_memory_status", "get_memory_source_map",
-    # 萃取 / 导入（只读）
-    "extract_preview", "extract_preview_by_path", "preview_import", "get_memory_ir",
-    # 旧发布历史（只读兼容；不再暴露构建/写回）
-    "list_releases", "list_history",
-    # 存储治理（只读）
-    "plan_memoryguard_gc", "get_storage_overview",
-    # 安全层（只读）
-    "get_sandbox_status", "get_request_status", "list_pending_requests",
-    "pick_path",
-    # Host AI 整理（只读）
-    "list_pending_enrichments", "get_enrichment_status",
-    "get_host_enrichment_guide",
-    "get_build_progress", "list_host_llm_agents",
-    # Conversation history is raw evidence in its own local store.  These
-    # operations only browse/search/export the caller's scoped archive.
-    "list_history_sessions", "search_history", "history_timeline",
-    "history_read", "history_extract_preview", "export_history",
-    # Installed-before-MemoryGuard local transcript inventory.  Discovery
-    # touches metadata only and never creates an archive or state receipt.
-    "discover_local_history_sources",
-    "list_rules_habits",
-    # Mandatory-rule audience governance.  Options and previews are read-only;
-    # edits must take the normal mutation/confirmation path below.
-    "get_rule_scope_options", "preview_effective_rules",
-    # Rule lifecycle cockpit: reads are safe previews; mutations still pass
-    # the normal localhost confirmation/admin capability path.
-    "list_rule_cockpit", "list_rule_decisions", "read_rule_decision",
-    "get_rule_auto_scope_metrics", "list_rule_match_receipts", "list_rule_exceptions",
-    # Knowledge bookshelf reads.
-    "knowledge_list", "knowledge_deleted_list", "knowledge_search",
-    "knowledge_read", "knowledge_book", "knowledge_job_status",
-    "knowledge_candidates_list", "knowledge_candidate_targets",
-})
+from .cutover_v2.surfaces import GUI_METHOD_NAMES, GUI_MUTATION_NAMES, GUI_OPERATION_SPECS
 
-# 变更 API：修改文件、删除目录、归档、绑定、记忆治理等
-# localhost 沙箱模式下这些方法不直接执行，而是创建 pending request
-MUTATION_API_METHODS: frozenset[str] = frozenset({
-    # Agent 选择 / 投影
-    "commit_selection", "neuron_decide", "set_projection_source_enabled",
-    "set_governance_scope", "build_projection", "start_build_projection",
-    "cancel_build_projection", "delete_projection",
-    # 来源管理（变更）
-    "add_source", "remove_source",
-    # Agent 候选 / 清理 / 归档（变更）
-    "mark_agent_uninstalled", "unmark_agent_uninstalled",
-    "archive_agent_dir", "restore_archived_agent",
-    "delete_archived_agent",
-    # 多 Agent 模式 / 绑定（变更）
-    "enter_multi_agent_mode", "exit_multi_agent_mode",
-    "bind_agent", "bind_agents_to_shared_group", "unbind_agent",
-    "ensure_personal_memory_group", "leave_shared_group_to_personal",
-    "dissolve_shared_group",
-    "export_memory_group", "clear_memory_group", "archive_memory_group",
-    "install_shared_group_mcp_redirects",
-    "set_host_hook_mode", "uninstall_host_hook",
-    "import_native_memories_to_group", "commit_shared_memory_governance",
-    # 外部 MCP 导入（变更）
-    "import_external_mcp_entries",
-    # 记忆治理（变更）
-    "edit_memory", "lock_memory", "unlock_memory",
-    "set_memory_injection_policy",
-    "restore_memory", "delete_memory", "rollback_memory",
-    "resolve_conflict", "release_quarantine", "delete_quarantine",
-    # 萃取 / 导入（变更）
-    "accept_candidates", "create_import",
-    # 存储治理（变更）
-    "apply_memoryguard_gc",
-    # 计划执行 / 回滚
-    "apply_plan", "undo_change",
-    # Host AI 整理（变更:写回 IR；主路径已并入 build）
-    "apply_enrichments",
-    # Raw-history deletion is deliberate and confirmation-gated by the API.
-    # It never deletes the governed long-term-memory record.
-    "delete_history",
-    # Imports raw transcript evidence into history.sqlite and updates the
-    # resumable receipt; this must use the existing confirmation path.
-    "backfill_local_history",
-    # Changes audience assignments or performs an atomic relevant<->always
-    # transition.  Never expose this as a read-only browser call.
-    "update_rule_audience",
-    "create_rule_from_text", "undo_rule_decision", "create_child_exception",
-    "create_rule_exception", "submit_rule_feedback", "revoke_rule_exception",
-    # 知识书库（变更）
-    "knowledge_add", "knowledge_reingest", "knowledge_rebuild_smart",
-    "knowledge_remove", "knowledge_restore", "knowledge_purge_deleted",
-    "knowledge_update_settings", "knowledge_candidate_review",
-})
-
-# 所有允许的 API 方法
-ALL_ALLOWED_METHODS: frozenset[str] = READONLY_API_METHODS | MUTATION_API_METHODS
+MUTATION_API_METHODS: frozenset[str] = GUI_MUTATION_NAMES
+READONLY_API_METHODS: frozenset[str] = frozenset(
+    name for name, spec in GUI_OPERATION_SPECS.items() if not spec.mutation
+)
+ALL_ALLOWED_METHODS: frozenset[str] = GUI_METHOD_NAMES
 
 # Phase 6 keeps this registry as the single security classification source for
 # GUI SafeBridge and CLI cutover adapters.  The version is metadata only; it
 # does not alter the public method names or old request envelope.
-API_METHOD_REGISTRY_VERSION = 2
+API_METHOD_REGISTRY_VERSION = 3
 V2_CUTOVER_STATES: frozenset[str] = frozenset({
     "V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE",
 })
 
 # 保留在 GovernanceApi 内仅供旧数据兼容/内部测试的原生写回实现。
 # 产品入口（GUI bridge、MCP、CLI）必须明确拒绝这些方法。
-BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS: frozenset[str] = frozenset({
-    "create_build_plan", "apply_build", "verify_release", "rollback_release",
-    "publish_reconstructed_memory", "rollback_native_memory_release",
-})
+# Compatibility export only.  V2 GUI operations are governed by the canonical
+# registry and must not be blocked merely because their historical
+# implementation used a legacy writeback path.
+BLOCKED_LEGACY_NATIVE_WRITEBACK_METHODS: frozenset[str] = frozenset()
 
 # 安全层自身的方法（不属于只读或变更，但需要允许调用）
 _SECURITY_API_METHODS: frozenset[str] = frozenset({
     "submit_request", "get_request_status", "list_pending_requests",
-    "get_sandbox_status", "get_api_method_registry",
+    "get_sandbox_status", "get_api_method_registry", "dispatch_api",
 })
 
 # Feedback authority is a transport fact, never inferred from a caller's
@@ -212,11 +101,15 @@ def is_allowed_method(method: str) -> bool:
 
 
 def get_api_method_registry() -> dict[str, Any]:
-    """Return immutable security classifications for bridge/CLI consumers."""
+    """Return the canonical GUI registry plus compatibility classifications."""
     return {
+        "version": API_METHOD_REGISTRY_VERSION,
         "readonly": sorted(READONLY_API_METHODS),
         "mutation": sorted(MUTATION_API_METHODS),
         "security": sorted(_SECURITY_API_METHODS),
+        "operations": {
+            name: spec.to_dict() for name, spec in GUI_OPERATION_SPECS.items()
+        },
     }
 
 

@@ -134,6 +134,150 @@ class MigrationResult:
         return self.to_dict()[key]
 
 
+@dataclass(frozen=True)
+class V1GroupInventory:
+    """Read-only inventory of one legacy shared-memory SQLite group."""
+
+    group_id: str
+    db_path: str
+    records: int
+    active: int
+    source_digest: str = ""
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "group_id": self.group_id,
+            "db_path": self.db_path,
+            "records": self.records,
+            "active": self.active,
+            "source_digest": self.source_digest,
+            "error": self.error,
+        }
+
+
+class V1GroupReader:
+    """Read V1 group metadata without constructing or mutating a V1 store.
+
+    The reader is deliberately small and boring: discovery and inventory are
+    migration concerns, while all writes remain in :class:`V1MemoryMigrator`.
+    Every SQLite connection is opened ``mode=ro`` with ``query_only`` so a
+    discovery pass cannot create, upgrade, or repair a legacy database.
+    """
+
+    def __init__(
+        self,
+        workspace: str | Path,
+        group_id: str,
+        db_path: str | Path | None = None,
+        *,
+        immutable: bool = False,
+    ) -> None:
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.group_id = str(group_id or "").strip()
+        if not self.group_id:
+            raise ValueError("group_id is required")
+        self.db_path = (
+            Path(db_path).expanduser().resolve()
+            if db_path is not None
+            else self.workspace / ".memoryguard" / "shared-memory" / self.group_id / "memory.db"
+        )
+        self.immutable = bool(immutable)
+
+    def rows(self) -> list[dict[str, Any]]:
+        """Return authoritative ``records`` rows, never derived FTS rows."""
+
+        conn = _sqlite_ro(self.db_path, immutable=self.immutable)
+        try:
+            tables = self._tables(conn)
+            if "records" not in tables:
+                return []
+            return self._rows(conn, "records")
+        finally:
+            conn.close()
+
+    def inventory(self) -> V1GroupInventory:
+        try:
+            rows = self.rows()
+            active = sum(
+                1
+                for row in rows
+                if str(row.get("status") or "active").strip().casefold() == "active"
+            )
+            return V1GroupInventory(
+                group_id=self.group_id,
+                db_path=str(self.db_path),
+                records=len(rows),
+                active=active,
+                source_digest=hashlib.sha256(self.db_path.read_bytes()).hexdigest(),
+            )
+        except Exception as exc:
+            return V1GroupInventory(
+                group_id=self.group_id,
+                db_path=str(self.db_path),
+                records=0,
+                active=0,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _tables(conn: sqlite3.Connection) -> set[str]:
+        return {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+
+    @staticmethod
+    def _rows(conn: sqlite3.Connection, table: str) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT * FROM {_quote(table)} ORDER BY rowid"
+            ).fetchall()
+        ]
+
+    @classmethod
+    def discover(
+        cls,
+        workspace: str | Path,
+        *,
+        shared_memory_root: str | Path | None = None,
+        immutable: bool = False,
+    ) -> list[V1GroupInventory]:
+        """Discover legacy group databases in deterministic order."""
+
+        root = Path(workspace).expanduser().resolve()
+        primary = (
+            Path(shared_memory_root).expanduser().resolve()
+            if shared_memory_root is not None
+            else root / ".memoryguard" / "shared-memory"
+        )
+        roots = [primary]
+        alternate = root / ".memoryguard" / "shared_memory"
+        if alternate != primary:
+            roots.append(alternate)
+        paths: dict[str, Path] = {}
+        for candidate_root in roots:
+            if not candidate_root.is_dir():
+                continue
+            for child in sorted(candidate_root.iterdir(), key=lambda item: item.name):
+                path = child / "memory.db" if child.is_dir() else child
+                if not path.is_file() or path.suffix.casefold() not in {".db", ".sqlite", ".sqlite3"}:
+                    continue
+                group_id = child.name if child.is_dir() else path.stem
+                paths.setdefault(str(group_id), path.resolve())
+        return [
+            cls(root, group_id, path, immutable=immutable).inventory()
+            for group_id, path in sorted(paths.items())
+        ]
+
+
 class V1MemoryMigrator:
     """Read-only V1 source migrator for shared groups and ManagedStore JSON."""
 
@@ -147,6 +291,7 @@ class V1MemoryMigrator:
         source_root: str | Path | None = None,
         shared_memory_root: str | Path | None = None,
         groups: Mapping[str, str | Path] | Sequence[str | Path] | None = None,
+        group_targets: Mapping[str, str] | None = None,
         managed_root: str | Path | None = None,
         include_managed: bool = True,
         immutable_sources: bool = False,
@@ -161,10 +306,18 @@ class V1MemoryMigrator:
         self.memory_store = memory_store or MemoryAtomStore(target_value)
         self.evidence_store = evidence_store or EvidenceStore(target_value)
         self.groups = groups
+        self.group_targets = {
+            str(source): str(target)
+            for source, target in dict(group_targets or {}).items()
+            if str(source).strip() and str(target).strip()
+        }
         self.include_managed = bool(include_managed)
         self.immutable_sources = bool(immutable_sources)
         self.fault_hook = fault_hook
         self.fail_at = fail_at
+
+    def _target_group(self, source_group: str) -> str:
+        return self.group_targets.get(str(source_group), str(source_group))
 
     def _fault(self, step: str) -> None:
         if self.fail_at == step:
@@ -265,12 +418,14 @@ class V1MemoryMigrator:
         *,
         managed: bool = False,
         source_path: Path | None = None,
+        target_group: str | None = None,
     ) -> tuple[MemoryAtom, list[dict[str, Any]], dict[str, Any]]:
         memory_id = _legacy_text(row.get("memory_id") or row.get("id") or "")
         if not memory_id:
             raise ValueError("legacy record has no memory_id")
         provenance = self._provenance(row)
         row_digest = _row_digest(row)
+        target_group = str(target_group or group)
         source_label = str(source_path or db_path)
         source_name = Path(source_label).name
         evidence_payload: list[dict[str, Any]] = []
@@ -280,12 +435,12 @@ class V1MemoryMigrator:
                 locator = _legacy_text(prov.get("locator") or index)
                 source_ref = f"{group}/{source_name}#provenance/{source_object}/{locator}"
                 evidence_payload.append({
-                    "source_ref": source_ref,
+                "source_ref": source_ref,
                     "revision": _legacy_text(prov.get("source_revision") or prov.get("revision") or ""),
                     "digest": _legacy_text(prov.get("excerpt_hash") or prov.get("digest") or row_digest),
                     "authority": "legacy_provenance",
                     "status": "valid",
-                    "metadata": {"legacy": True, "group": group, "memory_id": memory_id, "locator": locator, "source_object_id": source_object},
+                    "metadata": {"legacy": True, "group": group, "target_group": target_group, "memory_id": memory_id, "locator": locator, "source_object_id": source_object},
                 })
         else:
             # No parseable provenance is still explicit evidence; never create
@@ -296,7 +451,7 @@ class V1MemoryMigrator:
                 "digest": row_digest,
                 "authority": "legacy_record",
                 "status": "valid",
-                "metadata": {"legacy_record": True, "group": group, "memory_id": memory_id, "source_path": source_label},
+                "metadata": {"legacy_record": True, "group": group, "target_group": target_group, "memory_id": memory_id, "source_path": source_label},
             })
         metadata = _json(row.get("metadata"), {})
         if not isinstance(metadata, Mapping):
@@ -316,7 +471,7 @@ class V1MemoryMigrator:
             supersedes=[_legacy_text(item) for item in (_json(row.get("supersedes"), []) if isinstance(_json(row.get("supersedes"), []), list) else [])],
             provenance=provenance,
             agent_instance_id=_legacy_text(row.get("agent_instance_id") or row.get("agent_id") or (group.removeprefix("managed:") if managed else "")),
-            share_group_id=_legacy_text(group),
+            share_group_id=_legacy_text(target_group),
             project_ref=_legacy_text(row.get("project_ref") or metadata.get("project_ref") or ""),
             provider=_legacy_text(row.get("provider") or metadata.get("provider") or ""),
             runtime_role=_legacy_text(row.get("runtime_role") or metadata.get("runtime_role") or ""),
@@ -354,6 +509,7 @@ class V1MemoryMigrator:
         return result
 
     def _migrate_sqlite_group(self, group: str, path: Path) -> dict[str, Any]:
+        target_group = self._target_group(group)
         conn = _sqlite_ro(path, immutable=self.immutable_sources)
         atoms = 0
         source_records = 0
@@ -367,7 +523,7 @@ class V1MemoryMigrator:
             with self.memory_store.migration_batch():
                 for index, row in enumerate(rows):
                     self._fault(f"{group}:record:{index}:before")
-                    atom, evidence_payload, source_map = self._record_atom(group, path, row)
+                    atom, evidence_payload, source_map = self._record_atom(group, path, row, target_group=target_group)
                     persisted = self.memory_store._put_for_migration(atom, evidence=evidence_payload, source_mappings=[source_map], capability=_MIGRATION_CAPABILITY)
                     atom_ids_by_memory[persisted.memory_id] = persisted.atom_id
                     atoms += 1
@@ -408,20 +564,21 @@ class V1MemoryMigrator:
                         old_id = atom_ids_by_memory.get(_legacy_text(old_memory))
                         if old_id and old_id != new_id:
                             try:
-                                self.memory_store._supersede_for_migration(old_id, new_id, share_group_id=group, reason="v1 migration", source_ref=f"{group}/memory.db#records/{row.get('memory_id')}", capability=_MIGRATION_CAPABILITY)
+                                self.memory_store._supersede_for_migration(old_id, new_id, share_group_id=target_group, reason="v1 migration", source_ref=f"{group}/memory.db#records/{row.get('memory_id')}", capability=_MIGRATION_CAPABILITY)
                             except KeyError:
                                 pass
                 self._fault(f"{group}:commit")
         except Exception:
             # No evidence has been projected yet.  Remove only this group's
             # atoms/events so an injected fault cannot leave a half-built scope.
-            self.memory_store.rollback_scope(share_group_id=group, atom_ids=list(atom_ids_by_memory.values()))
+            self.memory_store.rollback_scope(share_group_id=target_group, atom_ids=list(atom_ids_by_memory.values()))
             raise
         finally:
             conn.close()
-        return {"source_records": source_records, "atoms": atoms, "queued_evidence": queued_evidence, "source_digest": source_hash, "atom_ids": atom_ids_by_memory}
+        return {"source_records": source_records, "atoms": atoms, "queued_evidence": queued_evidence, "source_digest": source_hash, "atom_ids": atom_ids_by_memory, "target_group": target_group}
 
     def _migrate_managed(self, group: str, path: Path, rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        target_group = self._target_group(group)
         atoms = 0
         queued = 0
         source_digest = stable_digest([_json_safe(dict(row)) for row in rows])
@@ -430,7 +587,7 @@ class V1MemoryMigrator:
             with self.memory_store.migration_batch():
                 for index, row in enumerate(rows):
                     self._fault(f"{group}:record:{index}:before")
-                    atom, evidence_payload, source_map = self._record_atom(group, path, row, managed=True, source_path=path)
+                    atom, evidence_payload, source_map = self._record_atom(group, path, row, managed=True, source_path=path, target_group=target_group)
                     persisted = self.memory_store._put_for_migration(atom, evidence=evidence_payload, source_mappings=[source_map], capability=_MIGRATION_CAPABILITY)
                     atom_ids[persisted.memory_id] = persisted.atom_id
                     atoms += 1
@@ -438,9 +595,9 @@ class V1MemoryMigrator:
                     self._fault(f"{group}:record:{index}:after")
                 self._fault(f"{group}:commit")
         except Exception:
-            self.memory_store.rollback_scope(share_group_id=group, atom_ids=list(atom_ids.values()))
+            self.memory_store.rollback_scope(share_group_id=target_group, atom_ids=list(atom_ids.values()))
             raise
-        return {"source_records": len(rows), "atoms": atoms, "queued_evidence": queued, "source_digest": source_digest, "atom_ids": atom_ids}
+        return {"source_records": len(rows), "atoms": atoms, "queued_evidence": queued, "source_digest": source_digest, "atom_ids": atom_ids, "target_group": target_group}
 
     def migrate(self, *, promote: bool = False, strict: bool = True) -> MigrationResult:
         """Migrate all discovered V1 memory sources into the shadow stores.
@@ -504,5 +661,54 @@ class V1MemoryMigrator:
 
     run = migrate
 
+    def preview(self) -> MigrationResult:
+        """Read and count sources without opening any V2 write transaction."""
 
-__all__ = ["MigrationResult", "V1MemoryMigrator"]
+        source_records = 0
+        groups: dict[str, dict[str, Any]] = {}
+        source_digests: dict[str, str] = {}
+        errors: list[str] = []
+        try:
+            for group, path in self._group_paths():
+                reader = V1GroupReader(self.source_root, group, path, immutable=self.immutable_sources)
+                inventory = reader.inventory()
+                if inventory.error:
+                    errors.append(f"{group}:{inventory.error}")
+                    continue
+                source_records += inventory.records
+                source_digests[group] = inventory.source_digest
+                groups[group] = {
+                    "source_records": inventory.records,
+                    "active": inventory.active,
+                    "source_digest": inventory.source_digest,
+                    "target_group": self._target_group(group),
+                }
+            for group, path, rows in self._managed_records():
+                digest = stable_digest([_json_safe(dict(row)) for row in rows])
+                source_records += len(rows)
+                source_digests[group] = digest
+                groups[group] = {
+                    "source_records": len(rows),
+                    "active": sum(
+                        1
+                        for row in rows
+                        if str(row.get("status") or "active").casefold() == "active"
+                    ),
+                    "source_digest": digest,
+                    "target_group": self._target_group(group),
+                }
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}:{exc}")
+        source_digest = stable_digest(source_digests)
+        return MigrationResult(
+            source_records=source_records,
+            groups=groups,
+            counts={"source_records": source_records, "atoms": 0},
+            digests={"source": source_digest},
+            source_digest=source_digest,
+            errors=tuple(errors),
+            status="ok" if not errors else "failed",
+        )
+
+
+__all__ = ["MigrationResult", "V1GroupInventory", "V1GroupReader", "V1MemoryMigrator"]

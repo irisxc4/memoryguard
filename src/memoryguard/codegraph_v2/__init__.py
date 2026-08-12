@@ -21,6 +21,7 @@ from .models import (
     stable_digest,
     stable_id,
 )
+from .graphify_adapter import EXPORT_FORMAT, GraphifyExportAdapter, GraphifyExportError, GraphifyImportResult
 from .projector import CodeGraphProjectionResult, CodeGraphProjector, PersistentCodeGraphProjector
 from .store import CodeGraphStorage, CodeGraphStore, PersistentCodeGraph, SCHEMA_MARKER, SCHEMA_VERSION, normalize_relative_path
 
@@ -40,6 +41,10 @@ __all__ = [
     "CodeGraphStorage",
     "CodeGraphStore",
     "Edge",
+    "EXPORT_FORMAT",
+    "GraphifyExportAdapter",
+    "GraphifyExportError",
+    "GraphifyImportResult",
     "OutboxEvent",
     "PersistentCodeGraph",
     "PersistentCodeGraphProjector",

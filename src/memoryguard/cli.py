@@ -28,6 +28,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
+from typing import Any
 
 from . import __version__
 from .discover import WorkspaceDiscoverer
@@ -38,6 +39,7 @@ from .rules import instruction_rules  # noqa: F401
 from .rules import skill_rules  # noqa: F401
 from .rules import memory_rules  # noqa: F401
 from .rules import rag_rules  # noqa: F401
+from .runtime_v2.public_safety import v2_upgrade_payload
 from .schema import (
     Change,
     ChangeStatus,
@@ -497,10 +499,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 def cmd_source(args: argparse.Namespace) -> int:
     """来源管理（spec §4.1）。"""
-    from .source_registry import SourceRegistry
-    from .schema_v3 import SourceRootType
+    from .runtime_v2.source_control import SourceControlError, SourceControlService
     workspace = Path(getattr(args, "workspace", ".")).resolve()
-    reg = SourceRegistry(workspace)
+    context = getattr(args, "_native_context", None) or _cli_trusted_context(workspace)
+    service = SourceControlService(workspace)
     action = args.action
     source_id = str(getattr(args, "source_id", "") or "").strip()
     if action == "remove" and not source_id:
@@ -508,51 +510,49 @@ def cmd_source(args: argparse.Namespace) -> int:
         # before the parser's source-target fix.
         source_id = str(getattr(args, "path", "") or "").strip()
     if action == "list":
-        sources = reg.list_sources()
-        print(f"sources: {len(sources)}")
-        for s in sources:
-            print(f"  - {s.root_id}  {s.type.value}  {s.display_name}  scope={s.scope}")
-            print(f"      path: {s.path}")
-        return 0
+        result = service.list_sources(context)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 2
     if action == "add":
-        root_type = SourceRootType(args.type)
-        root = reg.add(args.path, root_type, display_name=args.name or "")
-        print(f"added: {root.root_id}  type={root.type.value}  scope={root.scope}")
-        preview = reg.preview(args.path, root_type)
-        print(f"  estimated_files: {preview.get('estimated_files', 0)}")
-        return 0
+        try:
+            result = service.add(
+                str(getattr(args, "path", "") or ""),
+                str(getattr(args, "type", "") or ""),
+                context,
+                display_name=str(getattr(args, "name", "") or ""),
+            )
+        except SourceControlError as exc:
+            result = {"ok": False, "status": "blocked", "code": exc.code, "error": exc.code}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 2
     if action == "remove":
-        ok = reg.remove(source_id)
-        if ok:
-            print(f"removed: {source_id}")
-            return 0
-        print(f"error: cannot remove {source_id} (not found or project default)", file=sys.stderr)
-        return 1
+        try:
+            result = service.remove(source_id, context)
+        except SourceControlError as exc:
+            result = {"ok": False, "status": "blocked", "code": exc.code, "error": exc.code}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 2
     if action == "preview":
-        root_type = SourceRootType(args.type)
-        preview = reg.preview(args.path, root_type)
-        print(f"preview: {preview}")
-        return 0
-    print(f"unknown source action: {action}", file=sys.stderr)
-    return 1
+        try:
+            result = service.preview_path(str(getattr(args, "path", "") or ""), context)
+        except SourceControlError as exc:
+            result = {"ok": False, "status": "blocked", "code": exc.code, "error": exc.code}
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 2
+    result = {"ok": False, "status": "error", "code": "invalid_source_action", "error": "invalid_source_action"}
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 2
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
     """只读扫描，生成快照 + 覆盖率账本（spec §4.2）。"""
-    import json as _json
-    from .source_registry import SourceRegistry, ScanBudget
+    from .runtime_v2.source_control import SourceControlService
+
     workspace = Path(getattr(args, "workspace", ".")).resolve()
-    reg = SourceRegistry(workspace)
-    snap = reg.scan(ScanBudget())
-    cov = snap.coverage
-    counts = cov.counts()
-    print(f"snapshot: {snap.snapshot_id}")
-    print(f"  created_at: {snap.created_at}")
-    print(f"  source_objects: {len(snap.source_objects)}")
-    print(f"  coverage: {counts['coverage_status'] if 'coverage_status' in counts else cov.status().value}")
-    print(f"  candidates: {counts['candidate_count']}")
-    print(f"  read: {counts['read']}  unsupported: {counts['unsupported']}  unreadable: {counts['unreadable']}")
-    print(f"  skipped_by_policy: {counts['skipped_by_policy']}  unaccounted: {counts['unaccounted_count']}")
+    context = getattr(args, "_native_context", None) or _cli_trusted_context(workspace)
+    result = SourceControlService(workspace).scan_summary(context)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    return 0 if result.get("ok") else 2
     # 持久化快照
     snap_dir = workspace / MG_DIR / "snapshots" / snap.snapshot_id
     snap_dir.mkdir(parents=True, exist_ok=True)
@@ -567,8 +567,14 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 def cmd_import(args: argparse.Namespace) -> int:
     """离线导入（spec §4.3）。"""
-    import json as _json
-    from .adapters import GenericImportAdapter, ChatGPTImportAdapter
+    del args
+    print(json.dumps({
+        "ok": False,
+        "status": "retired",
+        "code": "v2_operation_retired",
+        "error": "v2_operation_retired",
+    }, ensure_ascii=False, sort_keys=True))
+    return 2
     workspace = Path(getattr(args, "workspace", ".")).resolve()
     bundle = Path(args.bundle).resolve()
     if not bundle.exists():
@@ -615,14 +621,20 @@ def cmd_import(args: argparse.Namespace) -> int:
 
 def cmd_memory(args: argparse.Namespace) -> int:
     """记忆构建与发布（spec §4.4）。须显式 --agent-instance-id。"""
-    import json as _json
+    del args
+    print(json.dumps({
+        "ok": False,
+        "status": "retired",
+        "code": "v2_operation_retired",
+        "error": "v2_operation_retired",
+    }, ensure_ascii=False, sort_keys=True))
+    return 2
     from .adapters import GenericMarkdownTarget
     from .governance_scope import (
         filter_ir_for_agent, resolve_governance_scope,
         resolve_scoped_roots, derive_publish_target_file, root_authorizes_agent,
     )
     from .release_manager import ReleaseManager
-    from .source_registry import ScanBudget, SourceRegistry
     workspace = Path(getattr(args, "workspace", ".")).resolve()
     rm = ReleaseManager(workspace)
     action = args.action
@@ -641,7 +653,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
     def _resolve_authorized_root(target_root_id: str):
         if not target_root_id:
             return None, "target_root_id_required"
-        reg = SourceRegistry(workspace)
+        reg = None
         root = next((r for r in reg.list_all_sources() if r.root_id == target_root_id), None)
         if root is None or not root_authorizes_agent(root, gscope.agent_instance_id):
             return None, "target_root_not_authorized_for_agent"
@@ -657,7 +669,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
         if err:
             print(f"error: {err}", file=sys.stderr)
             return 2
-        reg = SourceRegistry(workspace)
+        reg = None
         snap, ir = rm.scan_and_normalize(ScanBudget())
         roots, _ = resolve_scoped_roots(reg.list_all_sources(), gscope, enabled_only=True)
         allowed = {r.root_id for r in roots}
@@ -857,30 +869,20 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     # 5. 已绑定的 Agent
     try:
-        from .agent_binding import AgentBindingStore
-        from .schema_v3 import BindingStatus
-        store = AgentBindingStore(workspace)
-        bindings = store.list_bindings(include_inactive=False)
+        from .runtime_v2.group_native import GroupControlService
+        bindings = GroupControlService(workspace, write=False).list_bindings(
+            include_inactive=False,
+        ).get("bindings", [])
         lines.append(f"Agent bindings: {len(bindings)} active")
     except Exception as e:
         lines.append(f"Agent bindings: error ({e})")
 
     # 6. shared-memory 记录
-    sm_dir = workspace / MG_DIR / "shared-memory"
-    group_count = 0
-    record_count = 0
-    if sm_dir.is_dir():
-        try:
-            from .shared_memory_store import SharedMemoryStore
-            for group_dir in sorted(sm_dir.iterdir()):
-                if not group_dir.is_dir():
-                    continue
-                group_count += 1
-                s = SharedMemoryStore(workspace, group_dir.name).status()
-                record_count += s.get("total_records", 0)
-        except Exception:
-            pass
-    lines.append(f"Shared memory: {group_count} groups, {record_count} records")
+    try:
+        groups = GroupControlService(workspace, write=False).list_groups().get("groups", [])
+    except Exception:
+        groups = []
+    lines.append(f"V2 memory groups: {len(groups)}")
 
     # 7. provider adapter 安装状态
     lines.append("Provider adapters:")
@@ -946,28 +948,28 @@ def cmd_mcp_status(args: argparse.Namespace) -> int:
     lines.append("")
 
     # 收集所有 share group
-    sm_dir = workspace / MG_DIR / "shared-memory"
-    groups: list[tuple[str, dict]] = []
-    if sm_dir.is_dir():
-        try:
-            from .shared_memory_store import SharedMemoryStore
-            for group_dir in sorted(sm_dir.iterdir()):
-                if not group_dir.is_dir():
-                    continue
-                st = SharedMemoryStore(workspace, group_dir.name).status()
-                groups.append((group_dir.name, st))
-        except Exception as e:
-            lines.append(f"error reading shared-memory: {e}")
-            print("\n".join(lines))
-            return 1
+    from .runtime_v2.group_native import GroupControlService
+    native_groups = GroupControlService(workspace, write=False).list_groups().get("groups", [])
+    groups: list[tuple[str, dict]] = [
+        (str(item.get("share_group_id") or ""), {
+            "total_records": 0,
+            "total_events": 0,
+            "total_conflicts": 0,
+            "total_quarantine": 0,
+            "active_version": None,
+        })
+        for item in native_groups
+    ]
     # 收集已绑定 Agent
     group_agents: dict[str, list[str]] = {}
     try:
-        from .agent_binding import AgentBindingStore
-        from .schema_v3 import BindingStatus
-        store = AgentBindingStore(workspace)
-        for b in store.list_bindings(include_inactive=False):
-            group_agents.setdefault(b.share_group_id, []).append(b.agent_instance_id)
+        bindings = GroupControlService(workspace, write=False).list_bindings(
+            include_inactive=False,
+        ).get("bindings", [])
+        for binding in bindings:
+            group_agents.setdefault(
+                str(binding.get("share_group_id") or ""), []
+            ).append(str(binding.get("agent_instance_id") or ""))
     except Exception:
         pass
 
@@ -994,9 +996,10 @@ def cmd_mcp_status(args: argparse.Namespace) -> int:
     # 绑定的 Agent 总览
     bound_agents: list[str] = []
     try:
-        from .agent_binding import AgentBindingStore
-        store = AgentBindingStore(workspace)
-        bound_agents = [b.agent_instance_id for b in store.list_bindings(include_inactive=False)]
+        bindings = GroupControlService(workspace, write=False).list_bindings(
+            include_inactive=False,
+        ).get("bindings", [])
+        bound_agents = [str(item.get("agent_instance_id") or "") for item in bindings]
     except Exception:
         pass
     if bound_agents:
@@ -1068,8 +1071,8 @@ def cmd_hooks(args: argparse.Namespace) -> int:
     import json
     import os
 
-    from .agent_binding import AgentBindingStore
     from .host_hooks import HostHookManager, set_hook_mode
+    from .runtime_v2.group_native import GroupControlService
 
     workspace = Path(args.workspace).expanduser().resolve()
     manager = HostHookManager(workspace)
@@ -1095,14 +1098,14 @@ def cmd_hooks(args: argparse.Namespace) -> int:
                 )
             group_id = str(args.share_group_id or "")
             if not group_id:
-                bindings = AgentBindingStore(workspace).find_by_agent(
-                    agent_id, include_inactive=False,
+                binding = GroupControlService(workspace, write=False).active_binding_for_agent(
+                    agent_id,
                 )
-                if not bindings:
+                if binding is None:
                     raise ValueError(
                         f"no active binding found for {agent_id!r}"
                     )
-                group_id = bindings[0].share_group_id
+                group_id = str(binding.get("share_group_id") or "")
             result = manager.install(
                 provider,
                 agent_instance_id=agent_id,
@@ -1223,121 +1226,22 @@ def cmd_groups(args: argparse.Namespace) -> int:
     recovery path for the "control directory moved but memory did not"
     incident.
     """
-    from .group_migration import (
-        copy_group_records,
-        discover_legacy_group,
-        find_nonempty_shared_groups,
-    )
+    from .runtime_v2.group_native import GroupControlService
 
     workspace = Path(args.workspace).resolve()
 
     if args.action == "list":
-        print("MemoryGuard shared-memory groups")
-        print(f"  workspace: {workspace}")
-        groups = find_nonempty_shared_groups(workspace)
-        if not groups:
-            print("  (no non-empty groups found)")
-        for g in groups:
-            suffix = f"  [error: {g['error']}]" if g.get("error") else ""
-            print(
-                f"  {g['group_id']}  records={g['records']} active={g['active']}  "
-                f"{g['db_path']}{suffix}"
-            )
-        from .agent_binding import AgentBindingStore
-        bindings = AgentBindingStore(workspace).list_bindings(include_inactive=False)
-        if bindings:
-            print("  active bindings:")
-            for b in bindings:
-                print(f"    {b.agent_instance_id} -> {b.share_group_id}")
-        else:
-            print("  (no active bindings)")
-        return 0
+        result = GroupControlService(workspace, write=False).list_groups()
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 0 if result.get("ok") else 2
 
-    source_ws = (
-        Path(args.source_workspace).resolve() if args.source_workspace else workspace
-    )
-    source_gid = args.from_gid
-    if not source_gid:
-        legacy = discover_legacy_group(source_ws)
-        if legacy is None:
-            print(
-                f"error: no non-empty legacy group found in {source_ws}; "
-                "pass --from <group-id>",
-                file=sys.stderr,
-            )
-            return 2
-        source_gid = legacy["group_id"]
-        print(
-            f"auto-detected source group: {source_gid} "
-            f"({legacy['records']} records)"
-        )
-
-    target_gid = args.to_gid
-    if not target_gid:
-        from .agent_binding import AgentBindingStore
-        active = [
-            b for b in AgentBindingStore(workspace).list_bindings(include_inactive=False)
-            if b.share_group_id and not b.share_group_id.startswith("personal-")
-        ]
-        if not active:
-            print(
-                "error: no active shared binding in target workspace; "
-                "pass --to <group-id>",
-                file=sys.stderr,
-            )
-            return 2
-        target_gid = active[0].share_group_id
-        print(f"auto-detected target group: {target_gid}")
-
-    result = copy_group_records(
-        source_ws, source_gid, workspace, target_gid,
-        dry_run=not args.apply,
-        archive_source=args.archive_source,
-    )
-    mode = "dry-run" if result["dry_run"] else "apply"
-    prefix = "would-" if result["dry_run"] else ""
-    print("MemoryGuard groups migrate")
-    print(f"  mode:          {mode}")
-    print(
-        f"  source:        {result['source']['workspace']} / "
-        f"{result['source']['group_id']} ({result['source']['records']} records)"
-    )
-    print(
-        f"  target:        {result['target']['workspace']} / "
-        f"{result['target']['group_id']} "
-        f"(existing {result['target']['existing_records']} records, "
-        f"{result['target']['existing_active']} active)"
-    )
-    print(
-        f"  {prefix}copied={result['copied']} {prefix}updated={result['updated']} "
-        f"{prefix}replaced={result['replaced']} "
-        f"assignments={result['assignments_migrated']} "
-        f"failed={len(result['failed'])}"
-    )
-    if result["collisions"]:
-        print("  collisions (target holds these memory_id under another domain):")
-        for mid in result["collisions"]:
-            print(f"    {mid}")
-    for failed in result["failed"]:
-        print(
-            f"  failed {failed['memory_id']}: {failed['error']}",
-            file=sys.stderr,
-        )
-    if result["archived_to"]:
-        print(f"  archived source -> {result['archived_to']}")
-
-    if not result["dry_run"] and result["failed"]:
-        return 1
-    if (
-        not result["dry_run"]
-        and not result["copied"]
-        and not result["updated"]
-        and not result["replaced"]
-    ):
-        print("  (no records migrated)", file=sys.stderr)
-        return 1
-    return 0
-
+    print(json.dumps({
+        "ok": False,
+        "status": "retired",
+        "code": "v2_operation_retired",
+        "error": "v2_operation_retired",
+    }, ensure_ascii=False, sort_keys=True))
+    return 2
 
 def cmd_desktop(args: argparse.Namespace) -> int:
     """启动 MemoryGuard Desktop Executor（可信执行端）。"""
@@ -1411,6 +1315,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memoryguard",
         description="Local-first Agent governance: audit instructions, skills, memory, and local RAG.",
+        epilog="Public V1→V2 upgrade: memoryguard upgrade --workspace <path> [--data-home <path>] [--apply].",
     )
     parser.add_argument("--version", action="version", version=f"memoryguard {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1686,23 +1591,6 @@ def gui_main(argv: list[str] | None = None) -> int:
     return 0
 
 
-class _CliLegacyPort:
-    """Invoke the already-parsed legacy callback without losing Namespace data."""
-
-    def __init__(self, callback) -> None:
-        self.callback = callback
-
-    def dispatch(self, surface: str, name: str, payload: dict) -> dict:
-        namespace = argparse.Namespace(**dict(payload or {}))
-        namespace.command = name
-        namespace.func = self.callback
-        exit_code = self.callback(namespace)
-        return {
-            "ok": int(exit_code or 0) == 0,
-            "exit_code": int(exit_code or 0),
-        }
-
-
 def _cli_trusted_context(workspace: str | Path = ".") -> dict:
     """Return one process-issued CLI authority for native and maintenance ports.
 
@@ -1714,7 +1602,7 @@ def _cli_trusted_context(workspace: str | Path = ".") -> dict:
     """
     try:
         from .access_context import load_access_context
-        from .agent_binding import AgentBindingStore
+        from .runtime_v2.group_native import GroupControlService
         from .runtime_v2.native_ports import bind_native_transport_context
         from .maintenance_v2.runtime_port import bind_maintenance_transport_context
 
@@ -1723,15 +1611,15 @@ def _cli_trusted_context(workspace: str | Path = ".") -> dict:
         if not agent_id:
             return {}
         resolved_workspace = Path(workspace).expanduser().resolve()
-        bindings = AgentBindingStore(resolved_workspace).find_by_agent(
-            agent_id, include_inactive=False,
+        binding = GroupControlService(resolved_workspace, write=False).active_binding_for_agent(
+            agent_id,
         )
-        if len(bindings) != 1:
+        if binding is None:
             return {}
         envelope = bind_native_transport_context(
             ctx,
             workspace_id=str(resolved_workspace),
-            share_group_id=str(bindings[0].share_group_id or ""),
+            share_group_id=str(binding.get("share_group_id") or ""),
             runtime_role="cli",
             entrypoint="cli",
         )
@@ -1740,76 +1628,152 @@ def _cli_trusted_context(workspace: str | Path = ".") -> dict:
         return {}
 
 
-def _dispatch_cutover(args: argparse.Namespace) -> int:
-    """Run one CLI command through the Phase 6 one-way cutover gate."""
-    from .compat_v2 import make_cutover_adapter
+def _cli_workspace(args: argparse.Namespace) -> Path:
+    command = str(getattr(args, "command", "") or "")
+    if command == "provider":
+        from .data_home import resolve_data_home
 
-    workspace = getattr(args, "workspace", None) or getattr(args, "path", ".") or "."
-    # ``gui`` uses a fixed per-user control directory when no positional
-    # workspace was supplied.  Feed the same resolved path to the cutover
-    # manifest gate that ``cmd_gui`` will use on the legacy route.
-    if getattr(args, "command", "") == "gui" and not getattr(args, "workspace", ""):
-        workspace = str(_resolve_gui_workspace([]))
-    adapter = make_cutover_adapter(
-        workspace,
-        # Construct the legacy CLI port only after V1_ACTIVE/V2_BUILDING is
-        # selected.  V2/unknown calls must not instantiate callback adapters.
-        legacy_port=lambda: _CliLegacyPort(args.func),
-        trusted_context=_cli_trusted_context(workspace),
-    )
+        return resolve_data_home().expanduser().resolve()
+    if command == "gui" and not getattr(args, "workspace", ""):
+        resolved = _resolve_gui_workspace([])
+        if resolved is not None:
+            return resolved.expanduser().resolve()
+    raw = getattr(args, "workspace", None) or getattr(args, "path", ".") or "."
+    return Path(raw).expanduser().resolve()
+
+
+def _cli_manifest_snapshot(workspace: Path) -> tuple[str, int | None, Any]:
+    """Read one immutable-enough manifest snapshot without creating state."""
+    from .system.manifest import ManifestManager
+
     try:
-        mutation = adapter._cli_is_mutation(args.command, args)
-    except Exception as exc:
-        # Do not interpret malformed string booleans as a dry-run/read.
-        print(
-            json.dumps(
-                {"ok": False, "status": "error", "code": str(exc), "error": str(exc), "path": "none"},
-                ensure_ascii=False, sort_keys=True,
-            )
-        )
-        return 1
-    result = adapter.dispatch_cli(
-        args.command, args, mutation=mutation,
-        context=_cli_trusted_context(workspace),
+        record = ManifestManager(workspace).current()
+    except Exception:
+        return "UNKNOWN", None, None
+    if isinstance(record, dict):
+        raw_state = record.get("state", record.get("status", ""))
+        raw_generation = record.get("generation")
+    else:
+        raw_state = getattr(record, "state", "")
+        raw_generation = getattr(record, "generation", None)
+    state = str(getattr(raw_state, "value", raw_state) or "").strip().upper()
+    if state not in {"V1_ACTIVE", "V2_BUILDING", "V2_READY", "V2_ACTIVE"}:
+        return "UNKNOWN", None, record
+    generation = raw_generation if type(raw_generation) is int and raw_generation >= 0 else None
+    return state, generation, record
+
+
+def _cli_mutation(args: argparse.Namespace) -> bool:
+    command = str(getattr(args, "command", "") or "")
+    action = str(getattr(args, "action", "") or "").casefold()
+    if command in {"provider", "desktop"}:
+        return True
+    if command == "source":
+        return action in {"add", "remove"}
+    if command == "import":
+        return action == "create"
+    if command == "hooks":
+        return action != "status"
+    if command == "groups":
+        return action == "migrate" and bool(getattr(args, "apply", False))
+    if command == "storage":
+        return action not in {"audit", "report"}
+    if command == "gc":
+        return bool(getattr(args, "apply", False))
+    return command in {"apply", "undo"}
+
+
+def _dispatch_cutover(args: argparse.Namespace) -> int:
+    """Dispatch every normal CLI command through the native V2 runtime."""
+    workspace = _cli_workspace(args)
+    state, generation, manifest_record = _cli_manifest_snapshot(workspace)
+    if state not in {"V2_READY", "V2_ACTIVE"}:
+        result = v2_upgrade_payload(state, surface="CLI")
+        result.update({
+            "command": str(getattr(args, "command", "") or ""),
+            "path": "v2",
+            "status": "blocked",
+        })
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 2
+    if generation is None or manifest_record is None:
+        result = v2_upgrade_payload("UNKNOWN", surface="CLI")
+        result.update({
+            "command": str(getattr(args, "command", "") or ""),
+            "path": "v2",
+            "status": "blocked",
+        })
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 2
+
+    from .runtime_v2.native_ports import NativeV2RuntimePort
+
+    maintenance_port = None
+    if str(getattr(args, "command", "") or "") == "storage":
+        from .maintenance_v2.runtime_port import MaintenanceRuntimePort
+
+        maintenance_port = MaintenanceRuntimePort(workspace)
+    context = _cli_trusted_context(workspace)
+    native = NativeV2RuntimePort(
+        workspace,
+        maintenance_port=maintenance_port,
+        state_provider=lambda: manifest_record,
     )
-    path = str(result.get("path", ""))
-    if path == "v2" and result.get("ok"):
-        # A small set of host-control commands are deliberately executed only
-        # after the native V2 manifest/identity gate has returned an explicit
-        # action receipt.  This is not a data-plane fallback: these callbacks
-        # manage source/provider/hook/UI host state and must never be used for
-        # V2 Memory/Rules/Content persistence.
-        cursor: Any = result
-        host_action = ""
-        for _ in range(3):
-            if not isinstance(cursor, dict):
-                break
-            host_action = str(cursor.get("host_action") or "")
-            if host_action:
-                break
-            cursor = cursor.get("data")
-        allowed_host_actions = {"source", "provider", "hooks", "gui", "open", "desktop"}
+    result = native.dispatch_cli(
+        str(getattr(args, "command", "") or ""),
+        args,
+        context=context,
+        generation=generation,
+        mutation=_cli_mutation(args),
+        state=state,
+    )
+    cursor: Any = result
+    host_action = ""
+    for _ in range(3):
+        if not isinstance(cursor, dict):
+            break
+        host_action = str(cursor.get("host_action") or "")
         if host_action:
-            if host_action != str(args.command) or host_action not in allowed_host_actions:
-                print(json.dumps({"ok": False, "status": "error", "code": "invalid_v2_host_action", "path": "v2"}, ensure_ascii=False, sort_keys=True))
-                return 1
+            break
+        cursor = cursor.get("data")
+    allowed_host_actions = {"source", "provider", "hooks", "gui", "open", "desktop"}
+    if result.get("ok") and host_action:
+        if host_action != str(getattr(args, "command", "")) or host_action not in allowed_host_actions:
+            result = {
+                "ok": False,
+                "status": "error",
+                "path": "v2",
+                "code": "invalid_v2_host_action",
+                "error": "invalid_v2_host_action",
+            }
+        else:
+            setattr(args, "_native_context", context)
             return int(args.func(args) or 0)
-    if path == "legacy":
-        legacy = result.get("legacy")
-        if isinstance(legacy, dict) and "exit_code" in legacy:
-            return int(legacy.get("exit_code") or 0)
-        # Legacy callback failures retain the old recoverable-error code.
-        return 1 if not result.get("ok") else 0
-    # V2 and fail-closed envelopes are machine-readable and intentionally do
-    # not fall back to the callback.  Keep command/status/path for callers.
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
     if result.get("ok"):
         return 0
     code = str(result.get("code", ""))
-    return 2 if code in {"v2_manifest_state_unavailable", "v2_not_active", "unknown_cli_command", "v2_context_capability_required"} else 1
+    return 2 if code in {
+        "v2_upgrade_required",
+        "v2_manifest_state_unavailable",
+        "v2_not_active",
+        "unknown_cli_command",
+        "v2_context_capability_required",
+        "v2_operation_retired",
+    } else 1
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # ``upgrade`` is a public lifecycle command, not a legacy data-plane
+    # command.  Intercept it before the compatibility cutover adapter so an
+    # old 0.6.2 user never gets routed back to the legacy runtime.  Keeping it
+    # outside the adapter's historical command snapshot also preserves the
+    # existing public CLI compatibility contract.
+    if raw_argv and raw_argv[0] == "upgrade":
+        from .migration.upgrade import main as upgrade_main
+
+        return upgrade_main(raw_argv[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
     return _dispatch_cutover(args)

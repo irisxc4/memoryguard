@@ -10,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from memoryguard.gc import GcPlan, GcPlanItem, MemoryGuardGc
 from memoryguard.gui import GovernanceApi
+from memoryguard.access_context import AccessContext
+from memoryguard.desktop_executor import SERVER_ADMIN_AGENT_ID
+from memoryguard.migration.upgrade import run_upgrade
 from memoryguard.schema_v3 import _now_iso
 
 
@@ -49,6 +52,31 @@ def _make_native_release(mg: Path, release_id: str, *, status: str, created_at: 
         encoding="utf-8",
     )
     return release_dir
+
+
+def _active_gui_api(root: Path) -> GovernanceApi:
+    """Use V2 maintenance/task envelopes after explicit activation."""
+    ready = run_upgrade(root, data_home=root, apply=True)
+    assert ready["status"] == "V2_READY", ready
+    active = run_upgrade(
+        root,
+        data_home=root,
+        apply=True,
+        confirm="V2_ACTIVE",
+    )
+    assert active["v2_active"] is True, active
+    return GovernanceApi(
+        str(root),
+        _trusted_access_context=AccessContext(
+            trusted_agent_id=SERVER_ADMIN_AGENT_ID,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="gc-test-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+    )
 
 
 def test_gc_strips_expired_native_release_backup_and_staged(tmp_path) -> None:
@@ -258,16 +286,17 @@ def test_governance_api_plan_and_apply(tmp_path) -> None:
         created_at=_old_iso(40),
     )
 
-    api = GovernanceApi(str(workspace))
+    api = _active_gui_api(workspace)
     plan = api.plan_memoryguard_gc(older_than_days=30)
     assert plan["dry_run"] is True
-    assert plan["items"]
+    assert plan["plan"]["blocked"] is False
+    assert isinstance(plan["plan"]["candidate_count"], int)
 
     denied = api.apply_memoryguard_gc(confirmed=False)
-    assert "error" in denied
+    assert denied["code"] == "maintenance_confirmation_required"
 
     applied = api.apply_memoryguard_gc(confirmed=True, older_than_days=30)
     assert applied["ok"] is True
-    release_dir = mg / "native_releases" / "nrel-api"
-    assert (release_dir / "manifest.json").exists()
-    assert not (release_dir / "backup").exists()
+    assert applied["accepted"] is True
+    assert applied["deferred"] is True
+    assert applied["job_id"]

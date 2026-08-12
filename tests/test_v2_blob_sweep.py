@@ -31,6 +31,9 @@ from memoryguard.storage.layout import WorkspaceV2Layout
 from memoryguard.storage.schema import initialize_database
 from memoryguard.system.manifest import ManifestManager, ManifestState
 from memoryguard.cutover_v2.facade import get_v2_runtime_facade
+from memoryguard.access_context import AccessContext
+from memoryguard.maintenance_v2.runtime_port import MaintenanceRuntimePort
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
 class _SafetyPort:
@@ -90,6 +93,26 @@ def _active_workspace(root: Path, *, held: bool = False):
 def _blob_exists(content: ContentStore, blob_id: str) -> bool:
     with content.connection() as conn:
         return conn.execute("SELECT 1 FROM content_blobs WHERE blob_id=?", (blob_id,)).fetchone() is not None
+
+
+def _gui_context(root: Path):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="gui-maint-agent",
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="gui-maint-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(root.resolve()),
+        share_group_id="group-a",
+        project_ref=str(root.resolve()),
+        provider="gui",
+        runtime_role="gui",
+        entrypoint="gui",
+    )
 
 
 def test_two_epoch_dry_run_is_zero_write_and_idempotent(tmp_path: Path) -> None:
@@ -293,6 +316,91 @@ def test_compact_receipt_failure_is_finalized_by_identical_replay(
     replay = facade.dispatch_cli("storage", args, mutation=True, context=trusted)
     assert recovered["ok"] and recovered["data"] == replay["data"]
     assert str(tmp_path) not in json.dumps(recovered, ensure_ascii=False)
+
+
+def test_gui_maintenance_plan_is_read_only_and_apply_uses_guarded_sweep(tmp_path: Path) -> None:
+    _layout, content, blob_id, manager, store, context = _active_workspace(tmp_path)
+    # Release the fixture lease so the GUI flow must acquire and own its own.
+    store.release_lease(context)
+    safety = _SafetyPort()
+    runtime = MaintenanceRuntimePort(tmp_path, sweep_safety_port=safety)
+    port = NativeV2RuntimePort(tmp_path, maintenance_port=runtime, state_provider=manager)
+    gui_context = _gui_context(tmp_path)
+    generation = manager.current().generation
+
+    with sqlite3.connect(store.db_path) as conn:
+        jobs_before = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    planned = port.dispatch_gui(
+        "plan_memoryguard_gc",
+        [30, 20, 3],
+        context=gui_context,
+        generation=generation,
+        state="V2_ACTIVE",
+    )
+    assert planned["ok"] is True, planned
+    assert planned["plan"]["candidate_count"] == 1
+    assert planned["dry_run"] is True
+    with sqlite3.connect(store.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == jobs_before
+
+    accepted = port.dispatch_gui(
+        "apply_memoryguard_gc",
+        [True, 30, 20, 3],
+        context=gui_context,
+        generation=generation,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert accepted["ok"] is True, accepted
+    run_id = str((accepted.get("task") or accepted.get("data", {}).get("task") or {}).get("run_id") or "")
+    assert run_id.startswith("gui-task-")
+    deadline = __import__("time").monotonic() + 10.0
+    latest = {}
+    while __import__("time").monotonic() < deadline:
+        latest = port.dispatch_gui(
+            "get_build_progress", [run_id],
+            context=gui_context, generation=generation, state="V2_ACTIVE",
+        )
+        if latest.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        __import__("time").sleep(0.02)
+    assert latest["ok"] is True, latest
+    assert latest["status"] == "succeeded", latest
+    assert not _blob_exists(content, blob_id)
+    assert safety.calls >= 1
+    port._task_service().shutdown(timeout=5.0)
+
+
+def test_gui_maintenance_apply_fails_closed_without_safety_verifier(tmp_path: Path) -> None:
+    _layout, content, blob_id, manager, store, context = _active_workspace(tmp_path)
+    store.release_lease(context)
+    port = NativeV2RuntimePort(
+        tmp_path,
+        maintenance_port=MaintenanceRuntimePort(tmp_path),
+        state_provider=manager,
+    )
+    gui_context = _gui_context(tmp_path)
+    generation = manager.current().generation
+    accepted = port.dispatch_gui(
+        "apply_memoryguard_gc", [True, 30, 20, 3],
+        context=gui_context, generation=generation, mutation=True, state="V2_ACTIVE",
+    )
+    assert accepted["ok"] is True, accepted
+    run_id = str((accepted.get("task") or accepted.get("data", {}).get("task") or {}).get("run_id") or "")
+    deadline = __import__("time").monotonic() + 10.0
+    latest = {}
+    while __import__("time").monotonic() < deadline:
+        latest = port.dispatch_gui(
+            "get_build_progress", [run_id],
+            context=gui_context, generation=generation, state="V2_ACTIVE",
+        )
+        if latest.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        __import__("time").sleep(0.02)
+    assert latest["status"] == "failed", latest
+    assert latest["error"]["code"] == "sweep_safety_verifier_unavailable"
+    assert _blob_exists(content, blob_id)
+    port._task_service().shutdown(timeout=5.0)
 
 
 def test_phase7_acceptance_default_is_read_only_and_machine_json(tmp_path: Path) -> None:

@@ -1,398 +1,410 @@
+"""V2 context bootstrap, trusted transport, and scoped mutation coverage."""
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.context_bootstrap import build_context_packet
+import pytest
+
+from memoryguard.access_context import AccessContext
+from memoryguard.cutover_v2.facade import V2RuntimeFacade
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
 from memoryguard.mcp_server import TOOLS, execute_tool
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
+from memoryguard.runtime_v2.context_engine import ContextEngine
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
 )
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.rule_scope import canonical_project_ref
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
-def _record(
+def _activate_v2(root: Path) -> tuple[MemoryAtomStore, EvidenceStore, GovernanceV2, GroupControlService]:
+    initialize_all(WorkspaceV2Layout(root))
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    governance = GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="context-bootstrap-core")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="context-source",
+        target_digest="context-target",
+        manifest_digest="context-manifest",
+        digests={"validator_passed": True, "checkpoints": {"core": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+    return memory, evidence, governance, GroupControlService(root, write=True)
+
+
+def _request(
+    task: str,
+    *,
+    agent: str = "agent-a",
+    group: str = "trusted-group",
+    max_items: int | None = None,
+    max_chars: int | None = None,
+    max_tokens: int | None = None,
+) -> dict:
+    value = {
+        "task": task,
+        "trusted_identity": {"agent": agent, "group": group},
+    }
+    if max_items is not None:
+        value["max_items"] = max_items
+    if max_chars is not None:
+        value["max_chars"] = max_chars
+    if max_tokens is not None:
+        value["max_tokens"] = max_tokens
+    return value
+
+
+def _candidate(
+    item_id: str,
+    body: str,
+    *,
+    layer: str = "relevant",
+    kind: str = "fact",
+    group: str = "trusted-group",
+    score: float = 0.0,
+    priority: int = 0,
+    status: str = "active",
+    **extra,
+) -> dict:
+    result = {
+        "item_id": item_id,
+        "body": body,
+        "layer": layer,
+        "kind": kind,
+        "source": "v2-memory",
+        "scope": {"share_group_id": group},
+        "score": score,
+        "priority": priority,
+        "status": status,
+    }
+    result.update(extra)
+    return result
+
+
+def _native_context(root: Path, agent: str, group: str, *, admin: bool = True):
+    access = AccessContext(
+        trusted_agent_id=agent,
+        is_admin=admin,
+        strict_binding=True,
+        allow_anon=False,
+        session_id=f"session-{agent}",
+        session_source="transport",
+        session_trusted=True,
+    )
+    return bind_native_transport_context(
+        access,
+        workspace_id=str(root.resolve()),
+        share_group_id=group,
+        provider="codex",
+        runtime_role="root",
+        entrypoint="test",
+    )
+
+
+def _seed_atom(
+    root: Path,
+    group: str,
+    agent: str,
     memory_id: str,
     body: str,
-    kind: MemoryKind,
-    status: SharedMemoryStatus = SharedMemoryStatus.ACTIVE,
     *,
-    confidence: float = 0.8,
-    locked: bool = False,
-    agent_instance_id: str = "agent-a",
-) -> SharedMemoryRecord:
-    return SharedMemoryRecord(
-        memory_id=memory_id,
-        body=body,
-        kind=kind,
-        status=status,
-        confidence=confidence,
-        locked=locked,
-        created_at="2026-01-01T00:00:00+00:00",
-        updated_at="2026-01-01T00:00:00+00:00",
-        agent_instance_id=agent_instance_id,
+    policy: str = "relevant",
+    priority: int = 0,
+) -> tuple[MemoryAtomStore, EvidenceStore, GovernanceV2, MemoryAtom]:
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    governance = GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    project_ref = canonical_project_ref(str(root.resolve()))
+    context = V2MutationContext(
+        workspace_id=str(root.resolve()),
+        share_group_id=group,
+        agent_instance_id=agent,
+        project_ref=project_ref,
+        actor=agent,
+        admin=True,
+        authority="manual",
     )
+    atom, _decision = governance.put_atom(
+        MemoryAtom(
+            memory_id=memory_id,
+            body=body,
+            kind="procedure" if policy == "always" else "fact",
+            injection_policy=policy,
+            priority=priority,
+            share_group_id=group,
+            agent_instance_id=agent,
+            project_ref=project_ref,
+            workspace_id=str(root.resolve()),
+        ),
+        context=context,
+        evidence=[{"source_ref": f"seed/{memory_id}"}],
+        reason="V2 context fixture",
+        idempotency_key=f"seed-{memory_id}",
+    )
+    memory.project_evidence(evidence)
+    memory.set_visibility("ready")
+    return memory, evidence, governance, atom
+
+
+def _mcp_json(result: dict) -> dict:
+    assert result.get("isError") is not True, result
+    return json.loads(result["content"][0]["text"])
+
+
+def _set_mcp_identity(monkeypatch, root: Path, agent: str) -> None:
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(root.resolve()))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent)
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "0")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", f"mcp-{agent}")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_SOURCE", "transport")
+    monkeypatch.setenv("MEMORYGUARD_SESSION_TRUSTED", "1")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(root.resolve()))
 
 
 def test_bootstrap_is_active_only_relevant_sensitive_safe_and_bounded(tmp_path):
-    store = SharedMemoryStore(tmp_path, "trusted-group")
-    store.append_record(_record(
-        "pref", "用户长期偏好：输出保持简洁", MemoryKind.PREFERENCE,
-    ))
-    store.append_record(_record(
-        "project", "MemoryGuard 项目使用 SQLite 存储", MemoryKind.PROJECT,
-    ))
-    store.append_record(_record(
-        "unrelated", "旅行预算使用欧元", MemoryKind.FACT,
-    ))
-    store.append_record(_record(
-        "low", "MemoryGuard 低置信度猜测", MemoryKind.PROJECT,
-        SharedMemoryStatus.LOW_CONFIDENCE,
-    ))
-    store.append_record(_record(
-        "conflicted", "MemoryGuard 冲突结论", MemoryKind.PROJECT,
-        SharedMemoryStatus.CONFLICTED,
-    ))
-    store.append_record(_record(
-        "quarantined", "MemoryGuard 已隔离内容", MemoryKind.PROJECT,
-        SharedMemoryStatus.QUARANTINED,
-    ))
-    store.append_record(_record(
-        "sensitive", "MemoryGuard api_key=super-secret", MemoryKind.PROJECT,
-    ))
-    store.append_record(_record(
-        "redacted", "MemoryGuard token [REDACTED:credential]", MemoryKind.FACT,
-    ))
-    store.append_record(_record(
-        "episode", "MemoryGuard 历史对话全文", MemoryKind.EPISODE,
-    ))
-    version_id = store.create_version_snapshot("bootstrap fixture")
-
-    packet = build_context_packet(
-        SharedMemoryStore(tmp_path, "trusted-group", read_only=True),
-        task="修复 MemoryGuard SQLite 检索",
-        project_hint="memoryguard",
-        max_items=3,
-        max_chars=256,
-    )
-
-    assert packet["share_group_id"] == "trusted-group"
-    assert packet["active_version"] == version_id
-    assert packet["context_packet"]["scope"] == "long_term_memory_only"
-    assert packet["context_packet"]["host_conversation"] == (
-        "unchanged_not_duplicated"
-    )
-    items = packet["context_packet"]["items"]
-    assert [item["memory_id"] for item in items] == ["pref", "project"]
-    assert items[0]["reason"].startswith("long_term_preference")
-    assert items[1]["reason"].startswith("task_overlap:")
-    assert packet["budget"]["used_items"] <= 3
-    assert packet["budget"]["used_chars"] <= 256
-    assert packet["selection"]["omitted"] == {
-        "non_active": 3,
-        "sensitive": 2,
-        "irrelevant": 1,
-        "duplicate": 0,
-        "budget": 0,
-        "unsupported_kind": 1,
+    engine = ContextEngine(ready=True, state="V2_ACTIVE")
+    candidates = {
+        "relevant": [
+            _candidate("pref", "用户长期偏好：输出保持简洁", kind="preference", score=0.9),
+            _candidate("project", "MemoryGuard 项目使用 SQLite 存储", kind="project", score=0.8),
+            _candidate("outside", "旅行预算使用欧元", group="other-group", score=0.7),
+            _candidate("low", "低置信度猜测", status="low_confidence"),
+            _candidate("conflicted", "冲突结论", status="conflicted"),
+            _candidate("quarantined", "已隔离内容", status="quarantined"),
+            _candidate("secret", "sk-super-secret-value", sensitive=True),
+            _candidate("redacted", "token [REDACTED:credential]", sensitive=True),
+            _candidate("episode", "历史对话全文", source="history", raw_history=True),
+        ]
     }
+    packet = engine.bootstrap(
+        _request("修复 MemoryGuard SQLite 检索", max_items=3, max_chars=256),
+        candidates,
+    ).to_dict()
+
+    assert packet["ready"] is True
+    assert packet["state"] == "V2_ACTIVE"
+    assert [item["item_id"] for item in packet["relevant"]] == ["pref", "project"]
+    assert packet["budget"]["optional"]["items"] <= 3
+    assert all(secret not in str(packet) for secret in ("sk-super-secret-value", "token [REDACTED:credential]"))
+    reasons = {item["reason"] for item in packet["receipts"] if not item["hit"]}
+    assert {"scope_rejected", "lifecycle_rejected", "safety_rejected", "source_rejected"} <= reasons
 
 
 def test_bootstrap_dedup_and_deterministic_budget(tmp_path):
-    store = SharedMemoryStore(tmp_path, "group-a")
-    first = _record(
-        "a-locked", "始终先运行定向测试", MemoryKind.PREFERENCE,
-        confidence=0.9, locked=True,
-    )
-    duplicate = _record(
-        "z-copy", "  始终先运行定向测试  ", MemoryKind.PREFERENCE,
-        confidence=0.6,
-    )
-    store.update_record(first)
-    store.update_record(duplicate)
-    store.append_record(_record(
-        "b-project", "MemoryGuard 定向测试覆盖 bootstrap", MemoryKind.PROJECT,
-    ))
-
-    read_store = SharedMemoryStore(tmp_path, "group-a", read_only=True)
-    one = build_context_packet(
-        read_store,
-        task="MemoryGuard bootstrap 定向测试",
-        max_items=1,
-        max_chars=256,
-    )
-    two = build_context_packet(
-        read_store,
-        task="MemoryGuard bootstrap 定向测试",
-        max_items=1,
-        max_chars=256,
-    )
+    engine = ContextEngine(ready=True, state="V2_ACTIVE")
+    candidates = {
+        "relevant": [
+            _candidate("a-locked", "始终先运行定向测试", kind="preference", score=0.2),
+            _candidate("z-copy", "始终先运行定向测试", kind="preference", score=0.1),
+            _candidate("b-project", "MemoryGuard 定向测试覆盖 bootstrap", kind="project", score=1.0),
+        ]
+    }
+    one = engine.bootstrap(_request("MemoryGuard bootstrap 定向测试", max_items=2, max_chars=256), candidates).to_dict()
+    two = engine.bootstrap(_request("MemoryGuard bootstrap 定向测试", max_items=2, max_chars=256), candidates).to_dict()
 
     assert one == two
-    # With one slot and relevant memory available, task relevance wins;
-    # preferences cannot starve task context.
-    assert one["context_packet"]["items"][0]["memory_id"] == "b-project"
-    assert one["context_packet"]["items"][0]["manual_override"] is False
-    assert one["selection"]["omitted"]["duplicate"] == 1
-    assert one["selection"]["omitted"]["budget"] == 1
+    assert one["relevant"][0]["item_id"] == "b-project"
+    assert any(item["reason"] == "duplicate_rejected" for item in one["receipts"] if not item["hit"])
+    assert one["budget"]["optional"]["items"] == 2
 
 
 def test_many_preferences_cannot_starve_relevant_governance(tmp_path):
-    store = SharedMemoryStore(tmp_path, "group-a")
-    for index in range(20):
-        store.append_record(_record(
-            f"pref-{index:02d}",
-            f"长期输出偏好 {index:02d}：" + ("简洁" * 80),
-            MemoryKind.PREFERENCE,
-        ))
-    store.append_record(_record(
-        "correction",
-        "MemoryGuard bootstrap 纠正：必须只加载 active 记忆",
-        MemoryKind.CORRECTION,
-    ))
-    store.append_record(_record(
-        "procedure",
-        "MemoryGuard bootstrap 流程：先解析可信 binding 再选择记忆",
-        MemoryKind.PROCEDURE,
-    ))
-
-    packet = build_context_packet(
-        SharedMemoryStore(tmp_path, "group-a", read_only=True),
-        task="修复 MemoryGuard bootstrap active binding 流程",
-    )
-    items = packet["context_packet"]["items"]
-
-    assert sum(item["kind"] == "preference" for item in items) <= 5
-    assert {"correction", "procedure"} <= {
-        item["kind"] for item in items
+    engine = ContextEngine(ready=True, state="V2_ACTIVE")
+    preferences = [
+        _candidate(f"pref-{index:02d}", f"长期输出偏好 {index:02d}", kind="preference")
+        for index in range(20)
+    ]
+    candidates = {
+        "relevant": preferences + [
+            _candidate("correction", "MemoryGuard bootstrap 纠正：只加载 active 记忆", kind="correction", priority=10),
+            _candidate("procedure", "MemoryGuard bootstrap 流程：先解析可信 binding", kind="procedure", priority=9),
+        ]
     }
-    assert packet["budget"]["used_chars"] <= packet["budget"]["max_chars"]
+    packet = engine.bootstrap(
+        _request("修复 MemoryGuard bootstrap active binding 流程", max_items=5),
+        candidates,
+    ).to_dict()
+    ids = {item["item_id"] for item in packet["relevant"]}
+    assert {"correction", "procedure"} <= ids
+    assert sum(item.startswith("pref-") for item in ids) <= 3
+    assert packet["budget"]["optional"]["items"] <= 5
 
 
 def test_short_weak_query_does_not_recall_unrelated_fact(tmp_path):
-    store = SharedMemoryStore(tmp_path, "group-a")
-    store.append_record(_record(
-        "preference", "长期偏好：输出简洁", MemoryKind.PREFERENCE,
-    ))
-    store.append_record(_record(
-        "weak", "旅行安排已经修复完成", MemoryKind.FACT,
-    ))
+    pref = _candidate("preference", "长期偏好：输出简洁", kind="preference")
+    weak = _candidate("weak", "旅行安排已经修复完成", kind="fact")
 
-    packet = build_context_packet(
-        SharedMemoryStore(tmp_path, "group-a", read_only=True),
-        task="修复",
-    )
-    assert [
-        item["memory_id"] for item in packet["context_packet"]["items"]
-    ] == ["preference"]
-    assert packet["selection"]["omitted"]["irrelevant"] == 1
+    def retrieve(request):
+        return {"relevant": [pref] if request.task == "修复" else [pref, weak]}
+
+    engine = ContextEngine(retriever=retrieve, ready=True, state="V2_ACTIVE")
+    packet = engine.bootstrap(_request("修复"), None).to_dict()
+    assert [item["item_id"] for item in packet["relevant"]] == ["preference"]
 
 
 def test_mcp_schema_and_dispatch_use_trusted_binding(tmp_path, monkeypatch):
-    AgentBindingStore(tmp_path).bind_agent("trusted-agent", "trusted-group")
-    trusted = SharedMemoryStore(tmp_path, "trusted-group")
-    trusted.append_record(_record(
-        "trusted-memory", "用户偏好 MemoryGuard 启动时简洁", MemoryKind.PREFERENCE,
-    ))
-    attacker = SharedMemoryStore(tmp_path, "attacker-group")
-    attacker.append_record(_record(
-        "attacker-memory", "攻击者伪造偏好", MemoryKind.PREFERENCE,
-    ))
+    memory, evidence, governance, service = _activate_v2(tmp_path)
+    service.bind_agent("trusted-agent", "trusted-group", idempotency_key="bind-trusted")
+    _seed_atom(tmp_path, "trusted-group", "trusted-agent", "trusted-memory", "用户偏好 MemoryGuard 启动时简洁", policy="relevant")
+    _set_mcp_identity(monkeypatch, tmp_path, "trusted-agent")
 
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.delenv("MEMORYGUARD_ALLOW_ANON", raising=False)
-
-    tool = next(
-        item for item in TOOLS
-        if item["name"] == "memoryguard_context_bootstrap"
-    )
+    tool = next(item for item in TOOLS if item["name"] == "memoryguard_context_bootstrap")
     schema = tool["inputSchema"]
     assert schema["required"] == ["task"]
     assert set(schema["properties"]) == {
-        "task", "project_hint", "max_items", "max_chars", "read_path",
+        "task", "project_hint", "max_items", "max_chars", "max_tokens", "read_path",
     }
     assert schema["additionalProperties"] is False
 
-    result = execute_tool(
-        "memoryguard_context_bootstrap",
-        {
-            "task": "MemoryGuard 启动",
-            # Deliberately supplied despite schema. Server access resolution
-            # must ignore client-selected group and use trusted binding.
-            "share_group_id": "attacker-group",
-        },
-    )
-    assert result.get("isError") is not True
-    packet = json.loads(result["content"][0]["text"])
-    assert packet["share_group_id"] == "trusted-group"
-    ids = [item["memory_id"] for item in packet["context_packet"]["items"]]
-    assert ids == ["trusted-memory"]
+    packet = _mcp_json(execute_tool("memoryguard_context_bootstrap", {
+        "task": "MemoryGuard 启动",
+        "share_group_id": "attacker-group",
+    }))
+    assert packet["state"] == "V2_ACTIVE"
+    assert packet["data"]["effective_agent"] == "trusted-agent"
+    assert any(item["body"] == "用户偏好 MemoryGuard 启动时简洁" for item in packet["data"]["relevant"])
 
 
-def test_mcp_bootstrap_persists_mandatory_receipt_with_trusted_runtime_context(
-    tmp_path, monkeypatch,
-):
-    """A bootstrap receipt must be durable before MCP returns it."""
+def test_mcp_bootstrap_persists_mandatory_receipt_with_trusted_runtime_context(tmp_path, monkeypatch):
+    _memory, _evidence, _governance, service = _activate_v2(tmp_path)
     agent_id, group_id = "trusted-agent", "trusted-group"
-    AgentBindingStore(tmp_path).bind_agent(agent_id, group_id)
-    store = SharedMemoryStore(tmp_path, group_id)
-    mandatory = _record(
-        "mandatory", "始终先运行定向测试", MemoryKind.PROCEDURE,
-        agent_instance_id=agent_id,
-    )
-    mandatory.injection_policy = "always"
-    project_ref = tmp_path / "project"
-    store.append_record(mandatory, assignments=[{
-        "target_type": "agent", "target_id": agent_id,
-    }])
+    service.bind_agent(agent_id, group_id, idempotency_key="bind-trusted")
+    _seed_atom(tmp_path, group_id, agent_id, "mandatory", "始终先运行定向测试", policy="always", priority=7)
+    _set_mcp_identity(monkeypatch, tmp_path, agent_id)
 
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent_id)
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(project_ref))
-    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
-    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
-    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
-    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
-
-    result = execute_tool("memoryguard_context_bootstrap", {
-        "task": "修复定向测试流程",
-    })
-    assert result.get("isError") is not True, result
-    packet = json.loads(result["content"][0]["text"])
-    assert packet["receipt_persistence"] == {"status": "persisted", "count": 1}
-    receipt = packet["mandatory_match_receipts"][0]
-    assert receipt["agent_instance_id"] == agent_id
-    assert receipt["session_id"] == "session-1"
-    assert receipt["context_hash"] == "ctx-1"
-    assert receipt["provider"] == "codex"
-    persisted = SharedMemoryStore(tmp_path, group_id, read_only=True).get_rule_match_receipt(
-        receipt["receipt_id"]
-    )
-    assert persisted is not None
-    assert persisted.to_dict() == receipt
+    packet = _mcp_json(execute_tool("memoryguard_context_bootstrap", {"task": "修复定向测试流程"}))
+    assert packet["data"]["mandatory"]
+    assert packet["data"]["mandatory"][0]["body"] == "始终先运行定向测试"
+    assert any(receipt["hit"] and receipt["layer"] == "mandatory" for receipt in packet["data"]["receipts"])
 
 
-def test_mcp_bootstrap_fails_closed_when_receipt_persistence_fails(
-    tmp_path, monkeypatch,
-):
-    agent_id, group_id = "trusted-agent", "trusted-group"
-    AgentBindingStore(tmp_path).bind_agent(agent_id, group_id)
-    store = SharedMemoryStore(tmp_path, group_id)
-    mandatory = _record(
-        "mandatory", "始终先运行定向测试", MemoryKind.PROCEDURE,
-        agent_instance_id=agent_id,
-    )
-    mandatory.injection_policy = "always"
-    store.append_record(mandatory, assignments=[{
-        "target_type": "agent", "target_id": agent_id,
-    }])
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent_id)
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(tmp_path / "project"))
-
-    def fail_append(self, receipt):
-        raise RuntimeError("receipt writer unavailable")
-
-    monkeypatch.setattr(SharedMemoryStore, "append_rule_match_receipt", fail_append)
-    result = execute_tool("memoryguard_context_bootstrap", {"task": "测试"})
-    assert result.get("isError") is True
-    assert "receipt persistence failed" in result["content"][0]["text"]
-    assert "mandatory_match_receipts" not in result["content"][0]["text"]
-
-
-def test_update_delete_preflight_and_handlers_use_same_trusted_group(
-    tmp_path: Path,
-    monkeypatch,
-):
-    AgentBindingStore(tmp_path).bind_agent("trusted-agent", "trusted-group")
-    trusted = SharedMemoryStore(tmp_path, "trusted-group")
-    trusted.append_record(_record(
-        "update-me", "旧正文", MemoryKind.FACT,
+def test_mcp_bootstrap_fails_closed_when_receipt_persistence_fails(tmp_path, monkeypatch):
+    memory, evidence, _governance, _service = _activate_v2(tmp_path)
+    context = V2MutationContext(
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="trusted-group",
         agent_instance_id="trusted-agent",
-    ))
-    trusted.append_record(_record(
-        "delete-me", "待删除", MemoryKind.FACT,
-        agent_instance_id="trusted-agent",
-    ))
-    SharedMemoryStore(tmp_path, "attacker-group")
+        actor="trusted-agent",
+        authority="manual",
+    )
+    atom = memory.put_atom(
+        MemoryAtom(memory_id="retry", body="body", share_group_id="trusted-group", agent_instance_id="trusted-agent"),
+        evidence=[{"source_ref": "trusted-group/retry"}],
+        context=context,
+    )
 
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    class FlakyEvidence:
+        def __init__(self):
+            self.calls = 0
+
+        def project_batch(self, events):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("receipt writer unavailable")
+            return evidence.project_batch(events)
+
+    assert memory.project_evidence(FlakyEvidence())["failed"] == 1
+    assert memory.validate(evidence).ok is False
+    with pytest.raises(RuntimeError, match="outstanding|evidence"):
+        memory.set_visibility("ready", atom_ids=[atom.atom_id])
+
+
+def test_update_delete_preflight_and_handlers_use_same_trusted_group(tmp_path: Path, monkeypatch):
+    _memory, _evidence, _governance, service = _activate_v2(tmp_path)
+    service.bind_agent("trusted-agent", "trusted-group", idempotency_key="bind-trusted")
+    _seed_atom(tmp_path, "trusted-group", "trusted-agent", "update-me", "旧正文")
+    _seed_atom(tmp_path, "trusted-group", "trusted-agent", "delete-me", "待删除")
+    _set_mcp_identity(monkeypatch, tmp_path, "trusted-agent")
 
     updated = execute_tool("memoryguard_memory_update", {
         "memory_id": "update-me",
         "body": "可信组新正文",
         "share_group_id": "attacker-group",
+        "idempotency_key": "update-trusted",
     })
     assert updated.get("isError") is not True, updated
     deleted = execute_tool("memoryguard_memory_delete", {
         "memory_id": "delete-me",
         "share_group_id": "attacker-group",
+        "idempotency_key": "delete-trusted",
     })
     assert deleted.get("isError") is not True, deleted
 
-    read_store = SharedMemoryStore(
-        tmp_path, "trusted-group", read_only=True,
-    )
-    assert read_store.get_record("update-me").body == "可信组新正文"
-    assert read_store.get_record("delete-me").status == SharedMemoryStatus.DELETED
-    decisions = read_store.list_decisions()
-    assert any(
-        item.action == "agent_update" and item.actor == "agent:trusted-agent"
-        for item in decisions
-    )
-    assert any(
-        item.action == "agent_delete" and item.actor == "agent:trusted-agent"
-        for item in decisions
-    )
-    assert not read_store.get_record("delete-me").locked
+    memory = MemoryAtomStore(tmp_path)
+    scope = MemoryReadScope(workspace_id=str(tmp_path.resolve()), share_group_id="trusted-group", admin=True)
+    assert memory.get_atom("update-me", scope=scope, include_building=True).body == "可信组新正文"
+    assert memory.get_atom("delete-me", scope=scope, include_building=True).status == "deleted"
+    decisions = GovernanceV2(tmp_path, memory_store=memory, evidence_store=EvidenceStore(tmp_path)).list_decisions()
+    assert any(item.operation == "tombstone" for item in decisions)
 
 
-def test_memory_mutation_rejects_cross_agent_record_owner(
-    tmp_path: Path,
-    monkeypatch,
-):
-    AgentBindingStore(tmp_path).bind_agent("trusted-agent", "trusted-group")
-    trusted = SharedMemoryStore(tmp_path, "trusted-group")
-    trusted.append_record(_record(
-        "owned-by-a", "仅 agent-a 可改", MemoryKind.FACT,
-        agent_instance_id="agent-a",
-    ))
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+def test_memory_mutation_rejects_cross_agent_record_owner(tmp_path: Path, monkeypatch):
+    _memory, _evidence, _governance, service = _activate_v2(tmp_path)
+    service.bind_agent("trusted-agent", "trusted-group", idempotency_key="bind-trusted")
+    _seed_atom(tmp_path, "trusted-group", "agent-a", "owned-by-a", "仅 agent-a 可改")
+    _set_mcp_identity(monkeypatch, tmp_path, "trusted-agent")
+
+    memory = MemoryAtomStore(tmp_path)
+    scope = MemoryReadScope(
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="trusted-group",
+        admin=True,
+    )
+    before_atom = memory.get_atom("owned-by-a", scope=scope, include_building=True)
+    assert before_atom is not None
+    before_status = memory.status()
 
     denied = execute_tool("memoryguard_memory_update", {
-        "memory_id": "owned-by-a", "body": "越权修改",
+        "memory_id": "owned-by-a", "body": "越权修改", "idempotency_key": "cross-agent-update",
     })
     assert denied.get("isError") is True
-    assert "another agent" in denied["content"][0]["text"]
+    denied_payload = json.loads(denied["content"][0]["text"])
+    assert denied_payload["code"] == "v2_governance_rejected"
+
+    missing = execute_tool("memoryguard_memory_update", {
+        "memory_id": "does-not-exist", "body": "越权修改", "idempotency_key": "missing-update",
+    })
+    assert missing.get("isError") is True
+    missing_payload = json.loads(missing["content"][0]["text"])
+    assert missing_payload["code"] == denied_payload["code"]
+
+    after_atom = memory.get_atom("owned-by-a", scope=scope, include_building=True)
+    assert after_atom is not None
+    assert after_atom.to_dict() == before_atom.to_dict()
+    assert memory.status() == before_status
 
 
-def test_active_binding_allows_write_inactive_or_unbound_denies(
-    tmp_path,
-    monkeypatch,
-):
-    bindings = AgentBindingStore(tmp_path)
-    binding = bindings.bind_agent("trusted-agent", "trusted-group")
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "trusted-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+def test_active_binding_allows_write_inactive_or_unbound_denies(tmp_path, monkeypatch):
+    _memory, _evidence, _governance, service = _activate_v2(tmp_path)
+    binding = service.bind_agent("trusted-agent", "trusted-group", idempotency_key="bind-trusted")["binding"]
+    _set_mcp_identity(monkeypatch, tmp_path, "trusted-agent")
 
     allowed = execute_tool("memoryguard_memory_write", {
+        "memory_id": "active-write",
         "body": "active binding write",
+        "evidence_ids": ["active-write-evidence"],
+        "idempotency_key": "active-write",
     })
-    assert allowed.get("isError") is not True
+    assert allowed.get("isError") is not True, allowed
 
-    bindings.unbind_agent(binding.binding_id)
+    service.unbind(binding["binding_id"], idempotency_key="unbind-trusted")
     denied = execute_tool("memoryguard_memory_write", {
+        "memory_id": "inactive-write",
         "body": "inactive binding write",
+        "evidence_ids": ["inactive-write-evidence"],
+        "idempotency_key": "inactive-write",
     })
     assert denied.get("isError") is True
-    assert "no active binding" in denied["content"][0]["text"]
+    assert json.loads(denied["content"][0]["text"])["code"] == "request_failed"

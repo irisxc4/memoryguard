@@ -22,8 +22,8 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
-from .schema_v3 import MemoryKind, SharedMemoryRecord
-from .shared_memory_store import SharedMemoryStore
+from .memory import MemoryAtomStore, MemoryReadScope
+from .schema_v3 import MemoryKind
 
 
 DEFAULT_SEMANTIC_THRESHOLD = 0.85
@@ -223,7 +223,16 @@ class SemanticDedup:
         share_group_id: str,
         backend: EmbeddingBackend | None = None,
     ):
-        self.store = SharedMemoryStore(workspace, share_group_id)
+        self._scope = MemoryReadScope(
+            share_group_id=str(share_group_id or "").strip(),
+            workspace_id=str(Path(workspace).expanduser().resolve()),
+        )
+        try:
+            self.store = MemoryAtomStore(self._scope.workspace_id, readonly=True)
+        except (FileNotFoundError, OSError, ValueError, RuntimeError):
+            # A missing or unsupported V2 database is an empty read result;
+            # never recreate a retired store merely to answer a similarity query.
+            self.store = None
         if backend is not None:
             self.backend: EmbeddingBackend = backend
         else:
@@ -252,7 +261,9 @@ class SemanticDedup:
         if threshold is None:
             threshold = _env_threshold()
 
-        active_records = self.store.list_records(status="active")
+        if self.store is None:
+            return []
+        active_records = self.store.list_atoms(scope=self._scope, status="active")
         if not active_records:
             return []
 

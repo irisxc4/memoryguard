@@ -170,23 +170,49 @@ def test_gui_partial_memory_mutations_preserve_complete_v2_atom_state(tmp_path: 
     assert atom.priority == 33
 
 
-def test_gui_legacy_whole_version_rollback_is_explicitly_retired(tmp_path: Path):
+def test_gui_memory_rollback_replays_scoped_v2_revision_with_governance_receipt(tmp_path: Path):
+    memory, _evidence = _seed_memory(tmp_path)
     port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    context = _context(tmp_path)
     entry = next(
         item for item in port.coverage()["surfaces"]["gui"]["entries"]
         if item["name"] == "rollback_memory"
     )
-    assert entry["status"] == "retired"
-    assert "no lossless V2 equivalent" in entry["reason"]
-    before = list(tmp_path.rglob("*"))
-    result = port.dispatch_gui(
-        "rollback_memory", {"version_id": "legacy-version"},
-        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
+    assert entry["status"] == "implemented"
+    assert entry["reason"] == ""
+
+    edited = port.dispatch_gui(
+        "edit_memory", {"memory_id": "memory-a", "body": "changed before rollback"},
+        context=context, generation=7, state="V2_ACTIVE",
     )
-    assert result["ok"] is False
-    assert result["status"] == "retired"
-    assert result["code"] == "v2_operation_retired"
-    assert list(tmp_path.rglob("*")) == before
+    assert edited["ok"] is True, edited
+    assert _read(memory).body == "changed before rollback"
+
+    revisions = memory.list_revisions(
+        scope={
+            "workspace_id": str(tmp_path),
+            "share_group_id": "group-a",
+            "agent_instance_id": "agent-a",
+            "project_ref": "project-a",
+            "provider": "codex",
+            "runtime_role": "root",
+        },
+        memory_id="memory-a",
+    )
+    original = next(item for item in revisions if item["revision"] == 1)
+    result = port.dispatch_gui(
+        "rollback_memory", {"version_id": original["version_id"]},
+        context=context, generation=7, state="V2_ACTIVE",
+    )
+    assert result["ok"] is True, result
+    assert result["data"]["version_id"] == original["version_id"]
+    assert result["data"]["receipt"]["operation"] == "put"
+    restored = _read(memory)
+    assert restored is not None
+    assert restored.body == "original body"
+    assert restored.kind == "preference"
+    assert restored.confidence == 0.83
+    assert restored.metadata == {"keep": "yes", "nested": {"value": 3}}
 
 
 def test_gui_rule_audience_update_uses_v2_bindings_and_trusted_scope(tmp_path: Path):

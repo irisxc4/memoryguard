@@ -1,232 +1,332 @@
-"""共享组神经图与单 Agent ProjectionBuilder 美化对齐。"""
+"""V2 共享组投影图的确定性拓扑回归。"""
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
-from memoryguard.governance_scope import build_shared_memory_graph
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    Provenance,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-    stable_hash,
-    _now_iso,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.content.store import ContentStore, stable_id
+from memoryguard.evidence.store import EvidenceStore
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
+from memoryguard.memory.store import MemoryAtom, MemoryAtomStore
+from memoryguard.projection_v2 import ProjectionReadScope, ProjectionStore
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.projection_build import ProjectionBuildService
+from memoryguard.storage.layout import WorkspaceV2Layout
+from memoryguard.storage.schema import initialize_all
+from memoryguard.system.manifest import ManifestManager, ManifestState
 
 
-def _prov(oid: str, locator: str = "L1") -> Provenance:
-    return Provenance(source_object_id=oid, locator=locator, excerpt_hash=stable_hash(oid)[:16])
+def _ensure_v2_workspace(root: Path) -> None:
+    manager = ManifestManager(root)
+    if manager.current().state is ManifestState.V2_ACTIVE:
+        return
+    initialize_all(WorkspaceV2Layout(root))
+    MemoryAtomStore(root)
+    EvidenceStore(root)
+    ProjectionStore(root)
+    ContentStore(root)
+    GovernanceV2(
+        root,
+        memory_store=MemoryAtomStore(root),
+        evidence_store=EvidenceStore(root),
+    )
+    manager.transition(ManifestState.V2_BUILDING, migration_id="shared-projection-v2-fixture")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="shared-projection-source",
+        target_digest="shared-projection-target",
+        manifest_digest="shared-projection-manifest",
+        digests={"validator_passed": True, "checkpoints": {"projection": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
 
 
-def _rec(
-    mid: str,
-    body: str,
-    *,
-    kind: MemoryKind = MemoryKind.FACT,
-    provenance: list[Provenance] | None = None,
-) -> SharedMemoryRecord:
-    now = _now_iso()
-    return SharedMemoryRecord(
-        memory_id=mid,
-        body=body,
-        kind=kind,
-        status=SharedMemoryStatus.ACTIVE,
-        confidence=0.8,
-        provenance=list(provenance or []),
-        created_at=now,
-        updated_at=now,
+def _bind_group(root: Path, group_id: str) -> None:
+    _ensure_v2_workspace(root)
+    result = GroupControlService(root, write=True).bind_agent("agent-a", group_id)
+    assert result["ok"] is True
+
+
+def _scope(root: Path, group_id: str) -> ProjectionReadScope:
+    resolved = str(root.resolve())
+    return ProjectionReadScope(
+        workspace_id=resolved,
         agent_instance_id="agent-a",
+        project_ref=resolved,
+        provider="gui",
+        share_group_id=group_id,
+        sensitivity="normal",
+        policy_class="private",
     )
 
 
+def _mutation_context(root: Path, group_id: str) -> V2MutationContext:
+    resolved = str(root.resolve())
+    return V2MutationContext(
+        workspace_id=resolved,
+        share_group_id=group_id,
+        agent_instance_id="agent-a",
+        project_ref=resolved,
+        provider="gui",
+        runtime_role="gui",
+        actor="agent-a",
+        authority="manual",
+    )
+
+
+def _seed_atoms(root: Path, group_id: str, specs: list[dict]) -> None:
+    _ensure_v2_workspace(root)
+    memory = MemoryAtomStore(root, readonly=False)
+    governance = GovernanceV2(root, memory_store=memory)
+    context = _mutation_context(root, group_id)
+    atom_ids: list[str] = []
+    for spec in specs:
+        memory_id = str(spec["memory_id"])
+        evidence, _ = governance.put_evidence(
+            context=context,
+            reason="shared projection V2 fixture evidence",
+            source_ref=f"fixture:{memory_id}",
+            digest=(memory_id.encode("utf-8").hex() * 64)[:64].ljust(64, "0"),
+            authority="governance",
+            evidence_type="reference",
+        )
+        atom, _ = governance.put_atom(
+            MemoryAtom(
+                memory_id=memory_id,
+                body=str(spec.get("body") or memory_id),
+                kind=str(spec.get("kind") or "fact"),
+                workspace_id=str(root.resolve()),
+                share_group_id=group_id,
+                agent_instance_id="agent-a",
+                project_ref=str(root.resolve()),
+                provider="gui",
+                runtime_role="gui",
+                provenance=list(spec.get("provenance") or []),
+                metadata=dict(spec.get("metadata") or {}),
+            ),
+            context=context,
+            evidence=[evidence.to_dict()],
+            reason="shared projection V2 fixture atom",
+            idempotency_key=f"shared-projection-fixture:{memory_id}",
+        )
+        atom_ids.append(atom.atom_id)
+
+    for _ in range(4):
+        state = memory.project_evidence(governance.evidence)
+        if int(state.get("pending", 0)) == 0:
+            break
+    assert memory.pending_outbox(include_failed=True) == []
+    memory.set_visibility("active", atom_ids=atom_ids)
+
+
+def _build_graph(root: Path, group_id: str) -> tuple[dict, dict, dict]:
+    service = ProjectionBuildService(root)
+    scope = _scope(root, group_id)
+    result = service.build(mode="reconstructed", scope=scope, runtime_role="gui")
+    assert result["status"] == "succeeded", result
+    key = service._scope_key("reconstructed", scope)
+    record = ProjectionStore(root).get_projection("scenario", key, scope=scope)
+    assert record is not None
+    metadata = dict(record.payload.get("metadata") or {})
+    graph = dict(metadata.get("derived_graph") or {})
+    stats = dict(metadata.get("derived_stats") or {})
+    return result, graph, stats
+
+
 def test_shared_graph_missing_group(tmp_path: Path) -> None:
-    data = build_shared_memory_graph(tmp_path, "no-such-group")
-    assert data["empty"] is True
-    assert data["reason"] == "share_group_not_found"
-    assert data["projection_kind"] == "shared_memory_projection"
+    _ensure_v2_workspace(tmp_path)
+    group_id = "no-such-group"
+    assert not GroupControlService(tmp_path).active_binding_for_agent("agent-a")
+    service = ProjectionBuildService(tmp_path)
+    current = service.current(mode="reconstructed", scope=_scope(tmp_path, group_id))
+    assert current["status"] == "succeeded"
+    assert current["projection"] is None
+    result = service.build(mode="reconstructed", scope=_scope(tmp_path, group_id))
+    assert result["status"] == "NO_SOURCE"
+    assert result["atom_count"] == 0
 
 
 def test_shared_graph_reuses_builder_beauty(tmp_path: Path) -> None:
     gid = "parity-group"
-    store = SharedMemoryStore(tmp_path, gid)
-    # 同文件两条 fact → source_hub；另有 preference 同源 → shared_source；相似 fact → related
-    store.append_record(_rec(
-        "m-fact-1", "Python 用异步处理 IO 密集任务，注意事件循环。",
-        provenance=[_prov("src-doc-a", "h1")],
-    ))
-    store.append_record(_rec(
-        "m-fact-2", "Python 异步处理 IO 密集时别阻塞事件循环。",
-        provenance=[_prov("src-doc-a", "h2")],
-    ))
-    store.append_record(_rec(
-        "m-pref-1", "偏好短句说明异步约束。",
-        kind=MemoryKind.PREFERENCE,
-        provenance=[_prov("src-doc-a", "h3")],
-    ))
-    store.append_record(_rec(
-        "m-alone", "完全无关的独立记忆条目关于数据库备份策略。",
-        provenance=[_prov("src-other", "h1")],
-    ))
+    _bind_group(tmp_path, gid)
+    _seed_atoms(tmp_path, gid, [
+        {
+            "memory_id": "m-fact-1",
+            "body": "Python 用异步处理 IO 密集任务，注意事件循环。",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-doc-a",
+                "source_locator": "h1",
+            },
+            "provenance": [{"source_object_id": "src-doc-a", "locator": "h1"}],
+        },
+        {
+            "memory_id": "m-fact-2",
+            "body": "Python 异步处理 IO 密集时别阻塞事件循环。",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-doc-a",
+                "source_locator": "h2",
+                "related_memory_ids": ["m-fact-1"],
+            },
+            "provenance": [{"source_object_id": "src-doc-a", "locator": "h2"}],
+        },
+        {
+            "memory_id": "m-pref-1",
+            "body": "偏好短句说明异步约束。",
+            "kind": "preference",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-doc-a",
+                "source_locator": "h3",
+            },
+            "provenance": [{"source_object_id": "src-doc-a", "locator": "h3"}],
+        },
+        {
+            "memory_id": "m-alone",
+            "body": "完全无关的独立记忆条目关于数据库备份策略。",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-other",
+                "source_locator": "h1",
+            },
+            "provenance": [{"source_object_id": "src-other", "locator": "h1"}],
+        },
+    ])
 
-    data = build_shared_memory_graph(tmp_path, gid)
-    assert data["empty"] is False
-    assert data["projection_kind"] == "shared_memory_projection"
-    assert data["mode"] == "share_group"
-    meta = data.get("meta") or {}
-    assert meta.get("projection_mode") == "share_group"
-    assert meta.get("derivation_engine") == "deterministic_v3_shared"
-    assert meta.get("llm_used") is False
-    assert meta.get("share_group_id") == gid
-
-    nodes = data["nodes"]
-    kinds = {n["node_kind"] for n in nodes}
-    labels = {n["label"] for n in nodes}
-    assert "root" in kinds
-    assert "topic" in kinds
-    assert "claim_anchor" in kinds
-    assert "source_hub" in kinds, "同 provenance 文件 ≥2 条应有同源突触"
-    assert "共享胞体" in labels
-    assert "共享项目" in labels
-
-    root = next(n for n in nodes if n["node_kind"] == "root")
-    assert root["label"] == "共享胞体"
-    assert any("共享胞体" in (n.get("derivation") or "") for n in nodes if n["node_kind"] == "source_hub")
-
-    edge_types = {e["edge_type"] for e in data["edges"]}
-    assert "derived_from" in edge_types
-    assert "related" in edge_types, "相似 KEEP_ALL 应对齐 related 虚线"
-    assert "shared_source" in edge_types, "跨类型同源应对齐 shared_source"
-
-    stats = data.get("stats") or {}
-    assert stats.get("source_hub_count", 0) >= 1
-    assert stats.get("related_edge_count", 0) >= 1
-    assert stats.get("shared_source_edge_count", 0) >= 1
+    result, graph, stats = _build_graph(tmp_path, gid)
+    assert result["projection"]["kind"] == "scenario"
+    assert result["projection"]["status"] == "ready"
+    assert graph["root_id"] == "main"
+    kinds = {node["node_kind"] for node in graph["nodes"]}
+    labels = {node["label"] for node in graph["nodes"]}
+    assert {"root", "topic", "claim_anchor", "source_hub"} <= kinds
+    assert "记忆胞体" in labels
+    assert "共享来源" in labels
+    assert "事实" in labels
+    assert "偏好" in labels
+    hubs = [node for node in graph["nodes"] if node["node_kind"] == "source_hub"]
+    assert any(node["source_key"] == "src-doc-a" and len(node["member_ids"]) == 2 for node in hubs)
+    edge_types = {edge["edge_type"] for edge in graph["edges"]}
+    assert {"derived_from", "related"} <= edge_types
+    assert stats["source_hub_count"] >= 1
+    assert stats["related_edge_count"] >= 1
 
 
-def test_shared_empty_group_still_has_root(tmp_path: Path) -> None:
+def test_shared_empty_group_has_no_v2_projection(tmp_path: Path) -> None:
     gid = "empty-group"
-    SharedMemoryStore(tmp_path, gid)  # 建库无记录
-    data = build_shared_memory_graph(tmp_path, gid)
-    assert data["empty"] is True
-    assert data.get("reason") == "share_group_empty"
-    assert any(n["node_kind"] == "root" and n["label"] == "共享胞体" for n in data["nodes"])
+    _bind_group(tmp_path, gid)
+    service = ProjectionBuildService(tmp_path)
+    scope = _scope(tmp_path, gid)
+    result = service.build(mode="reconstructed", scope=scope, runtime_role="gui")
+    assert result["status"] == "NO_SOURCE"
+    assert result["atom_count"] == 0
+    assert service.current(mode="reconstructed", scope=scope)["projection"] is None
 
 
 def test_shared_graph_derives_scope_from_import_root_instead_of_forcing_project(
     tmp_path: Path,
 ) -> None:
-    from memoryguard.schema_v3 import MemoryEvent, SourceRootType
-    from memoryguard.source_registry import SourceRegistry
-
     gid = "scope-origin-group"
+    _bind_group(tmp_path, gid)
     source_file = tmp_path / "user_profile.md"
     source_file.write_text("用户偏好", encoding="utf-8")
-    reg = SourceRegistry(tmp_path)
-    root = reg.add(
-        str(source_file), SourceRootType.SELECTED_FILE, "User profile",
-        scope="user",
+    source_id = stable_id(
+        "agent-source", "agent-a", str(source_file.resolve()),
     )
-    root.source_category = "native_memory"
-    reg._save()
-
-    store = SharedMemoryStore(tmp_path, gid)
-    event = MemoryEvent(
-        event_id="scope-event",
-        agent_instance_id="agent-a",
-        share_group_id=gid,
-        raw_content="用户偏好",
-        metadata={"source_root_id": root.root_id},
+    ContentStore(tmp_path).upsert_source_connector(
+        source_id=source_id,
+        provider="agent-native",
+        source_type="file",
+        external_root_key=str(source_file.resolve()),
+        workspace_id=str(tmp_path.resolve()),
+        enabled=True,
     )
-    store.append_event(event)
-    store.append_record(_rec(
-        "scope-memory", "用户偏好",
-        provenance=[_prov(event.event_id)],
-    ))
+    selection = GroupControlService(tmp_path, write=True).record_selection(
+        "agent-a", [source_id], "scope-origin-selection",
+    )
+    assert selection["ok"] is True
+    _seed_atoms(tmp_path, gid, [{
+        "memory_id": "scope-memory",
+        "body": "用户偏好",
+        "metadata": {
+            "scope": "user",
+            "source_key": source_id,
+            "source_locator": "profile:user",
+        },
+        "provenance": [{"source_object_id": source_id, "locator": "profile:user"}],
+    }])
 
-    data = build_shared_memory_graph(tmp_path, gid)
-    labels = {node["label"] for node in data["nodes"]}
+    _result, graph, _stats = _build_graph(tmp_path, gid)
+    labels = {node["label"] for node in graph["nodes"]}
     assert "用户来源" in labels
     assert "项目来源" not in labels
 
 
 def test_share_get_neuron_graph_hydrates_related_jumps(tmp_path: Path) -> None:
-    """共享组 get_neuron_graph 应从边补 related，供详情点击跳转。"""
-    from memoryguard.gui import GovernanceApi
-    from memoryguard.governance_scope import (
-        GovernanceScope, authorized_roots_digest, share_group_projection_path,
-    )
-    import json
-
+    """V2 projection graph exposes claim anchors, hubs and related jumps."""
     gid = "jump-group"
-    store = SharedMemoryStore(tmp_path, gid)
-    store.append_record(_rec(
-        "jump-a" + "0" * 10, "Python 异步事件循环不要阻塞。",
-        provenance=[_prov("src-same")],
-    ))
-    store.append_record(_rec(
-        "jump-b" + "0" * 10, "Python 异步处理 IO 时别阻塞事件循环。",
-        provenance=[_prov("src-same")],
-    ))
-    graph = build_shared_memory_graph(tmp_path, gid)
-    path = share_group_projection_path(
-        tmp_path, GovernanceScope(mode="share_group", share_group_id=gid),
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # 确保 digest 匹配 get_neuron_graph 校验
-    meta = graph.setdefault("meta", {})
-    meta["authorized_roots_digest"] = authorized_roots_digest([f"share:{gid}"])
-    path.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
+    _bind_group(tmp_path, gid)
+    _seed_atoms(tmp_path, gid, [
+        {
+            "memory_id": "jump-a",
+            "body": "Python 异步事件循环不要阻塞。",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-same",
+                "source_locator": "h1",
+            },
+            "provenance": [{"source_object_id": "src-same", "locator": "h1"}],
+        },
+        {
+            "memory_id": "jump-b",
+            "body": "Python 异步处理 IO 时别阻塞事件循环。",
+            "metadata": {
+                "scope": "shared",
+                "source_key": "src-same",
+                "source_locator": "h2",
+                "related_memory_ids": ["jump-a"],
+            },
+            "provenance": [{"source_object_id": "src-same", "locator": "h2"}],
+        },
+    ])
 
-    loaded = GovernanceApi(str(tmp_path)).get_neuron_graph(share_group_id=gid)
-    assert not loaded.get("empty")
-    claims = [n for n in loaded["nodes"] if n.get("node_kind") == "claim_anchor"]
-    assert claims
-    # 至少一条有 related 或 hub 有 members
-    hubs = [n for n in loaded["nodes"] if n.get("node_kind") == "source_hub"]
-    assert hubs and hubs[0].get("members")
-    assert any(n.get("related") for n in claims) or any(
-        e.get("edge_type") in ("related", "shared_source") for e in loaded.get("edges") or []
-    )
+    _result, graph, stats = _build_graph(tmp_path, gid)
+    claims = [node for node in graph["nodes"] if node["node_kind"] == "claim_anchor"]
+    hubs = [node for node in graph["nodes"] if node["node_kind"] == "source_hub"]
+    assert len(claims) == 2
+    assert hubs and set(hubs[0]["member_ids"]) == {node["id"] for node in claims}
+    assert any(edge["edge_type"] == "related" for edge in graph["edges"])
+    assert stats["related_edge_count"] == 1
 
 
 def test_shared_graph_hubs_from_event_metadata(tmp_path: Path) -> None:
-    """旧导入 provenance=event_id 时，应从 events.metadata 还原同文件同源突触。"""
-    from memoryguard.schema_v3 import MemoryEvent
-
+    """V2 provenance/source metadata derives same-source hubs."""
     gid = "import-hub-group"
-    store = SharedMemoryStore(tmp_path, gid)
-    meta = {
-        "source_root_id": "root-demo",
-        "relative_path": "docs/README.md",
-        "locator": "heading:why",
-        "extraction_origin": "native_memory_import",
-    }
-    for i, body in enumerate([
+    _bind_group(tmp_path, gid)
+    source_id = "root-demo"
+    specs = []
+    for index, body in enumerate([
         "## 为什么需要 MemoryGuard\n本地治理。",
         "## 它是什么\n边界说明。",
         "路线图\n后续计划。",
     ], start=1):
-        eid = f"evt-import-{i}"
-        store.append_event(MemoryEvent(
-            event_id=eid,
-            agent_instance_id="agent-a",
-            share_group_id=gid,
-            raw_content=body,
-            metadata=dict(meta),
-            created_at=_now_iso(),
-        ))
-        store.append_record(_rec(
-            f"m-import-{i}", body,
-            provenance=[_prov(eid, f"heading:{i}")],
-        ))
+        specs.append({
+            "memory_id": f"m-import-{index}",
+            "body": body,
+            "metadata": {
+                "scope": "shared",
+                "source_key": source_id,
+                "source_locator": f"heading:{index}",
+            },
+            "provenance": [{
+                "source_object_id": source_id,
+                "locator": f"heading:{index}",
+            }],
+        })
+    _seed_atoms(tmp_path, gid, specs)
 
-    data = build_shared_memory_graph(tmp_path, gid)
-    kinds = {n["node_kind"] for n in data["nodes"]}
-    assert "source_hub" in kinds
-    hubs = [n for n in data["nodes"] if n["node_kind"] == "source_hub"]
-    assert any("README" in (n.get("label") or "") for n in hubs)
-    assert (data.get("stats") or {}).get("source_hub_count", 0) >= 1
+    _result, graph, stats = _build_graph(tmp_path, gid)
+    hubs = [node for node in graph["nodes"] if node["node_kind"] == "source_hub"]
+    assert hubs
+    assert any(node["label"] == source_id and len(node["member_ids"]) == 3 for node in hubs)
+    assert stats["source_hub_count"] >= 1

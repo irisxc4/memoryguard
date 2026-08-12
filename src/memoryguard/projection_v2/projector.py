@@ -81,6 +81,7 @@ class BaseProjector:
         source_digest: str = "",
         atom_refs: Sequence[Any] | None = None,
         evidence_refs: Sequence[Any] | None = None,
+        item_evidence_refs: Mapping[str, Sequence[str]] | None = None,
         fail_at: str | None = None,
     ) -> ProjectionRecord:
         if atoms is None:
@@ -105,15 +106,36 @@ class BaseProjector:
         }
         if not source_digest:
             source_digest = _digest({"atoms": atom_list, "evidence": evidence_list, "scope": scope.as_tuple(), "metadata": safe_metadata})
-        refs = [
-            {
-                "atom_id": atom["atom_id"],
-                "atom_hash": atom["atom_hash"],
-                "evidence_id": evidence_list[index % len(evidence_list)]["evidence_id"],
-                "evidence_hash": evidence_list[index % len(evidence_list)]["evidence_hash"],
-            }
-            for index, atom in enumerate(atom_list)
-        ]
+        evidence_by_id = {item["evidence_id"]: item for item in evidence_list}
+        refs: list[dict[str, str]] = []
+        if item_evidence_refs is None:
+            # Compatibility path for existing callers that supplied one
+            # evidence stream.  Native GUI build supplies an explicit mapping
+            # below so no cross-atom association is inferred from list order.
+            refs = [
+                {
+                    "atom_id": atom["atom_id"],
+                    "atom_hash": atom["atom_hash"],
+                    "evidence_id": evidence_list[index % len(evidence_list)]["evidence_id"],
+                    "evidence_hash": evidence_list[index % len(evidence_list)]["evidence_hash"],
+                }
+                for index, atom in enumerate(atom_list)
+            ]
+        else:
+            for atom in atom_list:
+                linked_ids = tuple(str(item) for item in item_evidence_refs.get(atom["atom_id"], ()))
+                if not linked_ids:
+                    raise ProjectionError("projection atom has no explicit evidence mapping")
+                for evidence_id in linked_ids:
+                    linked = evidence_by_id.get(evidence_id)
+                    if linked is None:
+                        raise ProjectionError("projection atom references evidence outside projection")
+                    refs.append({
+                        "atom_id": atom["atom_id"],
+                        "atom_hash": atom["atom_hash"],
+                        "evidence_id": evidence_id,
+                        "evidence_hash": linked["evidence_hash"],
+                    })
         return self.store.put_projection(
             self.kind,
             str(key),

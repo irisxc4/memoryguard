@@ -32,7 +32,7 @@ from ..storage.transaction import transaction
 
 
 NORMALIZER_ID = "utf8-nfc-newline-v1"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UNKNOWN_ACL = "__UNKNOWN__"
 
 # ACL values are an explicit contract.  Providers are intentionally open
@@ -315,6 +315,13 @@ CREATE TABLE IF NOT EXISTS content_evidence_links (
     created_at TEXT NOT NULL,
     invalidated_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS history_mutation_receipts (
+    idempotency_key TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    payload_digest TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS content_holds (
     hold_id TEXT PRIMARY KEY,
     blob_id TEXT NOT NULL,
@@ -459,6 +466,7 @@ _AUX_REQUIRED_TABLES = frozenset(
         "conversation_summaries",
         "conversation_observations",
         "content_evidence_links",
+        "history_mutation_receipts",
         "content_holds",
         "content_tombstones",
         "source_sync_state",
@@ -575,6 +583,14 @@ class ContentStore:
                         "content_schema_meta contains unknown or duplicate keys"
                     )
                 marker = str(rows[0][1])
+                if marker == "2":
+                    legacy_required = _AUX_REQUIRED_TABLES - {"history_mutation_receipts"}
+                    missing_legacy = sorted(legacy_required - tables)
+                    if missing_legacy:
+                        raise ContentError(
+                            "content schema marker 2 is incomplete: " + ",".join(missing_legacy)
+                        )
+                    return "upgrade_v3"
                 if marker != str(SCHEMA_VERSION):
                     direction = "future" if marker.isdigit() and int(marker) > SCHEMA_VERSION else "unsupported"
                     raise ContentError(
@@ -983,8 +999,151 @@ class ContentStore:
             with transaction(local):
                 return apply(local)
 
+    def list_source_connectors(
+        self,
+        *,
+        workspace_id: str | None = None,
+        enabled: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return reference-only source connector metadata."""
+        predicates = ["workspace_id=?"]
+        params: list[Any] = [str(workspace_id or self.workspace_id)]
+        if enabled is not None:
+            predicates.append("enabled=?")
+            params.append(1 if enabled else 0)
+        with open_database(self.db_path, readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT source_id,workspace_id,provider,source_type,external_root_key,enabled,created_at,updated_at "
+                "FROM source_connectors WHERE " + " AND ".join(predicates) + " ORDER BY source_id",
+                tuple(params),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def set_source_connector_enabled(
+        self,
+        source_id: str,
+        enabled: bool,
+        *,
+        workspace_id: str | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> bool:
+        """Toggle one exact source connector without touching source bodies."""
+        target_workspace = str(workspace_id or self.workspace_id)
+        now = _now()
+
+        def apply(local: sqlite3.Connection) -> bool:
+            cur = local.execute(
+                "UPDATE source_connectors SET enabled=?,updated_at=? WHERE source_id=? AND workspace_id=?",
+                (1 if bool(enabled) else 0, now, str(source_id), target_workspace),
+            )
+            return int(cur.rowcount or 0) == 1
+
+        if conn is not None:
+            return apply(conn)
+        with open_database(self.db_path) as local:
+            with transaction(local):
+                return apply(local)
+
+    def restore_tombstone(
+        self,
+        tombstone_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, str]:
+        """Restore one tombstoned occurrence and release its recovery hold.
+
+        The Blob is never rewritten.  Restoring only reactivates the existing
+        occurrence/reference and records ``restored_at`` so Content remains the
+        sole body authority.
+        """
+        now = _now()
+
+        def apply(local: sqlite3.Connection) -> dict[str, str]:
+            row = local.execute(
+                "SELECT occurrence_id,blob_id,reason FROM content_tombstones "
+                "WHERE tombstone_id=? AND active=1",
+                (str(tombstone_id),),
+            ).fetchone()
+            if row is None:
+                raise ContentError(f"unknown active tombstone: {tombstone_id}")
+            occurrence_id, blob_id, reason = str(row[0]), str(row[1]), str(row[2])
+            restored = local.execute(
+                "UPDATE content_occurrences SET active=1,deleted_scan_id='',last_seen_at=? "
+                "WHERE occurrence_id=?",
+                (now, occurrence_id),
+            )
+            local.execute(
+                "UPDATE content_tombstones SET active=0,restored_at=? WHERE tombstone_id=?",
+                (now, str(tombstone_id)),
+            )
+            released = local.execute(
+                "UPDATE content_holds SET active=0,released_at=? "
+                "WHERE blob_id=? AND reason=? AND source_ref=? AND active=1",
+                (now, blob_id, reason, occurrence_id),
+            )
+            return {
+                "occurrence_id": occurrence_id,
+                "blob_id": blob_id,
+                "tombstone_id": str(tombstone_id),
+                "restored_occurrence": int(restored.rowcount or 0),
+                "released_holds": int(released.rowcount or 0),
+            }
+
+        if conn is not None:
+            return apply(conn)
+        with open_database(self.db_path) as local:
+            with transaction(local):
+                return apply(local)
+
+    def purge_tombstone(
+        self,
+        tombstone_id: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, str]:
+        """Release recovery metadata without directly deleting a Blob.
+
+        Physical orphan reclamation remains the responsibility of guarded V2
+        maintenance.  This operation only removes the recovery hold and marks
+        the tombstone non-active, so purge cannot race references in another
+        domain.
+        """
+        now = _now()
+
+        def apply(local: sqlite3.Connection) -> dict[str, str]:
+            row = local.execute(
+                "SELECT occurrence_id,blob_id,reason FROM content_tombstones "
+                "WHERE tombstone_id=?",
+                (str(tombstone_id),),
+            ).fetchone()
+            if row is None:
+                raise ContentError(f"unknown tombstone: {tombstone_id}")
+            occurrence_id, blob_id, reason = str(row[0]), str(row[1]), str(row[2])
+            released = local.execute(
+                "UPDATE content_holds SET active=0,released_at=? "
+                "WHERE blob_id=? AND reason=? AND source_ref=? AND active=1",
+                (now, blob_id, reason, occurrence_id),
+            )
+            local.execute(
+                "UPDATE content_tombstones SET active=0,restored_at=CASE "
+                "WHEN restored_at='' THEN ? ELSE restored_at END WHERE tombstone_id=?",
+                (now, str(tombstone_id)),
+            )
+            return {
+                "occurrence_id": occurrence_id,
+                "blob_id": blob_id,
+                "tombstone_id": str(tombstone_id),
+                "released_holds": int(released.rowcount or 0),
+            }
+
+        if conn is not None:
+            return apply(conn)
+        with open_database(self.db_path) as local:
+            with transaction(local):
+                return apply(local)
+
     def counts(self) -> dict[str, int]:
-        tables = ("content_namespaces", "content_blobs", "source_objects", "content_occurrences", "conversation_sessions", "conversation_turns", "conversation_summaries", "conversation_observations", "content_evidence_links", "content_holds", "content_tombstones", "migration_map", "knowledge_records", "knowledge_relations", "content_acl_anomalies")
+        tables = ("content_namespaces", "content_blobs", "source_objects", "content_occurrences", "conversation_sessions", "conversation_turns", "conversation_summaries", "conversation_observations", "content_evidence_links", "history_mutation_receipts", "content_holds", "content_tombstones", "migration_map", "knowledge_records", "knowledge_relations", "content_acl_anomalies")
         with open_database(self.db_path, readonly=True) as conn:
             return {table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) for table in tables}
 

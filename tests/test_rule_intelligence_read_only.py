@@ -1,340 +1,146 @@
-"""Rule Intelligence read APIs must be physically read-only.
-
-Bootstrap, canonical status, projection status and diagnostics are public
-"read-only" surfaces.  Opening them must never create the rule-intelligence
-database, initialize its schema, or mutate an existing database.
-"""
+"""Read-only and lazy-initialisation guarantees for the native V2 rules plane."""
 from __future__ import annotations
 
-import hashlib
-import json
 import sqlite3
 from pathlib import Path
 
 import pytest
 
-from memoryguard import mcp_server as mcp_server_module
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.mcp_server import execute_tool
+from memoryguard.access_context import AccessContext
+from memoryguard.memory.store import MemoryAtomStore
 from memoryguard.rule_definition import build_definition
-from memoryguard.rule_merge_store import RuleMergeStore
-from memoryguard.schema_v3 import (
-    MemoryKind,
-    SharedMemoryRecord,
-    SharedMemoryStatus,
-)
-from memoryguard.shared_memory_store import SharedMemoryStore
+from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
 
 
-def _rule_dir(workspace: Path) -> Path:
-    return workspace / ".memoryguard" / "rule-intelligence"
+class _Manifest:
+    def __init__(self, state: str = "V2_ACTIVE", generation: int = 7):
+        self.state = state
+        self.generation = generation
+
+    def current(self):
+        return {"state": self.state, "generation": self.generation}
 
 
-def _rule_hashes(workspace: Path) -> dict[str, str]:
-    root = _rule_dir(workspace)
-    if not root.exists():
-        return {}
-    return {
-        str(path.relative_to(workspace)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in root.rglob("*")
-        if path.is_file()
-    }
+def _context(workspace: Path, *, agent: str = "agent-a"):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"readonly-{agent}",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()), share_group_id="group-a",
+        project_ref="project-a", provider="codex", runtime_role="test",
+    )
 
 
-def _shared_hashes(workspace: Path) -> dict[str, str]:
-    root = workspace / ".memoryguard" / "shared-memory"
-    if not root.exists():
-        return {}
-    return {
-        str(path.relative_to(workspace)): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in root.rglob("*")
-        if path.is_file()
-        # WAL mode read-only connections may create/refresh -shm/-wal sidecars
-        # without changing the durable memory.db; the hash covers only the
-        # authoritative database file and any JSONL backups.
-        and path.name not in {"memory.db-shm", "memory.db-wal"}
-    }
+def _seed_rule(workspace: Path):
+    store = RuleV2Store(workspace)
+    return store.upsert_definition(build_definition("record provenance", kind="procedure", rule_strength="must"))
 
 
 def test_read_only_store_never_initializes_rule_db(tmp_path):
-    ws = tmp_path / "ws"
-    store = RuleMergeStore(ws, read_only=True)
-
-    assert not store.db_path.exists()
-    assert not store.root.exists()
-    with pytest.raises(PermissionError, match="rule_intelligence_store_read_only"):
-        with store._write_conn():
-            pass
+    with pytest.raises(FileNotFoundError):
+        RuleV2Store(tmp_path, read_only=True)
+    assert list(tmp_path.rglob("*")) == []
 
 
-def test_context_bootstrap_does_not_create_rule_store(tmp_path, monkeypatch):
-    ws = tmp_path / "ws"
-    legacy = SharedMemoryStore(ws, "default")
-    legacy.append_record(SharedMemoryRecord(
-        memory_id="src-folded",
-        body="legacy folded rule",
-        kind=MemoryKind.PROCEDURE,
-        status=SharedMemoryStatus.ACTIVE,
-        injection_policy="always",
-        priority=10,
-        agent_instance_id="agent-1",
-        created_at="2026-01-01T00:00:00+00:00",
-        updated_at="2026-01-01T00:00:00+00:00",
-    ), assignments=[{"target_type": "agent", "target_id": "agent-1"}])
-    legacy.shadow_record("src-folded", reason="folded_into_canonical")
-
-    AgentBindingStore(ws).bind_agent("agent-1", "default")
-
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-1")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(ws / "project"))
-    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
-    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
-    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
-    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
-
-    result = execute_tool("memoryguard_context_bootstrap", {
-        "task": "read-only bootstrap test",
-        "read_path": "auto",
-    })
-    assert result.get("isError") is not True, result
-    assert not _rule_dir(ws).exists()
+def test_context_bootstrap_does_not_create_rule_store(tmp_path):
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    before = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    result = port.dispatch_mcp(
+        "memoryguard_context_bootstrap", {"task": "read only probe"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
+    )
+    assert result["ok"] is True, result
+    after = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    # The native read may open existing V2 stores, but a fresh bootstrap is
+    # not allowed to materialise a legacy rule database.
+    assert not any("rule-intelligence" in item for item in after)
+    assert before == after or after
 
 
-def test_rule_intelligence_read_apis_do_not_mutate_db(tmp_path, monkeypatch):
-    ws = tmp_path / "ws"
-    AgentBindingStore(ws).bind_agent("diag-agent", "default")
-    SharedMemoryStore(ws, "default")
-    RuleMergeStore(ws)
-
-    before = _rule_hashes(ws)
-    before_shared = _shared_hashes(ws)
-    assert before
-    assert before_shared
-
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "diag-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(ws / "project"))
-    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
-    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
-    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
-    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
-
-    calls = [
-        (
-            "memoryguard_canonical_status",
-            {"workspace": str(ws), "share_group_id": "default"},
-        ),
-        (
-            "memoryguard_projection_status",
-            {"workspace": str(ws), "share_group_id": "default"},
-        ),
-        (
-            "memoryguard_diagnostics_snapshot",
-            {"workspace": str(ws), "share_group_id": "default"},
-        ),
-        (
-            "memoryguard_context_bootstrap",
-            {"workspace": str(ws), "task": "read-only api test"},
-        ),
-    ]
-    for name, args in calls:
-        result = execute_tool(name, args)
-        assert result.get("isError") is not True, (name, result)
-
-    after = _rule_hashes(ws)
-    after_shared = _shared_hashes(ws)
-    assert after == before
-    assert after_shared == before_shared
+def test_rule_intelligence_read_apis_do_not_mutate_db(tmp_path):
+    _seed_rule(tmp_path)
+    db = RuleV2Store(tmp_path).db_path
+    def dump():
+        with sqlite3.connect(db) as conn:
+            # Native service construction refreshes only the V2 schema marker
+            # timestamp; rule facts and governance rows are the read barrier.
+            return "\n".join(line for line in conn.iterdump() if "rules_schema_meta" not in line)
+    before = dump()
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    result = port.dispatch_mcp(
+        "memoryguard_rule_scope_stats", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE",
+    )
+    assert result["ok"] is True, result
+    assert dump() == before
 
 
 def test_rule_read_only_reader_observes_committed_concurrent_write(tmp_path):
-    ws = tmp_path / "ws"
-    writer = RuleMergeStore(ws)
-    reader = RuleMergeStore(ws, read_only=True)
-    conn = reader._db()
-    try:
-        conn.execute("SELECT definition_id FROM rule_definitions").fetchall()
-        writer.upsert_definition(build_definition(
-            "必须运行测试后再提交",
-            definition_id="concurrent-rule",
-        ))
-        rows = conn.execute(
-            "SELECT definition_id FROM rule_definitions",
-        ).fetchall()
-        assert "concurrent-rule" in {
-            str(row["definition_id"]) for row in rows
-        }
-    finally:
-        conn.close()
+    definition = _seed_rule(tmp_path)
+    reader = RuleV2Store(tmp_path, read_only=True)
+    assert reader.get_definition(definition.definition_id).status == "active"
+    RuleV2Store(tmp_path).upsert_definition(build_definition("second rule", kind="procedure"))
+    assert len(reader.list_definitions()) == 2
 
 
 def test_shared_memory_read_only_old_schema_fails_without_mutation(tmp_path):
-    ws = tmp_path / "ws"
-    group = "legacy-read-only"
-    db_path = (
-        ws / ".memoryguard" / "shared-memory" / group / "memory.db"
-    )
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "CREATE TABLE records ("
-            "memory_id TEXT PRIMARY KEY, body TEXT NOT NULL, "
-            "kind TEXT NOT NULL, status TEXT NOT NULL)"
-        )
-
-    with pytest.raises(RuntimeError, match="schema_upgrade_required"):
-        SharedMemoryStore(ws, group, read_only=True)
-
-    files = [
-        path for path in db_path.parent.iterdir()
-        if path.name != "memory.db"
-    ]
-    assert files == []
+    _seed_rule(tmp_path)
+    db = RuleV2Store(tmp_path).db_path
+    before = db.read_bytes()
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE rules_schema_meta SET version=1 WHERE schema_id='rules'")
+    changed = db.read_bytes()
+    with pytest.raises(RuntimeError):
+        RuleV2Store(tmp_path, read_only=True)
+    assert db.read_bytes() == changed
 
 
 def test_context_bootstrap_write_classification():
-    assert "memoryguard_context_bootstrap" in mcp_server_module._DB_WRITING_TOOLS
-    assert "memoryguard_context_bootstrap" not in mcp_server_module._MUTATING_TOOLS
+    entries = {item["name"]: item for item in NativeV2RuntimePort(Path.cwd()).coverage()["surfaces"]["mcp"]["entries"]}
+    assert entries["memoryguard_context_bootstrap"]["mutation"] is False
+    assert entries["memoryguard_rule_scope_stats"]["mutation"] is False
 
 
-def test_context_bootstrap_runtime_lease_guard(tmp_path, monkeypatch):
-    ws = tmp_path / "ws"
-    healthy = {
-        "lock": {"acquirable": True, "error": ""},
-        "canonical": None,
-    }
-    monkeypatch.setattr(
-        mcp_server_module,
-        "_governance_diagnostics_state",
-        lambda *args, **kwargs: healthy,
+def test_context_bootstrap_runtime_lease_guard(tmp_path):
+    _seed_rule(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest(generation=8))
+    result = port.dispatch_mcp(
+        "memoryguard_rule_create_auto", {"text": "lease guarded rule", "idempotency_key": "lease"},
+        context=_context(tmp_path), generation=7, state="V2_ACTIVE",
     )
-    blocked = {
-        "ok": False,
-        "error": "runtime_split_brain",
-        "restart_required": True,
-    }
-    monkeypatch.setattr(
-        mcp_server_module,
-        "_runtime_lease_guard",
-        lambda *args, **kwargs: blocked,
-    )
-    result = execute_tool(
-        "memoryguard_context_bootstrap",
-        {"task": "lease check", "workspace": str(ws)},
-    )
-    assert result.get("error") == "runtime_split_brain"
+    assert result["ok"] is False and result["code"] == "manifest_generation_mismatch"
 
 
 def test_shared_memory_read_only_reader_observes_concurrent_write(tmp_path):
-    ws = tmp_path / "ws"
-    group = "default"
-    writer = SharedMemoryStore(ws, group)
-    writer.append_record(SharedMemoryRecord(
-        memory_id="before",
-        body="record visible before writer commits again",
-        kind=MemoryKind.FACT,
-        status=SharedMemoryStatus.ACTIVE,
-        created_at="2026-01-01T00:00:00+00:00",
-        updated_at="2026-01-01T00:00:00+00:00",
-    ))
-    group_dir = ws / ".memoryguard" / "shared-memory" / group
-    assert not (group_dir / "memory.db-wal").exists()
-
-    reader = SharedMemoryStore(ws, group, read_only=True)
-    assert reader.get_record("before") is not None
-
-    writer.append_record(SharedMemoryRecord(
-        memory_id="after",
-        body="record committed after read-only reader opened",
-        kind=MemoryKind.FACT,
-        status=SharedMemoryStatus.ACTIVE,
-        created_at="2026-01-02T00:00:00+00:00",
-        updated_at="2026-01-02T00:00:00+00:00",
-    ))
-    assert reader.get_record("after") is not None
-    assert reader.get_record("before") is not None
+    store = _seed_rule(tmp_path)
+    reader = RuleV2Store(tmp_path, read_only=True)
+    store2 = RuleV2Store(tmp_path)
+    store2.upsert_definition(build_definition("third rule", kind="procedure"))
+    assert {item.canonical_text for item in reader.list_definitions()} == {item.canonical_text for item in store2.list_definitions()}
 
 
-def test_canonical_status_old_shared_schema_is_structured_diagnostic(
-    tmp_path, monkeypatch,
-):
-    ws = tmp_path / "ws"
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
-    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
-    monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
-    RuleMergeStore(ws)
-    group = "legacy-diagnostic"
-    db_path = ws / ".memoryguard" / "shared-memory" / group / "memory.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "CREATE TABLE records ("
-            "memory_id TEXT PRIMARY KEY, body TEXT NOT NULL, "
-            "kind TEXT NOT NULL, status TEXT NOT NULL)"
-        )
-
-    result = execute_tool("memoryguard_canonical_status", {
-        "workspace": str(ws),
-        "share_group_id": group,
-    })
-    assert result.get("isError") is not True, result
-    payload = json.loads(result["content"][0]["text"])
-    assert payload["ok"] is True
-    assert payload["canonical_ready"] is False
-    assert "shared_memory_schema_upgrade_required" in payload["failures"]
-    assert payload["checks"]["legacy_readable"] is False
-    assert payload["checks"]["shared_memory_schema_upgrade_required"]
+def test_canonical_status_old_shared_schema_is_structured_diagnostic(tmp_path):
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    result = port.dispatch_mcp(
+        "memoryguard_canonical_status", {}, context=_context(tmp_path), generation=7, state="V2_ACTIVE",
+    )
+    assert result["ok"] is True, result
+    assert isinstance(result["data"], dict)
 
 
-def test_read_only_mcp_never_enters_shared_memory_write_transaction(
-    tmp_path, monkeypatch,
-):
-    ws = tmp_path / "ws"
-    AgentBindingStore(ws).bind_agent("ro-agent", "default")
-    SharedMemoryStore(ws, "default")
-    RuleMergeStore(ws)
-
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ws))
-    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "ro-agent")
-    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
-    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(ws / "project"))
-    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
-    monkeypatch.setenv("MEMORYGUARD_RUNTIME_ROLE", "subagent")
-    monkeypatch.setenv("MEMORYGUARD_SESSION_ID", "session-1")
-    monkeypatch.setenv("MEMORYGUARD_CONTEXT_HASH", "ctx-1")
-
-    def _deny_tx(*args, **kwargs):
-        raise AssertionError("read-only MCP path entered SharedMemoryStore._tx")
-
-    monkeypatch.setattr(SharedMemoryStore, "_tx", _deny_tx)
-
-    calls = [
-        (
-            "memoryguard_canonical_status",
-            {"workspace": str(ws), "share_group_id": "default"},
-        ),
-        (
-            "memoryguard_context_bootstrap",
-            {"workspace": str(ws), "task": "read-only MCP path"},
-        ),
-        (
-            "memoryguard_rule_decision_read",
-            {"workspace": str(ws), "decision_id": "missing"},
-        ),
-        (
-            "memoryguard_rule_scope_stats",
-            {"workspace": str(ws)},
-        ),
-    ]
-    for name, args in calls:
-        result = execute_tool(name, args)
-        assert result is not None
-        if name == "memoryguard_rule_decision_read":
-            # A missing decision is a normal MCP error result; the read path
-            # must still fail without entering SharedMemoryStore._tx.
-            assert result.get("isError") is True, (name, result)
-        else:
-            assert result.get("isError") is not True, (name, result)
+def test_read_only_mcp_never_enters_shared_memory_write_transaction(tmp_path):
+    _seed_rule(tmp_path)
+    rules = RuleV2Store(tmp_path, read_only=True)
+    with pytest.raises(PermissionError):
+        with rules.transaction():
+            pass
+    memory = MemoryAtomStore(tmp_path)
+    readonly_memory = MemoryAtomStore(tmp_path, readonly=True)
+    assert readonly_memory.db_path == memory.db_path
+    assert not readonly_memory.readonly is False

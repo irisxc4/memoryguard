@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .migration.gui_control import inspect_legacy_gui_control, migrate_legacy_gui_control
 from .migration.ready_prepare import prepare_v2_ready
 from .system.manifest import ManifestManager, ManifestState
 
@@ -69,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--expected-generation", type=int)
     prepare.add_argument("--apply", action="store_true", help="perform the shadow build; default is zero-write")
 
+    control = sub.add_parser(
+        "migrate-gui-control",
+        help="migrate legacy AgentBinding metadata into the V2 system control plane",
+    )
+    control.add_argument("-w", "--workspace", default=".")
+    control.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the digest-bound V2 control migration; default is zero-write preview",
+    )
+
     activate = sub.add_parser("activate", help="transition V2_READY to V2_ACTIVE after a fresh drift check")
     activate.add_argument("-w", "--workspace", default=".")
     activate.add_argument(
@@ -90,6 +102,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             _emit({"schema": SCHEMA, "command": "status", "status": "OK", "ok": True, **_public_manifest(manager)})
             return 0
+
+        if args.command == "migrate-gui-control":
+            report = (
+                migrate_legacy_gui_control(workspace)
+                if bool(args.apply)
+                else inspect_legacy_gui_control(workspace)
+            )
+            _emit({"schema": SCHEMA, "command": "migrate-gui-control", **report})
+            return 0 if report.get("ok") else 2
 
         if args.command == "prepare":
             report = prepare_v2_ready(

@@ -29,7 +29,6 @@ from .schema_v3 import (
     RecordMappingKind, RecordMappingEntry,
     stable_hash, _now_iso,
 )
-from .memory_ir import MemoryIR
 
 
 # ===========================================================================
@@ -94,7 +93,10 @@ class ImportAdapter:
         product imports must use this path.  It never creates an EPISODE or
         writes to the governed long-term memory store.
         """
-        from .conversation_history import ConversationHistoryStore, HistoryScope
+        from .content.conversation_sync import ConversationEvent, ConversationSync
+        from .content.store import ContentStore, stable_id
+        from .runtime_v2.group_native import personal_group_id
+
         # The concrete provider is deterministic and avoids treating a source
         # path as a trusted provider label.
         provider = self.__class__.__name__.replace("ImportAdapter", "").lower()
@@ -102,12 +104,62 @@ class ImportAdapter:
             provider = "chatgpt"
         elif isinstance(self, GenericImportAdapter):
             provider = "generic"
-        store = ConversationHistoryStore(workspace)
-        return store.import_conversations(
-            items, provider=provider,
-            scope=HistoryScope(agent_instance_id=agent_instance_id, project_ref=project_ref,
-                               provider=provider, share_group_id=share_group_id),
+        workspace_path = Path(workspace).expanduser().resolve()
+        agent = str(agent_instance_id or "").strip()
+        if not agent:
+            raise ValueError("agent_instance_id_required")
+        group = str(share_group_id or "").strip() or personal_group_id(agent)
+        content = ContentStore(
+            workspace_path,
+            workspace_id=str(workspace_path),
+            trust_domain="conversation-import",
+            sensitivity="normal",
+            retention_authority="workspace",
         )
+        events: list[ConversationEvent] = []
+        for conversation in items:
+            external = str(conversation.conv_id or "").strip()
+            if not external:
+                continue
+            for ordinal, message in enumerate(conversation.messages):
+                if not isinstance(message, dict):
+                    continue
+                role = str(message.get("role") or "").strip().casefold()
+                body = str(message.get("content") or "")
+                if role not in {"user", "assistant"} or not body.strip():
+                    continue
+                event_id = str(message.get("event_id") or message.get("id") or "")
+                events.append(ConversationEvent(
+                    external_object_key=external,
+                    content=body,
+                    role=role,
+                    ordinal=ordinal,
+                    event_id=event_id,
+                    source_revision=stable_id(provider, external, ordinal, message.get("created_at", "")),
+                    title=str(conversation.title or "")[:512],
+                    provider=provider,
+                    workspace_id=str(workspace_path),
+                    agent_instance_id=agent,
+                    project_ref=str(project_ref or conversation.project_ref or ""),
+                    share_group_id=group,
+                    metadata={"source_provider": provider},
+                    locator={"message_index": ordinal},
+                ))
+        if not events:
+            return {"conversation_count": 0, "turn_count": 0}
+        source_id = stable_id("adapter-import", provider, agent, project_ref, group)
+        result = ConversationSync(content).sync(
+            source_id,
+            events,
+            owner_id="adapter-import:" + agent,
+            max_turns=max(1, len(events)),
+            max_chars=max(1, sum(len(str(event.content)) for event in events)),
+        )
+        return {
+            "conversation_count": len({event.external_object_key for event in events}),
+            "turn_count": int(result.applied),
+            "changed_turn_count": int(result.changed),
+        }
 
     def explain(self) -> ImportCapability:
         raise NotImplementedError
@@ -435,7 +487,7 @@ class TargetAdapter:
     def inspect_target(self, path: Path) -> TargetState:
         raise NotImplementedError
 
-    def compile(self, ir: MemoryIR, decisions: list, staging_dir: Path,
+    def compile(self, ir: Any, decisions: list, staging_dir: Path,
                 target_profile: str) -> BuildManifest:
         raise NotImplementedError
 
@@ -482,7 +534,7 @@ class GenericMarkdownTarget(TargetAdapter):
             managed_files=managed, external_files=external,
         )
 
-    def compile(self, ir: MemoryIR, decisions: list, staging_dir: Path,
+    def compile(self, ir: Any, decisions: list, staging_dir: Path,
                 target_profile: str = "") -> BuildManifest:
         staging_dir.mkdir(parents=True, exist_ok=True)
         records = [r for r in ir.records if r.status != MemoryStatus.REJECTED]

@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .memory_ir import MemoryIR
 from .policies import _jaccard, _tokenize
 from .schema_v3 import (
     Completeness,
@@ -214,7 +213,7 @@ class MemoryDistiller:
         self.mg_dir = self.workspace / ".memoryguard"
         self.distilled_path = self.mg_dir / "ir" / "distilled.json"
 
-    def distill(self, ir: MemoryIR) -> DistilledMemory:
+    def distill(self, ir: Any) -> DistilledMemory:
         record_map = {r.memory_id: r for r in ir.records}
         eligible = [r for r in ir.records if _is_publishable(r)]
         input_count = len(eligible)

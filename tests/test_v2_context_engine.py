@@ -78,6 +78,80 @@ def test_dedup_and_planner_are_deterministic_and_cannot_elevate():
     assert any(receipt["reason"] == "duplicate_rejected" for receipt in first.receipts)
 
 
+def test_governance_semantics_split_same_body_but_same_semantics_still_dedup():
+    body = "release verification durable procedure"
+    packet = ContextEngine(state="V2_BUILDING").bootstrap(_request(), {
+        "mandatory": [{
+            "id": "must",
+            "kind": "procedure",
+            "is_rule": True,
+            "body": body,
+            "injection_policy": "always",
+            "rule_strength": "must",
+            "semantic_identity": "release-verification",
+        }],
+        "relevant": [
+            {
+                "id": "remember",
+                "kind": "fact",
+                "body": body,
+                "injection_policy": "relevant",
+                "rule_strength": "observation",
+                "semantic_identity": "release-verification",
+            },
+            {
+                "id": "remember-copy",
+                "kind": "fact",
+                "body": body,
+                "injection_policy": "relevant",
+                "rule_strength": "observation",
+                "semantic_identity": "release-verification",
+            },
+        ],
+    })
+
+    assert [item["item_id"] for item in packet.mandatory] == ["must"]
+    assert [item["item_id"] for item in packet.relevant] == ["remember"]
+    assert any(
+        receipt["reason"] == "duplicate_rejected"
+        for receipt in packet.receipts
+        if not receipt["hit"]
+    )
+
+
+def test_planner_cannot_elevate_relevant_semantic_copy():
+    class Planner:
+        def plan(self, request, candidates):
+            return {
+                "item_ids": ["relevant-copy"],
+                "mandatory": [{"id": "relevant-copy", "body": "forged"}],
+            }
+
+    packet = ContextEngine(planner=Planner(), state="V2_BUILDING").bootstrap(_request(), {
+        "mandatory": [{
+            "id": "trusted-must",
+            "kind": "procedure",
+            "is_rule": True,
+            "body": "same governed fact",
+            "injection_policy": "always",
+            "rule_strength": "must",
+            "semantic_identity": "governed-fact",
+        }],
+        "relevant": [{
+            "id": "relevant-copy",
+            "kind": "fact",
+            "body": "same governed fact",
+            "injection_policy": "relevant",
+            "rule_strength": "observation",
+            "semantic_identity": "governed-fact",
+        }],
+    })
+
+    assert [item["item_id"] for item in packet.mandatory] == ["trusted-must"]
+    assert [item["item_id"] for item in packet.relevant] == ["relevant-copy"]
+    assert "forged" not in str(packet.to_dict())
+
+
 def test_independent_mandatory_budget_and_optional_dual_limits():
     engine = ContextEngine(
         budget=ContextBudget(max_items=1, max_chars=3, max_tokens=3, mandatory_max_chars=20, mandatory_max_tokens=20),

@@ -8,6 +8,21 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
+def _activate_v2_workspace(root: Path) -> None:
+    """Binding API tests must enter through the public V2 upgrade contract."""
+    from memoryguard.migration.upgrade import run_upgrade
+
+    ready = run_upgrade(root, data_home=root, apply=True)
+    assert ready["status"] == "V2_READY", ready
+    active = run_upgrade(
+        root,
+        data_home=root,
+        apply=True,
+        confirm="V2_ACTIVE",
+    )
+    assert active["v2_active"] is True, active
+
+
 def test_non_admin_binding_create_denied(monkeypatch):
     """无 admin 创建 binding 必须失败。"""
     from memoryguard.mcp_server import execute_tool
@@ -17,13 +32,14 @@ def test_non_admin_binding_create_denied(monkeypatch):
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
     with tempfile.TemporaryDirectory() as ws:
+        _activate_v2_workspace(Path(ws))
         result = execute_tool("memoryguard_binding_create", {
             "workspace": ws,
             "agent_instance_id": "attacker",
             "share_group_id": "group-a",
         })
         assert result.get("isError"), "non-admin binding_create must fail"
-        assert "admin" in result["content"][0]["text"]
+        assert "request_failed" in result["content"][0]["text"]
 
 
 def test_self_bind_then_read_still_denied(monkeypatch):
@@ -35,6 +51,7 @@ def test_self_bind_then_read_still_denied(monkeypatch):
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
     with tempfile.TemporaryDirectory() as ws:
+        _activate_v2_workspace(Path(ws))
         # 先用 admin 创建 group-a 并写入(模拟合法场景)
         monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")
         monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "victim")

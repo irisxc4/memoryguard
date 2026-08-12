@@ -34,6 +34,14 @@ DERIVED_NAMES = {
     "history_fts_docsize", "history_fts_config", "embeddings",
 }
 
+_HISTORY_RECEIPT_COLUMNS: tuple[str, ...] = (
+    "idempotency_key",
+    "operation",
+    "payload_digest",
+    "result_json",
+    "created_at",
+)
+
 
 def _is_derived_table(name: str) -> bool:
     value = str(name or "")
@@ -154,28 +162,80 @@ class V2MigrationValidator:
         self.data_home = Path(data_home).expanduser().resolve() if data_home is not None else None
         self.source_workspace = Path(source_workspace).expanduser().resolve() if source_workspace is not None else self.workspace
         self.source_data_home = Path(source_data_home).expanduser().resolve() if source_data_home is not None else self.data_home
+        self._explicit_source_workspace = source_workspace is not None
+        self._explicit_source_data_home = source_data_home is not None
+        self._validation_source_workspace: Path | None = None
+        self._validation_source_data_home: Path | None = None
         self.migration_id = str(migration_id or "")
         self.expected_source_hashes = {str(key): str(value) for key, value in (expected_source_hashes or {}).items()}
         self.last_result: V2ValidationResult | None = None
 
     # ---- source inventory -----------------------------------------
     def _source_paths(self) -> dict[str, tuple[Path | None, str]]:
+        source_workspace = self._validation_source_workspace or self.source_workspace
+        source_data_home = (
+            self._validation_source_data_home
+            if self._validation_source_data_home is not None
+            else self.source_data_home
+        )
         result: dict[str, tuple[Path | None, str]] = {
-            "history": (self.source_workspace / ".memoryguard" / "history" / "history.sqlite", "configured"),
+            "history": (source_workspace / ".memoryguard" / "history" / "history.sqlite", "configured"),
             "knowledge": (None, "NOT_CONFIGURED"),
         }
-        if self.source_data_home is not None:
-            result["knowledge"] = (self.source_data_home / "knowledge" / "knowledge.db", "configured")
-        group_roots = [self.source_workspace / ".memoryguard" / "shared-memory", self.source_workspace / ".memoryguard" / "shared_memory"]
+        if source_data_home is not None:
+            result["knowledge"] = (source_data_home / "knowledge" / "knowledge.db", "configured")
+        group_roots = [source_workspace / ".memoryguard" / "shared-memory", source_workspace / ".memoryguard" / "shared_memory"]
         for groups in group_roots:
             if groups.is_dir():
                 for child in sorted(groups.iterdir(), key=lambda path: path.name):
                     path = child / "memory.db"
                     if child.is_dir():
                         result.setdefault(f"memory:{child.name}", (path, "configured"))
-        ri = self.source_workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
+        ri = source_workspace / ".memoryguard" / "rule-intelligence" / "memory.db"
         result["rule_intelligence"] = (ri, "configured")
         return result
+
+    def _frozen_source_snapshot(self) -> tuple[Path, Path | None] | None:
+        """Return the manifest-owned source snapshot for target validation.
+
+        Workspace preparation intentionally inventories live V1 before taking
+        a backup.  Once a build is recorded, target mappings point at the
+        frozen snapshot instead.  Validation must use that same immutable
+        identity unless the caller explicitly selected another source root.
+        """
+
+        if self._explicit_source_workspace or self._explicit_source_data_home:
+            return None
+        try:
+            manifest = ManifestManager(self.layout).current(immutable=True)
+            checkpoints = manifest.checkpoints if isinstance(manifest.checkpoints, Mapping) else {}
+            phase2 = checkpoints.get("phase2_sources") if isinstance(checkpoints, Mapping) else None
+            snapshot = phase2.get("snapshot") if isinstance(phase2, Mapping) else None
+            if not isinstance(snapshot, Mapping) or str(snapshot.get("mode") or "") != "frozen":
+                return None
+            raw_workspace = str(snapshot.get("workspace") or "")
+            if not raw_workspace:
+                return None
+            snapshot_workspace = Path(raw_workspace).expanduser().resolve()
+            backup_root = (self.workspace / ".memoryguard" / "migration-backups").resolve()
+            try:
+                snapshot_workspace.relative_to(backup_root)
+            except ValueError:
+                return None
+            if not snapshot_workspace.is_dir():
+                return None
+            raw_data_home = str(snapshot.get("data_home") or "")
+            snapshot_data_home = None
+            if raw_data_home and raw_data_home != "NOT_CONFIGURED":
+                candidate = Path(raw_data_home).expanduser().resolve()
+                try:
+                    candidate.relative_to(backup_root)
+                except ValueError:
+                    return None
+                snapshot_data_home = candidate if candidate.is_dir() else None
+            return snapshot_workspace, snapshot_data_home
+        except (OSError, sqlite3.Error, ValueError):
+            return None
 
     def source_inventory(self) -> dict[str, dict[str, Any]]:
         inventory: dict[str, dict[str, Any]] = {}
@@ -264,7 +324,7 @@ class V2MigrationValidator:
             schema_domain = "projection.profile" if domain == "projection" and path.name == "profile.db" else ("projection.scenario" if domain == "projection" else domain)
             self._check_db(phase1, path, marker=marker, schema_domain=schema_domain)
         result.domains["storage"] = phase1
-        self._check_db(result.domains.setdefault("content", DomainValidation("content")), layout.content_db, marker="memoryguard-v2-phase1", schema_domain="content", aux_marker="2")
+        self._check_db(result.domains.setdefault("content", DomainValidation("content")), layout.content_db, marker="memoryguard-v2-phase1", schema_domain="content", aux_marker="3")
         self._check_db(result.domains.setdefault("memory", DomainValidation("memory")), layout.memory_db, marker="memoryguard-v2-phase2-memory", schema_domain="memory")
         self._check_db(result.domains.setdefault("evidence", DomainValidation("evidence")), layout.evidence_db, marker="memoryguard-v2-phase2-evidence", schema_domain="evidence")
         self._check_db(result.domains.setdefault("rules", DomainValidation("rules")), layout.rules_db, marker="memoryguard-v2-phase2-rules", schema_domain="rules")
@@ -300,6 +360,90 @@ class V2MigrationValidator:
     def _rows(conn: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
         return conn.execute(f"SELECT * FROM {_quote(table)}").fetchall()
 
+    @staticmethod
+    def _receipt_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        tables = {
+            str(row[0])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "history_mutation_receipts" not in tables:
+            return []
+        rows = conn.execute(
+            "SELECT idempotency_key,operation,payload_digest,result_json,created_at "
+            "FROM history_mutation_receipts ORDER BY idempotency_key"
+        ).fetchall()
+        return [
+            {column: row[column] for column in _HISTORY_RECEIPT_COLUMNS}
+            for row in rows
+        ]
+
+    def _history_receipt_metrics(
+        self,
+        domain: DomainValidation,
+        history_item: Mapping[str, Any],
+        target: sqlite3.Connection,
+    ) -> dict[str, Any]:
+        target_rows = self._receipt_rows(target)
+        target_digest = _digest(target_rows)
+        if history_item.get("status") != "READY":
+            return {
+                "status": "NO_SOURCE",
+                "source_count": None,
+                "target_count": len(target_rows),
+                "source_digest": "",
+                "target_digest": target_digest,
+                "count_match": True,
+                "content_digest_match": True,
+                "loss": 0,
+            }
+
+        source_path = Path(str(history_item.get("path") or ""))
+        with open_database(source_path, readonly=True, immutable=True) as source:
+            source_tables = {
+                str(row[0])
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            source_rows = self._receipt_rows(source)
+        source_digest = _digest(source_rows)
+        if "history_mutation_receipts" not in source_tables:
+            status = "NO_SOURCE" if not target_rows else "BLOCKED"
+            if target_rows:
+                domain.fail("history_mutation_receipts_target_without_source")
+            return {
+                "status": status,
+                "source_count": None,
+                "target_count": len(target_rows),
+                "source_digest": "",
+                "target_digest": target_digest,
+                "count_match": not target_rows,
+                "content_digest_match": not target_rows,
+                "loss": len(target_rows),
+            }
+
+        count_match = len(source_rows) == len(target_rows)
+        digest_match = source_digest == target_digest
+        loss = 0 if count_match and digest_match else max(abs(len(source_rows) - len(target_rows)), 1)
+        if not count_match:
+            domain.fail(
+                f"history_mutation_receipts_count_mismatch:{len(source_rows)}/{len(target_rows)}"
+            )
+        if not digest_match:
+            domain.fail("history_mutation_receipts_content_digest_mismatch")
+        return {
+            "status": "PASS" if loss == 0 else "BLOCKED",
+            "source_count": len(source_rows),
+            "target_count": len(target_rows),
+            "source_digest": source_digest,
+            "target_digest": target_digest,
+            "count_match": count_match,
+            "content_digest_match": digest_match,
+            "loss": loss,
+        }
+
     def _content_metrics(self, domain: DomainValidation, source_inventory: Mapping[str, Mapping[str, Any]]) -> None:
         path = self.layout.content_db
         if not path.is_file():
@@ -310,6 +454,15 @@ class V2MigrationValidator:
             maps = conn.execute("SELECT source_db,source_table,source_pk,target_type,target_id,source_hash,acl_digest FROM migration_map").fetchall()
             by_db = Counter(str(row[0]) for row in maps)
             domain.metrics.update({"migration_map": len(maps), "migration_map_source_dbs": dict(by_db), "blobs": int(conn.execute("SELECT COUNT(*) FROM content_blobs").fetchone()[0]), "occurrences": int(conn.execute("SELECT COUNT(*) FROM content_occurrences").fetchone()[0]), "active_occurrences": int(conn.execute("SELECT COUNT(*) FROM content_occurrences WHERE active=1").fetchone()[0])})
+            receipt_metrics = self._history_receipt_metrics(domain, history_item, conn)
+            domain.metrics["history_mutation_receipts"] = receipt_metrics
+            domain.metrics.update({
+                "history_mutation_receipts_source_count": receipt_metrics["source_count"],
+                "history_mutation_receipts_target_count": receipt_metrics["target_count"],
+                "history_mutation_receipts_source_digest": receipt_metrics["source_digest"],
+                "history_mutation_receipts_target_digest": receipt_metrics["target_digest"],
+                "history_mutation_receipts_loss": receipt_metrics["loss"],
+            })
             for key, item in (("history", history_item), ("knowledge", knowledge_item)):
                 if item.get("status") != "READY":
                     domain.metrics[f"{key}_loss"] = 0
@@ -321,7 +474,7 @@ class V2MigrationValidator:
                     with open_database(Path(source_db), readonly=True, immutable=True) as source_conn:
                         for table in source_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
                             name = str(table[0])
-                            if name.endswith(("_data", "_idx", "_content", "_docsize", "_config")):
+                            if _is_derived_table(name):
                                 continue
                             source_rows += int(source_conn.execute(f"SELECT COUNT(*) FROM {_quote(name)}").fetchone()[0])
                 except Exception as exc:
@@ -745,7 +898,7 @@ class V2MigrationValidator:
 
     def _unknown_sources(self, result: V2ValidationResult, inventory: Mapping[str, Mapping[str, Any]]) -> None:
         allowed = {
-            "history": {"conversation_sessions", "conversation_turns", "session_summaries", "observations", "evidence_links", "history_fts"},
+            "history": {"conversation_sessions", "conversation_turns", "session_summaries", "observations", "evidence_links", "history_mutation_receipts", "history_fts"},
             "knowledge": {"books", "documents", "chunks", "entities", "relations", "chunk_entities", "embeddings", "memory_candidates", "deleted_books", "index_jobs", "chunks_fts"},
             "memory": {"records", "events", "decisions", "conflicts", "quarantine", "versions", "active_version", "rule_assignments", "rule_exceptions", "rule_decisions", "rule_scope_stats", "rule_scope_evaluations", "rule_match_receipts", "rule_match_feedbacks", "rule_event_outbox", "rule_idempotency_fences", "schema_meta", "records_fts", "records_fts_data", "records_fts_idx", "records_fts_content", "records_fts_docsize", "records_fts_config"},
             "rule_intelligence": {"rule_definitions", "rule_bindings", "rule_binding_contributions", "rule_evidence", "rule_negative_evidence", "rule_runtime_feedback", "rule_effective_feedback_projection", "rule_merge_proposals", "rule_merge_decisions", "rule_merge_approvals", "rule_merge_native_requests", "rule_definition_aliases", "rule_source_links", "rule_canonical_state", "rule_reconciliation_jobs", "rule_projection_state", "rule_projection_checkpoints", "agent_reputation", "project_profile", "rule_definition_versions", "rule_definition_runtime_stats", "rule_evidence_contributions", "rule_evidence_effective", "governance_capabilities", "governance_capability_consumptions"},
@@ -760,6 +913,12 @@ class V2MigrationValidator:
                 result.errors.append(f"unknown_authoritative_tables:{key}:{','.join(unknown)}")
 
     def validate(self, *, migration_id: str | None = None) -> V2ValidationResult:
+        frozen = self._frozen_source_snapshot()
+        if frozen is not None:
+            self._validation_source_workspace, self._validation_source_data_home = frozen
+        else:
+            self._validation_source_workspace = None
+            self._validation_source_data_home = None
         result = V2ValidationResult(status="PASS", migration_id=str(migration_id or self.migration_id))
         inventory = self.source_inventory()
         self._compare_source_hashes(result, inventory)
@@ -787,6 +946,8 @@ class V2MigrationValidator:
         result.errors = errors
         result.status = "BLOCKED" if errors or any(domain.status != "PASS" for domain in result.domains.values()) else "PASS"
         result.can_promote = False
+        self._validation_source_workspace = None
+        self._validation_source_data_home = None
         self.last_result = result
         return result
 

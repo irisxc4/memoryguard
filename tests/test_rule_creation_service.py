@@ -1,101 +1,160 @@
-import json
+from __future__ import annotations
 
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.rule_creation import RuleCreationService
-from memoryguard.schema_v3 import EffectiveAgentContext, SharedMemoryStatus
-from memoryguard.shared_memory_store import SharedMemoryStore
+from pathlib import Path
+
+from memoryguard.access_context import AccessContext
+from memoryguard.runtime_v2.group_native import GroupControlService
+from memoryguard.runtime_v2.native_ports import (
+    NativeV2RuntimePort,
+    bind_native_transport_context,
+)
+from memoryguard.rules.v2_store import RuleV2Store
 
 
-def _setup(tmp_path, agent="a"):
-    AgentBindingStore(tmp_path).bind_agent(agent, "team")
-    store = SharedMemoryStore(tmp_path, "team")
-    context = EffectiveAgentContext(
-        agent_instance_id=agent,
+class _Manifest:
+    def current(self):
+        return {"state": "V2_ACTIVE", "generation": 7}
+
+
+def _context(workspace: Path, *, agent: str = "a", admin: bool = False):
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=admin,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"session-{agent}",
+            session_source="test",
+            session_trusted=True,
+        ),
+        workspace_id=str(workspace.resolve()),
         share_group_id="team",
-        project_ref=str(tmp_path / "project"),
+        project_ref=str((workspace / "project").resolve()),
+        provider="codex",
+        runtime_role="root",
     )
-    return store, context
+
+
+def _call(port: NativeV2RuntimePort, operation: str, payload: dict, context):
+    return port.dispatch_mcp(
+        operation,
+        payload,
+        context=context,
+        generation=7,
+        state="V2_ACTIVE",
+    )
+
+
+def _data(result: dict) -> dict:
+    assert result["ok"] is True, result
+    return result["data"]
 
 
 def test_auto_create_infers_trusted_agent_project_and_exposes_undo(tmp_path):
-    store, context = _setup(tmp_path)
-    service = RuleCreationService(tmp_path, "team", store=store)
+    GroupControlService(tmp_path, write=True).bind_agent("a", "team")
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    context = _context(tmp_path)
 
-    result = service.create_rule_from_text("必须先运行测试", context)
+    result = _data(_call(
+        port,
+        "memoryguard_rule_create_auto",
+        {
+            "text": "必须先运行测试",
+            "scope": {"target_type": "agent_project", "project_ref": str(tmp_path / "project")},
+            "idempotency_key": "create-a",
+        },
+        context,
+    ))
 
-    assert result.status == "created"
-    assert result.scope_confidence > 0
-    assert result.target_type == "agent_project"
-    assert result.target_id == "a"
-    assert result.project_ref.endswith("/project")
-    assert result.undo_id
-    assert store.get_record(result.memory_id) is not None
-    assert store.list_rule_assignments(result.memory_id)[0].target_type == "agent_project"
+    assert result["definition_id"]
+    assert result["binding_id"]
+    assert result["undo_id"]
+    store = RuleV2Store(tmp_path)
+    definition = store.get_definition(result["definition_id"])
+    binding = next(item for item in store.list_bindings(definition_id=result["definition_id"]))
+    assert definition is not None and definition.status == "active"
+    assert binding.target_type == "agent_project"
+    assert binding.target_id == "a"
+    assert binding.project_ref.endswith("/project") or binding.project_ref.endswith("\\project")
 
-    undone = service.undo_rule(result.undo_id, context)
-    assert undone.status == "undone"
-    # v2 undo is a target-level inverse that soft-deletes the rule (history preserved),
-    # so the record survives with a DELETED status instead of vanishing from storage.
-    assert store.get_record(result.memory_id).status == SharedMemoryStatus.DELETED
+    undone = _data(_call(
+        port,
+        "memoryguard_rule_undo",
+        {"undo_id": result["undo_id"], "idempotency_key": "undo-a"},
+        context,
+    ))
+    assert undone["compensation"]["binding_status"] == "inactive"
+    assert store.get_definition(result["definition_id"]).status == "inactive"
 
 
 def test_agent_prefix_cannot_bypass_undo_owner(tmp_path):
-    """Undo ownership is exact: ``codex`` cannot undo ``codex-main``."""
-    store, owner_context = _setup(tmp_path, agent="codex-main")
-    service = RuleCreationService(tmp_path, "team", store=store)
-    created = service.create_rule_from_text(
-        "仅 codex-main 应遵循的规则", owner_context,
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    created = _data(_call(
+        port,
+        "memoryguard_rule_create_auto",
+        {"text": "仅 codex-main 应遵循的规则", "idempotency_key": "create-owner"},
+        _context(tmp_path, agent="codex-main"),
+    ))
+    denied = _call(
+        port,
+        "memoryguard_rule_undo",
+        {"undo_id": created["undo_id"], "idempotency_key": "undo-prefix"},
+        _context(tmp_path, agent="codex"),
     )
-    assert created.status == "created"
-
-    prefix_context = EffectiveAgentContext(
-        agent_instance_id="codex",
-        share_group_id="team",
-        project_ref=owner_context.project_ref,
-    )
-    denied = service.undo_rule(created.undo_id, prefix_context)
-    assert denied.status == "blocked"
-    assert denied.blocked_reason == "undo permission denied"
-    assert store.get_record(created.memory_id).status == SharedMemoryStatus.ACTIVE
+    assert denied["ok"] is False
+    assert denied["code"] == "rule_undo_owner_mismatch"
+    definition = RuleV2Store(tmp_path).get_definition(created["definition_id"])
+    assert definition is not None and definition.status == "active"
 
 
 def test_auto_scope_rejects_broad_or_other_agent_target(tmp_path):
-    store, context = _setup(tmp_path)
-    service = RuleCreationService(tmp_path, "team", store=store)
-
-    broad = service.create_rule_from_text(
-        "全局必须遵守", context,
-        requested_scope={"target_type": "group", "target_id": "team"},
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    context = _context(tmp_path)
+    broad = _call(
+        port,
+        "memoryguard_rule_create_auto",
+        {"text": "全局必须遵守", "scope": {"target_type": "group", "target_id": "team"}},
+        context,
     )
-    other = service.create_rule_from_text(
-        "他人规则", context,
-        requested_scope={"target_type": "agent", "target_id": "b"},
+    other = _call(
+        port,
+        "memoryguard_rule_create_auto",
+        {"text": "他人规则", "scope": {"target_type": "agent", "target_id": "b"}},
+        context,
     )
-
-    assert broad.status == "blocked"
-    assert "only agent or agent_project" in broad.blocked_reason
-    assert other.status == "blocked"
-    assert "trusted current agent" in other.blocked_reason
-    assert store.list_records() == []
+    assert broad["code"] == "automatic_scope_expansion_denied"
+    assert other["code"] == "other_agent_scope_denied"
+    assert RuleV2Store(tmp_path).list_definitions() == []
 
 
 def test_manual_broad_scope_requires_admin_and_is_audited(tmp_path):
-    store, context = _setup(tmp_path)
-    service = RuleCreationService(tmp_path, "team", store=store)
-
-    denied = service.create_rule_from_text(
-        "组规则", context,
-        requested_scope={"target_type": "group", "target_id": "team"},
-        manual=True,
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    denied = _call(
+        port,
+        "memoryguard_rule_create_auto",
+        {
+            "text": "组规则",
+            "scope": {"target_type": "group", "target_id": "team"},
+            "manual": True,
+            "idempotency_key": "manual-denied",
+        },
+        _context(tmp_path),
     )
-    assert denied.status == "blocked"
+    assert denied["code"] == "admin_scope_required"
 
-    accepted = service.create_rule_from_text(
-        "组规则", context,
-        requested_scope={"target_type": "group", "target_id": "team"},
-        manual=True,
-        is_admin=True,
-    )
-    assert accepted.status == "created"
-    assert store.list_rule_assignments(accepted.memory_id)[0].target_type == "group"
-    assert service.read_decision(accepted.decision_id).scope_reason == "explicit human-admin scope declaration"
+    accepted = _data(_call(
+        port,
+        "memoryguard_rule_create_auto",
+        {
+            "text": "组规则",
+            "scope": {"target_type": "group", "target_id": "team"},
+            "manual": True,
+            "idempotency_key": "manual-accepted",
+        },
+        _context(tmp_path, admin=True),
+    ))
+    store = RuleV2Store(tmp_path)
+    binding = next(item for item in store.list_bindings(definition_id=accepted["definition_id"]))
+    decision = store.get_decision(accepted["decision"]["decision_id"])
+    assert binding.target_type == "group"
+    assert decision is not None and '"manual":true' in decision["metadata_json"]

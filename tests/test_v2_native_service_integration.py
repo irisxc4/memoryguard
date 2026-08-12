@@ -5,12 +5,12 @@ import sys
 from pathlib import Path
 
 from memoryguard.access_context import AccessContext
-from memoryguard.agent_binding import AgentBindingStore, personal_group_id
 from memoryguard.cutover_v2.facade import V2RuntimeFacade
 from memoryguard.evidence import EvidenceStore
 from memoryguard.governance_v2 import V2MutationContext
 from memoryguard.gui import SafeBridgeApi
 from memoryguard.memory import MemoryAtom, MemoryAtomStore
+from memoryguard.runtime_v2.group_native import GroupControlService, personal_group_id as v2_personal_group_id
 from memoryguard.runtime_v2.native_ports import (
     NativeV2RuntimePort,
     bind_native_transport_context,
@@ -368,7 +368,7 @@ def test_goal_b_rule_mutations_are_native_and_ready_state_remains_write_blocked(
 
 
 def test_goal_b_enrichment_mutations_are_native_and_missing_schema_fails_closed(tmp_path: Path):
-    """Extraction/enrichment is V2-native and never falls back to legacy files."""
+    """Extraction/enrichment is V2-native and requires V2 schemas."""
     port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
     names = (
         "memoryguard_accept_candidates",
@@ -427,8 +427,8 @@ def test_goal_cli_native_and_retired_surfaces_are_explicit(tmp_path: Path):
     assert list(tmp_path.rglob("*")) == before
 
 
-def test_goal_gui_read_surfaces_are_native_or_explicitly_retired(tmp_path: Path):
-    """V2 GUI reads never depend on an implicit legacy fallback."""
+def test_goal_gui_read_surfaces_are_native(tmp_path: Path):
+    """V2 GUI reads resolve through native handlers without a fallback."""
     port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
     entries = {
         item["name"]: item
@@ -437,22 +437,16 @@ def test_goal_gui_read_surfaces_are_native_or_explicitly_retired(tmp_path: Path)
     implemented = (
         "get_storage_overview", "get_audit", "list_history",
         "list_rule_exceptions", "list_rule_match_receipts",
-        "get_rule_scope_options", "preview_effective_rules",
+        "get_rule_scope_options", "preview_effective_rules", "get_recent_events",
     )
     for name in implemented:
         assert entries[name]["status"] == "implemented"
         assert entries[name]["reason"] == ""
-    assert entries["get_recent_events"]["status"] == "retired"
-    assert entries["get_recent_events"]["reason"]
-
-    before = list(tmp_path.rglob("*"))
-    retired = port.dispatch_gui(
+    recent = port.dispatch_gui(
         "get_recent_events", {}, context=_context(tmp_path), generation=7,
     )
-    assert retired["ok"] is False
-    assert retired["status"] == "retired"
-    assert retired["code"] == "v2_operation_retired"
-    assert list(tmp_path.rglob("*")) == before
+    assert recent["ok"] is True, recent
+    assert isinstance(recent["data"].get("events"), list)
 
 
 def test_goal_gui_memory_history_reads_use_scoped_v2_revisions_and_edges(tmp_path: Path):
@@ -648,13 +642,13 @@ def test_phase9_list_scan_remain_mutation_gated_and_reject_ready_or_stale_genera
     assert stale["code"] == "manifest_generation_mismatch"
 
 
-def test_phase9_native_import_does_not_initialize_legacy_compat_module(tmp_path: Path):
+def test_phase9_native_import_is_lazy_and_does_not_initialize_storage(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     code = (
-        "import sys; from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort; "
-        f"NativeV2RuntimePort({str(tmp_path)!r}); "
-        "bad=sorted(k for k in sys.modules if k == 'memoryguard.compat_v2' "
-        "or k.startswith('memoryguard.compat_v2.')); assert not bad, bad"
+        "from pathlib import Path; "
+        "from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort; "
+        f"workspace=Path({str(tmp_path)!r}); NativeV2RuntimePort(workspace); "
+        "assert not (workspace / '.memoryguard').exists()"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -667,8 +661,8 @@ def test_phase9_native_import_does_not_initialize_legacy_compat_module(tmp_path:
 
 
 def test_phase9_safe_bridge_native_gui_aliases_use_bound_context_and_positional_shapes(tmp_path: Path):
-    group_id = personal_group_id("phase9-gui")
-    AgentBindingStore(tmp_path).bind_agent("phase9-gui", group_id)
+    group_id = v2_personal_group_id("phase9-gui")
+    GroupControlService(tmp_path, write=True).bind_agent("phase9-gui", group_id)
 
     manifest = _Manifest("V2_ACTIVE", 4)
     native = NativeV2RuntimePort(tmp_path, state_provider=manifest)
@@ -701,11 +695,11 @@ def test_phase9_safe_bridge_native_gui_aliases_use_bound_context_and_positional_
     preview = bridge.call_readonly("preview_import", [str(tmp_path)])
     assert preview["path"] == "v2"
     assert str(tmp_path) not in str(preview)
-    assert bridge._inner_instance is None
+    assert not hasattr(bridge, "_inner_instance")
 
 
 def test_phase9_safe_bridge_gui_spoof_is_rejected_and_delete_stays_mutation_gated(tmp_path: Path):
-    AgentBindingStore(tmp_path).bind_agent("phase9-agent", personal_group_id("phase9-agent"))
+    GroupControlService(tmp_path, write=True).bind_agent("phase9-agent", v2_personal_group_id("phase9-agent"))
     manifest = _Manifest("V2_ACTIVE", 4)
     native = NativeV2RuntimePort(tmp_path, state_provider=manifest)
     facade = V2RuntimeFacade(manifest=manifest, v2=native, workspace=str(tmp_path))

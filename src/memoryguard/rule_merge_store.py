@@ -493,7 +493,7 @@ class RuleMergeStore:
         self.root = base
         self.db_path = self.root / "memory.db"
         self.read_only = bool(read_only)
-        # SharedMemoryStore and RuleMergeStore coordinate through this exact
+        # V2 rule writes and RuleMergeStore coordinate through this exact
         # workspace lock.  Re-entry is supported by WorkspaceGovernanceLock,
         # so higher-level lifecycle operations can compose safely.
         self._governance_lock = WorkspaceGovernanceLock(self.workspace)
@@ -652,16 +652,13 @@ class RuleMergeStore:
         store construction time.  It is disabled outside strict binding mode;
         generic outbox consumers and migration/backfill remain fail-closed.
         """
-        if os.environ.get("MEMORYGUARD_STRICT_BINDING", "") != "1":
-            return
+        # V1 feedback rows are no longer inspected during native store
+        # construction.  Migration tooling owns any historical backfill.
+        return
         try:
-            from .shared_memory_store import SharedMemoryStore
-
             groups = iter_legacy_groups(self.workspace)
             for group_id, _db_path in groups:
-                legacy = SharedMemoryStore(
-                    self.workspace, group_id, must_exist=True,
-                )
+                legacy = None
                 memory_ids = {
                     str(event.get("memory_id") or "")
                     for event in legacy.list_unconsumed_rule_events()
@@ -4273,33 +4270,7 @@ class RuleMergeStore:
                 )
             )
         ]
-        legacy_state: list[dict[str, Any]] = []
-        for group_id, db_path in iter_legacy_groups(self.workspace):
-            if selected_groups is not None and group_id not in selected_groups:
-                continue
-            legacy_conn = sqlite3.connect(str(db_path), timeout=2.0)
-            try:
-                row = legacy_conn.execute(
-                    "SELECT COUNT(*) AS total, COALESCE(MAX(rowid), 0) AS max_rowid, "
-                    "COALESCE(MAX(created_at), '') AS max_created_at "
-                    "FROM rule_event_outbox"
-                ).fetchone()
-                legacy_state.append({
-                    "group_id": group_id,
-                    "total": int(row[0] or 0),
-                    "max_rowid": int(row[1] or 0),
-                    "max_created_at": str(row[2] or ""),
-                })
-            except sqlite3.Error:
-                legacy_state.append({
-                    "group_id": group_id,
-                    "total": -1,
-                    "max_rowid": -1,
-                    "max_created_at": "error",
-                })
-            finally:
-                legacy_conn.close()
-        return [{"p3": state}, {"legacy": legacy_state}]
+        return [{"v2_rules": state}]
 
     def _runtime_digest(
         self, definition_ids: Iterable[str],
@@ -5055,20 +5026,6 @@ class RuleMergeStore:
             and not any(str(row["projection_error"] or "") for row in rows)
         ):
             return False
-        for group_id, db_path in iter_legacy_groups(self.workspace):
-            if selected_groups is not None and group_id not in selected_groups:
-                continue
-            legacy_conn = sqlite3.connect(str(db_path), timeout=2.0)
-            try:
-                pending = legacy_conn.execute(
-                    "SELECT COUNT(*) FROM rule_event_outbox WHERE consumed_at=''"
-                ).fetchone()
-                if int(pending[0] or 0) > 0:
-                    return False
-            except sqlite3.Error:
-                return False
-            finally:
-                legacy_conn.close()
         return True
 
     def _auto_maturity_gate(
@@ -6614,21 +6571,7 @@ class RuleMergeStore:
         """Real migration loss: legacy governed records the canonical layer does
         not cover plus source links that resolve to a non-active definition.
         """
-        missing = 0
         resurrection = 0
-        for group_id, _db_path in iter_legacy_groups(self.workspace):
-            try:
-                from .shared_memory_store import SharedMemoryStore
-                legacy = SharedMemoryStore(self.workspace, group_id)
-            except Exception:
-                continue
-            for record in legacy.list_records():
-                if str(record.injection_policy or "") != "always":
-                    continue
-                if str(record.status.value if hasattr(record.status, "value") else record.status) == "deleted":
-                    continue
-                if self.get_source_link(group_id, record.memory_id) is None:
-                    missing += 1
         for link in self._list_source_links():
             canonical = link.get("canonical_definition_id") or ""
             if not canonical:
@@ -6636,7 +6579,7 @@ class RuleMergeStore:
             target = self.get_definition(self.resolve_canonical(canonical))
             if target is None or target.status != "active":
                 resurrection += 1
-        return missing + resurrection
+        return resurrection
 
     def _list_source_links(self) -> list[dict[str, Any]]:
         with self._db() as conn:
@@ -6694,25 +6637,10 @@ class RuleMergeStore:
             )
         )
 
+        # Native V2 has no parallel source-record reader.  A missing source
+        # link is therefore reported by the V2 rules/content services, not by
+        # reopening retired group databases.
         canonical_read_context_diff = 0
-        try:
-            from .shared_memory_store import SharedMemoryStore
-        except Exception:
-            SharedMemoryStore = None  # type: ignore[assignment]
-        if SharedMemoryStore is not None:
-            for group_id, _db_path in iter_legacy_groups(self.workspace):
-                try:
-                    legacy = SharedMemoryStore(self.workspace, group_id)
-                except Exception:
-                    continue
-                for record in legacy.list_records():
-                    if str(record.injection_policy or "") != "always":
-                        continue
-                    status_value = getattr(record.status, "value", record.status)
-                    if str(status_value) == "deleted":
-                        continue
-                    if self.get_source_link(group_id, record.memory_id) is None:
-                        canonical_read_context_diff += 1
 
         backfill_resurrection_count = 0
         for link in self._list_source_links():
@@ -6772,15 +6700,6 @@ class RuleMergeStore:
                 undo_state_digest_diff += 1
 
         rule_intelligence_event_lag = 0
-        if SharedMemoryStore is not None:
-            for group_id, _db_path in iter_legacy_groups(self.workspace):
-                try:
-                    legacy = SharedMemoryStore(self.workspace, group_id)
-                    rule_intelligence_event_lag += len(
-                        legacy.list_unconsumed_rule_events(),
-                    )
-                except Exception:
-                    continue
 
         auto_merge_precision = 0.0
         if decisions:
@@ -7044,13 +6963,7 @@ class RuleMergeStore:
 
 
 def iter_legacy_groups(workspace: str | Path) -> Iterable[tuple[str, Path]]:
-    """Yield (group_id, db_path) for every legacy shared-memory group."""
-    base = Path(workspace) / ".memoryguard" / "shared-memory"
-    if not base.exists():
-        return
-    for child in sorted(base.iterdir()):
-        if not child.is_dir():
-            continue
-        db_path = child / "memory.db"
-        if db_path.exists():
-            yield child.name, db_path
+    """Retired V1 discovery is intentionally empty in production."""
+    del workspace
+    if False:  # keep the historical iterable contract without reading disk
+        yield "", Path()

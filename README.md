@@ -36,11 +36,79 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.6.2
+## What's New in v0.7.0 (V2-only; local release acceptance passed)
 
-- **Python 3.10 SQLite correction:** Memory, Evidence, and Content schema preflights inspect a private copy of the SQLite main file plus any `-wal`/`-shm` companions. Older SQLite builds may checkpoint the temporary handle, but the live database remains byte-stable.
-- **Physical no-write verification:** schema preflight and its verification baseline keep older SQLite WAL checkpoint behavior away from the live database.
-- **No V2 behavior change:** the v0.6.0 production cutover, frozen-source migration, native routing, readiness gates, and explicit `memoryguard-v2` operator flow remain unchanged.
+v0.7.0 is V2-only. Local release acceptance passed; it is ready for
+commit/publish, not yet published. The boundary and evidence below describe the
+local acceptance result. The Graphify result is a real full-repository
+export/projection result, not a claim that upstream Graphify's full-repository
+test suite passed.
+
+- **V1 runtime physically retired:** production entrypoint import closure has no
+  V1 runtime/store modules. `V1_ACTIVE` is a migration starting state, not a
+  runnable fallback. Legacy formats are readable only under
+  `memoryguard.migration`; every other entrypoint fails closed with
+  `v2_upgrade_required`. V1 data and migration backups remain rollback/audit
+  evidence, never V2 runtime write targets.
+- **V2 control planes:** Memory, Evidence, History, Source, Binding, and Group
+  are V2-native boundaries. Memory atoms and evidence/decision receipts are
+  separate from raw conversation History; authorized Source files/folders are
+  separate from runtime state; trusted Agent Bindings select the governing
+  Group.
+- **Canonical governance:** canonical reconciliation folds rules into
+  `shared_baseline`, `agent_overlay`, and `project_overlay` bundles, keeps
+  durable source links, verifies parity, activates the canonical read path,
+  then shadows old duplicates for recovery. V2 automatic organization performs
+  exact/semantic duplicate detection inside one share group and records
+  deduplicated, superseded, conflicted, or quarantined outcomes. Rule duplicate
+  scans produce governed merge proposals; merge and supersede decisions keep
+  evidence, scope, idempotency, and undo receipts.
+- **Cross-agent same-group governance:** all members of one trusted
+  `share_group_id` participate in the same bounded candidate and governance
+  view; another group cannot enter it. Agent identity remains in provenance.
+- **Knowledge files and folders:** a selected folder becomes a governed book and
+  selected files become traceable documents. Content Plane owns source bodies;
+  Knowledge stores metadata/references, supports re-ingest, remove/restore/
+  purge, and requires explicit review before memory candidates are accepted.
+- **GUI Agent and Group control:** the native GUI discovers Agent names and
+  instances, records source selections, lists bindings, binds members to shared
+  or personal groups, checks drift, and can leave or dissolve a group. Group
+  changes commit receipts and system outbox events transactionally.
+- **GUI builds and process cleanup:** projection, Knowledge, import, history,
+  maintenance, release, and compatibility work use durable V2 `TaskRun`
+  status. Status survives reload, cancellation is cooperative and bounded, and
+  owned background workers/process cleanup must finish before shutdown.
+- **CodeGraph / Graphify:** Graphify contributes a trusted, body-free metadata
+  export only. CodeGraph preserves source role, provenance, source maps,
+  revisions, tombstones, and outbox state, and exposes bounded
+  query/path/explain/affected operations with production-only filtering.
+- **Security and rollback:** unknown/corrupt state, missing scope, invalid
+  provenance, reparse paths, unsafe metadata, and stale idempotency fail closed.
+  Public receipts redact source bodies and paths; governance/audit/outbox
+  records retain decisions. Release rollback restores a Content Plane blob and
+  held occurrence through a scoped receipt rather than trusting an unbound
+  backup path.
+- **Local release acceptance evidence:** `1761 / 1761`, with no skip or xfail;
+  V1 retirement + CodeGraph `15 / 15`; Graphify focused checks `3 / 3`;
+  canonical reconciliation `ACCEPTED`; RuleMerge `46 / 46`; v3.2 `27 / 27`.
+  The real full-repository Graphify export/projection covered `486 files / 11672
+  nodes / 38714 edges → 11667 canonical symbols / 38714 edges`; query/path/
+  affected passed and failure atomicity was `0` throughout.
+- **Final packaging evidence:** clean wheel `206 files`, `legacy bad=0`;
+  isolated package, CLI, and MCP all reported `0.7.0`; desktop help passed.
+
+Local release acceptance passed. v0.7.0 is ready for commit/publish, not yet
+published. These Graphify results cover the focused checks and the real
+full-repository export/projection only; they do not claim upstream Graphify's
+full-repository tests passed. See [the v0.7.0 release record](docs/releases/v0.7.0.md).
+
+### v0.6.2 compatibility baseline
+
+The Python 3.10 SQLite correction remains part of the v0.7.0 upgrade baseline:
+Memory, Evidence, and Content schema preflights inspect a private copy of the
+SQLite main file plus `-wal`/`-shm` companions, and physical no-write checks do
+not observe or checkpoint the live database. The historical release note is
+preserved at [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md).
 
 ## Major V2 refactor in v0.6.0
 
@@ -207,10 +275,41 @@ If you installed the GUI extra, keep it during the upgrade:
 python -m pip install --upgrade "agent-memguard[gui]"
 ```
 
-There is no separate `memoryguard update` self-update command yet. The package
-manager is the authoritative package-upgrade path.
+There is no package self-update command. The package manager is the
+authoritative package-upgrade path; `memoryguard upgrade` below is the explicit
+workspace migration flow, not a package updater.
 
-### Existing v0.5.x workspaces: explicit V2 cutover
+### Upgrade from v0.6.2: explicit V2-only migration
+
+Upgrade the package first, then preview the workspace migration. Preview is
+zero-write and must report `status=PREVIEW` with `writes_performed=false`:
+
+```bash
+python -m pip install --upgrade agent-memguard
+memoryguard --version                    # 0.7.0
+memoryguard upgrade --workspace .        # read-only preview
+```
+
+If v0.6.2 used a separate user data home, pass the same explicit
+`--data-home <path>` to each `memoryguard upgrade` invocation. Apply in two
+stages:
+
+```bash
+memoryguard upgrade --workspace . --apply
+# require: status=V2_READY, activation_required=true
+memoryguard upgrade --workspace . --apply --confirm V2_ACTIVE
+memoryguard doctor
+```
+
+`--apply` reads legacy input only through `memoryguard.migration`, builds the
+V2 shadow, migrates Agent/Group control records, validates frozen-source and
+live-source evidence, and stops at `V2_READY`. Activation requires the exact
+`V2_ACTIVE` confirmation and a fresh drift check. A failed control or validation
+stage stays non-active; it must not silently fall back or activate. Keep V1
+data, migration backups, receipts, and audit evidence until the release gate
+explicitly permits cleanup. Re-running an active upgrade is idempotent.
+
+### Existing pre-V2 workspaces: explicit V2 cutover
 
 v0.6.0 never auto-activates an existing workspace. Upgrade the package first,
 then use the packaged operator CLI:
@@ -233,14 +332,15 @@ legacy V1 data or migration backups as part of the upgrade.
 
 ## Knowledge Library
 
-The desktop console can turn a selected folder into one governed local
-knowledge library. Source files remain where they are; MemoryGuard stores the
-searchable index in its user data home instead of copying a runtime database
-into every source project.
+The desktop console can turn a selected folder or file set into one governed
+local knowledge library. Source files remain where they are; MemoryGuard stores
+the searchable index in its user data home instead of copying a runtime
+database into every source project. Knowledge metadata never becomes a second
+source-body store.
 
 | Capability | Current behavior |
 |---|---|
-| Folder ingestion | Add a folder as a book and ingest supported files as documents |
+| File/folder ingestion | Add a folder as a book or selected files as documents |
 | Structure | Parse documents, preserve chapter/section context, and create traceable chunks |
 | Retrieval | Full-text search, optional embeddings, and a layered knowledge graph |
 | Natural synchronization | Re-ingest changed files; a partial or failed scan does not silently remove previously indexed content |
@@ -431,9 +531,10 @@ Evidence remains traceable without being treated as automatically trusted memory
   knowledge database.
 - V2 authoritative workspace state is separated under `.memoryguard/` into
   explicit Memory, Rules, Evidence, Content, Runtime, Projection, Assets,
-  CodeGraph, Skills, and System domains. Legacy V1 artifacts are preserved as
-  local rollback/audit evidence after cutover and are no longer the active V2
-  runtime write path.
+  CodeGraph, Skills, and System domains; History, Source, Binding, and Group
+  control are V2-native surfaces. Legacy V1 artifacts are preserved as local
+  rollback/audit evidence after cutover and are no longer the active V2 runtime
+  write path; only `memoryguard.migration` may read them.
 - Source scanning is read-only by default.
 - Mutating governance paths use validation, explicit scope, provenance, and
   reversible state.
@@ -463,9 +564,11 @@ The installed `memoryguard` command exposes these top-level operations:
 | `gui [path]` | Launch the interactive governance console |
 | `desktop` | Launch the trusted desktop executor |
 
-The old V1 `plan`, `apply`, `verify`, `undo`, `import`, and `gc` workflows remain
-parseable for compatibility but are explicitly retired under `V2_ACTIVE`; they
-return a stable retired result instead of writing through a legacy store.
+The old V1 `plan`, `apply`, `verify`, `undo`, `import`, and `gc` workflows may
+remain parseable as explicit retired compatibility surfaces, but are not a V1
+runtime path. Under `V2_ACTIVE` they return a stable retired result instead of
+writing through a legacy store. Legacy data input is accepted only by the
+explicit `memoryguard.migration` upgrade flow.
 
 Run `memoryguard --help` or `memoryguard <command> --help` for the live command
 reference.
@@ -493,6 +596,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.0 release gate](docs/releases/v0.7.0.md)
 - [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Contributor License Agreement](CLA.md)
@@ -500,14 +604,17 @@ the installed version.
 
 ## Roadmap
 
-- **Current:** production-active V2 data plane, frozen-source migration and
-  cutover, native MCP/CLI/GUI/Hook routing, scoped Memory/Rules, Content/Evidence,
-  conversation archives, provider adapters, Reference Audit, maintenance, and
-  governance UI.
-- **Next:** richer scenario/profile projections, broader CodeGraph/Skills
-  ingestion, more operator-friendly maintenance reports, and additional
-  migration observability. Long-term records are not retired merely because
-  they are old.
+- **Current release line:** V2-only runtime boundary plus product-facing GUI
+  Agent/Group control, durable TaskRun lifecycle, native governance/release
+  flows, Knowledge file/folder ingestion, and trusted-scope CodeGraph
+  query/path/explain/affected metadata projection. Local release acceptance
+  passed; v0.7.0 is ready for commit/publish, not yet published.
+- **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result
+  plus the real full-repository export/projection described above. It does not
+  claim that upstream Graphify's full-repository test suite passed.
+- **Next after release:** broader CodeGraph/Skills ingestion, more operator-friendly
+  maintenance reports, and additional migration observability. Long-term records
+  are not retired merely because they are old.
 - **Later:** team and enterprise capabilities only after validated demand.
 
 ## Contributing

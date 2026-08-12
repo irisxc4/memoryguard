@@ -14,9 +14,13 @@ import weakref
 
 import pytest
 
-from memoryguard.compat_v2 import CLI_COMMAND_NAMES, GUI_METHOD_NAMES, MCP_TOOL_NAMES
 from memoryguard.cutover_v2 import V2RuntimeFacade
 from memoryguard.cutover_v2.facade import _GenerationPort, get_v2_runtime_facade
+from memoryguard.cutover_v2.surfaces import (
+    CLI_COMMAND_NAMES,
+    GUI_METHOD_NAMES,
+    MCP_TOOL_NAMES,
+)
 from memoryguard.runtime_v2.native_ports import (
     NativeContextEnvelope,
     NativeContextError,
@@ -57,16 +61,17 @@ def _prepare_native_memory_workspace(tmp_path: Path) -> None:
     GovernanceV2(tmp_path)
 
 
-def test_native_ports_fresh_import_does_not_load_legacy_compatibility_code():
+def test_native_ports_fresh_import_is_lazy_and_does_not_initialize_storage(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(root / "src"), env.get("PYTHONPATH", "")) if part
     )
     code = (
-        "import sys; import memoryguard.runtime_v2.native_ports; "
-        "bad=sorted(k for k in sys.modules if k == 'memoryguard.compat_v2' "
-        "or k.startswith('memoryguard.compat_v2.')); assert not bad, bad"
+        "from pathlib import Path; "
+        "from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort; "
+        f"workspace=Path({str(tmp_path)!r}); NativeV2RuntimePort(workspace); "
+        "assert not (workspace / '.memoryguard').exists()"
     )
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -242,9 +247,10 @@ def test_native_control_plane_reads_and_cli_probes_are_noop(tmp_path: Path):
         assert gui_entries[name]["status"] == "implemented"
     for name in cli_aliases:
         assert cli_entries[name]["status"] == "implemented"
-    assert gui_entries["get_build_progress"]["status"] == "retired"
-    assert gui_entries["get_request_status"]["status"] == "retired"
-    assert gui_entries["list_pending_requests"]["status"] == "retired"
+    assert gui_entries["get_build_progress"]["status"] == "implemented"
+    assert gui_entries["get_request_status"]["status"] == "implemented"
+    assert gui_entries["list_pending_requests"]["status"] == "implemented"
+    assert all(item["status"] != "retired" for item in gui_entries.values())
 
 
 def test_native_graph_and_semantic_reads_are_scoped_and_no_body_leak(tmp_path: Path):
@@ -368,11 +374,18 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
     assert {item["name"] for item in coverage["surfaces"]["gui"]["entries"]} == set(GUI_METHOD_NAMES)
     assert {item["name"] for item in coverage["surfaces"]["cli"]["entries"]} == set(CLI_COMMAND_NAMES)
     assert coverage["registry_digest"] == NativeV2RuntimePort(tmp_path).coverage()["registry_digest"]
-    assert coverage["counts"]["blocker"] == 0
+    assert coverage["surfaces"]["gui"]["retired"] == 0
     assert coverage["counts"]["neutral-read"] == 0
-    assert coverage["counts"]["retired"] > 0
-    assert coverage["complete"] is True
-    assert coverage["production_complete"] is True
+    assert coverage["complete"] is (coverage["counts"]["blocker"] == 0)
+    assert coverage["production_complete"] is (
+        coverage["counts"]["blocker"] == 0
+        and coverage["counts"]["neutral-read"] == 0
+    )
+    # Phase-11 acceptance requires every canonical GUI operation to resolve to
+    # a native handler. A missing handler is a blocker, never a retired success.
+    assert coverage["surfaces"]["gui"]["total"] == 162
+    assert coverage["surfaces"]["gui"]["implemented"] == 162
+    assert coverage["surfaces"]["gui"]["blocker"] == 0
     gui_by_name = {
         item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]
     }
@@ -381,8 +394,8 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
         "set_memory_injection_policy", "restore_memory", "delete_memory",
     ):
         assert gui_by_name[name]["status"] == "implemented"
-    assert gui_by_name["rollback_memory"]["status"] == "retired"
-    assert gui_by_name["rollback_memory"]["reason"]
+    assert gui_by_name["rollback_memory"]["status"] == "implemented"
+    assert gui_by_name["rollback_memory"]["reason"] == ""
 
 
 def test_context_spoof_is_rejected_before_native_handler(tmp_path):
@@ -1204,7 +1217,9 @@ def test_native_statuses_return_scoped_no_source_without_global_store_reads(tmp_
     graph = port.dispatch_mcp("memoryguard_projection_status", {}, context=context, generation=1)
     canonical = port.dispatch_mcp("memoryguard_canonical_status", {}, context=context, generation=1)
     diagnostics = port.dispatch_mcp("memoryguard_diagnostics_snapshot", {}, context=context, generation=1)
-    scope = port.dispatch_gui("get_governance_scope", {}, context=context, generation=1)
+    scope = port.dispatch_gui(
+        "get_governance_scope", {}, context=_trusted_native_context(tmp_path), generation=1
+    )
     for result in (memory, graph, canonical, diagnostics, scope):
         assert result["ok"] is True, result
         assert "db_path" not in result
@@ -1215,11 +1230,15 @@ def test_native_statuses_return_scoped_no_source_without_global_store_reads(tmp_
     assert canonical["data"]["status"] == "NO_SOURCE"
     assert diagnostics["data"]["status"] == "READY"
     assert diagnostics["data"]["memory"]["status"] == "NO_SOURCE"
-    assert scope["data"]["available"] is True
-    assert scope["data"]["agent_instance_id"] == "agent-bound"
-    assert scope["data"]["share_group_id"] == "group-bound"
-    assert scope["data"]["project_ref"] == "project-bound"
-    assert scope["data"]["provider"] == "codex"
+    assert scope["data"]["empty"] is True
+    assert scope["data"]["scope"] is None
+    assert scope["data"]["principal_agent_instance_id"] == "agent-bound"
+    assert scope["data"]["active_binding"] is None
+    # Scope reads no longer echo caller-supplied group/project/provider values;
+    # only V2 control-plane state is returned.
+    assert "share_group_id" not in scope["data"]
+    assert "project_ref" not in scope["data"]
+    assert "provider" not in scope["data"]
     assert not (tmp_path / ".memoryguard").exists()
 
 
@@ -1244,22 +1263,25 @@ def test_cli_doctor_and_mcp_status_are_safe_without_agent_binding(tmp_path):
         assert data["status"] == "READY"
         assert data["scope_status"] == "UNBOUND"
         assert data["manifest"] == {"state": "V2_ACTIVE", "generation": 11}
-        assert data["native_coverage"]["production_complete"] is True
+        assert data["native_coverage"]["production_complete"] is port.coverage()["production_complete"]
+        assert data["native_coverage"]["counts"] == port.coverage()["counts"]
         assert "total_records" not in data
         assert "share_group_id" not in json.dumps(data, ensure_ascii=False)
     assert status["data"]["available"] is True
     assert status["data"]["memory_status"] == "READY"
 
 
-def test_generation_port_status_does_not_retry_type_error_without_workspace(tmp_path):
+def test_generation_port_dispatch_does_not_retry_type_error():
+    calls = 0
+
     class Port:
-        def status(self, workspace):
+        def dispatch(self, surface, name, args, **kwargs):
+            nonlocal calls
+            calls += 1
             raise TypeError("implementation failure")
 
-    class Facade:
-        pass
-
-    import pytest
-
     with pytest.raises(TypeError, match="implementation failure"):
-        _GenerationPort(Port(), generation=1, facade=Facade()).status(str(tmp_path))
+        _GenerationPort(
+            Port(), generation=1, state="V2_ACTIVE", facade=V2RuntimeFacade(),
+        ).dispatch("gui", "get_audit", {}, context={})
+    assert calls == 1

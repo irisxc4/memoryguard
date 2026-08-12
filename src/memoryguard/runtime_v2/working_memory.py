@@ -83,6 +83,8 @@ _ALLOWED_SCALAR_KEYS = frozenset(
         "provider", "provider_id", "output_hash", "response_digest",
     }
 )
+_CONTROL_VALUE_KEYS = frozenset({"task_type", "stage", "operation", "event_type", "code"})
+_CONTROL_VALUE_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_.:-")
 
 
 class RuntimeV2Error(RuntimeError):
@@ -207,6 +209,16 @@ def _safe_json(value: Mapping[str, Any] | None, *, label: str) -> dict[str, Any]
         if type(item) is str:
             if len(item.encode("utf-8")) > 4096 or "\r" in item or "\n" in item:
                 raise RuntimeV2Error(f"{label} contains an unbounded string at {path}")
+            leaf = _norm_key(path.rsplit(".", 1)[-1].split("[", 1)[0])
+            if leaf in _CONTROL_VALUE_KEYS:
+                normalized_control = item.strip().lower()
+                if (
+                    not normalized_control
+                    or len(normalized_control.encode("utf-8")) > 256
+                    or any(char not in _CONTROL_VALUE_CHARS for char in normalized_control)
+                ):
+                    raise RuntimeV2Error(f"{label} contains invalid control metadata at {path}")
+                return normalized_control
             if _forbidden_text(item):
                 raise RuntimeV2Error(f"{label} contains forbidden raw/control content at {path}")
             return item
@@ -720,7 +732,11 @@ class RuntimeStore:
     ) -> TaskRun:
         self._require_mutation(mutation)
         run_id_text = _scalar_text(run_id, label="run_id")
-        task_type_text = _scalar_text(task_type, label="task_type")
+        # ``task_type`` is server-selected control metadata (for example
+        # ``history_backfill`` or ``content_import``), not user/source body.
+        # Token-based body filtering here rejected legitimate canonical task
+        # names and made durable GUI task routing impossible.
+        task_type_text = _scalar_text(task_type, label="task_type", reject_content=False)
         safe_goal = _scalar_text(goal, label="goal", max_bytes=16 * 1024)
         importance_value = _scalar_int(importance, label="importance")
         requested_by_text = _scalar_text(requested_by, label="requested_by", default="")
@@ -1262,6 +1278,96 @@ class RuntimeStore:
             nodes = tuple(self._node_from_row(conn, item) for item in conn.execute("SELECT * FROM task_nodes WHERE run_id=? ORDER BY node_id", (run_id_text,)).fetchall())
             checkpoints = tuple(self._checkpoint_from_row(item) for item in conn.execute("SELECT * FROM working_checkpoints WHERE run_id=? ORDER BY created_at,checkpoint_id", (run_id_text,)).fetchall())
             return self._run_from_row(row), nodes, checkpoints
+
+    def get_run(self, run_id: str, scope: RuntimeScope) -> TaskRun | None:
+        """Return one scoped task run without exposing another runtime scope."""
+        loaded = self.load(run_id, scope)
+        return loaded[0] if loaded is not None else None
+
+    def run_result_ref(self, run_id: str, scope: RuntimeScope) -> dict[str, Any]:
+        """Return the latest run-level transition result reference.
+
+        Run results live in immutable task events rather than duplicating a
+        mutable result column on ``task_runs``.  This read reconstructs the
+        terminal/current result without creating any runtime state.
+        """
+        if not self._scope_ok(scope) or not self.db_path.is_file():
+            return {}
+        run_id_text = _scalar_text(run_id, label="run_id")
+        with self.connection() as conn:
+            if self._run_row(conn, run_id_text, scope) is None:
+                return {}
+            rows = conn.execute(
+                "SELECT payload_json FROM task_events WHERE run_id=? AND node_id IS NULL "
+                "AND event_type='run_transition' ORDER BY event_seq DESC LIMIT 1",
+                (run_id_text,),
+            ).fetchone()
+        if rows is None:
+            return {}
+        try:
+            payload = json.loads(str(rows[0] or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        result = payload.get("result_ref") if isinstance(payload, Mapping) else None
+        return dict(result) if isinstance(result, Mapping) else {}
+
+    def latest_checkpoint(
+        self,
+        run_id: str,
+        scope: RuntimeScope,
+        *,
+        checkpoint_key: str = "progress",
+    ) -> WorkingCheckpoint | None:
+        """Return the latest scoped checkpoint for status/progress recovery."""
+        if not self._scope_ok(scope) or not self.db_path.is_file():
+            return None
+        run_id_text = _scalar_text(run_id, label="run_id")
+        key = _scalar_text(checkpoint_key, label="checkpoint_key")
+        with self.connection() as conn:
+            if self._run_row(conn, run_id_text, scope) is None:
+                return None
+            row = conn.execute(
+                "SELECT * FROM working_checkpoints WHERE run_id=? AND node_id IS NULL "
+                "AND checkpoint_key=? ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
+                (run_id_text, key),
+            ).fetchone()
+            return self._checkpoint_from_row(row) if row is not None else None
+
+    def list_runs(
+        self,
+        scope: RuntimeScope,
+        *,
+        states: Sequence[str] = (),
+        task_types: Sequence[str] = (),
+        limit: int = 100,
+    ) -> tuple[TaskRun, ...]:
+        """List scoped runs in deterministic newest-first order."""
+        if not self._scope_ok(scope) or not self.db_path.is_file():
+            return ()
+        bounded = max(1, min(_scalar_int(limit, label="limit", minimum=1, maximum=2**31 - 1), _MAX_PAGE_SIZE))
+        normalized_states = tuple(_scalar_text(item, label="state") for item in states)
+        normalized_types = tuple(_scalar_text(item, label="task_type") for item in task_types)
+        if any(item not in _RUN_STATES for item in normalized_states):
+            raise RuntimeV2Error("unknown runtime state filter")
+        clauses = [
+            "workspace_id=?", "agent_instance_id=?", "project_ref=?",
+            "share_group_id=?", "provider=?", "runtime_scope=?",
+        ]
+        params: list[Any] = list(scope.as_tuple())
+        if normalized_states:
+            clauses.append("state IN (" + ",".join("?" for _ in normalized_states) + ")")
+            params.extend(normalized_states)
+        if normalized_types:
+            clauses.append("task_type IN (" + ",".join("?" for _ in normalized_types) + ")")
+            params.extend(normalized_types)
+        params.append(bounded)
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM task_runs WHERE " + " AND ".join(clauses)
+                + " ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                tuple(params),
+            ).fetchall()
+            return tuple(self._run_from_row(row) for row in rows)
 
     def list_nodes(self, run_id: str, scope: RuntimeScope, *, limit: int = 100, cursor: str | None = None) -> tuple[tuple[TaskNode, ...], str | None]:
         if not self._scope_ok(scope):

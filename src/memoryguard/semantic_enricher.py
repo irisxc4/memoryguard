@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .policies import _VALID_KINDS, classify_kind
+from .runtime_v2.text_native import looks_english_text
 from .schema_v3 import MemoryKind
 
 
@@ -61,6 +62,48 @@ def _heuristic_confidence(content: str, kind: MemoryKind) -> float:
     return max(0.1, min(0.95, score))
 
 
+_KIND_LABELS = {
+    MemoryKind.FACT: "事实",
+    MemoryKind.PREFERENCE: "偏好",
+    MemoryKind.PROJECT: "项目",
+    MemoryKind.EPISODE: "事件",
+    MemoryKind.PROCEDURE: "流程",
+    MemoryKind.CORRECTION: "纠错",
+}
+
+
+def _compact_english_snippet(text: str, limit: int) -> str:
+    replacements = {
+        "memory": "记忆", "project": "项目", "preference": "偏好",
+        "rule": "规则", "workflow": "流程", "procedure": "流程",
+        "constraint": "约束", "fact": "事实", "use": "使用",
+        "should": "应", "must": "必须", "avoid": "避免", "file": "文件",
+        "files": "文件", "folder": "文件夹", "source": "来源", "truth": "事实依据",
+        "agent": "智能体", "global": "全局", "local": "本地", "compact": "简洁",
+    }
+    words = " ".join(str(text or "").replace("\n", " ").split())[:limit].split()
+    return " ".join(
+        replacements.get(word.strip(".,:;()[]{}\"'").lower(), word)
+        for word in words[:36]
+    ).strip()
+
+
+def _localize_memory_text(
+    title: str, body: str, kind: MemoryKind,
+) -> tuple[str, str, str, str, str, str]:
+    if not looks_english_text(title + " " + body):
+        return title, body, title, body, "zh", "none"
+    label = _KIND_LABELS.get(kind, "记忆")
+    return (
+        f"{label}：{_compact_english_snippet(title or body, 72)}",
+        _compact_english_snippet(body or title, 420),
+        title,
+        body,
+        "mixed",
+        "heuristic",
+    )
+
+
 class HeuristicEnricher:
     """默认：classify + localize_memory_text；不调外部模型。"""
 
@@ -75,11 +118,9 @@ class HeuristicEnricher:
         metadata: dict | None = None,
     ) -> EnrichmentResult:
         del metadata
-        from .memory_ir import localize_memory_text
-
         kind_str = _resolve_kind(title, body, kind_hint)
         kind = MemoryKind(kind_str)
-        zh_title, zh_body, _, _, disp_lang, loc_mode = localize_memory_text(title, body, kind)
+        zh_title, zh_body, _, _, disp_lang, loc_mode = _localize_memory_text(title, body, kind)
         content = body or title
         return EnrichmentResult(
             kind=kind_str,
@@ -108,8 +149,6 @@ class PassthroughEnricher:
         metadata: dict | None = None,
     ) -> EnrichmentResult:
         del metadata
-        from .memory_ir import looks_english_text
-
         kind_str = _resolve_kind(title, body, kind_hint)
         combined = f"{title} {body}".strip()
         disp_lang = "mixed" if looks_english_text(combined) else "zh"
@@ -204,8 +243,6 @@ class ModelEnricher:
         metadata: dict | None = None,
     ) -> EnrichmentResult:
         del metadata
-        from .memory_ir import localize_memory_text, looks_english_text
-
         # 无 backend:回退 heuristic
         if self._backend is None:
             result = self._fallback.enrich(
@@ -244,7 +281,7 @@ class ModelEnricher:
                 zh_body = zh_body_raw if isinstance(zh_body_raw, str) and zh_body_raw else body
                 loc_mode = "model"
             except Exception:
-                zh_title, zh_body, _, _, disp_lang, loc_mode = localize_memory_text(
+                zh_title, zh_body, _, _, disp_lang, loc_mode = _localize_memory_text(
                     title, body, kind)
                 return EnrichmentResult(
                     kind=kind_str, title=zh_title, body=zh_body,
@@ -255,7 +292,7 @@ class ModelEnricher:
                     enrichment_mode="heuristic",
                 )
         else:
-            zh_title, zh_body, _, _, disp_lang, loc_mode = localize_memory_text(
+            zh_title, zh_body, _, _, disp_lang, loc_mode = _localize_memory_text(
                 title, body, kind)
 
         return EnrichmentResult(
@@ -317,7 +354,6 @@ class ProviderModelBackend:
 
     def _fallback_classify(self, title, body, kind_hint):
         """heuristic 回退。"""
-        from .memory_ir import localize_memory_text, looks_english_text
         kind_str = _resolve_kind(title, body, kind_hint)
         return (kind_str, 0.5)
 

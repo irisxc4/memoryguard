@@ -3,20 +3,165 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import inspect
+import re
 import threading
 from typing import Any, Mapping
 
-from ..compat_v2 import LegacyV2Adapter
-from ..compat_v2.legacy_adapter import (
-    LegacyV2Adapter as _LegacyV2AdapterClassifier,
-    safe_error_code,
-    safe_exception_diagnostic,
-    sanitize_public_payload,
-)
 from .ports import RuntimePorts
 from .readiness import ReadinessGate
 from .state import CutoverState, RuntimeSnapshot, snapshot_from_port
+from .surfaces import (
+    CLI_COMMAND_NAMES,
+    GUI_METHOD_NAMES,
+    GUI_MUTATION_NAMES,
+    MCP_MUTATION_NAMES,
+    MCP_TOOL_NAMES,
+)
+
+
+_SAFE_CODE_RE = re.compile(r"^[a-z][a-z0-9_.-]*(?::[a-z0-9_.-]+(?:,[a-z0-9_.-]+)*)?$")
+_ERROR_KEYS = frozenset({"error", "detail", "exception", "traceback", "sql", "query"})
+_PATH_KEYS = frozenset({"workspace", "source_path", "absolute_path", "canonical_store_path"})
+
+
+def safe_error_code(value: Any, fallback: str = "operation_failed") -> str:
+    """Return a stable public code without reflecting arbitrary error text."""
+
+    candidate = str(value or "").strip().casefold()
+    if len(candidate) <= 128 and _SAFE_CODE_RE.fullmatch(candidate):
+        return candidate
+    return str(fallback or "operation_failed")
+
+
+def safe_exception_diagnostic(exc: BaseException, *, code: str) -> dict[str, str]:
+    """Expose only exception type and a non-reversible diagnostic hash."""
+
+    typename = type(exc).__name__ or "Exception"
+    digest = hashlib.sha256(
+        f"{typename}\x00{str(exc)}".encode("utf-8", "replace"),
+    ).hexdigest()[:16]
+    return {"type": typename, "hash": digest, "code": safe_error_code(code)}
+
+
+def sanitize_public_payload(value: Any, *, error_code: str = "operation_failed") -> Any:
+    """Redact public error/path fields while preserving safe data."""
+
+    if isinstance(value, Mapping):
+        output: dict[str, Any] = {}
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
+            lowered = key.casefold()
+            if lowered in _ERROR_KEYS:
+                if lowered == "error":
+                    output[key] = safe_error_code(raw_value, error_code)
+                continue
+            if lowered == "code":
+                output[key] = safe_error_code(raw_value, error_code)
+                continue
+            if lowered in _PATH_KEYS:
+                output[key] = "<redacted>"
+                continue
+            if lowered == "path" and isinstance(raw_value, str):
+                if raw_value.startswith(("/", "\\")) or (len(raw_value) > 2 and raw_value[1] == ":"):
+                    output[key] = "<redacted>"
+                    continue
+            output[key] = sanitize_public_payload(raw_value, error_code=error_code)
+        return output
+    if isinstance(value, (list, tuple)):
+        return [sanitize_public_payload(item, error_code=error_code) for item in value]
+    return value
+
+
+def _args_mapping(args: Any) -> dict[str, Any]:
+    if args is None:
+        return {}
+    if isinstance(args, Mapping):
+        return dict(args)
+    if isinstance(args, (list, tuple)):
+        return {"args": list(args)}
+    namespace = vars(args) if hasattr(args, "__dict__") else None
+    if isinstance(namespace, dict):
+        payload = dict(namespace)
+        payload.pop("func", None)
+        return payload
+    raise ValueError("invalid_cli_arguments")
+
+
+def _flag(value: Any) -> bool:
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return value == 1
+    return False
+
+
+def _cli_is_mutation(command: str, args: Any) -> bool:
+    """Classify CLI writes from command and parser sub-action."""
+
+    command = str(command or "").casefold()
+    try:
+        payload = _args_mapping(args)
+    except Exception:
+        return True
+    boolean_keys = {
+        "apply", "dry_run", "archive_source", "auto_confirm", "watch",
+        "register_uri", "force", "yes", "confirmed",
+    }
+    for key in boolean_keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None or type(value) is bool or (type(value) is int and value in (0, 1)):
+            continue
+        return True
+    if command in {"apply", "undo"}:
+        return True
+    values: list[str] = []
+    for key in ("action", "subcommand", "operation", "mode", "command"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            values.append(value.casefold())
+    raw_args = payload.get("args")
+    if isinstance(raw_args, (list, tuple)):
+        values.extend(str(item).casefold() for item in raw_args if isinstance(item, str))
+    if command == "groups":
+        if not any(key in payload for key in ("action", "subcommand", "operation")):
+            return True
+        if _flag(payload.get("apply")):
+            return True
+        if "migrate" in values or "list" in values:
+            return False
+        return True
+    if command == "source":
+        return not values or not any(value in {"list", "preview"} for value in values)
+    if command == "import":
+        return not values or "preview" not in values
+    if command == "provider":
+        return True
+    if command == "hooks":
+        return not values or "status" not in values
+    if command == "gc":
+        if "apply" in payload:
+            value = payload.get("apply")
+            if _flag(value):
+                return True
+            if value not in (None, False, 0, "0"):
+                return True
+        return "apply" in values
+    if command == "storage":
+        if not values:
+            return True
+        if any(value in {"audit", "report"} for value in values):
+            return False
+        if "compact" in values:
+            value = payload.get("apply")
+            return _flag(value) if value is not None else "apply" in values
+        return True
+    if command == "desktop":
+        return True
+    return False
 
 
 def _safe_dict(value: Any) -> Any:
@@ -45,37 +190,6 @@ class _GenerationPort:
         self.facade = facade
         self.supports_rule_mutation_context = getattr(port, "supports_rule_mutation_context", None)
 
-    def status(self, workspace: str = "") -> Any:
-        # LegacyV2Adapter never probes status when v2_ready is forced.  This
-        # method exists only for compatibility with an injected adapter.
-        method = getattr(self.port, "status", None)
-        if callable(method):
-            try:
-                parameters = inspect.signature(method).parameters
-            except (TypeError, ValueError):
-                return None
-            # Choose the call shape from the signature before invocation.  A
-            # TypeError raised by the implementation is never retried with a
-            # different argument set (which could drop workspace binding).
-            accepts_varargs = any(
-                item.kind is inspect.Parameter.VAR_POSITIONAL
-                for item in parameters.values()
-            )
-            positional = any(
-                item.kind in {
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                    inspect.Parameter.VAR_POSITIONAL,
-                }
-                for item in parameters.values()
-            )
-            if positional or accepts_varargs:
-                return method(workspace)
-            if "workspace" in parameters:
-                return method(workspace=workspace)
-            return method()
-        return None
-
     def dispatch(self, surface: str, name: str, args: Mapping[str, Any], **kwargs: Any) -> Any:
         payload = dict(kwargs)
         payload.setdefault("generation", self.generation)
@@ -90,16 +204,14 @@ class _GenerationPort:
 class V2RuntimeFacade:
     """Runtime entrypoint enforcing one state snapshot and one route per call.
 
-    ``manifest``, ``v2`` and ``legacy`` are explicit ports.  They may be
-    supplied as keyword arguments or through a :class:`RuntimePorts` bundle;
-    no implementation module is discovered by import or global lookup.
+    ``manifest`` and ``v2`` are explicit ports. Unknown constructor aliases
+    are ignored so an untrusted caller cannot inject another route.
     """
 
     def __init__(
         self,
         manifest: Any = None,
         v2: Any = None,
-        legacy: Any = None,
         *,
         ports: RuntimePorts | Mapping[str, Any] | Any | None = None,
         workspace: str = "",
@@ -107,17 +219,13 @@ class V2RuntimeFacade:
         context_engine: Any = None,
         recall_planner: Any = None,
         hook_v2: Any = None,
-        hook_legacy: Any = None,
         readiness_gate: Any = None,
-        legacy_adapter: Any = None,
         manifest_store: Any = None,
         v2_port: Any = None,
-        legacy_port: Any = None,
         **aliases: Any,
     ) -> None:
         manifest = manifest if manifest is not None else manifest_store
         v2 = v2 if v2 is not None else v2_port
-        legacy = legacy if legacy is not None else legacy_port
         if manifest is None:
             manifest = aliases.pop("system_manifest", None)
         if readiness_gate is None:
@@ -125,12 +233,10 @@ class V2RuntimeFacade:
         overrides = {
             "manifest": manifest,
             "v2": v2,
-            "legacy": legacy,
             "readiness": readiness_gate or readiness,
             "context_engine": context_engine,
             "recall_planner": recall_planner,
             "hook_v2": hook_v2,
-            "hook_legacy": hook_legacy,
         }
         overrides = {key: value for key, value in overrides.items() if value is not None}
         if ports is not None:
@@ -155,7 +261,6 @@ class V2RuntimeFacade:
         self.gate = self.ports.readiness if isinstance(self.ports.readiness, ReadinessGate) else (self.ports.readiness or ReadinessGate(manifest=self.ports.manifest))
         self.context_engine = self.ports.context_engine
         self.recall_planner = self.ports.recall_planner
-        self._legacy_adapter = legacy_adapter
         self._lock = threading.RLock()
         self._metrics: Counter[str] = Counter()
 
@@ -234,27 +339,13 @@ class V2RuntimeFacade:
         unknown names are conservatively gated as writes.
         """
         if surface == "mcp":
-            from ..compat_v2 import MCP_MUTATION_NAMES, MCP_TOOL_NAMES
-            known_mutation = name in MCP_MUTATION_NAMES
-            known_name = name in MCP_TOOL_NAMES
-            return True if known_mutation or not known_name else bool(explicit)
+            return name not in MCP_TOOL_NAMES or name in MCP_MUTATION_NAMES or bool(explicit)
         if surface == "gui":
-            from ..compat_v2.legacy_adapter import GUI_METHOD_NAMES, RULE_MUTATION_GUI_NAMES
-            # GUI's public mutation registry is broader than the rule-only
-            # context set mirrored by LegacyV2Adapter.  Keep the canonical
-            # security classification authoritative at this boundary.
-            from ..security import MUTATION_API_METHODS
-            known_mutation = (
-                name in RULE_MUTATION_GUI_NAMES
-                or name in MUTATION_API_METHODS
-                or name in {"request_mutation", "submit_request"}
-            )
-            known_name = name in GUI_METHOD_NAMES
-            return True if known_mutation or not known_name else bool(explicit)
+            return name not in GUI_METHOD_NAMES or name in GUI_MUTATION_NAMES or bool(explicit)
         if surface == "cli":
-            from ..compat_v2.legacy_adapter import CLI_COMMAND_NAMES
-            known_name = name in CLI_COMMAND_NAMES
-            return True if not known_name else bool(explicit) or _LegacyV2AdapterClassifier._cli_is_mutation(name, args)
+            if name not in CLI_COMMAND_NAMES:
+                return True
+            return bool(explicit) or _cli_is_mutation(name, args)
         return True if explicit is None else bool(explicit)
 
     @staticmethod
@@ -315,8 +406,14 @@ class V2RuntimeFacade:
         return False
 
     def _envelope(self, result: Any, snapshot: RuntimeSnapshot, *, path: str, status: str, code: str = "") -> dict[str, Any]:
+        raw_result = dict(result) if isinstance(result, Mapping) else {"data": _safe_dict(result)}
+        # TaskCoordinator includes an empty error mapping in successful task
+        # status payloads.  It is absence of an error, not a diagnostic to
+        # sanitize into the fallback ``runtime_dispatch_failed`` code.
+        if not raw_result.get("error"):
+            raw_result.pop("error", None)
         payload = sanitize_public_payload(
-            dict(result) if isinstance(result, Mapping) else {"data": _safe_dict(result)},
+            raw_result,
             error_code=code or "runtime_dispatch_failed",
         )
         payload.setdefault("ok", status == "ok")
@@ -341,12 +438,14 @@ class V2RuntimeFacade:
             with self._lock:
                 self._metrics["unknown"] += 1
             return self._base(snapshot, code="v2_manifest_state_unavailable")
+        if snapshot.state in {CutoverState.V1_ACTIVE, CutoverState.V2_BUILDING}:
+            return self._base(snapshot, code="v2_upgrade_required")
         is_mutation = self._mutation(surface, name, args, mutation)
         if snapshot.state is CutoverState.V2_READY and is_mutation:
-            # READY is a V2 read-only state.  Do not invoke either route.
+            # READY is a V2 read-only state.  Do not invoke the native port.
             return self._envelope({"ok": False}, snapshot, path="v2", status="error", code="v2_not_active")
-        # READY and ACTIVE are V2-only paths.  Never instantiate or invoke the
-        # compatibility adapter here, even for ordinary reads.
+        # READY and ACTIVE are the only executable states.  Both use the
+        # injected native V2 port and never fall back to another route.
         if snapshot.state in {CutoverState.V2_READY, CutoverState.V2_ACTIVE}:
             if context is not None and not self._supports_context(self.ports.v2):
                 return self._envelope({"ok": False}, snapshot, path="v2", status="error", code="v2_context_capability_required")
@@ -373,51 +472,7 @@ class V2RuntimeFacade:
                 )
             except Exception:
                 return self._envelope({"ok": False}, snapshot, path="v2", status="error", code="v2_error")
-        if context is not None and not self._supports_context(self.ports.legacy):
-            return self._envelope(
-                {"ok": False}, snapshot, path="legacy", status="error",
-                code="legacy_context_capability_required",
-            )
-        if context is not None:
-            try:
-                result = self._invoke_port(
-                    _GenerationPort(self.ports.legacy, generation=snapshot.generation, state=snapshot.state, facade=self),
-                    surface, name, args if args is not None else {},
-                    context=context,
-                    mutation=is_mutation,
-                )
-                with self._lock:
-                    self._metrics["legacy_calls"] += 1
-                return self._envelope(result, snapshot, path="legacy", status="ok")
-            except Exception:
-                return self._envelope({"ok": False}, snapshot, path="legacy", status="error", code="legacy_error")
-        adapter = self._legacy_adapter
-        if adapter is None:
-            adapter = LegacyV2Adapter(
-                v2_port=_GenerationPort(self.ports.v2, generation=snapshot.generation, state=snapshot.state, facade=self),
-                legacy_port=_GenerationPort(self.ports.legacy, generation=snapshot.generation, state=snapshot.state, facade=self),
-                workspace=self.workspace,
-                v2_ready=snapshot.state.value,
-            )
-        try:
-            if surface == "mcp":
-                result = adapter.dispatch_mcp(name, args, context=context)
-            elif surface == "gui":
-                result = adapter.dispatch_gui(name, args, mutation=is_mutation, context=context)
-            elif surface == "cli":
-                result = adapter.dispatch_cli(name, args, mutation=is_mutation)
-            else:
-                return self._base(snapshot, code="unknown_surface")
-        except Exception:
-            return self._envelope({"ok": False}, snapshot, path="none", status="error", code="runtime_dispatch_failed")
-        path = str(result.get("path", "none")) if isinstance(result, Mapping) else ("legacy" if snapshot.legacy_route else "v2")
-        if path == "legacy":
-            with self._lock:
-                self._metrics["legacy_calls"] += 1
-        elif path == "v2":
-            with self._lock:
-                self._metrics["v2_calls"] += 1
-        return self._envelope(result, snapshot, path=path, status=str(result.get("status", "ok")) if isinstance(result, Mapping) else "ok")
+        return self._base(snapshot, code="v2_manifest_state_unavailable")
 
     def dispatch_mcp(self, name: str, args: Any = None, *, context: Any = None, snapshot: RuntimeSnapshot | None = None) -> dict[str, Any]:
         return self._dispatch("mcp", str(name), args, context=context, snapshot=snapshot)
@@ -446,13 +501,15 @@ class V2RuntimeFacade:
             with self._lock:
                 self._metrics["unknown"] += 1
             return self._base(snapshot, code="v2_manifest_state_unavailable")
-        if context is not None and snapshot.state in {CutoverState.V2_READY, CutoverState.V2_ACTIVE}:
+        if snapshot.state in {CutoverState.V1_ACTIVE, CutoverState.V2_BUILDING}:
+            return self._base(snapshot, code="v2_upgrade_required")
+        if context is not None:
             context_port = self.ports.hook_v2 or self.ports.v2 or self.context_engine
             if context_port is None or not self._supports_context(context_port):
                 return self._envelope({"ok": False}, snapshot, path="v2", status="error", code="v2_context_capability_required")
-        port = self.ports.legacy if snapshot.legacy_route else (self.ports.hook_v2 or self.ports.v2)
-        path = "legacy" if snapshot.legacy_route else "v2"
-        if port is None and not snapshot.legacy_route and self.context_engine is not None:
+        port = self.ports.hook_v2 or self.ports.v2
+        path = "v2"
+        if port is None and self.context_engine is not None:
             port = self.context_engine
         try:
             if port is None:
@@ -462,11 +519,6 @@ class V2RuntimeFacade:
                 if not callable(fn):
                     raise RuntimeError("context_engine_missing_bootstrap")
                 result = fn(request, payload)
-            elif snapshot.legacy_route and self.ports.hook_legacy is not None:
-                fn = getattr(self.ports.hook_legacy, "bootstrap_hook", None) or getattr(self.ports.hook_legacy, "bootstrap", None)
-                if not callable(fn):
-                    raise RuntimeError("hook_port_missing_bootstrap")
-                result = self._invoke_port(self.ports.hook_legacy, "hook", "bootstrap_hook", {"request": request, "payload": payload}, generation=snapshot.generation, context=context)
             elif self.ports.hook_v2 is not None and port is self.ports.hook_v2:
                 fn = getattr(port, "bootstrap_hook", None)
                 result = fn(request, payload, generation=snapshot.generation, state=snapshot.state, context=context) if callable(fn) else self._invoke_port(port, "hook", "bootstrap_hook", {"request": request, "payload": payload}, generation=snapshot.generation, state=snapshot.state, context=context)
@@ -490,6 +542,24 @@ class V2RuntimeFacade:
         )
 
     bootstrap = bootstrap_hook
+
+    def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
+        """Stop workers owned by the selected V2 runtime before host exit."""
+        port = self.ports.v2
+        fn = getattr(port, "shutdown", None) or getattr(port, "close", None)
+        if not callable(fn):
+            return {"ok": True, "owned_workers_stopped": True}
+        try:
+            result = fn(timeout=float(timeout))
+        except TypeError:
+            result = fn()
+        except Exception:
+            return {"ok": False, "owned_workers_stopped": False}
+        if isinstance(result, Mapping):
+            return dict(result)
+        return {"ok": True, "owned_workers_stopped": True}
+
+    close = shutdown
 
     # ---- activation ------------------------------------------------------------
     def activate(self, evidence: Any = None) -> dict[str, Any]:
@@ -548,7 +618,16 @@ def get_v2_runtime_facade(
             maintenance_port=maintenance,
             state_provider=manifest,
         )
-    return V2RuntimeFacade(workspace=workspace, manifest=manifest, v2=port)
+    # NativeV2RuntimePort constructs the production ContextEngine when no
+    # explicit engine was supplied.  Surface that same instance through the
+    # facade so bootstrap callers cannot observe a missing context capability.
+    context_engine = getattr(port, "context_engine", None)
+    return V2RuntimeFacade(
+        workspace=workspace,
+        manifest=manifest,
+        v2=port,
+        context_engine=context_engine,
+    )
 
 
 __all__ = ["V2RuntimeFacade", "get_v2_runtime_facade"]

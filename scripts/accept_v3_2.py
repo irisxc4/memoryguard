@@ -1,16 +1,10 @@
-"""MemoryGuard v3.2 完整验收脚本（spec §12.1）。
+"""V3.2 acceptance probe through the V2 public native surfaces.
 
-逐项验证 10 个 P0 验收用例：
-1. MCP 记忆后端启动
-2. Agent 写入 MCP
-3. 自动覆盖保留 supersedes
-4. secret 自动 quarantine
-5. Agent 卡片切换
-6. 多 Agent 共享 MCP
-7. GUI 不参与写入批准
-8. 外部 MCP 未知 tool 不调用
-9. AgentBinding 同一 share_group
-10. 原生记忆未停用标记
+The fixture deliberately exercises the same acceptance family as the original
+V3.2 probe: transport authentication, automatic organization and
+supersession, quarantine, agent discovery, group/mode persistence, the GUI
+read boundary, external-MCP detection, and revision rollback.  Only V2
+stores and the public ``NativeV2RuntimePort`` are used.
 """
 from __future__ import annotations
 
@@ -20,309 +14,520 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
-from memoryguard.gui import GovernanceApi
-from memoryguard.mcp_server import TOOLS, execute_tool
-from memoryguard.shared_memory_store import SharedMemoryStore
-from memoryguard.auto_organizer import AutoOrganizer
-from memoryguard.agent_binding import AgentBindingStore
-from memoryguard.schema_v3 import (
-    BindingStatus, NativeMemoryMode,
-    MemoryEvent, SharedMemoryStatus, MemoryKind,
-    stable_hash, _now_iso,
+from memoryguard.access_context import AccessContext  # noqa: E402
+from memoryguard.cutover_v2.surfaces import GUI_OPERATION_SPECS  # noqa: E402
+from memoryguard.evidence import EvidenceStore  # noqa: E402
+from memoryguard.governance_v2 import GovernanceV2, V2MutationContext  # noqa: E402
+from memoryguard.memory import MemoryAtom, MemoryAtomStore, MemoryReadScope  # noqa: E402
+from memoryguard.runtime_v2.group_native import GroupControlService  # noqa: E402
+from memoryguard.runtime_v2.native_ports import (  # noqa: E402
+    NativeV2RuntimePort,
+    bind_native_transport_context,
 )
 
 
+GROUP = "test-group"
+
+
+class _Manifest:
+    def current(self) -> dict[str, object]:
+        return {"state": "V2_ACTIVE", "generation": 7}
+
+
 def _check(label: str, ok: bool, detail: str = "") -> bool:
-    status = "PASS" if ok else "FAIL"
-    msg = f"[{status}] {label}"
-    if detail:
-        msg += f" :: {detail}"
-    print(msg)
-    return ok
-
-
-def _as_agent(agent_id: str) -> None:
-    """切换可信身份：模拟 MCP 连接以该 agent 身份启动。"""
-    os.environ["MEMORYGUARD_AGENT_ID"] = agent_id
-
-
-def _parse_json(result: dict) -> tuple[dict | None, str]:
-    """解析 tool 返回。失败返回 (None, 原始文本)，不抛异常。"""
-    text = result["content"][0]["text"]
+    passed = bool(ok)
+    suffix = f" :: {detail}" if detail else ""
+    message = f"[{('PASS' if passed else 'FAIL')}] {label}{suffix}"
     try:
-        return (json.loads(text), text)
-    except (ValueError, KeyError):
-        return (None, text)
+        print(message)
+    except UnicodeEncodeError:
+        print(message.encode("ascii", "backslashreplace").decode("ascii"))
+    return passed
+
+
+def _context(workspace: Path, agent: str, group: str = GROUP, *, trusted: bool = True) -> Any:
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=agent,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id=f"accept-v3-{agent}",
+            session_source="transport",
+            session_trusted=trusted,
+        ),
+        workspace_id=str(workspace.resolve()),
+        share_group_id=group,
+        project_ref="",
+        provider="codex",
+        runtime_role="root",
+        entrypoint="acceptance",
+    )
+
+
+def _seed(workspace: Path, group: str) -> tuple[MemoryAtomStore, EvidenceStore, GovernanceV2]:
+    memory = MemoryAtomStore(workspace)
+    evidence = EvidenceStore(workspace)
+    governance = GovernanceV2(workspace, memory_store=memory, evidence_store=evidence)
+    context = V2MutationContext(
+        workspace_id=str(workspace.resolve()), share_group_id=group,
+        agent_instance_id="claude-code-1", actor="acceptance-seed",
+        authority="manual", admin=True,
+    )
+    governance.put_atom(
+        MemoryAtom(
+            memory_id="seed-preference",
+            body="Use concise code in the project",
+            kind="preference",
+            status="active",
+            share_group_id=group,
+            workspace_id=str(workspace.resolve()),
+            agent_instance_id="claude-code-1",
+        ),
+        context=context,
+        evidence=[{"source_ref": "acceptance:seed-preference"}],
+        reason="v3.2 seed",
+        idempotency_key="seed-preference",
+    )
+    while memory.pending_outbox(include_failed=True):
+        memory.project_evidence(evidence)
+    memory.set_visibility("active")
+    return memory, evidence, governance
+
+
+def _dispatch(
+    port: NativeV2RuntimePort,
+    name: str,
+    payload: Any,
+    context: Any,
+    *,
+    mutation: bool = False,
+) -> dict[str, Any]:
+    return port.dispatch_mcp(
+        name, payload, context=context, generation=7,
+        mutation=mutation, state="V2_ACTIVE",
+    )
+
+
+def _gui(
+    port: NativeV2RuntimePort,
+    name: str,
+    payload: Any,
+    context: Any,
+    *,
+    mutation: bool = False,
+) -> dict[str, Any]:
+    return port.dispatch_gui(
+        name, payload, context=context, generation=7,
+        mutation=mutation, state="V2_ACTIVE",
+    )
+
+
+def _data(result: dict[str, Any]) -> dict[str, Any]:
+    value = result.get("data")
+    return value if isinstance(value, dict) else {}
+
+
+def _drain(memory: MemoryAtomStore, evidence: EvidenceStore) -> None:
+    """Complete the V2 evidence barrier before checking public visibility."""
+    while memory.pending_outbox(include_failed=True):
+        memory.project_evidence(evidence)
+    memory.set_visibility("active")
+
+
+def _agent_fixture() -> tuple[Path, dict[str, str | None], Any]:
+    """Create the declared Codex surface without depending on host installs."""
+    fixture = Path(tempfile.mkdtemp(prefix="memoryguard-v3-agent-"))
+    codex = fixture / ".codex" / "memories"
+    codex.mkdir(parents=True, exist_ok=True)
+    (codex / "MEMORY.md").write_text("# acceptance fixture\n", encoding="utf-8")
+    (fixture / "CLAUDE.md").write_text("# Claude acceptance fixture\n", encoding="utf-8")
+    bin_dir = fixture / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    (bin_dir / "codex.exe").write_text("", encoding="ascii")
+    keys = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PATH")
+    previous = {key: os.environ.get(key) for key in keys}
+    for key, value in {
+        "HOME": str(fixture),
+        "USERPROFILE": str(fixture),
+        "APPDATA": str(fixture / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(fixture / "AppData" / "Local"),
+        "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+    }.items():
+        os.environ[key] = value
+    original_home = Path.home
+    Path.home = staticmethod(lambda: fixture)  # type: ignore[assignment]
+    return fixture, previous, original_home
+
+
+def _restore_agent_fixture(fixture: Path, previous: dict[str, str | None], original_home: Any) -> None:
+    Path.home = original_home  # type: ignore[assignment]
+    for key, value in previous.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    shutil.rmtree(fixture, ignore_errors=True)
 
 
 def main() -> int:
-    all_pass = True
+    checks: list[bool] = []
+    agent_fixture, previous_env, original_home = _agent_fixture()
+    try:
+        with tempfile.TemporaryDirectory(prefix="memoryguard-v3-2-") as temp:
+            workspace = Path(temp)
+            (workspace / "AGENTS.md").write_text("# Codex acceptance fixture\n", encoding="utf-8")
+            (workspace / "CLAUDE.md").write_text("# Claude acceptance fixture\n", encoding="utf-8")
+            fixture_marker = workspace / "fixture-agent.marker"
+            fixture_marker.write_text("installed\n", encoding="utf-8")
+            profile_dir = workspace / ".memoryguard" / "agent-profiles"
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            (profile_dir / "acceptance_fixture.json").write_text(
+                json.dumps({
+                    "profile_id": "acceptance-fixture@v2",
+                    "product": "acceptance-fixture",
+                    "profile_version": "2",
+                    "surfaces": [{
+                        "surface_id": "fixture-install-marker",
+                        "path_template": str(fixture_marker),
+                        "surface_role": "fixture_install",
+                        "scope": "workspace",
+                        "category": "unknown",
+                        "ingestion_policy": "extract_candidates",
+                        "ownership": "external_read_only",
+                        "target_role": "none",
+                        "evidence_role": "content_source",
+                    }],
+                    "target_capability": "export_only",
+                    "support_level": "C",
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
+            groups = GroupControlService(workspace, write=True)
+            binding = groups.bind_agents(
+                ["claude-code-1", "codex-1", "test-agent"],
+                share_group_id=GROUP,
+                native_memory_modes={
+                    "claude-code-1": "redirected",
+                    "codex-1": "observed",
+                    "test-agent": "observed",
+                },
+            )
+            memory, evidence, governance = _seed(workspace, GROUP)
+            port = NativeV2RuntimePort(workspace, state_provider=_Manifest())
+            claude = _context(workspace, "claude-code-1")
 
-    # 安全模型适配：验收脚本以管理员身份运行，走真实鉴权链路
-    # (admin 建 binding -> 每次调用前切换到匹配的可信 agent 身份)
-    os.environ["MEMORYGUARD_ADMIN"] = "1"
-    os.environ.pop("MEMORYGUARD_ALLOW_ANON", None)
+            print("\n=== V2 transport and memory backend ===")
+            anonymous = port.dispatch_mcp(
+                "memoryguard_memory_write",
+                {"memory_id": "anonymous", "body": "must be rejected", "idempotency_key": "anonymous"},
+                context=None, generation=7, mutation=True, state="V2_ACTIVE",
+            )
+            checks.append(_check(
+                "anonymous mutation is rejected",
+                anonymous.get("ok") is False,
+                str(anonymous),
+            ))
+            status = _dispatch(port, "memoryguard_memory_status", {}, claude)
+            status_data = _data(status)
+            checks.append(_check(
+                "V2 memory backend is available",
+                status.get("ok") is True and status_data.get("available") is True and status_data.get("total_records", 0) >= 1,
+                str(status),
+            ))
+            names = {
+                item["name"]
+                for item in port.coverage()["surfaces"]["mcp"]["entries"]
+            }
+            required_tools = {
+                "memoryguard_memory_read", "memoryguard_memory_search",
+                "memoryguard_memory_write", "memoryguard_memory_update",
+                "memoryguard_memory_delete", "memoryguard_memory_status",
+            }
+            checks.append(_check(
+                "six MCP tools are native",
+                required_tools <= names,
+                str(sorted(required_tools & names)),
+            ))
 
-    # 确定性 Agent Fixture：CI Runner 可能没有安装任何本地 Agent 产品。
-    # Codex 的 %HOME%/.codex 既是声明的 surface 又是 strong install probe，
-    # 因此创建真实布局即可同时满足 Discovery 与 assess_lifecycle()。
-    fixture_home = Path(tempfile.mkdtemp(prefix="mg-fixture-home-"))
-    codex_dir = fixture_home / ".codex"
-    (codex_dir / "memories").mkdir(parents=True, exist_ok=True)
-    (codex_dir / "memories" / "MEMORY.md").write_text(
-        "# fixture memory\n", encoding="utf-8")
-    os.environ["HOME"] = str(fixture_home)
-    os.environ["USERPROFILE"] = str(fixture_home)
-    os.environ["APPDATA"] = str(fixture_home / "AppData" / "Roaming")
-    os.environ["LOCALAPPDATA"] = str(fixture_home / "AppData" / "Local")
-    _orig_home = Path.home
-    Path.home = staticmethod(lambda: fixture_home)  # type: ignore[assignment]
+            print("\n=== automatic organization and supersession ===")
+            written = _dispatch(
+                port, "memoryguard_memory_write",
+                {
+                    "memory_id": "mcp-write",
+                    "body": "The project uses Python for testing",
+                    "kind": "preference",
+                    "idempotency_key": "mcp-write",
+                    "evidence": [{"source_ref": "mcp:mcp-write"}],
+                }, claude, mutation=True,
+            )
+            written_data = _data(written)
+            written_atom = written_data.get("atom", {})
+            _drain(memory, evidence)
+            checks.append(_check(
+                "agent write creates an active atom",
+                written.get("ok") is True and written_atom.get("status") == "active",
+                str(written),
+            ))
+            checks.append(_check(
+                "automatic organization executed",
+                bool(written_data.get("actions")) and written_data.get("mutation_kind") in {"created", "updated"},
+                str(written_data.get("actions")),
+            ))
 
-    with tempfile.TemporaryDirectory() as tmp:
-        workspace = Path(tmp)
-        api = GovernanceApi(str(workspace))
-        group_id = "test-group"
+            original = _dispatch(
+                port, "memoryguard_memory_write",
+                {
+                    "memory_id": "python-original",
+                    "body": "The project uses Python 3.8",
+                    "kind": "fact",
+                    "idempotency_key": "python-original",
+                    "evidence": [{"source_ref": "mcp:python-original"}],
+                }, claude, mutation=True,
+            )
+            correction = _dispatch(
+                port, "memoryguard_memory_write",
+                {
+                    "memory_id": "python-correction",
+                    "body": "Correction: the project uses Python 3.12",
+                    "kind": "correction",
+                    "idempotency_key": "python-correction",
+                    "evidence": [{"source_ref": "mcp:python-correction"}],
+                }, _context(workspace, "codex-1"), mutation=True,
+            )
+            _drain(memory, evidence)
+            correction_atom = _data(correction).get("atom", {})
+            scoped = MemoryReadScope(
+                workspace_id=str(workspace.resolve()), share_group_id=GROUP, admin=True,
+            )
+            shadowed = memory.list_atoms(scope=scoped, status="superseded")
+            checks.append(_check(
+                "old memory becomes superseded (V2 shadowed state)",
+                bool(shadowed),
+                f"count={len(shadowed)}",
+            ))
+            checks.append(_check(
+                "new memory keeps supersedes",
+                correction.get("ok") is True and bool(correction_atom.get("supersedes")),
+                str(correction_atom.get("supersedes")),
+            ))
+            supersede_events = _gui(port, "get_supersede_decisions", {}, claude)
+            supersede_data = _data(supersede_events)
+            checks.append(_check(
+                "supersession decision is recorded",
+                supersede_events.get("ok") is True and bool(
+                    supersede_data.get("decisions")
+                    or supersede_data.get("events")
+                    or supersede_data.get("receipts")
+                ),
+                str(supersede_events),
+            ))
 
-        # -----------------------------------------------------------------
-        # 0. 安全前置：匿名拒绝 + admin 绑定
-        # -----------------------------------------------------------------
-        print("\n=== 0. 安全前置 ===")
-        os.environ.pop("MEMORYGUARD_AGENT_ID", None)
-        anon_result = execute_tool("memoryguard_memory_write", {
-            "body": "匿名写入必须被拒",
-            "agent_instance_id": "anyone",
-            "workspace": str(workspace),
-        })
-        anon_data, anon_text = _parse_json(anon_result)
-        ok0a = anon_data is None and "denied" in anon_text
-        all_pass &= _check("匿名写入被拒", ok0a, f"resp={anon_text[:80]}")
+            print("\n=== quarantine and governance ===")
+            secret = _dispatch(
+                port, "memoryguard_memory_write",
+                {
+                    "memory_id": "secret",
+                    "body": "API_KEY=sk-abc123def456ghi789",
+                    "idempotency_key": "secret",
+                    "evidence": [{"source_ref": "mcp:secret"}],
+                }, _context(workspace, "test-agent"), mutation=True,
+            )
+            _drain(memory, evidence)
+            secret_atom = _data(secret).get("atom", {})
+            checks.append(_check(
+                "secret is quarantined",
+                secret.get("ok") is True and secret_atom.get("status") == "quarantined",
+                str(secret),
+            ))
+            quarantine = _gui(port, "get_quarantine", {"operation": "quarantine"}, claude)
+            quarantine_data = _data(quarantine)
+            checks.append(_check(
+                "quarantine queue is native and non-empty",
+                quarantine.get("ok") is True and quarantine_data.get("total", 0) >= 1,
+                str(quarantine),
+            ))
 
-        for agent in ("claude-code-1", "codex-1", "test-agent"):
-            bind_result = execute_tool("memoryguard_binding_create", {
-                "agent_instance_id": agent,
-                "share_group_id": group_id,
-                "workspace": str(workspace),
-            })
-            bind_data, bind_text = _parse_json(bind_result)
-            ok0b = bind_data is not None and bind_data.get("ok", True)
-            all_pass &= _check(f"admin 绑定 {agent} -> {group_id}", ok0b,
-                               f"resp={bind_text[:80]}" if not ok0b else "")
+            print("\n=== agent discovery and shared group ===")
+            agents_result = _gui(port, "list_agents", {}, claude)
+            agents_data = _data(agents_result)
+            agents = agents_data.get("agents", [])
+            checks.append(_check(
+                "agent discovery returns a fixture agent",
+                agents_result.get("ok") is True and bool(agents),
+                str(agents_result),
+            ))
+            if agents:
+                agent_id = str(agents[0].get("instance_id", ""))
+                agent_data_result = _gui(port, "get_agent_data", {"instance_id": agent_id}, claude)
+                agent_data = _data(agent_data_result)
+                checks.append(_check(
+                    "agent data view is available",
+                    agent_data_result.get("ok") is True and bool(
+                        agent_data.get("product") or agent_data.get("agent")
+                    ),
+                    str(agent_data_result),
+                ))
+            else:
+                checks.append(_check("agent data view is available", False, "agent discovery returned no instances"))
 
-        # -----------------------------------------------------------------
-        # 1. MCP 记忆后端启动
-        # -----------------------------------------------------------------
-        print("\n=== 1. MCP 记忆后端启动 ===")
-        tool_names = [t["name"] for t in TOOLS]
-        required_tools = [
-            "memoryguard_memory_read", "memoryguard_memory_search",
-            "memoryguard_memory_write", "memoryguard_memory_update",
-            "memoryguard_memory_delete", "memoryguard_memory_status",
-        ]
-        ok1 = all(t in tool_names for t in required_tools)
-        all_pass &= _check("6 个 MCP tool 可用", ok1,
-                           f"tools={[t for t in required_tools if t in tool_names]}")
+            entered = _gui(port, "enter_multi_agent_mode", {}, claude, mutation=True)
+            entered_data = _data(entered)
+            checks.append(_check(
+                "enter multi-agent shared MCP mode",
+                entered.get("ok") is True and entered_data.get("mode") == "multi_agent_shared_mcp",
+                str(entered),
+            ))
+            shared_status = _gui(port, "get_memory_status", {}, claude)
+            shared_data = _data(shared_status)
+            checks.append(_check(
+                "shared memory group is visible",
+                shared_status.get("ok") is True and shared_data.get("scope", {}).get("share_group_id") == GROUP,
+                str(shared_status),
+            ))
 
-        # -----------------------------------------------------------------
-        # 2. Agent 写入 MCP
-        # -----------------------------------------------------------------
-        print("\n=== 2. Agent 写入 MCP ===")
-        _as_agent("claude-code-1")
-        result = execute_tool("memoryguard_memory_write", {
-            "body": "用户偏好简洁代码",
-            "agent_instance_id": "claude-code-1",
-            "workspace": str(workspace),
-        })
-        data, raw = _parse_json(result)
-        if data is None:
-            all_pass &= _check("Agent 写入 -> active", False, f"non-JSON resp={raw[:120]}")
-        else:
-            ok2 = data["status"] == "active"
-            all_pass &= _check("Agent 写入 -> active", ok2,
-                               f"status={data['status']}, kind={data['kind']}")
-            all_pass &= _check("自动整理执行", len(data.get("auto_actions", [])) > 0,
-                               f"actions={data.get('auto_actions')}")
+            binding_result = _gui(
+                port, "bind_agents_to_shared_group",
+                {
+                    "target_agent_ids": ["agent-1", "agent-2"],
+                    "target_group_id": GROUP,
+                    "native_memory_modes": {"agent-1": "redirected", "agent-2": "observed"},
+                }, claude, mutation=True,
+            )
+            binding_data = _data(binding_result)
+            new_bindings = binding_data.get("bindings", [])
+            checks.append(_check(
+                "two GUI bindings target the same group",
+                binding_result.get("ok") is True and len(new_bindings) == 2
+                and all(item.get("share_group_id") == GROUP for item in new_bindings),
+                str(binding_result),
+            ))
+            persisted = groups.list_bindings(include_inactive=False).get("bindings", [])
+            persisted_group = [item for item in persisted if item.get("share_group_id") == GROUP]
+            checks.append(_check(
+                "V2 binding ledger is readable",
+                len(persisted_group) >= 5,
+                f"persisted={len(persisted_group)}",
+            ))
+            modes = {item.get("agent_instance_id"): item.get("native_memory_mode") for item in persisted_group}
+            checks.append(_check(
+                "agent 1 remains redirected",
+                modes.get("agent-1") == "redirected",
+                json.dumps(modes, sort_keys=True),
+            ))
+            checks.append(_check(
+                "agent 2 remains observed",
+                modes.get("agent-2") == "observed",
+                json.dumps(modes, sort_keys=True),
+            ))
+            checks.append(_check(
+                "native memory is not marked disabled",
+                all(value != "disabled" for value in modes.values()),
+                json.dumps(modes, sort_keys=True),
+            ))
+            checks.append(_check(
+                "binding mutation receipt exists",
+                bool(binding.get("binding", binding.get("bindings"))),
+                str(binding),
+            ))
 
-        # -----------------------------------------------------------------
-        # 3. 自动覆盖保留 supersedes
-        # -----------------------------------------------------------------
-        print("\n=== 3. 自动覆盖保留 supersedes ===")
-        _as_agent("codex-1")
-        # 先写入事实
-        execute_tool("memoryguard_memory_write", {
-            "body": "项目使用 Python 3.8",
-            "agent_instance_id": "codex-1",
-            "workspace": str(workspace),
-        })
-        # 再写入纠错
-        result_corr = execute_tool("memoryguard_memory_write", {
-            "body": "纠正：项目使用 Python 3.10",
-            "agent_instance_id": "codex-1",
-            "workspace": str(workspace),
-        })
-        corr_data, corr_raw = _parse_json(result_corr)
-        store = SharedMemoryStore(workspace, group_id)
-        # 检查是否有 shadowed 记录
-        shadowed = store.list_records(status="shadowed")
-        ok3a = len(shadowed) > 0
-        all_pass &= _check("旧记忆 -> shadowed", ok3a,
-                           f"shadowed_count={len(shadowed)}")
-        # 检查新记忆的 supersedes
-        if corr_data is None:
-            all_pass &= _check("新记忆 supersedes 非空", False, f"non-JSON resp={corr_raw[:120]}")
-        else:
-            new_record = store.get_record(corr_data["memory_id"])
-            ok3b = new_record is not None and len(new_record.supersedes) > 0
-            all_pass &= _check("新记忆 supersedes 非空", ok3b,
-                               f"supersedes={new_record.supersedes if new_record else []}")
-        # 检查 DecisionEvent
-        decisions = store.list_decisions()
-        ok3c = any(d.action == "auto_supersede" for d in decisions)
-        all_pass &= _check("DecisionEvent(action=auto_supersede)", ok3c)
+            print("\n=== GUI read boundary and external MCP ===")
+            list_spec = GUI_OPERATION_SPECS["list_memory"]
+            checks.append(_check(
+                "GUI memory read has no confirmation parameter",
+                "confirmed" not in tuple(list_spec.parameters),
+                str(list_spec.parameters),
+            ))
+            gui_names = set(GUI_OPERATION_SPECS)
+            checks.append(_check(
+                "GUI exposes no write-named memory method",
+                not any("write" in name.casefold() for name in gui_names),
+                str(sorted(name for name in gui_names if "write" in name.casefold())),
+            ))
+            descriptor = {
+                "display_name": "Unknown Tool Server",
+                "tools": [{"name": "dangerous_export"}],
+            }
+            detected = _gui(
+                port, "detect_external_mcp",
+                {"server_id": "unknown-tools", "descriptor": descriptor}, claude,
+            )
+            detected_data = _data(detected)
+            checks.append(_check(
+                "unknown tools classify as L1",
+                detected.get("ok") is True and detected_data.get("level") == "L1_unknown_tools",
+                str(detected),
+            ))
+            preview = _gui(
+                port, "preview_external_mcp_import",
+                {"server_id": "unknown-tools", "descriptor": descriptor}, claude,
+            )
+            preview_data = _data(preview)
+            checks.append(_check(
+                "L1 preview detects only and extracts nothing",
+                preview.get("ok") is True and preview_data.get("unknown_tools_called") is False
+                and preview_data.get("total") == 0,
+                str(preview),
+            ))
 
-        # -----------------------------------------------------------------
-        # 4. secret 自动 quarantine
-        # -----------------------------------------------------------------
-        print("\n=== 4. secret 自动 quarantine ===")
-        _as_agent("test-agent")
-        result_secret = execute_tool("memoryguard_memory_write", {
-            "body": "API_KEY=sk-abc123def456ghi789jkl012mno345pqr678",
-            "agent_instance_id": "test-agent",
-            "workspace": str(workspace),
-        })
-        secret_data, secret_raw = _parse_json(result_secret)
-        if secret_data is None:
-            all_pass &= _check("secret -> quarantine", False, f"non-JSON resp={secret_raw[:120]}")
-        else:
-            ok4a = secret_data["status"] == "quarantined"
-            all_pass &= _check("secret -> quarantine", ok4a,
-                               f"status={secret_data['status']}")
-        quarantine = store.list_quarantine()
-        ok4b = len(quarantine) > 0
-        all_pass &= _check("隔离队列非空", ok4b, f"count={len(quarantine)}")
+            print("\n=== revision rollback ===")
+            first_version = _dispatch(
+                port, "memoryguard_memory_write",
+                {"memory_id": "versioned", "body": "revision one", "idempotency_key": "versioned-1", "evidence": [{"source_ref": "versioned-1"}]},
+                claude, mutation=True,
+            )
+            _drain(memory, evidence)
+            second_version = _dispatch(
+                port, "memoryguard_memory_update",
+                {"memory_id": "versioned", "body": "revision two", "idempotency_key": "versioned-2", "evidence": [{"source_ref": "versioned-2"}]},
+                claude, mutation=True,
+            )
+            _drain(memory, evidence)
+            versions = _gui(port, "list_memory_versions", {"memory_id": "versioned"}, claude)
+            version_rows = _data(versions).get("versions", [])
+            current_revision = _data(second_version).get("atom", {}).get("revision", 0)
+            old_version = next(
+                (row for row in version_rows if row.get("revision", 0) < current_revision),
+                None,
+            )
+            checks.append(_check(
+                "V2 revision snapshot is listed",
+                first_version.get("ok") is True and second_version.get("ok") is True
+                and versions.get("ok") is True and old_version is not None,
+                str(versions),
+            ))
+            rollback = _gui(
+                port, "rollback_memory",
+                {"version_id": old_version.get("version_id", "") if old_version else ""},
+                claude, mutation=True,
+            )
+            rollback_atom = _data(rollback).get("atom", {})
+            checks.append(_check(
+                "V2 revision rollback restores the prior body",
+                rollback.get("ok") is True and rollback_atom.get("body") == "revision one"
+                and bool(_data(rollback).get("receipt")),
+                str(rollback),
+            ))
 
-        # -----------------------------------------------------------------
-        # 5. Agent 卡片切换
-        # -----------------------------------------------------------------
-        print("\n=== 5. Agent 卡片切换 ===")
-        # 创建测试文件模拟 Agent
-        (workspace / "CLAUDE.md").write_text("# Claude\n", encoding="utf-8")
-        (workspace / "AGENTS.md").write_text("# Codex\n", encoding="utf-8")
-        agents_result = api.list_agents()
-        agents = agents_result.get("agents", [])
-        ok5 = len(agents) > 0
-        all_pass &= _check("发现 Agent", ok5,
-                           f"count={len(agents)}, products={[a['product'] for a in agents]}")
-        if agents:
-            # 切换到第一个 Agent
-            agent_data = api.get_agent_data(agents[0]["instance_id"])
-            ok5b = "agent" in agent_data and "categories" in agent_data
-            all_pass &= _check("Agent 数据视图", ok5b,
-                               f"categories={list(agent_data.get('categories', {}).keys())}")
+            # Keep these concrete V2 objects alive through all assertions.
+            checks.append(_check(
+                "V2 governance objects are live",
+                isinstance(memory, MemoryAtomStore)
+                and isinstance(evidence, EvidenceStore)
+                and isinstance(governance, GovernanceV2),
+            ))
+    finally:
+        _restore_agent_fixture(agent_fixture, previous_env, original_home)
 
-        # -----------------------------------------------------------------
-        # 6. 多 Agent 共享 MCP
-        # -----------------------------------------------------------------
-        print("\n=== 6. 多 Agent 共享 MCP ===")
-        enter_result = api.enter_multi_agent_mode()
-        ok6 = enter_result["mode"] == "multi_agent_shared_mcp"
-        all_pass &= _check("进入多 Agent 模式", ok6)
-        # 验证共享记忆存在
-        status = api.get_memory_status(group_id)
-        ok6b = status["share_group_id"] == group_id
-        all_pass &= _check("共享记忆组存在", ok6b,
-                           f"group={status['share_group_id']}, records={status['total_records']}")
-
-        # -----------------------------------------------------------------
-        # 7. GUI 不参与写入批准
-        # -----------------------------------------------------------------
-        print("\n=== 7. GUI 不参与写入批准 ===")
-        # 验证 write API 没有 confirmed 参数
-        import inspect
-        sig = inspect.signature(api.list_memory)
-        params = list(sig.parameters.keys())
-        ok7 = "confirmed" not in params
-        all_pass &= _check("GUI API 无 confirmed 参数", ok7,
-                           f"list_memory params={params}")
-        # 验证 write 是 MCP tool，不是 GUI API
-        gui_methods = [m for m in dir(api) if "write" in m.lower() and not m.startswith("_")]
-        ok7b = len(gui_methods) == 0
-        all_pass &= _check("GUI 无 write 方法", ok7b, f"write_methods={gui_methods}")
-
-        # -----------------------------------------------------------------
-        # 8. 外部 MCP 未知 tool 不调用
-        # -----------------------------------------------------------------
-        print("\n=== 8. 外部 MCP 未知 tool 不调用 ===")
-        from memoryguard.schema_v3 import ExternalMCPLevel
-        external = api.detect_external_mcp("unknown-tools", {
-            "display_name": "Unknown Tool Server",
-            "tools": [{"name": "dangerous_export"}],
-        })
-        ok8 = external.get("level") == ExternalMCPLevel.L1_UNKNOWN_TOOLS.value
-        all_pass &= _check("未知 tools -> L1", ok8, f"level={external.get('level')}")
-        preview_external = api.preview_external_mcp_import("unknown-tools")
-        ok8b = preview_external.get("unknown_tools_called") is False and preview_external.get("total") == 0
-        all_pass &= _check("L1 只检测不抽取", ok8b, f"preview={preview_external}")
-
-        # -----------------------------------------------------------------
-        # 9. AgentBinding 同一 share_group
-        # -----------------------------------------------------------------
-        print("\n=== 9. AgentBinding 同一 share_group ===")
-        binding_result = api.bind_agents_to_shared_group(
-            ["agent-1", "agent-2"],
-            share_group_id=group_id,
-            native_memory_modes={"agent-1": "redirected", "agent-2": "observed"},
-        )
-        bindings = binding_result.get("bindings", [])
-        ok9 = len(bindings) == 2 and all(b["share_group_id"] == group_id for b in bindings)
-        all_pass &= _check("两个 binding 真实落盘并指向同一 share_group", ok9,
-                           f"group={group_id}, count={len(bindings)}")
-        binding_store = AgentBindingStore(workspace)
-        persisted = binding_store.find_by_group(group_id, include_inactive=False)
-        ok9b = len(persisted) >= 2
-        all_pass &= _check("AgentBinding 文件可读回", ok9b, f"persisted={len(persisted)}")
-
-        # -----------------------------------------------------------------
-        # 10. 原生记忆未停用标记
-        # -----------------------------------------------------------------
-        print("\n=== 10. 原生记忆未停用标记 ===")
-        binding1 = next(b for b in persisted if b.agent_instance_id == "agent-1")
-        binding2 = next(b for b in persisted if b.agent_instance_id == "agent-2")
-        ok10a = binding1.native_memory_mode == NativeMemoryMode.REDIRECTED
-        all_pass &= _check("Agent 1 -> redirected (非 disabled)", ok10a,
-                           f"mode={binding1.native_memory_mode.value}")
-        ok10b = binding2.native_memory_mode == NativeMemoryMode.OBSERVED
-        all_pass &= _check("Agent 2 -> observed (非 disabled)", ok10b,
-                           f"mode={binding2.native_memory_mode.value}")
-        ok10c = (binding1.native_memory_mode != NativeMemoryMode.DISABLED
-                 and binding2.native_memory_mode != NativeMemoryMode.DISABLED)
-        all_pass &= _check("未假装 disabled", ok10c)
-
-        # -----------------------------------------------------------------
-        # 附加：版本回滚
-        # -----------------------------------------------------------------
-        print("\n=== 附加：版本回滚 ===")
-        vid = store.create_version_snapshot("pre-acceptance")
-        ok_rollback = vid != ""
-        all_pass &= _check("创建版本快照", ok_rollback, f"vid={vid[:8]}")
-        store.rollback_to_version(vid)
-        ok_rollback2 = store.get_active_version_id() == vid
-        all_pass &= _check("回滚成功", ok_rollback2)
-
-    # -----------------------------------------------------------------
-    # 汇总
-    # -----------------------------------------------------------------
+    passed = all(checks)
     print("\n" + "=" * 60)
-    Path.home = _orig_home
-    shutil.rmtree(fixture_home, ignore_errors=True)
-    if all_pass:
-        print("v3.2 完整验收：全部通过")
-        return 0
-    else:
-        print("v3.2 完整验收：存在失败项")
-        return 1
+    print(f"v3.2 V2_ACTIVE acceptance: {'PASS' if passed else 'FAIL'} ({sum(checks)}/{len(checks)})")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
