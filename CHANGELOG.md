@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.7.0] - 2026-08-12 (local release acceptance passed; ready for commit/publish, not yet published)
+## [0.7.0] - 2026-08-12 (published to GitHub and PyPI; local release acceptance passed)
 
 ### Scope
 
@@ -29,7 +29,7 @@
   system control. Build, Knowledge, import, history, maintenance, release, and
   compatibility work use durable `TaskRun` status, bounded cancellation, and
   owned background-worker/process cleanup before shutdown.
-- Graphify metadata-only export feeds CodeGraph under trusted scope with source
+- Graphify metadata-only export feeds MemoryGuard's CodeGraph under trusted scope with source
   role, provenance, source maps, revisions, tombstones, outbox state, and
   bounded query/path/explain/affected operations. Source bodies are rejected.
 - Fail-closed state/scope/provenance/path/metadata checks, isolation, public
@@ -55,8 +55,7 @@
 
 ### Release state
 
-- Local release acceptance passed. v0.7.0 is ready for commit/publish, not yet
-  published.
+- Local release acceptance passed. v0.7.0 was published to GitHub and PyPI.
 - The acceptance result is local and receipt-backed. The Graphify evidence is
   intentionally limited to the focused `3 / 3` checks and the real
   full-repository export/projection; it is not an upstream Graphify

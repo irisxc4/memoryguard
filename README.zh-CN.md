@@ -34,11 +34,13 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.7.0 更新（V2-only；local release acceptance passed）
+## v0.7.0 更新（V2-only；已于 2026-08-12 发布）
 
-v0.7.0 是 V2-only。local release acceptance passed；ready for
-commit/publish, not yet published。本节说明本地验收结果。Graphify 结果是
-真实全仓 export/projection，不表示 upstream Graphify 的全仓测试套件通过。
+v0.7.0 是 V2-only。本地发布验收已通过，并于 2026-08-12 发布到 GitHub
+与 PyPI。MemoryGuard 自己拥有 CodeGraph 边界；Graphify 只是可选的提取
+Provider，不是第二套 MemoryGuard runtime，也不单独作为 MemoryGuard 包发布。
+本节说明发布边界与证据。Graphify 结果是真实全仓 export/projection，不表示
+upstream Graphify 的全仓测试套件通过。
 
 - **V1 runtime 已物理淘汰：** 生产入口导入闭包不再包含 V1 runtime/store
   模块。`V1_ACTIVE` 只是迁移起点，不是可运行 fallback；旧格式只允许由
@@ -66,9 +68,11 @@ commit/publish, not yet published。本节说明本地验收结果。Graphify �
 - **GUI 构建与后台收尾：** projection、Knowledge、import、history、maintenance、
   release、compatibility 使用持久 V2 `TaskRun`；状态可恢复，取消协作且有界，
   shutdown 前必须完成 owned worker/process 清理。
-- **CodeGraph / Graphify：** Graphify 只提供可信、无正文 metadata export；CodeGraph
-  保留 source role、provenance、source map、revision、tombstone、outbox，并提供
-  有界 query/path/explain/affected 与 production-only 过滤。
+- **CodeGraph / Graphify：** MemoryGuard 自己拥有可信、无正文的 CodeGraph adapter
+  与 projection；Graphify 只是提供 metadata-only export 的可选提取 Provider，不单独
+  发布成 MemoryGuard runtime。CodeGraph 保留 source role、provenance、source map、
+  revision、tombstone、outbox，并提供有界 query/path/explain/affected 与
+  production-only 过滤。
 - **安全与回滚：** unknown/corrupt state、缺失 scope、非法 provenance、reparse
   路径、不安全 metadata、过期幂等请求均 fail-closed。公共 receipt 脱敏正文和路径；
   governance/audit/outbox 保留决策。release rollback 通过有 scope 的 receipt 恢复
@@ -81,8 +85,8 @@ commit/publish, not yet published。本节说明本地验收结果。Graphify �
 - **最终制品证据：** clean wheel `206 files`、`legacy bad=0`；隔离包、CLI、MCP
   均报告 `0.7.0`；desktop help 通过。
 
-local release acceptance passed。v0.7.0 ready for commit/publish, not yet
-published。上述 Graphify 仅表示专项 `3 / 3` 与真实全仓 export/projection 通过，
+local release acceptance passed。v0.7.0 已于 2026-08-12 发布到 GitHub 与 PyPI。
+上述 Graphify 仅表示专项 `3 / 3` 与真实全仓 export/projection 通过，
 不表示 upstream Graphify 的全仓测试套件通过。详见
 [v0.7.0 发布记录](docs/releases/v0.7.0.md)。
 
@@ -416,7 +420,7 @@ MCP 服务提供：
 - **当前发布线：** V2-only runtime boundary、GUI Agent/Group control、持久 TaskRun、
   native governance/release、知识库文件/文件夹入库，以及可信 scope 的 CodeGraph
   query/path/explain/affected metadata projection。本地发布验收已通过；v0.7.0
-  ready for commit/publish, not yet published。
+  已于 2026-08-12 发布到 GitHub 与 PyPI。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
   export/projection；不表示 upstream Graphify 的全仓测试套件通过。
 - **发布后下一步：** 扩展 CodeGraph/Skills ingestion、维护报告和迁移可观测性。

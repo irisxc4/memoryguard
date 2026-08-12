@@ -40,9 +40,9 @@ main_acceptance = IN_PROGRESS
 | Phase 6 Governance | PASS | Governance native 53 项专项通过；相关 GUI blocker 全清零 |
 | Phase 7 History / Import / Maintenance / Hook | PASS | discover/backfill、import、GC、Hook mode/uninstall、raw/source preview、request compatibility 全部 native implemented |
 | Phase 8 GUI 状态机 | PASS | 持久 `TaskRun`、轮询、取消、恢复、统一错误/envelope 专项与全量回归通过 |
-| Phase 9 Graphify embedded GUI | **FUNCTIONAL PASS / PACKAGING BLOCKED** | embedded/provenance 测试 15 项通过；真实 GUI production-only semantic chain 完整；但当前 Graphify 目录仍是 sparse overlay，不是完整 upstream source checkout |
+| Phase 9 Graphify embedded GUI | **FUNCTIONAL PASS / OPTIONAL PROVIDER** | embedded/provenance 测试 15 项通过；真实 GUI production-only semantic chain 完整；Graphify 作为可选提取 Provider，MemoryGuard 自己负责 CodeGraph 接收与治理 |
 | Phase 10 CodeGraph | PASS | metadata-only adapter、schema v2、source role/provenance/source-map、query/path/explain/affected/update/status、GUI semantic cross-check 全部通过 |
-| Phase 11 回归 / 打包 | **RECORDED EVIDENCE / MAIN ACCEPTANCE IN PROGRESS** | 迁移候选曾记录 1761 测试通过、专项 gate 与干净 sdist→wheel；这些是历史候选证据，不是当前全仓全绿声明；发布仍等待主验收与 Graphify upstream source-tree package gate |
+| Phase 11 回归 / 打包 | **RELEASED** | v0.7.0 本地完整回归、专项 gate、干净制品检查通过，已发布到 GitHub/PyPI；Graphify 仅作为可选 Provider，不单独作为 MemoryGuard 制品发布 |
 
 ## Native coverage
 
@@ -69,8 +69,8 @@ registry / coverage digest：
 `45d1b85b4353532a843baf5da2a5e0752d2e7d60b9455ede6e69c8e39ddc3ee1`
 
 `NativeV2RuntimePort.coverage()` 的本地 coverage 布尔值只描述 native registry 本身，
-**不等同于本轮迁移计划的发布完成声明**。当前 Graphify upstream source/package
-硬门禁未通过，因此不得据此宣称 production complete。
+**不等同于 Graphify 独立包的发布声明**。MemoryGuard 的发布边界是自身的
+CodeGraph adapter/projection 与治理；Graphify 只在存在时提供 metadata-only export。
 
 ## V2-only 控制面与治理边界
 
@@ -231,8 +231,8 @@ receipt 和审计证据在发布门禁解除前不得清理。完整步骤见
 ## 当前发布结论与 release gate
 
 已有 V2 workspace 的 production activation 快照仍有效，本轮也没有重新开放 V1
-runtime fallback；**local release acceptance passed; ready for commit/publish, not yet
-published**。本地证据：`1761 / 1761`，无 skip/xfail；retirement+CodeGraph `15 / 15`；
+runtime fallback；**local release acceptance passed; published to GitHub/PyPI on
+2026-08-12**。本地证据：`1761 / 1761`，无 skip/xfail；retirement+CodeGraph `15 / 15`；
 Graphify 专项 `3 / 3`；canonical `ACCEPTED`；RuleMerge `46 / 46`；v3.2 `27 / 27`；
 真实全仓 Graphify export/projection：`486 files / 11672 nodes / 38714 edges → 11667
 canonical symbols / 38714 edges`，query/path/affected 通过，失败原子性全 `0`；clean
@@ -252,13 +252,14 @@ Graphify 证据仅指专项与真实全仓导出/投影，不声称 upstream Gra
 4. **GUI/Knowledge/Runtime：** Agent 名称/实例、Binding/Group 成员管理、文件/文件夹
    Knowledge、TaskRun status/cancel/recovery，以及 cancel/shutdown 后无 owned worker/
    process 残留均有验收证据。
-5. **CodeGraph/Graphify：** metadata-only、body-free、provenance/source-map/revision/
-   tombstone/outbox、production filter 与 query/path/explain/affected 通过；在完整
-   upstream Graphify source checkout 中完成同等改动、其测试、package/install 验证。
+5. **CodeGraph/Graphify：** MemoryGuard 的 metadata-only、body-free、provenance/
+   source-map/revision/tombstone/outbox、production filter 与 query/path/explain/affected
+   通过；可选 Graphify Provider 的 metadata export 只作为输入，不改变 MemoryGuard
+   的 CodeGraph 治理边界，也不形成第二个 MemoryGuard 包。
 6. **安全与主验收：** fail-closed、scope isolation、audit、rollback/hold/occurrence、
    upgrade-from-0.6.2 与支持矩阵 CI 全部通过并有 receipt。
 
-当前 `H:/ai/workspace/graphify` 仍是已验证功能的 sparse overlay，没有完整 upstream
-source checkout / `.git` / `pyproject.toml`；不得改已安装 `site-packages/graphify`
-代替该门禁。门禁通过前不得删除迁移备份、清理 legacy 审计证据、手工改 manifest，也
-不得把局部 native coverage 包装成 `production_complete=true`，更不得声称当前全仓已全绿。
+Graphify Provider 的独立仓库版本和安装由其上游项目自行管理；MemoryGuard 不把它
+作为自己的独立发布制品。后续 MemoryGuard 版本仍不得删除迁移备份、清理 legacy
+审计证据、手工改 manifest，也不得把局部 native coverage 包装成
+`production_complete=true`。

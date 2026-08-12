@@ -36,11 +36,13 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.0 (V2-only; local release acceptance passed)
+## What's New in v0.7.0 (V2-only; published 2026-08-12)
 
-v0.7.0 is V2-only. Local release acceptance passed; it is ready for
-commit/publish, not yet published. The boundary and evidence below describe the
-local acceptance result. The Graphify result is a real full-repository
+v0.7.0 is V2-only. Local release acceptance passed and the release was
+published to GitHub and PyPI on 2026-08-12. MemoryGuard owns the CodeGraph
+boundary; Graphify is an optional extraction provider, not a second MemoryGuard
+runtime or a separate MemoryGuard package. The boundary and evidence below
+describe the release. The Graphify result is a real full-repository
 export/projection result, not a claim that upstream Graphify's full-repository
 test suite passed.
 
@@ -78,10 +80,12 @@ test suite passed.
   maintenance, release, and compatibility work use durable V2 `TaskRun`
   status. Status survives reload, cancellation is cooperative and bounded, and
   owned background workers/process cleanup must finish before shutdown.
-- **CodeGraph / Graphify:** Graphify contributes a trusted, body-free metadata
-  export only. CodeGraph preserves source role, provenance, source maps,
-  revisions, tombstones, and outbox state, and exposes bounded
-  query/path/explain/affected operations with production-only filtering.
+- **CodeGraph / Graphify:** MemoryGuard owns the trusted, body-free CodeGraph
+  adapter and projection. Graphify is an optional extraction provider that
+  supplies metadata-only exports; it is not a separate MemoryGuard runtime or
+  package. CodeGraph preserves source role, provenance, source maps, revisions,
+  tombstones, and outbox state, and exposes bounded query/path/explain/affected
+  operations with production-only filtering.
 - **Security and rollback:** unknown/corrupt state, missing scope, invalid
   provenance, reparse paths, unsafe metadata, and stale idempotency fail closed.
   Public receipts redact source bodies and paths; governance/audit/outbox
@@ -97,8 +101,8 @@ test suite passed.
 - **Final packaging evidence:** clean wheel `206 files`, `legacy bad=0`;
   isolated package, CLI, and MCP all reported `0.7.0`; desktop help passed.
 
-Local release acceptance passed. v0.7.0 is ready for commit/publish, not yet
-published. These Graphify results cover the focused checks and the real
+Local release acceptance passed. v0.7.0 was published to GitHub and PyPI on
+2026-08-12. These Graphify results cover the focused checks and the real
 full-repository export/projection only; they do not claim upstream Graphify's
 full-repository tests passed. See [the v0.7.0 release record](docs/releases/v0.7.0.md).
 
@@ -608,7 +612,7 @@ the installed version.
   Agent/Group control, durable TaskRun lifecycle, native governance/release
   flows, Knowledge file/folder ingestion, and trusted-scope CodeGraph
   query/path/explain/affected metadata projection. Local release acceptance
-  passed; v0.7.0 is ready for commit/publish, not yet published.
+  passed; v0.7.0 was published to GitHub and PyPI on 2026-08-12.
 - **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result
   plus the real full-repository export/projection described above. It does not
   claim that upstream Graphify's full-repository test suite passed.
