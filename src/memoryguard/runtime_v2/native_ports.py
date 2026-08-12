@@ -4490,7 +4490,14 @@ class NativeV2RuntimePort:
         del payload
         group = _text(context.get("share_group_id"))
         if not group:
-            raise NativePortError("native_scope_required")
+            # This is one of the four neutral diagnostics that may run before
+            # an Agent binding exists.  Do not inspect a global canonical row;
+            # report only that the scoped source is unavailable.
+            return {
+                "status": "NO_SOURCE",
+                "share_group_id": "",
+                "canonical_state": "unbound",
+            }
         if not self.layout.rules_db.is_file():
             return {"status": "NO_SOURCE", "share_group_id": group, "canonical_state": "absent"}
         try:
