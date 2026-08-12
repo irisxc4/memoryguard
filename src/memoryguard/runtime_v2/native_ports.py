@@ -103,6 +103,17 @@ _PHASE9_GUI_HANDLERS = frozenset({
 })
 _PHASE9_GUI_READ_HANDLERS = _PHASE9_GUI_HANDLERS - {"history_delete"}
 
+# These MCP reads intentionally expose only aggregate/availability
+# diagnostics.  They must remain usable before a host Agent binding exists;
+# all scoped reads and every mutation still require the process-issued native
+# context below.
+_NEUTRAL_MCP_READS = frozenset({
+    "memoryguard_canonical_status",
+    "memoryguard_diagnostics_snapshot",
+    "memoryguard_projection_status",
+    "memoryguard_runtime_processes",
+})
+
 
 # Native mutation is allowed to open a writable store only after this
 # read-only contract has passed.  The phase-2 stores intentionally keep their
@@ -5906,15 +5917,24 @@ class NativeV2RuntimePort:
             if surface == "mcp" and name == "memoryguard_provider_install" and "provider" in raw_payload:
                 raw_payload = dict(raw_payload)
                 raw_payload["target_provider"] = raw_payload.pop("provider")
+            neutral_mcp_read = (
+                surface == "mcp"
+                and not effective_mutation
+                and name in _NEUTRAL_MCP_READS
+            )
             trusted = self._context(
                 context,
                 raw_payload,
-                required=effective_mutation or surface in {"mcp", "gui", "hook"},
+                required=(
+                    effective_mutation
+                    or surface in {"gui", "hook"}
+                    or (surface == "mcp" and not neutral_mcp_read)
+                ),
                 allow_partial=(
                     surface == "cli" and spec.handler == "maintenance"
                 ) or (
                     surface == "gui" and spec.handler in _PHASE9_GUI_READ_HANDLERS
-                ),
+                ) or neutral_mcp_read,
             )
             # MaintenanceRuntimePort owns a separate private CLI capability
             # and validates it at its own boundary.  Do not require the MCP/

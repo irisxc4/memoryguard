@@ -397,7 +397,7 @@ class TestSelectionTree:
 class TestScopeWriteback:
     """场景9：选择后 scope 正确写入 SourceRoot。"""
 
-    def test_commit_selection_writes_scope(self, temp_workspace):
+    def test_commit_selection_writes_scope(self, temp_workspace, monkeypatch):
         """选择提交后 scope 由 V2 discovery tree 保持，并写入 connector selection。
 
         先尝试默认选中的文件（import_verbatim），若没有则手动选中所有 found 文件，
@@ -407,6 +407,46 @@ class TestScopeWriteback:
         from memoryguard.content.store import ContentStore, stable_id
         from memoryguard.runtime_v2.agent_native import AgentNativeService
         from memoryguard.runtime_v2.group_native import GroupControlService
+        from memoryguard.schema_v3 import AgentInstance, DiscoveryLedger, TargetCapability
+
+        # CI runners do not have the user's installed Agent directories.  The
+        # selection contract is about deterministic discovery-tree writeback,
+        # so provide one synthetic native-memory surface instead of depending
+        # on host state.
+        source_root = temp_workspace / "synthetic-agent-memory"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "MEMORY.md").write_text(
+            "deterministic CI memory fixture\n", encoding="utf-8",
+        )
+        instance = AgentInstance(
+            instance_id="ci-agent-instance",
+            profile_id="ci-agent@profile-1",
+            product="ci-agent",
+            profile_version="1",
+            platform="test",
+            host_id="ci",
+            workspace=str(temp_workspace),
+            surfaces=[{
+                "surface_id": "ci-native-memory",
+                "resolved_path": str(source_root / "MEMORY.md"),
+                "status": "found",
+                "scope": "user",
+                "category": "native_memory",
+                "ingestion_policy": "import_verbatim",
+                "ownership": "agent_managed",
+                "target_role": "takeover_input",
+                "classification_confidence": 1.0,
+            }],
+            target_capability=TargetCapability.EXPORT_ONLY,
+        )
+        monkeypatch.setattr(
+            AgentLocator,
+            "detect_instances",
+            lambda self: (
+                [instance],
+                {instance.instance_id: DiscoveryLedger(instance_id=instance.instance_id)},
+            ),
+        )
 
         service = AgentNativeService(temp_workspace)
         ctx = DetectionContext.from_workspace(temp_workspace)
