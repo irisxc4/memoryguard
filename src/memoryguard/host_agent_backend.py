@@ -21,6 +21,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,7 @@ from .rule_reconciliation import (
     build_bundles,
     validate_bundles,
 )
+from .runtime_v2.task_coordinator import TaskCancelled
 
 
 def _hidden_subprocess_kwargs() -> dict[str, Any]:
@@ -368,14 +371,144 @@ def _call_cli(agent: str, cli_path: str, prompt: str, timeout: int = 60) -> str:
     return ""
 
 
-def _call_llm_json(agent: str, cli_path: str, system_prompt: str, user_prompt: str,
-                   timeout: int = 60, expect_array: bool = False) -> dict | list | None:
-    """调用 CLI 并解析 JSON 输出。
+def _cli_command(agent: str, cli_path: str, prompt: str) -> tuple[list[str], str | None]:
+    """Return ``(command_list, stdin_payload_or_None)`` for one agent CLI.
 
-    P1-6: 增强数组解析 -- expect_array=True 时优先找 [ 开头的 JSON。
+    ``codex`` reads the prompt from stdin; every other engine receives it as a
+    positional argument.  Keeping this in one place lets both the blocking and
+    cancellable callers share identical argv construction.
     """
+    if agent == "codex":
+        return [cli_path, "exec", "--skip-git-repo-check", "-"], prompt
+    if agent == "claude":
+        return [cli_path, "--print", prompt], None
+    if agent == "cursor":
+        return [cli_path, "-p", "--force", "--output-format", "text", prompt], None
+    if agent == "trae":
+        return [cli_path, "chat", "--print", prompt], None
+    return [cli_path], None
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    """Best-effort terminate, then bounded kill, of an owned subprocess."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _run_cli_cancellable(
+    cmd: list[str],
+    prompt: str | None,
+    *,
+    timeout: int = 60,
+    execution: Any = None,
+) -> str:
+    """Run one CLI as an owned subprocess that observes TaskExecution cancellation.
+
+    ``subprocess.communicate`` runs on a reader thread; the caller polls it and
+    can terminate (then bounded-kill) the child the moment ``execution`` is
+    cancelled.  The termination routine is also registered as owned cleanup so
+    a cancellation observed elsewhere in the worker still releases the child.
+    """
+    hidden = _hidden_subprocess_kwargs()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        **hidden,
+    )
+    if execution is not None:
+        execution.own_cleanup(lambda: _terminate_proc(proc))
+
+    output: dict[str, str] = {}
+    failure: dict[str, BaseException] = {}
+
+    def _communicate() -> None:
+        try:
+            # One owner controls the deadline: the polling loop below.  Giving
+            # communicate() its own equal timeout creates a race where its
+            # TimeoutExpired can win and return while the child is still alive.
+            out, err = proc.communicate(input=prompt or "")
+            output["text"] = out or ""
+            output["err"] = err or ""
+        except BaseException as exc:  # noqa: BLE001 - reader must always finish
+            failure["exc"] = exc
+
+    reader = threading.Thread(target=_communicate, name="memoryguard-cli-reader", daemon=True)
+    reader.start()
+    deadline = time.monotonic() + max(float(timeout), 1.0)
+    try:
+        while reader.is_alive():
+            if execution is not None and execution.cancelled:
+                _terminate_proc(proc)
+                reader.join(timeout=1.0)
+                raise TaskCancelled("cli_subprocess_cancelled")
+            if time.monotonic() > deadline:
+                _terminate_proc(proc)
+                reader.join(timeout=1.0)
+                raise TimeoutError("cli_subprocess_timeout")
+            time.sleep(0.03)
+    except BaseException:
+        _terminate_proc(proc)
+        reader.join(timeout=1.0)
+        raise
+    if failure:
+        raise failure["exc"]
+    text = output.get("text", "")
+    if not text.strip() and output.get("err"):
+        # 部分版本把结果打到 stderr；仍尽量返回
+        err = output["err"].strip()
+        if err and not err.lower().startswith("error"):
+            return err
+    return text
+
+
+def _call_cli_cancellable(
+    agent: str,
+    cli_path: str,
+    prompt: str,
+    timeout: int = 60,
+    execution: Any = None,
+) -> str:
+    """Cancellable equivalent of :func:`_call_cli`."""
+    cmd, stdin_payload = _cli_command(agent, cli_path, prompt)
+    return _run_cli_cancellable(cmd, stdin_payload, timeout=timeout, execution=execution)
+
+
+def _call_llm_json_cancellable(
+    agent: str,
+    cli_path: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int = 60,
+    expect_array: bool = False,
+    execution: Any = None,
+) -> dict | list | None:
+    """Cancellable JSON CLI call; same parsing contract as :func:`_call_llm_json`."""
     full_prompt = f"{system_prompt}\n\n{user_prompt}\n\n请只返回 JSON,不要其他内容。"
-    output = _call_cli(agent, cli_path, full_prompt, timeout)
+    output = _call_cli_cancellable(agent, cli_path, full_prompt, timeout, execution=execution)
+    return _parse_llm_json(output or "", expect_array=expect_array)
+
+
+def _parse_llm_json(output: str, expect_array: bool = False) -> dict | list | None:
+    """Parse a raw CLI text output into JSON (array or object).
+
+    P1-6: ``expect_array=True`` prefers a ``[``-led JSON array, scanning from
+    the last line first so trailing logging does not defeat batch parsing.
+    """
     if not output:
         return None
 
@@ -414,6 +547,17 @@ def _call_llm_json(agent: str, cli_path: str, system_prompt: str, user_prompt: s
         return json.loads(output)
     except json.JSONDecodeError:
         return None
+
+
+def _call_llm_json(agent: str, cli_path: str, system_prompt: str, user_prompt: str,
+                   timeout: int = 60, expect_array: bool = False) -> dict | list | None:
+    """调用 CLI 并解析 JSON 输出。
+
+    P1-6: 增强数组解析 -- expect_array=True 时优先找 [ 开头的 JSON。
+    """
+    full_prompt = f"{system_prompt}\n\n{user_prompt}\n\n请只返回 JSON,不要其他内容。"
+    output = _call_cli(agent, cli_path, full_prompt, timeout)
+    return _parse_llm_json(output or "", expect_array=expect_array)
 
 
 # ---------------------------------------------------------------------------
@@ -484,11 +628,15 @@ def batch_enrich_via_cli(
     agent: str = "",
     cli_path: str = "",
     workspace: str | Path | None = None,
+    execution: Any = None,
 ) -> list[dict]:
     """批量通过 CLI 处理 pending enrichment tasks。
 
     将多条 task 合并成一个 prompt,让 LLM 一次处理,减少 CLI 启动开销。
     返回 apply_results 所需的 results 列表。
+
+    ``execution`` (TaskExecution) 传入时，CLI 子进程变为可取消的 owned 子进程：
+    取消会终止/杀灭该进程，绝不留下孤儿命令行窗口或 CLI 进程。
     """
     if not tasks:
         return []
@@ -529,8 +677,14 @@ def batch_enrich_via_cli(
             })
 
         batch_user = json.dumps(items, ensure_ascii=False, indent=2)
-        # P1-6: expect_array=True
-        data = _call_llm_json(agent, cli_path, system, batch_user, timeout=120, expect_array=True)
+        # P1-6: expect_array=True；GUI 后台任务走可取消子进程
+        if execution is not None:
+            data = _call_llm_json_cancellable(
+                agent, cli_path, system, batch_user, timeout=120,
+                expect_array=True, execution=execution,
+            )
+        else:
+            data = _call_llm_json(agent, cli_path, system, batch_user, timeout=120, expect_array=True)
         if not data or not isinstance(data, list):
             import logging
             logging.getLogger("memoryguard").warning(

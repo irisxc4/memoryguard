@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -26,11 +27,96 @@ from memoryguard.cutover_v2.facade import (  # noqa: E402
 )
 from memoryguard.cutover_v2.surfaces import CLI_COMMAND_NAMES  # noqa: E402
 from memoryguard.gui import SafeBridgeApi, _dispatch_gui_api_call, _redact_gui_paths  # noqa: E402
+from memoryguard.runtime_v2.native_ports import (  # noqa: E402
+    NativeV2RuntimePort,
+    bind_native_transport_context,
+)
 from memoryguard.cli import (  # noqa: E402
     _cli_workspace,
     _resolve_gui_workspace,
     build_parser,
+    main as cli_main,
 )
+from memoryguard.mcp_server import _resolve_memory_workspace  # noqa: E402
+from memoryguard.memory import MemoryAtomStore  # noqa: E402
+from memoryguard.evidence.store import EvidenceStore  # noqa: E402
+from memoryguard.governance_v2 import GovernanceV2  # noqa: E402
+from memoryguard.runtime_v2.group_native import GroupControlService  # noqa: E402
+from memoryguard.storage.layout import WorkspaceV2Layout  # noqa: E402
+from memoryguard.storage.schema import initialize_all  # noqa: E402
+from memoryguard.system.manifest import ManifestManager, ManifestState  # noqa: E402
+
+
+def test_webview_file_picker_passes_filter_items_not_pipe_joined_string(tmp_path, monkeypatch):
+    selected = tmp_path / "bundle.zip"
+    selected.write_bytes(b"fixture")
+    calls = []
+
+    class Window:
+        def create_file_dialog(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return [str(selected)]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "webview",
+        SimpleNamespace(OPEN_DIALOG="open", FOLDER_DIALOG="folder"),
+    )
+    result = gui._pick_path_with_dialog(Window(), for_files=True)
+
+    assert result["path"] == str(selected.resolve())
+    assert calls and calls[0][0] == ("open",)
+    filters = calls[0][1]["file_types"]
+    assert isinstance(filters, tuple)
+    assert filters == (
+        "All files (*.*)",
+        "Zip files (*.zip)",
+        "JSON files (*.json)",
+        "JSONL files (*.jsonl)",
+    )
+
+
+def test_agent_residual_queries_use_agent_route_without_source_binding_gate():
+    assert "get_residual_cleanup" not in gui._GUI_SOURCE_READS
+    assert "get_agent_data" not in gui._GUI_SOURCE_READS
+
+
+def test_unbound_agent_residual_query_requires_trusted_process_only(tmp_path):
+    """Residual inspection must work before an Agent has a memory binding."""
+    from memoryguard.access_context import AccessContext
+
+    class AgentService:
+        def residual_cleanup(self, *, instance_id="", candidate_id=""):
+            return {
+                "ok": True,
+                "status": "succeeded",
+                "instance_id": instance_id,
+                "candidate_id": candidate_id,
+                "items": [],
+            }
+
+    port = NativeV2RuntimePort(tmp_path)
+    port._agent_native_service = AgentService()
+    access = AccessContext(
+        trusted_agent_id="unbound-agent",
+        is_admin=False,
+        strict_binding=True,
+        allow_anon=False,
+        session_id="unbound-session",
+        session_source="transport",
+        session_trusted=True,
+    )
+    context = bind_native_transport_context(access, workspace_id=str(tmp_path))
+    result = port.dispatch_gui(
+        "get_residual_cleanup",
+        ["unbound-agent"],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+
+    assert result["ok"] is True
+    assert result["data"]["instance_id"] == "unbound-agent"
 
 
 class Manifest:
@@ -309,41 +395,102 @@ def test_cli_snapshot_matches_all_commands_and_namespace_subactions_survive(tmp_
     assert v2.calls[0][2].apply is False
 
 
-def test_bare_gui_uses_current_project_workspace_and_supports_workspace_flag(tmp_path, monkeypatch):
-    (tmp_path / ".memoryguard").mkdir()
-    monkeypatch.chdir(tmp_path)
+def test_bare_gui_uses_global_control_workspace_and_supports_workspace_flag(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    data_home = tmp_path / "global-home"
+    (project / ".memoryguard").mkdir(parents=True)
+    (data_home / ".memoryguard").mkdir(parents=True)
+    monkeypatch.chdir(project)
     monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
-    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
 
     parser = build_parser()
     bare = parser.parse_args(["gui"])
-    flagged = parser.parse_args(["gui", "--workspace", str(tmp_path)])
+    flagged = parser.parse_args(["gui", "--workspace", str(project)])
 
-    assert _resolve_gui_workspace([]) == tmp_path.resolve()
-    assert _cli_workspace(bare) == tmp_path.resolve()
-    assert _cli_workspace(flagged) == tmp_path.resolve()
+    assert _resolve_gui_workspace([]) == data_home.resolve()
+    assert _cli_workspace(bare) == data_home.resolve()
+    assert _cli_workspace(flagged) == project.resolve()
 
 
-def test_bare_gui_skips_v1_parent_and_discovers_v2_child(tmp_path, monkeypatch):
-    from memoryguard import cli
+def test_bare_gui_does_not_switch_to_nearby_project_database(tmp_path, monkeypatch):
+    root = tmp_path / "tools"
+    child = root / "memoryguard"
+    data_home = tmp_path / "global-home"
+    (root / ".memoryguard").mkdir(parents=True)
+    (child / ".memoryguard").mkdir(parents=True)
+    (data_home / ".memoryguard").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
 
+    assert _resolve_gui_workspace([]) == data_home.resolve()
+
+
+def _activate_v2_workspace(root: Path) -> None:
+    layout = WorkspaceV2Layout(root)
+    initialize_all(layout)
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    manager = ManifestManager(root)
+    manager.transition(ManifestState.V2_BUILDING, migration_id="workspace-resolver-repro")
+    manager.transition(
+        ManifestState.V2_READY,
+        source_digest="resolver-source",
+        target_digest="resolver-target",
+        manifest_digest="resolver-manifest",
+        digests={"validator_passed": True, "checkpoints": {"resolver": True}},
+    )
+    assert manager.transition(ManifestState.V2_ACTIVE).state is ManifestState.V2_ACTIVE
+
+
+def test_bare_control_cli_uses_global_data_home(tmp_path, monkeypatch):
+    root = tmp_path / "tools"
+    child = root / "memoryguard"
+    data_home = tmp_path / "global-home"
+    (root / ".memoryguard").mkdir(parents=True)
+    child.mkdir()
+    _activate_v2_workspace(child)
+    _activate_v2_workspace(data_home)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+    args = build_parser().parse_args(["doctor"])
+
+    assert _cli_workspace(args) == data_home.resolve()
+
+
+def test_bare_mcp_skips_v1_parent_and_discovers_v2_child(tmp_path, monkeypatch):
     root = tmp_path / "tools"
     child = root / "memoryguard"
     (root / ".memoryguard").mkdir(parents=True)
-    (child / ".memoryguard").mkdir(parents=True)
+    child.mkdir()
+    _activate_v2_workspace(child)
     monkeypatch.chdir(root)
     monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
-    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
 
-    states = {
-        root.resolve(): ("V1_ACTIVE", 0, object()),
-        child.resolve(): ("V2_ACTIVE", 11, object()),
-    }
-    monkeypatch.setattr(cli, "_cli_manifest_snapshot", lambda path: states.get(
-        Path(path).resolve(), ("UNKNOWN", None, None),
-    ))
+    assert _resolve_memory_workspace({}) == child.resolve()
 
-    assert _resolve_gui_workspace([]) == child.resolve()
+
+def test_bare_upgrade_uses_global_data_home_from_unrelated_directory(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "tools"
+    child = root / "memoryguard"
+    data_home = tmp_path / "global-home"
+    (root / ".memoryguard").mkdir(parents=True)
+    child.mkdir()
+    _activate_v2_workspace(child)
+    _activate_v2_workspace(data_home)
+    monkeypatch.chdir(root)
+    monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+    assert cli_main(["upgrade"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "already_active"
+    assert Path(payload["workspace"]) == data_home.resolve()
 
 
 @pytest.mark.parametrize(

@@ -80,6 +80,13 @@ class NativeRuleLifecycleService:
         self.workspace = Path(workspace).expanduser().resolve()
         self.store = RuleV2Store(self.workspace)
 
+    def _settle_canonical(self, group: str) -> dict[str, Any]:
+        from ..rule_reconciliation import settle_native_canonical_snapshot
+
+        return settle_native_canonical_snapshot(
+            self.workspace, group, store=self.store,
+        )
+
     def _context(self, raw: Any, *, automatic: bool) -> tuple[Any, RuleMutationContext]:
         try:
             authority = resolve_native_transport_context(raw)
@@ -220,6 +227,10 @@ class NativeRuleLifecycleService:
             raise NativeRuleLifecycleError("invalid_rule_priority")
         key, fingerprint, replay = self._replay("rule_create_auto", payload, trusted)
         if replay is not None:
+            # A prior write may have committed before snapshot publication.
+            # Idempotent replay is also the repair path for that narrow crash
+            # window; never report success while canonical reads remain stale.
+            self._settle_canonical(trusted.group)
             return replay
         kind = str(payload.get("kind") or "procedure")
         now = _now()
@@ -286,6 +297,31 @@ class NativeRuleLifecycleService:
                 "created_at": now,
             })
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=persisted.definition_id)
+            source_id = "decision:" + decision_id
+            source_ref = "native-v2:mcp:rule_create_auto:" + decision_id
+            self.store.upsert_source_link(
+                source_kind="native-rule-lifecycle",
+                share_group_id=trusted.group,
+                memory_id=source_id,
+                source_ref=source_ref,
+                original_definition_id=persisted.definition_id,
+                canonical_definition_id=persisted.definition_id,
+                status="active",
+                created_at=now,
+                updated_at=now,
+            )
+            self.store.record_evidence_ref({
+                "evidence_id": stable_digest(("native-rule-lifecycle", decision_id)),
+                "definition_id": persisted.definition_id,
+                "source_rule_id": source_id,
+                "share_group_id": trusted.group,
+                "evidence_ref": source_ref,
+                "content_digest": persisted.semantic_hash,
+                "authority": "governed-lifecycle",
+                "status": "active",
+                "created_at": now,
+            })
+            self._settle_canonical(trusted.group)
         decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
         return self._decision_result(decision, definition_id=definition.definition_id, binding_id=binding_id, undo_id=undo_id)
 
@@ -447,6 +483,7 @@ class NativeRuleLifecycleService:
         clean_payload = {"decision_id": str(original.get("decision_id") or ""), "undo_id": str(original.get("undo_id") or ""), "idempotency_key": payload.get("idempotency_key", "")}
         key, fingerprint, replay = self._replay("rule_undo", clean_payload, trusted)
         if replay is not None:
+            self._settle_canonical(trusted.group)
             return replay
         now = _now()
         original_after = _object(original.get("after_json"))
@@ -526,6 +563,7 @@ class NativeRuleLifecycleService:
                 "created_at": now,
             })
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=new_decision_id, memory_id=str(original.get("rule_id") or ""))
+            self._settle_canonical(trusted.group)
         decision = self.store.get_decision(new_decision_id) or {"decision_id": new_decision_id}
         return self._decision_result(decision, compensation=compensation)
 
@@ -586,6 +624,7 @@ class NativeRuleLifecycleService:
         }
         key, fingerprint, replay = self._replay("rule_exception_create", clean_payload, trusted)
         if replay is not None:
+            self._settle_canonical(trusted.group)
             decision = replay.get("decision") or {}
             try:
                 after = _object(decision.get("after_json"))
@@ -723,6 +762,7 @@ class NativeRuleLifecycleService:
                 "source_group_id": trusted.group,
                 "payload_json": _json({"exception_id": exception_id, "parent_rule_id": parent_id}),
                 "created_at": now,
+                "consumed_at": now,
             })
             self.store.append_domain_outbox({
                 "event_id": stable_digest(("rule-exception-domain-event", exception_id)),
@@ -734,8 +774,33 @@ class NativeRuleLifecycleService:
                 "payload_digest": stable_digest(after),
                 "payload_json": _json({"exception_id": exception_id, "definition_id": child.definition_id}),
                 "created_at": now,
+                "consumed_at": now,
+            })
+            source_id = "exception:" + exception_id
+            self.store.upsert_source_link(
+                source_kind="rule_exception",
+                share_group_id=trusted.group,
+                memory_id=source_id,
+                source_ref=source_ref,
+                original_definition_id=child.definition_id,
+                canonical_definition_id=child.definition_id,
+                status="active",
+                created_at=now,
+                updated_at=now,
+            )
+            self.store.record_evidence_ref({
+                "evidence_id": evidence_id,
+                "definition_id": child.definition_id,
+                "source_rule_id": source_id,
+                "share_group_id": trusted.group,
+                "evidence_ref": source_ref,
+                "content_digest": child.semantic_hash,
+                "authority": "governed-lifecycle",
+                "status": "active",
+                "created_at": now,
             })
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=parent_id)
+            self._settle_canonical(trusted.group)
         decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
         return self._decision_result(
             decision,
@@ -754,6 +819,7 @@ class NativeRuleLifecycleService:
         clean_payload = {"exception_id": exception_id}
         key, fingerprint, replay = self._replay("rule_exception_revoke", clean_payload, trusted)
         if replay is not None:
+            self._settle_canonical(trusted.group)
             return {**replay, "exception_id": exception_id}
         with self.store.transaction() as conn:
             row = conn.execute("SELECT * FROM rule_exceptions WHERE exception_id=?", (exception_id,)).fetchone()
@@ -820,8 +886,10 @@ class NativeRuleLifecycleService:
                 "payload_digest": stable_digest(after),
                 "payload_json": _json({"exception_id": exception_id}),
                 "created_at": now,
+                "consumed_at": now,
             })
             self._record_fence(key=key, fingerprint=fingerprint, context=trusted, decision_id=decision_id, memory_id=parent_id)
+            self._settle_canonical(trusted.group)
         decision = self.store.get_decision(decision_id) or {"decision_id": decision_id}
         return self._decision_result(decision, exception_id=exception_id, revoked=True)
 

@@ -808,7 +808,10 @@ class TestSafeBridgeApi:
         _activate_v2(tmp_path, "security-sandbox")
         monkeypatch.setattr(security, "detect_sandbox_mode", lambda: True)
 
-        api = SafeBridgeApi(str(tmp_path), direct_mutations=True)
+        # Sandbox detection happens once when the transport constructs its
+        # bridge.  A sandbox bridge has no direct-mutation capability; ambient
+        # IDE variables cannot later override a trusted desktop bridge.
+        api = SafeBridgeApi(str(tmp_path), direct_mutations=False)
         result = api.request_mutation(
             "bind_agents_to_shared_group",
             [["sandbox-agent-a", "sandbox-agent-b"], "sandbox-group"],

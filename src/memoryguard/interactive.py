@@ -828,6 +828,39 @@ function escapeHtml(value) {
     .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
 }
 
+function finiteNumber(value, fallback = 0) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+// SafeBridge redacts filesystem paths into descriptors before they reach the
+// browser.  Every display path must pass this adapter; never call String or
+// split directly on a path-bearing API field.
+function guiPathText(value, fallback = '') {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') {
+    for (const key of ['summary', 'display_name', 'relative_path', 'name', 'ref']) {
+      if (typeof value[key] === 'string' && value[key]) return value[key];
+    }
+    return fallback;
+  }
+  return value == null ? fallback : String(value);
+}
+
+function guiPathLabel(value, fallback = '受保护来源') {
+  const text = guiPathText(value, fallback).replaceAll('\\\\', '/');
+  const parts = text.split('/').filter(Boolean);
+  return parts.slice(-2).join('/') || fallback;
+}
+
+function agentCapabilityLabel(value) {
+  return ({
+    export_only: '可接入 MemoryGuard 层',
+    mcp: '支持 MCP',
+    native_takeover: '支持原生接管',
+  })[String(value || '')] || String(value || '能力待确认');
+}
+
 function setReaderLanguage(language) {
   readerLanguage = language;
   localStorage.setItem('memoryguard.readerLanguage', language);
@@ -910,6 +943,45 @@ function normalizeApiResult(raw) {
   return merged;
 }
 
+function normalizeAuditReport(raw) {
+  const report = raw && typeof raw === 'object' ? {...raw} : {};
+  const blockers = Array.isArray(report.blockers) ? report.blockers : [];
+  const findings = Array.isArray(report.findings) ? report.findings : blockers.map((blocker, index) => {
+    const code = blocker.code || 'reference_audit_blocker';
+    const domain = blocker.domain || 'runtime';
+    const table = blocker.table || '';
+    return {
+      id: blocker.finding_id || `v2-audit-${index}-${code}`,
+      severity: 'high',
+      rule_id: code,
+      evidence: `${domain}${table ? ' / ' + table : ''}`,
+      dimension: 'reference audit',
+      surface: domain,
+      location: {path: table || domain, span: [1, 1]},
+      impact: 'V2 参考审计未通过，当前结果不能作为完整健康证明。',
+      suggestion: '先处理审计阻塞项，再重新扫描验证。',
+      confidence: 1,
+      fixable: false,
+    };
+  });
+  const summary = report.summary && typeof report.summary === 'object' ? {...report.summary} : {};
+  const rawHealth = finiteNumber(report.health_score, NaN);
+  const status = String(report.status || '').toUpperCase();
+  const health = Number.isFinite(rawHealth)
+    ? Math.max(0, Math.min(100, rawHealth))
+    : (status === 'PASS' || status === 'READY' || (status === 'OK' && !report.blocked) ? 100 : 0);
+  summary.object_count = finiteNumber(summary.object_count, finiteNumber(report.reference_count, 0));
+  summary.invisible_count = finiteNumber(summary.invisible_count, 0);
+  summary.finding_count_by_severity = summary.finding_count_by_severity || (findings.length ? {high: findings.length} : {});
+  report.workspace = guiPathText(report.workspace, '');
+  report.generated_at = report.generated_at || report.completed_at || '';
+  report.findings = findings;
+  report.invisible = Array.isArray(report.invisible) ? report.invisible : [];
+  report.summary = summary;
+  report.health_score = health;
+  return report;
+}
+
 function apiErrorMessage(result, fallback = '操作失败') {
   if (!result) return fallback;
   const error = result.error;
@@ -958,7 +1030,10 @@ async function callApi(method, ...args) {
     if (!resp.ok) throw new Error(apiErrorMessage(body, 'API ' + method + ' 返回 ' + resp.status));
     raw = body;
   }
-  return normalizeApiResult(raw);
+  const normalized = normalizeApiResult(raw);
+  return method === 'get_audit' || method === 'run_audit'
+    ? normalizeAuditReport(normalized)
+    : normalized;
 }
 
 function sleepMs(ms) {
@@ -1199,14 +1274,16 @@ if (action === 'history-backfill') return runHistoryBackfill();
 function renderAll() {
   if (!state.report) return;
   const r = state.report;
-  document.getElementById('ws-path').textContent = r.workspace;
+  const findings = Array.isArray(r.findings) ? r.findings : [];
+  const health = Math.max(0, Math.min(100, finiteNumber(r.health_score, 0)));
+  document.getElementById('ws-path').textContent = guiPathText(r.workspace, '');
   const badge = document.getElementById('health-badge');
   document.getElementById('reader-auto')?.classList.toggle('active', readerLanguage === 'auto');
   document.getElementById('reader-zh')?.classList.toggle('active', readerLanguage === 'zh');
   document.getElementById('reader-en')?.classList.toggle('active', readerLanguage === 'en');
-  badge.textContent = '健康度 ' + Math.round(r.health_score) + '/100';
-  badge.style.color = r.health_score >= 70 ? 'var(--accent)' : r.health_score >= 40 ? 'var(--orange)' : 'var(--red)';
-  document.getElementById('findings-count').textContent = r.findings.length || '';
+  badge.textContent = '健康度 ' + Math.round(health) + '/100';
+  badge.style.color = health >= 70 ? 'var(--accent)' : health >= 40 ? 'var(--orange)' : 'var(--red)';
+  document.getElementById('findings-count').textContent = findings.length || '';
   document.getElementById('sources-count').textContent = '';
   document.getElementById('releases-count').textContent = state.releases ? state.releases.length : '';
   renderContent();
@@ -1726,7 +1803,7 @@ function renderProjectionSourceEntry(entry) {
   const eligible = entry.logical_eligible || entry.native_eligible;
   const sharedOrigin = entry.is_shared_memory_origin === true;
   const mode = projectionModeLabel(entry.projection_mode);
-  const path = entry.path || '';
+  const path = guiPathText(entry.path, '受保护来源');
   const project = entry.project_ref || (entry.scope === 'project' ? '当前项目' : entry.scope || '未知');
   return `<tr class="${entry.enabled ? '' : 'muted-row'}">
     <td><span class="chip ${(sharedOrigin && entry.participates) || entry.enabled ? 'chip-confirmed' : 'chip-medium'}">${sharedOrigin ? (entry.participates ? `已入库 · ${entry.record_count || 0} 条` : '历史来源') : (entry.enabled ? '已勾选' : '未勾选')}</span></td>
@@ -2749,8 +2826,12 @@ async function refreshNeuronGraph(message = '') {
   if (message) showToast(message, 'success');
 }
 
+let activeBuildRunId = '';
+
 async function pollBuildProgress(jobId) {
   const phases = [
+    { id: 'engine', label: '引擎' },
+    { id: 'enrich', label: '整理' },
     { id: 'scan', label: '扫描' },
     { id: 'scope', label: '范围' },
     { id: 'evidence', label: '证据' },
@@ -2759,6 +2840,7 @@ async function pollBuildProgress(jobId) {
     { id: 'complete', label: '完成' },
   ];
   const result = await waitForTask(jobId, '投影构建', 10 * 60 * 1000, (raw, task) => {
+    activeBuildRunId = task.run_id || jobId;
     const view = {
       ...raw,
       job_id: task.run_id || jobId,
@@ -2771,15 +2853,51 @@ async function pollBuildProgress(jobId) {
     renderBuildProgressPage(view, phases);
     renderBuildStatusRail(view);
   });
+  activeBuildRunId = '';
   if (result.execution_status === 'cancelled') {
-    showToast('构建已取消', 'info');
+    await restoreNeuronAfterBuild('构建已取消', false);
     return;
   }
   if (!result.ok) {
-    showToast(apiErrorMessage(result, '构建失败'), 'error');
+    await restoreNeuronAfterBuild(apiErrorMessage(result, '构建失败'), true);
     return;
   }
   await refreshNeuronGraph('投影构建完成');
+}
+
+async function restoreNeuronAfterBuild(message = '', isError = false) {
+  activeBuildRunId = '';
+  try {
+    await refreshNeuronGraph();
+  } catch (e) {
+    renderBuildRetryPage(message || '构建未完成');
+  }
+  if (message) showToast(message, isError ? 'error' : 'info');
+}
+
+function renderBuildRetryPage(message) {
+  setContent(`<div class="card empty-state"><div><div class="empty-orb"></div>
+    <p>${escapeHtml(message || '构建未完成')}</p>
+    <p style="margin-top:6px;font-size:11px">可返回神经图页面重试。</p>
+    <div class="finding-actions" style="margin-top:12px">
+      <button class="btn btn-primary" type="button" onclick="renderNeuronGraph()">重试</button>
+    </div>
+  </div></div>`);
+}
+
+function renderBuildStartingPage() {
+  setContent(`<div class="build-progress" role="status" aria-live="polite">
+    <div class="bp-kicker">Build progress</div>
+    <h2>正在启动构建</h2>
+    <div class="bp-msg">准备中…</div>
+    <div class="bp-bar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i style="width:0%"></i></div>
+    <div class="bp-meta"><span>starting</span><span>0%</span></div>
+    <div class="bp-phases"></div>
+    <div class="finding-actions" style="margin-top:8px">
+      <button class="btn" type="button" disabled>正在创建任务…</button>
+    </div>
+  </div>`);
+  renderBuildStatusRail({ phase: 'starting', message: '正在启动…', percent: 0, job_id: '' });
 }
 
 function renderBuildProgressPage(prog, phases) {
@@ -2800,7 +2918,7 @@ function renderBuildProgressPage(prog, phases) {
     <div class="bp-meta"><span>${escapeHtml(phase || 'starting')}</span><span>${pct}%</span></div>
     <div class="bp-phases">${chips}</div>
     <div class="finding-actions" style="margin-top:8px">
-      <button class="btn" type="button" onclick="cancelActiveBuild('${escapeHtml(prog.job_id || '')}')">取消构建</button>
+      <button class="btn" type="button" onclick="cancelActiveBuild()">取消构建</button>
     </div>
   </div>`);
 }
@@ -2815,22 +2933,37 @@ function renderBuildStatusRail(prog) {
     <div class="status-item"><span class="status-label">阶段</span><span class="status-num" style="font-size:12px">${escapeHtml(prog.phase || '—')}</span></div>
     <div class="status-item"><span class="status-label">进度</span><span class="status-num">${pct}%</span></div>
     <div class="neuron-detail-body" style="margin-top:10px">${escapeHtml(prog.message || '构建中…')}</div>
-    <div class="rail-link" onclick="cancelActiveBuild('${escapeHtml(prog.job_id || '')}')">取消构建</div>`;
+    ${prog.job_id
+      ? '<div class="rail-link" onclick="cancelActiveBuild()">取消构建</div>'
+      : '<div class="rail-link" style="opacity:.55;pointer-events:none">正在创建任务…</div>'}`;
 }
 
 async function cancelActiveBuild(jobId) {
+  // 优先用页面内单一 activeBuildRunId；为空时后端按精确可信范围回退解析。
+  const id = String(jobId || activeBuildRunId || '').trim();
   try {
-    await callApi('cancel_build_projection', jobId || '', true);
+    renderBuildStatusRail({ phase: 'cancelling', message: '正在取消…', percent: 0, job_id: id || 'scope-fallback' });
+    const result = await callApi('cancel_build_projection', id, true);
+    if (!result || result.error || result.ok === false) {
+      await restoreNeuronAfterBuild(apiErrorMessage(result || {}, '取消失败'), true);
+      return;
+    }
+    if (result.status === 'cancelled' || (result.task && result.task.state === 'cancelled')) {
+      await restoreNeuronAfterBuild('构建已取消', false);
+      return;
+    }
     showToast('已请求取消构建', 'info');
-  } catch (e) { showToast('取消失败：' + e, 'error'); }
+  } catch (e) { await restoreNeuronAfterBuild('取消失败：' + e, true); }
 }
 
 async function buildProjection(llmAgent = '', llmCli = '', skipConfirm = false) {
   const native = projectionMode === 'native';
   const shared = isShareGroupScope();
 
-  // 多 Agent / 共享组：必须弹窗选整理引擎；多个 CLI 时也弹窗
-  if (!native && !llmAgent) {
+  // 多 Agent / 共享组：必须弹窗选整理引擎；多个 CLI 时也弹窗。
+  // 引擎列表只含真实可执行 CLI，不再出现合成「host」行。
+  let engineId = llmAgent || '';
+  if (!native && !engineId) {
     try {
       const agentsResp = await callApi('list_host_llm_agents');
       const agents = (agentsResp && agentsResp.agents) || [];
@@ -2838,51 +2971,51 @@ async function buildProjection(llmAgent = '', llmCli = '', skipConfirm = false) 
       if (needPick && agents.length >= 1) {
         showLlmPickModal({
           agents,
-          suggested_agent: agentsResp.primary || agents[0].agent || 'host',
+          suggested_agent: agentsResp.primary || (agents[0] && agents[0].agent) || '',
           for_build: true,
           title: shared ? '多 Agent 共享组：选择整理用 LLM' : '选择构建用 LLM',
         });
         return;
       }
       if (agents.length === 1) {
-        llmAgent = agents[0].agent || '';
-        llmCli = agents[0].cli || '';
+        engineId = agents[0].agent || '';
       } else {
-        showToast('未检测到可用整理引擎，将用本地启发式', 'info');
+        showToast('未检测到可用的 Agent CLI，将用本地确定性构建', 'info');
       }
     } catch (e) {
-      showToast('检测 LLM 失败，将用启发式：' + e, 'info');
+      showToast('检测 LLM 失败，将用确定性构建：' + e, 'info');
     }
   }
 
-  const llmHint = llmAgent === 'host'
-    ? '\n· LLM：宿主 Skill（GUI 只入队；须在 Cursor 对话里继续整理）'
-    : (llmAgent ? `\n· LLM：${llmAgent}` : '\n· LLM：启发式兜底');
+  const llmHint = engineId
+    ? `\n· LLM：${engineId}（在后台任务中完成分类/翻译，无需外部对话）`
+    : '\n· LLM：确定性构建（不调用 LLM）';
   const message = shared
-    ? `构建共享 MCP 记忆投影？\n\n· 共享组：${activeShareGroupId}${llmHint}\n· 入队后整理，再生成投影\n\n继续？`
+    ? `构建共享 MCP 记忆投影？\n\n· 共享组：${activeShareGroupId}${llmHint}\n· 后台任务整理后生成投影\n\n继续？`
     : native
     ? '构建原生记忆投影？\n\n· 读取已勾选原生/项目记忆\n· 只生成当前真实记忆图\n· 不调用 LLM\n\n继续？'
     : `构建重构治理投影？\n\n· 萃取、合并、清理已勾选来源${llmHint}\n· 分类/翻译后出图\n\n继续？`;
   if (!skipConfirm && !confirm(message)) return;
 
-  setContent(`<div class="build-progress"><div class="bp-kicker">Build progress</div><h2>正在启动构建</h2><div class="bp-msg">准备中…</div><div class="bp-bar"><i style="width:2%"></i></div><div class="bp-meta"><span>starting</span><span>0%</span></div></div>`);
-  renderBuildStatusRail({ phase: 'starting', message: '正在启动…', percent: 0, job_id: '' });
+  renderBuildStartingPage();
   try {
     const ok = await ensureGovernanceScope();
-    if (!ok) return showToast('缺少治理范围，请先选择 Agent 或共享组', 'error');
+    if (!ok) { await restoreNeuronAfterBuild('缺少治理范围，请先选择 Agent 或共享组', true); return; }
     const [scope, agentId, groupId] = scopeApiArgs();
-    const enrichMode = llmAgent === 'host' ? 'host' : (llmAgent && llmCli ? 'cli' : 'auto');
+    const enrichMode = engineId ? 'cli' : 'deterministic';
     const result = await callApi(
-      'start_build_projection', true, projectionMode, scope, agentId, groupId, llmAgent, llmCli, enrichMode,
+      'start_build_projection', true, projectionMode, scope, agentId, groupId, engineId, '', enrichMode,
     );
-    if (result.error && !result.job_id) return showToast(result.error, 'error');
+    if (result.error && !result.job_id) { await restoreNeuronAfterBuild(result.error, true); return; }
     if (result.job_id) {
+      activeBuildRunId = result.job_id;
+      if (result.focused) showToast('构建已在后台进行中，回到该任务', 'info');
       await pollBuildProgress(result.job_id);
       return;
     }
-    if (result.error) return showToast(result.error, 'error');
+    if (result.error) { await restoreNeuronAfterBuild(result.error, true); return; }
     await refreshNeuronGraph(shared ? '共享组投影构建完成' : native ? '原生投影构建完成' : '重构投影构建完成');
-  } catch (e) { showToast('构建失败：' + e, 'error'); }
+  } catch (e) { await restoreNeuronAfterBuild('构建失败：' + e, true); }
 }
 
 async function deleteProjection() {
@@ -2901,14 +3034,15 @@ function showLlmPickModal(payload) {
   closeLlmPickModal();
   const agents = payload.agents || [];
   if (!agents.length) {
-    showToast(payload.message || '未检测到可用 Agent CLI', 'error');
+    showToast(payload.message || '未检测到可用的 Agent CLI，将用确定性构建', 'info');
+    buildProjection('', '', false);
     return;
   }
-  const suggested = payload.suggested_agent || agents[0].agent;
+  const suggested = payload.suggested_agent || (agents[0] && agents[0].agent);
   const rows = agents.map((a, i) => `<label class="release-option">
     <input type="radio" name="llm-pick" value="${i}" ${a.agent === suggested || (!suggested && i === 0) ? 'checked' : ''}>
     <span><div class="release-title">${escapeHtml(a.label || a.agent)}</div>
-      <div class="release-meta">${escapeHtml(a.agent)}${a.cli ? ' · ' + escapeHtml(a.cli) : ' · Skill/MCP 自动整理'}</div></span>
+      <div class="release-meta">${escapeHtml(a.agent)} · ${escapeHtml(a.display || '本机 Agent CLI · 后台任务整理')}</div></span>
   </label>`).join('');
   const head = payload.title || '选择构建用 LLM';
   const modal = document.createElement('div');
@@ -2916,7 +3050,7 @@ function showLlmPickModal(payload) {
   modal.className = 'modal-backdrop';
   modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeHtml(head)}">
     <div class="modal-head"><h3>${escapeHtml(head)}</h3>
-      <p>多 Agent 必须选择整理引擎。「宿主 Skill」只入队，须在 Cursor 对话里继续；要 GUI 内同步整理请选 Cursor Agent / Codex 等 CLI。</p></div>
+      <p>多 Agent 必须选择整理引擎。所选本机 Agent CLI 会在后台任务里完成分类/翻译，无需在别处对话继续。</p></div>
     <div class="modal-body">${rows}</div>
     <div class="modal-actions">
       <button class="btn" type="button" onclick="closeLlmPickModal()">取消</button>
@@ -2941,7 +3075,7 @@ async function confirmLlmPickModal() {
   const agent = modal.__agents[Number(selected.value)];
   closeLlmPickModal();
   if (!agent) return;
-  await buildProjection(agent.agent || '', agent.cli || '', false);
+  await buildProjection(agent.agent || '', '', false);
 }
 
 async function commitSharedMemoryGovernance() {
@@ -3010,7 +3144,7 @@ async function reExtract() {
 }
 
 function renderOverview() {
-  const report = state.report;
+  const report = state.report || {};
   const snap = state.governanceSnapshot;
 
   // 空状态：没有记忆写入事件
@@ -3063,12 +3197,13 @@ function renderOverview() {
   </div>` : `<div class="flow-card empty red"><div class="flow-kicker">隔离</div><div class="flow-title">无隔离项</div></div>`;
 
   // 健康分摘要（保留原有信息但缩小为次要）
-  const summary = report.summary;
-  const health = Math.max(0, Math.min(100, Number(report.health_score || 0)));
+  const summary = report.summary && typeof report.summary === 'object' ? report.summary : {};
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  const health = Math.max(0, Math.min(100, finiteNumber(report.health_score, 0)));
   const severity = Object.entries(summary.finding_count_by_severity || {})
     .map(([name, count]) => `<span class="chip chip-${escapeHtml(name)}">${escapeHtml(name)} · ${count}</span>`).join('');
   const invisible = summary.invisible_count > 0 ? `<section class="card"><div class="card-head"><div><h2>不可见范围</h2><p>治理边界之外的对象会明确显示，不会静默忽略。</p></div></div>
-    ${report.invisible.map(item => `<div class="finding-evidence">${escapeHtml(item.path)} · ${escapeHtml(item.reason)}</div>`).join('')}</section>` : '';
+    ${(Array.isArray(report.invisible) ? report.invisible : []).map(item => `<div class="finding-evidence">${escapeHtml(guiPathText(item.path))} · ${escapeHtml(item.reason || '')}</div>`).join('')}</section>` : '';
 
   setContent(`<div class="view-heading"><span class="eyebrow">Governance Flow</span><h2>总览</h2>
     <p>概念图式的治理流控制台。新写入 -> 覆盖 / 冲突 / 隔离，实时展示真实事件。</p></div>
@@ -3078,19 +3213,20 @@ function renderOverview() {
       <section class="card"><div class="card-head"><div><h2>健康度</h2></div></div><div class="scan-list">
         <div class="scan-row"><span>健康分</span><strong style="color:${health >= 70 ? 'var(--accent)' : health >= 40 ? 'var(--orange)' : 'var(--red)'}">${Math.round(health)}/100</strong></div>
         <div class="scan-row"><span>已识别对象</span><strong>${summary.object_count}</strong></div>
-        <div class="scan-row"><span>风险信号</span><strong>${report.findings.length}</strong></div>
+        <div class="scan-row"><span>风险信号</span><strong>${findings.length}</strong></div>
         <div class="scan-row"><span>生成时间</span><strong>${escapeHtml(report.generated_at)}</strong></div>
       </div></section>
     </div>${invisible}`);
 }
 
 function renderFindings() {
-  const report = state.report;
-  if (!report.findings.length) {
+  const report = state.report || {};
+  const findings = Array.isArray(report.findings) ? report.findings : [];
+  if (!findings.length) {
     setContent('<div class="view-heading"><span class="eyebrow">Risk signals</span><h2>风险信号</h2></div><div class="card empty-state"><div><div class="empty-orb"></div><p>没有发现需要处理的风险信号。</p></div></div>');
     return;
   }
-  const items = report.findings.map((finding, index) => `<article class="finding-item sev-${escapeHtml(finding.severity)}" role="button" tabindex="0"
+  const items = findings.map((finding, index) => `<article class="finding-item sev-${escapeHtml(finding.severity)}" role="button" tabindex="0"
     aria-expanded="${index === 0 ? 'true' : 'false'}"
     onclick="toggleFinding('${escapeHtml(finding.id)}')"
     onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleFinding('${escapeHtml(finding.id)}')}">
@@ -3164,14 +3300,14 @@ async function copyText(text) {
 }
 
 async function copyFindingForAgent(findingId) {
-  const finding = (state.report.findings || []).find(item => item.id === findingId);
+  const finding = (Array.isArray(state.report?.findings) ? state.report.findings : []).find(item => item.id === findingId);
   if (!finding) return showToast('未找到风险信号', 'error');
   const ok = await copyText(findingAgentPrompt(finding));
   showToast(ok ? '已复制，可直接粘贴给 Agent 处理' : '复制失败，请展开后手动复制证据', ok ? 'success' : 'error');
 }
 
 async function copyAllFindingsForAgent() {
-  const findings = state.report.findings || [];
+  const findings = Array.isArray(state.report?.findings) ? state.report.findings : [];
   if (!findings.length) return showToast('当前没有风险信号', 'info');
   const text = findings.map((finding, index) =>
     `# 风险 ${index + 1}\n${findingAgentPrompt(finding)}`
@@ -3225,9 +3361,10 @@ async function renderSources() {
     // v3.2：先加载 Agent 卡片
     agentCardsData = await callApi('list_agents');
     const agents = agentCardsData.agents || [];
+    const availableAgents = [...agents, ...(agentCardsData.residuals || [])];
     // 默认选中第一个 Agent
-    if (!activeAgentInstanceId && agents.length > 0) {
-      activeAgentInstanceId = agents[0].instance_id;
+    if (!activeAgentInstanceId && availableAgents.length > 0) {
+      activeAgentInstanceId = availableAgents[0].instance_id;
     }
     // 加载选中 Agent 的数据 + 来源列表 + 覆盖率
     const [agentData, sourcesResult, rawResult, bindingsResult] = await Promise.all([
@@ -3274,8 +3411,17 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const agents = (agentCardsData && agentCardsData.agents) || [];
   const activeBindings = ((bindingsResult && bindingsResult.bindings) || []).filter(b => b.status === 'active');
   const residuals = (agentCardsData && agentCardsData.residuals) || [];
-  const lifecycleLabels = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
+  const discoveredCount = Array.isArray(discoveryResult?.instances) ? discoveryResult.instances.length : 0;
+  const knownProfileCount = Number(agentCardsData?.known_profile_count || discoveryResult?.known_profile_count || 0);
+  const lifecycleLabels = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '原生数据待接入', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
   const lifecycleChips = { installed: 'confirmed', installed_no_data: 'info', data_only: 'medium', uncertain: 'info', ignored: 'low', not_detected: 'low' };
+  const lifecycleLabel = (item) => {
+    const state = item?.lifecycle_state || 'uncertain';
+    const discoveryOnly = Object.prototype.hasOwnProperty.call(item || {}, 'install_confidence')
+      && finiteNumber(item.install_confidence, 0) <= 0
+      && item.target_capability === 'export_only';
+    return discoveryOnly ? '已发现 · 待接入' : (lifecycleLabels[state] || state);
+  };
   const agentCardsHtml = agents.length ? agents.map(a => {
     const isActive = a.instance_id === activeAgentInstanceId;
     const lifecycle = a.lifecycle_state || 'uncertain';
@@ -3290,18 +3436,19 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
       <div class="agent-name">${escapeHtml(a.product)}</div>
       <div class="agent-meta">${a.found_surface_count}/${a.surface_count} 表面 · 私有 ${a.private_data_surface_count || 0} · 共享 ${a.shared_surface_count || 0} · ${a.bound_source_count} 来源</div>
       <div class="agent-badge">${escapeHtml(a.target_capability || 'export_only')}</div>
-      <span class="chip chip-${lifecycleChips[lifecycle] || 'info'}">${escapeHtml(lifecycleLabels[lifecycle] || lifecycle)}</span>
+       <span class="chip chip-${lifecycleChips[lifecycle] || 'info'}">${escapeHtml(lifecycleLabel(a))}</span>
       <div class="surface-meta">${kindLabel}${binding ? ` · ${escapeHtml(binding.share_group_id)} · ${escapeHtml(binding.canonical_store_path || '')}` : ''}</div>
       ${binding && binding.migration_required ? '<div class="chip chip-medium">待迁移（仅提示）</div>' : ''}
       <div class="finding-actions">${bindingAction}</div>
     </div>`;
-  }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">未发现已安装 Agent，点击"检测本机 Agent"</div></div>';
+  }).join('') : `<div class="agent-card" style="cursor:default"><div class="agent-meta">${discoveredCount ? `当前没有可接入 Agent；已检测到 ${discoveredCount} 个候选，请从“本机 Agent 检测”中授权。` : '未发现可接入 Agent，点击“检测本机 Agent”'}</div></div>`;
   const residualCardsHtml = residuals.length ? residuals.map(r => {
     const lifecycle = r.lifecycle_state || 'uncertain';
     return `<div class="agent-card" onclick="showResidualCleanup('${escapeHtml(r.instance_id)}')">
       <div class="agent-name">${escapeHtml(r.product)}</div>
-      <div class="agent-meta">私有残留 ${r.private_data_surface_count || 0} · 共享表面 ${r.shared_surface_count || 0}</div>
-      <span class="chip chip-${lifecycleChips[lifecycle] || 'medium'}">${escapeHtml(lifecycleLabels[lifecycle] || lifecycle)}</span>
+      <div class="agent-meta">原生数据 ${r.private_data_surface_count || 0} · 共享表面 ${r.shared_surface_count || 0}${r.control_repair_required ? ' · V2 绑定待修复/接入' : ''}</div>
+      <span class="chip chip-${lifecycleChips[lifecycle] || 'medium'}">${escapeHtml(lifecycleLabel(r))}</span>
+      <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="event.stopPropagation(); ensurePersonalLayer('${escapeHtml(r.instance_id)}')">启用个人记忆层</button></div>
     </div>`;
   }).join('') : '<div class="agent-card" style="cursor:default"><div class="agent-meta">无私有残留数据。</div></div>';
   const addCards = `<div class="agent-card add-card" onclick="addSourceDialog()"><div class="agent-name">+ 手动来源</div></div>
@@ -3319,7 +3466,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
     const viewArgs = escapeHtml(JSON.stringify([String(f.root_id || ''), String(f.relative_path || '')]));
     const clickAttr = canOpen ? ` onclick="viewSourceFile(...${viewArgs})"` : '';
     const statusText = canOpen ? (f.read_status || '') : '仅发现，需先授权';
-    const displayPath = String(f.relative_path || f.path || f.display_name || '未命名文件').replaceAll('\\', '/');
+    const displayPath = guiPathText(f.relative_path || f.path || f.display_name, '未命名文件').replaceAll('\\', '/');
     return `<div class="raw-file-row"${clickAttr} style="${canOpen ? '' : 'cursor:default;opacity:.72'}">
       <span class="raw-file-path"><code>${escapeHtml(displayPath)}</code></span>
       <span class="chip chip-${canOpen && f.read_status === 'read' ? 'confirmed' : 'medium'}">${escapeHtml(statusText)}</span>
@@ -3329,7 +3476,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const buildFileTree = (files) => {
     const root = { dirs: new Map(), files: [] };
     for (const f of files || []) {
-      const parts = String(f.relative_path || f.path || f.display_name || '未命名文件')
+      const parts = guiPathText(f.relative_path || f.path || f.display_name, '未命名文件')
         .replaceAll('\\', '/').split('/').filter(Boolean);
       if (!parts.length) { root.files.push(f); continue; }
       let node = root;
@@ -3386,7 +3533,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
         </div>
         <span class="chip chip-${connected ? 'confirmed' : 'high'}">${connected ? '已连接' : '路径失效'}</span>
       </div>
-      <div class="knowledge-path" title="${escapeHtml(source.path || '')}"><code>${escapeHtml(source.path || '')}</code></div>
+      <div class="knowledge-path" title="${escapeHtml(guiPathText(source.path, '受保护来源'))}"><code>${escapeHtml(guiPathText(source.path, '受保护来源'))}</code></div>
       <details class="knowledge-files">
         <summary>${files.length ? `查看已扫描文件（${files.length}）` : '暂无可读取文件'}</summary>
         ${files.length ? renderFiles(visibleFiles) : '<div class="surface-meta" style="margin-top:8px">目录为空，或没有符合扫描策略的文件。</div>'}
@@ -3450,17 +3597,18 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   setContent(`<div class="view-heading"><span class="eyebrow">Sources</span><h2>数据源</h2>
     <p>顶部选择 Agent，下方查看其数据。全局/项目可折叠展开。</p></div>
     <section class="card"><div class="card-head"><div><h2>Agent 摘要</h2>
-      <p>${agents.length} 个已安装 · ${residuals.length} 个残留候选 · 点击卡片切换数据视图</p></div>
+       <p>${agents.length} 个已接入/可接入 · ${residuals.length} 个绑定待修复或接入${discoveredCount ? ` · 检测到 ${discoveredCount} 个候选` : ''}${knownProfileCount ? ` · 已注册 ${knownProfileCount} 个 Agent Profile` : ''} · 点击卡片切换数据视图</p></div>
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="discoverAgents()">检测本机 Agent</button>
+        <button class="btn" type="button" onclick="enterMultiAgentMode()">管理已有记忆组</button>
         <button class="btn" type="button" onclick="addSourceDialog()">手工添加</button>
         <button class="btn" type="button" onclick="importBundleDialog()">导入导出包</button>
       </div></div>
       <div class="agent-cards">${agentCardsHtml}${addCards}</div></section>
     ${knowledgeSection}
     ${residuals.length ? `<details class="card" style="margin-bottom:16px">
-      <summary class="card-head" style="cursor:pointer"><div><h2>残留与清理</h2>
-        <p>${residuals.length} 个候选 · 点击展开查看</p></div></summary>
+      <summary class="card-head" style="cursor:pointer"><div><h2>未接入原生数据</h2>
+        <p>${residuals.length} 个 Agent · 可恢复旧绑定、接入已有组或管理原生数据</p></div></summary>
       <div class="agent-cards" style="padding:16px">${residualCardsHtml}</div>
     </details>` : ''}
     <section class="card"><div class="card-head"><div><h2>${agentInfo ? escapeHtml(agentInfo.product) + ' 数据视图' : 'Agent 数据视图'}</h2>
@@ -3480,22 +3628,26 @@ async function enterMultiAgentMode() {
 async function renderMultiAgentBinding() {
   setContent('<div class="loading">正在加载 Agent 列表与已有绑定…</div>');
   try {
-    const [agentsResult, bindingsResult, hooksResult] = await Promise.all([
+    const [agentsResult, bindingsResult, hooksResult, groupsResult] = await Promise.all([
       callApi('list_agents'),
       callApi('list_bindings'),
       callApi('get_host_hook_status'),
+      callApi('list_share_groups'),
     ]);
-    showMultiAgentBinding(agentsResult, bindingsResult, hooksResult);
+    showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groupsResult);
   } catch (e) {
     showToast('加载失败：' + e, 'error');
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>加载失败：${escapeHtml(e)}</p></div></div>`);
   }
 }
 
-function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
-  const agents = (agentsResult && agentsResult.agents) || [];
+function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groupsResult) {
+  const discoveredAgents = (agentsResult && agentsResult.agents) || [];
+  const residualAgents = (agentsResult && agentsResult.residuals) || [];
+  const agents = Array.from(new Map([...discoveredAgents, ...residualAgents].map(item => [item.instance_id, item])).values());
   const existingBindings = (bindingsResult && bindingsResult.bindings) || [];
   const hookAgents = (hooksResult && hooksResult.agents) || [];
+  const existingGroups = (groupsResult && groupsResult.groups) || [];
   if (!agents.length) {
     setContent(`<div class="view-heading"><span class="eyebrow">Multi-agent</span><h2>多 Agent 共享 MCP 模式</h2></div>
       <div class="card empty-state"><div><div class="empty-orb"></div><p>未发现 Agent。请先在数据源 tab 检测本机 Agent 或手工添加来源。</p></div></div>
@@ -3519,6 +3671,45 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
   }).join('');
 
   const activeBindings = existingBindings.filter(b => b.status === 'active');
+  const groupById = new Map(existingGroups
+    .filter(g => String(g.share_group_id || g.group_id || '').trim())
+    .map(g => [String(g.share_group_id || g.group_id), g]));
+  // Keep groups that are present only in the memory database as selectable
+  // targets too.  A group with zero current members is still a valid,
+  // recoverable memory layer from an earlier binding/migration.
+  activeBindings.forEach(b => {
+    const gid = String(b.share_group_id || '').trim();
+    if (gid && !groupById.has(gid)) groupById.set(gid, {
+      share_group_id: gid,
+      group_id: gid,
+      group_kind: b.group_kind || 'shared',
+      members: [b.agent_instance_id],
+      member_count: 1,
+      active_records: 0,
+    });
+  });
+  const selectableGroups = [...groupById.values()]
+    .filter(g => String(g.share_group_id || g.group_id || '').trim())
+    .sort((left, right) => String(left.share_group_id || left.group_id).localeCompare(String(right.share_group_id || right.group_id)));
+  const groupOptionLabel = (group) => {
+    const gid = String(group.share_group_id || group.group_id || '');
+    const kind = group.group_kind === 'personal' ? '个人' : '共享';
+    const memberCount = Number(group.member_count || (group.members || []).length || 0);
+    const recordCount = Number(group.active_records || group.active_count || 0);
+    return `${kind} · ${gid.slice(0, 20)} · ${memberCount} Agent · ${recordCount} active`;
+  };
+  const existingGroupSelector = (agentId, selectedGroupId = '') => {
+    if (!selectableGroups.length) return '';
+    const options = selectableGroups.map(group => {
+      const gid = String(group.share_group_id || group.group_id || '');
+      return `<option value="${escapeHtml(gid)}" ${gid === selectedGroupId ? 'selected' : ''}>${escapeHtml(groupOptionLabel(group))}</option>`;
+    }).join('');
+    return `<label class="surface-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span>绑定已有记忆组</span>
+      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentId)} 选择已有记忆组">${options}</select>
+      <button class="btn" type="button" onclick="bindSelectedExistingGroup('${escapeHtml(agentId)}')">应用</button>
+    </label>`;
+  };
   const personalLayerHtml = agents.map(a => {
     const b = activeBindings.find(x => x.agent_instance_id === a.instance_id);
     const hook = hookAgents.find(x => x.agent_instance_id === a.instance_id);
@@ -3526,6 +3717,7 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
     const action = b
       ? (b.group_kind === 'shared' ? '' : `<button class="btn" type="button" onclick="ensurePersonalLayer('${escapeHtml(a.instance_id)}')">保持个人层</button>`)
       : `<button class="btn btn-primary" type="button" onclick="ensurePersonalLayer('${escapeHtml(a.instance_id)}')">启用个人记忆层</button>`;
+    const groupAction = existingGroupSelector(a.instance_id, b ? b.share_group_id : '');
     const viewAction = b ? `<button class="btn" type="button" onclick="viewMemoryLayer('${escapeHtml(b.share_group_id)}')">进入记忆层</button>` : '';
     const hookStatus = hook ? (hook.runtime_verified ? '运行已验证' : (hook.configured ? '已配置待运行' : (hook.supported === false ? '宿主无 Hook' : '未配置'))) : '未配置';
     const hookChip = hook && hook.runtime_verified ? 'confirmed' : (hook && hook.configured ? 'medium' : 'info');
@@ -3539,29 +3731,45 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
       <div class="row"><span class="key">canonical DB</span><span>${escapeHtml(b ? (b.canonical_store_path || '') : '—')}</span></div>
       <div class="row"><span class="key">Hook</span><span>${escapeHtml(hookStatus)}${hook && hook.mode ? ` · ${escapeHtml(hook.mode)}` : ''}</span></div>
       <div class="row"><span class="key">last receipt</span><span>${escapeHtml((hook && hook.last_seen_at) || '—')}</span></div>
-      <div class="finding-actions">${viewAction}${action}${hookActions}${b && b.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="leaveSharedToPersonal('${escapeHtml(a.instance_id)}')">退出共享组并回个人层</button>` : ''}</div></article>`;
+      <div class="finding-actions">${viewAction}${action}${hookActions}${b && b.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="leaveSharedToPersonal('${escapeHtml(a.instance_id)}')">退出共享组并回个人层</button>` : ''}</div>
+      ${groupAction ? `<div style="margin-top:10px">${groupAction}</div>` : ''}</article>`;
   }).join('');
 
-  // 已有共享组分组展示
+  // 已有记忆组分组展示：同时保留个人组、空共享组和只有数据的旧组。
   const agentNameById = new Map(agents.map(a => [a.instance_id, a.product || a.instance_id]));
   const groupMap = new Map();
   existingBindings.forEach(b => {
-    if (b.status !== 'active' || b.group_kind !== 'shared') return;
-    if (!groupMap.has(b.share_group_id)) groupMap.set(b.share_group_id, []);
-    groupMap.get(b.share_group_id).push(b);
+    if (b.status !== 'active') return;
+    const gid = String(b.share_group_id || '').trim();
+    if (!gid) return;
+    if (!groupMap.has(gid)) groupMap.set(gid, []);
+    groupMap.get(gid).push(b);
   });
-  const groupsHtml = groupMap.size ? Array.from(groupMap.entries()).map(([gid, binds]) => `<article class="plan-item verified">
+  selectableGroups.forEach(group => {
+    const gid = String(group.share_group_id || group.group_id || '').trim();
+    if (!groupMap.has(gid)) groupMap.set(gid, []);
+  });
+  const groupsHtml = groupMap.size ? Array.from(groupMap.entries()).map(([gid, binds]) => {
+    const group = groupById.get(gid) || {};
+    const memberIds = new Set([...(Array.isArray(group.members) ? group.members : []), ...binds.map(b => b.agent_instance_id)]);
+    const memberNames = [...memberIds].map(id => escapeHtml(agentNameById.get(id) || id)).join(' · ');
+    const kind = group.group_kind || binds[0]?.group_kind || (gid.startsWith('personal-') ? 'personal' : 'shared');
+    const recordCount = Number(group.active_records || group.active_count || 0);
+    return `<article class="plan-item verified">
     <div class="finding-header">
-      <span class="finding-rule">共享组 ${escapeHtml(gid.slice(0, 16))}</span>
-      <span class="chip chip-confirmed">${binds.length} 个 Agent</span>
+      <span class="finding-rule">${kind === 'personal' ? '个人记忆组' : '共享记忆组'} ${escapeHtml(gid.slice(0, 20))}</span>
+      <span class="chip chip-confirmed">${memberIds.size} 个 Agent</span>
+      <span class="chip chip-info">${recordCount} active</span>
     </div>
-    <div class="finding-evidence">${binds.map(b => escapeHtml(agentNameById.get(b.agent_instance_id) || b.agent_instance_id)).join(' · ')}</div>
+    <div class="finding-evidence">${memberNames || '当前没有绑定 Agent；仍可重新接入'}</div>
     <div class="finding-actions">
       <button class="btn" type="button" onclick="activateShareGroup('${escapeHtml(gid)}')">设为治理范围</button>
-      <button class="btn" type="button" onclick="previewSharedGroup('${escapeHtml(gid)}')">查看共享组预览</button>
-      <button class="btn btn-danger" type="button" onclick="dissolveSharedGroup('${escapeHtml(gid)}')">解散共享组</button>
+      <button class="btn" type="button" onclick="viewMemoryLayer('${escapeHtml(gid)}')">进入记忆层</button>
+      ${kind === 'shared' ? `<button class="btn" type="button" onclick="previewSharedGroup('${escapeHtml(gid)}')">查看共享组预览</button>
+      <button class="btn btn-danger" type="button" onclick="dissolveSharedGroup('${escapeHtml(gid)}')">解散共享组</button>` : ''}
     </div>
-  </article>`).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>暂无共享组。勾选 Agent 后创建。</p></div>';
+  </article>`;
+  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>暂无个人或共享记忆组。可先启用个人层，或勾选多个 Agent 创建共享组。</p></div>';
 
   setContent(`<div class="view-heading"><span class="eyebrow">Multi-agent shared MCP</span><h2>多 Agent 共享 MCP 模式</h2>
     <p>勾选多个 Agent，创建共享组绑定，所有 Agent 通过 MemoryGuard MCP 共享同一组记忆。</p></div>
@@ -3574,7 +3782,7 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult) {
       </div>
     </section>
     <section class="card"><div class="card-head"><div><h2>个人记忆层</h2><p>个人层与共享层都使用 MemoryGuard SharedMemoryStore；原生文件仅只读扫描源。</p></div></div>${personalLayerHtml}</section>
-    <section class="card"><div class="card-head"><div><h2>已有共享组</h2></div></div>
+    <section class="card"><div class="card-head"><div><h2>已有记忆组</h2><p>未绑定 Agent 也可以在上方选择已有个人组或共享组；不会强制新建个人层。</p></div></div>
       ${groupsHtml}
       <div class="finding-actions" style="margin-top:14px">
         <button class="btn" type="button" onclick="renderSources()">← 返回数据源</button>
@@ -4143,7 +4351,7 @@ function renderHistoryBackfillPanel(inventory) {
     const label = { importable: '可导入', complete: '已完成', partial: '部分导入（会话已索引）', pending_binding: '待绑定 Agent', unsupported: '暂不支持', error: '扫描失败' }[status] || status;
     const tone = status === 'importable' ? 'chip-confirmed' : (status === 'unsupported' || status === 'pending_binding' || status === 'partial' ? 'chip-medium' : 'chip-high');
     const bound = source.matched_agent_id ? ` → ${source.matched_agent_id}` : '';
-    const location = source.path_count > 1 ? `${source.path_count} 个本地路径` : (source.path || '');
+    const location = source.path_count > 1 ? `${source.path_count} 个本地路径` : guiPathText(source.path, '受保护来源');
     return `<tr><td><strong>${escapeHtml(source.provider || 'unknown')}</strong></td><td class="path-cell">${escapeHtml(location)}</td><td>${Number(source.file_count || 0)}</td><td>${historyBytes(source.byte_count)}</td><td><span class="chip ${tone}">${escapeHtml(label)}</span><div class="surface-meta">${escapeHtml(source.support_reason || '')}${escapeHtml(bound)}</div></td></tr>`;
   }).join('') || '<tr><td colspan="5" class="empty-note">未发现可识别的本地会话来源。</td></tr>';
   const canImport = sources.some(source => source.status === 'importable' && source.matched_agent_id);
@@ -4452,18 +4660,47 @@ async function exitMultiAgentMode() {
 async function discoverAgents() {
   showToast('正在检测本机 Agent…');
   try {
-    const result = await callApi('discover_agents');
+    const [result, groupsResult, bindingsResult] = await Promise.all([
+      callApi('discover_agents'),
+      callApi('list_share_groups'),
+      callApi('list_bindings'),
+    ]);
     if (result.error) return showToast(result.error, 'error');
     discoveryResult = result;
-    showDiscoveryResult(result);
+    showDiscoveryResult(result, groupsResult, bindingsResult);
   } catch (e) {
     showToast('检测失败：' + e, 'error');
   }
 }
 
-function showDiscoveryResult(result) {
+function showDiscoveryResult(result, groupsResult = {}, bindingsResult = {}) {
   const instances = result.instances || [];
   const ledger = result.discovery_ledger || {};
+  const knownProfileCount = Number(result.known_profile_count || 0);
+  const knownProducts = Array.isArray(result.known_products) ? result.known_products : [];
+  const activeBindings = ((bindingsResult && bindingsResult.bindings) || [])
+    .filter(binding => binding.status === 'active');
+  const existingGroups = ((groupsResult && groupsResult.groups) || [])
+    .filter(group => String(group.share_group_id || group.group_id || '').trim());
+  const groupLabel = (group) => {
+    const groupId = String(group.share_group_id || group.group_id || '');
+    const kind = group.group_kind === 'personal' ? '个人' : '共享';
+    const members = Number(group.member_count || (group.members || []).length || 0);
+    const records = Number(group.active_records || group.active_count || group.record_count || 0);
+    return `${kind} · ${groupId.slice(0, 24)} · ${members} Agent · ${records} 条记忆`;
+  };
+  const groupSelector = (agentId) => {
+    if (!existingGroups.length) return '<span class="surface-meta">暂无已有记忆组，可新建个人记忆层。</span>';
+    const options = existingGroups.map(group => {
+      const groupId = String(group.share_group_id || group.group_id || '');
+      return `<option value="${escapeHtml(groupId)}">${escapeHtml(groupLabel(group))}</option>`;
+    }).join('');
+    return `<label class="surface-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span>已有记忆组</span>
+      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentId)} 选择已有记忆组">${options}</select>
+      <button class="btn btn-primary" type="button" onclick="bindSelectedExistingGroup('${escapeHtml(agentId)}')">接入已有记忆组</button>
+    </label>`;
+  };
 
   // 聚合所有 surface 按 scope 分组：user / project
   const SCOPE_LABEL = { user: '全局/用户', project: '项目' };
@@ -4484,7 +4721,7 @@ function showDiscoveryResult(result) {
     return `<div class="surface-row" title="${escapeHtml(s.surface_id || '')}">
       <span class="surface-icon ${escapeHtml(state)}"></span>
       <div class="surface-path">
-        <code>${escapeHtml(s.resolved_path || s.path_template || '')}</code>
+        <code>${escapeHtml(guiPathText(s.resolved_path || s.path_template, '受保护来源'))}</code>
         <div class="surface-meta">${escapeHtml(s.product || '')} · ${escapeHtml(s.surface_id || '')} · ${escapeHtml(role)}</div>
       </div>
       <span class="chip chip-${state==='found'?'confirmed':state==='missing'?'medium':state==='unsupported'?'medium':'info'}">${escapeHtml(state)}</span>
@@ -4510,30 +4747,47 @@ function showDiscoveryResult(result) {
     const foundCount = (inst.surfaces || []).filter(s => s.status === 'found').length;
     const totalCount = (inst.surfaces || []).length;
     const lifecycle = inst.lifecycle_state || inst.install_state || 'pending';
-    const lifecycleLabel = LIFECYCLE_LABEL[lifecycle] || lifecycle;
-    const lifecycleChip = LIFECYCLE_CHIP[lifecycle] || 'info';
+    const discoveryOnly = Object.prototype.hasOwnProperty.call(inst, 'install_confidence')
+      && finiteNumber(inst.install_confidence, 0) <= 0
+      && inst.target_capability === 'export_only';
+    const lifecycleLabel = discoveryOnly ? '已发现 · 待接入' : (LIFECYCLE_LABEL[lifecycle] || lifecycle);
+    const lifecycleChip = discoveryOnly ? 'info' : (LIFECYCLE_CHIP[lifecycle] || 'info');
     const supportLevel = inst.support_level || '';
     const supportChip = SUPPORT_CHIP[supportLevel] || 'info';
+    const binding = activeBindings.find(item => item.agent_instance_id === inst.instance_id);
+    const nativeMemoryCount = (inst.surfaces || []).filter(surface =>
+      surface.status === 'found' && (
+        surface.category === 'native_memory' || surface.evidence_role === 'private_data_evidence'
+      )
+    ).length;
+    const bindingControls = binding
+      ? `<span class="chip chip-confirmed">已接入${binding.group_kind === 'personal' ? '个人' : '共享'}记忆组</span>
+         <button class="btn btn-primary" type="button" onclick="viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button>`
+      : `${groupSelector(inst.instance_id)}
+         <button class="btn" type="button" onclick="ensurePersonalLayer('${escapeHtml(inst.instance_id)}')">新建个人记忆层</button>`;
     return `<article class="plan-item verified">
       <div class="finding-header">
         <span class="finding-rule">${escapeHtml(inst.product)}</span>
         <span class="chip chip-confirmed">${foundCount}/${totalCount} 表面</span>
         <span class="chip chip-${lifecycleChip}">${escapeHtml(lifecycleLabel)}</span>
         ${supportLevel ? `<span class="chip chip-${supportChip}">支持 ${escapeHtml(supportLevel)}</span>` : ''}
-        <span class="chip chip-info">${escapeHtml(inst.target_capability || 'export_only')}</span>
+        <span class="chip chip-info">${escapeHtml(agentCapabilityLabel(inst.target_capability))}</span>
       </div>
       <div class="row"><span class="key">profile</span><code>${escapeHtml(inst.profile_id || '')}</code></div>
       <div class="row"><span class="key">platform</span><span>${escapeHtml(inst.platform || '')} · ${escapeHtml(inst.host_id || '')}</span></div>
+      <div class="surface-meta">MemoryGuard 接入与原生记忆相互独立；无原生记忆不影响接入。${nativeMemoryCount ? `检测到 ${nativeMemoryCount} 个可选原生记忆来源。` : '当前未发现原生记忆。'}</div>
       <div class="finding-actions">
-        <button class="btn btn-primary" type="button" onclick="selectAgentInstance('${escapeHtml(inst.instance_id)}')">勾选授权</button>
-        <button class="btn" type="button" onclick="showResidualCleanup('${escapeHtml(inst.instance_id)}')">残留与清理</button>
+        ${bindingControls}
+        <button class="btn" type="button" onclick="selectAgentInstance('${escapeHtml(inst.instance_id)}')">导入原生记忆（可选）</button>
+        ${nativeMemoryCount ? `<button class="btn" type="button" onclick="showResidualCleanup('${escapeHtml(inst.instance_id)}')">原生数据管理</button>` : ''}
       </div>
     </article>`;
-  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>未检测到任何已安装 Agent。可手工添加文件/文件夹。</p></div>';
+  }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>未检测到可接入 Agent。可手工添加文件/文件夹。</p></div>';
 
   setContent(`<div class="view-heading"><span class="eyebrow">Discovery</span><h2>本机 Agent 检测</h2>
-    <p>有限候选发现：只检测 Profile 声明的固定路径，不递归扫描用户主目录，候选阶段不读取正文。</p></div>
-    <section class="card"><div class="card-head"><div><h2>Agent 摘要</h2><p>${instances.length} 个 Agent · 点击操作</p></div></div>
+    <p>有限候选发现：只检测已注册 Profile 声明的固定路径，不递归扫描用户主目录，候选阶段不读取正文。未登记的新产品不会被猜测扫描，可通过外部 Profile 或手工来源接入。</p></div>
+    <section class="card"><div class="card-head"><div><h2>Agent 摘要</h2><p>${instances.length} 个 Agent · ${activeBindings.length} 个已接入 · ${existingGroups.length} 个已有记忆组 · 已注册 ${knownProfileCount} 个 Profile${knownProducts.length ? ` · ${escapeHtml(knownProducts.join('、'))}` : ''}</p></div>
+      <div class="finding-actions"><button class="btn" type="button" onclick="enterMultiAgentMode()">管理已有记忆组</button></div></div>
       ${instancesHtml}</section>
     ${scopeSectionsHtml}
     <section class="card"><div class="card-head"><div><h2>发现账本</h2>
@@ -4555,6 +4809,7 @@ async function selectAgentInstance(instanceId) {
   try {
     const result = await callApi('get_selection_tree', instanceId);
     if (result.error) return showToast(result.error, 'error');
+    activeAgentInstanceId = instanceId;
     showSelectionTree(instanceId, result);
   } catch (e) { showToast('加载失败：' + e, 'error'); }
 }
@@ -4578,14 +4833,16 @@ async function showResidualCleanup(instanceId) {
     const lifecycleLabel = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '仅数据残留', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
     const lifecycle = lifecycleLabel[result.lifecycle_state] || result.lifecycle_state || '';
     const installEvHtml = (result.install_evidence || []).map(e => `<div class="row"><span class="key">${escapeHtml(e.probe_type)}</span><span style="color:${e.found ? 'var(--accent)' : 'var(--danger)'}">${e.found ? '命中' : '未命中'}: ${escapeHtml(e.detail || '')}</span></div>`).join('');
-    const dataEvHtml = (result.data_evidence || []).map(e => `<div class="row"><span class="key">${escapeHtml(e.dir_path || '')}</span><span>${e.exists ? `${e.file_count} 文件` : '不存在'}</span></div>`).join('');
+    const dataEvHtml = (result.data_evidence || []).map(e => `<div class="row"><span class="key">${escapeHtml(guiPathText(e.dir_path, '受保护来源'))}</span><span>${e.exists ? `${e.file_count} 文件` : '不存在'}</span></div>`).join('');
     const itemsHtml = items.length ? items.map((it, idx) => {
       const preview = it.archive_preview || {};
       const previewOk = preview.ok !== false;
       const safeIdx = idx;
-      return `<article class="plan-item" data-candidate-id="${escapeHtml(candidateId)}" data-item-path="${escapeHtml(it.path || '')}" data-instance-id="${escapeHtml(instanceId)}">
+      const itemRef = typeof it.path_ref === 'string' ? it.path_ref : '';
+      const itemLabel = guiPathLabel(it.path, '受保护来源');
+      return `<article class="plan-item" data-candidate-id="${escapeHtml(candidateId)}" data-item-path="${escapeHtml(itemRef)}" data-instance-id="${escapeHtml(instanceId)}">
         <div class="finding-header">
-          <span class="finding-rule">${escapeHtml(it.path || '')}</span>
+          <span class="finding-rule">${escapeHtml(itemLabel)}</span>
           <span class="chip chip-info">${escapeHtml(it.residual_type || '')}</span>
         </div>
         <div class="finding-evidence">${escapeHtml(it.description || '')}</div>
@@ -4616,6 +4873,7 @@ async function showResidualCleanup(instanceId) {
       ${dataEvHtml ? `<section class="card"><div class="card-head"><div><h2>数据证据明细</h2></div></div>${dataEvHtml}</section>` : ''}
       ${archivesHtml ? `<section class="card"><div class="card-head"><div><h2>归档历史</h2><p>可恢复或永久删除</p></div></div>${archivesHtml}</section>` : ''}
       <div class="finding-actions" style="margin-top:14px">
+        <button class="btn btn-primary" type="button" onclick="ensurePersonalLayer('${escapeHtml(instanceId)}')">启用个人记忆层</button>
         <button class="btn" type="button" onclick="discoverAgents()">返回检测</button>
       </div>`);
   } catch (e) {
@@ -4784,7 +5042,7 @@ function showSelectionTree(instanceId, tree) {
     ${notes ? `<section class="card"><div class="card-head"><div><h2>发现提示</h2></div></div>${notes}</section>` : ''}
     <section class="card"><div class="card-head"><div><h2>记忆来源勾选</h2></div></div>
       ${scopeTabs}
-      ${treeHtml || '<div class="empty-state"><p>未发现可勾选的记忆来源。</p></div>'}
+       ${treeHtml || `<div class="empty-state"><p>该 Agent 没有可勾选的原生长期记忆文件；这不影响接入 MemoryGuard 个人记忆层。</p><div class="finding-actions" style="margin-top:12px"><button class="btn btn-primary" type="button" onclick="ensurePersonalLayer('${escapeHtml(instanceId)}')">启用个人记忆层</button></div></div>`}
       <div class="finding-actions">
         <button class="btn btn-primary" type="button" onclick="confirmSelection('${escapeHtml(instanceId)}')">确认授权</button>
         <button class="btn" type="button" onclick="renderSources()">取消</button>
@@ -4801,11 +5059,17 @@ function renderExtractFileSection(files) {
   const html = Object.keys(byCat).map(cat => {
     const list = byCat[cat];
     const rows = list.slice(0, 12).map(f => {
-      const p = escapeHtml(f.path || '').replaceAll("'", "\\'");
-      return `<div class="raw-file-row" style="cursor:pointer;grid-template-columns:1fr auto" onclick="extractSourceFileByPath('${p}')">
-        <span><code>${escapeHtml((f.path || '').split(/[/\\\\]/).slice(-2).join('/'))}</code>
+      const rawPath = typeof f.path === 'string' ? f.path : '';
+      const sourceRef = typeof f.source_root_id === 'string' ? f.source_root_id : '';
+      const extractRef = rawPath || sourceRef;
+      const p = escapeHtml(extractRef).replaceAll("'", "\\'");
+      const canExtract = !!extractRef;
+      const clickAttr = canExtract ? ` onclick="extractSourceFileByPath('${p}')"` : '';
+      const label = guiPathLabel(f.path || f.relative_path || f.display_name, '受保护来源');
+      return `<div class="raw-file-row" style="${canExtract ? 'cursor:pointer' : 'cursor:default;opacity:.72'};grid-template-columns:1fr auto"${clickAttr}>
+        <span><code>${escapeHtml(label)}</code>
           <div class="surface-meta">${escapeHtml(f.session_title || catTitles[cat] || cat)}</div></span>
-        <span class="chip chip-info">萃取</span></div>`;
+        <span class="chip chip-${canExtract ? 'info' : 'medium'}">${canExtract ? '萃取' : '路径已保护'}</span></div>`;
     }).join('');
     return `<div style="margin-bottom:12px"><div class="finding-header"><span class="finding-rule">${escapeHtml(catTitles[cat] || cat)}</span>
       <span class="chip chip-info">${list.length} 个</span></div><div class="raw-file-list">${rows}</div></div>`;
@@ -4897,6 +5161,8 @@ function renderSelectionCategory(cat, scope, projectRef) {
     const scopeSource = f.scope_source || '';
     const fProjectRef = f.project_ref || projectRef;
     const discoveryId = f.discovery_object_id || '';
+    const sourceRootId = typeof f.source_root_id === 'string' ? f.source_root_id : '';
+    const displayPath = guiPathText(f.path, '受保护来源');
     const confidence = f.confidence != null ? (f.confidence * 100).toFixed(0) + '%' : '';
     const reason = f.default_reason || '';
     const scopeTag = scopeTags[fScope] || fScope;
@@ -4904,9 +5170,9 @@ function renderSelectionCategory(cat, scope, projectRef) {
     if (reason) metaParts.push(escapeHtml(reason));
     if (confidence) metaParts.push('置信度 ' + confidence);
     return `<label class="raw-file-row" style="cursor:pointer">
-      <input type="checkbox" data-selectable="true" data-cat="${escapeHtml(cat.category)}" data-path="${escapeHtml(f.path)}" data-scope="${escapeHtml(fScope)}" data-scope-source="${escapeHtml(scopeSource)}" data-project-ref="${escapeHtml(fProjectRef)}" data-discovery-object-id="${escapeHtml(discoveryId)}" ${checked}>
+      <input type="checkbox" data-selectable="true" data-cat="${escapeHtml(cat.category)}" data-source-root-id="${escapeHtml(sourceRootId)}" data-scope="${escapeHtml(fScope)}" data-scope-source="${escapeHtml(scopeSource)}" data-project-ref="${escapeHtml(fProjectRef)}" data-discovery-object-id="${escapeHtml(discoveryId)}" ${checked}>
       <span class="raw-file-path">
-        <code>${escapeHtml(f.path)}</code>
+        <code>${escapeHtml(displayPath)}</code>
         <div class="surface-meta">${metaParts.join(' · ')}</div>
       </span>
       <span class="chip chip-${persistedChip}">${escapeHtml(persisted)}</span>
@@ -4937,7 +5203,7 @@ async function confirmSelection(instanceId) {
   const checks = document.querySelectorAll('input[type=checkbox][data-selectable="true"]:checked');
   const selected = Array.from(checks).map(c => ({
     category: c.dataset.cat,
-    path: c.dataset.path,
+    source_root_id: c.dataset.sourceRootId || '',
     scope: c.dataset.scope || 'project',
     scope_source: c.dataset.scopeSource || 'fallback',
     project_ref: c.dataset.projectRef || '',
@@ -5250,6 +5516,35 @@ async function ensurePersonalLayer(agentId) {
     showToast('个人记忆层返回结果缺少组 ID', 'error');
   }
   if (dataPageMode === 'multi_agent_shared_mcp') await renderMultiAgentBinding(); else await renderSources();
+}
+
+async function bindSelectedExistingGroup(agentId) {
+  const select = Array.from(document.querySelectorAll('select[data-existing-group-agent]'))
+    .find(item => item.dataset.existingGroupAgent === agentId);
+  const groupId = String(select?.value || '').trim();
+  if (!groupId) return showToast('请选择已有记忆组', 'error');
+  const label = memoryGroupLabel(groupId);
+  if (!confirm(`确认将 ${agentId} 绑定到已有${label}？\n\n· 该 Agent 当前个人/共享绑定会切换到此组\n· 不删除原记忆组，也不改写原生记忆文件\n· 绑定后更新该组 MCP + Hook 配置\n\n继续？`)) return;
+  showToast('正在绑定到已有记忆组…');
+  try {
+    const result = await waitForMutation(
+      await callApi('bind_agent', agentId, groupId, 'memoryguard', 'redirected', []),
+      '绑定已有记忆组',
+    );
+    if (!result || result.error || result.ok === false) {
+      return showToast((result && result.error) || '已有记忆组绑定失败', 'error');
+    }
+    const install = await callApi('install_shared_group_mcp_redirects', groupId, true);
+    if (!install || install.error || install.ok === false) {
+      const detail = install && (install.error || `${install.error_count || 0} 失败，${install.skipped_count || 0} 跳过`);
+      showToast(`已绑定已有${label}，但 MCP + Hook 未完整更新：${detail || '未知错误'}`, 'error');
+    } else {
+      showToast(`已绑定到已有${label}，MCP + Hook 已更新；请按提示重启/信任`, 'success');
+    }
+    await renderMultiAgentBinding();
+  } catch (error) {
+    showToast('绑定已有记忆组失败：' + error, 'error');
+  }
 }
 
 async function installMemoryGroupMcp(groupId) {

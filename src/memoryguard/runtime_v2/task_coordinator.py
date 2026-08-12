@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -176,6 +177,40 @@ class TaskCoordinator:
             checkpoint_key="progress",
         )
 
+    def _record_owner(self, run_id: str, scope: RuntimeScope) -> None:
+        """Persist process identity before worker launch for restart recovery."""
+        from ..runtime_lease import _process_started_at_for_pid
+
+        started = _process_started_at_for_pid(os.getpid())
+        state = {
+            "pid": os.getpid(),
+            "process_started_at": started.isoformat() if started is not None else "",
+        }
+        self._writer().checkpoint(
+            run_id,
+            state,
+            mutation=self._mutation(scope, f"{run_id}:owner:{os.getpid()}"),
+            checkpoint_key="owner",
+        )
+
+    def _owner_state(self, run_id: str, scope: RuntimeScope) -> dict[str, Any]:
+        checkpoint = self._reader().latest_checkpoint(
+            run_id, scope, checkpoint_key="owner",
+        )
+        return dict(checkpoint.state) if checkpoint is not None else {}
+
+    def _owner_is_live(self, run_id: str, scope: RuntimeScope) -> bool:
+        from ..runtime_lease import _lease_is_live, _pid_alive
+
+        owner = self._owner_state(run_id, scope)
+        if not owner:
+            return False
+        # Platforms unable to expose process creation time fail closed while
+        # the PID exists; Windows/Linux additionally reject PID reuse.
+        if not owner.get("process_started_at"):
+            return _pid_alive(owner.get("pid"))
+        return _lease_is_live(owner)
+
     def start(
         self,
         *,
@@ -195,13 +230,124 @@ class TaskCoordinator:
         if not operation_text or not key:
             raise TaskCoordinatorError("operation and idempotency_key are required")
         run_id = _stable_run_id(operation_text, key, scope)
-        existing = self._reader().get_run(run_id, scope)
-        if existing is not None:
-            return self.status(run_id, scope)
+        with self._lock:
+            existing = self._reader().get_run(run_id, scope)
+            if existing is not None:
+                return self.status(run_id, scope)
+            self._schedule(
+                operation=operation_text,
+                key=key,
+                scope=scope,
+                worker=worker,
+                goal=goal,
+                importance=importance,
+            )
+        return self.status(run_id, scope)
 
+    def start_scope_exclusive(
+        self,
+        *,
+        operation: str,
+        scope: RuntimeScope,
+        worker: Callable[[TaskExecution], Mapping[str, Any] | None],
+        goal: str | None = None,
+        importance: int = 0,
+        key: str | None = None,
+    ) -> dict[str, Any]:
+        """Start one worker per (operation, scope).
+
+        If a ``queued``/``running`` run of the same operation already exists in
+        the exact trusted scope, focus it (``started=False``,
+        ``code="operation_already_active"``) instead of creating duplicate work.
+        The active-run check and the durable create are performed under one lock,
+        so two racing starts cannot both win.
+        """
+        if self._closed:
+            raise TaskCoordinatorError("task coordinator is closed")
+        if not callable(worker):
+            raise TypeError("task worker must be callable")
+        operation_text = str(operation or "").strip()
+        if not operation_text:
+            raise TaskCoordinatorError("operation is required")
+        if key is None:
+            key = f"{operation_text}:{time.time_ns()}"
+        key = str(key)
+        run_id = _stable_run_id(operation_text, key, scope)
+        with self._lock:
+            if self._closed:
+                raise TaskCoordinatorError("task coordinator closed during scheduling")
+            active = self._reader().list_runs(
+                scope,
+                states=("queued", "running"),
+                task_types=(operation_text,),
+                limit=100,
+            )
+            for item in active:
+                if item.run_id in self._workers or self._owner_is_live(item.run_id, scope):
+                    focused = self.status(item.run_id, scope)
+                    focused.update({
+                        "started": False,
+                        "focused": True,
+                        "code": "operation_already_active",
+                        "job_id": item.run_id,
+                    })
+                    return focused
+                # Process died after persisting queued/running state.  Close
+                # that orphan before creating a replacement; never focus a
+                # task that has no live owner.
+                self._transition(
+                    item.run_id,
+                    scope,
+                    "cancelled",
+                    key=f"{item.run_id}:orphan-recovered",
+                    error={"code": "task_owner_exited", "retryable": True},
+                )
+            self._schedule(
+                operation=operation_text,
+                key=key,
+                scope=scope,
+                worker=worker,
+                goal=goal,
+                importance=importance,
+            )
+        result = self.status(run_id, scope)
+        result["started"] = True
+        return result
+
+    def active_runs(self, scope: RuntimeScope, *, operation: str | None = None, limit: int = 100) -> list[str]:
+        """Run ids of ``queued``/``running`` runs in the exact trusted scope.
+
+        Optionally filtered to a single operation (task_type).
+        """
+        if self._closed:
+            return []
+        runs = self._reader().list_runs(
+            scope,
+            states=("queued", "running"),
+            task_types=(str(operation),) if operation else (),
+            limit=limit,
+        )
+        return [run.run_id for run in runs]
+
+    def _schedule(
+        self,
+        *,
+        operation: str,
+        key: str,
+        scope: RuntimeScope,
+        worker: Callable[[TaskExecution], Mapping[str, Any] | None],
+        goal: str | None = None,
+        importance: int = 0,
+    ) -> None:
+        """Create the durable run and start its worker thread.
+
+        Caller must hold ``_lock`` (or be in a single-threaded context) so the
+        active-run check and the create cannot race another start.
+        """
+        run_id = _stable_run_id(operation, key, scope)
         self._writer().create_run(
             run_id,
-            task_type=operation_text,
+            task_type=operation,
             # Goal is body-filtered runtime metadata; do not copy a canonical
             # operation such as ``history_backfill`` into it because control
             # tokens are intentionally forbidden in free-form goal text.
@@ -210,6 +356,7 @@ class TaskCoordinator:
             mutation=self._mutation(scope, f"{run_id}:create"),
             requested_by="gui",
         )
+        self._record_owner(run_id, scope)
         cancel_event = threading.Event()
         done_event = threading.Event()
 
@@ -265,13 +412,9 @@ class TaskCoordinator:
                 with self._lock:
                     self._workers.pop(run_id, None)
 
-        thread = threading.Thread(target=runner, name=f"MemoryGuardTask:{operation_text}:{run_id[-8:]}", daemon=False)
-        with self._lock:
-            if self._closed:
-                raise TaskCoordinatorError("task coordinator closed during scheduling")
-            self._workers[run_id] = _WorkerHandle(run_id, thread, cancel_event, done_event)
+        thread = threading.Thread(target=runner, name=f"MemoryGuardTask:{operation}:{run_id[-8:]}", daemon=False)
+        self._workers[run_id] = _WorkerHandle(run_id, thread, cancel_event, done_event)
         thread.start()
-        return self.status(run_id, scope)
 
     def status(self, run_id: str, scope: RuntimeScope) -> dict[str, Any]:
         run = self._reader().get_run(run_id, scope)
@@ -333,9 +476,20 @@ class TaskCoordinator:
         with self._lock:
             handle = self._workers.get(run_id)
         if handle is None:
-            # A process restart already terminated the old owned worker.  An
-            # explicit cancellation can now safely make the durable run
-            # terminal; there is no thread/process left to outlive it.
+            if self._owner_is_live(run_id, scope):
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "operation": "task_cancel",
+                    "task": self.status(run_id, scope).get("task", {}),
+                    "error": {
+                        "code": "task_owned_by_other_process",
+                        "message": "Task is owned by another live process",
+                        "details": {},
+                    },
+                }
+            # Process restart terminated the old owner.  Cancellation now
+            # safely makes the orphan durable run terminal.
             self._transition(run_id, scope, "cancelled", key=f"{run_id}:cancel-recovered")
             return self.status(run_id, scope)
 

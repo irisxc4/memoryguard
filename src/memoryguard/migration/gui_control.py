@@ -22,6 +22,7 @@ from ..runtime_v2.group_native import (
     _group_kind,
     personal_group_id,
 )
+from ..storage.transaction import transaction
 
 
 class GuiControlMigrationError(RuntimeError):
@@ -36,6 +37,50 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
+
+
+def _missing_legacy_bindings(conn: Any, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT binding_id,agent_instance_id,share_group_id,group_kind,mcp_server_name,"
+        "native_memory_mode,redirect_paths_json,status FROM agent_group_bindings "
+        "ORDER BY binding_id"
+    ).fetchall()
+    existing_by_id = {str(row[0]): row for row in rows}
+    missing: list[dict[str, Any]] = []
+    for record in records:
+        old = existing_by_id.get(record["binding_id"])
+        if old is None:
+            missing.append(record)
+            continue
+        expected = (
+            record["agent_instance_id"],
+            record["share_group_id"],
+            _group_kind(record["share_group_id"]),
+            record["mcp_server_name"],
+            record["native_memory_mode"],
+            _canonical(record["redirect_paths"]),
+            record["status"],
+        )
+        actual = tuple(str(old[index]) for index in range(1, 8))
+        if actual != expected:
+            raise GuiControlMigrationError("v2_binding_identity_conflict")
+    return missing
+
+
+def _validate_success_receipt(
+    receipt: Mapping[str, Any], *, source_digest: str, record_count: int,
+) -> Mapping[str, Any]:
+    result = receipt.get("result")
+    if not isinstance(result, Mapping):
+        raise GuiControlMigrationError("control_receipt_corrupt")
+    if (
+        result.get("ok") is not True
+        or result.get("status") != "succeeded"
+        or result.get("source_digest") != source_digest
+        or result.get("record_count") != record_count
+    ):
+        raise GuiControlMigrationError("control_receipt_inconsistent")
+    return result
 
 
 def _load_legacy_bindings(workspace: Path) -> tuple[list[dict[str, Any]], str]:
@@ -123,6 +168,7 @@ def migrate_legacy_gui_control(workspace: str | Path) -> dict[str, Any]:
             "SELECT binding_id,agent_instance_id,share_group_id,status FROM agent_group_bindings ORDER BY binding_id"
         ).fetchall()
         existing_by_id = {str(row[0]): row for row in existing}
+        _missing_legacy_bindings(conn, records)
         migrated = 0
         active = 0
         inactive = 0
@@ -181,6 +227,46 @@ def migrate_legacy_gui_control(workspace: str | Path) -> dict[str, Any]:
         return result, "gui-control-migration"
 
     try:
+        request_digest = _digest(request)
+        receipt = control.read_receipt("migrate_legacy_agent_bindings", "legacy-agent-bindings-v1")
+        if receipt is not None:
+            if receipt.get("request_digest") != request_digest:
+                raise GuiControlMigrationError("idempotency_key_reused")
+            stored = _validate_success_receipt(
+                receipt, source_digest=source_digest, record_count=len(records),
+            )
+            with control.connection(write=True) as conn:
+                with transaction(conn):
+                    missing = _missing_legacy_bindings(conn, records)
+                    if not missing:
+                        replay = dict(stored)
+                        replay["replayed"] = True
+                        if "changed" in replay:
+                            replay["changed"] = False
+                        if "created" in replay:
+                            replay["created"] = False
+                        return replay
+
+            repair_key = f"legacy-agent-bindings-v1:repair:{source_digest}"
+            suffix = 1
+            while control.read_receipt("migrate_legacy_agent_bindings", repair_key) is not None:
+                suffix += 1
+                repair_key = f"legacy-agent-bindings-v1:repair:{source_digest}:{suffix}"
+            repair_request = {
+                **request,
+                "repair_of": "legacy-agent-bindings-v1",
+                "missing_binding_ids": [item["binding_id"] for item in missing],
+            }
+
+            def apply_repair(conn: Any) -> tuple[Mapping[str, Any], str]:
+                result, aggregate = apply(conn)
+                repaired = dict(result)
+                repaired["repaired"] = True
+                return repaired, aggregate
+
+            return dict(control.mutate(
+                "migrate_legacy_agent_bindings", repair_key, repair_request, apply_repair,
+            ))
         result = control.mutate(
             "migrate_legacy_agent_bindings",
             "legacy-agent-bindings-v1",

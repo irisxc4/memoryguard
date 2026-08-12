@@ -69,6 +69,9 @@ class _Locator:
         self.workspace = workspace
         self.data_path = data_path
         self.context = SimpleNamespace(platform="test", host_id="host-a")
+        self.registry = SimpleNamespace(
+            list_profiles=lambda: [SimpleNamespace(product="codex"), SimpleNamespace(product="cursor")]
+        )
 
     def detect_instances(self):
         instance = _Instance(self.workspace, self.data_path)
@@ -115,6 +118,8 @@ def test_discovery_selection_and_content_connector_are_v2_native(tmp_path: Path)
 
     discovered = service.discover_agents()
     assert discovered["instances"][0]["instance_id"] == "agent-instance-a"
+    assert discovered["known_profile_count"] == 2
+    assert discovered["known_products"] == ["codex", "cursor"]
     tree = service.get_selection_tree("agent-instance-a")
     source_id = tree["scopes"][0]["categories"][0]["files"][0]["source_root_id"]
     committed = service.commit_selection("agent-instance-a", [{"path": str(data)}])
@@ -128,6 +133,23 @@ def test_discovery_selection_and_content_connector_are_v2_native(tmp_path: Path)
     assert cleared["disabled_source_count"] == 1
     connectors = service.content.list_source_connectors(workspace_id=str(tmp_path.resolve()))
     assert connectors[0]["enabled"] == 0
+
+
+def test_selection_commit_accepts_opaque_source_root_id(tmp_path: Path) -> None:
+    """The GUI must submit the redaction-safe source token, not an absolute path."""
+    data = tmp_path / "agent-data"
+    data.mkdir()
+    (data / "memory.md").write_text("hello", encoding="utf-8")
+    service = _service(tmp_path, data)
+    tree = service.get_selection_tree("agent-instance-a")
+    source_id = tree["scopes"][0]["categories"][0]["files"][0]["source_root_id"]
+
+    committed = service.commit_selection(
+        "agent-instance-a",
+        [{"source_root_id": source_id, "category": "native_memory"}],
+    )
+
+    assert committed["source_ids"] == [source_id]
 
 
 def test_v2_agent_mark_archive_restore_delete_and_open(tmp_path: Path) -> None:
@@ -181,3 +203,22 @@ def test_agent_native_has_no_legacy_control_store_imports() -> None:
         "from ..agent_binding import", "from ..shared_memory_store import",
     ):
         assert text not in source
+
+
+def test_active_binding_keeps_private_data_agent_out_of_residual_bucket(tmp_path: Path) -> None:
+    data = tmp_path / "agent-data"
+    data.mkdir()
+    service = _service(tmp_path, data)
+    GroupControlService(tmp_path, write=True).bind_agent(
+        agent_instance_id="agent-instance-a",
+        share_group_id="shared-existing",
+        mcp_server_name="memoryguard",
+        native_memory_mode="redirected",
+        redirect_paths=[],
+    )
+
+    listed = service.list_agents()
+
+    assert listed["residuals"] == []
+    assert listed["agents"][0]["binding_status"] == "active"
+    assert listed["agents"][0]["binding"]["share_group_id"] == "shared-existing"

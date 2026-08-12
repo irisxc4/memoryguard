@@ -136,6 +136,7 @@ def _effective_agent_context(
         or payload.get("conversation_id")
         or payload.get("conversationId")
         or payload.get("sessionId")
+        or payload.get("thread_id")
         or ""
     ).strip()
     context_hash = str(payload.get("context_hash") or "").strip()
@@ -144,7 +145,9 @@ def _effective_agent_context(
         share_group_id=share_group_id,
         provider=provider,
         project_ref=canonical_project_ref(
-            payload.get("project_ref") or payload.get("cwd")
+            payload.get("project_ref")
+            or payload.get("projectRef")
+            or payload.get("cwd")
         ),
         runtime_role="subagent" if event == "subagent_start" else "root",
         runtime_agent_id=(
@@ -1427,6 +1430,9 @@ def _session_id(payload: dict[str, Any]) -> str:
     base = str(
         payload.get("session_id")
         or payload.get("conversation_id")
+        or payload.get("conversationId")
+        or payload.get("sessionId")
+        or payload.get("thread_id")
         or "unknown-session"
     )
     subagent = str(
@@ -1919,6 +1925,19 @@ def _v2_hook_context(
         provider, agent_instance_id, share_group_id, payload, event=event,
     )
     plain = _plain_hook_context(context)
+    # The plain compatibility seam is used by injected/test facades when a
+    # process-local native capability cannot be issued.  Keep the same
+    # authenticated scope shape there so compact/resume events cannot lose
+    # workspace or trusted identity merely because their payload is sparse.
+    plain.setdefault("workspace_id", str(workspace))
+    plain["trusted_identity"] = {
+        key: plain.get(key, "")
+        for key in (
+            "workspace_id", "agent_instance_id", "share_group_id",
+            "project_ref", "provider", "runtime_role",
+        )
+        if plain.get(key, "")
+    }
     try:
         from .access_context import AccessContext, load_access_context
         from .runtime_v2.group_native import GroupControlService
@@ -2021,6 +2040,22 @@ def _normalize_native_v2_packet(
         item_id = str(item.get("item_id") or item.get("memory_id") or "").strip()
         if not item_id:
             continue
+        memory_id = str(item.get("memory_id") or item_id).strip()
+        injection_policy = str(item.get("injection_policy") or "always").strip().casefold()
+        priority = item.get("priority", 0)
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            priority = 0
+        scope = item.get("scope")
+        public_scope = {}
+        if isinstance(scope, dict):
+            public_scope = {
+                key: scope[key]
+                for key in (
+                    "workspace_id", "project_ref", "agent_instance_id",
+                    "share_group_id", "provider", "runtime_role",
+                )
+                if key in scope and isinstance(scope[key], (str, int, bool, float))
+            }
         receipt_id = "v2-" + _short_hash(json.dumps(
             {
                 "workspace": str(workspace),
@@ -2030,6 +2065,10 @@ def _normalize_native_v2_packet(
                 "session": session_id,
                 "event": event,
                 "item": item_id,
+                "memory_id": memory_id,
+                "injection_policy": injection_policy,
+                "priority": priority,
+                "scope": public_scope,
                 "digest": item.get("digest") or item.get("item_hash") or "",
             },
             ensure_ascii=False,
@@ -2038,10 +2077,13 @@ def _normalize_native_v2_packet(
         ))
         receipts.append({
             "receipt_id": receipt_id,
-            "memory_id": item_id,
+            "memory_id": memory_id,
             "item_id": item_id,
             "layer": "mandatory",
             "source": "native-v2-context",
+            "injection_policy": injection_policy,
+            "priority": priority,
+            "scope": public_scope,
         })
     normalized["mandatory_rule_ids"] = rule_ids
     normalized["mandatory_match_receipts"] = receipts
@@ -2104,9 +2146,36 @@ def _v2_hook_cutover(
             "MemoryGuard V2 hook context capability unavailable; bootstrap blocked.",
         )
     try:
+        # Compaction/resume payloads are commonly sparse (for example they
+        # carry only a session id and a trigger).  Reuse the last trusted
+        # lifecycle scope for omitted project/session fields, while keeping
+        # the hook arguments authoritative for agent/group/provider.
+        context_payload = dict(payload)
+        prior_state = _load_state(workspace, provider, session_id)
+        prior_identity = prior_state.get("context_identity")
+        if isinstance(prior_identity, dict):
+            for key in ("project_ref", "projectRef", "cwd", "context_hash"):
+                if not context_payload.get(key) and prior_identity.get(key):
+                    context_payload[key] = prior_identity[key]
+            if not any(
+                context_payload.get(key)
+                for key in ("session_id", "conversation_id", "conversationId", "sessionId", "thread_id")
+            ) and prior_identity.get("session_id"):
+                context_payload["session_id"] = prior_identity["session_id"]
         context = _v2_hook_context(
-            provider, agent_instance_id, share_group_id, payload, event, workspace,
+            provider, agent_instance_id, share_group_id, context_payload, event, workspace,
         )
+        context_view = _plain_hook_context(context)
+        context_identity = {
+            "workspace_id": str(workspace),
+            "agent_instance_id": agent_instance_id,
+            "share_group_id": share_group_id,
+            "provider": provider,
+            "runtime_role": str(context_view.get("runtime_role") or "root"),
+            "project_ref": str(context_view.get("project_ref") or ""),
+            "session_id": str(context_view.get("session_id") or session_id or ""),
+            "context_hash": str(context_view.get("context_hash") or ""),
+        }
         kwargs: dict[str, Any] = {"context": context}
         if accepts_snapshot:
             kwargs["snapshot"] = snapshot
@@ -2204,6 +2273,7 @@ def _v2_hook_cutover(
                 packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []
             ),
             "mandatory_match_receipts": receipts if isinstance(receipts, list) else [],
+            "context_identity": context_identity,
         })
         if event == "user_prompt":
             state_payload.update({

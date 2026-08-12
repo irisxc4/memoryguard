@@ -88,6 +88,10 @@ class ContextRequest:
     share_group_id: str = ""
     runtime_role: str = ""
     trusted_identity: Mapping[str, Any] = field(default_factory=dict)
+    workspace_id: str = ""
+    namespace_id: str = ""
+    sensitivity: str = ""
+    policy_class: str = ""
 
     def __post_init__(self) -> None:
         trusted = dict(self.trusted_identity) if isinstance(self.trusted_identity, Mapping) else self.trusted_identity
@@ -147,6 +151,15 @@ class ContextRequest:
             ("provider", "trusted_provider"),
             "provider",
         )
+        workspace = _identity_value(
+            {
+                "workspace_id": self.workspace_id,
+                "trusted_workspace_id": trusted.get("workspace_id", ""),
+                "trusted_workspace": trusted.get("workspace", ""),
+            },
+            ("workspace_id", "trusted_workspace_id", "trusted_workspace"),
+            "workspace_id",
+        )
         object.__setattr__(self, "task", _text(self.task))
         object.__setattr__(self, "project_hint", _text(self.project_hint))
         object.__setattr__(self, "agent", agent)
@@ -158,6 +171,10 @@ class ContextRequest:
         object.__setattr__(self, "project_ref", project)
         object.__setattr__(self, "share_group_id", group)
         object.__setattr__(self, "runtime_role", runtime)
+        object.__setattr__(self, "workspace_id", workspace)
+        object.__setattr__(self, "namespace_id", _text(self.namespace_id))
+        object.__setattr__(self, "sensitivity", _text(self.sensitivity))
+        object.__setattr__(self, "policy_class", _text(self.policy_class))
         object.__setattr__(self, "read_path", _text(self.read_path).casefold() or "auto")
         for name in ("max_items", "max_chars", "max_tokens"):
             value = getattr(self, name)
@@ -194,6 +211,7 @@ class ContextRequest:
             ("trusted_project", "project"), ("trusted_project_ref", "project_ref"), ("trusted_project_id", "project_id"),
             ("trusted_group", "group"), ("trusted_share_group_id", "share_group_id"), ("trusted_group_id", "group_id"),
             ("trusted_runtime", "runtime"), ("trusted_runtime_role", "runtime_role"),
+            ("trusted_workspace_id", "workspace_id"), ("trusted_workspace", "workspace"),
         ):
             if alias in identity:
                 merged[key] = identity[alias]
@@ -205,6 +223,14 @@ class ContextRequest:
             provider_values["trusted_provider"] = identity["provider"]
         fields["provider"] = _identity_value(provider_values, ("provider", "trusted_provider"), "provider")
         fields["runtime"] = _identity_value(merged, ("runtime", "runtime_role", "trusted_runtime", "trusted_runtime_role"), "runtime")
+        fields["workspace_id"] = _identity_value(
+            merged,
+            ("workspace_id", "workspace", "trusted_workspace_id", "trusted_workspace"),
+            "workspace_id",
+        )
+        fields["namespace_id"] = _text(value.get("namespace_id", identity.get("namespace_id", "")))
+        fields["sensitivity"] = _text(value.get("sensitivity", identity.get("sensitivity", "")))
+        fields["policy_class"] = _text(value.get("policy_class", identity.get("policy_class", "")))
         for name in ("max_items", "max_chars", "max_tokens"):
             if name in value:
                 fields[name] = value[name]
@@ -227,6 +253,7 @@ class ContextRequest:
             "provider": self.provider,
             "runtime": self.runtime,
             "runtime_role": self.runtime,
+            "workspace_id": self.workspace_id,
             "trusted_identity": dict(self.trusted_identity),
         }
 
@@ -235,6 +262,7 @@ class ContextRequest:
 class ContextCandidate:
     item_id: str
     body: str
+    memory_id: str = ""
     layer: str = "relevant"
     kind: str = "fact"
     source: str = "retrieval"
@@ -331,6 +359,7 @@ class ContextCandidate:
         if is_reference and ("body" in data or "text" in data or "content" in data):
             unsafe_payload = True
         body_text = summary if is_reference else _text(body)
+        memory_id = _text(data.get("memory_id", ""))
         candidate_id = _text(data.get("item_id", data.get("memory_id", data.get("id", ""))))
         digest = hashlib.sha256(f"{layer}|{data.get('kind', '')}|{body_text}".encode("utf-8")).hexdigest()[:20]
         if not candidate_id:
@@ -383,6 +412,8 @@ class ContextCandidate:
             injection_policy = "always" if layer == "mandatory" else "relevant"
         if source.casefold() == "native-v2-rule" and not rule_strength:
             rule_strength = "must" if layer == "mandatory" else "observation"
+        if source.casefold() == "native-v2-rule" and not injection_policy:
+            injection_policy = "always" if layer == "mandatory" else "relevant"
         semantic_identity = ""
         for identity_key in ("semantic_identity", "stable_identity", "dedup_identity", "semantic_id"):
             value = data.get(identity_key)
@@ -464,6 +495,7 @@ class ContextCandidate:
         return cls(
             item_id=candidate_id,
             body=body_text,
+            memory_id=memory_id,
             layer=declared_layer,
             kind=kind,
             source=source,
@@ -528,12 +560,14 @@ class ContextCandidate:
     def public(self) -> dict[str, Any]:
         return {
             "item_id": self.item_id,
+            "memory_id": self.memory_id or self.item_id,
             "kind": self.kind,
             "layer": self.layer,
             "source": self.source,
             "scope": dict(self.scope),
             "priority": self.priority,
             "score": self.score,
+            "injection_policy": self.injection_policy or ("always" if self.layer == "mandatory" else "relevant"),
         }
 
 
@@ -562,6 +596,9 @@ class ContextReceipt:
                 "lifecycle_flag_invalid": "lifecycle_rejected",
                 "lifecycle_flags_invalid": "lifecycle_rejected",
                 "lifecycle_flags_conflict": "lifecycle_rejected",
+                "injection_policy_layer_conflict": "policy_rejected",
+                "injection_policy_invalid": "policy_rejected",
+                "mandatory_policy_requires_rule": "policy_rejected",
                 "unsafe_payload": "content_rejected",
                 "mandatory_content_blocked": "content_rejected",
                 "unknown_layer": "layer_rejected",
@@ -748,11 +785,29 @@ class ContextEngine:
 
     @staticmethod
     def _scope_public(scope: Mapping[str, Any]) -> dict[str, Any]:
-        return {
-            key: scope[key]
-            for key in ("target_type", "target_id", "agent", "agent_instance_id", "project", "group", "share_group_id", "provider", "runtime")
-            if key in scope and isinstance(scope[key], (str, int, bool, float))
-        }
+        public: dict[str, Any] = {}
+        for key in (
+            "target_type", "target_id", "agent", "agent_instance_id",
+            "project", "project_ref", "group", "share_group_id",
+            "provider", "runtime", "runtime_role", "workspace_id",
+        ):
+            if key in scope and isinstance(scope[key], (str, int, bool, float)):
+                public[key] = scope[key]
+        for key, aliases in {
+            "project_ref": ("__top_project_ref", "__top_project", "__top_project_id"),
+            "workspace_id": ("__top_workspace_id", "__top_workspace", "__top_workspace_path"),
+            "agent_instance_id": ("__top_agent_instance_id", "__top_agent_id", "__top_agent"),
+            "share_group_id": ("__top_share_group_id", "__top_group_id", "__top_group"),
+            "runtime_role": ("__top_runtime_role", "__top_runtime"),
+        }.items():
+            if key in public:
+                continue
+            for alias in aliases:
+                value = scope.get(alias)
+                if isinstance(value, (str, int, bool, float)):
+                    public[key] = value
+                    break
+        return public
 
     @staticmethod
     def _evidence_public(evidence: Any) -> dict[str, Any]:
@@ -810,7 +865,7 @@ class ContextEngine:
         )
         if workspace_conflict:
             return False, "scope_alias_conflict"
-        if workspace and request.project_hint and workspace != request.project_hint:
+        if workspace and (not request.workspace_id or workspace != request.workspace_id):
             return False, "scope_mismatch"
         target_type, type_conflict = ContextEngine._scope_alias(scope, ("target_type", "type", "scope_type", "__top_target_type", "__top_type", "__top_scope_type"), casefold=True)
         target_id, id_conflict = ContextEngine._scope_alias(scope, ("target_id", "id", "scope_id", "__top_target_id", "__top_id", "__top_scope_id"))
@@ -891,6 +946,7 @@ class ContextEngine:
             return payload
         payload: dict[str, Any] = {
             "item_id": candidate.item_id,
+            "memory_id": candidate.memory_id or candidate.item_id,
             "body": text,
             "kind": candidate.kind,
             "layer": layer,
@@ -898,9 +954,9 @@ class ContextEngine:
             "scope": self._scope_public(candidate.scope),
             "evidence": self._evidence_public(candidate.evidence),
             "digest": candidate.digest,
+            "injection_policy": candidate.injection_policy or ("always" if layer == "mandatory" else "relevant"),
+            "priority": candidate.priority,
         }
-        if candidate.priority:
-            payload["priority"] = candidate.priority
         if truncated:
             payload["truncated"] = True
         return payload
@@ -949,6 +1005,16 @@ class ContextEngine:
                         receipts.append(ContextReceipt(candidate.item_id, layer, False, candidate.lifecycle_reason or "lifecycle_status_rejected", {}, {}))
                         ledger.omit("lifecycle_rejected")
                         continue
+                    policy = candidate.injection_policy
+                    if policy and policy not in {"always", "relevant"}:
+                        receipts.append(ContextReceipt(candidate.item_id, layer, False, "injection_policy_invalid", {}, {}))
+                        raise ContextSafetyError("injection_policy_invalid")
+                    if policy == "always" and layer != "mandatory":
+                        receipts.append(ContextReceipt(candidate.item_id, layer, False, "injection_policy_layer_conflict", {}, {}))
+                        raise ContextSafetyError("injection_policy_layer_conflict")
+                    if policy == "relevant" and layer == "mandatory":
+                        receipts.append(ContextReceipt(candidate.item_id, layer, False, "injection_policy_layer_conflict", {}, {}))
+                        raise ContextSafetyError("injection_policy_layer_conflict")
                     # Never inject raw history or tool output, regardless of
                     # planner/retriever labels.
                     source = candidate.source.casefold()
@@ -974,6 +1040,9 @@ class ContextEngine:
                     # A non-rule item can never enter mandatory.  Demote to
                     # relevant so it remains recallable without authority.
                     if layer == "mandatory" and not candidate.is_rule:
+                        if policy == "always":
+                            receipts.append(ContextReceipt(candidate.item_id, layer, False, "mandatory_policy_requires_rule", {}, {}))
+                            raise ContextSafetyError("mandatory_policy_requires_rule")
                         candidate = replace(candidate, layer="relevant")
                         layer = "relevant"
                     groups.setdefault(layer, []).append(candidate)

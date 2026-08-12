@@ -151,7 +151,14 @@ class AgentNativeService:
         raise AgentNativeError("candidate_not_found")
 
     def discover_agents(self) -> dict[str, Any]:
-        instances, ledgers = self._instances()
+        locator = self._locator()
+        instances, ledgers = locator.detect_instances()
+        # Discovery is intentionally Profile-bounded.  Return the registry
+        # coverage beside the detections so the GUI never implies that a
+        # finite set of safe probes equals every product on the market.
+        registry = getattr(locator, "registry", None)
+        profiles = registry.list_profiles() if registry is not None else []
+        known_products = sorted({str(profile.product) for profile in profiles if str(profile.product).strip()})
         marks = self._marks()
         output: list[dict[str, Any]] = []
         for instance in instances:
@@ -160,7 +167,11 @@ class AgentNativeService:
             mark = marks.get(candidate, {})
             item["candidate_id"] = candidate
             item["lifecycle_state"] = "ignored" if mark.get("status") == "uninstalled" else "installed"
-            item["support_level"] = _enum(getattr(instance, "target_capability", ""))
+            # Keep the support grade (A/B/C/D) separate from the takeover
+            # capability (export_only/mcp/native_takeover).  The old mapping
+            # overwrote the grade with ``export_only``, making the UI say
+            # "支持 export_only" and hiding the actual support classification.
+            item["support_level"] = _enum(getattr(instance, "support_level", "")) or "C"
             item["marked_uninstalled"] = mark.get("status") == "uninstalled"
             output.append(item)
         counts = {"found": 0, "missing": 0, "unsupported": 0, "permission_denied": 0, "excluded_by_user": 0, "not_applicable": 0, "unaccounted_count": 0, "surface_count": 0}
@@ -170,8 +181,10 @@ class AgentNativeService:
                 counts[key] += int(values.get(key, 0) or 0)
         return {
             "ok": True, "status": "succeeded", "instances": output,
-            "discovery_ledger": counts, "platform": self._locator().context.platform,
-            "host_id": self._locator().context.host_id,
+            "discovery_ledger": counts, "platform": locator.context.platform,
+            "host_id": locator.context.host_id,
+            "known_profile_count": len(profiles),
+            "known_products": known_products,
         }
 
     def list_candidates(
@@ -235,6 +248,38 @@ class AgentNativeService:
                         result[str(Path(str(file_row["path"])).expanduser().resolve())] = dict(file_row)
         return result
 
+    def resolve_source_path(self, instance_id: str, source_root_id: str) -> str:
+        """Resolve a server-issued source token without exposing its path."""
+        token = str(source_root_id or '').strip()
+        if not token:
+            raise AgentNativeError('source_root_id_required')
+        allowed = self._tree_paths(self.get_selection_tree(str(instance_id)))
+        matches = [
+            path for path, row in allowed.items()
+            if str(row.get('source_root_id') or '') == token
+        ]
+        if len(matches) != 1:
+            raise AgentNativeError('agent_source_not_found')
+        return matches[0]
+
+    def resolve_residual_path(self, candidate_id: str, path_ref: str) -> str:
+        """Resolve a server-issued residual token for a guarded file action."""
+        token = str(path_ref or '').strip()
+        if not token:
+            raise AgentNativeError('dir_path_required')
+        _product, _instance_id, paths, resolved_candidate = self._candidate_context(candidate_id)
+        matches = [
+            str(Path(item).expanduser().resolve())
+            for item in paths
+            if stable_id(
+                'agent-residual', resolved_candidate,
+                str(Path(item).expanduser().resolve()),
+            ) == token
+        ]
+        if len(matches) != 1:
+            raise AgentNativeError('agent_path_not_discovered')
+        return matches[0]
+
     def commit_selection(self, instance_id: str, selected: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         instance, _candidate, _paths = self._instance_context(instance_id)
         tree = self.get_selection_tree(instance_id)
@@ -243,7 +288,17 @@ class AgentNativeService:
         for item in selected:
             if not isinstance(item, Mapping):
                 raise AgentNativeError("selection_entry_invalid")
-            path = str(item.get("path") or "").strip()
+            source_root_id = str(item.get("source_root_id") or "").strip()
+            if source_root_id:
+                matches = [
+                    candidate_path for candidate_path, row in allowed.items()
+                    if str(row.get("source_root_id") or "") == source_root_id
+                ]
+                if len(matches) != 1:
+                    raise AgentNativeError("selection_path_not_discovered")
+                path = matches[0]
+            else:
+                path = str(item.get("path") or "").strip()
             if not path:
                 raise AgentNativeError("selection_path_required")
             resolved = str(Path(path).expanduser().resolve())
@@ -541,6 +596,7 @@ class AgentNativeService:
                 resolved_path = str(path.resolve())
                 items.append({
                     "path": resolved_path,
+                    "path_ref": stable_id("agent-residual", cid, resolved_path),
                     "residual_type": "private_data_evidence" if resolved_path in private_paths else "agent_data",
                     "description": "AgentLocator discovered data surface",
                     "archive_preview": {"ok": True},
@@ -570,16 +626,33 @@ class AgentNativeService:
         discovered = self.discover_agents()
         agents = []
         residuals = []
+        active_bindings = {
+            str(item.get("agent_instance_id") or ""): dict(item)
+            for item in self.control.list_bindings(include_inactive=False).get("bindings", [])
+            if isinstance(item, Mapping)
+        }
         for item in discovered["instances"]:
             instance, _candidate, _paths = self._instance_context(str(item["instance_id"]))
             private_surfaces, shared_surfaces, install_surfaces = self._surface_partition(instance)
+            binding = active_bindings.get(str(item["instance_id"]))
+            if binding:
+                item["binding"] = binding
+                item["binding_status"] = "active"
+                item["private_data_surface_count"] = len(private_surfaces)
+                item["shared_surface_count"] = len(shared_surfaces)
+                agents.append(item)
+                continue
             if private_surfaces and not install_surfaces:
-                residuals.append(self.residual_cleanup(instance_id=str(item["instance_id"])))
+                residual = self.residual_cleanup(instance_id=str(item["instance_id"]))
+                residual["binding_status"] = "missing"
+                residual["control_repair_required"] = True
+                residuals.append(residual)
                 continue
             if shared_surfaces and not install_surfaces and not private_surfaces:
                 continue
             item["private_data_surface_count"] = len(private_surfaces)
             item["shared_surface_count"] = len(shared_surfaces)
+            item["binding_status"] = "unbound"
             agents.append(item)
             try:
                 # Installed instances remain in the primary agent list; their
@@ -595,6 +668,8 @@ class AgentNativeService:
             "residuals": residuals,
             "total": len(agents),
             "residual_total": len(residuals),
+            "known_profile_count": discovered.get("known_profile_count", 0),
+            "known_products": discovered.get("known_products", []),
         }
 
 

@@ -40,6 +40,7 @@ from .rules import skill_rules  # noqa: F401
 from .rules import memory_rules  # noqa: F401
 from .rules import rag_rules  # noqa: F401
 from .runtime_v2.public_safety import v2_upgrade_payload
+from .workspace_resolver import WorkspaceResolutionError, resolve_workspace
 from .schema import (
     Change,
     ChangeStatus,
@@ -115,7 +116,7 @@ def _health_score(discovery, findings=None) -> float:
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
-    workspace = Path(args.path).resolve()
+    workspace = _effective_workspace(args, getattr(args, "path", "."))
     if not workspace.is_dir():
         print(f"error: workspace not found: {workspace}", file=sys.stderr)
         return 1
@@ -167,7 +168,7 @@ def cmd_open(args: argparse.Namespace) -> int:
     顺序: 桌面原生窗口 -> localhost 浏览器 -> 静态 HTML 文件 -> 文本+JSON 路径
     退出码: 0 成功, 1 无报告, 3 所有 GUI 能力不可用（已降级到文本）
     """
-    workspace = Path(args.path).resolve()
+    workspace = _effective_workspace(args, getattr(args, "path", "."))
     mode = getattr(args, "mode", "auto")
 
     from .interactive import render_interactive_html
@@ -238,7 +239,7 @@ def _load_report(workspace: Path) -> Report | None:
 
 def cmd_explain(args: argparse.Namespace) -> int:
     """解释 Finding 的证据、影响、建议、验证方式（spec §4）。"""
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     report = _load_report(workspace)
     if report is None:
         print(f"error: no report found. run `memoryguard audit {args.workspace}` first.", file=sys.stderr)
@@ -274,7 +275,7 @@ BACKUPS_DIR = f"{MG_DIR}/backups"
 
 def cmd_plan(args: argparse.Namespace) -> int:
     """为指定 Findings 生成最小修复 Plan（只读，不写源文件，spec §9）。"""
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     report = _load_report(workspace)
     if report is None:
         print("error: no report found. run audit first.", file=sys.stderr)
@@ -352,7 +353,7 @@ def _generate_patch(finding: Finding) -> Patch | None:
 
 def cmd_apply(args: argparse.Namespace) -> int:
     """经批准应用 Plan：备份 + 补丁 + 重扫（spec §9）。"""
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     plan_path = workspace / PLANS_DIR / f"{args.plan_id}.json"
     if not plan_path.exists():
         print(f"error: plan not found: {args.plan_id}", file=sys.stderr)
@@ -443,7 +444,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
 
 def cmd_undo(args: argparse.Namespace) -> int:
     """撤销 Change：从备份恢复 + 重扫验证（spec §9）。"""
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     change_path = workspace / CHANGES_DIR / f"{args.change_id}.json"
     if not change_path.exists():
         print(f"error: change not found: {args.change_id}", file=sys.stderr)
@@ -472,7 +473,7 @@ def cmd_undo(args: argparse.Namespace) -> int:
 
 def cmd_verify(args: argparse.Namespace) -> int:
     """重扫并比较修复前后（spec §4）。"""
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     report = _load_report(workspace)
     if report is None:
         print("error: no report found.", file=sys.stderr)
@@ -500,7 +501,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def cmd_source(args: argparse.Namespace) -> int:
     """来源管理（spec §4.1）。"""
     from .runtime_v2.source_control import SourceControlError, SourceControlService
-    workspace = Path(getattr(args, "workspace", ".")).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     context = getattr(args, "_native_context", None) or _cli_trusted_context(workspace)
     service = SourceControlService(workspace)
     action = args.action
@@ -548,7 +549,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     """只读扫描，生成快照 + 覆盖率账本（spec §4.2）。"""
     from .runtime_v2.source_control import SourceControlService
 
-    workspace = Path(getattr(args, "workspace", ".")).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     context = getattr(args, "_native_context", None) or _cli_trusted_context(workspace)
     result = SourceControlService(workspace).scan_summary(context)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
@@ -575,7 +576,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         "error": "v2_operation_retired",
     }, ensure_ascii=False, sort_keys=True))
     return 2
-    workspace = Path(getattr(args, "workspace", ".")).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     bundle = Path(args.bundle).resolve()
     if not bundle.exists():
         print(f"error: bundle not found: {bundle}", file=sys.stderr)
@@ -831,7 +832,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     """诊断安装环境，输出检查报告。"""
-    workspace = Path(getattr(args, "workspace", ".")).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     issues = 0
     lines: list[str] = ["MemoryGuard Doctor", "=================="]
 
@@ -940,7 +941,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_mcp_status(args: argparse.Namespace) -> int:
     """查询 MCP 记忆后端状态。"""
-    workspace = Path(getattr(args, "workspace", ".")).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     lines: list[str] = ["MemoryGuard MCP Status", "======================"]
 
     # MCP server 运行状态（stdio 模式，无常驻进程）
@@ -1074,7 +1075,7 @@ def cmd_hooks(args: argparse.Namespace) -> int:
     from .host_hooks import HostHookManager, set_hook_mode
     from .runtime_v2.group_native import GroupControlService
 
-    workspace = Path(args.workspace).expanduser().resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     manager = HostHookManager(workspace)
     agent_id = (
         str(getattr(args, "agent_id", "") or "")
@@ -1152,7 +1153,7 @@ def cmd_gc(args: argparse.Namespace) -> int:
     """`.memoryguard/` GC：默认可重建物优先清的 dry-run 预览。"""
     from .gc import MemoryGuardGc
 
-    workspace = Path(args.path).resolve()
+    workspace = _effective_workspace(args, getattr(args, "path", "."))
     if not workspace.is_dir():
         print(f"error: workspace not found: {workspace}", file=sys.stderr)
         return 1
@@ -1197,7 +1198,7 @@ def cmd_storage(args: argparse.Namespace) -> int:
 
     from .maintenance_v2.api import MaintenanceV2Api
 
-    workspace = Path(args.workspace).expanduser()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
     try:
         api = MaintenanceV2Api(workspace)
         if args.action == "audit":
@@ -1228,7 +1229,7 @@ def cmd_groups(args: argparse.Namespace) -> int:
     """
     from .runtime_v2.group_native import GroupControlService
 
-    workspace = Path(args.workspace).resolve()
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
 
     if args.action == "list":
         result = GroupControlService(workspace, write=False).list_groups()
@@ -1247,8 +1248,9 @@ def cmd_desktop(args: argparse.Namespace) -> int:
     """启动 MemoryGuard Desktop Executor（可信执行端）。"""
     from .desktop_executor import main as desktop_main
     argv = []
-    if getattr(args, "workspace", "."):
-        argv.append(args.workspace)
+    workspace = _effective_workspace(args, getattr(args, "workspace", "."))
+    if workspace:
+        argv.append(str(workspace))
     if getattr(args, "auto_confirm", False):
         argv.append("--auto-confirm")
     if getattr(args, "watch", False):
@@ -1264,8 +1266,10 @@ def cmd_desktop(args: argparse.Namespace) -> int:
 
 def cmd_gui(args: argparse.Namespace) -> int:
     """从可见终端启动交互式治理台。"""
-    workspace = getattr(args, "workspace_option", "") or getattr(args, "workspace", "")
-    workspace_args = [workspace] if workspace else []
+    workspace = getattr(args, "_resolved_workspace", None)
+    if workspace is None:
+        workspace = getattr(args, "workspace_option", "") or getattr(args, "workspace", "")
+    workspace_args = [str(workspace)] if workspace else []
     if os.name == "nt" and os.environ.get("_MEMORYGUARD_GUI_CHILD") != "1":
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         if not pythonw.exists():
@@ -1316,7 +1320,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memoryguard",
         description="Local-first Agent governance: audit instructions, skills, memory, and local RAG.",
-        epilog="Public V1→V2 upgrade: memoryguard upgrade --workspace <path> [--data-home <path>] [--apply].",
+        epilog="Verified V1→V2 migration: run `memoryguard upgrade`; use `--preview` for zero-write inspection.",
     )
     parser.add_argument("--version", action="version", version=f"memoryguard {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1524,107 +1528,16 @@ def _default_gui_workspace() -> Path:
 
 def _resolve_gui_workspace(argv: list[str]) -> Path | None:
     if argv:
-        return Path(argv[0]).expanduser().resolve()
+        return resolve_workspace(argv[0], explicit=True)
 
+    # A bare GUI is the user-level governance console.  It must not change
+    # databases merely because the terminal happens to be inside a project
+    # (or C:\Windows\System32).  MEMORYGUARD_WORKSPACE remains an explicit
+    # operator override; otherwise the canonical data home is authoritative.
     configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
     if configured:
-        candidate = Path(configured).expanduser().resolve()
-        if candidate.is_dir():
-            return candidate
-
-    # MEMORYGUARD_HOME is an explicit operator choice for the shared control
-    # directory.  It must take precedence over the terminal's current project
-    # so existing shortcuts and isolated test/operator environments remain
-    # deterministic.
-    if os.environ.get("MEMORYGUARD_HOME", "").strip():
-        return _default_gui_workspace()
-
-    # A terminal launched inside a project should open that project's V2
-    # workspace.  Search the current ancestry and the small set of known local
-    # project roots, because a common layout has a legacy workspace beside the
-    # actual repository (for example ``tools/.memoryguard`` and
-    # ``tools/memoryguard/.memoryguard``).  The first ``.memoryguard`` directory
-    # is not authoritative: prefer a V2_READY/V2_ACTIVE manifest.
-    cwd = Path.cwd().resolve()
-    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows")).resolve()
-
-    candidates: list[Path] = []
-    local_candidates: set[Path] = set()
-
-    def add_candidate(path: Path, *, local: bool = False) -> None:
-        path = path.expanduser().resolve()
-        if path in candidates or not path.is_dir() or not (path / ".memoryguard").is_dir():
-            return
-        candidates.append(path)
-        if local:
-            local_candidates.add(path)
-
-    def scan_tree(root: Path, max_depth: int) -> None:
-        if not root.is_dir():
-            return
-        frontier = [root]
-        for _ in range(max_depth + 1):
-            next_frontier: list[Path] = []
-            for directory in frontier:
-                add_candidate(directory)
-                try:
-                    children = sorted(
-                        (item for item in directory.iterdir() if item.is_dir() and not item.is_symlink()),
-                        key=lambda item: str(item).casefold(),
-                    )
-                except (OSError, PermissionError):
-                    continue
-                next_frontier.extend(children)
-            frontier = next_frontier
-
-    if cwd != system_root and system_root not in cwd.parents:
-        ancestor = cwd
-        for _ in range(6):
-            add_candidate(ancestor, local=True)
-            try:
-                children = sorted(
-                    (item for item in ancestor.iterdir() if item.is_dir() and not item.is_symlink()),
-                    key=lambda item: str(item).casefold(),
-                )
-            except (OSError, PermissionError):
-                children = []
-            for child in children:
-                # Only direct children of the launch directory are local
-                # candidates.  Treating every child of every ancestor as
-                # local makes unrelated temporary projects compete with the
-                # workspace the user is actually in.
-                add_candidate(child, local=ancestor == cwd)
-            if ancestor.parent == ancestor:
-                break
-            ancestor = ancestor.parent
-
-    for root in (
-        Path.home() / "workspace",
-        Path.home() / "projects",
-        Path(r"H:\ai\workspace"),
-        Path(r"C:\workspace"),
-        Path(r"D:\workspace"),
-        Path(r"D:\ai\workspace"),
-    ):
-        scan_tree(root, 2)
-
-    active: list[tuple[int, Path]] = []
-    fallback: list[Path] = []
-    for path in candidates:
-        state, _generation, _record = _cli_manifest_snapshot(path)
-        if state in {"V2_READY", "V2_ACTIVE"}:
-            distance = 0 if path == cwd else 1 if path in cwd.parents or path in local_candidates else 2
-            active.append((distance, path))
-        elif path == cwd or path in cwd.parents:
-            fallback.append(path)
-
-    if active and (not fallback or min(item[0] for item in active) < 2):
-        # Prefer the current project/ancestor over a merely discoverable
-        # workspace elsewhere; sort the remainder for deterministic launches.
-        return min(active, key=lambda item: (item[0], len(item[1].parts), str(item[1]).casefold()))[1]
-    if fallback:
-        return min(fallback, key=lambda path: (len(path.parts), str(path).casefold()))
-    return _default_gui_workspace()
+        return resolve_workspace(configured, explicit=True)
+    return _default_gui_workspace().expanduser().resolve()
 
 
 def gui_main(argv: list[str] | None = None) -> int:
@@ -1727,10 +1640,6 @@ def _cli_trusted_context(workspace: str | Path = ".") -> dict:
 
 def _cli_workspace(args: argparse.Namespace) -> Path:
     command = str(getattr(args, "command", "") or "")
-    if command == "provider":
-        from .data_home import resolve_data_home
-
-        return resolve_data_home().expanduser().resolve()
     if command == "gui" and not (
         getattr(args, "workspace", "") or getattr(args, "workspace_option", "")
     ):
@@ -1743,7 +1652,31 @@ def _cli_workspace(args: argparse.Namespace) -> Path:
         or getattr(args, "path", ".")
         or "."
     )
-    return Path(raw).expanduser().resolve()
+    explicit = bool(raw and str(raw) != ".")
+    # Governance/control-plane commands operate on the one user-level shared
+    # library when no path was explicitly supplied.  Project inspection
+    # commands (audit/scan/open/...) intentionally retain bounded cwd lookup.
+    if not explicit and command in {
+        "doctor", "mcp-status", "hooks", "provider", "groups", "desktop",
+        "gc", "storage", "source", "import",
+    }:
+        configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+        if configured:
+            return resolve_workspace(configured, explicit=True)
+        from .data_home import resolve_data_home
+
+        return resolve_data_home().expanduser().resolve()
+    return resolve_workspace(raw, explicit=explicit)
+
+
+def _effective_workspace(args: argparse.Namespace, raw: str | Path = ".") -> Path:
+    """Use the cutover-selected path, otherwise apply the shared resolver."""
+
+    selected = getattr(args, "_resolved_workspace", None)
+    if selected is not None:
+        return Path(selected).expanduser().resolve()
+    value = str(raw or ".")
+    return resolve_workspace(value, explicit=value != ".")
 
 
 def _cli_manifest_snapshot(workspace: Path) -> tuple[str, int | None, Any]:
@@ -1789,7 +1722,12 @@ def _cli_mutation(args: argparse.Namespace) -> bool:
 
 def _dispatch_cutover(args: argparse.Namespace) -> int:
     """Dispatch every normal CLI command through the native V2 runtime."""
-    workspace = _cli_workspace(args)
+    try:
+        workspace = _cli_workspace(args)
+    except WorkspaceResolutionError as exc:
+        print(json.dumps(exc.to_payload(surface="CLI"), ensure_ascii=False, sort_keys=True))
+        return 2
+    setattr(args, "_resolved_workspace", workspace)
     state, generation, manifest_record = _cli_manifest_snapshot(workspace)
     if state not in {"V2_READY", "V2_ACTIVE"}:
         result = v2_upgrade_payload(state, surface="CLI")
@@ -1875,9 +1813,29 @@ def main(argv: list[str] | None = None) -> int:
     # outside the adapter's historical command snapshot also preserves the
     # existing public CLI compatibility contract.
     if raw_argv and raw_argv[0] == "upgrade":
-        from .migration.upgrade import main as upgrade_main
+        from .migration.upgrade import (
+            build_parser as build_upgrade_parser,
+            main as upgrade_main,
+        )
 
-        return upgrade_main(raw_argv[1:])
+        upgrade_argv = raw_argv[1:]
+        requested = build_upgrade_parser().parse_args(upgrade_argv)
+        if not requested.workspace and not requested.workspace_arg:
+            configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+            if configured:
+                resolved = resolve_workspace(configured, explicit=True)
+            else:
+                from .data_home import resolve_data_home
+
+                resolved = resolve_data_home().expanduser().resolve()
+            upgrade_argv = [*upgrade_argv, "--workspace", str(resolved)]
+        # Product default: one command completes the verified cutover.  A
+        # read-only plan remains available, but must be requested explicitly.
+        if not requested.preview and not requested.apply and requested.confirm is None:
+            upgrade_argv.extend(["--apply", "--confirm", "V2_ACTIVE"])
+        elif not requested.preview and requested.confirm is not None and not requested.apply:
+            upgrade_argv.append("--apply")
+        return upgrade_main(upgrade_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     return _dispatch_cutover(args)

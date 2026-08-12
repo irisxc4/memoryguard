@@ -119,6 +119,7 @@ def _request(
     return {
         "task": task,
         "trusted_identity": {
+            "workspace_id": str(root.resolve()),
             "agent": agent,
             "group": group,
             "project_ref": project_ref,

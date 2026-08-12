@@ -5,6 +5,7 @@ from pathlib import Path
 from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
+from memoryguard.rule_reconciliation import settle_native_canonical_snapshot
 from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.runtime_v2.native_ports import (
     NativeV2RuntimePort,
@@ -61,6 +62,36 @@ def _seed_rule(store: RuleV2Store, memory_id: str, *, target_type: str = "agent"
 
 
 def _bootstrap(workspace: Path, *, agent: str = "a", project: str = "p", provider: str = "codex", runtime: str = "terra"):
+    store = RuleV2Store(workspace)
+    for definition in store.list_definitions(status="active"):
+        bindings = store.list_bindings(
+            definition_id=definition.definition_id,
+            share_group_id="team",
+            status="active",
+        )
+        if not any(binding.effect != "exclude" for binding in bindings):
+            continue
+        source_id = f"test-source:{definition.definition_id}"
+        source_ref = f"test-rule:{definition.definition_id}"
+        store.upsert_source_link(
+            source_kind="test-governed-rule",
+            share_group_id="team",
+            memory_id=source_id,
+            source_ref=source_ref,
+            original_definition_id=definition.definition_id,
+            canonical_definition_id=definition.definition_id,
+            status="active",
+        )
+        store.record_evidence_ref({
+            "evidence_id": f"test-evidence:{definition.definition_id}",
+            "definition_id": definition.definition_id,
+            "source_rule_id": source_id,
+            "share_group_id": "team",
+            "evidence_ref": source_ref,
+            "content_digest": definition.semantic_hash,
+        })
+    if store.list_definitions(status="active"):
+        settle_native_canonical_snapshot(workspace, "team", store=store)
     port = NativeV2RuntimePort(workspace, state_provider=_Manifest())
     result = port.dispatch_mcp(
         "memoryguard_context_bootstrap",

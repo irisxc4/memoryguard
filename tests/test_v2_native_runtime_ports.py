@@ -218,12 +218,15 @@ def test_native_control_plane_reads_and_cli_probes_are_noop(tmp_path: Path):
     assert isinstance(first["get_sandbox_status"]["data"]["sandbox"], bool)
     guide = first["get_host_enrichment_guide"]
     assert guide["ok"] is True
-    assert guide["data"]["mode"] == "host_skill_primary"
+    assert guide["data"]["mode"] == "host_enrichment_queue"
     assert guide["data"]["pending_count"] == 0
     agents = first["list_host_llm_agents"]
     assert agents["ok"] is True
-    assert agents["data"]["primary"] == "host"
-    assert all(item.get("cli", "") == "" for item in agents["data"]["agents"])
+    data = agents["data"]
+    # 只暴露真实可执行引擎，绝无合成「host」行，也不泄露本地可执行路径。
+    assert all(str(item.get("agent") or "") != "host" for item in data["agents"])
+    assert all("cli" not in item for item in data["agents"])
+    assert data["primary"] == (data["agents"][0]["agent"] if data["agents"] else "")
     assert first == second == repeated
     for name in ("gui", "open"):
         result = cli[name]

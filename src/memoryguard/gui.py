@@ -247,11 +247,14 @@ def _pick_path_with_dialog(window: Any, for_files: bool = False) -> dict[str, An
         import webview
 
         if for_files:
+            # pywebview expects one filter string per tuple item.  Passing a
+            # pipe-joined string makes the Windows backend iterate characters
+            # and fail with "A is not a valid file filter".
             file_types = (
-                "All files (*.*)|*.*|"
-                "Zip files (*.zip)|*.zip|"
-                "JSON files (*.json)|*.json|"
-                "JSONL files (*.jsonl)|*.jsonl"
+                "All files (*.*)",
+                "Zip files (*.zip)",
+                "JSON files (*.json)",
+                "JSONL files (*.jsonl)",
             )
             result = window.create_file_dialog(
                 webview.OPEN_DIALOG,
@@ -554,7 +557,6 @@ def open_report_window(html_content: str, *, title: str = "MemoryGuard") -> int:
 _GUI_SOURCE_READS = frozenset({
     "list_sources", "scan_sources", "preview_source", "get_raw_memory",
     "get_source_file_content", "extract_preview", "extract_preview_by_path",
-    "get_agent_data", "get_residual_cleanup",
 })
 
 _GUI_PATH_KEYS = frozenset({
@@ -1152,7 +1154,7 @@ class SafeBridgeApi:
         # business request for the trusted desktop executor and return a
         # stable deferred envelope.
         from .security import RequestQueue, detect_sandbox_mode
-        if detect_sandbox_mode():
+        if not self._direct_mutations and detect_sandbox_mode():
             request = RequestQueue(self._workspace).submit(method, list(args or []))
             return {
                 "ok": True,

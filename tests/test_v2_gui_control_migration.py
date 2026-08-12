@@ -10,7 +10,11 @@ from memoryguard.migration.gui_control import (
     inspect_legacy_gui_control,
     migrate_legacy_gui_control,
 )
-from memoryguard.runtime_v2.group_native import GroupControlService, personal_group_id
+from memoryguard.runtime_v2.group_native import (
+    GroupControlService,
+    SystemControlStore,
+    personal_group_id,
+)
 
 
 def _legacy(root: Path, name: str, *, agent: str, group: str, status: str = "active") -> Path:
@@ -63,6 +67,42 @@ def test_gui_control_migration_fails_closed_if_legacy_source_changes_after_recei
     with pytest.raises(GuiControlMigrationError, match="idempotency_key_reused"):
         migrate_legacy_gui_control(tmp_path)
     assert GroupControlService(tmp_path).active_binding_for_agent("agent-a")["share_group_id"] == "shared-team"
+
+
+def test_gui_control_migration_repairs_missing_binding_after_success_receipt(tmp_path: Path) -> None:
+    _legacy(tmp_path, "b-a", agent="agent-a", group="shared-team")
+    migrate_legacy_gui_control(tmp_path)
+
+    store = SystemControlStore(tmp_path)
+    with store.connection(write=True) as conn:
+        conn.execute("DELETE FROM agent_group_bindings WHERE binding_id=?", ("b-a",))
+        conn.commit()
+
+    repaired = migrate_legacy_gui_control(tmp_path)
+    assert repaired["repaired"] is True
+    assert repaired["migrated_count"] == 1
+    assert repaired["changed"] is True
+    assert GroupControlService(tmp_path).active_binding_for_agent("agent-a")["share_group_id"] == "shared-team"
+
+    replayed = migrate_legacy_gui_control(tmp_path)
+    assert replayed["replayed"] is True
+    assert replayed["changed"] is False
+
+
+def test_gui_control_migration_rejects_binding_identity_conflict_after_success_receipt(tmp_path: Path) -> None:
+    _legacy(tmp_path, "b-a", agent="agent-a", group="shared-team")
+    migrate_legacy_gui_control(tmp_path)
+
+    store = SystemControlStore(tmp_path)
+    with store.connection(write=True) as conn:
+        conn.execute(
+            "UPDATE agent_group_bindings SET share_group_id=? WHERE binding_id=?",
+            ("changed-team", "b-a"),
+        )
+        conn.commit()
+
+    with pytest.raises(GuiControlMigrationError, match="v2_binding_identity_conflict"):
+        migrate_legacy_gui_control(tmp_path)
 
 
 def test_gui_control_migration_rejects_multiple_active_or_invalid_personal_binding(tmp_path: Path) -> None:

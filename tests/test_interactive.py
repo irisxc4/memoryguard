@@ -164,12 +164,63 @@ def test_lifecycle_ui_matches_backend_enums_and_residual_split() -> None:
     html = render_interactive_html()
 
     assert "installed_no_data: '已安装无数据'" in html
-    assert "data_only: '仅数据残留'" in html
+    assert "data_only: '原生数据待接入'" in html
     assert "uncertain: '待确认'" in html
     assert "agentCardsData.residuals" in html
     assert "残留与清理" in html
     assert "Agent 摘要" in html
+    assert "已接入" in html
+    assert "已发现 · 待接入" in html
+    assert "新建个人记忆层" in html
+    assert "可接入 MemoryGuard 层" in html
     assert "const items = result.items || []" in html
+
+
+def test_multi_agent_ui_keeps_existing_personal_and_shared_groups_selectable() -> None:
+    html = render_interactive_html()
+
+    assert "callApi('list_share_groups')" in html
+    assert "showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groupsResult)" in html
+    assert "data-existing-group-agent" in html
+    assert "bindSelectedExistingGroup" in html
+    assert "绑定已有记忆组" in html
+    assert "已有记忆组" in html
+    assert "当前没有绑定 Agent；仍可重新接入" in html
+
+
+def test_discovery_ui_exposes_existing_groups_without_requiring_native_memory() -> None:
+    html = render_interactive_html()
+
+    assert "const [result, groupsResult, bindingsResult] = await Promise.all" in html
+    assert "showDiscoveryResult(result, groupsResult, bindingsResult)" in html
+    assert "data-existing-group-agent" in html
+    assert "接入已有记忆组" in html
+    assert "新建个人记忆层" in html
+    assert "导入原生记忆（可选）" in html
+    assert "无原生记忆不影响接入" in html
+    assert "管理已有记忆组" in html
+
+
+def test_discovery_ui_discloses_profile_bounded_market_coverage() -> None:
+    html = render_interactive_html()
+
+    assert "known_profile_count" in html
+    assert "未登记的新产品不会被猜测扫描" in html
+    assert "外部 Profile 或手工来源接入" in html
+
+
+def test_gui_normalizes_v2_audit_and_redacted_path_values() -> None:
+    """V2 receipts and redacted path descriptors must not break the browser shell."""
+    html = render_interactive_html()
+
+    assert "function normalizeAuditReport" in html
+    assert "Number.isFinite" in html
+    assert "function guiPathText" in html
+    assert "function guiPathLabel" in html
+    assert "source_root_id" in html
+    assert "source_root_id: c.dataset.sourceRootId" in html
+    assert "(f.path || '').split(/[/\\\\]/)" not in html
+    assert "const p = escapeHtml(f.path || '').replaceAll" not in html
 
 
 def test_governance_actions_use_choices_and_explicit_scope() -> None:
@@ -285,7 +336,8 @@ def test_personal_and_shared_memory_layers_are_distinct_and_reachable() -> None:
     assert "共享记忆层" in html
     assert "viewMemoryLayer" in html
     assert "installMemoryGroupMcp" in html
-    assert "b.status !== 'active' || b.group_kind !== 'shared'" in html
+    assert "activeBindings = existingBindings.filter(b => b.status === 'active')" in html
+    assert "b && b.group_kind === 'shared'" in html
     assert "确认启用该 Agent 的个人记忆层并安装全局 MCP" in html
     assert "MCP 未完整安装" in html
     assert "选择个人或共享记忆层" in html
@@ -377,3 +429,16 @@ def test_neuron_graph_bridges_missing_parent_edges() -> None:
     assert "const edgeKeys = new Set();" in html
     assert "parent-bridge:" in html
     assert "主光点到分类不会悬空" in html
+
+
+def test_projection_build_ui_closes_start_cancel_and_error_states() -> None:
+    html = render_interactive_html()
+
+    assert "let activeBuildRunId = '';" in html
+    assert '<button class="btn" type="button" disabled>正在创建任务…</button>' in html
+    assert "pointer-events:none\">正在创建任务…" in html
+    assert "phase: 'cancelling', message: '正在取消…'" in html
+    assert "await restoreNeuronAfterBuild(apiErrorMessage(result || {}, '取消失败'), true)" in html
+    assert "await restoreNeuronAfterBuild('构建已取消', false)" in html
+    assert "{ id: 'engine', label: '引擎' }" in html
+    assert "{ id: 'enrich', label: '整理' }" in html

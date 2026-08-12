@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import os
 
 from memoryguard.runtime_v2.task_coordinator import TaskCoordinator
 from memoryguard.runtime_v2.working_memory import RuntimeScope
@@ -134,3 +135,157 @@ def test_task_coordinator_idempotent_start_reuses_durable_run(tmp_path):
     )
     assert second["task"]["run_id"] == first["task"]["run_id"]
     assert calls == 1
+
+
+def test_scope_exclusive_start_returns_run_id_before_worker_completes(tmp_path):
+    coordinator = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    started = threading.Event()
+
+    def worker(execution):
+        started.set()
+        execution.check_cancelled()
+        return {"result_id": "blocked"}
+
+    accepted = coordinator.start_scope_exclusive(
+        operation="projection_build",
+        scope=scope,
+        worker=worker,
+    )
+    assert accepted.get("started") is True
+    run_id = accepted["task"]["run_id"]
+    assert run_id
+    # run id returned promptly, before the (blocked) worker can finish
+    assert started.wait(1.0)
+    final = _wait_terminal(coordinator, run_id, scope)
+    assert final["status"] == "succeeded"
+
+
+def test_scope_exclusive_focuses_existing_active_run_and_no_duplicate_worker(tmp_path):
+    coordinator = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    calls = 0
+    release = threading.Event()
+
+    def worker(execution):
+        nonlocal calls
+        calls += 1
+        while not release.is_set():
+            execution.check_cancelled()
+            time.sleep(0.01)
+        return {"result_id": "one"}
+
+    first = coordinator.start_scope_exclusive(
+        operation="projection_build",
+        scope=scope,
+        worker=worker,
+    )
+    assert first.get("started") is True
+    second = coordinator.start_scope_exclusive(
+        operation="projection_build",
+        scope=scope,
+        worker=worker,
+    )
+    # 同一 (operation, scope) 的第二次启动聚焦已有任务，绝不创建第二个 worker
+    assert second.get("started") is False
+    assert second.get("focused") is True
+    assert second.get("code") == "operation_already_active"
+    assert second["task"]["run_id"] == first["task"]["run_id"]
+    release.set()
+    _wait_terminal(coordinator, first["task"]["run_id"], scope)
+    assert calls == 1
+
+
+def test_active_runs_filters_by_operation(tmp_path):
+    coordinator = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    release = threading.Event()
+
+    def blocker(execution):
+        while not release.is_set():
+            execution.check_cancelled()
+            time.sleep(0.01)
+        return {}
+
+    build = coordinator.start_scope_exclusive(
+        operation="projection_build", scope=scope, worker=blocker,
+    )
+    other = coordinator.start_scope_exclusive(
+        operation="import_create", scope=scope, worker=blocker,
+    )
+    try:
+        build_ids = coordinator.active_runs(scope, operation="projection_build")
+        assert build_ids == [build["task"]["run_id"]]
+        all_ids = set(coordinator.active_runs(scope))
+        assert all_ids == {build["task"]["run_id"], other["task"]["run_id"]}
+    finally:
+        release.set()
+        _wait_terminal(coordinator, build["task"]["run_id"], scope)
+        _wait_terminal(coordinator, other["task"]["run_id"], scope)
+
+
+def _seed_external_running(coordinator, scope, *, run_id, pid, started_at):
+    store = coordinator._writer()
+    store.create_run(
+        run_id,
+        task_type="projection_build",
+        goal="background_task",
+        importance=0,
+        mutation=coordinator._mutation(scope, f"{run_id}:create"),
+        requested_by="gui",
+    )
+    store.checkpoint(
+        run_id,
+        {"pid": pid, "process_started_at": started_at},
+        mutation=coordinator._mutation(scope, f"{run_id}:owner:{pid}"),
+        checkpoint_key="owner",
+    )
+    coordinator._transition(run_id, scope, "running", key=f"{run_id}:running")
+
+
+def test_scope_exclusive_recovers_dead_process_run_before_restart(tmp_path):
+    seed = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    stale_id = "stale-projection-build"
+    _seed_external_running(
+        seed, scope, run_id=stale_id, pid=2_000_000_000,
+        started_at="2020-01-01T00:00:00+00:00",
+    )
+    calls = 0
+
+    def worker(execution):
+        nonlocal calls
+        calls += 1
+        return {"result_id": "replacement"}
+
+    restarted = TaskCoordinator(tmp_path)
+    accepted = restarted.start_scope_exclusive(
+        operation="projection_build", scope=scope, worker=worker,
+    )
+    assert accepted["started"] is True
+    assert accepted["task"]["run_id"] != stale_id
+    assert restarted.status(stale_id, scope)["status"] == "cancelled"
+    assert _wait_terminal(restarted, accepted["task"]["run_id"], scope)["status"] == "succeeded"
+    assert calls == 1
+
+
+def test_scope_exclusive_focuses_live_external_owner_and_cancel_fails_closed(tmp_path):
+    from memoryguard.runtime_lease import _process_started_at_for_pid
+
+    seed = TaskCoordinator(tmp_path)
+    scope = _scope(tmp_path)
+    run_id = "live-external-projection-build"
+    started = _process_started_at_for_pid(os.getpid())
+    _seed_external_running(
+        seed, scope, run_id=run_id, pid=os.getpid(),
+        started_at=started.isoformat() if started is not None else "",
+    )
+    restarted = TaskCoordinator(tmp_path)
+    focused = restarted.start_scope_exclusive(
+        operation="projection_build", scope=scope, worker=lambda execution: {},
+    )
+    assert focused["focused"] is True
+    assert focused["task"]["run_id"] == run_id
+    cancelled = restarted.cancel(run_id, scope)
+    assert cancelled["ok"] is False
+    assert cancelled["error"]["code"] == "task_owned_by_other_process"

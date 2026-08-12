@@ -25,7 +25,7 @@ import json
 from collections import Counter
 from dataclasses import dataclass, replace as replace_dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .rule_binding import AUTO_ALLOWED_TARGET_TYPES, build_binding
 from .rule_definition import build_definition
@@ -40,6 +40,130 @@ from .schema_v3 import (
     stable_hash,
 )
 from .runtime_v2.group_native import GroupControlService
+
+
+@dataclass(frozen=True)
+class _NativeRuleAssignment:
+    """Small compatibility view over a V2 atom audience.
+
+    Reconciliation used to consume ``SharedMemoryStore`` assignments.  The
+    V2 read path must not reopen that store, so the native source adapter
+    exposes the same narrow attributes from the atom's validated audience
+    metadata and exact owner scope.
+    """
+
+    memory_id: str
+    target_type: str
+    target_id: str = ""
+    project_ref: str = ""
+    provider: str = ""
+    runtime_role: str = ""
+    effect: str = "include"
+    priority_override: int | None = None
+
+    @property
+    def assignment_id(self) -> str:
+        return stable_hash(
+            "native-rule-assignment", self.memory_id, self.target_type,
+            self.target_id, self.project_ref, self.provider,
+            self.runtime_role, self.effect,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assignment_id": self.assignment_id,
+            "memory_id": self.memory_id,
+            "target_type": self.target_type,
+            "target_id": self.target_id,
+            "project_ref": self.project_ref,
+            "provider": self.provider,
+            "runtime_role": self.runtime_role,
+            "effect": self.effect,
+            "priority_override": self.priority_override,
+        }
+
+
+class _NativeReconciliationSource:
+    """Read-only V2 memory source used by the canonical checks.
+
+    This is deliberately a V2 adapter, not a renamed import of the retired
+    ``SharedMemoryStore``.  Mutation methods fail closed because canonical
+    writes belong to the V2 governance coordinator, not a compatibility read
+    shim.
+    """
+
+    def __init__(self, workspace: str | Path, share_group_id: str, *, read_only: bool = True):
+        from .memory.store import MemoryAtomStore, MemoryReadScope
+
+        self.workspace = Path(workspace).resolve()
+        self.group_id = str(share_group_id or "")
+        if not self.group_id:
+            raise ValueError("native reconciliation requires share_group_id")
+        self._scope_type = MemoryReadScope
+        self.memory = MemoryAtomStore(self.workspace, readonly=read_only)
+
+    def _scope(self) -> Any:
+        return self._scope_type(
+            workspace_id=str(self.workspace),
+            share_group_id=self.group_id,
+            admin=True,
+        )
+
+    def list_records(self, status: str | None = None) -> list[Any]:
+        return self.memory.list_atoms(
+            scope=self._scope(), status=status, include_building=True,
+        )
+
+    def get_record(self, memory_id: str) -> Any | None:
+        return self.memory.get_atom(
+            str(memory_id or ""), scope=self._scope(), include_building=True,
+        )
+
+    def list_rule_assignments(self, memory_id: str) -> list[_NativeRuleAssignment]:
+        atom = self.get_record(memory_id)
+        if atom is None:
+            return []
+        audience = atom.metadata.get("audience") if isinstance(atom.metadata, Mapping) else None
+        if not isinstance(audience, Mapping) or str(audience.get("source") or "") != "native_v2":
+            if atom.agent_instance_id:
+                target_type = "agent_project" if atom.project_ref else "agent"
+                target_id = atom.agent_instance_id
+            elif atom.project_ref:
+                target_type, target_id = "project", ""
+            else:
+                target_type, target_id = "group", atom.share_group_id
+            audience = {
+                "target_type": target_type,
+                "target_id": target_id,
+                "project_ref": atom.project_ref,
+                "provider": atom.provider,
+                "runtime_role": atom.runtime_role,
+                "effect": "include",
+            }
+        try:
+            priority = int(audience.get("priority_override")) if audience.get("priority_override") is not None else None
+        except (TypeError, ValueError):
+            priority = None
+        return [_NativeRuleAssignment(
+            memory_id=atom.memory_id,
+            target_type=str(audience.get("target_type") or ""),
+            target_id=str(audience.get("target_id") or ""),
+            project_ref=canonical_project_ref(str(audience.get("project_ref") or "")),
+            provider=str(audience.get("provider") or ""),
+            runtime_role=str(audience.get("runtime_role") or ""),
+            effect=str(audience.get("effect") or "include"),
+            priority_override=priority,
+        )]
+
+    def outbox_high_water(self) -> dict[str, int]:
+        pending = len(self.memory.pending_outbox(include_failed=True))
+        return {"pending": pending, "failed": pending}
+
+    def append_record(self, *_: Any, **__: Any) -> None:
+        raise RuntimeError("native_reconciliation_write_requires_v2_coordinator")
+
+    def shadow_record(self, *_: Any, **__: Any) -> None:
+        raise RuntimeError("native_reconciliation_write_requires_v2_coordinator")
 
 # Persisted job lifecycle (Req2).  ``superseded`` marks a job whose source
 # state was replaced by a newer reconciliation run; ``terminal_failed`` is
@@ -1972,6 +2096,267 @@ def _actual_binding_multiset(
     }
 
 
+def _native_canonical_reconciliation_status(
+    workspace: str | Path,
+    share_group_id: str,
+    *,
+    store: Any = None,
+    exclude_job_id: str = "",
+) -> dict[str, Any]:
+    """Evaluate the V2 canonical gates from one exact rule-intelligence DB.
+
+    The old implementation returned before inspecting the native store.  That
+    made a real canonical generation impossible to report as ready and left
+    callers tempted to fall back to an unscoped legacy read.  Keep this check
+    read-only and make every readiness dependency explicit: activation,
+    settled jobs/outboxes, source links, evidence anchors, projection and
+    digest parity.
+    """
+    group = str(share_group_id or "")
+    base = {
+        "share_group_id": group,
+        "canonical_ready": False,
+        "read_path": "v2",
+        "failures": [],
+        "checks": {},
+    }
+    if not group:
+        base["failures"] = ["share_group_required"]
+        return base
+
+    workspace_path = Path(workspace).resolve()
+    rules_db = workspace_path / ".memoryguard" / "rules" / "rules.db"
+    if not rules_db.is_file():
+        base["failures"] = ["rule_intelligence_not_initialized"]
+        base["checks"] = {"rules_db": False}
+        return base
+
+    # ``initialize_all`` creates the domain database before the optional rule
+    # intelligence schema is installed.  That is a legitimate "no rules"
+    # state, not a retrieval outage.  Distinguish it before constructing the
+    # rule store so ordinary memory bootstrap is not blocked by an empty
+    # placeholder database.
+    import sqlite3
+    try:
+        with sqlite3.connect(f"file:{rules_db.as_posix()}?mode=ro", uri=True) as conn:
+            initialized = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='rules_schema_meta' LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        base["failures"] = ["native_canonical_status_unavailable"]
+        base["checks"] = {"native_rule_service": False}
+        base["error"] = str(exc)
+        return base
+    if initialized is None:
+        base["failures"] = ["rule_intelligence_not_initialized"]
+        base["checks"] = {"rules_db": True, "rule_intelligence_schema": False}
+        return base
+
+    try:
+        from .rules.v2_store import RuleV2Store
+
+        native = store if isinstance(store, RuleV2Store) else RuleV2Store(workspace_path, read_only=True)
+
+        def snapshot(conn: Any) -> dict[str, Any]:
+            def rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+                return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+            state = rows(
+                "SELECT * FROM rule_canonical_state WHERE share_group_id=? "
+                "ORDER BY updated_at DESC, scope_id DESC LIMIT 1",
+                (group,),
+            )
+            jobs = rows(
+                "SELECT * FROM rule_reconciliation_jobs WHERE share_group_id=? "
+                "ORDER BY updated_at, job_id",
+                (group,),
+            )
+            links = rows(
+                "SELECT * FROM rule_source_links WHERE share_group_id=? AND status='active' "
+                "ORDER BY source_link_id",
+                (group,),
+            )
+            evidence = rows(
+                "SELECT * FROM rule_evidence_refs WHERE share_group_id=? "
+                "ORDER BY evidence_id",
+                (group,),
+            )
+            checkpoints = rows(
+                "SELECT * FROM rule_projection_checkpoints WHERE scope_id=? "
+                "ORDER BY updated_at DESC, checkpoint_id DESC LIMIT 1",
+                (str(state[0].get("scope_id") or "") if state else "",),
+            )
+            pending_domain = rows(
+                "SELECT event_id FROM rule_domain_outbox WHERE source_group_id=? "
+                "AND (consumed_at IS NULL OR consumed_at='') ORDER BY event_id",
+                (group,),
+            )
+            pending_evidence = rows(
+                "SELECT event_id FROM rule_evidence_outbox WHERE source_group_id=? "
+                "AND (consumed_at IS NULL OR consumed_at='') ORDER BY event_id",
+                (group,),
+            )
+            return {
+                "state": state[0] if state else None,
+                "jobs": jobs,
+                "links": links,
+                "evidence": evidence,
+                "checkpoint": checkpoints[0] if checkpoints else None,
+                "pending_domain": pending_domain,
+                "pending_evidence": pending_evidence,
+            }
+
+        data = native._read(snapshot)
+        definitions = {
+            item.definition_id: item
+            for item in native.list_definitions(status="active")
+        }
+        bindings = native.list_bindings(share_group_id=group, status="active")
+        include_bindings = [
+            item for item in bindings
+            if str(getattr(item, "effect", "include") or "include").casefold() != "exclude"
+        ]
+        definition_ids = {
+            str(getattr(item, "definition_id", "") or "")
+            for item in include_bindings
+            if str(getattr(item, "definition_id", "") or "")
+        }
+        links = data["links"]
+        evidence = data["evidence"]
+        link_keys = {
+            (
+                str(item.get("memory_id") or ""),
+                str(item.get("canonical_definition_id") or item.get("original_definition_id") or ""),
+            )
+            for item in links
+        }
+        evidence_keys = {
+            (
+                str(item.get("source_rule_id") or ""),
+                str(item.get("definition_id") or ""),
+                str(item.get("share_group_id") or ""),
+            )
+            for item in evidence
+        }
+        failures: list[str] = []
+        checks: dict[str, Any] = {
+            "rules_db": True,
+            "active_bindings": len(include_bindings),
+            "active_definitions": len(definitions),
+            "source_links": len(links),
+            "evidence_refs": len(evidence),
+        }
+
+        state = data["state"] or {}
+        checks["canonical_state"] = bool(state)
+        if not state or str(state.get("activation_status") or "").casefold() not in {"active", "canonical_ready", "ready"}:
+            failures.append("canonical_not_activated")
+        read_path = str(state.get("read_path") or "")
+        checks["read_path"] = read_path
+        if read_path.casefold() not in {"rule-intelligence", "v2", "native"}:
+            failures.append("canonical_read_path_unavailable")
+
+        missing_definitions = sorted(definition_ids - set(definitions))
+        checks["missing_definitions"] = missing_definitions
+        if missing_definitions:
+            failures.append("canonical_definitions_missing")
+
+        required_links = [
+            item for item in links
+            if str(item.get("canonical_definition_id") or item.get("original_definition_id") or "") in definition_ids
+        ]
+        checks["required_source_links"] = len(required_links)
+        missing_link_definitions = sorted(
+            definition_ids - {
+                str(item.get("canonical_definition_id") or item.get("original_definition_id") or "")
+                for item in required_links
+                if item.get("memory_id") and (item.get("source_ref") or item.get("memory_id"))
+            }
+        )
+        checks["missing_source_link_definitions"] = missing_link_definitions
+        if missing_link_definitions:
+            failures.append("source_links_missing")
+
+        missing_evidence = sorted(
+            {
+                (str(item.get("memory_id") or ""), str(item.get("canonical_definition_id") or item.get("original_definition_id") or ""))
+                for item in required_links
+                if item.get("memory_id") and (item.get("source_ref") or item.get("memory_id"))
+                and (
+                    str(item.get("memory_id") or ""),
+                    str(item.get("canonical_definition_id") or item.get("original_definition_id") or ""),
+                    group,
+                ) not in evidence_keys
+            }
+        )
+        checks["missing_evidence_anchors"] = [list(item) for item in missing_evidence]
+        if missing_evidence:
+            failures.append("evidence_anchor_missing")
+
+        jobs = [
+            item for item in data["jobs"]
+            if str(item.get("job_id") or "") != str(exclude_job_id or "")
+            and str(item.get("status") or "") in {
+                "pending_model", "model_running", "staged", "applying", "retryable_failed",
+            }
+        ]
+        checks["reconciliation_in_flight"] = len(jobs)
+        if jobs:
+            failures.append("reconciliation_in_flight")
+
+        pending = data["pending_domain"] + data["pending_evidence"]
+        checks["outbox_pending"] = len(pending)
+        if pending:
+            failures.append("outbox_pending")
+
+        checkpoint = data["checkpoint"] or {}
+        checkpoint_status = str(checkpoint.get("status") or "").casefold()
+        checks["projection_checkpoint"] = checkpoint_status or None
+        checks["projection_error"] = str(checkpoint.get("error") or "")
+        if not checkpoint or checkpoint_status not in {"settled", "ready", "projected", "complete"}:
+            failures.append("projection_unsettled")
+        if checks["projection_error"]:
+            failures.append("projection_error")
+
+        canonical_payload = {
+            "definitions": sorted(
+                (key, getattr(value, "canonical_text", ""), getattr(value, "revision", 0), getattr(value, "status", ""))
+                for key, value in definitions.items() if key in definition_ids
+            ),
+            "bindings": sorted(
+                (item.to_dict() for item in include_bindings),
+                key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+            ),
+            "links": required_links,
+            "evidence": [
+                item for item in evidence
+                if str(item.get("definition_id") or "") in definition_ids
+            ],
+        }
+        canonical_digest = stable_hash("native-canonical", json.dumps(canonical_payload, ensure_ascii=False, sort_keys=True, default=str))
+        checks["canonical_digest"] = canonical_digest
+        checks["stored_canonical_digest"] = str(state.get("canonical_digest") or "")
+        if state.get("canonical_digest") and str(state.get("canonical_digest")) != canonical_digest:
+            failures.append("canonical_digest_drift")
+        if checkpoint.get("projection_digest") and state.get("effective_digest") and str(checkpoint.get("projection_digest")) != str(state.get("effective_digest")):
+            failures.append("projection_digest_drift")
+
+        failures = sorted(set(failures))
+        base.update({
+            "canonical_ready": not failures,
+            "read_path": "rule-intelligence" if not failures else "v2",
+            "failures": failures,
+            "checks": checks,
+        })
+        return base
+    except Exception as exc:
+        base["failures"] = ["native_canonical_status_unavailable"]
+        base["checks"] = {"native_rule_service": False}
+        base["error"] = str(exc)
+        return base
+
+
 def canonical_reconciliation_status(
     workspace: str | Path,
     share_group_id: str,
@@ -1986,14 +2371,81 @@ def canonical_reconciliation_status(
     group while *it* is the ``applying`` job: the in-flight gate must not flag
     the very job performing the verification.
     """
-    del workspace, store, exclude_job_id
-    return {
-        "share_group_id": str(share_group_id or ""),
-        "canonical_ready": False,
-        "read_path": "v2",
-        "failures": ["v2_native_reconciliation_required"],
-        "checks": {"native_rule_service": False},
+    return _native_canonical_reconciliation_status(
+        workspace,
+        share_group_id,
+        store=store,
+        exclude_job_id=exclude_job_id,
+    )
+
+
+def settle_native_canonical_snapshot(
+    workspace: str | Path,
+    share_group_id: str,
+    *,
+    store: Any = None,
+) -> dict[str, Any]:
+    """Activate one fully anchored native rule snapshot.
+
+    Callers must persist source links and evidence anchors first.  This helper
+    never invents authority; it only records the digest/projection checkpoint
+    after all other canonical gates pass.
+    """
+    from .rules.v2_store import RuleV2Store
+
+    native = store if isinstance(store, RuleV2Store) else RuleV2Store(workspace)
+    probe = _native_canonical_reconciliation_status(
+        workspace, share_group_id, store=native,
+    )
+    if probe.get("canonical_ready"):
+        return probe
+    allowed = {
+        "canonical_not_activated",
+        "canonical_read_path_unavailable",
+        "projection_unsettled",
+        # A governed lifecycle mutation intentionally changes the canonical
+        # payload.  Once source/evidence/outbox gates are clean, digest drift
+        # is the signal to publish a new immutable snapshot, not a blocker.
+        "canonical_digest_drift",
+        "projection_digest_drift",
     }
+    blockers = set(probe.get("failures") or []) - allowed
+    digest = str((probe.get("checks") or {}).get("canonical_digest") or "")
+    if blockers or not digest:
+        raise RuntimeError("canonical_snapshot_not_settleable:" + ",".join(sorted(blockers)))
+    now = _now_iso()
+    # A later mutation can legitimately return to an earlier digest (for
+    # example create exception -> revoke exception).  Canonical state is an
+    # immutable timeline, so every publication needs a new scope identity.
+    scope_id = "native:" + stable_hash(
+        "canonical-scope", share_group_id, digest, now,
+    )[:32]
+    native.record_canonical_state({
+        "scope_id": scope_id,
+        "share_group_id": str(share_group_id),
+        "activation_status": "active",
+        "read_path": "rule-intelligence",
+        "canonical_digest": digest,
+        "effective_digest": digest,
+        "source_ref": "native-v2-governed-snapshot",
+        "created_at": now,
+        "updated_at": now,
+    })
+    native.record_projection_checkpoint({
+        "checkpoint_id": "native:" + stable_hash("canonical-checkpoint", scope_id, digest)[:32],
+        "scope_id": scope_id,
+        "status": "settled",
+        "projection_digest": digest,
+        "error": "",
+        "created_at": now,
+        "updated_at": now,
+    })
+    result = _native_canonical_reconciliation_status(
+        workspace, share_group_id, store=native,
+    )
+    if not result.get("canonical_ready"):
+        raise RuntimeError("canonical_snapshot_settle_failed:" + ",".join(result.get("failures") or []))
+    return result
 
     from .governance_scope import (
         GovernanceScope,

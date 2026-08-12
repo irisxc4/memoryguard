@@ -36,6 +36,40 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.1
+
+v0.7.1 closes the migration and desktop lifecycle gaps found after the V2-only
+cutover:
+
+- **One-command migration:** after upgrading the Python package, run
+  `memoryguard upgrade`. The bare command uses the canonical user data home,
+  migrates and verifies bindings, groups, memory, rules, history, and sources,
+  activates V2, then removes only the successful migration backup batch.
+  `memoryguard upgrade --preview` is the zero-write inspection path.
+- **One canonical control workspace:** bare `memoryguard gui`, `doctor`,
+  `mcp-status`, `hooks`, `groups`, and storage commands all use the same
+  user-level data home, independent of the terminal's current directory.
+- **Recovered Agent and Group control:** migrated bindings and groups remain
+  editable; discovered but unbound Agents can enable a personal memory layer.
+  Discovery exposes registered product/profile surfaces without guessing every
+  directory on the machine or reading source bodies.
+- **Real projection engines:** the build dialog lists only executable local
+  Agent CLIs such as Cursor Agent and Codex. A selected CLI runs the governed
+  extraction/enrichment pipeline inside the tracked task; deterministic mode
+  is labeled honestly. There is no synthetic `host skill` engine.
+- **Reliable start/cancel:** one active build is allowed per trusted scope.
+  Durable task IDs survive reloads, stale owners recover safely, cancellation
+  stops owned CLI children, and every terminal/error path restores the neuron
+  page instead of leaving `starting / 0%` spinning.
+- **Unified governance:** canonical rules, memory deduplication, compaction,
+  knowledge references, and bounded context injection preserve identity,
+  policy, priority, audience, scope, provenance, and evidence. Graphify stays
+  integrated as an optional metadata provider behind MemoryGuard CodeGraph; it
+  is not a separate MemoryGuard package.
+
+Local regression: **1810 passed / 0 failed**. See
+[the v0.7.1 release record](docs/releases/v0.7.1.md).
+
 ## What's New in v0.7.0 (V2-only; published 2026-08-12)
 
 v0.7.0 is V2-only. Local release acceptance passed and the release was
@@ -247,17 +281,13 @@ Launch the desktop console:
 memoryguard gui
 ```
 
-`memoryguard-gui .` remains available for desktop shortcuts. In PowerShell and
-other terminals, a bare `memoryguard gui` automatically discovers the nearest
-usable V2 project from the current directory, its local project siblings, and
-the configured local workspace roots. It skips stale `V1_ACTIVE` workspaces,
-keeping GUI state aligned with `doctor` and `mcp-status`; no path argument is
-required. An explicit `memoryguard gui <project-path>` or
-`memoryguard gui --workspace <project-path>` remains available for selecting a
-specific project.
-`MEMORYGUARD_WORKSPACE` and then an explicit `MEMORYGUARD_HOME` take priority;
-otherwise a non-project shortcut location uses the fixed user-level control
-directory (defaulting to `%LOCALAPPDATA%\MemoryGuard` on Windows).
+`memoryguard-gui .` remains available for desktop shortcuts. A bare
+`memoryguard gui` always opens the canonical user-level control directory
+(default `%LOCALAPPDATA%\MemoryGuard` on Windows), so running it from a project
+or from `C:\Windows\System32` cannot silently switch databases.
+`MEMORYGUARD_WORKSPACE` is an explicit operator override; an explicit
+`memoryguard gui <project-path>` or `memoryguard gui --workspace <project-path>`
+selects a specific workspace.
 It does not remember a previously selected project or open a folder picker.
 On Windows, `memoryguard gui` detaches the native window from the terminal, so
 closing PowerShell does not close the GUI.
@@ -288,35 +318,31 @@ There is no package self-update command. The package manager is the
 authoritative package-upgrade path; `memoryguard upgrade` below is the explicit
 workspace migration flow, not a package updater.
 
-### Upgrade from v0.6.2: explicit V2-only migration
+### Upgrade an existing V1 data home
 
-Upgrade the package first, then preview the workspace migration. Preview is
-zero-write and must report `status=PREVIEW` with `writes_performed=false`:
+Upgrade the package, then run the verified migration. No workspace, data-home,
+apply, or confirmation arguments are required for the normal user-level data
+home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.0
-memoryguard upgrade --workspace .        # read-only preview
-```
-
-If v0.6.2 used a separate user data home, pass the same explicit
-`--data-home <path>` to each `memoryguard upgrade` invocation. Apply in two
-stages:
-
-```bash
-memoryguard upgrade --workspace . --apply
-# require: status=V2_READY, activation_required=true
-memoryguard upgrade --workspace . --apply --confirm V2_ACTIVE
+memoryguard --version                    # 0.7.1
+memoryguard upgrade
 memoryguard doctor
 ```
 
-`--apply` reads legacy input only through `memoryguard.migration`, builds the
-V2 shadow, migrates Agent/Group control records, validates frozen-source and
-live-source evidence, and stops at `V2_READY`. Activation requires the exact
-`V2_ACTIVE` confirmation and a fresh drift check. A failed control or validation
-stage stays non-active; it must not silently fall back or activate. Keep V1
-data, migration backups, receipts, and audit evidence until the release gate
-explicitly permits cleanup. Re-running an active upgrade is idempotent.
+The command prepares V2, validates the frozen and live source evidence,
+migrates Agent/Group control, activates only after all gates pass, and removes
+only the backup batch belonging to that successful migration. Re-running it on
+`V2_ACTIVE` is idempotent. For a zero-write report, use:
+
+```bash
+memoryguard upgrade --preview
+```
+
+Advanced explicit workspace/data-home options remain available for operators
+managing an isolated installation. A failed gate stays non-active and preserves
+its evidence; successful activation does not keep a redundant migration backup.
 
 ### Existing pre-V2 workspaces: explicit V2 cutover
 
@@ -605,6 +631,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.1 release record](docs/releases/v0.7.1.md)
 - [v0.7.0 release gate](docs/releases/v0.7.0.md)
 - [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
 - [Contributing guide](CONTRIBUTING.md)
@@ -613,11 +640,10 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** V2-only runtime boundary plus product-facing GUI
-  Agent/Group control, durable TaskRun lifecycle, native governance/release
-  flows, Knowledge file/folder ingestion, and trusted-scope CodeGraph
-  query/path/explain/affected metadata projection. Local release acceptance
-  passed; v0.7.0 was published to GitHub and PyPI on 2026-08-12.
+- **Current release line:** v0.7.1 keeps the V2-only runtime boundary and closes
+  the one-command migration, Agent/Group recovery, executable projection-engine,
+  durable cancellation, and unified context-governance lifecycle. Local full
+  regression passed at `1810 / 1810`.
 - **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result
   plus the real full-repository export/projection described above. It does not
   claim that upstream Graphify's full-repository test suite passed.

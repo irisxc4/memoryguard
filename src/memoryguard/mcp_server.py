@@ -1024,15 +1024,20 @@ def _mcp_json_error(
 
 def _resolve_workspace(args: dict[str, Any]) -> Path:
     """Resolve the configured MemoryGuard control workspace."""
+    from .data_home import resolve_data_home
+    from .workspace_resolver import resolve_workspace
+
     explicit = str(args.get("workspace", "") or "").strip()
-    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-    return Path(explicit or configured or ".").expanduser().resolve()
+    if explicit:
+        return resolve_workspace(explicit, explicit=True)
+    return resolve_data_home()
 
 
 def _resolve_memory_workspace(args: dict[str, Any]) -> Path:
     """Resolve the V2 control plane without migration redirects."""
     from .access_context import clear_runtime_connection_override
     from .data_home import resolve_data_home
+    from .workspace_resolver import resolve_workspace
 
     control_scope = os.environ.get("MEMORYGUARD_CONTROL_SCOPE", "").strip().lower()
     if control_scope == "global":
@@ -1041,9 +1046,12 @@ def _resolve_memory_workspace(args: dict[str, Any]) -> Path:
     configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
     if configured:
         clear_runtime_connection_override()
-        return Path(configured).expanduser().resolve()
+        return resolve_workspace(configured, explicit=True)
     clear_runtime_connection_override()
-    return _resolve_workspace(args)
+    explicit = str(args.get("workspace", "") or "").strip()
+    if explicit:
+        return resolve_workspace(explicit, explicit=True)
+    return resolve_workspace()
 
 
 def _get_share_group_id(
@@ -1705,6 +1713,10 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         workspace = _resolve_memory_workspace(request_args)
         result = _v2_cutover_dispatch(name, request_args, workspace)
     except Exception as exc:
+        from .workspace_resolver import WorkspaceResolutionError
+
+        if isinstance(exc, WorkspaceResolutionError):
+            return _mcp_json_error(exc.to_payload(surface="MCP"))
         payload = v2_upgrade_payload("UNKNOWN", surface="MCP")
         payload["diagnostic"] = safe_exception_diagnostic(
             exc, code="v2_manifest_state_unavailable",

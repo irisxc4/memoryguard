@@ -16,6 +16,7 @@ from memoryguard.memory.store import MemoryAtomStore
 from memoryguard.projection_v2.store import ProjectionStore
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
+from memoryguard.rule_reconciliation import settle_native_canonical_snapshot
 from memoryguard.rules.v2_store import RuleV2Store
 from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.runtime_v2.working_memory import RuntimeStore
@@ -99,6 +100,27 @@ def _prepare(workspace: Path) -> tuple[GovernanceApi, str, RuleV2Store]:
         created_by="admin",
         authorization="fixture:v2-rule-scope",
     ))
+    source_id = "fixture:rule-1"
+    store.upsert_source_link(
+        source_kind="test-fixture",
+        share_group_id=group_id,
+        memory_id=source_id,
+        source_ref="fixture:v2-rule-scope",
+        original_definition_id=definition.definition_id,
+        canonical_definition_id=definition.definition_id,
+        status="active",
+    )
+    store.record_evidence_ref({
+        "evidence_id": "fixture-evidence-rule-1",
+        "definition_id": definition.definition_id,
+        "source_rule_id": source_id,
+        "share_group_id": group_id,
+        "evidence_ref": "fixture:v2-rule-scope",
+        "content_digest": definition.semantic_hash,
+        "authority": "test-fixture",
+        "status": "active",
+    })
+    settle_native_canonical_snapshot(workspace, group_id, store=store)
     return _gui_api(workspace, group=group_id), group_id, store
 
 
@@ -188,6 +210,40 @@ def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(
     assert store.list_bindings(
         definition_id="rule-1", share_group_id=group_id, status="active",
     ) == []
+
+
+def test_gui_audience_update_rolls_back_when_canonical_publish_fails(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    api, group_id, store = _prepare(tmp_path)
+    before = [
+        item.to_dict()
+        for item in store.list_bindings(
+            definition_id="rule-1", share_group_id=group_id,
+        )
+    ]
+    import memoryguard.rule_reconciliation as reconciliation
+
+    monkeypatch.setattr(
+        reconciliation,
+        "settle_native_canonical_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fault")),
+    )
+    result = api.update_rule_audience(
+        "rule-1",
+        [{"target_type": "group", "target_id": group_id}],
+        group_id,
+        "always",
+        confirmed=True,
+    )
+
+    assert result["ok"] is False
+    assert [
+        item.to_dict()
+        for item in store.list_bindings(
+            definition_id="rule-1", share_group_id=group_id,
+        )
+    ] == before
 
 
 def test_legacy_unknown_targets_are_display_only_and_confirmation_is_noop(

@@ -34,6 +34,33 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.1 更新
+
+v0.7.1 补齐 V2-only 切换后暴露的迁移与桌面生命周期缺口：
+
+- **一条命令完成迁移：** 升级 Python 包后直接运行 `memoryguard upgrade`。
+  裸命令使用权威用户数据目录，迁移并验证 Binding、Group、记忆、规则、历史与来源，
+  激活 V2 后只清理本次成功迁移产生的备份。零写入检查使用
+  `memoryguard upgrade --preview`。
+- **统一控制目录：** 裸 `memoryguard gui`、`doctor`、`mcp-status`、`hooks`、
+  `groups` 与存储命令都指向同一用户级数据目录，不再随终端当前目录切换数据库。
+- **恢复 Agent / Group：** V1 迁移来的绑定和共享/个人组继续可编辑；已发现但未绑定、
+  也还没有原生记忆的 Agent，可以直接启用个人记忆层。检测只读取注册的产品/Profile
+  表面，不猜扫整台电脑，也不读取候选正文。
+- **真实构建引擎：** 重构弹窗只列出本机可执行的 Agent CLI，例如 Cursor Agent、
+  Codex。选中后由后台受治理任务真正执行抽取/富化；确定性模式明确标注，不再伪造
+  `host skill` 或“在其他对话继续”的文案。
+- **可靠启动与取消：** 每个可信 scope 同时只允许一个构建。TaskRun ID 可恢复，
+  僵尸 owner 会被安全回收；取消会停止归属 CLI 子进程，所有失败/取消/超时路径都回到
+  神经图页面，不再卡在 `starting / 0%`。
+- **治理链路收口：** canonical 规则、记忆去重、压缩、知识引用和有界上下文注入统一
+  保留 identity、policy、priority、audience、scope、provenance 与 evidence。
+  Graphify 仍作为 MemoryGuard CodeGraph 后的可选 metadata Provider 集成，不是独立
+  MemoryGuard runtime，也不单独发布 PyPI 包。
+
+本地全量回归：**1810 passed / 0 failed**。详见
+[v0.7.1 发布记录](docs/releases/v0.7.1.md)。
+
 ## v0.7.0 更新（V2-only；已于 2026-08-12 发布）
 
 v0.7.0 是 V2-only。本地发布验收已通过，并于 2026-08-12 发布到 GitHub
@@ -215,10 +242,11 @@ memoryguard hooks status --provider all
 memoryguard gui
 ```
 
-`memoryguard-gui .` 仍可用于桌面快捷方式。PowerShell 和其他终端推荐使用
-`memoryguard gui .`，这样启动失败时可以直接看到错误信息。
-不传路径时，MemoryGuard 使用 `MEMORYGUARD_WORKSPACE` 或固定用户级控制目录
-（`MEMORYGUARD_HOME`，Windows 默认 `%LOCALAPPDATA%\MemoryGuard`）。
+`memoryguard-gui .` 仍可用于桌面快捷方式。裸 `memoryguard gui` 始终打开固定用户级
+控制目录（Windows 默认 `%LOCALAPPDATA%\MemoryGuard`），因此无论从项目目录还是
+`C:\Windows\System32` 启动都不会静默切换数据库。`MEMORYGUARD_WORKSPACE` 是显式
+运维覆盖；需要指定隔离工作区时仍可使用 `memoryguard gui <project-path>` 或
+`memoryguard gui --workspace <project-path>`。
 它不再记住上次项目，也不会从启动目录推断工作区或弹出文件夹选择器。
 在 Windows 上，`memoryguard gui` 会把原生窗口独立到后台进程，关闭 PowerShell 不会关闭 GUI。
 
@@ -244,33 +272,28 @@ python -m pip install --upgrade "agent-memguard[gui]"
 目前**没有**包级自更新命令。包管理器是正式升级入口；下面的
 `memoryguard upgrade` 是工作区迁移，不是包自更新。
 
-### 从 v0.6.2 升级：显式 V2-only 迁移
+### 升级现有 V1 用户数据
 
-先升级包，再预览工作区迁移。预览必须零写入，并返回
-`status=PREVIEW`、`writes_performed=false`：
+先升级包，再执行完整验证迁移。正常用户数据目录不需要 workspace、data-home、apply
+或 confirm 参数：
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.0
-memoryguard upgrade --workspace .        # 只读预览
-```
-
-如果 v0.6.2 使用独立用户数据目录，每次 `memoryguard upgrade` 都传入相同的
-`--data-home <path>`。分两步执行：
-
-```bash
-memoryguard upgrade --workspace . --apply
-# 要求：status=V2_READY、activation_required=true
-memoryguard upgrade --workspace . --apply --confirm V2_ACTIVE
+memoryguard --version                    # 0.7.1
+memoryguard upgrade
 memoryguard doctor
 ```
 
-`--apply` 只通过 `memoryguard.migration` 读取旧输入，构建 V2 shadow，迁移
-Agent/Group control，校验 frozen-source 与 live-source 证据，并停在 `V2_READY`。
-只有精确的 `V2_ACTIVE` 确认和新鲜 drift check 才能激活。control 或 validator
-失败必须保持非 active，不得静默 fallback 或自动激活。release gate 明确允许前，
-保留 V1 数据、migration-backups、receipt 和审计证据；重复执行 active upgrade
-应保持幂等。
+该命令构建 V2、校验 frozen/live source evidence、迁移 Agent/Group control，并仅在
+所有门禁通过后激活；随后只删除本次成功迁移的备份批次。重复执行 `V2_ACTIVE` 是幂等的。
+零写入检查使用：
+
+```bash
+memoryguard upgrade --preview
+```
+
+隔离安装仍可使用显式 workspace/data-home 高级参数。任一门禁失败都会保持非 active
+并保留证据；成功激活后不会继续保留冗余迁移备份。
 
 ### 更早的 pre-V2 工作区：显式切换到 V2
 
@@ -409,6 +432,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.1 发布记录](docs/releases/v0.7.1.md)
 - [v0.7.0 发布门禁](docs/releases/v0.7.0.md)
 - [长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)
 - [贡献指南](CONTRIBUTING.md)
@@ -417,10 +441,9 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** V2-only runtime boundary、GUI Agent/Group control、持久 TaskRun、
-  native governance/release、知识库文件/文件夹入库，以及可信 scope 的 CodeGraph
-  query/path/explain/affected metadata projection。本地发布验收已通过；v0.7.0
-  已于 2026-08-12 发布到 GitHub 与 PyPI。
+- **当前发布线：** v0.7.1 保持 V2-only runtime boundary，并补齐一键迁移、
+  Agent/Group 恢复、真实 CLI 构建引擎、持久取消和上下文治理收口。本地全量回归
+  `1810 / 1810` 通过。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
   export/projection；不表示 upstream Graphify 的全仓测试套件通过。
 - **发布后下一步：** 扩展 CodeGraph/Skills ingestion、维护报告和迁移可观测性。

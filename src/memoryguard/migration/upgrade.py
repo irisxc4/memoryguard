@@ -31,6 +31,7 @@ from .gui_control import (
     inspect_legacy_gui_control,
     migrate_legacy_gui_control,
 )
+from .backup_cleanup import cleanup_migration_backups
 from .ready_prepare import prepare_v2_ready
 from .workspace_prepare import prepare_v2_workspace, verify_v2_source_snapshot
 
@@ -123,7 +124,7 @@ def _envelope(
     detail: Any = None,
 ) -> dict[str, Any]:
     state = _state_value(current)
-    return {
+    payload = {
         "schema": SCHEMA,
         "command": "upgrade",
         "from_version": "0.6.2",
@@ -147,6 +148,12 @@ def _envelope(
         "stages": {name: dict(stages.get(name, _stage())) for name in _STAGE_NAMES},
         "detail": detail if detail is not None else {},
     }
+    cleanup = detail.get("cleanup") if isinstance(detail, Mapping) else None
+    if isinstance(cleanup, Mapping):
+        payload["cleanup"] = dict(cleanup)
+        payload["cleanup_warning"] = bool(cleanup.get("cleanup_warning"))
+        payload["cleanup_remaining"] = list(cleanup.get("remaining") or [])
+    return payload
 
 
 def _legacy_binding_ids(workspace: Path) -> set[str]:
@@ -161,6 +168,48 @@ def _legacy_binding_ids(workspace: Path) -> set[str]:
             if binding_id:
                 result.add(binding_id)
     return result
+
+
+def _control_binding_health(workspace: Path) -> dict[str, Any]:
+    """Compare frozen V1 Agent bindings with authoritative V2 membership."""
+
+    legacy_ids = _legacy_binding_ids(workspace)
+    bindings = GroupControlService(workspace, write=False).list_bindings(include_inactive=True)
+    v2_ids = {
+        str(item.get("binding_id") or "")
+        for item in bindings.get("bindings", [])
+        if isinstance(item, Mapping)
+    }
+    missing = sorted(legacy_ids - v2_ids)
+    return {
+        "legacy_binding_count": len(legacy_ids),
+        "v2_binding_count": len(v2_ids),
+        "missing_binding_ids": missing,
+        "status": "PASS" if not missing else "BLOCKED",
+    }
+
+
+def _cleanup_active_migration(
+    workspace: Path,
+    current: Any,
+    *,
+    apply: bool,
+) -> dict[str, Any]:
+    """Clean only the active batch, without changing activation outcome."""
+
+    migration_id = str(getattr(current, "migration_id", "") or "")
+    try:
+        return cleanup_migration_backups(workspace, migration_id, dry_run=not apply)
+    except Exception as exc:  # cleanup debt must never demote V2_ACTIVE
+        return {
+            "status": "WARNING",
+            "ok": False,
+            "cleanup_warning": True,
+            "migration_id": migration_id,
+            "removed": False,
+            "remaining": [migration_id] if migration_id else [],
+            "errors": [{"path": migration_id or "<missing>", "error": f"{type(exc).__name__}: {exc}"}],
+        }
 
 
 def _verify_ready(
@@ -180,17 +229,11 @@ def _verify_ready(
             "state": _state_value(current),
         }
 
-    legacy_ids = _legacy_binding_ids(workspace)
-    bindings = GroupControlService(workspace, write=False).list_bindings(include_inactive=True)
-    v2_ids = {
-        str(item.get("binding_id") or "")
-        for item in bindings.get("bindings", [])
-        if isinstance(item, Mapping)
-    }
-    missing_bindings = sorted(legacy_ids - v2_ids)
+    binding_health = _control_binding_health(workspace)
+    missing_bindings = list(binding_health["missing_binding_ids"])
     control = {
         "legacy_record_count": int(control_preview.get("record_count") or 0),
-        "v2_binding_count": len(v2_ids),
+        "v2_binding_count": int(binding_health["v2_binding_count"]),
         "missing_binding_ids": missing_bindings,
         "status": "PASS" if not missing_bindings else "BLOCKED",
     }
@@ -391,11 +434,73 @@ def run_upgrade(
 
     state = current.state
     if state is ManifestState.V2_ACTIVE:
+        try:
+            control_preview = inspect_legacy_gui_control(root)
+            control_health = _control_binding_health(root)
+        except Exception as exc:
+            code = _error_code(exc, "active_control_preflight_failed")
+            stages["preflight"] = _stage("BLOCKED", code=code, detail={"error": str(exc)})
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=apply,
+                current=current, stages=stages, status="BLOCKED", ok=False,
+                stage="preflight", code=code, next_step=_next_step("error"),
+                detail={"error": str(exc)},
+            )
+        missing = list(control_health["missing_binding_ids"])
+        if missing and not apply:
+            stages["preflight"] = _stage(
+                "BLOCKED", code="active_control_repair_required", detail=control_health
+            )
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=False,
+                current=current, stages=stages, status="BLOCKED", ok=False,
+                stage="preflight", code="active_control_repair_required",
+                next_step="rerun with --apply to restore migrated Agent bindings",
+                detail=control_health,
+            )
+        if missing:
+            stages["preflight"] = _stage("PASS", ok=True, detail=control_health)
+            try:
+                repaired = migrate_legacy_gui_control(root)
+                repaired["projection"] = _project_gui_control_outbox(root)
+                after = _control_binding_health(root)
+                if after["missing_binding_ids"]:
+                    raise GuiControlMigrationError("active_control_repair_incomplete")
+            except Exception as exc:
+                code = _error_code(exc, "active_control_repair_failed")
+                stages["gui_control"] = _stage(
+                    "BLOCKED", writes_performed=True, code=code, detail={"error": str(exc)}
+                )
+                return _envelope(
+                    workspace=root, data_home=resolved_data_home, apply=True,
+                    current=current, stages=stages, status="BLOCKED", ok=False,
+                    stage="gui_control", code=code, next_step=_next_step("error"),
+                    writes_performed=True, detail={"error": str(exc)},
+                )
+            stages["gui_control"] = _stage(
+                "PASS", ok=True, writes_performed=True, detail=repaired
+            )
+            stages["verify"] = _stage("PASS", ok=True, detail=after)
+            cleanup = _cleanup_active_migration(root, current, apply=True)
+            stages["activate"] = _stage(
+                "IDEMPOTENT", ok=True, code="already_active",
+                detail={**_manifest_summary(manager, current), "cleanup": cleanup},
+            )
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=True,
+                current=current, stages=stages, status=ManifestState.V2_ACTIVE.value,
+                ok=True, stage="complete", code="active_control_repaired",
+                next_step=_next_step("active"), writes_performed=True,
+                detail={"control": after, "cleanup": cleanup},
+            )
+        cleanup = _cleanup_active_migration(root, current, apply=apply)
         stages["preflight"] = _stage(
-            "PASS", ok=True, code="already_active", detail=_manifest_summary(manager, current)
+            "PASS", ok=True, code="already_active",
+            detail={**_manifest_summary(manager, current), "control": control_health},
         )
         stages["activate"] = _stage(
-            "IDEMPOTENT", ok=True, code="already_active", detail=_manifest_summary(manager, current)
+            "IDEMPOTENT", ok=True, code="already_active",
+            detail={**_manifest_summary(manager, current), "cleanup": cleanup},
         )
         return _envelope(
             workspace=root,
@@ -409,6 +514,7 @@ def run_upgrade(
             code="already_active",
             next_step=_next_step("active"),
             activation_required=False,
+            detail={"control": control_health, "cleanup": cleanup},
         )
 
     if confirm is not None and not apply:
@@ -691,8 +797,10 @@ def run_upgrade(
             detail={"error": str(exc)},
         )
 
+    cleanup = _cleanup_active_migration(root, active, apply=True)
     stages["activate"] = _stage(
-        "PASS", ok=True, writes_performed=True, code="activated", detail=_manifest_summary(manager, active)
+        "PASS", ok=True, writes_performed=True, code="activated",
+        detail={**_manifest_summary(manager, active), "cleanup": cleanup},
     )
     return _envelope(
         workspace=root,
@@ -707,18 +815,20 @@ def run_upgrade(
         next_step=_next_step("active"),
         writes_performed=True,
         activation_required=False,
+        detail={"cleanup": cleanup},
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="memoryguard upgrade",
-        description="Public V1 (0.6.2) to V2 upgrade orchestration.",
+        description="Verified V1-to-V2 migration. Bare `memoryguard upgrade` uses the canonical user data home.",
     )
-    parser.add_argument("workspace_arg", nargs="?", help="workspace path (default: .)")
-    parser.add_argument("-w", "--workspace", default="", help="workspace path")
+    parser.add_argument("workspace_arg", nargs="?", help="advanced: explicit isolated workspace path")
+    parser.add_argument("-w", "--workspace", default="", help="advanced: explicit isolated workspace path")
     parser.add_argument("--data-home", help="explicit V1 global data home")
-    parser.add_argument("--apply", action="store_true", help="write the resumable migration")
+    parser.add_argument("--preview", action="store_true", help="show the zero-write migration plan")
+    parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--confirm",
         metavar="V2_ACTIVE",

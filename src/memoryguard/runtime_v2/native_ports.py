@@ -103,6 +103,13 @@ _PHASE9_GUI_HANDLERS = frozenset({
 })
 _PHASE9_GUI_READ_HANDLERS = _PHASE9_GUI_HANDLERS - {"history_delete"}
 
+# Agent discovery/lifecycle reads are guarded by the process-issued GUI
+# capability, but they do not read a MemoryGuard group.  Requiring a group
+# here made an unbound/residual Agent impossible to inspect, which in turn
+# trapped the GUI in ``active_binding_required`` before the user could choose
+# an existing group or enable a personal layer.
+_GUI_AGENT_READ_HANDLERS = frozenset({"gui_agent_query"})
+
 # These MCP reads intentionally expose only aggregate/availability
 # diagnostics.  They must remain usable before a host Agent binding exists;
 # all scoped reads and every mutation still require the process-issued native
@@ -2289,11 +2296,15 @@ class NativeV2RuntimePort:
                 request.setdefault(key, value)
         request["trusted_identity"] = dict(context.get("trusted_identity") or {})
         request.update({
+            "workspace_id": context.get("workspace_id", "") or self.workspace,
             "agent_instance_id": context.get("agent_instance_id", ""),
             "project_ref": context.get("project_ref", ""),
             "share_group_id": context.get("share_group_id", ""),
             "provider": context.get("provider", ""),
             "runtime_role": context.get("runtime_role", ""),
+            "namespace_id": context.get("namespace_id", ""),
+            "sensitivity": context.get("sensitivity", ""),
+            "policy_class": context.get("policy_class", ""),
         })
         candidates = request.pop("candidates", None)
         # Keep the engine's readiness/state projection synchronized with the
@@ -2341,7 +2352,9 @@ class NativeV2RuntimePort:
             provider=_text(req.provider),
             runtime_role=_text(req.runtime_role or req.runtime),
         )
-        result: dict[str, list[dict[str, Any]]] = {"mandatory": [], "relevant": []}
+        result: dict[str, list[dict[str, Any]]] = {
+            "mandatory": [], "relevant": [], "reference_only": [],
+        }
         scope_public = {
             "workspace_id": self.workspace,
             "agent_instance_id": agent,
@@ -2358,55 +2371,99 @@ class NativeV2RuntimePort:
                     policy = _text(getattr(atom, "injection_policy", "relevant")).casefold()
                     layer = "mandatory" if policy == "always" else "relevant"
                     kind = _text(getattr(atom, "kind", "fact")) or "fact"
+                    atom_id = _text(getattr(atom, "atom_id", "")) or _text(getattr(atom, "memory_id", ""))
+                    evidence_ids = list(getattr(memory, "evidence_ids_for_atom", lambda *_: [])(atom_id) or [])
+                    mappings = list(getattr(memory, "list_source_mappings", lambda **_: [])(atom_id=atom_id) or [])
+                    mapping = mappings[0] if mappings else {}
+                    source_ref = _text(mapping.get("source_ref")) or _text(getattr(atom, "memory_id", ""))
+                    evidence_ref = _text(evidence_ids[0] if evidence_ids else "") or source_ref
                     result[layer].append({
-                        "item_id": _text(getattr(atom, "atom_id", "")) or _text(getattr(atom, "memory_id", "")),
-                        "body": _text(getattr(atom, "body", "")),
-                        "kind": kind,
-                        "layer": layer,
-                        "source": "native-v2-memory",
+                        "item_id": atom_id, "body": _text(getattr(atom, "body", "")),
+                        "kind": kind, "layer": layer, "source": "native-v2-memory",
+                        "source_ref": source_ref,
+                        "evidence": {"id": evidence_ref, "digest": _text(getattr(atom, "canonical_hash", ""))},
                         "scope": dict(scope_public),
                         "priority": int(getattr(atom, "priority", 0) or 0),
                         "score": float(getattr(atom, "confidence", 0.0) or 0.0),
                         "is_rule": layer == "mandatory" or kind.casefold() in {"rule", "procedure", "instruction"},
                         "status": _text(getattr(atom, "status", "active")) or "active",
                     })
-        except Exception:
-            # Context retrieval is a read-only optional port.  Schema and
-            # filesystem failures become a neutral packet; the native
-            # diagnostics/health surfaces remain responsible for reporting
-            # storage availability without leaking exceptions into context.
-            pass
-        try:
             if self.layout.rules_db.is_file():
-                rules = self._domain_store("rules")
-                definitions = rules.list_definitions(status="active")
-                for definition in definitions:
-                    bindings = rules.list_bindings(
-                        definition_id=definition.definition_id,
-                        share_group_id=group,
-                        status="active",
-                    )
-                    matched = [
-                        binding for binding in bindings
-                        if self._binding_matches_context(binding, scope_public)
-                    ]
-                    if not matched:
-                        continue
-                    layer = "mandatory" if _text(definition.rule_strength).casefold() == "must" or _text(definition.maturity_state).casefold() == "trusted" else "relevant"
-                    result[layer].append({
-                        "item_id": _text(definition.definition_id),
-                        "body": _text(definition.canonical_text),
-                        "kind": _text(definition.rule_kind) or "rule",
-                        "layer": layer,
-                        "source": "native-v2-rule",
-                        "scope": dict(scope_public),
-                        "priority": max((int(getattr(item, "priority", 0) or 0) for item in matched), default=0),
-                        "score": float(getattr(definition, "confidence", 0.0) or 0.0),
-                        "is_rule": True,
-                        "status": _text(definition.status) or "active",
-                    })
-        except Exception:
-            pass
+                from ..rule_reconciliation import canonical_reconciliation_status
+                readiness = canonical_reconciliation_status(self.workspace, group)
+                if readiness.get("failures") and readiness.get("failures") == ["native_canonical_status_unavailable"]:
+                    raise RuntimeError("canonical status unavailable")
+                if readiness.get("canonical_ready"):
+                    rules = self._domain_store("rules")
+                    definitions = rules.list_definitions(status="active")
+                    for definition in definitions:
+                        bindings = rules.list_bindings(definition_id=definition.definition_id, share_group_id=group, status="active")
+                        includes = [item for item in bindings if _text(getattr(item, "effect", "include")).casefold() != "exclude"]
+                        matched = [item for item in includes if self._binding_matches_context(item, scope_public)]
+                        if not matched:
+                            continue
+                        read = getattr(rules, "_read", None)
+                        if not callable(read):
+                            raise RuntimeError("native rule provenance unavailable")
+                        provenance = read(lambda conn: {
+                            "link": (
+                                lambda row: dict(row) if row is not None else None
+                            )(conn.execute(
+                                "SELECT * FROM rule_source_links "
+                                "WHERE share_group_id=? AND status='active' "
+                                "AND canonical_definition_id=? "
+                                "ORDER BY source_link_id LIMIT 1",
+                                (group, definition.definition_id),
+                            ).fetchone()),
+                            "evidence": [],
+                        })
+                        link = provenance.get("link") or {}
+                        memory_id = _text(link.get("memory_id"))
+                        if not memory_id:
+                            raise RuntimeError("native rule source link unavailable")
+                        evidence_rows = read(lambda conn: [
+                            dict(row) for row in conn.execute(
+                                "SELECT * FROM rule_evidence_refs "
+                                "WHERE share_group_id=? AND definition_id=? "
+                                "AND source_rule_id=? ORDER BY evidence_id",
+                                (group, definition.definition_id, memory_id),
+                            ).fetchall()
+                        ])
+                        evidence = evidence_rows[0] if evidence_rows else {}
+                        evidence_ref = _text(evidence.get("evidence_ref")) or _text(evidence.get("evidence_id"))
+                        if not evidence_ref:
+                            raise RuntimeError("native rule evidence unavailable")
+                        layer = "mandatory" if _text(definition.rule_strength).casefold() == "must" or _text(definition.maturity_state).casefold() == "trusted" else "relevant"
+                        result[layer].append({
+                            "item_id": _text(definition.definition_id), "body": _text(definition.canonical_text),
+                            "kind": _text(definition.rule_kind) or "rule", "layer": layer,
+                            "source": "native-v2-rule", "source_ref": _text(link.get("source_ref")) or memory_id,
+                            "evidence": {"id": evidence_ref, "digest": _text(evidence.get("content_digest")) or _text(getattr(definition, "semantic_hash", ""))},
+                            "scope": dict(scope_public),
+                            "priority": max((int(getattr(item, "priority", 0) or 0) for item in matched), default=0),
+                            "score": float(getattr(definition, "confidence", 0.0) or 0.0),
+                            "is_rule": True, "status": _text(definition.status) or "active",
+                        })
+            # Knowledge is always reference-only and uses the exact trusted
+            # ACL tuple. Missing identity yields no candidates; no legacy
+            # global knowledge store is consulted.
+            from ..context_bootstrap import knowledge_reference_candidates
+            references = knowledge_reference_candidates(
+                self.workspace,
+                namespace_id=_text(getattr(req, "namespace_id", "")),
+                workspace_id=self.workspace,
+                agent_instance_id=agent,
+                project_ref=scope.project_ref,
+                provider=scope.provider,
+                share_group_id=group,
+                sensitivity=_text(getattr(req, "sensitivity", "")),
+                policy_class=_text(getattr(req, "policy_class", "")),
+                query=_text(req.task),
+                limit=6,
+            )
+            result["reference_only"].extend(references)
+        except Exception as exc:
+            raise RuntimeError("native_v2_retrieval_failed") from exc
         return result
 
     def _rule_decision_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
@@ -2498,6 +2555,93 @@ class NativeV2RuntimePort:
             except Exception as exc:
                 raise NativePortError("v2_projection_build_service_unavailable") from exc
         return self._projection_build_service
+
+    def _build_projection_worker(
+        self,
+        scope: Any,
+        mode: str,
+        runtime_role: str,
+        context: Mapping[str, Any],
+        *,
+        engine: Mapping[str, Any] | None,
+        deterministic: bool,
+        execution: Any,
+    ) -> Mapping[str, Any]:
+        """Run one governed projection build inside a TaskCoordinator worker.
+
+        A selected, real Agent CLI participates through the existing governed
+        enrichment path (stage -> list_pending -> batch_enrich_via_cli ->
+        apply_enrichments) before the canonical projection build.  Deterministic
+        mode skips enrichment and truthfully reports ``llm_used=False``; an Agent
+        CLI that fails to enrich fails the task rather than silently claiming
+        LLM organization.
+        """
+        from ..host_agent_backend import batch_enrich_via_cli
+        from .projection_build import ProjectionBuildError, ProjectionBuildService
+
+        llm_used = False
+        llm_engine = ""
+        if not deterministic and engine is not None:
+            execution.progress(2, "engine")
+            enrichment = self._native_service("extraction")
+            if enrichment is None:
+                raise ProjectionBuildError("v2_extraction_service_unavailable")
+            self._service_result(enrichment, "memoryguard_build_and_enrich", {}, context=context)
+            enriched_count = 0
+            while True:
+                execution.check_cancelled()
+                pending = self._service_result(
+                    enrichment, "memoryguard_list_pending_enrichments", {"limit": 100}, context=context,
+                )
+                tasks = list((pending or {}).get("tasks") or [])
+                if not tasks:
+                    break
+                execution.progress(6, "enrich", item_count=enriched_count + len(tasks))
+                results = batch_enrich_via_cli(
+                    tasks,
+                    agent=str(engine["agent"]),
+                    cli_path=str(engine["cli"]),
+                    workspace=self.workspace,
+                    execution=execution,
+                )
+                if not results:
+                    raise ProjectionBuildError("llm_cli_enrichment_failed")
+                expected_ids = [str(item.get("task_id") or "") for item in tasks]
+                actual_ids = [str(item.get("task_id") or "") for item in results]
+                if (
+                    not all(expected_ids)
+                    or len(set(expected_ids)) != len(expected_ids)
+                    or len(actual_ids) != len(expected_ids)
+                    or set(actual_ids) != set(expected_ids)
+                ):
+                    raise ProjectionBuildError("llm_cli_enrichment_incomplete")
+                applied = self._service_result(
+                    enrichment, "memoryguard_apply_enrichments", {"results": results}, context=context,
+                )
+                if int((applied or {}).get("applied") or 0) != len(tasks):
+                    raise ProjectionBuildError("llm_cli_enrichment_failed")
+                llm_used = True
+                llm_engine = str(engine["agent"])
+                enriched_count += len(tasks)
+            # Re-evaluate after all batches.  This proves the governed queue is
+            # terminal before projection rather than assuming one page was all.
+            refreshed = self._service_result(
+                enrichment, "memoryguard_build_and_enrich", {}, context=context,
+            )
+            if list((refreshed or {}).get("pending_tasks") or []):
+                raise ProjectionBuildError("llm_cli_enrichment_incomplete")
+        else:
+            execution.progress(2, "engine")
+
+        return ProjectionBuildService(self.workspace).build(
+            scope=scope,
+            mode=mode,
+            runtime_role=runtime_role,
+            llm_provider=llm_engine or "deterministic",
+            llm_used=llm_used,
+            llm_engine=llm_engine,
+            execution=execution,
+        )
 
     def _release_v2_service(self) -> Any:
         if self._release_service is None:
@@ -2861,9 +3005,18 @@ class NativeV2RuntimePort:
         if payload.get("confirmed") is not True:
             raise NativePortError("task_cancel_confirmation_required")
         run_id = _text(payload.get("run_id") or payload.get("job_id") or payload.get("request_id"))
+        scope = self._gui_task_scope(context)
         if not run_id:
-            raise NativePortError("task_run_id_required")
-        result = self._task_service().cancel(run_id, self._gui_task_scope(context), timeout=5.0)
+            # No run id yet: resolve the exact trusted scope's active
+            # projection_build run.  Exactly one => cancel it; zero or
+            # ambiguous => fail closed instead of issuing an empty no-op.
+            active = self._task_service().active_runs(scope, operation="projection_build")
+            if not active:
+                raise NativePortError("no_active_projection_build")
+            if len(active) > 1:
+                raise NativePortError("ambiguous_active_projection_build")
+            run_id = active[0]
+        result = self._task_service().cancel(run_id, scope, timeout=5.0)
         if not result.get("ok"):
             raise NativePortError(_text((result.get("error") or {}).get("code")) or "task_cancel_failed")
         return result
@@ -2956,25 +3109,32 @@ class NativeV2RuntimePort:
                 task_scope = self._gui_task_scope(context)
                 key = self._gui_task_key(operation, payload)
                 mode = _text(payload.get("mode")) or "reconstructed"
-                llm_provider = (
-                    _text(payload.get("llm_agent"))
-                    or _text(payload.get("llm_cli"))
-                    or _text(payload.get("enrich_mode"))
-                    or "deterministic"
-                )
+                runtime_role = _text(context.get("runtime_role"))
+                # The browser may only name an engine id; the executable path is
+                # resolved again from the fresh allowlist, never from llm_cli.
+                llm_agent_id = _text(payload.get("llm_agent")).strip()
+                enrich_mode = _text(payload.get("enrich_mode")) or "auto"
+                engine: dict[str, Any] | None = None
+                if llm_agent_id and llm_agent_id not in {"host", "auto", "none", "deterministic"}:
+                    engine = self._resolve_engine_id(llm_agent_id)
+                    if engine is None:
+                        raise NativePortError("llm_engine_unavailable")
+                deterministic = engine is None or enrich_mode in {"deterministic", "host"}
 
                 def worker(execution: Any) -> Mapping[str, Any]:
-                    return service.build(
-                        scope=scope,
-                        mode=mode,
-                        runtime_role=_text(context.get("runtime_role")),
-                        llm_provider=llm_provider,
+                    return self._build_projection_worker(
+                        scope,
+                        mode,
+                        runtime_role,
+                        context,
+                        engine=engine,
+                        deterministic=deterministic,
                         execution=execution,
                     )
 
-                accepted = coordinator.start(
+                accepted = coordinator.start_scope_exclusive(
                     operation="projection_build",
-                    idempotency_key=key,
+                    key=key,
                     scope=task_scope,
                     worker=worker,
                     goal="background_task",
@@ -3181,9 +3341,13 @@ class NativeV2RuntimePort:
                     candidate_id=_text(payload.get("candidate_id")),
                 )
             if operation == "open_agent_folder":
+                dir_path = _text(payload.get("dir_path"))
+                candidate_id = _text(payload.get("candidate_id"))
+                if dir_path.startswith("agent-residual-"):
+                    dir_path = service.resolve_residual_path(candidate_id, dir_path)
                 return service.open_folder(
-                    dir_path=_text(payload.get("dir_path")),
-                    candidate_id=_text(payload.get("candidate_id")),
+                    dir_path=dir_path,
+                    candidate_id=candidate_id,
                 )
             raise NativePortError("unknown_agent_query")
         except NativePortError:
@@ -3230,9 +3394,12 @@ class NativeV2RuntimePort:
                 return service.unmark_uninstalled(candidate, product=_text(payload.get("product")))
             if operation == "archive_agent_dir":
                 candidate = self._agent_candidate_id(service, payload)
+                dir_path = _text(payload.get("dir_path"))
+                if dir_path.startswith("agent-residual-"):
+                    dir_path = service.resolve_residual_path(candidate, dir_path)
                 return service.archive(
                     candidate,
-                    dir_path=_text(payload.get("dir_path")),
+                    dir_path=dir_path,
                     reason=_text(payload.get("reason")),
                     dry_run=bool(payload.get("dry_run")),
                 )
@@ -4395,6 +4562,21 @@ class NativeV2RuntimePort:
         source_path = _text(payload.get("source_path") or payload.get("path"))
         if not source_path:
             raise NativePortError("source_path_required")
+        # Selection-tree paths are redacted at the GUI boundary.  The browser
+        # may send back the server-issued source token plus the selected Agent
+        # instance; resolve it against a fresh tree before extraction.
+        if source_path.startswith("agent-source-"):
+            extra = payload.get("args")
+            instance_id = _text(payload.get("agent_instance_id"))
+            if not instance_id and isinstance(extra, (list, tuple)) and extra:
+                instance_id = _text(extra[0])
+            if not instance_id:
+                raise NativePortError("agent_instance_required")
+            try:
+                source_path = self._agent_service().resolve_source_path(instance_id, source_path)
+            except Exception as exc:
+                code = _text(getattr(exc, "code", "")) or "agent_source_not_found"
+                raise NativePortError(code) from exc
         return self._extract_memories({"source_path": source_path}, context, **kwargs)
 
     def _accept_candidates(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
@@ -4480,11 +4662,11 @@ class NativeV2RuntimePort:
             raise NativePortError("v2_enrichment_read_unavailable")
         return {
             "ok": True,
-            "mode": "host_skill_primary",
+            "mode": "host_enrichment_queue",
             "pending_count": pending,
             "applied_count": applied,
             "message": (
-                f"host skill has {pending} pending enrichment items"
+                f"host enrichment queue has {pending} pending items"
                 if pending else "no pending enrichment items"
             ),
             "mcp_tools": [
@@ -4497,13 +4679,55 @@ class NativeV2RuntimePort:
 
     @staticmethod
     def _host_llm_agents(payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        """Expose host-only control-plane option; never scan or spawn CLIs."""
+        """Expose only real, currently executable host Agent CLIs.
+
+        There is deliberately no synthetic ``host`` row: a GUI "skill" is not a
+        synchronous executable LLM.  Each row carries a stable engine id, human
+        name, capability mode, and a safe display hint -- never the full local
+        executable path, which stays server-side for build dispatch.
+        """
 
         del payload, context
+        from ..host_agent_backend import detect_available_agents
+
+        rows: list[dict[str, Any]] = []
+        for agent in detect_available_agents() or []:
+            engine_id = str(agent.get("agent") or "").strip()
+            if not engine_id:
+                continue
+            rows.append({
+                "agent": engine_id,
+                "label": str(agent.get("label") or engine_id),
+                "mode": "cli",
+                "display": "本机 Agent CLI · 后台任务整理",
+            })
+        if not rows:
+            return {
+                "agents": [],
+                "primary": "",
+                "empty": True,
+                "note": "未检测到可用的 Agent CLI（Cursor Agent / Codex / Claude Code / TRAE）",
+            }
         return {
-            "agents": [{"agent": "host", "cli": "", "label": "host skill"}],
-            "primary": "host",
+            "agents": rows,
+            "primary": rows[0]["agent"],
+            "empty": False,
         }
+
+    @staticmethod
+    def _resolve_engine_id(engine_id: str) -> dict[str, Any] | None:
+        """Re-resolve a caller-supplied engine id against the fresh allowlist.
+
+        The caller may only name an engine id; the concrete CLI path is always
+        taken from :func:`detect_available_agents`, never from a browser payload.
+        """
+        from ..host_agent_backend import detect_available_agents
+
+        requested = str(engine_id or "").strip()
+        for agent in detect_available_agents() or []:
+            if str(agent.get("agent") or "").strip() == requested:
+                return dict(agent)
+        return None
 
     def _canonical_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
@@ -5289,6 +5513,14 @@ class NativeV2RuntimePort:
                     "metadata_json": _canonical_json({"injection_policy": policy}),
                     "source_ref": "native-v2:gui:rule_audience_update",
                 })
+                # Snapshot publication shares this SQLite transaction.  A
+                # missing provenance gate or publication fault rolls the
+                # audience replacement back instead of returning a false
+                # failure after partially committing the new bindings.
+                from ..rule_reconciliation import settle_native_canonical_snapshot
+                settle_native_canonical_snapshot(
+                    self.workspace, group, store=store,
+                )
             return {"ok": True, "definition_id": definition_id, "injection_policy": policy, "bindings": after, "decision_id": decision_id}
         except NativePortError:
             raise
@@ -5967,6 +6199,8 @@ class NativeV2RuntimePort:
                     surface == "cli" and spec.handler == "maintenance"
                 ) or (
                     surface == "gui" and spec.handler in _PHASE9_GUI_READ_HANDLERS
+                ) or (
+                    surface == "gui" and spec.handler in _GUI_AGENT_READ_HANDLERS
                 ) or neutral_mcp_read,
             )
             # MaintenanceRuntimePort owns a separate private CLI capability

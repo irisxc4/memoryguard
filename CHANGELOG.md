@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.7.1] - 2026-08-13
+
+### Fixed
+
+- `memoryguard upgrade` is now the complete verified user-data migration: a
+  bare command selects the canonical data home, prepares and validates V2,
+  activates it, and removes only the successful migration backup batch.
+  `memoryguard upgrade --preview` remains read-only. Bare `gui`, `doctor`,
+  `mcp-status`, `hooks`, `groups`, and storage commands use that same data home
+  instead of accidentally switching databases with the terminal directory.
+- V1 Agent bindings, shared/personal groups, source selections, memories,
+  rules, and history migrate into V2 without requiring a new binding. Existing
+  migrated groups remain editable. Unbound discovered Agents can create a
+  personal memory layer; residual cleanup is no longer confused with binding.
+- Desktop Agent discovery returns registered real products and safe source
+  tokens without leaking local paths. File/folder and External MCP dialogs use
+  valid pywebview filters, health scoring cannot render `NaN`, and trusted
+  desktop mutations do not become request-queue operations merely because an
+  IDE environment variable is present.
+- Reconstructed projection builds list only executable local Agent CLIs. The
+  selected CLI performs governed extraction/enrichment in the background;
+  synthetic `host skill` claims are removed. Deterministic mode is explicit,
+  selected-engine metadata records actual LLM use, and browser payloads cannot
+  substitute an arbitrary executable path.
+- Projection builds are exclusive per trusted scope and survive reloads with a
+  durable `TaskRun` ID. Start, failure, timeout, and cancellation restore the
+  neuron page. Cancellation terminates owned CLI children with bounded cleanup;
+  stale owners are recovered and duplicate workers are not created.
+- Canonical rule reconciliation, audience updates, retrieval, compaction, and
+  context bootstrap now share the same governed source/evidence/scope path.
+  Rule and memory deduplication keeps explicit supersede/conflict/quarantine
+  outcomes; Knowledge contributes references, never raw source bodies.
+- Windows acceptance helpers force UTF-8 machine output so non-ASCII user paths
+  are decoded consistently on Python 3.10 through 3.14.
+
+### Verification
+
+- Full local suite: `1810 passed / 0 failed`.
+- Forced sandbox GUI dispatch: `40 passed`; security regressions: `54 passed`.
+- Projection/LLM/cancellation/interactivity focused gate: `53 passed`.
+- Real canonical user data migrated to `V2_ACTIVE`; binding, group, memory,
+  rule, history, Hook, `doctor`, and `mcp-status` checks passed.
+
+Graphify remains an optional metadata extraction provider integrated behind
+MemoryGuard's CodeGraph boundary. It is not a separate MemoryGuard runtime or
+PyPI release.
+
 ## [0.7.0] - 2026-08-12 (published to GitHub and PyPI; local release acceptance passed)
 
 ### Scope

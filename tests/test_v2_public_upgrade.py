@@ -76,6 +76,8 @@ def _run_upgrade(root: Path, *, apply: bool = False, confirm: str | None = None,
     args = ["upgrade", "--workspace", str(root), "--data-home", str(root)]
     if apply:
         args.append("--apply")
+    else:
+        args.append("--preview")
     if confirm is not None:
         args.extend(["--confirm", confirm])
     code = cli_main(args)
@@ -84,7 +86,7 @@ def _run_upgrade(root: Path, *, apply: bool = False, confirm: str | None = None,
 
 
 def test_public_upgrade_0_6_2_global_workspace_is_zero_write_then_explicitly_active(tmp_path: Path, capsys) -> None:
-    assert __version__ == "0.7.0"
+    assert __version__ == "0.7.1"
     root = tmp_path / "global-memoryguard-home"
     binding = _legacy_0_6_2_fixture(root)
     before_binding = binding.read_bytes()
@@ -137,6 +139,23 @@ def test_public_upgrade_0_6_2_global_workspace_is_zero_write_then_explicitly_act
     assert manager.current().generation == active.generation
 
 
+def test_bare_public_upgrade_completes_verified_activation(tmp_path: Path, capsys) -> None:
+    root = tmp_path / "one-command-upgrade"
+    _legacy_0_6_2_fixture(root)
+
+    code = cli_main([
+        "upgrade", "--workspace", str(root), "--data-home", str(root),
+    ])
+    report = json.loads(capsys.readouterr().out)
+
+    assert code == 0, report
+    assert report["status"] == ManifestState.V2_ACTIVE.value
+    assert report["v2_active"] is True
+    assert report["stages"]["verify"]["status"] == "PASS"
+    assert report["stages"]["activate"]["status"] == "PASS"
+    assert ManifestManager(root).current().state is ManifestState.V2_ACTIVE
+
+
 def test_public_upgrade_control_failure_stays_ready_and_never_activates(tmp_path: Path, capsys) -> None:
     root = tmp_path / "global-memoryguard-home"
     binding = _legacy_0_6_2_fixture(root)
@@ -154,3 +173,41 @@ def test_public_upgrade_control_failure_stays_ready_and_never_activates(tmp_path
     assert failed["code"] == "idempotency_key_reused"
     assert failed["activation_required"] is True
     assert ManifestManager(root).current().state is ManifestState.V2_READY
+
+
+def test_public_upgrade_repairs_missing_v1_bindings_after_premature_v2_activation(
+    tmp_path: Path, capsys
+) -> None:
+    """V2_ACTIVE is not healthy when legacy Agent bindings were never projected."""
+
+    root = tmp_path / "global-memoryguard-home"
+    _legacy_0_6_2_fixture(root)
+    code, ready = _run_upgrade(root, apply=True, capsys=capsys)
+    assert code == 0, ready
+    code, active = _run_upgrade(root, apply=True, confirm="V2_ACTIVE", capsys=capsys)
+    assert code == 0, active
+
+    control = WorkspaceV2Layout(root).manifest_db
+    with sqlite3.connect(control) as conn:
+        conn.execute("DELETE FROM agent_group_bindings")
+        conn.execute(
+            "DELETE FROM group_operation_receipts WHERE operation='migrate_legacy_agent_bindings'"
+        )
+        conn.execute("DELETE FROM group_outbox WHERE event_type='migrate_legacy_agent_bindings'")
+        conn.commit()
+    assert GroupControlService(root).list_bindings(include_inactive=True)["total"] == 0
+
+    code, preview = _run_upgrade(root, capsys=capsys)
+    assert code == 2
+    assert preview["code"] == "active_control_repair_required"
+    assert preview["writes_performed"] is False
+    assert preview["detail"]["missing_binding_ids"] == ["binding-1"]
+
+    code, repaired = _run_upgrade(root, apply=True, capsys=capsys)
+    assert code == 0, repaired
+    assert repaired["status"] == ManifestState.V2_ACTIVE.value
+    assert repaired["code"] == "active_control_repaired"
+    assert repaired["writes_performed"] is True
+    binding = GroupControlService(root).active_binding_for_agent("agent-1")
+    assert binding is not None
+    assert binding["share_group_id"] == "shared-team"

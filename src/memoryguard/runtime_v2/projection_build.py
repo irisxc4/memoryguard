@@ -475,6 +475,8 @@ class ProjectionBuildService:
         scope: ProjectionReadScope,
         runtime_role: str = "",
         llm_provider: str = "",
+        llm_used: bool = False,
+        llm_engine: str = "",
         execution: TaskExecution | None = None,
     ) -> dict[str, Any]:
         checked_mode = self._mode(mode)
@@ -549,12 +551,13 @@ class ProjectionBuildService:
             "atom_count": len(atom_refs),
             "evidence_count": len(evidence_refs),
             "llm_provider": str(llm_provider or "none")[:128],
+            "llm_used": bool(llm_used),
+            "llm_engine": str(llm_engine or "")[:64],
             "source_digest": source_digest,
         }
         derived_graph, derived_stats = _derive_reference_graph(list(atoms))
         metadata.update({
             "derivation_engine": "deterministic_v3",
-            "llm_used": False,
             "derived_graph": derived_graph,
             "derived_stats": derived_stats,
         })

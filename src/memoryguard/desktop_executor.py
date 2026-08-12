@@ -168,6 +168,8 @@ class RequestExecutor:
                 session_trusted=True,
             )
         api_kwargs: dict[str, Any] = {}
+        if self.trusted_desktop:
+            api_kwargs["direct_mutations"] = True
         if access_context is not None:
             api_kwargs["_trusted_access_context"] = access_context
         if self.v2_port is not None:

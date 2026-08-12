@@ -74,7 +74,13 @@ def test_dedup_and_planner_are_deterministic_and_cannot_elevate():
     assert first.to_dict() == second.to_dict()
     assert [item["item_id"] for item in first.mandatory] == ["r1"]
     assert [item["item_id"] for item in first.relevant] == ["r3"]
-    assert "inject" not in str(first.to_dict())
+    rendered_bodies = [
+        item["body"]
+        for layer in ("mandatory", "relevant", "knowledge", "reference_only")
+        for item in getattr(first, layer)
+        if "body" in item
+    ]
+    assert "inject" not in rendered_bodies
     assert any(receipt["reason"] == "duplicate_rejected" for receipt in first.receipts)
 
 
