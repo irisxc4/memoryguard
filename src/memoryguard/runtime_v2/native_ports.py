@@ -1788,6 +1788,16 @@ class NativeV2RuntimePort:
 
     def _memory_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
+        if not _text(context.get("share_group_id")):
+            return {
+                "available": self.layout.memory_db.is_file(),
+                "status": "UNBOUND",
+                "scope": {"share_group_id": "", "agent_instance_id": "", "project_ref": ""},
+                "total_records": 0,
+                "status_counts": {},
+                "kind_counts": {},
+                "evidence_link_count": 0,
+            }
         scope = self._scope(context)
         if not self.layout.memory_db.is_file():
             return {
@@ -4405,6 +4415,15 @@ class NativeV2RuntimePort:
         return self._extraction_operation("memoryguard_apply_enrichments", payload, context, **kwargs)
 
     def _enrichment_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **kwargs: Any) -> Any:
+        if not _text(context.get("share_group_id")):
+            return {
+                "pending": 0,
+                "applied": 0,
+                "other": 0,
+                "total": 0,
+                "mode": "v2_content_plane",
+                "status": "UNBOUND",
+            }
         if not self.layout.content_db.is_file():
             return {"pending": 0, "applied": 0, "other": 0, "total": 0, "mode": "v2_content_plane", "status": "NO_SOURCE"}
         return self._extraction_operation("memoryguard_enrichment_status", payload, context, **kwargs)
@@ -4536,6 +4555,13 @@ class NativeV2RuntimePort:
 
     def _projection_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
+        if not _text(context.get("share_group_id")):
+            return {
+                "status": "UNBOUND",
+                "scenario_heads": 0,
+                "profile_heads": 0,
+                "total_heads": 0,
+            }
         scope = self._scope(context)
         result: dict[str, Any] = {"status": "READY", "scenario_heads": 0, "profile_heads": 0}
         configured = False
