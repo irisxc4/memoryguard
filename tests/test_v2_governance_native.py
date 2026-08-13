@@ -201,9 +201,13 @@ def test_governance_native_quarantine_conflict_and_decision_outbox(tmp_path: Pat
         "get_recent_events", [], context=context, generation=11, state="V2_ACTIVE"
     )
     assert recent["ok"] is True, recent
-    actions = [item["action"] for item in recent["data"]["events"]]
+    events = recent["data"]["events"]
+    actions = [item["action"] for item in events]
     assert "put" in actions
     assert "tombstone" in actions
+    assert all(item["agent_instance_id"] == "agent-a" for item in events)
+    assert all(item["share_group_id"] == "group-a" for item in events)
+    assert all(item["provider"] == "gui" for item in events)
 
     service = GovernanceNativeService(tmp_path)
     outbox = service.outbox_status(context)

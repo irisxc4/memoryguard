@@ -206,11 +206,21 @@ def main() -> int:
         # 8. Source map and group status retain the external-source boundary.
         source_map = projections.source_map(scope=projection_scope)
         group_status = groups.get_global_memory_status()
+        source_summary = source_map["summary"]
         passed &= _check(
             "V2 source map and group status",
-            source_map["summary"]["enabled"] == 1
+            source_summary["selected_source_connectors"] == 1
+            and source_summary["selected_source_connector_total"] == 1
+            and source_summary["governed_memory"] == len(atoms)
+            and source_summary["buildable_atom_count"] == len(atoms)
+            and source_summary["enabled"] == 1 + len(atoms)
             and any(item["share_group_id"] == group and item["record_count"] == len(atoms) for item in group_status["groups"]),
-            f"enabled={source_map['summary']['enabled']}, groups={group_status['total_groups']}",
+            (
+                f"connectors={source_summary['selected_source_connectors']}, "
+                f"governed={source_summary['governed_memory']}, "
+                f"buildable={source_summary['buildable_atom_count']}, "
+                f"groups={group_status['total_groups']}"
+            ),
         )
 
         # 9. Projection deletion is precise and idempotent; group export remains

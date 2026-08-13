@@ -18,6 +18,7 @@ from memoryguard.memory import MemoryAtom, MemoryAtomStore
 from memoryguard.projection_v2 import ProjectionReadScope
 from memoryguard.runtime_v2.native_ports import bind_native_transport_context
 from memoryguard.runtime_v2.projection_build import (
+    ProjectionBuildError,
     ProjectionBuildService,
     V2ReleaseService,
 )
@@ -261,11 +262,16 @@ def publish(
     projections = ProjectionBuildService(workspace)
     built = projections.current(mode=mode, scope=checked_scope)
     if built.get("projection") is None:
-        built = projections.build(
-            mode=mode,
-            scope=checked_scope,
-            runtime_role=runtime_role,
-        )
+        try:
+            built = projections.build(
+                mode=mode,
+                scope=checked_scope,
+                runtime_role=runtime_role,
+            )
+        except ProjectionBuildError as exc:
+            if exc.code == "no_projection_sources":
+                return {"ok": False, "status": "NO_SOURCE", "error": "projection_required"}
+            raise
     if built.get("projection") is None:
         return {"ok": False, "status": "NO_SOURCE", "error": "projection_required"}
     release = V2ReleaseService(workspace)

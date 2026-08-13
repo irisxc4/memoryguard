@@ -220,6 +220,14 @@ class GovernanceNativeService:
                 "status": item.status,
                 "created_at": item.created_at,
                 "actor": str((item.context or {}).get("actor") or ""),
+                "agent_instance_id": str(
+                    (item.context or {}).get("agent_instance_id")
+                    or (item.context or {}).get("actor")
+                    or ""
+                ),
+                "share_group_id": str((item.context or {}).get("share_group_id") or ""),
+                "project_ref": str((item.context or {}).get("project_ref") or ""),
+                "provider": str((item.context or {}).get("provider") or ""),
                 "authority": str((item.context or {}).get("authority") or ""),
             }
             for item in visible

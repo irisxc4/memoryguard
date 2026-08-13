@@ -103,12 +103,33 @@ _PHASE9_GUI_HANDLERS = frozenset({
 })
 _PHASE9_GUI_READ_HANDLERS = _PHASE9_GUI_HANDLERS - {"history_delete"}
 
+# These GUI fields select the business target displayed/acted on by the page.
+# They are never a second authorization source: projection/release handlers
+# always derive exact scope from the process-issued NativeBoundContext.
+_GUI_BUSINESS_SELECTOR_OPERATIONS = frozenset({
+    "get_governance_snapshot",
+    "get_neuron_graph", "get_memory_neuron_graph", "get_codegraph_graph",
+    "get_projection_source_map", "build_projection", "start_build_projection",
+    "cancel_build_projection", "delete_projection", "set_projection_source_enabled",
+    "list_native_memory_releases", "list_releases", "list_publish_targets",
+    "choose_publish_target_path", "create_build_plan", "apply_build",
+    "publish_reconstructed_memory", "verify_release", "rollback_release",
+    "rollback_native_memory_release",
+})
+_GUI_BUSINESS_SELECTOR_KEYS = frozenset({
+    "agent_instance_id", "share_group_id", "project_ref", "provider", "runtime_role",
+    "scope",
+})
+
 # Agent discovery/lifecycle reads are guarded by the process-issued GUI
 # capability, but they do not read a MemoryGuard group.  Requiring a group
 # here made an unbound/residual Agent impossible to inspect, which in turn
 # trapped the GUI in ``active_binding_required`` before the user could choose
 # an existing group or enable a personal layer.
 _GUI_AGENT_READ_HANDLERS = frozenset({"gui_agent_query"})
+_GUI_HISTORY_SESSION_SELECTOR_OPERATIONS = frozenset({
+    "history_read", "history_timeline", "history_extract_preview",
+})
 
 # These MCP reads intentionally expose only aggregate/availability
 # diagnostics.  They must remain usable before a host Agent binding exists;
@@ -468,14 +489,23 @@ def _phase9_gui_payload(surface: str, name: str, payload: Mapping[str, Any]) -> 
     operation = get_gui_operation_spec(name)
     if operation is None:
         return dict(payload)
+
+    def strip_business_selectors(values: Mapping[str, Any]) -> dict[str, Any]:
+        result = dict(values)
+        if name in _GUI_BUSINESS_SELECTOR_OPERATIONS:
+            for key in _GUI_BUSINESS_SELECTOR_KEYS:
+                result.pop(key, None)
+        return result
+
     values = payload.get("args")
     if not isinstance(values, (list, tuple)):
         # Historical SafeBridge flattens a single mapping positional argument.
-        # Scope selection is business input that must be validated against the
-        # trusted binding, not an authority claim to be silently discarded.
+        # ``scope_set`` is the one explicit business-scope mutation.  All
+        # projection/release selectors are compatibility input and are
+        # discarded below before the trusted scope is derived.
         if operation.canonical_name == "scope_set" and operation.parameters == ("requested_scope",):
             return {"requested_scope": dict(payload)}
-        return dict(payload)
+        return strip_business_selectors(payload)
     args = list(values)
     result = {
         key: args[index]
@@ -503,7 +533,7 @@ def _phase9_gui_payload(surface: str, name: str, payload: Mapping[str, Any]) -> 
         for key in ("session_id", "turn_id"):
             if result.get(key) == "":
                 result[key] = None
-    return result
+    return strip_business_selectors(result)
 
 
 def _text(value: Any) -> str:
@@ -697,7 +727,8 @@ class NativeV2RuntimePort:
         "memoryguard_knowledge_read": ("knowledge_read", "implemented", False),
         "memoryguard_knowledge_book": ("knowledge_book", "implemented", False),
         "memoryguard_knowledge_candidates": ("knowledge_candidates", "implemented", False),
-        "memoryguard_neuron_graph": ("codegraph_graph", "implemented", False),
+        "memoryguard_codegraph_graph": ("codegraph_graph", "implemented", False),
+        "memoryguard_neuron_graph": ("projection_graph", "implemented", False),
         "memoryguard_codegraph_query": ("codegraph_query", "implemented", False),
         "memoryguard_codegraph_path": ("codegraph_path", "implemented", False),
         "memoryguard_codegraph_explain": ("codegraph_explain", "implemented", False),
@@ -738,7 +769,7 @@ class NativeV2RuntimePort:
         # store is opened so group existence cannot be probed.
         "get_global_memory_status": ("memory_global_status", "implemented", False),
         "list_bindings": ("binding_list", "implemented", False),
-        "get_governance_snapshot": ("diagnostics_snapshot", "implemented", False),
+        "get_governance_snapshot": ("governance_snapshot", "implemented", False),
         # The GUI registry endpoint is a read-only native coverage view.  It
         # exposes no legacy security store, paths, or contents.
         "get_api_method_registry": ("coverage", "implemented", False),
@@ -748,7 +779,11 @@ class NativeV2RuntimePort:
         "get_sandbox_status": ("sandbox_status", "implemented", False),
         "get_host_enrichment_guide": ("host_enrichment_guide", "implemented", False),
         "list_host_llm_agents": ("host_llm_agents", "implemented", False),
-        "get_neuron_graph": ("codegraph_graph", "implemented", False),
+        "get_neuron_graph": ("projection_graph", "implemented", False),
+        "get_memory_neuron_graph": ("projection_graph", "implemented", False),
+        "get_codegraph_graph": ("codegraph_graph", "implemented", False),
+        "list_codegraph_projects": ("codegraph_projects", "implemented", False),
+        "build_codegraph": ("codegraph_build", "implemented", True),
         "list_pending_enrichments": ("list_pending_enrichments", "implemented", False),
         "get_enrichment_status": ("enrichment_status", "implemented", False),
         "get_audit": ("reference_audit", "implemented", False),
@@ -1013,6 +1048,10 @@ class NativeV2RuntimePort:
             registry["mcp"][name] = SurfaceSpec(name, status, handler, mutation, reason)
         for name, operation in sorted(GUI_OPERATION_SPECS.items()):
             handler = operation.native_handler
+            # Keep the canonical GUI surface table compatible while routing
+            # this legacy snapshot name to its explicit GUI contract.
+            if name == "get_governance_snapshot":
+                handler = "governance_snapshot"
             mutation = operation.mutation
             # The operation registry is the only GUI truth source.  A method
             # is implemented only when its canonical native handler resolves;
@@ -1250,7 +1289,7 @@ class NativeV2RuntimePort:
             "admin", "is_admin", "authority", "automatic", "session_id",
             "session_source", "session_trusted", "context_hash",
             "runtime_agent_id", "parent_agent_id", "namespace_id",
-            "sensitivity", "policy_class",
+            "sensitivity", "policy_class", "entrypoint",
         ):
             if key in source:
                 context[key] = source[key]
@@ -1439,6 +1478,44 @@ class NativeV2RuntimePort:
             and session_id
             and source in {"host", "transport"}
         )
+
+    def _bind_cli_transport_context(self, context: Any) -> Any:
+        """Mint trusted CLI scope when outer CLI adapter omitted its envelope.
+
+        CLI command flags are not identity.  The native route may recover a
+        missing envelope from process-owned AccessContext plus the active
+        binding for that agent; a non-empty plain mapping remains untrusted and
+        is never upgraded.
+        """
+        if context is not None and (not isinstance(context, Mapping) or bool(context)):
+            return context
+        try:
+            from ..access_context import AccessContext, load_access_context
+            from .group_native import GroupControlService
+
+            access_context = load_access_context()
+            if type(access_context) is not AccessContext:
+                raise NativeContextError("native_context_required")
+            agent_instance_id = _text(access_context.trusted_agent_id)
+            if not agent_instance_id:
+                raise NativeContextError("native_context_required")
+            binding = GroupControlService(self.workspace, write=False).active_binding_for_agent(
+                agent_instance_id,
+            )
+            share_group_id = _text((binding or {}).get("share_group_id"))
+            if not share_group_id:
+                raise NativeContextError("native_context_required")
+            return bind_native_transport_context(
+                access_context,
+                workspace_id=self.workspace,
+                share_group_id=share_group_id,
+                runtime_role="cli",
+                entrypoint="cli",
+            )
+        except NativeContextError:
+            return context
+        except Exception:
+            return context
 
     # ---- lazy stores ---------------------------------------------------------
     @staticmethod
@@ -1697,7 +1774,7 @@ class NativeV2RuntimePort:
             "extract_memories", "accept_candidates", "list_pending_enrichments",
             "apply_enrichments", "enrichment_status", "build_and_enrich", "resolve_group",
             "sandbox_status", "host_enrichment_guide", "host_llm_agents",
-            "coverage", "codegraph_graph", "codegraph_query", "codegraph_path", "codegraph_explain",
+            "coverage", "projection_graph", "codegraph_graph", "codegraph_query", "codegraph_path", "codegraph_explain",
             "codegraph_affected", "codegraph_update", "codegraph_status", "semantic_check", "reference_audit", "provider_install",
             "rule_create_auto", "rule_feedback", "rule_undo", "rule_decision_read", "rule_scope_stats",
         }:
@@ -1735,6 +1812,8 @@ class NativeV2RuntimePort:
             memory = self._domain_store("memory", write=True)
             evidence = self._domain_store("evidence", write=True)
             ledger_path = self.layout.root / "governance_v2" / "decisions.db"
+            if not ledger_path.is_file() or ledger_path.stat().st_size == 0:
+                raise NativePortError("v2_governance_ledger_missing")
             ledger = self._open_governance_lease(ledger_path)
             try:
                 self._assert_governance_lease(ledger)
@@ -1801,6 +1880,7 @@ class NativeV2RuntimePort:
                 "status": "UNBOUND",
                 "scope": {"share_group_id": "", "agent_instance_id": "", "project_ref": ""},
                 "total_records": 0,
+                "active_count": 0,
                 "status_counts": {},
                 "kind_counts": {},
                 "evidence_link_count": 0,
@@ -1816,6 +1896,7 @@ class NativeV2RuntimePort:
                     "project_ref": scope.get("project_ref", ""),
                 },
                 "total_records": 0,
+                "active_count": 0,
                 "status_counts": {},
                 "kind_counts": {},
                 "evidence_link_count": 0,
@@ -1840,6 +1921,7 @@ class NativeV2RuntimePort:
                     "project_ref": scope.get("project_ref", ""),
                 },
                 "total_records": len(atoms),
+                "active_count": int(by_status.get("active", 0)),
                 "status_counts": by_status,
                 "kind_counts": by_kind,
                 "evidence_link_count": evidence_links,
@@ -2579,20 +2661,51 @@ class NativeV2RuntimePort:
         from ..host_agent_backend import batch_enrich_via_cli
         from .projection_build import ProjectionBuildError, ProjectionBuildService
 
+        # Gate the task before any optional Agent enrichment.  An empty source
+        # set is a failed build input, never a successful empty projection.
+        source_summary = dict(
+            ProjectionBuildService(self.workspace).source_map(scope=scope).get("summary") or {}
+        )
+        if int(source_summary.get("buildable_atom_count") or 0) <= 0:
+            raise ProjectionBuildError("no_projection_sources")
+
         llm_used = False
         llm_engine = ""
         if not deterministic and engine is not None:
             execution.progress(2, "engine")
             enrichment = self._native_service("extraction")
             if enrichment is None:
-                raise ProjectionBuildError("v2_extraction_service_unavailable")
-            self._service_result(enrichment, "memoryguard_build_and_enrich", {}, context=context)
+                raise ProjectionBuildError(
+                    self._native_service_init_errors.get("extraction")
+                    or "v2_extraction_service_unavailable"
+                )
+
+            # The desktop transport is deliberately bound to the server-admin
+            # bridge, while ``scope`` is the persisted business selection.  A
+            # real extraction service must therefore use the already-validated
+            # projection scope directly; dispatching with the bridge context
+            # would stage/enrich the admin group (usually zero records).  Test
+            # doubles and older injected services retain the dispatch fallback.
+            build_for_scope = getattr(enrichment, "build_and_enrich_projection", None)
+            pending_for_scope = getattr(enrichment, "list_pending_projection", None)
+            apply_for_scope = getattr(enrichment, "apply_enrichments_projection", None)
+            scoped_enrichment = all(callable(item) for item in (build_for_scope, pending_for_scope, apply_for_scope))
+
+            def enrichment_result(operation: str, payload: Mapping[str, Any]) -> Any:
+                if scoped_enrichment:
+                    if operation == "memoryguard_build_and_enrich":
+                        return build_for_scope(payload, scope=scope)
+                    if operation == "memoryguard_list_pending_enrichments":
+                        return pending_for_scope(payload, scope=scope)
+                    if operation == "memoryguard_apply_enrichments":
+                        return apply_for_scope(payload, scope=scope)
+                return self._service_result(enrichment, operation, payload, context=context)
+
+            enrichment_result("memoryguard_build_and_enrich", {})
             enriched_count = 0
             while True:
                 execution.check_cancelled()
-                pending = self._service_result(
-                    enrichment, "memoryguard_list_pending_enrichments", {"limit": 100}, context=context,
-                )
+                pending = enrichment_result("memoryguard_list_pending_enrichments", {"limit": 100})
                 tasks = list((pending or {}).get("tasks") or [])
                 if not tasks:
                     break
@@ -2615,9 +2728,7 @@ class NativeV2RuntimePort:
                     or set(actual_ids) != set(expected_ids)
                 ):
                     raise ProjectionBuildError("llm_cli_enrichment_incomplete")
-                applied = self._service_result(
-                    enrichment, "memoryguard_apply_enrichments", {"results": results}, context=context,
-                )
+                applied = enrichment_result("memoryguard_apply_enrichments", {"results": results})
                 if int((applied or {}).get("applied") or 0) != len(tasks):
                     raise ProjectionBuildError("llm_cli_enrichment_failed")
                 llm_used = True
@@ -2625,9 +2736,7 @@ class NativeV2RuntimePort:
                 enriched_count += len(tasks)
             # Re-evaluate after all batches.  This proves the governed queue is
             # terminal before projection rather than assuming one page was all.
-            refreshed = self._service_result(
-                enrichment, "memoryguard_build_and_enrich", {}, context=context,
-            )
+            refreshed = enrichment_result("memoryguard_build_and_enrich", {})
             if list((refreshed or {}).get("pending_tasks") or []):
                 raise ProjectionBuildError("llm_cli_enrichment_incomplete")
         else:
@@ -2727,13 +2836,74 @@ class NativeV2RuntimePort:
         return self._audit_plan_service
 
     def _gui_projection_scope(self, context: Mapping[str, Any]) -> Any:
-        try:
-            authority = resolve_native_transport_context(context)
-        except NativeContextError as exc:
-            raise NativePortError("trusted_context_capability_required") from exc
+        authority = self._gui_authority(context)
         from .projection_build import projection_scope_from_context
 
-        return projection_scope_from_context(self.workspace, authority.to_dict())
+        # The desktop bridge deliberately remains the server-admin principal.
+        # Its transport identity is an ACL capability, not the Agent whose
+        # business scope the GUI selected.  Resolve that selection from the
+        # persisted control plane and derive a read scope from the validated
+        # record; never promote browser selectors or mutate the bound context.
+        is_server_admin_bridge = bool(authority.admin) and _text(authority.agent_instance_id) == "memoryguard-server-admin"
+        if is_server_admin_bridge:
+            from ..projection_v2 import ProjectionReadScope
+
+            try:
+                state = self._group_service(write=False).scope_state(
+                    _text(authority.agent_instance_id),
+                    admin=True,
+                )
+            except Exception as exc:
+                raise NativePortError("governance_scope_unavailable") from exc
+            if not isinstance(state, Mapping) or state.get("empty") is not False:
+                raise NativePortError("governance_scope_empty")
+            persisted = state.get("scope")
+            if not isinstance(persisted, Mapping):
+                raise NativePortError("governance_scope_invalid")
+            mode = _text(persisted.get("mode")).casefold()
+            group_id = _text(persisted.get("share_group_id"))
+            if not group_id:
+                raise NativePortError("governance_scope_invalid")
+            if mode == "agent":
+                agent_id = _text(persisted.get("agent_instance_id"))
+                if not agent_id:
+                    raise NativePortError("governance_scope_invalid")
+                # An Agent bound to a shared group consumes the group's one
+                # canonical memory plane.  ``agent_instance_id`` on an atom is
+                # writer/provenance metadata, not an audience partition.  If
+                # we keep the selected Agent as a read filter here, a shared
+                # group appears empty whenever another member wrote the active
+                # records.  Personal groups remain Agent-scoped.
+                active_binding = state.get("active_binding")
+                if (
+                    isinstance(active_binding, Mapping)
+                    and _text(active_binding.get("group_kind")).casefold() == "shared"
+                ):
+                    agent_id = ""
+            elif mode == "share_group":
+                # Blank agent/project/provider fields intentionally mean all
+                # active members and all their V2 atoms within this group.
+                agent_id = ""
+            else:
+                raise NativePortError("governance_scope_invalid")
+            try:
+                return ProjectionReadScope(
+                    workspace_id=self.workspace,
+                    agent_instance_id=agent_id,
+                    project_ref="",
+                    provider="",
+                    share_group_id=group_id,
+                    sensitivity=_text(authority.sensitivity) or "normal",
+                    policy_class=_text(authority.policy_class) or "private",
+                )
+            except (TypeError, ValueError) as exc:
+                raise NativePortError("governance_scope_invalid") from exc
+
+        try:
+            return projection_scope_from_context(self.workspace, authority.to_dict())
+        except Exception as exc:
+            code = _text(getattr(exc, "code", "")) or "projection_scope_required"
+            raise NativePortError(code) from exc
 
     def _gui_knowledge_scope(self, context: Mapping[str, Any]) -> Any:
         """Create exact Knowledge ACL scope from the process-issued GUI capability."""
@@ -3109,7 +3279,16 @@ class NativeV2RuntimePort:
                 task_scope = self._gui_task_scope(context)
                 key = self._gui_task_key(operation, payload)
                 mode = _text(payload.get("mode")) or "reconstructed"
-                runtime_role = _text(context.get("runtime_role"))
+                # A trusted desktop/admin bridge is not an Agent filter.  The
+                # persisted business scope above controls Agent/group ACL;
+                # admin builds must not re-introduce the bridge runtime role as
+                # a hidden atom filter.
+                bridge_authority = self._gui_authority(context)
+                is_server_admin_bridge = (
+                    bool(bridge_authority.admin)
+                    and _text(bridge_authority.agent_instance_id) == "memoryguard-server-admin"
+                )
+                runtime_role = "" if is_server_admin_bridge else _text(context.get("runtime_role"))
                 # The browser may only name an engine id; the executable path is
                 # resolved again from the fresh allowlist, never from llm_cli.
                 llm_agent_id = _text(payload.get("llm_agent")).strip()
@@ -3433,9 +3612,13 @@ class NativeV2RuntimePort:
             if operation == "group_preview":
                 return service.group_preview(_text(payload.get("target_group_id")))
             if operation == "scope_get":
-                state = service.scope_state(_text(authority.agent_instance_id))
+                state = service.scope_state(
+                    _text(authority.agent_instance_id),
+                    admin=bool(authority.admin),
+                )
                 state["principal_agent_instance_id"] = _text(authority.agent_instance_id)
-                state["active_binding"] = service.active_binding_for_agent(_text(authority.agent_instance_id))
+                state.setdefault("active_binding", None)
+                state.setdefault("members", [])
                 state["options"] = service.list_groups().get("groups", [])
                 return state
             raise NativePortError("unknown_group_query")
@@ -3700,9 +3883,13 @@ class NativeV2RuntimePort:
         continuation = payload.get("continuation")
         if continuation is not None and not isinstance(continuation, Mapping):
             raise NativePortError("history_continuation_invalid")
+        progress = service.discover()
         key = self._gui_task_key(
             "history_backfill",
-            {"continuation_present": bool(continuation)},
+            {
+                "progress_token": _text(progress.get("progress_token")),
+                "continuation": dict(continuation) if isinstance(continuation, Mapping) else {},
+            },
         )
 
         def worker(execution: Any) -> Mapping[str, Any]:
@@ -3719,15 +3906,25 @@ class NativeV2RuntimePort:
                 "operation": "history_backfill",
                 "status": "succeeded",
                 "code": "ok",
+                # Keep both the canonical task counters and the historical GUI
+                # field names.  The browser waits for this result_ref; it must
+                # never infer zero from the accepted/deferred envelope.
                 "session_count": int(result.get("imported") or 0),
+                "imported": int(result.get("imported") or 0),
+                "skipped": int(result.get("skipped") or 0),
                 "turn_count": int(result.get("turn_count") or 0),
                 "changed_turn_count": int(result.get("changed_turn_count") or 0),
                 "processed_files": int(result.get("processed_files") or 0),
                 "processed_size": int(result.get("processed_bytes") or 0),
                 "partial_count": int(result.get("partial") or 0),
+                "errors": int(result.get("errors") or 0),
                 "error_count": int(result.get("errors") or 0),
                 "remaining_files": int(result.get("remaining_files") or 0),
+                "remaining_fresh_files": int(result.get("remaining_fresh_files") or 0),
+                "retryable_failed_files": int(result.get("retryable_failed_files") or 0),
+                "pending_binding": list(result.get("pending_binding") or []),
                 "pending_binding_count": len(result.get("pending_binding") or []),
+                "continuation": result.get("continuation"),
                 "memory_record_count": 0,
             }
 
@@ -4170,15 +4367,293 @@ class NativeV2RuntimePort:
         except Exception as exc:
             raise NativePortError("v2_explain_unavailable") from exc
 
-    def _codegraph_scope(self, context: Mapping[str, Any]) -> Any:
+    @staticmethod
+    def _is_server_admin_gui_authority(authority: Any) -> bool:
+        return bool(getattr(authority, "admin", False)) and (
+            _text(getattr(authority, "agent_instance_id", "")) == "memoryguard-server-admin"
+            and _text(getattr(authority, "entrypoint", "")).casefold() == "gui"
+        )
+
+    def _codegraph_gui_project_rows(self, context: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """List CodeGraph projects visible to the trusted global GUI group.
+
+        The browser never supplies a group/Agent identity here.  The native
+        authority fixes the active share group; project paths are merely local
+        business selectors inside that already-authorized group.
+        """
+        authority = resolve_native_transport_context(context)
+        if not self._is_server_admin_gui_authority(authority):
+            raise NativePortError("admin_capability_required")
+        group_id = _text(authority.share_group_id)
+        if not group_id:
+            raise NativePortError("codegraph_group_scope_required")
+        source_projects: dict[str, dict[str, Any]] = {}
+        try:
+            from .source_control import SourceControlService
+            source_service = SourceControlService(self.workspace)
+            for source in source_service.list_sources(context).get("sources", ()):
+                if not isinstance(source, Mapping):
+                    continue
+                source_id = _text(source.get("source_id"))
+                if not source_id or _text(source.get("state")) != "READY":
+                    continue
+                try:
+                    root, source_kind = source_service.resolve_root(source_id, context)
+                except Exception:
+                    continue
+                if source_kind not in {"selected_directory", "obsidian_vault"} or not root.is_dir():
+                    continue
+                canonical = canonical_project_ref(root)
+                if not canonical:
+                    continue
+                source_projects[canonical] = {
+                    "scope_id": "", "source_id": source_id,
+                    "project_ref": str(root), "project_key": canonical,
+                    "label": _text(source.get("display_name")) or root.name or "Code project",
+                    "agent_instance_id": "", "provider": "graphify", "runtime_role": "",
+                    "file_count": 0, "symbol_count": 0, "built": False,
+                    "authorized_source": True,
+                }
+        except Exception:
+            source_projects = {}
+        if not self.layout.codegraph_db.is_file():
+            return [source_projects[key] for key in sorted(source_projects)]
+        try:
+            with open_database(self.layout.codegraph_db, readonly=True) as conn:
+                rows = conn.execute(
+                    "SELECT g.scope_id,g.project_ref,g.agent_instance_id,g.provider,g.runtime_role,"
+                    "(SELECT COUNT(*) FROM source_files f WHERE f.scope_id=g.scope_id AND f.active=1) file_count,"
+                    "(SELECT COUNT(*) FROM symbols s WHERE s.scope_id=g.scope_id AND s.active=1) symbol_count "
+                    "FROM graph_scopes g "
+                    "WHERE g.workspace_id=? AND g.share_group_id=? AND g.project_ref<>'' "
+                    "ORDER BY g.project_ref,g.agent_instance_id,g.provider,g.runtime_role",
+                    (self.workspace, group_id),
+                ).fetchall()
+        except Exception as exc:
+            raise NativePortError("codegraph_project_list_failed") from exc
+        by_project: dict[str, dict[str, Any]] = dict(source_projects)
+        for row in rows:
+            project_ref = _text(row[1])
+            canonical = canonical_project_ref(project_ref)
+            if not canonical:
+                continue
+            candidate = {
+                "scope_id": _text(row[0]),
+                "source_id": "",
+                "project_ref": project_ref,
+                "project_key": canonical,
+                "label": Path(project_ref).name or project_ref,
+                "agent_instance_id": _text(row[2]),
+                "provider": _text(row[3]),
+                "runtime_role": _text(row[4]),
+                "file_count": int(row[5] or 0),
+                "symbol_count": int(row[6] or 0),
+                "built": True,
+                "authorized_source": False,
+            }
+            existing = by_project.get(canonical)
+            if existing and _text(existing.get("source_id")):
+                candidate["source_id"] = _text(existing.get("source_id"))
+                candidate["label"] = _text(existing.get("label")) or candidate["label"]
+                candidate["authorized_source"] = True
+            # Prefer the group-level Graphify scope created by the desktop
+            # builder over older Agent-scoped imports of the same repository.
+            preferred = not candidate["agent_instance_id"] and candidate["provider"] == "graphify"
+            existing_preferred = bool(existing and existing.get("built") and not existing["agent_instance_id"] and existing["provider"] == "graphify")
+            if existing is None or (preferred and not existing_preferred):
+                by_project[canonical] = candidate
+        return [by_project[key] for key in sorted(by_project)]
+
+    def _codegraph_scope(
+        self,
+        context: Mapping[str, Any],
+        *,
+        codegraph_project_ref: str = "",
+        codegraph_source_id: str = "",
+    ) -> Any:
         try:
             from ..codegraph_v2 import CodeGraphScope
 
-            return CodeGraphScope.from_value({**self._scope(context), "trusted_context": True})
+            authority = resolve_native_transport_context(context)
+            if self._is_server_admin_gui_authority(authority):
+                projects = self._codegraph_gui_project_rows(context)
+                requested_source = _text(codegraph_source_id)
+                requested = canonical_project_ref(codegraph_project_ref)
+                if requested_source:
+                    matches = [item for item in projects if _text(item.get("source_id")) == requested_source]
+                    if not matches:
+                        raise NativePortError("codegraph_source_not_found")
+                    selected = matches[0]
+                elif requested:
+                    matches = [item for item in projects if item["project_key"] == requested]
+                    if not matches:
+                        raise NativePortError("codegraph_project_not_found")
+                    selected = matches[0]
+                elif len(projects) == 1:
+                    selected = projects[0]
+                elif not projects:
+                    raise NativePortError("codegraph_project_not_built")
+                else:
+                    raise NativePortError("codegraph_project_required")
+                # A GUI-built CodeGraph is canonical for the whole governed
+                # group+project, not one Agent/provider/runtime instance.
+                if _text(selected.get("source_id")):
+                    return CodeGraphScope.from_value({
+                        "workspace_id": self.workspace,
+                        "share_group_id": authority.share_group_id,
+                        "agent_instance_id": "",
+                        "project_ref": selected["project_key"],
+                        "provider": "graphify",
+                        "runtime_role": "",
+                        "trusted_context": True,
+                    })
+                return CodeGraphScope.from_value({
+                    "workspace_id": self.workspace,
+                    "share_group_id": authority.share_group_id,
+                    "agent_instance_id": selected["agent_instance_id"],
+                    "project_ref": selected["project_ref"],
+                    "provider": selected["provider"],
+                    "runtime_role": selected["runtime_role"],
+                    "trusted_context": True,
+                })
+            return CodeGraphScope.from_value({
+                "workspace_id": self.workspace,
+                "share_group_id": authority.share_group_id,
+                "agent_instance_id": authority.agent_instance_id,
+                "project_ref": authority.project_ref,
+                "provider": authority.provider,
+                "runtime_role": authority.runtime_role,
+                "trusted_context": True,
+            })
         except NativePortError:
             raise
         except Exception as exc:
             raise NativePortError("codegraph_trusted_scope_required") from exc
+
+    def _codegraph_projects(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        del payload
+        projects = self._codegraph_gui_project_rows(context)
+        try:
+            from ..codegraph_v2.graphify_adapter import GraphifyCapability
+            capability = GraphifyCapability.detect().to_dict()
+        except Exception:
+            capability = {"available": False, "metadata_export": False, "code": "graphify_status_unavailable"}
+        return {
+            "status": "READY" if projects else "NO_SOURCE",
+            "projects": projects,
+            "total": len(projects),
+            "graphify": capability,
+            "build_ready": bool(capability.get("available") and capability.get("metadata_export")),
+        }
+
+    def _codegraph_build(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        if payload.get("confirmed") is not True:
+            raise NativePortError("confirmation_required")
+        authority = resolve_native_transport_context(context)
+        if not self._is_server_admin_gui_authority(authority):
+            raise NativePortError("admin_capability_required")
+        group_id = _text(authority.share_group_id)
+        if not group_id:
+            raise NativePortError("codegraph_group_scope_required")
+        source_id = _text(payload.get("source_id") or payload.get("project_path"))
+        if not source_id:
+            raise NativePortError("codegraph_source_id_required")
+        try:
+            from ..codegraph_v2 import CodeGraphScope
+            from ..codegraph_v2.store import _assert_no_reparse
+            from ..codegraph_v2.graphify_adapter import GraphifyCapability
+            from .source_control import SourceControlService, SourceControlError
+
+            try:
+                project, source_kind = SourceControlService(self.workspace).resolve_root(source_id, context)
+            except SourceControlError as exc:
+                raise NativePortError(exc.code) from exc
+            if source_kind not in {"selected_directory", "obsidian_vault"} or not project.is_dir():
+                raise NativePortError("codegraph_directory_source_required")
+            _assert_no_reparse(project)
+            canonical = canonical_project_ref(project)
+            if not canonical:
+                raise NativePortError("codegraph_project_path_invalid")
+            capability = GraphifyCapability.detect()
+            if not capability.available or not capability.metadata_export:
+                raise NativePortError(capability.code or "graphify_metadata_export_unavailable")
+            scope = CodeGraphScope.from_value({
+                "workspace_id": self.workspace,
+                "share_group_id": group_id,
+                "agent_instance_id": "",
+                "project_ref": canonical,
+                "provider": "graphify",
+                "runtime_role": "",
+                "trusted_context": True,
+            })
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError("codegraph_project_path_invalid") from exc
+
+        task_scope = self._gui_task_scope(context)
+        key = self._gui_task_key(
+            "codegraph_build",
+            {"source_id": source_id, "project_ref": canonical, "nonce": os.urandom(12).hex()},
+        )
+
+        def worker(execution: Any) -> Mapping[str, Any]:
+            execution.progress(5, "graphify_scan")
+            execution.check_cancelled()
+            try:
+                from ..graphify_core import CODE_EXTENSIONS
+                from ..graphify_core import collect_files
+                from ..graphify_core import export_repository, provenance_for_path
+                from ..codegraph_v2.graphify_adapter import GraphifyExportAdapter
+
+                candidates = collect_files(project, follow_symlinks=False, root=project)
+                source_files = [
+                    path for path in candidates
+                    if (path.suffix in CODE_EXTENSIONS or path.suffix.lower() in CODE_EXTENSIONS)
+                    and provenance_for_path(path.relative_to(project).as_posix()) == "production"
+                ]
+                execution.progress(18, "graphify_extract", item_count=len(source_files))
+                execution.check_cancelled()
+                export = export_repository(project, paths=source_files, complete=True, parallel=False, max_files=10_000)
+                execution.progress(70, "codegraph_import", item_count=len(export.get("nodes") or ()))
+                execution.check_cancelled()
+                store = self._domain_store("codegraph", write=True)
+                imported = GraphifyExportAdapter(store).project(export, scope=scope, full_snapshot=True)
+                execution.progress(96, "codegraph_save", item_count=int(imported.counts.get("symbols", 0)))
+                return {
+                    "operation": "codegraph_build",
+                    "status": "succeeded",
+                    "code": "ok",
+                    "project_label": project.name,
+                    "source_id": source_id,
+                    "graphify_version": imported.graphify_version,
+                    "projection_digest": imported.projection_digest,
+                    "counts": dict(imported.counts),
+                    "diagnostic_count": len(export.get("diagnostics") or ()),
+                }
+            except NativePortError:
+                raise
+            except Exception as exc:
+                raise NativePortError(
+                    _text(getattr(exc, "code", "")) or "codegraph_build_failed"
+                ) from exc
+
+        accepted = self._task_service().start_scope_exclusive(
+            operation="codegraph_build",
+            scope=task_scope,
+            worker=worker,
+            goal="background_task",
+            key=key,
+        )
+        task = dict(accepted.get("task") or {})
+        return {
+            **accepted,
+            "accepted": True,
+            "job_id": task.get("run_id", ""),
+            "deferred": True,
+            "source_id": source_id,
+            "project_ref": canonical,
+        }
 
     @staticmethod
     def _codegraph_bounded_int(value: Any, *, default: int, minimum: int, maximum: int, code: str) -> int:
@@ -4349,7 +4824,39 @@ class NativeV2RuntimePort:
         hard errors from the store preflight and never trigger initialization.
         """
 
-        graph_scope = self._codegraph_scope(context)
+        request = payload.get("request")
+        if isinstance(request, Mapping):
+            payload = {
+                **dict(request),
+                **{key: value for key, value in payload.items() if key != "request"},
+            }
+        requested_project = _text(payload.get("codegraph_project_ref"))
+        requested_source = _text(payload.get("codegraph_source_id") or payload.get("source_id"))
+        try:
+            graph_scope = self._codegraph_scope(
+                context,
+                codegraph_project_ref=requested_project,
+                codegraph_source_id=requested_source,
+            )
+        except NativePortError as exc:
+            if exc.code in {
+                "codegraph_project_not_built",
+                "codegraph_project_required",
+                "codegraph_project_not_found",
+                "codegraph_source_not_found",
+            }:
+                projects = self._codegraph_gui_project_rows(context)
+                return {
+                    "status": "PROJECT_REQUIRED" if projects else "NO_SOURCE",
+                    "scope_digest": "",
+                    "project_required": bool(projects),
+                    "projects": projects,
+                    "nodes": [],
+                    "edges": [],
+                    "node_count": 0,
+                    "edge_count": 0,
+                }
+            raise
         try:
             from ..codegraph_v2.models import normalize_provenance
 
@@ -4368,13 +4875,36 @@ class NativeV2RuntimePort:
                 return {
                     "status": "NO_SOURCE",
                     "scope_digest": graph_scope.digest,
+                    "project_ref": graph_scope.project_ref,
                     "nodes": [],
                     "edges": [],
                     "node_count": 0,
                     "edge_count": 0,
                 }
+            def file_rank(source: Any) -> tuple[int, int, str]:
+                path = str(source.path or "").replace("\\", "/").casefold()
+                roots = ("src/", "app/", "apps/", "packages/", "lib/", "server/", "client/")
+                priority = next((index for index, prefix in enumerate(roots) if path.startswith(prefix)), len(roots))
+                return priority, path.count("/"), path
+
+            ordered_files = sorted(files, key=file_rank)
+            max_file_nodes = max(1, min(len(ordered_files), max(4, limit // 8)))
+            bundles: list[tuple[Any, tuple[Any, ...]]] = []
+            for source in ordered_files[:max_file_nodes]:
+                try:
+                    symbols = tuple(
+                        symbol for symbol in store.get_symbols(source.file_id, scope=graph_scope)
+                        if not provenance_filter or symbol.provenance == provenance_filter
+                    )
+                except Exception:
+                    symbols = ()
+                bundles.append((source, symbols))
+            selected = bundles
             nodes: list[dict[str, Any]] = []
-            for source in files[:limit]:
+            selected_symbols: list[Any] = []
+            for source, _symbols in selected:
+                if len(nodes) >= limit:
+                    break
                 nodes.append({
                     "id": source.file_id,
                     "node_kind": "file",
@@ -4386,29 +4916,68 @@ class NativeV2RuntimePort:
                     "source_role": source.source_role,
                     "provenance": source.provenance,
                 })
-                try:
-                    symbols = store.get_symbols(source.file_id, scope=graph_scope)
-                except Exception:
-                    symbols = ()
-                for symbol in tuple(symbols)[: max(1, min(50, limit))]:
-                    if provenance_filter and symbol.provenance != provenance_filter:
+
+            symbol_budget = max(0, limit - len(nodes))
+            depth = 0
+            while symbol_budget > 0:
+                added = 0
+                for _source, symbols in selected:
+                    if depth >= len(symbols) or symbol_budget <= 0:
                         continue
-                    nodes.append({
-                        "id": symbol.symbol_id,
-                        "node_kind": "symbol",
-                        "label": symbol.name,
-                        "kind": symbol.kind,
-                        "signature": symbol.signature,
-                        "file_id": symbol.file_id,
-                        "line_start": symbol.line_start,
-                        "line_end": symbol.line_end,
-                        "provenance": symbol.provenance,
-                        "source_map": dict(symbol.source_map),
-                        "metadata": dict(symbol.metadata),
-                    })
-            raw_edges = store.list_edges(scope=graph_scope)
-            edges = [
-                {
+                    selected_symbols.append(symbols[depth])
+                    symbol_budget -= 1
+                    added += 1
+                if not added:
+                    break
+                depth += 1
+            for symbol in selected_symbols:
+                nodes.append({
+                    "id": symbol.symbol_id,
+                    "node_kind": "symbol",
+                    "label": symbol.name,
+                    "kind": symbol.kind,
+                    "signature": symbol.signature,
+                    "file_id": symbol.file_id,
+                    "line_start": symbol.line_start,
+                    "line_end": symbol.line_end,
+                    "provenance": symbol.provenance,
+                    "source_map": dict(symbol.source_map),
+                    "metadata": dict(symbol.metadata),
+                })
+
+            visible_ids = {node["id"] for node in nodes}
+            edges: list[dict[str, Any]] = []
+            for symbol in selected_symbols:
+                if symbol.file_id not in visible_ids:
+                    continue
+                edge_id = "visual-contains-" + hashlib.sha256(
+                    f"{symbol.file_id}:{symbol.symbol_id}".encode("utf-8")
+                ).hexdigest()[:24]
+                edges.append({
+                    "id": edge_id,
+                    "from_id": symbol.file_id,
+                    "to_id": symbol.symbol_id,
+                    "relation": "contains",
+                    "context": "file_symbol",
+                    "provenance": symbol.provenance,
+                    "source_location": "",
+                    "metadata": {"visual_only": True},
+                    "weight": 1.0,
+                })
+
+            edge_budget = max(limit, min(2_000, limit * 4))
+            raw_edges = sorted(
+                store.list_edges(scope=graph_scope),
+                key=lambda edge: (-float(edge.weight or 0.0), str(edge.edge_id)),
+            )
+            for edge in raw_edges:
+                if len(edges) >= edge_budget:
+                    break
+                if provenance_filter and edge.provenance != provenance_filter:
+                    continue
+                if edge.from_id not in visible_ids or edge.to_id not in visible_ids:
+                    continue
+                edges.append({
                     "id": edge.edge_id,
                     "from_id": edge.from_id,
                     "to_id": edge.to_id,
@@ -4418,24 +4987,621 @@ class NativeV2RuntimePort:
                     "source_location": edge.source_location,
                     "metadata": dict(edge.metadata),
                     "weight": edge.weight,
-                }
-                for edge in tuple(raw_edges)[:limit]
-                if (not provenance_filter or edge.provenance == provenance_filter)
-                and edge.from_id in {node["id"] for node in nodes}
-                and edge.to_id in {node["id"] for node in nodes}
-            ]
+                })
+            total_counts = store.counts(scope=graph_scope)
+            displayed_file_count = sum(1 for node in nodes if node.get("node_kind") == "file")
+            displayed_symbol_count = sum(1 for node in nodes if node.get("node_kind") == "symbol")
             return {
                 "status": "READY",
                 "scope_digest": graph_scope.digest,
+                "project_ref": graph_scope.project_ref,
                 "nodes": nodes,
                 "edges": edges,
                 "node_count": len(nodes),
                 "edge_count": len(edges),
+                "displayed_file_count": displayed_file_count,
+                "displayed_symbol_count": displayed_symbol_count,
+                "total_counts": dict(total_counts),
+                "truncated": (
+                    int(total_counts.get("source_files", 0)) > displayed_file_count
+                    or int(total_counts.get("symbols", 0)) > displayed_symbol_count
+                    or int(total_counts.get("edges", 0)) > len(edges)
+                ),
             }
         except NativePortError:
             raise
         except Exception as exc:
             raise NativePortError("v2_codegraph_read_unavailable") from exc
+
+    @staticmethod
+    def _gui_rule_record(rule: Mapping[str, Any]) -> dict[str, Any]:
+        """Project one canonical V2 rule into the legacy GUI read shape only.
+
+        Rules V2 remains authoritative.  This adapter gives the existing rule
+        cards their historical body/kind/audience fields without writing a
+        second rule record or changing canonical storage.
+        """
+        row = dict(rule)
+        binding_rows = [dict(item) for item in row.get("bindings", ()) if isinstance(item, Mapping)]
+        assignments = [
+            {
+                "assignment_id": _text(item.get("binding_id")),
+                "target_type": _text(item.get("target_type")),
+                "target_id": _text(item.get("target_id")),
+                "project_ref": _text(item.get("project_ref")),
+                "effect": _text(item.get("effect")) or "include",
+                "priority_override": item.get("priority"),
+            }
+            for item in binding_rows
+        ]
+        strength = _text(row.get("rule_strength")).casefold()
+        body = _text(row.get("canonical_text"))
+        priorities = [
+            int(item.get("priority") or 0)
+            for item in binding_rows
+            if isinstance(item.get("priority"), int) and not isinstance(item.get("priority"), bool)
+        ]
+        row.update({
+            "memory_id": _text(row.get("memory_id")) or _text(row.get("definition_id")),
+            "title": body[:120],
+            "body": body,
+            "kind": _text(row.get("rule_kind")) or "fact",
+            "status": "active",
+            "injection_policy": "always" if strength in {"must", "mandatory", "required"} else "relevant",
+            "priority": max(priorities) if priorities else 0,
+            "assignments": assignments,
+            "locked": False,
+        })
+        return row
+
+    @staticmethod
+    def _virtual_rule_bucket(rule: Mapping[str, Any]) -> tuple[str, str]:
+        """Map one canonical V2 rule to the stable V1 graph taxonomy."""
+
+        kind = _text(rule.get("rule_kind")).casefold()
+        strength = _text(rule.get("rule_strength")).casefold()
+        polarity = _text(rule.get("polarity")).casefold()
+        if strength in {"must", "mandatory", "required"}:
+            return "mandatory", "强制规则"
+        if kind == "preference":
+            return "preferences", "长期习惯与偏好"
+        if kind in {"procedure", "workflow", "instruction"}:
+            return "procedures", "工作流程"
+        if kind in {"correction", "constraint"} or polarity == "negative":
+            return "corrections", "纠错与禁忌"
+        if kind in {"project", "decision"}:
+            return "projects", "项目决策"
+        return "preferences", "长期习惯与偏好"
+
+    def _with_virtual_neuron_overlay(
+        self,
+        graph: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Restore V1's safe rule/history indexes over V2 canonical stores.
+
+        The durable Memory Projection remains reference-only.  Rules are read
+        from RuleV2Store and history contributes metadata only; raw conversation
+        turns are never copied into the graph payload.
+        """
+
+        result = dict(graph or {})
+        nodes = [dict(node) for node in (result.get("nodes") or []) if isinstance(node, Mapping)]
+        edges = [dict(edge) for edge in (result.get("edges") or []) if isinstance(edge, Mapping)]
+        node_ids = {_text(node.get("id")) for node in nodes if _text(node.get("id"))}
+        if "main" not in node_ids:
+            nodes.insert(0, {
+                "id": "main", "parent_id": "", "node_kind": "root",
+                "label": "记忆胞体", "derivation": "记忆胞体",
+            })
+            node_ids.add("main")
+        edge_ids = {_text(edge.get("id")) for edge in edges if _text(edge.get("id"))}
+
+        def add_node(node: Mapping[str, Any]) -> None:
+            # Keep dict identity for category accumulators: rules/history counts
+            # are filled after children are collected and must update the node
+            # already present in ``nodes`` rather than a discarded copy.
+            item = node if isinstance(node, dict) else dict(node)
+            if item.get("virtual_category") and not item.get("record_kind"):
+                item["record_kind"] = _text(item.get("virtual_category"))
+            node_id = _text(item.get("id"))
+            if node_id and node_id not in node_ids:
+                nodes.append(item)
+                node_ids.add(node_id)
+
+        def add_edge(source: str, target: str) -> None:
+            edge_id = f"virtual-index:{source}:{target}"
+            if edge_id in edge_ids:
+                return
+            edges.append({
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "edge_type": "virtual_index",
+                "virtual": True,
+            })
+            edge_ids.add(edge_id)
+
+        # ---- rules / habits -------------------------------------------------
+        rules_id = "virtual-rules-habits"
+        rules_node = {
+            "id": rules_id,
+            "parent_id": "main",
+            "node_kind": "virtual_category",
+            "virtual_category": "rules_habits",
+            "label": "规则与习惯",
+            "kind": "rules_habits",
+            "count": 0,
+            "virtual": True,
+        }
+        add_node(rules_node)
+        add_edge("main", rules_id)
+        bucket_labels = {
+            "mandatory": "强制规则",
+            "preferences": "长期习惯与偏好",
+            "procedures": "工作流程",
+            "corrections": "纠错与禁忌",
+            "projects": "项目决策",
+        }
+        rule_buckets: dict[str, list[Mapping[str, Any]]] = {key: [] for key in bucket_labels}
+        try:
+            snapshot = self._gui_rule_snapshot({}, context)
+            for rule in snapshot.get("rules", ()) if isinstance(snapshot, Mapping) else ():
+                if not isinstance(rule, Mapping):
+                    continue
+                bucket, _label = self._virtual_rule_bucket(rule)
+                rule_buckets.setdefault(bucket, []).append(rule)
+        except Exception as exc:
+            rules_node["load_error"] = _text(getattr(exc, "code", "")) or "rules_overlay_unavailable"
+
+        rule_total = 0
+        for bucket, label in bucket_labels.items():
+            all_rules = rule_buckets.get(bucket, [])
+            rule_total += len(all_rules)
+            bucket_id = f"{rules_id}:{bucket}"
+            add_node({
+                "id": bucket_id,
+                "parent_id": rules_id,
+                "node_kind": "virtual_bucket",
+                "virtual_category": "rules_habits",
+                "bucket": bucket,
+                "label": label,
+                "kind": bucket,
+                "count": len(all_rules),
+                "has_more": len(all_rules) > 50,
+                "virtual": True,
+            })
+            add_edge(rules_id, bucket_id)
+            for rule in all_rules[:50]:
+                definition_id = _text(rule.get("definition_id"))
+                if not definition_id:
+                    continue
+                body = _text(rule.get("canonical_text"))
+                memory_id = _text(rule.get("memory_id"))
+                ref_id = f"virtual-rule-ref:{bucket}:{definition_id}"
+                status = (
+                    "excluded" if bool(rule.get("excluded"))
+                    else "effective" if bool(rule.get("effective"))
+                    else _text(rule.get("maturity_state")) or "observing"
+                )
+                add_node({
+                    "id": ref_id,
+                    "parent_id": bucket_id,
+                    "node_kind": "virtual_rule_ref",
+                    "virtual_category": "rules_habits",
+                    "definition_id": definition_id,
+                    "memory_id": memory_id,
+                    "source_memory_ids": list(rule.get("source_memory_ids") or ()),
+                    "kind": _text(rule.get("rule_kind")) or bucket,
+                    "label": " ".join(body.split())[:96] or definition_id,
+                    "body": body,
+                    "status": status,
+                    "polarity": _text(rule.get("polarity")),
+                    "rule_strength": _text(rule.get("rule_strength")),
+                    "maturity_state": _text(rule.get("maturity_state")),
+                    "bindings": list(rule.get("bindings") or ()),
+                    "effective": bool(rule.get("effective")),
+                    "excluded": bool(rule.get("excluded")),
+                    "virtual": True,
+                })
+                add_edge(bucket_id, ref_id)
+        rules_node["count"] = rule_total
+
+        # ---- conversation history -------------------------------------------
+        history_id = "virtual-conversation-history"
+        history_node = {
+            "id": history_id,
+            "parent_id": "main",
+            "node_kind": "virtual_category",
+            "virtual_category": "conversation_history",
+            "label": "对话历史",
+            "kind": "conversation_history",
+            "count": 0,
+            "virtual": True,
+        }
+        add_node(history_node)
+        add_edge("main", history_id)
+        try:
+            from .group_native import GroupControlService
+            from .history_store import ContentHistoryStore, V2HistoryAccessResolver, V2HistoryScope
+
+            agent_id = _text(context.get("agent_instance_id"))
+            group_id = _text(context.get("share_group_id"))
+            history_scope: Any
+            if group_id and self._trusted_admin(context):
+                bindings = GroupControlService(self.workspace, write=False).list_bindings(include_inactive=False).get("bindings", [])
+                members = tuple(sorted({
+                    _text(item.get("agent_instance_id"))
+                    for item in bindings
+                    if _text(item.get("share_group_id")) == group_id
+                    and _text(item.get("agent_instance_id"))
+                }))
+                if not members:
+                    raise PermissionError("history_active_binding_required")
+                history_scope = V2HistoryScope(
+                    agent_instance_id=members[0],
+                    share_group_id=group_id,
+                    authorized_agent_ids=members,
+                    shared_read=True,
+                )
+            else:
+                history_scope = V2HistoryAccessResolver(self.workspace).resolve(agent_id, {
+                    "project_ref": _text(context.get("project_ref")),
+                    "provider": _text(context.get("provider")),
+                })
+            listing = ContentHistoryStore(self.workspace, readonly=True).list_sessions(history_scope, limit=50, offset=0)
+            sessions = list(listing.get("sessions") or ())
+            history_node["count"] = int(listing.get("total") or len(sessions))
+            history_node["total"] = history_node["count"]
+            history_node["has_more"] = history_node["count"] > len(sessions)
+            history_node["project_groups"] = list(listing.get("project_groups") or ())
+            for session in sessions:
+                if not isinstance(session, Mapping):
+                    continue
+                session_id = _text(session.get("session_id"))
+                project_key = _text(session.get("project_key"))
+                owner = _text(session.get("owner_agent_instance_id") or session.get("agent_instance_id"))
+                if not session_id or not project_key or not owner:
+                    continue
+                project_id = f"history-project:{project_key}"
+                owner_id = "history-agent:" + hashlib.sha256(
+                    f"{project_key}\x1f{owner}".encode("utf-8")
+                ).hexdigest()[:20]
+                add_node({
+                    "id": project_id,
+                    "parent_id": history_id,
+                    "node_kind": "history_project",
+                    "virtual_category": "conversation_history",
+                    "project_key": project_key,
+                    "project_ref": _text(session.get("project_ref")),
+                    "project_status": _text(session.get("project_status")) or "unknown",
+                    "project_parent": _text(session.get("project_parent")),
+                    "label": _text(session.get("project_label")) or "未识别项目",
+                    "kind": "project",
+                    "virtual": True,
+                })
+                add_edge(history_id, project_id)
+                add_node({
+                    "id": owner_id,
+                    "parent_id": project_id,
+                    "node_kind": "history_agent",
+                    "virtual_category": "conversation_history",
+                    "owner_agent_instance_id": owner,
+                    "label": owner,
+                    "kind": "agent",
+                    "virtual": True,
+                })
+                add_edge(project_id, owner_id)
+                node_id = f"history-session:{session_id}"
+                add_node({
+                    "id": node_id,
+                    "parent_id": owner_id,
+                    "node_kind": "history_session",
+                    "virtual_category": "conversation_history",
+                    "session_id": session_id,
+                    "title": _text(session.get("title")),
+                    "label": _text(session.get("title")) or session_id[:8],
+                    "owner_agent_instance_id": owner,
+                    "provider": _text(session.get("provider")),
+                    "project_key": project_key,
+                    "project_ref": _text(session.get("project_ref")),
+                    "project_status": _text(session.get("project_status")) or "unknown",
+                    "created_at": _text(session.get("created_at")),
+                    "imported_at": _text(session.get("imported_at")),
+                    "summary": _text(session.get("summary")),
+                    "turn_count": int(session.get("turn_count") or 0),
+                    "evidence_count": int(session.get("evidence_count") or 0),
+                    "kind": "session",
+                    "virtual": True,
+                })
+                add_edge(owner_id, node_id)
+        except Exception as exc:
+            history_node["load_error"] = _text(getattr(exc, "code", "")) or "history_overlay_unavailable"
+
+        result["nodes"] = nodes
+        result["edges"] = edges
+        result["base_empty"] = bool(result.get("empty") or result.get("base_empty"))
+        result["virtual_overlay_available"] = True
+        stats = dict(result.get("stats") or {})
+        stats["node_count"] = len(nodes)
+        stats["edge_count"] = len(edges)
+        stats["rule_count"] = rule_total
+        stats["history_session_count"] = int(history_node.get("count") or 0)
+        result["stats"] = stats
+        return result
+
+    def _projection_virtual_overlay(
+        self,
+        graph: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Compose GUI-only rule/history references onto a Memory Projection.
+
+        Durable ProjectionStore remains reference-only and Memory-only.  Rules
+        and conversation history retain their independent V2 stores; this
+        method merely joins authorized metadata at the final GUI read boundary.
+        """
+
+        result = dict(graph)
+        nodes = [dict(item) for item in result.get("nodes", ()) if isinstance(item, Mapping)]
+        edges = [dict(item) for item in result.get("edges", ()) if isinstance(item, Mapping)]
+        node_ids = {_text(item.get("id")) for item in nodes if _text(item.get("id"))}
+        edge_ids = {_text(item.get("id")) for item in edges if _text(item.get("id"))}
+
+        def add_node(item: Mapping[str, Any]) -> None:
+            value = dict(item)
+            node_id = _text(value.get("id"))
+            if not node_id or node_id in node_ids:
+                return
+            nodes.append(value)
+            node_ids.add(node_id)
+
+        def add_edge(source: str, target: str, *, edge_type: str = "virtual_index") -> None:
+            if source not in node_ids or target not in node_ids:
+                return
+            edge_id = f"{edge_type}:{source}:{target}"
+            if edge_id in edge_ids:
+                return
+            edges.append({
+                "id": edge_id,
+                "source": source,
+                "target": target,
+                "edge_type": edge_type,
+            })
+            edge_ids.add(edge_id)
+
+        if "main" not in node_ids:
+            add_node({
+                "id": "main",
+                "node_kind": "root",
+                "label": "记忆胞体",
+                "parent_id": "",
+                "derivation": "记忆胞体",
+            })
+
+        # Rules/habits are authoritative in Rules V2.  Canonical text is safe
+        # to show in this authorized GUI response, but is never persisted into
+        # ProjectionStore.
+        rule_error = ""
+        try:
+            rule_snapshot = self._gui_rule_snapshot({}, context)
+            rule_rows = [
+                dict(item) for item in rule_snapshot.get("rules", ())
+                if isinstance(item, Mapping)
+            ]
+        except NativePortError as exc:
+            rule_rows = []
+            rule_error = exc.code
+        rules_total = len(rule_rows)
+        add_node({
+            "id": "virtual-rules-habits",
+            "node_kind": "virtual_category",
+            "record_kind": "rules_habits",
+            "virtual_category": "rules_habits",
+            "kind": "rules_habits",
+            "label": "规则与习惯",
+            "parent_id": "main",
+            "count": rules_total,
+            "total": rules_total,
+            "load_error": rule_error,
+            "derivation": "记忆胞体 -> 规则与习惯",
+        })
+        add_edge("main", "virtual-rules-habits")
+        for row in rule_rows[:100]:
+            definition_id = _text(row.get("definition_id"))
+            if not definition_id:
+                continue
+            body = _text(row.get("canonical_text"))
+            memory_id = _text(row.get("memory_id"))
+            bindings = [dict(item) for item in row.get("bindings", ()) if isinstance(item, Mapping)]
+            node_id = "virtual-rule-ref:" + definition_id
+            add_node({
+                "id": node_id,
+                "node_kind": "virtual_rule_ref",
+                "record_kind": "rules_habits",
+                "virtual_category": "rules_habits",
+                "parent_id": "virtual-rules-habits",
+                "definition_id": definition_id,
+                "memory_id": memory_id,
+                "source_memory_ids": list(row.get("source_memory_ids") or ()),
+                "label": (body.splitlines()[0][:160] if body else definition_id[:24]),
+                "body": body[:6000],
+                "kind": _text(row.get("rule_kind")) or "procedure",
+                "status": _text(row.get("maturity_state")) or "active",
+                "polarity": _text(row.get("polarity")),
+                "rule_strength": row.get("rule_strength"),
+                "revision": row.get("revision"),
+                "bindings": bindings,
+                "assignments": bindings,
+                "effective": bool(row.get("effective")),
+                "excluded": bool(row.get("excluded")),
+                "injection_policy": "relevant",
+                "priority": 0,
+                "derivation": "记忆胞体 -> 规则与习惯 -> 规则",
+            })
+            add_edge("virtual-rules-habits", node_id)
+
+        # Conversation history is authoritative in Content V2.  The graph gets
+        # only session metadata/summary counters; raw turns remain behind the
+        # explicit history_read permission path.
+        history_error = ""
+        history_listing: Mapping[str, Any] = {}
+        try:
+            history = self._native_service("history")
+            if history is None:
+                raise NativePortError("v2_history_service_unavailable")
+            history_listing = self._service_result(
+                history,
+                "memoryguard_history_list_sessions",
+                {"limit": 100, "offset": 0},
+                context=context,
+            )
+        except NativePortError as exc:
+            history_error = exc.code
+            history_listing = {}
+        sessions = [
+            dict(item) for item in history_listing.get("sessions", ())
+            if isinstance(item, Mapping)
+        ]
+        history_total = int(history_listing.get("total") or len(sessions))
+        add_node({
+            "id": "virtual-conversation-history",
+            "node_kind": "virtual_category",
+            "record_kind": "conversation_history",
+            "virtual_category": "conversation_history",
+            "kind": "conversation_history",
+            "label": "对话历史",
+            "parent_id": "main",
+            "count": history_total,
+            "total": history_total,
+            "has_more": history_total > len(sessions),
+            "load_error": history_error,
+            "derivation": "记忆胞体 -> 对话历史",
+        })
+        add_edge("main", "virtual-conversation-history")
+
+        project_nodes: dict[str, str] = {}
+        agent_nodes: dict[tuple[str, str], str] = {}
+        for session in sessions:
+            session_id = _text(session.get("session_id"))
+            if not session_id:
+                continue
+            project_key = _text(session.get("project_key")) or "unknown"
+            project_id = "history-project:" + project_key
+            if project_key not in project_nodes:
+                project_nodes[project_key] = project_id
+                add_node({
+                    "id": project_id,
+                    "node_kind": "history_project",
+                    "record_kind": "conversation_history",
+                    "virtual_category": "conversation_history",
+                    "label": _text(session.get("project_label")) or "未标注项目",
+                    "project_ref": _text(session.get("project_ref")),
+                    "project_status": _text(session.get("project_status")),
+                    "parent_id": "virtual-conversation-history",
+                    "session_count": 0,
+                })
+                add_edge("virtual-conversation-history", project_id)
+            project_node = next(item for item in nodes if item.get("id") == project_id)
+            project_node["session_count"] = int(project_node.get("session_count") or 0) + 1
+
+            agent_id = _text(session.get("agent_instance_id")) or "unknown"
+            agent_key = (project_key, agent_id)
+            agent_node_id = "history-agent:" + project_key + ":" + agent_id
+            if agent_key not in agent_nodes:
+                agent_nodes[agent_key] = agent_node_id
+                add_node({
+                    "id": agent_node_id,
+                    "node_kind": "history_agent",
+                    "record_kind": "conversation_history",
+                    "virtual_category": "conversation_history",
+                    "label": agent_id[:24],
+                    "agent_instance_id": agent_id,
+                    "parent_id": project_id,
+                })
+                add_edge(project_id, agent_node_id)
+
+            session_node_id = "history-session:" + session_id
+            add_node({
+                "id": session_node_id,
+                "node_kind": "history_session",
+                "record_kind": "conversation_history",
+                "virtual_category": "conversation_history",
+                "parent_id": agent_node_id,
+                "session_id": session_id,
+                "title": _text(session.get("title")),
+                "label": _text(session.get("title")) or _text(session.get("provider")) or "对话",
+                "provider": _text(session.get("provider")),
+                "project_ref": _text(session.get("project_ref")),
+                "agent_instance_id": agent_id,
+                "created_at": _text(session.get("created_at")),
+                "imported_at": _text(session.get("imported_at")),
+                "summary": _text(session.get("summary"))[:1000],
+                "turn_count": int(session.get("turn_count") or 0),
+                "evidence_count": int(session.get("evidence_count") or 0),
+            })
+            add_edge(agent_node_id, session_node_id)
+
+        stats = dict(result.get("stats") or {})
+        stats.setdefault("memory_node_count", int(stats.get("node_count") or 0))
+        stats["virtual_rule_count"] = rules_total
+        stats["history_session_count"] = history_total
+        stats["node_count"] = len(nodes)
+        stats["edge_count"] = len(edges)
+        result.update({
+            "nodes": nodes,
+            "edges": edges,
+            "stats": stats,
+            "virtual_overlay_available": True,
+        })
+        return result
+
+    def _projection_graph(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+        """Read Memory Core graph from Memory Projection only.
+
+        GUI positional compatibility may place mode in ``args``; all scope and
+        member selectors are business input and the trusted context remains the
+        sole ACL source.
+        """
+        scope = self._gui_projection_scope(context)
+        mode = _text(payload.get("mode"))
+        args = payload.get("args")
+        if not mode and isinstance(args, (list, tuple)) and args:
+            mode = _text(args[0])
+        try:
+            service = self._projection_service()
+            graph = dict(service.graph(
+                mode=mode or "reconstructed",
+                scope=scope,
+            ))
+            # Memory Core renders the build gate and source table from one
+            # consistent scope snapshot.  Returning only the projection made
+            # every unbuilt graph look source-less in the desktop UI even when
+            # the selected shared group already contained governed memories.
+            graph["source_map"] = service.source_map(scope=scope)
+            graph["scope"] = {
+                "workspace_id": str(scope.workspace_id),
+                "agent_instance_id": str(scope.agent_instance_id or ""),
+                "share_group_id": str(scope.share_group_id or ""),
+                "project_ref": str(scope.project_ref or ""),
+                "provider": str(scope.provider or ""),
+            }
+            if not graph.get("nodes"):
+                summary = dict(graph["source_map"].get("summary") or {})
+                graph["reason"] = (
+                    "not_built"
+                    if int(summary.get("buildable_atom_count") or 0) > 0
+                    else "no_projection_sources"
+                )
+            if self._trusted_admin(context) and _text(context.get("entrypoint")).casefold() == "gui":
+                return self._with_virtual_neuron_overlay(graph, context)
+            return graph
+        except NativePortError:
+            raise
+        except Exception as exc:
+            raise NativePortError(
+                _text(getattr(exc, "code", "")) or "v2_projection_graph_unavailable",
+            ) from exc
 
     def _provider_install(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         """Repair one provider integration without constructing V1 memory.
@@ -4828,6 +5994,115 @@ class NativeV2RuntimePort:
             "enrichment": self._enrichment_status(payload, context),
         }
 
+    def _governance_snapshot(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        **_: Any,
+    ) -> Any:
+        """Return the bounded GUI governance status contract.
+
+        The historical positional group selector is compatibility input only.
+        The process-issued NativeBoundContext and its active binding are the
+        sole scope authority; stale contexts never become group existence
+        or record-count oracles.
+        """
+        del payload
+        authority = self._gui_authority(context)
+        agent_id = _text(authority.agent_instance_id)
+        members: list[str] = []
+        memory: dict[str, Any] = {
+            "status": "UNBOUND",
+            "available": False,
+            "total_records": 0,
+            "active_count": 0,
+            "status_counts": {},
+        }
+        governance_state = "audit_only"
+        group_id = ""
+
+        try:
+            groups = self._group_service(write=False)
+            # Resolve the persisted GUI selection from the control plane.  The
+            # server-admin authority is only allowed to validate that saved
+            # selection; its own binding/group is never used as the scope.
+            scope_state = groups.scope_state(agent_id, admin=bool(authority.admin)) if agent_id else {}
+            binding = scope_state.get("active_binding") if isinstance(scope_state, Mapping) else None
+            bound_group = _text((binding or {}).get("share_group_id"))
+            persisted_scope = scope_state.get("scope") if isinstance(scope_state, Mapping) else None
+            if (
+                isinstance(binding, Mapping)
+                and isinstance(persisted_scope, Mapping)
+                and bound_group
+                and scope_state.get("empty") is False
+            ):
+                members = sorted({
+                    _text(item)
+                    for item in (scope_state.get("members") or [])
+                    if _text(item)
+                })
+                if not members:
+                    raise NativePortError("governance_scope_empty")
+                scoped_authority = authority.to_dict()
+                # Shared memory is one canonical group plane.  The binding's
+                # Agent identifies the selected member, not an atom-owner
+                # filter.  Personal groups keep their exact Agent scope.
+                scoped_authority["agent_instance_id"] = (
+                    ""
+                    if _text(binding.get("group_kind")).casefold() == "shared"
+                    else _text(binding.get("agent_instance_id"))
+                )
+                scoped_authority["trusted_agent_id"] = scoped_authority["agent_instance_id"]
+                scoped_authority["share_group_id"] = bound_group
+                memory = dict(self._memory_status({}, scoped_authority))
+                governance_state = "active_governance"
+                group_id = bound_group
+        except Exception:
+            # A diagnostics endpoint remains renderable when its control plane
+            # is unavailable; it must not fall back to caller-selected data.
+            pass
+
+        conflict_count = 0
+        quarantine_count = 0
+        if governance_state == "active_governance":
+            try:
+                governance = self._governance_native()
+                trusted = authority.to_dict()
+                trusted["agent_instance_id"] = _text((binding or {}).get("agent_instance_id"))
+                trusted["trusted_agent_id"] = trusted["agent_instance_id"]
+                trusted["share_group_id"] = group_id
+                conflicts = governance.conflicts(trusted)
+                quarantine = governance.quarantine(trusted)
+                conflict_count = int(conflicts.get("total") or len(conflicts.get("conflicts", [])))
+                quarantine_count = int(quarantine.get("total") or len(quarantine.get("quarantine", [])))
+            except Exception:
+                # Missing governance data is a stable empty queue, not a raw
+                # exception or record-bearing diagnostic.
+                pass
+
+        active_count = int(
+            memory.get("active_count")
+            or (memory.get("status_counts") or {}).get("active", 0)
+            or 0
+        )
+        return {
+            "status": {"active_count": max(0, active_count)},
+            "conflicts": {"count": max(0, conflict_count)},
+            "quarantine": {"count": max(0, quarantine_count), "items": []},
+            "rollback_ready": 0,
+            "has_events": False,
+            "latest_event": None,
+            "latest_supersede": None,
+            "governance_state": governance_state,
+            "scope_state": governance_state,
+            "group": {
+                "share_group_id": group_id,
+                "members": members,
+                "member_count": len(members),
+            },
+            "memory": memory,
+        }
+
     def _scope_echo(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         """Return the trusted GUI scope without exposing an absolute workspace."""
         del payload
@@ -4959,6 +6234,13 @@ class NativeV2RuntimePort:
             else:  # pragma: no cover - registry controls this value
                 self._native_service_init_errors[kind] = "v2_native_service_unavailable"
                 return None
+        except NativePortError as exc:
+            # Preserve the stable blocker code without exposing constructor
+            # details such as absolute paths.  Callers can then surface the
+            # real remediation instead of collapsing every failure to a
+            # generic service-unavailable message.
+            self._native_service_init_errors[kind] = exc.code
+            return None
         except Exception:
             # Do not expose constructor exception details (which can include
             # absolute paths).  Service operation wrappers emit the stable
@@ -5199,6 +6481,17 @@ class NativeV2RuntimePort:
             by_definition: dict[str, list[Any]] = {}
             for binding in bindings:
                 by_definition.setdefault(binding.definition_id, []).append(binding)
+            source_memories: dict[str, list[str]] = {}
+            with open_database(self.layout.rules_db, readonly=True) as conn:
+                for memory_id, definition_id in conn.execute(
+                    "SELECT memory_id,canonical_definition_id FROM rule_source_links "
+                    "WHERE share_group_id=? ORDER BY canonical_definition_id,memory_id",
+                    (group,),
+                ).fetchall():
+                    mid = _text(memory_id)
+                    did = _text(definition_id)
+                    if mid and did:
+                        source_memories.setdefault(did, []).append(mid)
             rules: list[dict[str, Any]] = []
             effective: list[dict[str, Any]] = []
             excluded: list[dict[str, Any]] = []
@@ -5220,6 +6513,8 @@ class NativeV2RuntimePort:
                     "maturity_state": definition.maturity_state,
                     "revision": definition.revision,
                     "bindings": [item.to_dict() for item in visible_bindings],
+                    "memory_id": (source_memories.get(definition.definition_id) or [""])[0],
+                    "source_memory_ids": list(source_memories.get(definition.definition_id) or ()),
                     "effective": bool(includes and not excludes),
                     "excluded": bool(excludes),
                 }
@@ -5228,9 +6523,20 @@ class NativeV2RuntimePort:
                     excluded.append(row)
                 elif includes:
                     effective.append(row)
+            buckets: dict[str, list[dict[str, Any]]] = {
+                "mandatory": [],
+                "preferences": [],
+                "procedures": [],
+                "corrections": [],
+                "projects": [],
+            }
+            for row in rules:
+                bucket, _label = self._virtual_rule_bucket(row)
+                buckets.setdefault(bucket, []).append(self._gui_rule_record(row))
             return {
                 "status": "READY",
                 "rules": rules,
+                "buckets": buckets,
                 "effective": effective,
                 "excluded": excluded,
                 "total": len(rules),
@@ -5299,14 +6605,41 @@ class NativeV2RuntimePort:
                 if not admin and not owner and rule_id not in allowed:
                     continue
                 # Decision bodies are hash/JSON state, not source text; still
-                # keep the public view compact and bounded.
-                values.append({
+                # keep the public view compact and bounded.  Auto-scope facts
+                # are persisted inside reason JSON, so project them into stable
+                # fields instead of forcing every GUI client to parse it.
+                reason_text = _text(item.get("reason"))
+                reason_data: Mapping[str, Any] = {}
+                try:
+                    decoded_reason = json.loads(reason_text) if reason_text else {}
+                    if isinstance(decoded_reason, Mapping):
+                        reason_data = decoded_reason
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    reason_data = {}
+                assignment = reason_data.get("assignment")
+                assignment = assignment if isinstance(assignment, Mapping) else {}
+                scope_type = _text(assignment.get("target_type"))
+                if not scope_type:
+                    scope_type = "project" if _text(assignment.get("project_ref")) else "agent"
+                confidence_value = reason_data.get("scope_confidence", item.get("confidence"))
+                try:
+                    scope_confidence = max(0.0, min(1.0, float(confidence_value)))
+                except (TypeError, ValueError):
+                    scope_confidence = 0.0
+                public = {
                     key: item.get(key) for key in (
                         "decision_id", "actor", "owner_agent_id", "rule_id", "action",
                         "before_hash", "after_hash", "reason", "confidence", "undo_id",
                         "target_ids_json", "created_at",
                     )
+                }
+                public.update({
+                    "scope_reason": _text(reason_data.get("scope_reason")) or reason_text,
+                    "scope_confidence": scope_confidence,
+                    "scope_type": scope_type or "agent",
+                    "object_type": "rule",
                 })
+                values.append(public)
                 if len(values) >= limit:
                     break
             return {"decisions": values, "total": len(values), "status": "READY"}
@@ -5961,7 +7294,10 @@ class NativeV2RuntimePort:
             "gui_audit_plan": self._gui_audit_plan,
             "reference_audit": self._reference_audit,
             "explain": self._explain,
+            "projection_graph": self._projection_graph,
             "codegraph_graph": self._codegraph_graph,
+            "codegraph_projects": self._codegraph_projects,
+            "codegraph_build": self._codegraph_build,
             "codegraph_query": self._codegraph_query,
             "codegraph_path": self._codegraph_path,
             "codegraph_explain": self._codegraph_explain,
@@ -5975,6 +7311,7 @@ class NativeV2RuntimePort:
             "host_enrichment_guide": self._host_enrichment_guide,
             "host_llm_agents": self._host_llm_agents,
             "diagnostics_snapshot": self._diagnostics_snapshot,
+            "governance_snapshot": self._governance_snapshot,
             "scope_echo": self._scope_echo,
             "hook_status": self._hook_status,
             "gui_host_control": self._gui_host_control,
@@ -6144,6 +7481,15 @@ class NativeV2RuntimePort:
             # Maintenance audit/report are read-only.  Every other action is
             # conservatively treated as a write, independent of caller flags.
             return action not in {"audit", "report"}
+        if surface == "cli":
+            try:
+                action = _text(_payload(args).get("action")).casefold()
+            except NativePortError:
+                return True
+            if spec.handler == "cli_hooks":
+                return action != "status"
+            if spec.handler == "cli_source":
+                return action in {"add", "remove"}
         return False
 
     def _dispatch_checked(
@@ -6201,6 +7547,18 @@ class NativeV2RuntimePort:
                     surface == "gui" and spec.handler in _PHASE9_GUI_READ_HANDLERS
                 ) or (
                     surface == "gui" and spec.handler in _GUI_AGENT_READ_HANDLERS
+                ) or (
+                    # Agent/group control-plane operations bootstrap and
+                    # repair bindings themselves.  They require a process-
+                    # issued native capability, but they must not require an
+                    # already-selected memory share group or the first binding
+                    # could never be created.  The handlers below still enforce
+                    # admin authority for every mutation.
+                    surface == "gui" and spec.handler in {
+                        "gui_agent_query", "gui_agent_command",
+                        "gui_group_query", "gui_group_command",
+                        "gui_maintenance_control",
+                    }
                 ) or neutral_mcp_read,
             )
             # MaintenanceRuntimePort owns a separate private CLI capability
@@ -6243,7 +7601,15 @@ class NativeV2RuntimePort:
                     raise NativePortError("no_source")
             # Do not forward identity claims from the transport payload.  The
             # trusted context above is the only source of scope/identity.
-            clean = {key: value for key, value in raw_payload.items() if key not in _IDENTITY_PAYLOAD_KEYS}
+            clean = {
+                key: value for key, value in raw_payload.items()
+                if key not in _IDENTITY_PAYLOAD_KEYS
+                or (
+                    key == "session_id"
+                    and surface == "gui"
+                    and name in _GUI_HISTORY_SESSION_SELECTOR_OPERATIONS
+                )
+            }
             fn = self._service(surface, name, spec.handler) or self._builtin(spec.handler)
             if fn is None:
                 raise NativePortError("v2_operation_not_implemented")
@@ -6296,6 +7662,10 @@ class NativeV2RuntimePort:
         )
         if state_error is not None:
             return state_error
+        if surface_key == "cli" and effective_mutation:
+            spec = self._registry.get(surface_key, {}).get(operation)
+            if spec is not None and spec.handler != "maintenance":
+                context = self._bind_cli_transport_context(context)
         return self._dispatch_checked(
             surface_key,
             operation,

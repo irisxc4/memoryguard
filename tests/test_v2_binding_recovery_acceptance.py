@@ -5,6 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+from memoryguard.memory.store import MemoryAtomStore
 from memoryguard.migration.upgrade import run_upgrade
 from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.storage.layout import WorkspaceV2Layout
@@ -202,3 +203,68 @@ def test_active_control_break_fails_closed_on_preview_and_recovers_on_apply(tmp_
     assert restored is not None
     assert restored["binding_id"] == legacy_binding.stem
     assert restored["share_group_id"] == "shared-team"
+
+
+def test_activation_exposes_migrated_memory_and_active_upgrade_repairs_split_state(tmp_path: Path) -> None:
+    _write_legacy_group(tmp_path)
+    _upgrade_to_ready(tmp_path)
+    active = _activate(tmp_path)
+    assert active["detail"]["memory"]["after"]["status"] == "PASS"
+
+    memory_db = WorkspaceV2Layout(tmp_path).memory_db
+    with sqlite3.connect(memory_db) as connection:
+        assert connection.execute("SELECT DISTINCT visibility FROM atoms").fetchall() == [("active",)]
+        assert connection.execute(
+            "SELECT state FROM domain_state WHERE domain='memory'"
+        ).fetchone() == ("ACTIVE",)
+        connection.execute("UPDATE atoms SET visibility='building'")
+        connection.execute(
+            "UPDATE domain_state SET state='BUILDING' WHERE domain='memory'"
+        )
+        connection.commit()
+
+    preview = run_upgrade(tmp_path, data_home=tmp_path, apply=False)
+    assert preview["ok"] is False
+    assert preview["code"] == "active_memory_repair_required"
+    repaired = run_upgrade(tmp_path, data_home=tmp_path, apply=True)
+    assert repaired["ok"] is True, repaired
+    assert repaired["code"] == "active_memory_repaired"
+    assert repaired["detail"]["memory"]["status"] == "PASS"
+
+
+def test_activation_creates_governance_ledger_and_active_upgrade_repairs_missing_ledger(tmp_path: Path) -> None:
+    _write_legacy_group(tmp_path)
+    _upgrade_to_ready(tmp_path)
+    _activate(tmp_path)
+
+    ledger = tmp_path / ".memoryguard" / "governance_v2" / "decisions.db"
+    assert ledger.is_file()
+    connection = sqlite3.connect(ledger)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        connection.close()
+    assert {"decisions", "request_ledger", "decision_outbox"} <= tables
+
+    split_root = tmp_path / "historical-split"
+    _write_legacy_group(split_root)
+    _upgrade_to_ready(split_root)
+    manager = ManifestManager(split_root)
+    ready = manager.current()
+    manager.activate_v2(expected_generation=ready.generation)
+    MemoryAtomStore(split_root).set_visibility("active")
+
+    split_ledger = split_root / ".memoryguard" / "governance_v2" / "decisions.db"
+    assert not split_ledger.exists()
+    preview = run_upgrade(split_root, data_home=split_root, apply=False)
+    assert preview["ok"] is False
+    assert preview["code"] == "active_governance_repair_required"
+
+    repaired = run_upgrade(split_root, data_home=split_root, apply=True)
+    assert repaired["ok"] is True, repaired
+    assert repaired["code"] == "active_governance_repaired"
+    assert repaired["detail"]["governance"]["status"] == "PASS"
+    assert split_ledger.is_file()

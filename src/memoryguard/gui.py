@@ -80,6 +80,127 @@ def _start_webview(webview) -> None:
         webview.start()
 
 
+def _install_windows_restore_recovery(window, url: str) -> None:
+    """Recover a WinForms/WebView2 surface after a real minimize cycle.
+
+    WebView2 can keep its process and localhost connection alive while losing
+    the rendered surface after a WinForms window is restored.  Microsoft
+    recommends hiding the WebView container while its host is minimized.  Do
+    that first, then show/refresh and navigate once the host is visible again.
+    Limit the recovery to a real minimize cycle so ordinary resize/maximize
+    events never reload the application.
+    """
+    if os.name != "nt":
+        return
+    events = getattr(window, "events", None)
+    minimized_event = getattr(events, "minimized", None)
+    restored_event = getattr(events, "restored", None)
+    if minimized_event is None or restored_event is None:
+        return
+
+    state_lock = threading.Lock()
+    recovery_state: dict[str, Any] = {
+        "generation": 0,
+        "minimized": False,
+        "scheduled_generation": None,
+        "closed": False,
+    }
+
+    def _set_renderer_visible(visible: bool) -> bool:
+        native = getattr(window, "native", None)
+        control = getattr(native, "webview", None)
+        if native is None or control is None:
+            return False
+
+        def _apply() -> None:
+            control.Visible = bool(visible)
+            if visible:
+                control.BringToFront()
+                control.Invalidate()
+                control.Update()
+                control.Refresh()
+                native.Invalidate()
+                native.Update()
+
+        try:
+            if bool(getattr(control, "InvokeRequired", False)):
+                from System import Action
+
+                control.Invoke(Action(_apply))
+            else:
+                _apply()
+            return True
+        except Exception:
+            return False
+
+    def _mark_minimized() -> None:
+        # Keep renderer visibility and lifecycle state in one critical
+        # section.  A delayed restore callback can no longer race a second
+        # minimize and make the WebView visible again behind a minimized host.
+        with state_lock:
+            if recovery_state["closed"]:
+                return
+            recovery_state["generation"] += 1
+            recovery_state["minimized"] = True
+            recovery_state["scheduled_generation"] = None
+            _set_renderer_visible(False)
+
+    def _mark_closed() -> None:
+        with state_lock:
+            recovery_state["closed"] = True
+            recovery_state["minimized"] = False
+            recovery_state["scheduled_generation"] = None
+            recovery_state["generation"] += 1
+
+    def _recover_after_restore(*_dimensions) -> None:
+        with state_lock:
+            if recovery_state["closed"] or not recovery_state["minimized"]:
+                return
+            generation = int(recovery_state["generation"])
+            if recovery_state["scheduled_generation"] == generation:
+                return
+            recovery_state["scheduled_generation"] = generation
+
+        def _reload_surface() -> None:
+            # Hold the lifecycle lock through the UI recovery.  If a second
+            # minimize arrives concurrently it runs immediately afterwards
+            # and wins by hiding the renderer with a newer generation.
+            with state_lock:
+                if (
+                    recovery_state["closed"]
+                    or not recovery_state["minimized"]
+                    or recovery_state["generation"] != generation
+                    or recovery_state["scheduled_generation"] != generation
+                ):
+                    return
+                try:
+                    _set_renderer_visible(True)
+                    window.load_url(str(url))
+                except Exception:
+                    # Window recovery is best-effort.  The localhost server
+                    # and binding state remain authoritative if renderer died.
+                    pass
+                finally:
+                    recovery_state["minimized"] = False
+                    recovery_state["scheduled_generation"] = None
+
+        # WinForms reports ``restored`` before WebView2 has recreated its
+        # composition target on some machines.  Waiting for the subsequent
+        # resize turn avoids navigating into the still-minimized surface.
+        timer = threading.Timer(0.25, _reload_surface)
+        timer.daemon = True
+        timer.start()
+
+    minimized_event += _mark_minimized
+    restored_event += _recover_after_restore
+    resized_event = getattr(events, "resized", None)
+    if resized_event is not None:
+        resized_event += _recover_after_restore
+    closed_event = getattr(events, "closed", None)
+    if closed_event is not None:
+        closed_event += _mark_closed
+
+
 # ---------------------------------------------------------------------------
 # 1. 桌面原生窗口
 # ---------------------------------------------------------------------------
@@ -125,43 +246,10 @@ def _find_free_port() -> int:
 
 
 def _render_v2_knowledge_html(book_id: str = "") -> str:
-    """Render the knowledge surface without importing the retired page adapter."""
-    selected_book = _json.dumps(str(book_id or ""), ensure_ascii=False)
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MemoryGuard Knowledge</title>
-<style>
-body {{ margin: 0; padding: 32px; color: #e4f5ef; background: #07120f; font: 14px/1.6 system-ui, sans-serif; }}
-main {{ max-width: 960px; margin: 0 auto; }}
-a, button {{ color: #bcffeb; }}
-button {{ padding: 8px 14px; border: 1px solid #6ee7c4; border-radius: 6px; background: #12352d; cursor: pointer; }}
-input {{ width: min(520px, 100%); padding: 9px; color: inherit; background: #0d211b; border: 1px solid #356b5b; border-radius: 6px; }}
-pre {{ white-space: pre-wrap; padding: 16px; border: 1px solid #214b3e; border-radius: 8px; background: #0b1a16; }}
-</style></head>
-<body><main>
-<p><a href="/">← 返回治理面板</a></p>
-<h1>知识书库</h1>
-<p>此页面通过 V2 knowledge registry 读取和管理知识内容。</p>
-<p><input id="query" placeholder="搜索知识内容"><button id="search">搜索</button></p>
-<pre id="result">正在加载…</pre>
-<script>
-const selectedBook = {selected_book};
-const token = window.__MG_SESSION__ || "";
-async function call(name, args) {{
-  const response = await fetch('/api/' + name, {{method: 'POST', headers: {{'X-Session-Token': token}}, body: JSON.stringify(args || [])}});
-  return response.json();
-}}
-async function load() {{
-  const query = document.getElementById('query').value || '';
-  const value = selectedBook
-    ? await call('knowledge_book', [selectedBook])
-    : await call(query ? 'knowledge_search' : 'knowledge_list', query ? [query, 50] : ['', 50]);
-  document.getElementById('result').textContent = JSON.stringify(value, null, 2);
-}}
-document.getElementById('search').addEventListener('click', load);
-load();
-</script></main></body></html>"""
+    """Render the V2-only product knowledge surface."""
+    from .knowledge_gui import render_book_detail_html, render_bookshelf_html
+
+    return render_book_detail_html(book_id) if book_id else render_bookshelf_html()
 
 
 def _choose_publish_target_path(kind: str = "file") -> dict[str, Any]:
@@ -513,6 +601,7 @@ def open_localhost_window(
                 min_size=(800, 600),
             )
             bridge._set_window(window)
+            _install_windows_restore_recovery(window, url)
             _start_webview(webview)
         finally:
             server.shutdown()
@@ -1010,24 +1099,35 @@ class SafeBridgeApi:
             from .access_context import AccessContext
             if not isinstance(ctx, AccessContext):
                 return {}
-            # AccessContext carries the connection principal but not its
-            # governance group. Resolve exactly one active binding from the V2
-            # system control plane; GUI preferences are never authorization.
             from .runtime_v2.native_ports import bind_native_transport_context
             from .runtime_v2.group_native import GroupControlService
-            from .desktop_executor import SERVER_ADMIN_AGENT_ID, SERVER_ADMIN_GROUP_ID
+            from .desktop_executor import SERVER_ADMIN_AGENT_ID
             agent_id = str(ctx.trusted_agent_id or "").strip()
-            share_group_id = ""
-            if agent_id:
-                active = GroupControlService(self._workspace, write=False).active_binding_for_agent(agent_id)
-                if active is not None:
-                    share_group_id = str(active.get("share_group_id") or "")
-            if (
-                not share_group_id
-                and ctx.is_admin
-                and agent_id == SERVER_ADMIN_AGENT_ID
-            ):
-                share_group_id = SERVER_ADMIN_GROUP_ID
+            groups = GroupControlService(self._workspace, write=False)
+            if ctx.is_admin and agent_id == SERVER_ADMIN_AGENT_ID:
+                # The server-owned desktop/localhost principal must be able to
+                # perform control-plane bootstrap operations (for example,
+                # creating the first shared binding) before any governance
+                # scope exists.  A persisted admin scope, when present, is
+                # still folded into the capability; an ordinary "no active
+                # binding yet" state remains a valid *unscoped* admin
+                # capability.  Unexpected control-plane failures stay
+                # fail-closed.
+                share_group_id, scope_error = self._trusted_admin_scope(groups)
+                if scope_error == "active_binding_required":
+                    share_group_id = ""
+                elif scope_error:
+                    return {}
+            else:
+                # AccessContext carries the connection principal but not its
+                # governance group. Resolve exactly one active binding from
+                # the V2 system control plane; GUI preferences are never
+                # authorization. Ordinary callers keep this existing path.
+                share_group_id = ""
+                if agent_id:
+                    active = groups.active_binding_for_agent(agent_id)
+                    if active is not None:
+                        share_group_id = str(active.get("share_group_id") or "")
             from .access_context import effective_provider
             import hashlib
 
@@ -1053,6 +1153,66 @@ class SafeBridgeApi:
             # silently retrying without provenance.
             return {}
 
+    @staticmethod
+    def _trusted_admin_scope(groups: Any) -> tuple[str, str]:
+        """Resolve the persisted, service-validated desktop admin scope.
+
+        The desktop transport principal is intentionally not a target agent
+        and has no binding of its own.  Its selected scope is therefore the
+        only trusted source for the bridge group.  ``scope_state(...,
+        admin=True)`` is part of the GroupControlService contract: an older
+        service that cannot perform this administrator validation must fail
+        closed rather than silently reverting to a default or browser scope.
+        """
+        from .desktop_executor import SERVER_ADMIN_AGENT_ID
+
+        try:
+            state = groups.scope_state(SERVER_ADMIN_AGENT_ID, admin=True)
+        except Exception:
+            return "", "trusted_context_unavailable"
+        if (
+            not isinstance(state, Mapping)
+            or state.get("ok") is not True
+            or state.get("empty") is not False
+        ):
+            return "", "active_binding_required"
+        scope = state.get("scope")
+        if not isinstance(scope, Mapping):
+            return "", "active_binding_required"
+
+        mode = str(scope.get("mode") or "").strip()
+        if mode == "agent":
+            target_agent = str(scope.get("agent_instance_id") or "").strip()
+            if not target_agent:
+                return "", "active_binding_required"
+            try:
+                binding = groups.active_binding_for_agent(target_agent)
+            except Exception:
+                return "", "trusted_context_unavailable"
+            if binding is None:
+                return "", "active_binding_required"
+            group_id = str(binding.get("share_group_id") or "").strip()
+            return (group_id, "") if group_id else ("", "active_binding_required")
+
+        if mode == "share_group":
+            group_id = str(scope.get("share_group_id") or "").strip()
+            if not group_id:
+                return "", "active_binding_required"
+            try:
+                bindings = groups.list_bindings(include_inactive=False).get("bindings", [])
+            except Exception:
+                return "", "trusted_context_unavailable"
+            if not any(
+                isinstance(binding, Mapping)
+                and str(binding.get("share_group_id") or "").strip() == group_id
+                and str(binding.get("agent_instance_id") or "").strip()
+                for binding in bindings
+            ):
+                return "", "active_binding_required"
+            return group_id, ""
+
+        return "", "active_binding_required"
+
     def _source_scope(self) -> tuple[str, str]:
         """Resolve exactly one active binding for source introspection."""
         ctx = self._trusted_access_context
@@ -1060,11 +1220,18 @@ class SafeBridgeApi:
         if not principal:
             return "", "active_binding_required"
         try:
+            from .access_context import AccessContext
             from .runtime_v2.group_native import GroupControlService
+            from .desktop_executor import SERVER_ADMIN_AGENT_ID
 
-            binding = GroupControlService(
-                self._workspace, write=False,
-            ).active_binding_for_agent(principal)
+            groups = GroupControlService(self._workspace, write=False)
+            if (
+                type(ctx) is AccessContext
+                and bool(ctx.is_admin)
+                and principal == SERVER_ADMIN_AGENT_ID
+            ):
+                return self._trusted_admin_scope(groups)
+            binding = groups.active_binding_for_agent(principal)
         except Exception:
             return "", "trusted_context_unavailable"
         if binding is None:

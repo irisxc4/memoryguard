@@ -133,6 +133,31 @@ def test_no_intelligence_is_legacy_and_packet_unchanged(tmp_path):
     assert result["ok"] and result["data"]["mandatory"] == [] and result["data"]["relevant"] == []
 
 
+def test_canonical_status_explicitly_closes_sqlite_probe(tmp_path, monkeypatch):
+    store = RuleV2Store(tmp_path)
+    original_connect = sqlite3.connect
+    opened = []
+
+    class TrackingConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            return super().close()
+
+    def tracked_connect(*args, **kwargs):
+        kwargs.setdefault("factory", TrackingConnection)
+        connection = original_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    canonical_reconciliation_status(tmp_path, "group-a", store=store)
+
+    assert opened
+    assert all(connection.closed for connection in opened)
+
+
 def test_dedupe_records_passthrough_without_mapping(tmp_path):
     first = _seed_atom(tmp_path, "atom-a", "same read body")
     second = _seed_atom(tmp_path, "atom-b", "same read body")

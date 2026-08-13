@@ -345,6 +345,47 @@ class NativeHistoryService:
         if context_workspace != self.source_workspace:
             raise NativeHistoryError("context_workspace_mismatch")
 
+        # A process-issued GUI admin capability may govern a selected shared
+        # group without having an Agent binding of its own.  The group carried
+        # by the native authority has already been resolved from the control
+        # plane, so expand only its active members and aggregate their history
+        # across projects.  Browser-supplied group/project selectors never
+        # enter this branch.
+        is_server_admin_gui = (
+            bool(getattr(authority, "admin", False))
+            and agent == "memoryguard-server-admin"
+            and str(getattr(authority, "entrypoint", "") or "").strip().casefold() == "gui"
+        )
+        if is_server_admin_gui and authority.share_group_id:
+            try:
+                from .group_native import GroupControlService
+
+                bindings = GroupControlService(
+                    self.source_workspace, write=False,
+                ).list_bindings(include_inactive=False).get("bindings", [])
+                members = tuple(sorted({
+                    str(item.get("agent_instance_id") or "")
+                    for item in bindings
+                    if str(item.get("share_group_id") or "") == authority.share_group_id
+                    and str(item.get("agent_instance_id") or "")
+                }))
+            except Exception:
+                return None
+            if not members:
+                return None
+            return _TrustedScope(
+                HistoryScope(
+                    agent_instance_id=agent,
+                    project_ref="",
+                    provider="",
+                    share_group_id=authority.share_group_id,
+                    authorized_agent_ids=members,
+                    shared_read=True,
+                ),
+                True,
+                source,
+            )
+
         # The active binding, not a request body or caller-claimed group, is
         # authoritative.  A missing/inactive/ambiguous binding is neutralized
         # by returning None, avoiding an existence oracle.
@@ -591,7 +632,7 @@ class NativeHistoryService:
             if turn_id is not None and not cls._text(turn_id):
                 turn_id = None
             if (session_id is None) == (turn_id is None):
-                raise NativeHistoryError("exactly_one_of_session_id_or_turn_id_required")
+                raise NativeHistoryError("conversation_selector_invalid")
             if session_id is not None:
                 normalized["session_id"] = cls._required_text(payload, "session_id")
             if turn_id is not None:
@@ -855,7 +896,13 @@ class NativeHistoryService:
             status = "neutral" if bool(result.get("neutral")) else "ok"
             return {"ok": True, "status": status, "operation": name, "data": result}
         except NativeHistoryError as exc:
-            return {"ok": False, "status": "error", "operation": name, "code": exc.code, "error": exc.code}
+            error = {
+                "ok": False, "status": "error", "operation": name,
+                "code": exc.code, "error": exc.code,
+            }
+            if exc.code == "conversation_selector_invalid":
+                error["message"] = "读取会话需要且仅需要 session_id；读取单条消息需要且仅需要 turn_id。"
+            return error
 
     call = dispatch
 

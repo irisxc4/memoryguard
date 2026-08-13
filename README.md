@@ -66,8 +66,15 @@ cutover:
   policy, priority, audience, scope, provenance, and evidence. Graphify stays
   integrated as an optional metadata provider behind MemoryGuard CodeGraph; it
   is not a separate MemoryGuard package.
+- **History, Governance, and Knowledge UI repaired:** raw History sessions now
+  open through the real SafeBridge/native V2 path, governance activity shows
+  the responsible Agent instead of `Unknown Agent`, and `/knowledge` is again
+  a full V2 bookshelf/detail experience instead of a JSON debug page.
+- **Clearer governance visualization:** dominant automatic decisions collapse
+  into readable groups, while the neuron graph uses a tighter level-aware
+  layout and root-outward soft signal bands instead of projectile-like particles.
 
-Local regression: **1810 passed / 0 failed**. See
+Final local regression: **1884 passed / 0 failed** across **205 test files**. See
 [the v0.7.1 release record](docs/releases/v0.7.1.md).
 
 ## What's New in v0.7.0 (V2-only; published 2026-08-12)

@@ -103,7 +103,9 @@ def test_native_projection_build_and_release_transport(tmp_path: Path) -> None:
 
     accepted = port.dispatch_gui(
         "start_build_projection",
-        [True, "reconstructed", {}, "agent-a", "group-a", "", "", "auto"],
+        # Browser selectors are business compatibility fields, not trusted
+        # identity.  The build must still use the bound agent/group.
+        [True, "reconstructed", {}, "attacker-agent", "attacker-group", "", "", "auto"],
         context=context,
         generation=11,
         mutation=True,
@@ -114,6 +116,18 @@ def test_native_projection_build_and_release_transport(tmp_path: Path) -> None:
     run_id = str(accepted["task"]["run_id"])
     final = _wait(port, context, run_id)
     assert final["status"] == "succeeded", final
+
+    graph = port.dispatch_gui(
+        "get_neuron_graph",
+        {"agent_instance_id": "attacker-agent", "share_group_id": "attacker-group"},
+        context=context,
+        generation=11,
+        state="V2_ACTIVE",
+    )
+    assert graph["ok"] is True, graph
+    assert graph["data"]["status"] == "READY"
+    assert any(node.get("memory_id") == "native-m1" for node in graph["data"]["nodes"])
+    assert "native private body" not in str(graph)
 
     plan = port.dispatch_gui(
         "create_build_plan",
@@ -325,6 +339,98 @@ def test_projection_build_worker_invokes_selected_cli(monkeypatch, tmp_path: Pat
     assert dict(record.payload["metadata"])["llm_used"] is True
 
 
+def test_projection_build_worker_enriches_validated_shared_group_scope(monkeypatch, tmp_path: Path) -> None:
+    """The server-admin bridge must not replace the persisted business scope."""
+
+    import memoryguard.host_agent_backend as backend
+    from _publish_helpers import projection_scope, seed_atom
+    from memoryguard.content.store import ContentStore
+    from memoryguard.projection_v2 import ProjectionStore
+
+    group_id = "shared-business-group"
+    seed_atom(
+        tmp_path,
+        "shared-a",
+        "first english memory",
+        confidence=0.5,
+        agent_id="member-a",
+        share_group_id=group_id,
+    )
+    seed_atom(
+        tmp_path,
+        "shared-b",
+        "second english memory",
+        confidence=0.5,
+        agent_id="member-b",
+        share_group_id=group_id,
+    )
+    scope = projection_scope(tmp_path, agent_id="", share_group_id=group_id, provider="")
+    ContentStore(tmp_path)
+    port = _port(tmp_path)
+    observed: dict[str, object] = {}
+
+    def fake_batch(tasks, **kwargs):
+        observed["task_ids"] = [str(item["task_id"]) for item in tasks]
+        return [
+            {
+                "task_id": item["task_id"],
+                "kind": "procedure",
+                "title": "已整理",
+                "body": "共享组中文整理结果",
+                "confidence": 0.9,
+            }
+            for item in tasks
+        ]
+
+    monkeypatch.setattr(backend, "batch_enrich_via_cli", fake_batch)
+
+    class Execution:
+        cancelled = False
+
+        def progress(self, *args, **kwargs):
+            pass
+
+        def check_cancelled(self):
+            pass
+
+        def own_cleanup(self, callback):
+            pass
+
+    result = port._build_projection_worker(
+        scope,
+        "reconstructed",
+        "",
+        # Deliberately no usable transport context: the real extraction
+        # service must consume only the validated projection scope here.
+        {},
+        engine={"agent": "codex", "cli": "/fake/codex", "label": "Codex"},
+        deterministic=False,
+        execution=Execution(),
+    )
+
+    assert result["status"] == "succeeded"
+    assert len(observed.get("task_ids", [])) == 2
+    key = port._projection_service()._scope_key("reconstructed", scope)
+    record = ProjectionStore(tmp_path, initialize=False).get_projection("scenario", key, scope=scope)
+    metadata = dict(record.payload["metadata"])
+    assert metadata["llm_used"] is True
+    assert metadata["llm_engine"] == "codex"
+
+    atoms = MemoryAtomStore(tmp_path, readonly=True).list_atoms(
+        scope={
+            "workspace_id": str(tmp_path.resolve()),
+            "share_group_id": group_id,
+            "agent_instance_id": "",
+            "project_ref": "",
+            "provider": "",
+            "runtime_role": "",
+        },
+        status="active",
+    )
+    assert {item.agent_instance_id for item in atoms} == {"member-a", "member-b"}
+    assert all(item.metadata.get("enrichment_mode") == "host" for item in atoms)
+
+
 def test_projection_build_worker_drains_more_than_one_enrichment_page(monkeypatch, tmp_path: Path) -> None:
     import memoryguard.host_agent_backend as backend
     from _publish_helpers import projection_scope, seed_atom
@@ -485,3 +591,28 @@ def test_empty_id_cancel_ambiguous_fails_closed(tmp_path: Path) -> None:
     finally:
         coordinator.cancel(a["task"]["run_id"], scope)
         coordinator.cancel(b["task"]["run_id"], scope)
+
+
+def test_empty_projection_build_fails_closed_without_creating_projection(tmp_path: Path) -> None:
+    from memoryguard.projection_v2 import ProjectionReadScope
+    from memoryguard.runtime_v2.projection_build import ProjectionBuildError, ProjectionBuildService
+
+    scope = ProjectionReadScope(
+        workspace_id=str(tmp_path.resolve()),
+        agent_instance_id="agent-empty",
+        project_ref=str(tmp_path.resolve()),
+        provider="gui",
+        share_group_id="group-empty",
+        sensitivity="normal",
+        policy_class="private",
+    )
+    service = ProjectionBuildService(tmp_path)
+    before = set(tmp_path.rglob("*"))
+    try:
+        service.build(mode="reconstructed", scope=scope, runtime_role="gui")
+    except ProjectionBuildError as exc:
+        assert exc.code == "no_projection_sources"
+    else:  # pragma: no cover - regression assertion
+        raise AssertionError("empty projection build must fail closed")
+    assert set(tmp_path.rglob("*")) == before
+    assert service.current(mode="reconstructed", scope=scope)["projection"] is None

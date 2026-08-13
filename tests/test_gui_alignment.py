@@ -212,7 +212,8 @@ def test_gui_readonly_no_side_effects(tmp_path: Path):
 
     snapshot = api.get_governance_snapshot(group)
     assert snapshot["ok"] is True, snapshot
-    assert snapshot["data"]["status"] == "READY"
+    assert snapshot["data"]["governance_state"] == "audit_only"
+    assert snapshot["data"]["status"]["active_count"] == 0
     assert snapshot["data"]["memory"]["total_records"] == 0
 
     assert memory_db.read_bytes() == before

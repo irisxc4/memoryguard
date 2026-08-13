@@ -143,8 +143,28 @@ def test_native_history_derives_scope_and_keeps_previews_body_free(tmp_path: Pat
 
     raw = service.dispatch("read", {"session_id": session_id}, context=context)
     assert raw["data"]["turns"][0]["content"] == "secret user body"
+    turn = service.dispatch("read", {"turn_id": turn_id}, context=context)
+    assert turn["data"]["turn"]["content"] == "secret user body"
+    invalid = service.dispatch(
+        "read", {"session_id": session_id, "turn_id": turn_id}, context=context,
+    )
+    assert invalid["ok"] is False
+    assert invalid["code"] == "conversation_selector_invalid"
+    assert "session_id" in invalid["message"] and "turn_id" in invalid["message"]
     exported = service.dispatch("export", {"session_ids": [session_id]}, context=context)
     assert exported["data"]["sessions"][0]["turns"][0]["content"] == "secret user body"
+
+
+def test_native_history_list_uses_readable_first_user_title_before_source_title(tmp_path: Path):
+    scope, _, _ = _seed(tmp_path)
+    listed = ContentHistoryStore(tmp_path, readonly=True).list_sessions(scope)
+    assert listed["total"] == 1
+    session = listed["sessions"][0]
+    assert session["display_title"] == "secret user body"
+    assert session["source_title"] == "native history"
+    assert session["preview_excerpt"] == "secret user body"
+    assert session["summarized"] is False
+    assert "first_user_text" not in session
 
 
 def test_native_history_missing_active_binding_is_existence_neutral(tmp_path: Path):

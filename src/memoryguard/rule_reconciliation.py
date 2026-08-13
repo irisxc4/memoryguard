@@ -2137,8 +2137,12 @@ def _native_canonical_reconciliation_status(
     # rule store so ordinary memory bootstrap is not blocked by an empty
     # placeholder database.
     import sqlite3
+    from contextlib import closing
     try:
-        with sqlite3.connect(f"file:{rules_db.as_posix()}?mode=ro", uri=True) as conn:
+        # sqlite3.Connection's context manager commits/rolls back but does not
+        # close the handle.  Use closing so repeated readiness reads do not
+        # pin rules.db on Windows.
+        with closing(sqlite3.connect(f"file:{rules_db.as_posix()}?mode=ro", uri=True)) as conn:
             initialized = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' "
                 "AND name='rules_schema_meta' LIMIT 1"

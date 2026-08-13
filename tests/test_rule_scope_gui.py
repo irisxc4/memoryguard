@@ -142,6 +142,28 @@ def test_rule_scope_options_only_expose_discovered_or_bound_targets(tmp_path: Pa
     assert "legacy_unknown" not in options
 
 
+def test_gui_rule_decisions_project_auto_scope_fields_for_grouped_display(tmp_path: Path) -> None:
+    api, _group_id, store = _prepare(tmp_path)
+    store.record_decision({
+        "decision_id": "auto-scope-delete",
+        "actor": "agent-a",
+        "owner_agent_id": "agent-a",
+        "rule_id": "rule-1",
+        "action": "delete",
+        "reason": '{"scope_reason":"auto project","scope_confidence":0.91,"assignment":{"target_type":"project"}}',
+        "confidence": 0.2,
+        "created_at": "2026-08-14T00:00:00Z",
+    })
+
+    result = api.list_rule_decisions()
+    assert result["ok"] is True, result
+    item = next(row for row in result["data"]["decisions"] if row["decision_id"] == "auto-scope-delete")
+    assert item["scope_reason"] == "auto project"
+    assert item["scope_confidence"] == 0.91
+    assert item["scope_type"] == "project"
+    assert item["object_type"] == "rule"
+
+
 def test_gui_audience_update_is_atomic_and_preview_is_agent_scoped(
     tmp_path: Path, monkeypatch,
 ) -> None:

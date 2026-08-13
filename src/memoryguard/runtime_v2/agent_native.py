@@ -22,6 +22,7 @@ from typing import Any, Callable, Mapping, Sequence
 from ..agent_locator import AgentLocator
 from ..content.store import ContentStore, stable_id
 from ..storage.database import open_database
+from ..storage.transaction import transaction
 from .group_native import GroupControlError, GroupControlService, SystemControlStore, _digest, _json, _now
 
 
@@ -280,6 +281,60 @@ class AgentNativeService:
             raise AgentNativeError('agent_path_not_discovered')
         return matches[0]
 
+    def _selected_enabled_source_ids(self, instance_id: str) -> tuple[set[str], set[str]]:
+        """Return manifest-selected IDs and the subset with live connectors.
+
+        SelectionManifest is the per-Agent authorization ledger; the content
+        connector is the buildability gate.  Keeping the intersection here
+        prevents a stale manifest (for example after an external disable) from
+        being reported as an available build source.
+        """
+        selected = set(self.control.selected_source_ids(str(instance_id)))
+        if not selected:
+            return selected, set()
+        connectors = self.content.list_source_connectors(
+            workspace_id=str(self.workspace), enabled=True,
+        )
+        enabled = {
+            str(row.get("source_id") or "")
+            for row in connectors
+            if str(row.get("source_id") or "")
+        }
+        return selected, selected & enabled
+
+    @staticmethod
+    def _restore_connector_snapshot(
+        content: ContentStore,
+        snapshot: Mapping[str, Mapping[str, Any]],
+        touched: set[str],
+    ) -> None:
+        """Restore connector metadata after the cross-database saga fails."""
+        with open_database(content.db_path) as conn:
+            with transaction(conn):
+                for source_id in touched:
+                    previous = snapshot.get(source_id)
+                    if previous is None:
+                        conn.execute(
+                            "DELETE FROM source_connectors WHERE source_id=?",
+                            (source_id,),
+                        )
+                        continue
+                    conn.execute(
+                        "UPDATE source_connectors SET workspace_id=?,provider=?,"
+                        "source_type=?,external_root_key=?,enabled=?,created_at=?,"
+                        "updated_at=? WHERE source_id=?",
+                        (
+                            str(previous.get("workspace_id") or content.workspace_id),
+                            str(previous.get("provider") or ""),
+                            str(previous.get("source_type") or ""),
+                            str(previous.get("external_root_key") or ""),
+                            int(bool(previous.get("enabled"))),
+                            str(previous.get("created_at") or ""),
+                            str(previous.get("updated_at") or ""),
+                            source_id,
+                        ),
+                    )
+
     def commit_selection(self, instance_id: str, selected: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         instance, _candidate, _paths = self._instance_context(instance_id)
         tree = self.get_selection_tree(instance_id)
@@ -305,39 +360,69 @@ class AgentNativeService:
             if resolved not in allowed:
                 raise AgentNativeError("selection_path_not_discovered")
             normalized.append((resolved, item))
-        source_ids = [stable_id("agent-source", str(instance_id), path) for path, _ in normalized]
+        source_by_id = {
+            stable_id("agent-source", str(instance_id), path): path
+            for path, _ in normalized
+        }
+        source_ids = sorted(source_by_id)
         digest = hashlib.sha256(_json({"instance_id": str(instance_id), "source_ids": sorted(source_ids)}).encode("utf-8")).hexdigest()
 
         content = ContentStore(self.workspace)
         previous = set(self.control.selected_source_ids(str(instance_id)))
         all_touched = previous | set(source_ids)
-        previous_enabled: dict[str, bool] = {}
         existing = {str(row.get("source_id") or ""): row for row in content.list_source_connectors(workspace_id=str(self.workspace))}
-        for source_id in all_touched:
-            if source_id in existing:
-                previous_enabled[source_id] = bool(existing[source_id].get("enabled"))
+        snapshot = {source_id: existing[source_id] for source_id in all_touched if source_id in existing}
         try:
-            for source_id in previous - set(source_ids):
-                content.set_source_connector_enabled(source_id, False, workspace_id=str(self.workspace))
-            for (path, item), source_id in zip(normalized, source_ids):
-                path_obj = Path(path)
-                content.upsert_source_connector(
-                    source_id=source_id,
-                    provider=str(instance.product or "agent"),
-                    source_type="directory" if path_obj.is_dir() else "file",
-                    external_root_key=path,
-                    workspace_id=str(self.workspace),
-                    enabled=True,
-                )
+            # The control manifest and content connector live in separate
+            # SQLite databases.  Commit the connector side as one transaction,
+            # then commit the manifest; failures compensate both sides so no
+            # partial selection is observable after this call returns.
+            with open_database(content.db_path) as conn:
+                with transaction(conn):
+                    for source_id in previous - set(source_ids):
+                        content.set_source_connector_enabled(
+                            source_id, False, workspace_id=str(self.workspace), conn=conn,
+                        )
+                    for source_id, path in source_by_id.items():
+                        path_obj = Path(path)
+                        content.upsert_source_connector(
+                            source_id=source_id,
+                            provider=str(instance.product or "agent"),
+                            source_type="directory" if path_obj.is_dir() else "file",
+                            external_root_key=path,
+                            workspace_id=str(self.workspace),
+                            enabled=True,
+                            conn=conn,
+                        )
             result = GroupControlService(self.workspace, write=True).record_selection(
                 str(instance_id), source_ids, digest,
             )
+            committed = set(self.control.selected_source_ids(str(instance_id)))
+            live_connectors = {
+                str(row.get("source_id") or "")
+                for row in content.list_source_connectors(
+                    workspace_id=str(self.workspace), enabled=True,
+                )
+            }
+            if committed != set(source_ids) or not set(source_ids) <= live_connectors:
+                raise AgentNativeError("selection_commit_incomplete")
         except Exception:
-            for source_id in all_touched:
-                if source_id in previous_enabled:
-                    content.set_source_connector_enabled(source_id, previous_enabled[source_id], workspace_id=str(self.workspace))
-                elif source_id in set(source_ids):
-                    content.set_source_connector_enabled(source_id, False, workspace_id=str(self.workspace))
+            try:
+                self._restore_connector_snapshot(content, snapshot, all_touched)
+            except Exception:
+                # Preserve the original operation failure; the restore attempt
+                # remains auditable through the absence of a successful result.
+                pass
+            try:
+                if set(self.control.selected_source_ids(str(instance_id))) != previous:
+                    restore_digest = hashlib.sha256(
+                        _json({"instance_id": str(instance_id), "source_ids": sorted(previous)}).encode("utf-8")
+                    ).hexdigest()
+                    GroupControlService(self.workspace, write=True).record_selection(
+                        str(instance_id), sorted(previous), restore_digest,
+                    )
+            except Exception:
+                pass
             raise
         result.update({"added_source_count": len(set(source_ids) - previous), "disabled_source_count": len(previous - set(source_ids))})
         return result
@@ -618,7 +703,8 @@ class AgentNativeService:
         instance, cid, _paths = self._instance_context(instance_id)
         value = dict(instance.to_dict())
         value.update(self.residual_cleanup(instance_id=str(instance_id)))
-        value["source_count"] = len(self.control.selected_source_ids(str(instance_id)))
+        _selected, enabled = self._selected_enabled_source_ids(str(instance_id))
+        value["source_count"] = len(enabled)
         value["candidate_id"] = cid
         return value
 
@@ -634,6 +720,16 @@ class AgentNativeService:
         for item in discovered["instances"]:
             instance, _candidate, _paths = self._instance_context(str(item["instance_id"]))
             private_surfaces, shared_surfaces, install_surfaces = self._surface_partition(instance)
+            all_surfaces = [
+                surface for surface in (getattr(instance, "surfaces", ()) or ())
+                if isinstance(surface, Mapping)
+            ]
+            item["found_surface_count"] = int(sum(
+                str(surface.get("status") or "") == "found" for surface in all_surfaces
+            ))
+            item["surface_count"] = int(len(all_surfaces))
+            _selected, enabled_sources = self._selected_enabled_source_ids(str(item["instance_id"]))
+            item["bound_source_count"] = int(len(enabled_sources))
             binding = active_bindings.get(str(item["instance_id"]))
             if binding:
                 item["binding"] = binding
@@ -644,6 +740,9 @@ class AgentNativeService:
                 continue
             if private_surfaces and not install_surfaces:
                 residual = self.residual_cleanup(instance_id=str(item["instance_id"]))
+                residual["found_surface_count"] = item["found_surface_count"]
+                residual["surface_count"] = item["surface_count"]
+                residual["bound_source_count"] = item["bound_source_count"]
                 residual["binding_status"] = "missing"
                 residual["control_repair_required"] = True
                 residuals.append(residual)

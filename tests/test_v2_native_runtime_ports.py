@@ -9,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import time
 from types import MappingProxyType
 import weakref
 
@@ -33,6 +34,22 @@ from memoryguard.runtime_v2.native_ports import (
 )
 
 
+def test_gui_history_structured_selector_request_survives_native_binding() -> None:
+    from memoryguard.runtime_v2.native_ports import _payload, _phase9_gui_payload
+
+    session = _phase9_gui_payload(
+        "gui", "history_read",
+        _payload([{"session_id": "session-1", "limit": 100, "offset": 0}]),
+    )
+    assert session == {"session_id": "session-1", "limit": 100, "offset": 0}
+
+    turn = _phase9_gui_payload(
+        "gui", "history_read",
+        _payload([{"turn_id": "turn-1", "limit": 1, "offset": 0}]),
+    )
+    assert turn == {"turn_id": "turn-1", "limit": 1, "offset": 0}
+
+
 def _trusted_native_context(tmp_path: Path) -> dict[str, object]:
     from memoryguard.access_context import AccessContext
 
@@ -48,6 +65,25 @@ def _trusted_native_context(tmp_path: Path) -> dict[str, object]:
         ),
         workspace_id=str(tmp_path),
         share_group_id="group-bound",
+    )
+
+
+def _trusted_server_admin_context(tmp_path: Path) -> dict[str, object]:
+    from memoryguard.access_context import AccessContext
+    from memoryguard.desktop_executor import SERVER_ADMIN_AGENT_ID, SERVER_ADMIN_GROUP_ID
+
+    return bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id=SERVER_ADMIN_AGENT_ID,
+            is_admin=True,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="server-admin-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id=SERVER_ADMIN_GROUP_ID,
     )
 
 
@@ -257,36 +293,63 @@ def test_native_control_plane_reads_and_cli_probes_are_noop(tmp_path: Path):
 
 
 def test_native_graph_and_semantic_reads_are_scoped_and_no_body_leak(tmp_path: Path):
-    from memoryguard.codegraph_v2 import CodeGraphScope, CodeGraphStore
+    from memoryguard.access_context import AccessContext
     from memoryguard.memory.store import MemoryAtomStore
+    from memoryguard.runtime_v2.projection_build import ProjectionBuildService
+    from memoryguard.projection_v2 import ProjectionReadScope
+    from _publish_helpers import seed_atom
 
-    context = {
-        **_context(tmp_path),
-        "runtime_role": "root",
-    }
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound", is_admin=False, strict_binding=True,
+            allow_anon=False, session_id="graph-session", session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="group-bound",
+        project_ref=str(tmp_path.resolve()),
+        provider="codex",
+        runtime_role="root",
+        sensitivity="normal",
+        policy_class="private",
+    )
     missing = NativeV2RuntimePort(tmp_path)
     before = list(tmp_path.rglob("*"))
-    for name, args in (
-        ("memoryguard_neuron_graph", {}),
-        ("memoryguard_semantic_check", {"text": "hello"}),
-    ):
-        result = missing.dispatch_mcp(name, args, context=context, generation=1)
-        assert result["ok"] is False
-        assert result["code"] in {"v2_store_unavailable", "v2_schema_missing"}
+    graph_missing = missing.dispatch_mcp(
+        "memoryguard_neuron_graph", {}, context=context, generation=1,
+    )
+    assert graph_missing["ok"] is True
+    assert graph_missing["data"]["status"] == "NO_SOURCE"
+    semantic_missing = missing.dispatch_mcp(
+        "memoryguard_semantic_check", {"text": "hello"}, context=context, generation=1,
+    )
+    assert semantic_missing["ok"] is False
+    assert semantic_missing["code"] in {"v2_store_unavailable", "v2_schema_missing"}
     assert list(tmp_path.rglob("*")) == before
 
-    graph_store = CodeGraphStore(tmp_path)
-    graph_scope = CodeGraphScope(
-        str(tmp_path), "agent-bound", "project-bound", "codex", "group-bound", "root",
+    seed_atom(
+        tmp_path,
+        "native-graph-memory",
+        "private body must not enter graph",
+        agent_id="agent-bound",
+        share_group_id="group-bound",
+        provider="codex",
+        runtime_role="root",
     )
-    source = graph_store.upsert_source_file(
-        "src/demo.py",
-        "digest-demo",
-        scope=graph_scope,
-        symbols=({"name": "demo", "kind": "function", "signature": "demo()", "line_start": 1, "line_end": 2},),
+    scope = ProjectionReadScope(
+        workspace_id=str(tmp_path.resolve()),
+        agent_instance_id="agent-bound",
+        project_ref=str(tmp_path.resolve()),
+        provider="codex",
+        share_group_id="group-bound",
+        sensitivity="normal",
+        policy_class="private",
+    )
+    ProjectionBuildService(tmp_path).build(
+        mode="reconstructed", scope=scope, runtime_role="root",
     )
     # Native semantic reads accept an explicitly validated read-only store;
-    # no atom rows are needed to prove empty/scope-neutral behavior here.
+    # the seeded atom is visible only to this exact trusted scope.
     memory_store = MemoryAtomStore(tmp_path)
     readonly_memory = MemoryAtomStore(tmp_path, readonly=True)
     port = NativeV2RuntimePort(
@@ -298,9 +361,9 @@ def test_native_graph_and_semantic_reads_are_scoped_and_no_body_leak(tmp_path: P
     )
     assert graph["ok"] is True
     assert graph["data"]["status"] == "READY"
-    assert any(node["id"] == source.file_id for node in graph["data"]["nodes"])
+    assert any(node.get("memory_id") == "native-graph-memory" for node in graph["data"]["nodes"])
     encoded_graph = json.dumps(graph, ensure_ascii=False)
-    assert "body" not in encoded_graph and "demo source body" not in encoded_graph
+    assert "body" not in encoded_graph and "private body" not in encoded_graph
 
     semantic = port.dispatch_mcp(
         "memoryguard_semantic_check", {"text": "hello", "threshold": 0.8},
@@ -308,20 +371,84 @@ def test_native_graph_and_semantic_reads_are_scoped_and_no_body_leak(tmp_path: P
     )
     assert semantic["ok"] is True
     assert semantic["data"]["duplicates"] == []
-    assert semantic["data"]["checked_against"] == 0
+    assert semantic["data"]["checked_against"] == 1
     assert not (tmp_path / "legacy").exists()
     del memory_store
 
-    other = {
-        **context,
-        "agent_instance_id": "other-agent",
-        "share_group_id": "other-group",
-    }
+    other = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="other-agent", is_admin=False, strict_binding=True,
+            allow_anon=False, session_id="other-session", session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="other-group",
+        project_ref=str(tmp_path.resolve()),
+        provider="codex",
+        runtime_role="root",
+        sensitivity="normal",
+        policy_class="private",
+    )
     isolated = port.dispatch_mcp(
         "memoryguard_neuron_graph", {}, context=other, generation=1,
     )
     assert isolated["ok"] is True
     assert isolated["data"]["nodes"] == []
+
+
+def test_cli_hook_mutation_mints_trusted_context_when_outer_cli_omits_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    from memoryguard import access_context
+    from memoryguard.access_context import AccessContext
+    from memoryguard.runtime_v2 import group_native
+
+    access = AccessContext(
+        trusted_agent_id="cli-agent",
+        is_admin=True,
+        strict_binding=True,
+        allow_anon=False,
+        session_id="cli-session",
+        session_source="transport",
+        session_trusted=True,
+    )
+    monkeypatch.setattr(access_context, "load_access_context", lambda: access)
+
+    class BindingService:
+        def __init__(self, workspace, *, write):
+            assert Path(workspace).resolve() == tmp_path.resolve()
+            assert write is False
+
+        def active_binding_for_agent(self, agent_instance_id):
+            assert agent_instance_id == "cli-agent"
+            return {"share_group_id": "selected-group"}
+
+    monkeypatch.setattr(group_native, "GroupControlService", BindingService)
+
+    class Manifest:
+        def current(self):
+            return {"state": "V2_ACTIVE", "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest())
+    changed = port.dispatch_cli(
+        "hooks",
+        {"action": "mode", "provider": "codex", "mode": "enforce"},
+        context={},
+        generation=1,
+        # The native classifier must not allow a mutating hooks action to be
+        # downgraded by the outer adapter's default mutation=False.
+        mutation=False,
+        state="V2_ACTIVE",
+    )
+    assert changed["ok"] is True, changed
+    assert changed["data"]["host_action"] == "hooks"
+
+    status = port.dispatch_cli(
+        "hooks", {"action": "status"}, context={}, generation=1,
+        mutation=False, state="V2_ACTIVE",
+    )
+    assert status["ok"] is True, status
+    assert status["data"]["host_action"] == "hooks"
 
 
 def test_native_audit_is_real_ro_receipt_without_report_writes(tmp_path: Path):
@@ -386,8 +513,8 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
     )
     # Phase-11 acceptance requires every canonical GUI operation to resolve to
     # a native handler. A missing handler is a blocker, never a retired success.
-    assert coverage["surfaces"]["gui"]["total"] == 162
-    assert coverage["surfaces"]["gui"]["implemented"] == 162
+    assert coverage["surfaces"]["gui"]["total"] == 166
+    assert coverage["surfaces"]["gui"]["implemented"] == 166
     assert coverage["surfaces"]["gui"]["blocker"] == 0
     gui_by_name = {
         item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]
@@ -1288,3 +1415,401 @@ def test_generation_port_dispatch_does_not_retry_type_error():
             Port(), generation=1, state="V2_ACTIVE", facade=V2RuntimeFacade(),
         ).dispatch("gui", "get_audit", {}, context={})
     assert calls == 1
+
+
+def test_gui_governance_snapshot_is_scoped_and_has_stable_contract(tmp_path: Path):
+    from _publish_helpers import seed_atom
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agent("agent-bound", "group-bound")
+    groups.set_scope(
+        "agent-bound",
+        {"mode": "agent", "agent_instance_id": "agent-bound"},
+    )
+    seed_atom(
+        tmp_path,
+        "snapshot-active",
+        "bounded snapshot fixture",
+        agent_id="agent-bound",
+        share_group_id="group-bound",
+    )
+
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+    result = port.dispatch_gui(
+        "get_governance_snapshot",
+        ["caller-selected-group-must-be-ignored"],
+        context=_trusted_native_context(tmp_path),
+        generation=1,
+        state="V2_ACTIVE",
+    )
+
+    assert result["ok"] is True, result
+    data = result["data"]
+    assert data["governance_state"] == "active_governance"
+    assert data["status"]["active_count"] == 1
+    assert data["conflicts"]["count"] == 0
+    assert data["quarantine"]["count"] == 0
+    assert data["group"] == {
+        "share_group_id": "group-bound",
+        "members": ["agent-bound"],
+        "member_count": 1,
+    }
+    assert "bounded snapshot fixture" not in json.dumps(data, ensure_ascii=False)
+
+
+def test_server_admin_scope_get_uses_selected_agent_binding(tmp_path: Path):
+    from memoryguard.runtime_v2.group_native import GroupControlService
+    from memoryguard.runtime_v2.group_native import personal_group_id
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agent("selected-agent", personal_group_id("selected-agent"))
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+    context = _trusted_server_admin_context(tmp_path)
+
+    selected = port.dispatch_gui(
+        "set_governance_scope",
+        [{"mode": "agent", "agent_instance_id": "selected-agent"}],
+        context=context,
+        generation=1,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert selected["ok"] is True, selected
+
+    scope = port.dispatch_gui(
+        "get_governance_scope_state",
+        [],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert scope["ok"] is True, scope
+    data = scope["data"]
+    assert data["empty"] is False
+    assert data["active_binding"]["agent_instance_id"] == "selected-agent"
+    assert data["active_binding"]["share_group_id"] == personal_group_id("selected-agent")
+    assert data["members"] == ["selected-agent"]
+
+
+def test_server_admin_shared_scope_get_and_snapshot_use_active_members(tmp_path: Path):
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agents(
+        ["selected-agent-a", "selected-agent-b"],
+        share_group_id="selected-shared-group",
+    )
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+    context = _trusted_server_admin_context(tmp_path)
+
+    selected = port.dispatch_gui(
+        "set_governance_scope",
+        [{"mode": "share_group", "share_group_id": "selected-shared-group"}],
+        context=context,
+        generation=1,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert selected["ok"] is True, selected
+
+    scope = port.dispatch_gui(
+        "get_governance_scope_state",
+        [],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert scope["ok"] is True, scope
+    scope_data = scope["data"]
+    assert scope_data["empty"] is False
+    assert scope_data["active_binding"]["agent_instance_id"] in {
+        "selected-agent-a", "selected-agent-b",
+    }
+    assert scope_data["active_binding"]["agent_instance_id"] != "memoryguard-server-admin"
+    assert scope_data["members"] == ["selected-agent-a", "selected-agent-b"]
+
+    snapshot = port.dispatch_gui(
+        "get_governance_snapshot",
+        ["caller-selected-group-must-be-ignored"],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert snapshot["ok"] is True, snapshot
+    data = snapshot["data"]
+    assert data["governance_state"] == "active_governance"
+    assert data["group"] == {
+        "share_group_id": "selected-shared-group",
+        "members": ["selected-agent-a", "selected-agent-b"],
+        "member_count": 2,
+    }
+
+
+def test_server_admin_memberless_scope_is_empty_and_audit_only(tmp_path: Path):
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    binding = groups.bind_agent("selected-agent", "memberless-admin-group")
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+    context = _trusted_server_admin_context(tmp_path)
+
+    selected = port.dispatch_gui(
+        "set_governance_scope",
+        [{"mode": "share_group", "share_group_id": "memberless-admin-group"}],
+        context=context,
+        generation=1,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert selected["ok"] is True, selected
+    groups.unbind(binding["binding_id"])
+
+    scope = port.dispatch_gui(
+        "get_governance_scope_state",
+        [],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert scope["ok"] is True, scope
+    assert scope["data"]["empty"] is True
+    assert scope["data"]["scope"] is None
+    assert scope["data"]["active_binding"] is None
+    assert scope["data"]["members"] == []
+
+    snapshot = port.dispatch_gui(
+        "get_governance_snapshot",
+        ["memberless-admin-group"],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert snapshot["ok"] is True, snapshot
+    assert snapshot["data"]["governance_state"] == "audit_only"
+    assert snapshot["data"]["group"] == {
+        "share_group_id": "",
+        "members": [],
+        "member_count": 0,
+    }
+
+
+def test_stale_memberless_scope_is_rejected_and_snapshot_is_audit_only(tmp_path: Path):
+    from memoryguard.access_context import AccessContext
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    bound = groups.bind_agent("agent-bound", "memberless-group")
+    groups.set_scope(
+        "agent-bound",
+        {"mode": "share_group", "share_group_id": "memberless-group"},
+    )
+    groups.unbind(bound["binding_id"])
+
+    scope = groups.scope_state("agent-bound")
+    assert scope["empty"] is True
+    assert scope["scope"] is None
+
+    context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-bound",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="stale-snapshot-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path),
+        share_group_id="memberless-group",
+    )
+    result = NativeV2RuntimePort(tmp_path).dispatch_gui(
+        "get_governance_snapshot",
+        ["memberless-group"],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+
+    assert result["ok"] is True, result
+    data = result["data"]
+    assert data["governance_state"] == "audit_only"
+    assert data["status"]["active_count"] == 0
+    assert data["conflicts"]["count"] == 0
+    assert data["quarantine"]["count"] == 0
+    assert data["group"] == {"share_group_id": "", "members": [], "member_count": 0}
+
+
+def test_server_admin_shared_projection_scope_uses_group_atoms_and_empty_build_fails(tmp_path: Path):
+    from _publish_helpers import seed_atom
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agents(["shared-agent-a", "shared-agent-b"], share_group_id="shared-projection-group")
+    groups.set_scope(
+        "memoryguard-server-admin",
+        {"mode": "share_group", "share_group_id": "shared-projection-group"},
+        admin=True,
+    )
+    context = _trusted_server_admin_context(tmp_path)
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+
+    seed_atom(tmp_path, "shared-a", "shared A", agent_id="shared-agent-a", share_group_id="shared-projection-group")
+    seed_atom(tmp_path, "shared-b", "shared B", agent_id="shared-agent-b", share_group_id="shared-projection-group")
+    business_scope = port._gui_projection_scope(context)
+    assert business_scope.agent_instance_id == ""
+    assert business_scope.share_group_id == "shared-projection-group"
+
+    source_map = port.dispatch_gui(
+        "get_projection_source_map", [], context=context, generation=1, state="V2_ACTIVE",
+    )
+    assert source_map["ok"] is True, source_map
+    summary = source_map["data"]["summary"]
+    assert summary["selected_source_connectors"] == 0
+    assert summary["governed_memory"] == 2
+    assert summary["buildable_atom_count"] == 2
+    assert all(item["entry_kind"] == "governed_memory" for item in source_map["data"]["entries"])
+
+    graph_before_build = port.dispatch_gui(
+        "get_memory_neuron_graph", ["reconstructed"],
+        context=context, generation=1, state="V2_ACTIVE",
+    )
+    assert graph_before_build["ok"] is True, graph_before_build
+    graph_data = graph_before_build["data"]
+    assert graph_data["reason"] == "not_built"
+    assert graph_data["scope"]["agent_instance_id"] == ""
+    assert graph_data["scope"]["share_group_id"] == "shared-projection-group"
+    assert graph_data["source_map"]["projection_kind"] == "shared_memory_projection"
+    assert graph_data["source_map"]["summary"]["buildable_atom_count"] == 2
+
+    accepted = port.dispatch_gui(
+        "start_build_projection",
+        [True, "reconstructed", {}, "browser-agent", "browser-group", "", "", "deterministic"],
+        context=context, generation=1, mutation=True, state="V2_ACTIVE",
+    )
+    assert accepted["ok"] is True, accepted
+    run_id = accepted["task"]["run_id"]
+    final = {}
+    for _ in range(500):
+        final = port.dispatch_gui(
+            "get_build_progress", [run_id], context=context, generation=1, state="V2_ACTIVE",
+        )
+        if final.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.01)
+    assert final["status"] == "succeeded", final
+    assert final["result_ref"]["atom_count"] == 2
+
+
+def test_server_admin_selected_member_of_shared_group_reads_one_group_memory_plane(tmp_path: Path):
+    from _publish_helpers import seed_atom
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agents(["shared-agent-a", "shared-agent-b"], share_group_id="shared-projection-group")
+    groups.set_scope(
+        "memoryguard-server-admin",
+        {"mode": "agent", "agent_instance_id": "shared-agent-a"},
+        admin=True,
+    )
+    seed_atom(tmp_path, "shared-a", "shared A", agent_id="shared-agent-a", share_group_id="shared-projection-group")
+    seed_atom(tmp_path, "shared-b", "shared B", agent_id="shared-agent-b", share_group_id="shared-projection-group")
+
+    context = _trusted_server_admin_context(tmp_path)
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+
+    business_scope = port._gui_projection_scope(context)
+    assert business_scope.agent_instance_id == ""
+    assert business_scope.share_group_id == "shared-projection-group"
+
+    graph = port.dispatch_gui(
+        "get_memory_neuron_graph", ["reconstructed"],
+        context=context, generation=1, state="V2_ACTIVE",
+    )
+    assert graph["ok"] is True, graph
+    assert graph["data"]["source_map"]["projection_kind"] == "shared_memory_projection"
+    assert graph["data"]["source_map"]["summary"]["governed_memory"] == 2
+    assert graph["data"]["source_map"]["summary"]["buildable_atom_count"] == 2
+
+    snapshot = port.dispatch_gui(
+        "get_governance_snapshot", [],
+        context=context, generation=1, state="V2_ACTIVE",
+    )
+    assert snapshot["ok"] is True, snapshot
+    assert snapshot["data"]["status"]["active_count"] == 2
+    assert snapshot["data"]["group"]["member_count"] == 2
+
+    empty_groups = GroupControlService(tmp_path, write=True)
+    empty_groups.bind_agents(["empty-agent-a", "empty-agent-b"], share_group_id="empty-projection-group")
+    empty_groups.set_scope(
+        "memoryguard-server-admin",
+        {"mode": "share_group", "share_group_id": "empty-projection-group"},
+        admin=True,
+    )
+    empty = port.dispatch_gui(
+        "start_build_projection",
+        [True, "reconstructed", {}, "browser-agent", "empty-projection-group", "", "", "deterministic"],
+        context=context, generation=1, mutation=True, state="V2_ACTIVE",
+    )
+    assert empty["ok"] is True, empty
+    empty_run_id = empty["task"]["run_id"]
+    empty_final = {}
+    for _ in range(500):
+        empty_final = port.dispatch_gui(
+            "get_build_progress", [empty_run_id], context=context, generation=1, state="V2_ACTIVE",
+        )
+        if empty_final.get("status") in {"succeeded", "failed", "cancelled"}:
+            break
+        time.sleep(0.01)
+    assert empty_final["status"] == "failed", empty_final
+    assert empty_final["error"]["code"] == "no_projection_sources"
+
+
+def test_gui_rule_record_projects_v2_rule_into_existing_card_contract() -> None:
+    row = NativeV2RuntimePort._gui_rule_record({
+        "definition_id": "definition-a",
+        "memory_id": "memory-a",
+        "canonical_text": "Run focused tests before release.",
+        "rule_kind": "procedure",
+        "rule_strength": "must",
+        "bindings": [{
+            "binding_id": "binding-a",
+            "target_type": "agent",
+            "target_id": "agent-a",
+            "project_ref": "",
+            "effect": "include",
+            "priority": 100,
+        }],
+    })
+
+    assert row["body"] == "Run focused tests before release."
+    assert row["kind"] == "procedure"
+    assert row["status"] == "active"
+    assert row["injection_policy"] == "always"
+    assert row["priority"] == 100
+    assert row["assignments"] == [{
+        "assignment_id": "binding-a",
+        "target_type": "agent",
+        "target_id": "agent-a",
+        "project_ref": "",
+        "effect": "include",
+        "priority_override": 100,
+    }]

@@ -337,8 +337,8 @@ class KnowledgeV2ReadonlyService:
                 if len(meta_rows) != 1 or str(meta_rows[0][0]) != "version":
                     raise KnowledgeV2SchemaError("content_schema_unavailable")
                 aux_version = str(meta_rows[0][1])
-                if aux_version != "3":
-                    code = "content_schema_future" if aux_version.isdigit() and int(aux_version) > 3 else "content_schema_unsupported"
+                if aux_version != "4":
+                    code = "content_schema_future" if aux_version.isdigit() and int(aux_version) > 4 else "content_schema_unsupported"
                     raise KnowledgeV2SchemaError(code)
                 if not _CONTENT_REQUIRED_TABLES <= tables:
                     raise KnowledgeV2SchemaError("content_schema_incomplete")

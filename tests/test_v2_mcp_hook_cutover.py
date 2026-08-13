@@ -182,7 +182,9 @@ def test_v2_product_surfaces_route_through_native_mcp_facade(
         provider: str = "codex"
 
     monkeypatch.setattr(mcp_server, "_effective_agent_context", lambda args, group: _Context())
-    args = {"provider": "cursor"} if name == "memoryguard_provider_install" else {}
+    args = {"workspace": str(tmp_path)}
+    if name == "memoryguard_provider_install":
+        args["provider"] = "cursor"
     result = mcp_server.execute_tool(name, args)
     assert result.get("isError") is not True
     assert facade.mcp_calls[-1][0] == name

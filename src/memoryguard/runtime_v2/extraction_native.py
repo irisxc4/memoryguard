@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 from ..content.store import ContentStore
 from ..content_parsers import parse_file
 from ..governance_v2 import GovernanceV2
-from ..memory.store import MemoryAtom, MemoryAtomStore
+from ..memory.store import MemoryAtom, MemoryAtomStore, stable_digest
 from ..storage.database import open_database
 from ..storage.transaction import transaction
 from .native_ports import NativePortError, resolve_native_transport_context
@@ -72,6 +72,36 @@ def _scope(context: Any) -> dict[str, Any]:
 
 def _scope_digest(scope: Mapping[str, Any]) -> str:
     return _digest("scope", {str(key): str(value or "") for key, value in scope.items()})
+
+
+def _projection_scope(value: Any, workspace: Path) -> dict[str, Any]:
+    """Normalize an already-authorized internal projection scope.
+
+    Desktop requests arrive through the server-admin transport capability, but
+    the selected governance scope lives in the persisted group control plane.
+    The native GUI port resolves that selection before calling these internal
+    helpers.  Keep this seam private to the in-process service and require the
+    exact workspace plus a non-empty group; browser payload selectors never
+    reach it.
+    """
+
+    fields = {
+        "workspace_id": str(getattr(value, "workspace_id", "") or ""),
+        "share_group_id": str(getattr(value, "share_group_id", "") or ""),
+        "agent_instance_id": str(getattr(value, "agent_instance_id", "") or ""),
+        "project_ref": str(getattr(value, "project_ref", "") or ""),
+        "provider": str(getattr(value, "provider", "") or ""),
+        # Projection scopes intentionally span runtime roles unless the
+        # governed selector explicitly gains that dimension in the future.
+        "runtime_role": "",
+    }
+    try:
+        requested = Path(fields["workspace_id"]).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise NativePortError("projection_scope_required") from exc
+    if requested != workspace or not fields["share_group_id"]:
+        raise NativePortError("projection_scope_required")
+    return fields
 
 
 def _redact_secret(body: str) -> tuple[str, bool]:
@@ -512,7 +542,16 @@ class NativeExtractionEnrichmentService:
     # Host enrichment
     # ------------------------------------------------------------------
     @staticmethod
+    def _enrichment_content_fp(atom: MemoryAtom) -> str:
+        body = str(atom.body or "").strip()
+        return _digest(atom.memory_id, atom.canonical_hash, body, atom.kind, atom.confidence)
+
+    @staticmethod
     def _needs_enrichment(atom: MemoryAtom) -> bool:
+        metadata = dict(atom.metadata or {})
+        terminal_fp = str(metadata.get("enrichment_terminal_fp") or "")
+        if terminal_fp and terminal_fp == NativeExtractionEnrichmentService._enrichment_content_fp(atom):
+            return False
         try:
             english = looks_english_text(str(atom.body or ""))
         except Exception:
@@ -523,7 +562,7 @@ class NativeExtractionEnrichmentService:
     def _stage_enrichment_task(self, atom: MemoryAtom, scope: Mapping[str, Any]) -> str:
         body = str(atom.body or "").strip()
         title = body.splitlines()[0][:120] if body else atom.memory_id[:24]
-        content_fp = _digest(atom.memory_id, atom.canonical_hash, body, atom.kind, atom.confidence)
+        content_fp = self._enrichment_content_fp(atom)
         task_id = "enr-" + _digest("v2-enrichment", _scope_digest(scope), atom.memory_id, content_fp)[:20]
         blob_id = self.content.put_blob(body)
         if not blob_id:
@@ -552,8 +591,7 @@ class NativeExtractionEnrichmentService:
         )
         return task_id
 
-    def list_pending(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
-        scope = _scope(context)
+    def _list_pending_scope(self, payload: Mapping[str, Any], scope: Mapping[str, Any]) -> dict[str, Any]:
         raw_limit = payload.get("limit", 50)
         if isinstance(raw_limit, bool):
             raise NativePortError("invalid_limit")
@@ -585,6 +623,12 @@ class NativeExtractionEnrichmentService:
             "storage": "v2_content_plane",
         }
 
+    def list_pending(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        return self._list_pending_scope(payload, _scope(context))
+
+    def list_pending_projection(self, payload: Mapping[str, Any], *, scope: Any) -> dict[str, Any]:
+        return self._list_pending_scope(payload, _projection_scope(scope, self.workspace))
+
     def enrichment_status(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
         del payload
         scope = _scope(context)
@@ -598,9 +642,7 @@ class NativeExtractionEnrichmentService:
                 counts["other"] += 1
         return {**counts, "total": len(rows), "mode": "v2_content_plane"}
 
-    def build_and_enrich(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
-        del payload
-        scope = _scope(context)
+    def _build_and_enrich_scope(self, scope: Mapping[str, Any]) -> dict[str, Any]:
         atoms = self.memory.list_atoms(scope=scope, status="active")
         queued = 0
         for atom in atoms:
@@ -611,7 +653,7 @@ class NativeExtractionEnrichmentService:
             # rebuilds keep an applied task terminal for the same content_fp.
             if any(row["source_pk"] == task_id and row["status"] == "pending" for row in self._records(_TASK_SOURCE, scope)):
                 queued += 1
-        pending = self.list_pending({"limit": 100}, context=context)
+        pending = self._list_pending_scope({"limit": 100}, scope)
         return {
             "projection_built": True,
             "projection_mode": "v2_native_memory",
@@ -626,8 +668,21 @@ class NativeExtractionEnrichmentService:
             },
         }
 
-    def apply_enrichments(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
-        scope = _scope(context)
+    def build_and_enrich(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        del payload
+        return self._build_and_enrich_scope(_scope(context))
+
+    def build_and_enrich_projection(self, payload: Mapping[str, Any], *, scope: Any) -> dict[str, Any]:
+        del payload
+        return self._build_and_enrich_scope(_projection_scope(scope, self.workspace))
+
+    def _apply_enrichments_scope(
+        self,
+        payload: Mapping[str, Any],
+        scope: Mapping[str, Any],
+        *,
+        admin: bool,
+    ) -> dict[str, Any]:
         raw = payload.get("results")
         if not isinstance(raw, list) or not raw:
             raise NativePortError("enrichment_results_required")
@@ -668,16 +723,26 @@ class NativeExtractionEnrichmentService:
             updated.body = new_body
             updated.kind = str(item["kind"])
             updated.confidence = float(item["confidence"])
+            # Body mutations must advance the canonical hash.  Keeping the old
+            # hash here makes the next enrichment scan see a different content
+            # fingerprint forever and can requeue the atom after every apply.
+            updated.canonical_hash = stable_digest(updated.body)
             updated.metadata = {
                 **dict(updated.metadata),
                 "enrichment_mode": "host",
                 "enrichment_task_id": str(item["task_id"]),
                 "enrichment_rationale_digest": _digest(str(item.get("rationale") or "")),
             }
+            updated.metadata["enrichment_terminal_fp"] = self._enrichment_content_fp(updated)
             try:
                 persisted, decision = self.governance.put_atom(
                     updated,
-                    context={**scope, "actor": str(scope["agent_instance_id"]), "authority": "manual"},
+                    context={
+                        **scope,
+                        "actor": "memoryguard-server-admin" if admin else str(scope["agent_instance_id"]),
+                        "authority": "admin" if admin else "manual",
+                        "admin": bool(admin),
+                    },
                     reason="host enrichment applied",
                     confidence=float(item["confidence"]),
                     idempotency_key=f"apply_enrichment:{item['task_id']}:{meta.get('content_fp','')}",
@@ -707,6 +772,16 @@ class NativeExtractionEnrichmentService:
             "rebuild_suggested": False,
             "storage": "v2_memory",
         }
+
+    def apply_enrichments(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
+        return self._apply_enrichments_scope(payload, _scope(context), admin=False)
+
+    def apply_enrichments_projection(self, payload: Mapping[str, Any], *, scope: Any) -> dict[str, Any]:
+        return self._apply_enrichments_scope(
+            payload,
+            _projection_scope(scope, self.workspace),
+            admin=True,
+        )
 
     def dispatch(self, operation: str, payload: Any = None, *, context: Any = None, **_: Any) -> dict[str, Any]:
         data = dict(payload or {}) if isinstance(payload, Mapping) else {}

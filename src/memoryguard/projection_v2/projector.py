@@ -101,7 +101,7 @@ class BaseProjector:
             "projection_kind": self.kind,
             "projection_key": str(key),
             "atom_refs": atom_list,
-            "evidence_refs": evidence_list,
+            "evidence_refs": evidence_list if not safe_metadata.get("evidence_refs_compacted") else [],
             "metadata": safe_metadata,
         }
         if not source_digest:

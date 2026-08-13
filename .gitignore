@@ -36,8 +36,19 @@ htmlcov/
 *.tmp
 *.temp
 *.bak
+*.bak-*
+*.bak_*
 *.swp
 *~
+
+# 本地修补/验收脚手架（不得进入发布树）
+/.self-eval-scores.jsonl
+/CLAUDE_HANDOFF_*.md
+/NUL
+/_*.py
+/_*.txt
+/dist_builtin_graphify*/
+/fix_cursor_hooks_bom.ps1
 
 # 本地日志
 *.log

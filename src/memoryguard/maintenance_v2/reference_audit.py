@@ -142,7 +142,7 @@ _METADATA_MARKERS: dict[str, tuple[tuple[str, str, int], ...]] = {
     "memory": (("schema_meta", "memoryguard-v2-phase1", 1), ("memory_schema_meta", "memoryguard-v2-phase2-memory", 1)),
     "rules": (("schema_meta", "memoryguard-v2-phase1", 1), ("rules_schema_meta", "memoryguard-v2-phase2-rules", 2)),
     "evidence": (("schema_meta", "memoryguard-v2-phase1", 1), ("evidence_schema_meta", "memoryguard-v2-phase2-evidence", 1)),
-    "content": (("schema_meta", "memoryguard-v2-phase1", 1), ("content_schema_meta", "3", 3)),
+    "content": (("schema_meta", "memoryguard-v2-phase1", 1), ("content_schema_meta", "4", 4)),
     "knowledge": (("schema_meta", "memoryguard-v2-phase1", 1),),
     "codegraph": (("schema_meta", "memoryguard-v2-phase1", 1), ("codegraph_schema_meta", "2", 2)),
     "assets": (("schema_meta", "memoryguard-v2-phase1", 1), ("asset_schema_meta", "1", 1)),

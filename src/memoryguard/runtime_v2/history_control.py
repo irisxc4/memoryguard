@@ -17,6 +17,8 @@ from typing import Any, Iterable, Mapping
 
 from ..content.conversation_sync import ConversationEvent, ConversationSync
 from ..content.store import ContentStore, stable_id
+from ..storage.database import open_database
+from ..storage.layout import WorkspaceV2Layout
 from .group_native import GroupControlService
 from .task_coordinator import TaskExecution
 
@@ -248,13 +250,74 @@ class HistoryControlService:
             result.setdefault(provider, (agent, str(binding.get("share_group_id") or "")))
         return result
 
+    def _source_states(self) -> dict[str, dict[str, Any]]:
+        """Read durable per-source import progress without opening transcript bodies."""
+
+        path = WorkspaceV2Layout(self.workspace).content_db
+        if not path.is_file():
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        try:
+            with open_database(path, readonly=True) as conn:
+                rows = conn.execute(
+                    "SELECT s.source_id,s.state,s.last_error_code,m.source_revision,m.active "
+                    "FROM source_sync_state s LEFT JOIN source_manifest_items m "
+                    "ON m.source_id=s.source_id ORDER BY s.source_id"
+                ).fetchall()
+        except Exception:
+            return {}
+        for row in rows:
+            source_id = str(row[0] or "")
+            if not source_id:
+                continue
+            item = result.setdefault(source_id, {
+                "state": str(row[1] or ""),
+                "last_error_code": str(row[2] or ""),
+                "revisions": set(),
+            })
+            if bool(row[4]) and str(row[3] or ""):
+                item["revisions"].add(str(row[3]))
+        return result
+
+    @staticmethod
+    def _durably_current(source: HistorySource, state: Mapping[str, Any] | None) -> bool:
+        if not state or str(state.get("state") or "") not in {"complete", "partial"}:
+            return False
+        revisions = set(state.get("revisions") or ())
+        # A completed zero-visible-message source has no manifest items. Local
+        # session files are immutable enough to treat that terminal state as
+        # current; non-empty imports additionally prove the exact file revision.
+        return not revisions or source.revision in revisions
+
+    def _progress_token(self, states: Mapping[str, Mapping[str, Any]] | None = None) -> str:
+        current = states if states is not None else self._source_states()
+        parts = []
+        for source in discover_sources(self.home):
+            state = current.get(source.source_id, {}) if isinstance(current, Mapping) else {}
+            parts.append(
+                f"{source.source_id}:{source.revision}:{state.get('state','')}:"
+                f"{','.join(sorted(state.get('revisions') or ()))}"
+            )
+        return _digest("history-progress", *parts)
+
     def discover(self) -> dict[str, Any]:
         mapping = self._agent_map()
+        states = self._source_states()
         sources = []
         providers: dict[str, dict[str, int]] = {}
         for source in discover_sources(self.home):
             bound = mapping.get(source.provider)
-            status = "importable" if source.supported and bound else ("pending_binding" if source.supported else "unsupported")
+            durable = states.get(source.source_id)
+            if not source.supported:
+                status = "unsupported"
+            elif not bound:
+                status = "pending_binding"
+            elif self._durably_current(source, durable):
+                status = str(durable.get("state") or "complete")
+            elif durable and str(durable.get("state") or "") == "failed":
+                status = "error"
+            else:
+                status = "importable"
             item = {
                 "source_id": source.source_id,
                 "provider": source.provider,
@@ -270,35 +333,44 @@ class HistoryControlService:
             bucket["files"] += 1
             bucket["bytes"] += source.byte_count
             bucket["supported_files"] += int(source.supported)
-        return {"ok": True, "status": "succeeded", "sources": sources, "providers": providers}
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "sources": sources,
+            "providers": providers,
+            "progress_token": self._progress_token(states),
+        }
 
     def backfill(self, *, execution: TaskExecution | None = None, continuation: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        del continuation  # ContentSync revisions are the durable continuation source.
+        # Durable source_sync_state is authoritative.  The continuation is a
+        # replay/idempotency hint only; restarting the GUI must still resume at
+        # the first not-yet-terminal source.
+        del continuation
         mapping = self._agent_map()
         all_sources = [item for item in discover_sources(self.home) if item.supported]
-        ready = [item for item in all_sources if item.provider in mapping]
+        states = self._source_states()
+        bound_sources = [item for item in all_sources if item.provider in mapping]
+        current_sources = [item for item in bound_sources if self._durably_current(item, states.get(item.source_id))]
+        fresh_sources = [
+            item for item in bound_sources
+            if not self._durably_current(item, states.get(item.source_id))
+            and str((states.get(item.source_id) or {}).get("state") or "") != "failed"
+        ]
+        retry_sources = [
+            item for item in bound_sources
+            if str((states.get(item.source_id) or {}).get("state") or "") == "failed"
+        ]
+        # Never let historical failures starve unseen Codex/Cursor/Claude
+        # sources. Fill spare batch capacity with retries only after fresh work.
+        ready = [*fresh_sources, *retry_sources]
         pending_binding = sorted({item.provider for item in all_sources if item.provider not in mapping})
         processed_files = imported_sessions = imported_turns = changed_turns = partial = errors = 0
+        skipped = len(current_sources)
         processed_bytes = 0
         content: ContentStore | None = None
-        for index, source in enumerate(ready[:MAX_BATCH_FILES]):
-            if execution is not None:
-                execution.check_cancelled()
-                execution.progress(min(80, int(5 + 70 * index / max(1, min(len(ready), MAX_BATCH_FILES)))), "history_backfill", item_count=processed_files)
-            if processed_bytes and processed_bytes + min(source.byte_count, MAX_SOURCE_READ_BYTES) > MAX_BATCH_BYTES:
-                break
-            agent_id, group_id = mapping[source.provider]
-            try:
-                parsed = parse_source(source)
-            except HistoryControlError:
-                errors += 1
-                processed_files += 1
-                continue
-            processed_files += 1
-            processed_bytes += parsed.read_bytes
-            partial += int(parsed.truncated)
-            if not parsed.messages:
-                continue
+
+        def begin_source_sync(source: HistorySource, agent_id: str) -> tuple[ConversationSync, str, Any]:
+            nonlocal content
             if content is None:
                 content = ContentStore(
                     self.workspace,
@@ -308,16 +380,58 @@ class HistoryControlService:
                     retention_authority="workspace",
                 )
             sync = ConversationSync(content)
-            source_id = source.source_id
             owner = f"history-backfill:{agent_id}"
             run = sync.begin_sync(
-                source_id,
+                source.source_id,
                 owner_id=owner,
                 provider=source.provider,
                 source_type="local_history",
                 external_root_key="history:" + _digest(source.provider, str(source.path).casefold()),
                 workspace_id=str(self.workspace),
             )
+            return sync, owner, run
+
+        for index, source in enumerate(ready[:MAX_BATCH_FILES]):
+            if execution is not None:
+                execution.check_cancelled()
+                execution.progress(min(80, int(5 + 70 * index / max(1, min(len(ready), MAX_BATCH_FILES)))), "history_backfill", item_count=processed_files)
+            if processed_bytes and processed_bytes + min(source.byte_count, MAX_SOURCE_READ_BYTES) > MAX_BATCH_BYTES:
+                break
+            agent_id, group_id = mapping[source.provider]
+            sync, owner, run = begin_source_sync(source, agent_id)
+            try:
+                parsed = parse_source(source)
+            except HistoryControlError as exc:
+                errors += 1
+                processed_files += 1
+                try:
+                    sync.finish_sync(
+                        run,
+                        status="failed",
+                        continuation_cursor="",
+                        owner_id=owner,
+                        error_code=str(exc.code or "history_parse_failed"),
+                    )
+                except Exception:
+                    pass
+                continue
+            processed_files += 1
+            processed_bytes += parsed.read_bytes
+            partial += int(parsed.truncated)
+            if not parsed.messages:
+                skipped += 1
+                try:
+                    sync.finish_sync(
+                        run,
+                        status="complete",
+                        continuation_cursor="",
+                        owner_id=owner,
+                        error_code="",
+                    )
+                except Exception:
+                    errors += 1
+                continue
+            source_id = source.source_id
             events = [
                 ConversationEvent(
                     external_object_key=parsed.external_id,
@@ -361,7 +475,7 @@ class HistoryControlService:
                     owner_id=owner,
                     error_code=("bounded_prefix_imported" if parsed.truncated else ""),
                 )
-                if finish.state == "complete":
+                if finish.state in {"complete", "partial"}:
                     imported_sessions += 1
             except Exception:
                 errors += 1
@@ -369,18 +483,49 @@ class HistoryControlService:
                     sync.finish_sync(run, status="failed", error_code="history_backfill_failed", owner_id=owner)
                 except Exception:
                     pass
-        remaining = max(0, len(ready) - processed_files) + len(pending_binding)
+        fresh_processed = min(processed_files, len(fresh_sources))
+        remaining_fresh = max(0, len(fresh_sources) - fresh_processed)
+        refreshed_states = self._source_states()
+        remaining_failed = sum(
+            1 for source in bound_sources
+            if str((refreshed_states.get(source.source_id) or {}).get("state") or "") == "failed"
+        )
+        resolved_retries = sum(
+            1 for source in retry_sources
+            if str((refreshed_states.get(source.source_id) or {}).get("state") or "") != "failed"
+        )
+        # Continue through old failures only while the previous batch actually
+        # repaired at least one. This drains historical migration failures after
+        # a schema fix without turning a permanently bad source into a busy loop.
+        should_continue = remaining_fresh > 0 or (remaining_failed > 0 and resolved_retries > 0)
+        remaining = remaining_fresh + remaining_failed + len(pending_binding)
+        continuation_out = (
+            {"progress_token": self._progress_token(refreshed_states)}
+            if should_continue else None
+        )
+        status = (
+            "pending_binding" if pending_binding
+            else "importing" if should_continue
+            else "failed" if errors or remaining_failed
+            else "succeeded"
+        )
         return {
-            "status": "pending_binding" if pending_binding else ("importing" if remaining else ("failed" if errors else "succeeded")),
+            "status": status,
             "imported": imported_sessions,
             "turn_count": imported_turns,
             "changed_turn_count": changed_turns,
             "processed_files": processed_files,
             "processed_bytes": processed_bytes,
             "partial": partial,
+            "skipped": skipped,
             "errors": errors,
             "pending_binding": pending_binding,
             "remaining_files": remaining,
+            "remaining_work_files": remaining_fresh + remaining_failed,
+            "remaining_fresh_files": remaining_fresh,
+            "retryable_failed_files": remaining_failed,
+            "resolved_retry_files": resolved_retries,
+            "continuation": continuation_out,
             "storage": "v2_content_plane",
             "memory_record_count": 0,
         }

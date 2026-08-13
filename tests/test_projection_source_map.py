@@ -75,7 +75,14 @@ def test_projection_source_map_distinguishes_v2_connector_origins(tmp_path) -> N
     assert entries[logical_id]["provider"] == "knowledge-library"
     assert entries[evidence_id]["provider"] == "conversation-history"
     assert all(entry["source_type"] == "directory" for entry in entries.values())
-    assert source_map["summary"] == {"total": 3, "enabled": 3}
+    summary = source_map["summary"]
+    assert summary["total"] == 3
+    assert summary["enabled"] == 3
+    assert summary["selected_source_connectors"] == 3
+    assert summary["selected_source_connector_total"] == 3
+    assert summary["governed_memory"] == 0
+    assert summary["buildable_atom_count"] == 0
+    assert summary["logical_reconstruction"] == 3
     visible = SourceControlService(tmp_path).list_sources({
         "is_admin": False, "trusted_agent_id": "agent-1",
     })
@@ -163,7 +170,14 @@ def test_share_group_source_map_reports_v2_connector_origins(tmp_path) -> None:
         scope=_scope(tmp_path, agent="agent-a", group=gid),
     )
 
-    assert result["summary"] == {"total": 1, "enabled": 1}
+    summary = result["summary"]
+    assert summary["total"] == 1
+    assert summary["enabled"] == 1
+    assert summary["selected_source_connectors"] == 1
+    assert summary["selected_source_connector_total"] == 1
+    assert summary["governed_memory"] == 0
+    assert summary["buildable_atom_count"] == 0
+    assert summary["shared_memory"] == 0
     entry = result["entries"][0]
     assert entry["source_id"] == source_id
     assert entry["provider"] == "agent-native"

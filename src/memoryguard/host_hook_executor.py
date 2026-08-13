@@ -9,7 +9,7 @@ receipts.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .host_hooks import HostHookManager, get_hook_mode, set_hook_mode
 
@@ -41,6 +41,12 @@ class HostHookExecutor:
 
     def uninstall(self, provider: str) -> dict[str, Any]:
         return self._manager.uninstall(provider)
+
+    def remove_generated_bindings(
+        self,
+        bindings: Iterable[Mapping[str, Any]],
+    ) -> Any:
+        return self._manager.remove_generated_bindings(bindings)
 
     def get_mode(self, provider: str, agent_instance_id: str) -> str:
         return get_hook_mode(self.workspace, provider, agent_instance_id)

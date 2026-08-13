@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sqlite3
 
 from memoryguard.content import ContentStore
 from memoryguard.content.conversation_sync import ConversationEvent, ConversationSync
@@ -152,7 +153,56 @@ def test_list_sessions_returns_exact_scoped_total_and_summary_field(tmp_path: Pa
     listing = _history(tmp_path).list_sessions(_scope(project_ref=project), limit=1, offset=10)
     assert listing["sessions"] == []
     assert listing["total"] == 3
-    assert all("summary" in row for row in _history(tmp_path).list_sessions(_scope(project_ref=project))["sessions"])
+    sessions = _history(tmp_path).list_sessions(_scope(project_ref=project))["sessions"]
+    assert all("summary" in row for row in sessions)
+    assert all("display_title" in row for row in sessions)
+    assert all("preview_excerpt" in row for row in sessions)
+    assert all("summarized" in row for row in sessions)
+
+
+def test_list_sessions_builds_readable_fallback_title_from_first_user_turn(tmp_path: Path):
+    project = str(tmp_path.resolve())
+    raw = "我需要你帮我查看现在项目再修的问题，会话ID：019fc183-3e8f-72d0-974e-ce9c74c3c561"
+    _seed(
+        tmp_path,
+        [_event(
+            tmp_path,
+            session="fallback-title",
+            event_id="fallback-title-1",
+            content=raw,
+            project_ref=project,
+            title="未命名会话",
+        )],
+        source_id="fallback-title-source",
+    )
+
+    item = _history(tmp_path).list_sessions(_scope(project_ref=project))["sessions"][0]
+    assert item["display_title"] == "查看现在项目再修的问题"
+    assert item["source_title"] == "未命名会话"
+    assert item["preview_excerpt"] == raw
+    assert item["summarized"] is False
+
+
+def test_list_sessions_fallback_title_discards_paths_and_long_cli_args(tmp_path: Path):
+    project = str(tmp_path.resolve())
+    raw = "我需要你帮我排查历史读取问题 H:/ai/workspace/tools/history.py --session-id=019fc183-extra"
+    _seed(
+        tmp_path,
+        [_event(
+            tmp_path,
+            session="clean-fallback-title",
+            event_id="clean-fallback-title-1",
+            content=raw,
+            project_ref=project,
+            title="untitled",
+        )],
+        source_id="clean-fallback-title-source",
+    )
+
+    item = _history(tmp_path).list_sessions(_scope(project_ref=project))["sessions"][0]
+    assert item["display_title"] == "排查历史读取问题"
+    assert "H:/" not in item["display_title"]
+    assert "--session-id" not in item["display_title"]
 
 
 def test_read_and_extract_preview_keep_raw_content_at_explicit_boundaries(tmp_path: Path):
@@ -236,3 +286,27 @@ def test_v2_history_scope_isolation_covers_group_and_provider(tmp_path: Path):
     assert _history(tmp_path).search(_scope(project_ref=project), "claude-only")["results"] == []
     assert _history(tmp_path).search(_scope(project_ref=project, provider="claude"), "claude body")["results"]
     assert content_history_schema_status(ContentStore(tmp_path).db_path) == "valid"
+
+
+def test_history_schema_probe_explicitly_closes_connection(tmp_path: Path, monkeypatch):
+    path = ContentStore(tmp_path).db_path
+    original_connect = sqlite3.connect
+    opened = []
+
+    class TrackingConnection(sqlite3.Connection):
+        closed = False
+
+        def close(self):
+            self.closed = True
+            return super().close()
+
+    def tracked_connect(*args, **kwargs):
+        kwargs.setdefault("factory", TrackingConnection)
+        connection = original_connect(*args, **kwargs)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracked_connect)
+    assert content_history_schema_status(path) == "valid"
+    assert opened
+    assert all(connection.closed for connection in opened)

@@ -21,10 +21,10 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 from .runtime_v2.public_safety import v2_upgrade_message, v2_upgrade_payload
 
@@ -140,6 +140,7 @@ def _effective_agent_context(
         or ""
     ).strip()
     context_hash = str(payload.get("context_hash") or "").strip()
+    child_agent_id = _host_subagent_id(payload, agent_instance_id)
     return EffectiveAgentContext(
         agent_instance_id=agent_instance_id,
         share_group_id=share_group_id,
@@ -149,14 +150,14 @@ def _effective_agent_context(
             or payload.get("projectRef")
             or payload.get("cwd")
         ),
-        runtime_role="subagent" if event == "subagent_start" else "root",
-        runtime_agent_id=(
-            str(payload.get("subagent_id") or "")
-            if event == "subagent_start" else ""
-        ),
-        parent_agent_id=(
-            agent_instance_id if event == "subagent_start" else ""
-        ),
+        # Codex sends the child identifier as ``agent_id`` on child tool
+        # events.  It is a runtime identity, never a replacement for the
+        # configured/bound MemoryGuard Agent.  Preserve it in the trusted
+        # runtime context so child rule scope is stable across lifecycle and
+        # tool events.
+        runtime_role="subagent" if child_agent_id else "root",
+        runtime_agent_id=child_agent_id,
+        parent_agent_id=agent_instance_id if child_agent_id else "",
         session_id=session_id,
         context_hash=context_hash,
     )
@@ -374,6 +375,100 @@ def _is_our_handler(handler: Any) -> bool:
         return False
     command = str(handler.get("command", "") or "")
     return HOOK_MARKER in command and "--managed-by" in command
+
+
+def _command_option(command: str, option: str) -> str:
+    """Read one generated hook command option without executing its shell text."""
+    match = re.search(
+        rf"{re.escape(option)}(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+        command,
+    )
+    if match is None:
+        return ""
+    return next((str(value) for value in match.groups() if value), "")
+
+
+def _generated_handler_binding(handler: Any) -> tuple[str, str, str, str] | None:
+    """Return generated handler identity: provider, agent, group, workspace.
+
+    ``HOOK_MARKER`` plus ``--managed-by memoryguard`` identifies a generated
+    MemoryGuard command.  All three bound arguments must be present before a
+    handler can be removed; malformed or user-owned commands stay untouched.
+    """
+    if not _is_our_handler(handler):
+        return None
+    for key in ("command", "commandWindows"):
+        command = str(handler.get(key, "") or "") if isinstance(handler, dict) else ""
+        if not command:
+            continue
+        if _command_option(command, "--managed-by") != "memoryguard":
+            continue
+        provider = _command_option(command, "--provider").lower()
+        agent_id = _command_option(command, "--agent-id")
+        group_id = _command_option(command, "--share-group-id")
+        workspace = _command_option(command, "--workspace")
+        if provider and agent_id and group_id and workspace:
+            return (provider, agent_id, group_id, workspace)
+    return None
+
+
+def _remove_generated_bindings(
+    data: dict[str, Any],
+    *,
+    provider: str,
+    workspace: Path,
+    targets: set[tuple[str, str]],
+) -> list[tuple[str, str, str]]:
+    """Remove only generated handlers matching one requested agent/group.
+
+    Handles both nested Claude/Codex and direct Cursor hook config shapes.
+    A handler must match provider, agent id and group id together, preventing
+    a dissolved binding from deleting another active binding on same provider.
+    """
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    removed: list[tuple[str, str, str]] = []
+
+    def keep(handler: Any) -> bool:
+        binding = _generated_handler_binding(handler)
+        if binding is None:
+            return True
+        bound_provider, agent_id, group_id, bound_workspace = binding
+        if (
+            bound_provider != provider
+            or Path(bound_workspace).expanduser().resolve() != workspace
+            or (agent_id, group_id) not in targets
+        ):
+            return True
+        removed.append((bound_provider, agent_id, group_id))
+        return False
+
+    for event_name in list(hooks):
+        entries = hooks.get(event_name)
+        if not isinstance(entries, list):
+            continue
+        kept_entries: list[Any] = []
+        for entry in entries:
+            if _generated_handler_binding(entry) is not None:
+                if keep(entry):
+                    kept_entries.append(entry)
+                continue
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                kept_entries.append(entry)
+                continue
+            nested = [handler for handler in entry["hooks"] if keep(handler)]
+            if nested:
+                copied = dict(entry)
+                copied["hooks"] = nested
+                kept_entries.append(copied)
+        if kept_entries:
+            hooks[event_name] = kept_entries
+        else:
+            hooks.pop(event_name, None)
+    if not hooks:
+        data.pop("hooks", None)
+    return removed
 
 
 def _owned_hook_hash(data: dict[str, Any]) -> str:
@@ -958,6 +1053,34 @@ def _current_hook_hash(workspace: Path, provider: str) -> str:
     return _owned_hook_hash(data)
 
 
+@dataclass
+class HookBindingCleanup:
+    """Compensation receipt for exact host-config mutations during dissolve."""
+
+    snapshots: list[tuple[Path, dict[str, Any]]] = field(default_factory=list)
+    removed: dict[tuple[str, str, str], int] = field(default_factory=dict)
+
+    def restore(self) -> None:
+        for path, data in reversed(self.snapshots):
+            _write_json_config(path, data)
+
+    def public_result(self) -> dict[str, Any]:
+        bindings = [
+            {
+                "provider": provider,
+                "agent_instance_id": agent_id,
+                "share_group_id": group_id,
+                "handler_count": count,
+            }
+            for (provider, agent_id, group_id), count in sorted(self.removed.items())
+        ]
+        return {
+            "binding_count": len(bindings),
+            "handler_count": sum(item["handler_count"] for item in bindings),
+            "bindings": bindings,
+        }
+
+
 class HostHookManager:
     """Deep module: install, remove, inspect, and execute every host hook."""
 
@@ -990,6 +1113,56 @@ class HostHookManager:
 
     def uninstall(self, provider: str) -> dict[str, Any]:
         return self.adapter(provider).uninstall()
+
+    def remove_generated_bindings(
+        self,
+        bindings: Iterable[Mapping[str, Any]],
+    ) -> "HookBindingCleanup":
+        """Remove dissolved-group handlers by exact generated binding identity.
+
+        This intentionally never calls ``uninstall(provider)``: provider
+        configuration can contain other active MemoryGuard bindings.
+        """
+        targets = {
+            (str(item.get("agent_instance_id") or "").strip(), str(item.get("share_group_id") or "").strip())
+            for item in bindings
+            if str(item.get("agent_instance_id") or "").strip()
+            and str(item.get("share_group_id") or "").strip()
+        }
+        cleanup = HookBindingCleanup()
+        if not targets:
+            return cleanup
+        adapters = (
+            ("claude", ClaudeHookAdapter),
+            ("codex", CodexHookAdapter),
+            ("cursor", CursorHookAdapter),
+        )
+        try:
+            for provider, adapter_cls in adapters:
+                adapter = adapter_cls(self.workspace)
+                path = adapter.config_path()
+                # A malformed existing host config cannot prove target Hooks
+                # absent.  Fail closed so dissolve never reports success while
+                # a stale generated command may still target its shared group.
+                # ``_load_json_config`` still returns {} for a missing file.
+                data = _load_json_config(path, strict=True)
+                original = json.loads(json.dumps(data))
+                removed = _remove_generated_bindings(
+                    data,
+                    provider=provider,
+                    workspace=self.workspace,
+                    targets=targets,
+                )
+                if not removed:
+                    continue
+                cleanup.snapshots.append((path, original))
+                _write_json_config(path, data)
+                for identity in removed:
+                    cleanup.removed[identity] = cleanup.removed.get(identity, 0) + 1
+        except Exception:
+            cleanup.restore()
+            raise
+        return cleanup
 
     def status(
         self,
@@ -1441,6 +1614,52 @@ def _session_id(payload: dict[str, Any]) -> str:
         or ""
     )
     return f"{base}:subagent:{subagent}" if subagent else base
+
+
+def _host_subagent_id(payload: dict[str, Any], agent_instance_id: str) -> str:
+    """Return the host child identity without accepting it as a bound Agent.
+
+    Codex uses ``agent_id`` for a child on PreToolUse while other adapters use
+    ``subagent_id``.  A root event may also contain the configured Agent ID;
+    that is not a child identity and must remain a root scope.
+    """
+    explicit = str(payload.get("subagent_id") or "").strip()
+    if explicit:
+        return explicit
+    candidate = str(payload.get("agent_id") or "").strip()
+    return candidate if candidate and candidate != str(agent_instance_id) else ""
+
+
+_V2_HOOK_UNTRUSTED_IDENTITY_KEYS = frozenset({
+    "workspace_id", "workspace",
+    "agent_instance_id", "agent_id", "agent", "trusted_agent_id", "trusted_agent",
+    "share_group_id", "group_id", "group", "trusted_group_id", "trusted_group",
+    "project_ref", "project_id", "project", "trusted_project_ref", "trusted_project",
+    "provider", "trusted_provider",
+    "runtime_role", "runtime", "trusted_runtime_role", "trusted_runtime",
+    "runtime_agent_id", "parent_agent_id",
+    "session_id", "conversation_id", "conversationId", "sessionId", "thread_id",
+    "session_source", "session_trusted", "context_hash",
+    "trusted_identity", "trusted_context", "identity", "entrypoint",
+    # The subagent selector is host metadata too.  Its trusted projection is
+    # issued by ``_effective_agent_context`` above, not forwarded as request
+    # data to the native identity validator.
+    "subagent_id",
+})
+
+
+def _v2_hook_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove host identity claims before native V2 dispatch.
+
+    The Hook command arguments are the authority for provider/bound Agent/
+    group.  Host payload identities are useful only to derive a separate
+    runtime-child context and must never be treated as an RPC caller trying to
+    select a MemoryGuard binding.
+    """
+    return {
+        key: value for key, value in payload.items()
+        if key not in _V2_HOOK_UNTRUSTED_IDENTITY_KEYS
+    }
 
 
 def _prompt(payload: dict[str, Any]) -> str:
@@ -2176,10 +2395,12 @@ def _v2_hook_cutover(
             "session_id": str(context_view.get("session_id") or session_id or ""),
             "context_hash": str(context_view.get("context_hash") or ""),
         }
+
+
         kwargs: dict[str, Any] = {"context": context}
         if accepts_snapshot:
             kwargs["snapshot"] = snapshot
-        result = hook(event, dict(payload), **kwargs)
+        result = hook(event, _v2_hook_request_payload(payload), **kwargs)
     except Exception as exc:
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,

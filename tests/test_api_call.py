@@ -68,8 +68,11 @@ def test_get_neuron_graph_supports_empty_projection(tmp_path) -> None:
     assert graph["ok"] is True
     assert graph["path"] == "v2"
     assert graph["data"]["status"] == "NO_SOURCE"
-    assert graph["data"]["nodes"] == []
-    assert graph["data"]["edges"] == []
+    assert graph["data"]["base_empty"] is True
+    assert graph["data"]["virtual_overlay_available"] is True
+    node_ids = {item["id"] for item in graph["data"]["nodes"]}
+    assert {"main", "virtual-rules-habits", "virtual-conversation-history"} <= node_ids
+    assert any(item.get("edge_type") == "virtual_index" for item in graph["data"]["edges"])
 
 
 def test_pyproject_declares_windowed_gui_entry() -> None:
@@ -188,11 +191,17 @@ def test_gui_main_rejects_windows_system_directory(monkeypatch, capsys) -> None:
     assert "refusing to use a Windows system directory" in capsys.readouterr().err
 
 
-def test_gui_workspace_prefers_environment(monkeypatch, tmp_path) -> None:
+def test_bare_gui_ignores_project_workspace_environment(monkeypatch, tmp_path) -> None:
     from memoryguard.cli import _resolve_gui_workspace
 
-    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
-    assert _resolve_gui_workspace([]) == tmp_path.resolve()
+    project = tmp_path / "project"
+    data_home = tmp_path / "global-home"
+    project.mkdir()
+    data_home.mkdir()
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(project))
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+
+    assert _resolve_gui_workspace([]) == data_home.resolve()
 
 
 def test_bare_gui_uses_fixed_user_control_directory_without_picker(

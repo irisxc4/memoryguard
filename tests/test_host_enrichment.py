@@ -17,6 +17,7 @@ from _publish_helpers import (
 )
 from memoryguard.content import ContentStore
 from memoryguard.memory import MemoryAtomStore, MemoryReadScope
+from memoryguard.memory.store import stable_digest
 from memoryguard.runtime_v2.extraction_native import NativeExtractionEnrichmentService
 from memoryguard.runtime_v2.projection_build import ProjectionBuildService
 
@@ -137,6 +138,12 @@ def test_apply_valid_kind() -> None:
         assert atom.kind == "preference"
         assert atom.body.startswith("使用 pnpm 而非 npm")
         assert atom.metadata["enrichment_mode"] == "host"
+        assert atom.canonical_hash == stable_digest(atom.body)
+        assert atom.metadata["enrichment_terminal_fp"]
+        assert _pending(service, context) == []
+        rebuilt = service.build_and_enrich({}, context=context)
+        assert rebuilt["host_action_required"] is False
+        assert rebuilt["pending_tasks"] == []
         assert _pending(service, context) == []
 
 

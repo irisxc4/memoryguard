@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.7.1] - 2026-08-13
+## [0.7.1] - 2026-08-14
 
 ### Fixed
 
@@ -34,10 +34,29 @@
   outcomes; Knowledge contributes references, never raw source bodies.
 - Windows acceptance helpers force UTF-8 machine output so non-ASCII user paths
   are decoded consistently on Python 3.10 through 3.14.
+- Raw History reads now preserve the business `session_id` selector through the
+  native identity scrubber. A real SafeBridge → native History → Content V2
+  regression covers the button path, and Windows project references compare
+  case-insensitively.
+- Governance recent-event payloads now carry Agent/group/provider provenance;
+  the GUI displays a resolved Agent name or stable fallback instead of rows of
+  `Unknown Agent`.
+- Restored the V2 Knowledge Library product surface. `/knowledge` is again a
+  bookshelf with search, add/reingest, candidate review, deleted-book recovery,
+  TaskRun status, book detail, document/occurrence reading, settings, and smart
+  rebuild controls rather than a JSON debug page. The retired `KnowledgeStore`
+  remains outside the V2 runtime path.
+- Governance decisions group/collapse dominant actions, and the neuron graph
+  uses compact level-aware layout plus root-outward soft signal bands, node
+  arrival halos, and terminal flashes instead of random projectile particles.
+- Embedded Graphify core ships under `memoryguard.graphify_core` with explicit
+  grammar imports and license/notice files. V2 group control keeps host-hook
+  side effects behind `HostHookExecutor`.
+- Canonical-readiness and History-schema SQLite probes explicitly close their read-only handles, preventing lingering `rules.db` and `content.db` locks on Windows.
 
 ### Verification
 
-- Full local suite: `1810 passed / 0 failed`.
+- Final local suite: `1884 passed / 0 failed` across `205` test files.
 - Forced sandbox GUI dispatch: `40 passed`; security regressions: `54 passed`.
 - Projection/LLM/cancellation/interactivity focused gate: `53 passed`.
 - Real canonical user data migrated to `V2_ACTIVE`; binding, group, memory,

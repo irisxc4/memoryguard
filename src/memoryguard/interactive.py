@@ -119,6 +119,26 @@ code {
 .local-badge { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
 .local-badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
 
+/* CodeGraph is a separate projection surface.  It intentionally does not
+   reuse neuron-shell/neuron-canvas styles or state. */
+.codegraph-shell { display: grid; gap: 14px; }
+.codegraph-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.codegraph-toolbar h2 { font-size: 16px; }
+.codegraph-toolbar p { margin-top: 4px; color: var(--muted); font-size: 11px; }
+.codegraph-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.codegraph-controls label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+.codegraph-controls select { min-height: 32px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-solid); color: var(--fg); }
+.codegraph-stage { position: relative; min-height: 560px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: radial-gradient(circle at 50% 45%, rgba(99,179,237,.12), transparent 46%), #06101a; }
+.codegraph-stage::before { content: ""; position: absolute; inset: 0; pointer-events: none; background-image: linear-gradient(rgba(99,179,237,.12) 1px, transparent 1px), linear-gradient(90deg, rgba(99,179,237,.12) 1px, transparent 1px); background-size: 42px 42px; mask-image: radial-gradient(circle at center, black, transparent 84%); }
+.codegraph-canvas { position: absolute; inset: 0; z-index: 1; }
+.codegraph-legend { position: absolute; z-index: 2; left: 14px; bottom: 14px; display: flex; gap: 10px; flex-wrap: wrap; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(4,11,9,.72); color: var(--muted); font-size: 10px; }
+.codegraph-dot { display: inline-block; width: 8px; height: 8px; margin-right: 4px; border-radius: 50%; background: #63b3ed; box-shadow: 0 0 8px rgba(99,179,237,.65); }
+.codegraph-dot.symbol { background: #f6ad55; box-shadow: 0 0 8px rgba(246,173,85,.65); }
+.codegraph-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+.codegraph-stat { min-width: 92px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: rgba(99,179,237,.06); }
+.codegraph-stat strong { display: block; color: var(--accent-bright); font-size: 18px; }
+.codegraph-stat span { color: var(--muted); font-size: 10px; }
+
 /* 主工作区 */
 .main-wrapper { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 .topbar {
@@ -467,40 +487,23 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .neuron-edge-particle {
   display: block; position: absolute; left: 0; top: 0;
-  width: 10px; height: 10px; margin: 0; padding: 0; border: 0;
-  border-radius: 50%;
-  background: radial-gradient(circle,
-    #ffffff 0 18%,
-    #d8fff4 28%,
-    rgba(110,231,196,.65) 48%,
-    rgba(110,231,196,.18) 68%,
-    transparent 78%);
-  box-shadow:
-    0 0 6px 1px rgba(255,255,255,.55),
-    0 0 14px 4px rgba(110,231,196,.35);
+  width: 30px; height: 5px; margin: 0; padding: 0; border: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    rgba(110,231,196,.14) 16%,
+    rgba(110,231,196,.54) 34%,
+    rgba(226,255,248,.9) 47%,
+    rgba(255,255,255,.96) 50%,
+    rgba(226,255,248,.9) 53%,
+    rgba(110,231,196,.54) 66%,
+    rgba(110,231,196,.14) 84%,
+    transparent 100%);
+  box-shadow: 0 0 7px rgba(255,255,255,.22), 0 0 13px rgba(110,231,196,.24);
+  filter: blur(.35px);
+  transform-origin: 50% 50%;
   will-change: transform, opacity;
   transform: translate3d(-9999px, -9999px, 0);
-  pointer-events: none;
-}
-.neuron-edge-particle-core {
-  position: absolute; left: 50%; top: 50%;
-  width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px;
-  border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 0 4px 1px rgba(255,255,255,.8);
-}
-.neuron-edge-particle-trail {
-  position: absolute; left: 50%; top: 50%;
-  width: 18px; height: 3px; margin: -1.5px 0 0 -2px;
-  border-radius: 50%;
-  background: radial-gradient(ellipse at right center,
-    rgba(255,255,255,.75) 0%,
-    rgba(110,231,196,.45) 40%,
-    transparent 75%);
-  transform: rotate(var(--particle-angle, 0rad));
-  transform-origin: 2px 50%;
-  filter: blur(.8px);
-  opacity: .85;
   pointer-events: none;
 }
 .neuron-stats {
@@ -720,6 +723,34 @@ tbody tr:last-child td { border-bottom: 0; }
 .source-map-table th, .source-map-table td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 12px; }
 .source-map-table th { color: var(--muted); font-weight: 700; background: rgba(12,34,27,.72); }
 .source-map-table tr:last-child td { border-bottom: 0; }
+.projection-source-map { min-width: 0; }
+.source-map-toggle-row { display: flex; justify-content: flex-start; margin-top: 12px; }
+.source-map-toggle { min-width: 152px; }
+.source-map-details { margin-top: 12px; }
+.source-map-list { display: grid; gap: 10px; }
+.source-map-entry {
+  min-width: 0; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: rgba(4,13,10,.42);
+}
+.source-map-entry.muted-row { opacity: .58; }
+.source-map-entry-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; min-width: 0; }
+.source-map-entry-name { min-width: 0; }
+.source-map-entry-name strong { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.source-map-entry-status { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.source-map-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px 14px; margin-top: 12px; }
+.source-map-fields > div { min-width: 0; }
+.source-map-fields dt { color: var(--faint); font-size: 10px; letter-spacing: .04em; }
+.source-map-fields dd { min-width: 0; margin-top: 3px; color: var(--fg); font-size: 11px; overflow-wrap: anywhere; }
+.source-map-fields dd code { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-map-id { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-map-empty { margin-top: 12px; padding: 12px 14px; border: 1px dashed var(--line-strong); border-radius: 10px; color: var(--muted); background: rgba(110,231,196,.035); }
+.source-map-empty strong { display: block; margin-bottom: 3px; color: var(--fg); font-size: 12px; }
+.source-map-empty p { font-size: 11px; }
+@media (max-width: 680px) {
+  .source-map-entry-header { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .source-map-entry-status { justify-content: flex-start; }
+  .source-map-fields { grid-template-columns: minmax(0, 1fr); }
+}
 .path-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
 .muted-row { opacity: .58; }
 .rule-cockpit-panel { border-color: rgba(110,231,196,.28); }
@@ -730,6 +761,19 @@ tbody tr:last-child td { border-bottom: 0; }
 .rule-decision-row, .rule-exception-row, .rule-receipt { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 9px 0; border-top: 1px solid var(--line); }
 .rule-decision-row:first-of-type { border-top: 0; }
 .rule-decision-row > .muted { flex: 1 1 100%; }
+.rule-decision-groups { display: grid; gap: 9px; margin-top: 12px; }
+.rule-decision-group { border: 1px solid var(--line); border-radius: 10px; background: rgba(4,13,10,.34); overflow: hidden; }
+.rule-decision-group > summary, .rule-decision-subgroup > summary { cursor: pointer; list-style: none; }
+.rule-decision-group > summary::-webkit-details-marker, .rule-decision-subgroup > summary::-webkit-details-marker { display: none; }
+.rule-decision-group-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; }
+.rule-decision-group-head::before { content: '›'; color: var(--accent); transition: transform .16s ease; }
+.rule-decision-group[open] > .rule-decision-group-head::before { transform: rotate(90deg); }
+.rule-decision-group-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.rule-decision-group-meta { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; color: var(--muted); font-size: 10px; }
+.rule-decision-group-body { padding: 0 12px 10px; border-top: 1px solid var(--line); }
+.rule-decision-subgroup { margin-top: 8px; border: 1px solid rgba(110,231,196,.13); border-radius: 8px; background: rgba(110,231,196,.025); }
+.rule-decision-subgroup > summary { padding: 7px 9px; color: var(--muted); font-size: 10px; }
+.rule-decision-subgroup-body { padding: 0 9px 7px; }
 .rule-decision-link, .rule-receipts, .rule-exceptions { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
 .rule-feedback-actions { display: flex; flex-wrap: wrap; gap: 4px; }
 .rule-feedback-actions .btn { min-height: 26px; padding: 3px 7px; font-size: 10px; }
@@ -754,6 +798,7 @@ tbody tr:last-child td { border-bottom: 0; }
       <div class="nav-item active" role="tab" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源<span class="count" id="sources-count"></span></div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></div>
+      <div class="nav-item" role="tab" tabindex="0" data-tab="codegraph" onclick="switchTab('codegraph')">CodeGraph<span class="count" id="codegraph-count"></span></div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="rules" onclick="switchTab('rules')">规则与习惯</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="history" onclick="switchTab('history')">对话历史</div>
       <div class="nav-item" role="tab" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号<span class="count" id="findings-count"></span></div>
@@ -774,7 +819,7 @@ tbody tr:last-child td { border-bottom: 0; }
           <button type="button" id="reader-en" onclick="setReaderLanguage('en')">English</button>
         </div>
       </div>
-      <span class="local-badge">Local only · 构建内 LLM 整理 · MCP 可补做</span>
+      <span class="local-badge">Local only · Memory Projection / CodeGraph</span>
     </div>
   </aside>
 
@@ -801,12 +846,17 @@ tbody tr:last-child td { border-bottom: 0; }
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-let state = { report: null, activeTab: 'overview', plans: [], changes: [], releases: [], lastPlan: null, governanceSnapshot: null };
+const rememberedActiveTab = localStorage.getItem('memoryguard.activeTab') || 'overview';
+let state = { report: null, activeTab: rememberedActiveTab, plans: [], changes: [], releases: [], lastPlan: null, governanceSnapshot: null };
 let neuronGraph = null;
+let codeGraph = null;
 let projectionMode = localStorage.getItem('memoryguard.projectionMode') || 'native';
 let cyInstance = null;
+let codeCyInstance = null;
 let selectedNeuronId = null;
 let selectedNeuronNode = null;
+let neuronDetailHydrationSeq = 0;
+let selectedCodeGraphNode = null;
 let selectedNeuronIds = new Set();
 let neuronDragState = null;
 let neuronTapSelectionAdditive = false;
@@ -821,6 +871,19 @@ let agentCardsData = null;     // v3.2：缓存 list_agents 结果
 let dataPageMode = 'single_agent';  // v3.2：single_agent | multi_agent_shared_mcp
 let activeShareGroupId = '';
 let governanceSubTab = 'recent_events';  // 治理台子视图
+let codeGraphLimit = 100;
+let codeGraphProvenance = '';
+let codeGraphProjects = [];
+let codeGraphBuildReady = false;
+let selectedCodeGraphProject = localStorage.getItem('memoryguard.codeGraphProject') || '';
+let codeGraphBuildInFlight = false;
+let activeScopeMemberIds = [];
+let governanceScopeState = { status: 'unselected', share_group_id: '', reason: '' };
+let projectionEngineState = { loaded: false, engines: [], error: '' };
+let selectedProjectionEngine = localStorage.getItem('memoryguard.projectionEngine') || 'deterministic';
+let activeBuildRunId = '';
+let buildStartInFlight = false;
+let buildCancelInFlight = false;
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -831,6 +894,188 @@ function escapeHtml(value) {
 function finiteNumber(value, fallback = 0) {
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function finiteOrNull(value) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function safeDisplayText(value, fallback = '') {
+  if (value === null || value === undefined || value === '') return fallback;
+  const text = String(value);
+  return text === 'undefined' || text === 'null' || text === 'NaN' ? fallback : text;
+}
+
+function sameNonEmptyAgentId(left, right) {
+  const leftId = safeDisplayText(left, '').trim();
+  const rightId = safeDisplayText(right, '').trim();
+  return Boolean(leftId && rightId && leftId === rightId);
+}
+
+function apiRows(result, key) {
+  if (Array.isArray(result)) return result;
+  return Array.isArray(result?.[key]) ? result[key] : [];
+}
+
+function agentSummary(agent, sourceCount = null) {
+  const item = agent && typeof agent === 'object' ? agent : {};
+  const surfaces = Array.isArray(item.surfaces) ? item.surfaces : [];
+  const foundSurfaceCount = finiteNumber(
+    item.found_surface_count,
+    surfaces.filter(surface => surface && surface.status === 'found').length,
+  );
+  const surfaceCount = finiteNumber(item.surface_count, surfaces.length);
+  const resolvedSourceCount = finiteNumber(
+    item.bound_source_count,
+    finiteNumber(item.source_count, finiteNumber(sourceCount, 0)),
+  );
+  return {
+    foundSurfaceCount: Math.max(0, foundSurfaceCount),
+    surfaceCount: Math.max(0, surfaceCount),
+    privateSurfaceCount: Math.max(0, finiteNumber(item.private_data_surface_count, 0)),
+    sharedSurfaceCount: Math.max(0, finiteNumber(item.shared_surface_count, 0)),
+    sourceCount: Math.max(0, resolvedSourceCount),
+  };
+}
+
+function agentSourceLabel(agent, sourceCount = null) {
+  const summary = agentSummary(agent, sourceCount);
+  return `${summary.sourceCount} 来源`;
+}
+
+function objectValue(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function finiteFirst(...values) {
+  for (const value of values) {
+    const number = finiteOrNull(value);
+    if (number !== null) return number;
+  }
+  return 0;
+}
+
+function governanceSnapshot(raw) {
+  const root = objectValue(raw);
+  const source = objectValue(root.governance_snapshot || root.governanceSnapshot || root.snapshot || root.governance || root);
+  const memory = objectValue(source.memory);
+  const counts = objectValue(source.counts || source.metrics);
+  const status = objectValue(source.status);
+  const statusCounts = objectValue(source.status_counts || memory.status_counts || memory.statusCounts);
+  const conflicts = objectValue(source.conflicts);
+  const quarantine = objectValue(source.quarantine);
+  const rollback = objectValue(source.rollback);
+  const statusText = safeDisplayText(source.scope_status || source.governance_status || source.status, '').toLowerCase();
+  const auditOnly = source.audit_only === true || statusText === 'audit_only';
+  const activeMemories = finiteFirst(
+    counts.active_memories,
+    counts.active_count,
+    source.active_memories,
+    source.active_count,
+    status.active_count,
+    memory.active_records,
+    statusCounts.active_memories,
+    statusCounts.active_count,
+    statusCounts.active,
+    memory.total_records,
+    memory.total,
+  );
+  const conflictCount = finiteFirst(
+    counts.conflicts,
+    counts.conflict_count,
+    source.conflict_count,
+    conflicts.count,
+    memory.conflict_count,
+    statusCounts.conflicts,
+    statusCounts.conflict,
+  );
+  const quarantineCount = finiteFirst(
+    counts.quarantined,
+    counts.quarantine_count,
+    source.quarantined,
+    quarantine.count,
+    memory.quarantined_count,
+    statusCounts.quarantined,
+    statusCounts.quarantine,
+  );
+  const rollbackCount = finiteFirst(
+    counts.rollback_ready,
+    source.rollback_ready,
+    rollback.count,
+    rollback.ready,
+  );
+  const members = Array.isArray(source.members)
+    ? source.members
+    : (Array.isArray(source.group_members) ? source.group_members : []);
+  return {
+    ...source,
+    audit_only: auditOnly,
+    counts: {
+      active_memories: activeMemories,
+      conflicts: conflictCount,
+      quarantined: quarantineCount,
+      rollback_ready: rollbackCount,
+    },
+    conflicts: {...conflicts, count: conflictCount},
+    quarantine: {...quarantine, count: quarantineCount},
+    rollback_ready: rollbackCount,
+    members,
+    active_binding: source.active_binding || source.binding || null,
+  };
+}
+
+function normalizeGovernanceScope(raw, expectedGroupId = '') {
+  const root = objectValue(raw);
+  const scope = objectValue(root.scope);
+  const groupId = safeDisplayText(expectedGroupId || scope.share_group_id || root.share_group_id, '');
+  const agentId = safeDisplayText(scope.agent_instance_id || root.agent_instance_id, '');
+  const bindingCandidate = root.active_binding || root.binding;
+  const binding = objectValue(bindingCandidate);
+  const bindingGroupId = safeDisplayText(binding.share_group_id, '');
+  const bindingStatus = safeDisplayText(binding.status, 'active').toLowerCase();
+  const trustedBinding = groupId && bindingGroupId === groupId && bindingStatus === 'active' ? binding : null;
+  const bindings = [
+    ...(Array.isArray(root.bindings) ? root.bindings : []),
+    ...(Array.isArray(scope.bindings) ? scope.bindings : []),
+  ];
+  const matchingBinding = bindings.find(item => {
+    const candidate = objectValue(item);
+    return safeDisplayText(candidate.share_group_id, '') === groupId
+      && safeDisplayText(candidate.status, '').toLowerCase() === 'active';
+  }) || null;
+  const rawMembers = [
+    ...(Array.isArray(root.members) ? root.members : []),
+    ...(Array.isArray(root.group_members) ? root.group_members : []),
+    ...(Array.isArray(scope.members) ? scope.members : []),
+    ...(Array.isArray(scope.agent_instance_ids) ? scope.agent_instance_ids : []),
+  ];
+  const members = [...new Set(rawMembers.map(item => {
+    const value = objectValue(item);
+    return safeDisplayText(value.instance_id || value.agent_instance_id || item, '');
+  }).filter(Boolean))];
+  const selectedBinding = trustedBinding || matchingBinding;
+  if (selectedBinding) {
+    const selectedId = safeDisplayText(selectedBinding.agent_instance_id || selectedBinding.instance_id, '');
+    if (selectedId && !members.includes(selectedId)) members.push(selectedId);
+  }
+  const statusText = safeDisplayText(root.scope_status || root.governance_status || root.status, '').toLowerCase();
+  const auditOnly = root.audit_only === true || statusText === 'audit_only';
+  return {
+    status: auditOnly ? 'audit_only' : (groupId ? (selectedBinding ? 'active' : 'stale_selection') : (agentId ? 'active' : 'unselected')),
+    share_group_id: groupId,
+    agent_instance_id: agentId,
+    binding: selectedBinding,
+    members,
+    reason: auditOnly ? 'audit_only' : (groupId && !selectedBinding ? 'active_binding_required' : ''),
+  };
+}
+
+function clearSharedGovernance(status = 'stale_selection', reason = 'active_binding_required') {
+  activeShareGroupId = '';
+  activeScopeMemberIds = [];
+  dataPageMode = 'single_agent';
+  governanceScopeState = {status, share_group_id: '', reason, binding: null, members: []};
 }
 
 // SafeBridge redacts filesystem paths into descriptors before they reach the
@@ -991,6 +1236,100 @@ function apiErrorMessage(result, fallback = '操作失败') {
   return fallback;
 }
 
+function projectionEngineId(engine) {
+  return String(engine && (engine.agent || engine.id || engine.engine_id) || '').trim();
+}
+
+async function refreshProjectionEngines() {
+  try {
+    const result = await callApi('list_host_llm_agents');
+    const rows = Array.isArray(result?.agents) ? result.agents : [];
+    projectionEngineState = {
+      loaded: true,
+      engines: rows.filter(item => projectionEngineId(item) && String(item.mode || 'cli').toLowerCase() === 'cli'),
+      error: '',
+    };
+  } catch (error) {
+    projectionEngineState = {loaded: true, engines: [], error: String(error && (error.message || error) || '')};
+  }
+  const valid = projectionEngineState.engines.some(item => projectionEngineId(item) === selectedProjectionEngine);
+  if (selectedProjectionEngine !== 'deterministic' && !valid) {
+    selectedProjectionEngine = 'deterministic';
+    localStorage.setItem('memoryguard.projectionEngine', selectedProjectionEngine);
+  }
+  return projectionEngineState;
+}
+
+function setProjectionEngine(engineId) {
+  const requested = String(engineId || '').trim();
+  const valid = requested === 'deterministic'
+    || projectionEngineState.engines.some(item => projectionEngineId(item) === requested);
+  selectedProjectionEngine = valid ? requested : 'deterministic';
+  localStorage.setItem('memoryguard.projectionEngine', selectedProjectionEngine);
+  renderContent();
+}
+
+function projectionEngineControls() {
+  if (!projectionEngineState.loaded) {
+    return `<section class="card projection-engine-status"><div class="card-head"><div><h2>整理引擎</h2><p>正在检测可执行整理引擎；确定性构建可用。</p></div></div></section>`;
+  }
+  if (!projectionEngineState.engines.length) {
+    const detail = projectionEngineState.error
+      ? '暂时无法读取可执行引擎；为避免误导，LLM 整理不可选。'
+      : '未发现可执行整理引擎，确定性构建可用；LLM 整理不可选。';
+    return `<section class="card projection-engine-status"><div class="card-head"><div><h2>整理引擎</h2><p>${detail}</p></div><span class="chip chip-medium">仅确定性构建</span></div></section>`;
+  }
+  const options = [
+    '<option value="deterministic">确定性构建（不使用 LLM）</option>',
+    ...projectionEngineState.engines.map(engine => {
+      const id = projectionEngineId(engine);
+      const label = engine.label || id;
+      return `<option value="${escapeHtml(id)}" ${selectedProjectionEngine === id ? 'selected' : ''}>${escapeHtml(label)} · CLI</option>`;
+    }),
+  ].join('');
+  return `<section class="card projection-engine-status"><div class="card-head"><div><h2>整理引擎</h2><p>仅列出当前可执行的真实 CLI；不选择 LLM 时使用确定性构建。</p></div><span class="chip chip-confirmed">${projectionEngineState.engines.length} 个 CLI 可用</span></div>
+    <label class="scope-select-label" for="projection-engine-select">构建整理方式</label>
+    <select id="projection-engine-select" class="scope-select" onchange="setProjectionEngine(this.value)">${options}</select>
+  </section>`;
+}
+
+function buildResultCode(result) {
+  const error = result && result.error;
+  const values = [
+    result && result.code, result && result.status, result && result.reason,
+    error && (typeof error === 'object' ? error.code : error),
+    result && result.result_ref && result.result_ref.status,
+    result && result.result && result.result.status,
+  ];
+  return values.filter(Boolean).map(value => String(value).toLowerCase()).join(' ');
+}
+
+function buildHasNoSources(result) {
+  const code = buildResultCode(result);
+  return code.includes('no_projection_sources') || code.includes('no_source') || code.includes('no_ir');
+}
+
+function buildIsBlocked(result) {
+  const code = buildResultCode(result);
+  return (result && result.blocked === true) || code.includes('blocked') || code.includes('block');
+}
+
+function buildResultMessage(result, fallback = '构建失败') {
+  if (buildHasNoSources(result)) {
+    return '没有可构建的数据源：当前数据源映射为空。请先到数据源页选择并启用数据源，再重新构建。';
+  }
+  if (buildIsBlocked(result)) {
+    const reason = apiErrorMessage(result, '后端拒绝了当前构建');
+    return `构建被后端阻止：${reason}。请先处理阻止原因后重试。`;
+  }
+  const code = buildResultCode(result);
+  if (code.includes('timeout') || code.includes('timed_out') || result?.pending) {
+    return '构建等待超时：任务未确认完成，已恢复记忆核心页面；请重新读取状态或重试。';
+  }
+  if (code.includes('no_active_projection_build')) return '当前没有可取消的构建';
+  return apiErrorMessage(result, fallback);
+}
+
 function normalizeTaskState(result) {
   const task = result && result.task && typeof result.task === 'object' ? result.task : {};
   let state = String(task.state || result.status || result.state || '').toLowerCase();
@@ -1122,21 +1461,24 @@ function waitForPywebview(timeoutMs) {
 async function loadGovernanceScopePreference() {
   try {
     const runtime = await callApi('get_governance_scope_state');
-    if (runtime && runtime.ok && runtime.scope) {
-      if (runtime.scope.mode === 'share_group' && runtime.scope.share_group_id) {
-        activeShareGroupId = runtime.scope.share_group_id;
-        activeAgentInstanceId = runtime.principal_agent_instance_id || '';
-        dataPageMode = 'multi_agent_shared_mcp';
-      } else if (runtime.scope.agent_instance_id) {
-        activeAgentInstanceId = runtime.scope.agent_instance_id;
-        activeShareGroupId = '';
-        dataPageMode = 'single_agent';
-      } else {
-        activeAgentInstanceId = '';
-        activeShareGroupId = '';
-      }
+    const normalized = normalizeGovernanceScope(runtime);
+    governanceScopeState = normalized;
+    if (normalized.status === 'audit_only' || normalized.status === 'stale_selection') {
+      clearSharedGovernance(normalized.status, normalized.reason);
+      activeAgentInstanceId = '';
+    } else if (runtime && runtime.ok && runtime.scope && normalized.share_group_id) {
+      activeShareGroupId = normalized.share_group_id;
+      activeAgentInstanceId = runtime.principal_agent_instance_id || '';
+      activeScopeMemberIds = normalized.members;
+      dataPageMode = 'multi_agent_shared_mcp';
+    } else if (runtime && runtime.ok && runtime.scope && normalized.agent_instance_id) {
+      activeAgentInstanceId = normalized.agent_instance_id;
+      activeScopeMemberIds = [activeAgentInstanceId];
+      activeShareGroupId = '';
+      dataPageMode = 'single_agent';
     } else {
       activeAgentInstanceId = '';
+      activeScopeMemberIds = [];
       activeShareGroupId = '';
     }
   } catch (_) {}
@@ -1152,6 +1494,47 @@ function memoryGroupKind(groupId) {
 
 function memoryGroupLabel(groupId) {
   return memoryGroupKind(groupId) === 'personal' ? '个人记忆层' : '共享记忆层';
+}
+
+function agentDisplayName(agentOrId, fallback = '未知 Agent') {
+  const id = typeof agentOrId === 'object'
+    ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || '')
+    : String(agentOrId || '');
+  const direct = typeof agentOrId === 'object' ? agentOrId : null;
+  if (direct) {
+    return direct.display_name || direct.product || direct.label || direct.name || id || fallback;
+  }
+  const pools = [
+    agentCardsData?.agents || [], agentCardsData?.residuals || [],
+    discoveryResult?.instances || [], discoveryResult?.agents || [],
+  ];
+  for (const pool of pools) {
+    const match = pool.find(item => String(item.instance_id || item.agent_instance_id || item.id || item.agent || '') === id);
+    if (match) return match.display_name || match.product || match.label || match.name || id || fallback;
+  }
+  return id || fallback;
+}
+
+function agentNamesForIds(ids) {
+  return [...new Set((ids || []).map(id => String(id || '')).filter(Boolean))]
+    .map(id => agentDisplayName(id)).filter(Boolean);
+}
+
+function scopeSelectionLabel() {
+  // ``activeAgentInstanceId`` also drives the data-source card selection.  It
+  // must not be rendered as an authorized governance scope until the trusted
+  // scope endpoint has confirmed an active binding.
+  if (governanceScopeState.status !== 'active') return '未选择治理范围';
+  if (isShareGroupScope()) {
+    const names = agentNamesForIds(activeScopeMemberIds);
+    return names.length ? `共享组 · ${names.join('、')}` : '共享记忆组';
+  }
+  return activeAgentInstanceId ? agentDisplayName(activeAgentInstanceId) : '未选择治理范围';
+}
+
+async function ensureAgentLabels() {
+  if (agentCardsData) return;
+  try { agentCardsData = await callApi('list_agents'); } catch (_) { /* labels are best effort */ }
 }
 
 function scopeApiArgs() {
@@ -1178,6 +1561,7 @@ async function setActiveShareGroup(groupId) {
     throw new Error((result && result.error) || '治理范围保存失败');
   }
   activeShareGroupId = normalized;
+  activeScopeMemberIds = result.members || result.agent_instance_ids || activeScopeMemberIds;
   dataPageMode = 'multi_agent_shared_mcp';
   return result;
 }
@@ -1211,11 +1595,19 @@ async function runAudit() {
 
 function switchTab(tab) {
   state.activeTab = tab;
+  localStorage.setItem('memoryguard.activeTab', tab);
   if (tab !== 'neurons') {
     selectedNeuronId = null;
     selectedNeuronNode = null;
     selectedNeuronIds = new Set();
     neuronDragState = null;
+  }
+  if (tab !== 'codegraph') {
+    selectedCodeGraphNode = null;
+    if (codeCyInstance) {
+      try { codeCyInstance.destroy(); } catch (_) { /* graph torn down */ }
+      codeCyInstance = null;
+    }
   }
   document.querySelectorAll('.nav-item').forEach(el => {
     const active = el.dataset.tab === tab;
@@ -1297,7 +1689,31 @@ async function loadGovernanceSnapshot() {
     return;
   }
   try {
-    state.governanceSnapshot = await callApi('get_governance_snapshot', activeShareGroupId);
+    const [rawSnapshot, rawScope] = await Promise.all([
+      callApi('get_governance_snapshot', activeShareGroupId),
+      callApi('get_governance_scope_state'),
+    ]);
+    const snapshot = governanceSnapshot(rawSnapshot);
+    const runtimeScope = normalizeGovernanceScope(rawScope, activeShareGroupId);
+    const snapshotScope = normalizeGovernanceScope(snapshot, activeShareGroupId);
+    const trustedScope = runtimeScope.status === 'active' ? runtimeScope : snapshotScope;
+    if (snapshot.audit_only || runtimeScope.status === 'audit_only' || snapshotScope.status === 'audit_only') {
+      state.governanceSnapshot = {...snapshot, audit_only: true};
+      clearSharedGovernance('audit_only', 'audit_only');
+      renderStatusRail();
+      if (state.activeTab === 'overview') renderOverview();
+      return;
+    }
+    if (trustedScope.status !== 'active') {
+      state.governanceSnapshot = {...snapshot, non_governable: true};
+      clearSharedGovernance('stale_selection', 'active_binding_required');
+      renderStatusRail();
+      if (state.activeTab === 'overview') renderOverview();
+      return;
+    }
+    governanceScopeState = trustedScope;
+    activeScopeMemberIds = trustedScope.members;
+    state.governanceSnapshot = {...snapshot, active_binding: trustedScope.binding, members: trustedScope.members};
     renderStatusRail();
     if (state.activeTab === 'overview') renderOverview();
   } catch (e) { /* 静默失败，状态栏显示占位 */ }
@@ -1307,6 +1723,25 @@ function renderStatusRail() {
   const container = document.getElementById('status-rail-content');
   const title = document.querySelector('#status-rail h3');
   if (!container) return;
+  if (governanceScopeState.status === 'audit_only') {
+    if (title) title.textContent = '治理状态';
+    container.innerHTML = `<div class="status-item danger"><span class="status-label">共享治理</span><span class="status-num">仅审计</span></div>
+      <div class="rail-warning">当前共享组没有可用治理绑定，已停止共享治理投影。</div>
+      <div class="rail-link" onclick="switchTab('sources')">去数据源恢复绑定 →</div>`;
+    return;
+  }
+  if (governanceScopeState.status === 'stale_selection') {
+    if (title) title.textContent = '治理状态';
+    container.innerHTML = `<div class="status-item danger"><span class="status-label">共享治理</span><span class="status-num">未激活</span></div>
+      <div class="rail-warning">已清除失效共享组选择：当前没有活动绑定，不能作为共享治理范围。</div>
+      <div class="rail-link" onclick="switchTab('sources')">去数据源选择有效绑定 →</div>`;
+    return;
+  }
+  if (state.activeTab === 'codegraph') {
+    if (title) title.textContent = 'CodeGraph';
+    container.innerHTML = renderCodeGraphRail();
+    return;
+  }
   if (state.activeTab === 'neurons' && selectedNeuronNode) {
     if (title) title.textContent = '节点详情';
     container.innerHTML = renderNeuronRailDetail(selectedNeuronNode);
@@ -1328,10 +1763,11 @@ function renderStatusRail() {
     container.innerHTML = '<div class="loading" style="min-height:60px">连接中…</div>';
     return;
   }
-  const activeCount = snap.status ? snap.status.active_count : 0;
-  const conflictCount = snap.conflicts ? snap.conflicts.count : 0;
-  const quarantineCount = snap.quarantine ? snap.quarantine.count : 0;
-  const rollbackCount = snap.rollback_ready || 0;
+  const counts = objectValue(snap.counts);
+  const activeCount = finiteNumber(counts.active_memories, 0);
+  const conflictCount = finiteNumber(counts.conflicts, 0);
+  const quarantineCount = finiteNumber(counts.quarantined, 0);
+  const rollbackCount = finiteNumber(counts.rollback_ready, 0);
   const conflictClass = conflictCount > 0 ? 'alert' : 'zero';
   const quarantineClass = quarantineCount > 0 ? 'danger' : 'zero';
   const rollbackClass = rollbackCount > 0 ? '' : 'zero';
@@ -1500,6 +1936,7 @@ function renderContent() {
     case 'overview': renderOverview(); break;
     case 'sources': renderSources(); break;
     case 'neurons': renderNeurons(); break;
+    case 'codegraph': renderCodeGraph(); break;
     case 'rules': renderRulesHabits(); break;
     case 'history': renderHistory(); break;
     case 'findings': renderFindings(); break;
@@ -1511,16 +1948,25 @@ function renderContent() {
 async function ensureGovernanceScope() {
   try {
     const runtime = await callApi('get_governance_scope_state');
-    if (runtime && runtime.ok && runtime.scope) {
-      if (runtime.scope.mode === 'share_group') {
-        activeShareGroupId = runtime.scope.share_group_id || '';
-        activeAgentInstanceId = runtime.principal_agent_instance_id || '';
-        dataPageMode = 'multi_agent_shared_mcp';
-      } else {
-        activeAgentInstanceId = runtime.scope.agent_instance_id || '';
-        activeShareGroupId = '';
-        dataPageMode = 'single_agent';
-      }
+    const normalized = normalizeGovernanceScope(runtime);
+    governanceScopeState = normalized;
+    if (normalized.status === 'audit_only' || normalized.status === 'stale_selection') {
+      clearSharedGovernance(normalized.status, normalized.reason);
+      activeAgentInstanceId = '';
+      return false;
+    }
+    if (runtime && runtime.ok && runtime.scope && normalized.share_group_id) {
+      activeShareGroupId = normalized.share_group_id;
+      activeAgentInstanceId = runtime.principal_agent_instance_id || '';
+      activeScopeMemberIds = normalized.members;
+      dataPageMode = 'multi_agent_shared_mcp';
+      return true;
+    }
+    if (runtime && runtime.ok && runtime.scope && normalized.agent_instance_id) {
+      activeAgentInstanceId = normalized.agent_instance_id;
+      activeScopeMemberIds = [activeAgentInstanceId];
+      activeShareGroupId = '';
+      dataPageMode = 'single_agent';
       return true;
     }
     // A single active binding is safe to select automatically; multiple
@@ -1529,6 +1975,7 @@ async function ensureGovernanceScope() {
     const agents = options.agents || [];
     if (agents.length === 1 && !(options.share_groups || []).length) {
       activeAgentInstanceId = agents[0].agent_instance_id || '';
+      activeScopeMemberIds = activeAgentInstanceId ? [activeAgentInstanceId] : [];
       activeShareGroupId = '';
       dataPageMode = 'single_agent';
       return !!activeAgentInstanceId;
@@ -1548,8 +1995,10 @@ async function renderNeurons() {
       </div></div>`);
       return;
     }
+    await ensureAgentLabels();
+    await refreshProjectionEngines();
     const [scope, agentId, groupId] = scopeApiArgs();
-    neuronGraph = await callApi('get_neuron_graph', projectionMode, scope, agentId, groupId);
+    neuronGraph = await callApi('get_memory_neuron_graph', projectionMode, scope, agentId, groupId);
     renderNeuronGraph();
   }
   catch (e) {
@@ -1558,11 +2007,350 @@ async function renderNeurons() {
   }
 }
 
+function codeGraphNodeLabel(node) {
+  if (!node) return '未命名节点';
+  return String(node.label || node.path || node.name || node.signature || node.id || '未命名节点');
+}
+
+function codeGraphNodeColor(node) {
+  return node && node.node_kind === 'symbol' ? '#f6ad55' : '#63b3ed';
+}
+
+function codeGraphNodePositions(graph) {
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const files = nodes.filter(node => node.node_kind === 'file').sort((a, b) => String(a.path || a.label || '').localeCompare(String(b.path || b.label || '')));
+  const symbolsByFile = new Map();
+  nodes.filter(node => node.node_kind === 'symbol').forEach(node => {
+    const fileId = String(node.file_id || '');
+    if (!symbolsByFile.has(fileId)) symbolsByFile.set(fileId, []);
+    symbolsByFile.get(fileId).push(node);
+  });
+  const positions = {};
+  const columns = Math.max(1, Math.ceil(Math.sqrt(files.length || 1)));
+  const gapX = 340;
+  const gapY = 290;
+  files.forEach((file, index) => {
+    const row = Math.floor(index / columns);
+    const col = index % columns;
+    const x = (col - (columns - 1) / 2) * gapX;
+    const y = (row - (Math.ceil(files.length / columns) - 1) / 2) * gapY;
+    positions[file.id] = {x, y};
+    const symbols = (symbolsByFile.get(String(file.id)) || []).sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+    symbols.forEach((symbol, symbolIndex) => {
+      const perRing = 10;
+      const ring = Math.floor(symbolIndex / perRing);
+      const slot = symbolIndex % perRing;
+      const ringCount = Math.min(perRing, symbols.length - ring * perRing);
+      const angle = (slot / Math.max(1, ringCount)) * Math.PI * 2 + neuronHashUnit(symbol.id) * .08;
+      const radius = 72 + ring * 54;
+      positions[symbol.id] = {x: x + Math.cos(angle) * radius, y: y + Math.sin(angle) * radius};
+    });
+  });
+  nodes.forEach((node, index) => {
+    if (positions[node.id]) return;
+    const angle = neuronHashUnit(node.id) * Math.PI * 2;
+    const radius = 420 + index * 4;
+    positions[node.id] = {x: Math.cos(angle) * radius, y: Math.sin(angle) * radius};
+  });
+  return positions;
+}
+
+function codeGraphElements(graph) {
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const positions = codeGraphNodePositions(graph);
+  const nodeIds = new Set(nodes.map(node => String(node.id || '')).filter(Boolean));
+  const elements = nodes.filter(node => nodeIds.has(String(node.id || ''))).map(node => ({
+    data: {
+      id: String(node.id),
+      label: codeGraphNodeLabel(node),
+      node_kind: node.node_kind || 'file',
+      color: codeGraphNodeColor(node),
+      path: node.path || '',
+      language: node.language || '',
+      kind: node.kind || '',
+      signature: node.signature || '',
+      file_id: node.file_id || '',
+      line_start: node.line_start || '',
+      line_end: node.line_end || '',
+      provenance: node.provenance || '',
+    },
+    position: positions[String(node.id)] || {x: 0, y: 0},
+  }));
+  const edgeKeys = new Set();
+  (Array.isArray(graph?.edges) ? graph.edges : []).forEach(edge => {
+    const source = String(edge.from_id || edge.source || edge.from || '');
+    const target = String(edge.to_id || edge.target || edge.to || '');
+    if (!nodeIds.has(source) || !nodeIds.has(target)) return;
+    const relation = String(edge.relation || edge.etype || 'related');
+    const key = `${source}|${target}|${relation}`;
+    if (edgeKeys.has(key)) return;
+    edgeKeys.add(key);
+    elements.push({data: {
+      id: String(edge.id || `codegraph:${key}`),
+      source,
+      target,
+      relation,
+      label: relation,
+    }});
+  });
+  return elements;
+}
+
+function codeGraphNodeForId(nodeId) {
+  const nodes = Array.isArray(codeGraph?.nodes) ? codeGraph.nodes : [];
+  return nodes.find(node => String(node.id || '') === String(nodeId || '')) || null;
+}
+
+function selectedCodeGraphProjectRow() {
+  return codeGraphProjects.find(item => item.source_id === selectedCodeGraphProject
+    || item.project_key === selectedCodeGraphProject || item.project_ref === selectedCodeGraphProject) || null;
+}
+
+function codeGraphProjectControls() {
+  const options = codeGraphProjects.map(item => {
+    const value = item.source_id || item.project_key || item.project_ref || '';
+    const selected = value === selectedCodeGraphProject ? 'selected' : '';
+    const counts = `${Number(item.file_count || 0)} 文件 · ${Number(item.symbol_count || 0)} 符号`;
+    return `<option value="${escapeHtml(value)}" ${selected}>${escapeHtml(item.label || item.project_ref || value)} · ${counts}</option>`;
+  }).join('');
+  const select = codeGraphProjects.length
+    ? `<label>项目<select aria-label="CodeGraph 项目" onchange="setCodeGraphProject(this.value)"><option value="" ${selectedCodeGraphProject ? '' : 'selected'}>${codeGraphProjects.length > 1 ? '选择项目' : '自动选择'}</option>${options}</select></label>`
+    : '<span class="muted">尚未构建任何项目 CodeGraph</span>';
+  const buildLabel = codeGraphBuildInFlight ? '正在构建…' : (codeGraphProjects.length ? '构建 / 更新项目' : '选择项目并构建');
+  return `${select}<button class="btn ${codeGraphProjects.length ? '' : 'btn-primary'}" type="button" onclick="buildCodeGraphFromFolder()" ${codeGraphBuildInFlight || !codeGraphBuildReady ? 'disabled' : ''}>${buildLabel}</button>`;
+}
+
+async function loadCodeGraphProjects() {
+  const result = await callApi('list_codegraph_projects');
+  if (result.error || result.ok === false) throw new Error(apiErrorMessage(result, 'CodeGraph 项目列表读取失败'));
+  codeGraphProjects = Array.isArray(result.projects) ? result.projects : [];
+  codeGraphBuildReady = result.build_ready === true;
+  if (selectedCodeGraphProject && !selectedCodeGraphProjectRow()) selectedCodeGraphProject = '';
+  if (!selectedCodeGraphProject && codeGraphProjects.length === 1) {
+    selectedCodeGraphProject = codeGraphProjects[0].source_id || codeGraphProjects[0].project_key || codeGraphProjects[0].project_ref || '';
+    if (selectedCodeGraphProject) localStorage.setItem('memoryguard.codeGraphProject', selectedCodeGraphProject);
+  }
+  return result;
+}
+
+function renderCodeGraphRail() {
+  const graph = codeGraph || {};
+  if (selectedCodeGraphNode) {
+    const node = selectedCodeGraphNode;
+    return `<div class="popover-kicker">CodeGraph 节点</div>
+      <h3 style="margin:4px 0 10px;font-size:15px">${escapeHtml(codeGraphNodeLabel(node))}</h3>
+      <div class="row"><span class="key">类型</span><span>${escapeHtml(node.node_kind || 'file')}</span></div>
+      ${node.path ? `<div class="row"><span class="key">路径</span><code>${escapeHtml(guiPathText(node.path))}</code></div>` : ''}
+      ${node.kind ? `<div class="row"><span class="key">符号</span><span>${escapeHtml(node.kind)}</span></div>` : ''}
+      ${node.signature ? `<div class="detail-section"><h4>签名</h4><div class="neuron-detail-body">${escapeHtml(node.signature)}</div></div>` : ''}
+      ${node.line_start ? `<div class="row"><span class="key">行号</span><span>${escapeHtml(node.line_start)}${node.line_end ? `–${escapeHtml(node.line_end)}` : ''}</span></div>` : ''}
+      ${node.provenance ? `<div class="row"><span class="key">来源</span><span>${escapeHtml(node.provenance)}</span></div>` : ''}`;
+  }
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  return `<div class="status-item"><span class="status-label">节点</span><span class="status-num">${graph.node_count ?? nodes.length}</span></div>
+    <div class="status-item"><span class="status-label">关系</span><span class="status-num">${graph.edge_count ?? edges.length}</span></div>
+    <div class="status-item"><span class="status-label">项目</span><span class="status-num" style="font-size:11px">${escapeHtml(selectedCodeGraphProjectRow()?.label || graph.project_ref || '未选择')}</span></div>
+    <div class="rail-link" onclick="refreshCodeGraph()">刷新 CodeGraph</div>`;
+}
+
+function renderCodeGraphEmpty(message = '当前范围没有 CodeGraph 数据。') {
+  setContent(`<div class="view-heading"><span class="eyebrow">CodeGraph</span><h2>CodeGraph</h2>
+    <p>代码结构图独立于记忆核心。Graphify 只写入文件/符号/关系元数据，不会把代码正文塞进长期记忆。</p></div>
+    <section class="card empty-state"><div><div class="empty-orb"></div><p>${escapeHtml(message)}</p>
+      <div class="codegraph-controls" style="justify-content:center;margin-top:14px">${codeGraphProjectControls()}<button class="btn" type="button" onclick="refreshCodeGraph()">刷新 CodeGraph</button></div>
+      ${!codeGraphBuildReady ? '<p class="muted" style="margin-top:10px">内置 Graphify Core 当前不可用，请运行 MemoryGuard 诊断/修复；无需安装外部 Graphify。</p>' : ''}</div></section>`);
+  renderStatusRail();
+}
+
+function renderCodeGraphView() {
+  const graph = codeGraph || {};
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges : [];
+  const count = Number(graph.node_count ?? nodes.length);
+  const edgeCount = Number(graph.edge_count ?? edges.length);
+  const totalCounts = graph.total_counts || {};
+  const countEl = document.getElementById('codegraph-count');
+  if (countEl) countEl.textContent = count || '';
+  if (graph.error || graph.ok === false) {
+    renderCodeGraphEmpty(`CodeGraph 读取失败：${apiErrorMessage(graph, 'CodeGraph 读取失败')}`);
+    return;
+  }
+  if (!nodes.length) {
+    const emptyMessage = graph.status === 'PROJECT_REQUIRED'
+      ? '当前共享组有多个 CodeGraph 项目，请选择一个项目。'
+      : (graph.status === 'NO_SOURCE' ? '当前共享组尚未构建任何 CodeGraph 项目。' : '当前项目没有 CodeGraph 节点。');
+    renderCodeGraphEmpty(emptyMessage);
+    return;
+  }
+  selectedCodeGraphNode = null;
+  setContent(`<div class="view-heading"><span class="eyebrow">Independent code projection</span><h2>CodeGraph</h2>
+    <p>代码文件、符号与关系独立展示；本页不复用记忆核心状态或 Memory Projection 数据。</p></div>
+    <section class="codegraph-shell">
+      <div class="card codegraph-toolbar"><div><h2>代码结构图</h2><p>当前项目：${escapeHtml(selectedCodeGraphProjectRow()?.label || graph.project_ref || '未选择')}</p></div>
+        <div class="codegraph-controls">
+          ${codeGraphProjectControls()}
+          <label>节点上限<select aria-label="CodeGraph 节点上限" onchange="setCodeGraphLimit(this.value)">
+            ${[50, 100, 200, 500].map(limit => `<option value="${limit}" ${limit === codeGraphLimit ? 'selected' : ''}>${limit}</option>`).join('')}
+          </select></label>
+          <button class="btn" type="button" onclick="fitCodeGraph()">重置视野</button>
+          <button class="btn btn-primary" type="button" onclick="refreshCodeGraph()">刷新 CodeGraph</button>
+        </div>
+      </div>
+      <div class="codegraph-stats">
+        <div class="codegraph-stat"><strong>${count}</strong><span>当前显示节点</span></div>
+        <div class="codegraph-stat"><strong>${edgeCount}</strong><span>当前显示关系</span></div>
+        <div class="codegraph-stat"><strong>${Number(totalCounts.symbols || graph.displayed_symbol_count || 0)}</strong><span>项目符号总数</span></div>
+        <div class="codegraph-stat"><strong>${Number(totalCounts.edges || edgeCount)}</strong><span>项目关系总数</span></div>
+      </div>
+      <section class="codegraph-stage" aria-label="CodeGraph 代码结构图">
+        <div class="codegraph-canvas" id="codegraph-canvas"></div>
+        <div class="codegraph-legend"><span><i class="codegraph-dot"></i>文件</span><span><i class="codegraph-dot symbol"></i>符号</span></div>
+      </section>
+    </section>`);
+  renderStatusRail();
+  if (typeof cytoscape === 'undefined') {
+    document.getElementById('codegraph-canvas').innerHTML = '<div class="empty-state" style="color:var(--red)">本地 Cytoscape 资源加载失败</div>';
+    return;
+  }
+  if (codeCyInstance) {
+    try { codeCyInstance.destroy(); } catch (_) { /* graph torn down */ }
+  }
+  codeCyInstance = cytoscape({
+    container: document.getElementById('codegraph-canvas'),
+    elements: codeGraphElements(graph),
+    style: [
+      { selector: 'node', style: {
+        'shape': 'ellipse', 'width': 22, 'height': 22, 'background-color': 'data(color)',
+        'border-width': 1.4, 'border-color': '#d8f3ff', 'border-opacity': .8,
+        'label': 'data(label)', 'color': '#d9f1ff', 'font-size': 9,
+        'font-family': 'Segoe UI, PingFang SC, sans-serif', 'text-valign': 'bottom',
+        'text-halign': 'center', 'text-margin-y': 7, 'text-wrap': 'wrap', 'text-max-width': 120,
+        'text-outline-width': 2, 'text-outline-color': '#06101a',
+      }},
+      { selector: 'node[node_kind = "file"]', style: {'width': 30, 'height': 30, 'border-width': 2} },
+      { selector: 'edge', style: {
+        'width': 1.1, 'line-color': '#63b3ed', 'line-opacity': .34,
+        'curve-style': 'bezier', 'target-arrow-shape': 'triangle', 'target-arrow-color': '#63b3ed',
+      }},
+      { selector: 'edge:selected', style: {'line-color': '#f6ad55', 'target-arrow-color': '#f6ad55', 'width': 2.2} },
+      { selector: 'node:selected', style: {'border-color': '#fff6c7', 'border-width': 3} },
+    ],
+    layout: {name: 'preset', fit: true, padding: 58},
+    minZoom: .2, maxZoom: 3.6,
+  });
+  codeCyInstance.on('tap', 'node', event => {
+    selectedCodeGraphNode = codeGraphNodeForId(event.target.id());
+    renderStatusRail();
+  });
+  codeCyInstance.on('tap', event => {
+    if (event.target === codeCyInstance) {
+      selectedCodeGraphNode = null;
+      renderStatusRail();
+    }
+  });
+}
+
+async function renderCodeGraph() {
+  setContent('<div class="loading">正在读取 CodeGraph</div>');
+  try {
+    const ok = await ensureGovernanceScope();
+    if (!ok) {
+      renderCodeGraphEmpty('请先选择一个受治理的 Agent / 共享组。');
+      return;
+    }
+    await ensureAgentLabels();
+    await loadCodeGraphProjects();
+    await refreshCodeGraph();
+  } catch (error) {
+    codeGraph = {error: error.message || String(error)};
+    showToast('CodeGraph 读取失败：' + (error.message || error), 'error');
+    renderCodeGraphView();
+  }
+}
+
+async function refreshCodeGraph(message = '') {
+  const selected = selectedCodeGraphProjectRow();
+  codeGraph = await callApi('get_codegraph_graph', {
+    codegraph_source_id: selected?.source_id || '',
+    codegraph_project_ref: selected?.source_id ? '' : (selectedCodeGraphProject || ''),
+    limit: codeGraphLimit,
+    provenance: codeGraphProvenance,
+  });
+  if (Array.isArray(codeGraph.projects) && !codeGraphProjects.length) codeGraphProjects = codeGraph.projects;
+  renderCodeGraphView();
+  if (message) showToast(message, 'success');
+}
+
+async function setCodeGraphProject(value) {
+  selectedCodeGraphProject = String(value || '');
+  if (selectedCodeGraphProject) localStorage.setItem('memoryguard.codeGraphProject', selectedCodeGraphProject);
+  else localStorage.removeItem('memoryguard.codeGraphProject');
+  try { await refreshCodeGraph(); }
+  catch (error) { showToast('CodeGraph 项目切换失败：' + (error.message || error), 'error'); }
+}
+
+async function buildCodeGraphFromFolder() {
+  if (codeGraphBuildInFlight) return;
+  const picked = await callApi('pick_path');
+  const projectPath = String(picked?.path || '').trim();
+  if (!projectPath || picked?.is_directory === false) return;
+  if (!confirm(`确认使用 Graphify 构建该项目的 CodeGraph？\n\n${projectPath}\n\n只写入结构元数据，不复制代码正文到长期记忆。`)) return;
+  codeGraphBuildInFlight = true;
+  renderCodeGraphView();
+  try {
+    const added = await callApi('add_source', projectPath, 'directory', '', true);
+    if (added.error || added.ok === false) throw new Error(apiErrorMessage(added, '代码来源授权失败'));
+    const sourceId = String(added.source_id || added.root_id || '');
+    if (!sourceId) throw new Error('代码来源未返回 source_id');
+    selectedCodeGraphProject = sourceId;
+    localStorage.setItem('memoryguard.codeGraphProject', sourceId);
+    const accepted = await callApi('build_codegraph', sourceId, true);
+    if (accepted.error || accepted.ok === false) throw new Error(apiErrorMessage(accepted, 'CodeGraph 构建启动失败'));
+    const task = normalizeTaskState(accepted);
+    const runId = task.run_id || accepted.job_id || '';
+    const result = (accepted.deferred || runId)
+      ? await waitForTask(runId, 'CodeGraph 构建', 300000)
+      : accepted;
+    if (!result || result.ok === false || result.execution_status === 'failed') {
+      throw new Error(apiErrorMessage(result || {}, 'CodeGraph 构建失败'));
+    }
+    const projectRef = String(result.project_ref || accepted.project_ref || '');
+    const builtSourceId = String(result.source_id || accepted.source_id || selectedCodeGraphProject || '');
+    await loadCodeGraphProjects();
+    const match = codeGraphProjects.find(item => item.source_id === builtSourceId
+      || item.project_key === projectRef || item.project_ref === projectRef);
+    selectedCodeGraphProject = match?.source_id || match?.project_key || match?.project_ref || builtSourceId || projectRef;
+    if (selectedCodeGraphProject) localStorage.setItem('memoryguard.codeGraphProject', selectedCodeGraphProject);
+    const counts = result.counts || {};
+    await refreshCodeGraph(`CodeGraph 已更新：${Number(counts.source_files || 0)} 文件 · ${Number(counts.symbols || 0)} 符号 · ${Number(counts.edges || 0)} 关系`);
+  } catch (error) {
+    showToast('CodeGraph 构建失败：' + (error.message || error), 'error');
+    try { await loadCodeGraphProjects(); await refreshCodeGraph(); } catch (_) { /* keep original error */ }
+  } finally {
+    codeGraphBuildInFlight = false;
+    if (state.activeTab === 'codegraph') renderCodeGraphView();
+  }
+}
+
+async function setCodeGraphLimit(value) {
+  const next = Number(value);
+  if (![50, 100, 200, 500].includes(next)) return;
+  codeGraphLimit = next;
+  try { await refreshCodeGraph(); }
+  catch (error) { showToast('CodeGraph 刷新失败：' + (error.message || error), 'error'); }
+}
+
+function fitCodeGraph() {
+  if (codeCyInstance) codeCyInstance.fit(undefined, 58);
+}
+
 function kindColor(kind) {
   const colors = {
     fact: '#6ee7c4', preference: '#f6ad55', project: '#63b3ed', episode: '#fc8181', procedure: '#b794f4', correction: '#f687b3', workflow: '#b794f4', constraint: '#fbd38d',
     user: '#c084fc', agent: '#38bdf8', session: '#94a3b8', share_group: '#2dd4bf', unknown: '#64748b',
-    rules_habits: '#f6ad55', conversation_history: '#7dd3fc'
+    rules_habits: '#f6ad55', mandatory: '#fb7185', preferences: '#f6ad55', procedures: '#b794f4', corrections: '#f687b3', projects: '#63b3ed',
+    conversation_history: '#7dd3fc'
   };
   return colors[kind] || '#6ee7c4';
 }
@@ -1595,97 +2383,164 @@ function neuronHashUnit(value) {
 }
 
 function neuronNodePositions(nodes) {
-  const positions = {};
+  const positions = { main: { x: 0, y: 0 } };
   const children = {};
+  const byId = new Map();
   nodes.forEach(node => {
-    const parent = node.parent_id || '';
+    byId.set(String(node.id || ''), node);
+    const parent = String(node.parent_id || '');
     if (!children[parent]) children[parent] = [];
     children[parent].push(node);
   });
-  positions.main = { x: 0, y: 0 };
-  const directMain = children.main || [];
+  Object.values(children).forEach(items => items.sort((a, b) => String(a.id || '').localeCompare(String(b.id || ''))));
+
+  const descendantCount = (nodeId, memo = new Map()) => {
+    if (memo.has(nodeId)) return memo.get(nodeId);
+    let total = 0;
+    for (const child of children[nodeId] || []) total += 1 + descendantCount(String(child.id || ''), memo);
+    memo.set(nodeId, total);
+    return total;
+  };
+  const branchRank = (node) => {
+    if (node.id === 'virtual-rules-habits') return 0;
+    if (node.id === 'virtual-conversation-history') return 1;
+    if (node.kind === 'user') return 2;
+    if (node.kind === 'project') return 3;
+    if (node.kind === 'shared') return 4;
+    return 10;
+  };
+  const directMain = [...(children.main || [])].sort((a, b) => branchRank(a) - branchRank(b) || String(a.id || '').localeCompare(String(b.id || '')));
+  const weights = directMain.map(node => Math.max(1.2, Math.sqrt(1 + descendantCount(String(node.id || ''))) * .72));
+  const totalWeight = Math.max(1, weights.reduce((sum, item) => sum + item, 0));
+  const branchMeta = new Map();
+  let cursor = -Math.PI / 2;
   directMain.forEach((node, index) => {
-    const total = Math.max(1, directMain.length);
-    const angle = (index / total) * Math.PI * 2 + neuronHashUnit(node.id) * .14;
-    const radius = 285 + neuronHashUnit(node.id + ':r') * 105;
+    const sector = Math.PI * 2 * (weights[index] / totalWeight);
+    const angle = cursor + sector / 2;
+    const radius = 118 + Math.min(18, descendantCount(String(node.id || '')) * .45);
+    positions[node.id] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+    branchMeta.set(String(node.id || ''), { angle, sector: Math.max(.42, sector) });
+    cursor += sector;
+  });
+
+  const topBranch = (nodeId) => {
+    let current = byId.get(String(nodeId || ''));
+    let guard = 0;
+    while (current && current.parent_id && current.parent_id !== 'main' && guard++ < 12) {
+      current = byId.get(String(current.parent_id));
+    }
+    return current && current.parent_id === 'main' ? String(current.id || '') : String(nodeId || '');
+  };
+  const depthOf = (nodeId) => {
+    let depth = 0;
+    let current = byId.get(String(nodeId || ''));
+    let guard = 0;
+    while (current && current.parent_id && guard++ < 12) {
+      depth += 1;
+      if (current.parent_id === 'main') break;
+      current = byId.get(String(current.parent_id));
+    }
+    return depth;
+  };
+  const pending = nodes.filter(node => node.id !== 'main' && !positions[node.id]);
+  for (let pass = 0; pass < 12 && pending.length; pass++) {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const node = pending[i];
+      const parentId = String(node.parent_id || 'main');
+      const parent = positions[parentId];
+      if (!parent) continue;
+      const siblings = children[parentId] || [node];
+      const index = Math.max(0, siblings.findIndex(item => item.id === node.id));
+      const siblingCount = Math.max(1, siblings.length);
+      const branchId = topBranch(node.id);
+      const meta = branchMeta.get(branchId) || {
+        angle: Math.atan2(parent.y, parent.x) || -Math.PI / 2,
+        sector: Math.PI / Math.max(2, directMain.length || 2),
+      };
+      const parentAngle = Math.atan2(parent.y, parent.x);
+      const depth = Math.max(2, depthOf(node.id));
+      const perRing = Math.max(6, Math.min(14, Math.ceil(Math.sqrt(siblingCount) * 2.2)));
+      const ring = Math.floor(index / perRing);
+      const ringIndex = index % perRing;
+      const ringCount = Math.max(1, Math.min(perRing, siblingCount - ring * perRing));
+      const fan = Math.min(1.32, meta.sector * .76);
+      const offset = ringCount === 1 ? 0 : ((ringIndex + .5) / ringCount - .5) * fan;
+      const angle = parentAngle + offset + (neuronHashUnit(node.id) - .5) * .035;
+      const parentRadius = Math.sqrt(parent.x * parent.x + parent.y * parent.y);
+      const radialStep = node.node_kind === 'history_session' ? 82
+        : node.node_kind === 'virtual_rule_ref' ? 78 : 96;
+      const radius = parentRadius + radialStep + ring * 58 + Math.min(30, depth * 5);
+      positions[node.id] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
+      pending.splice(i, 1);
+    }
+  }
+  pending.forEach((node, index) => {
+    const angle = neuronHashUnit(node.id) * Math.PI * 2;
+    const radius = 420 + index * 14;
     positions[node.id] = { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius };
   });
-  const placeNode = (node) => {
-    const parent = positions[node.parent_id || 'main'] || positions.main;
-    const siblings = children[node.parent_id || ''] || [];
-    const index = Math.max(0, siblings.findIndex(s => s.id === node.id));
-    const siblingCount = Math.max(1, siblings.length);
-    const angle = (index / siblingCount) * Math.PI * 2 + neuronHashUnit(node.id) * .18;
-    const radius = 72 + Math.min(170, index * 9 + neuronHashUnit(node.id + ':leaf') * 56);
-    positions[node.id] = {
-      x: parent.x + Math.cos(angle) * radius + (neuronHashUnit(node.id + ':x') - .5) * 42,
-      y: parent.y + Math.sin(angle) * radius + (neuronHashUnit(node.id + ':y') - .5) * 42,
-    };
-  };
-  const pending = [];
-  for (const node of nodes) {
-    if (positions[node.id]) continue;
-    if (!positions[node.parent_id || 'main']) { pending.push(node); continue; }
-    placeNode(node);
-  }
-  for (let pass = 0; pass < 6 && pending.length; pass++) {
-    const next = [];
-    for (const node of pending) {
-      if (positions[node.id]) continue;
-      if (!positions[node.parent_id || 'main']) { next.push(node); continue; }
-      placeNode(node);
-    }
-    pending.length = 0;
-    pending.push(...next);
-  }
-  pending.forEach(placeNode);
-  // 轻量级排斥后处理，减少高密度叠点。仅用于可视化舒适度，不影响语义。
-  const radii = {};
-  const nodeKinds = new Set(nodes.map(n => n.node_kind));
+
+  // Stronger collision pass.  It only adjusts visualization coordinates and
+  // keeps the semantic parent/edge graph untouched.
   const estimateRadius = (item) => {
     const kind = item.node_kind || '';
-    if (kind === 'root') return 30;
-    if (kind === 'source_hub') return 28;
-    if (kind === 'claim_anchor' || kind === 'duplicate_cluster') return 16;
-    if (item.node_kind === 'virtual_bucket') return 35;
-    if (item.node_kind === 'virtual_category') return 30;
-    if (item.node_kind === 'history_session') return 9;
-    return 18 + Math.min(16, (item.provenance_count || 0) * 2.5);
+    if (kind === 'root') return 36;
+    if (kind === 'source_hub') return 30;
+    if (kind === 'virtual_category') return 44;
+    if (kind === 'virtual_bucket') return 38;
+    if (kind === 'history_project') return 38;
+    if (kind === 'history_agent') return 30;
+    if (kind === 'topic') return 32;
+    if (kind === 'history_session') return 11;
+    if (kind === 'virtual_rule_ref') return 12;
+    if (kind === 'claim_anchor' || kind === 'duplicate_cluster') return 12;
+    return 20 + Math.min(18, (item.provenance_count || 0) * 2.2);
   };
-  nodes.forEach(node => {
-    radii[node.id] = estimateRadius(node);
-  });
-  if ((nodeKinds.has('virtual_category') || nodeKinds.has('virtual_bucket') || nodes.length > 45) && Object.keys(positions).length) {
-    const ids = nodes.map(item => item.id).filter(id => positions[id]);
-    for (let iter = 0; iter < 55; iter++) {
-      let moved = false;
-      for (let i = 0; i < ids.length; i++) {
-        const idA = ids[i];
-        const posA = positions[idA];
-        if (!posA || idA === 'main') continue;
-        for (let j = i + 1; j < ids.length; j++) {
-          const idB = ids[j];
-          if (idB === 'main') continue;
-          const posB = positions[idB];
-          if (!posB) continue;
-          const dx = posB.x - posA.x;
-          const dy = posB.y - posA.y;
-          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-          const req = (radii[idA] || 20) + (radii[idB] || 20) + 7;
-          if (dist >= req) continue;
-          const gap = req - dist;
-          const nx = dx / dist;
-          const ny = dy / dist;
-          const force = gap / 2 * (1 - iter / 55);
+  const radii = Object.fromEntries(nodes.map(node => [node.id, estimateRadius(node)]));
+  const anchored = new Set(directMain.map(node => String(node.id || '')));
+  const ids = nodes.map(item => item.id).filter(id => positions[id] && id !== 'main');
+  const branchById = Object.fromEntries(ids.map(id => [id, topBranch(id)]));
+  for (let iter = 0; iter < 78; iter++) {
+    let moved = false;
+    for (let i = 0; i < ids.length; i++) {
+      const posA = positions[ids[i]];
+      for (let j = i + 1; j < ids.length; j++) {
+        const posB = positions[ids[j]];
+        let dx = posB.x - posA.x;
+        let dy = posB.y - posA.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < .001) {
+          const splitAngle = neuronHashUnit(`${ids[i]}:${ids[j]}`) * Math.PI * 2;
+          dx = Math.cos(splitAngle);
+          dy = Math.sin(splitAngle);
+          dist = 1;
+        }
+        const sameBranch = branchById[ids[i]] === branchById[ids[j]];
+        const clusterPadding = sameBranch ? 10 : 26;
+        const required = (radii[ids[i]] || 18) + (radii[ids[j]] || 18) + clusterPadding;
+        if (dist >= required) continue;
+        const force = (required - dist) * .46 * (1 - iter / 92);
+        const nx = dx / dist;
+        const ny = dy / dist;
+        const anchorA = anchored.has(ids[i]);
+        const anchorB = anchored.has(ids[j]);
+        if (anchorA && anchorB) continue;
+        if (anchorA) {
+          posB.x += nx * force * 1.7;
+          posB.y += ny * force * 1.7;
+        } else if (anchorB) {
+          posA.x -= nx * force * 1.7;
+          posA.y -= ny * force * 1.7;
+        } else {
           posA.x -= nx * force;
           posA.y -= ny * force;
           posB.x += nx * force;
           posB.y += ny * force;
-          moved = true;
         }
+        moved = true;
       }
-      if (!moved) break;
     }
+    if (!moved) break;
   }
   return positions;
 }
@@ -1695,12 +2550,24 @@ function graphElements(graph) {
   // node: id / parent_id / label / node_kind / memory_id / kind / provenance_count
   // edge: id / source / target / edge_type (+ strength 粗细)
   const elements = [];
-  const positions = neuronNodePositions(graph.nodes || []);
+  const graphNodes = graph.nodes || [];
+  const nodeById = new Map(graphNodes.map(node => [String(node.id || ''), node]));
+  const positions = neuronNodePositions(graphNodes);
+  const nodeDepth = (node) => {
+    let depth = 0;
+    let current = node;
+    let guard = 0;
+    while (current && current.parent_id && guard++ < 16) {
+      depth += 1;
+      current = nodeById.get(String(current.parent_id));
+    }
+    return depth;
+  };
   const EDGE_STRENGTH = {
     derived_from: 0.58, related: 0.28, shared_source: 0.4,
     duplicate: 0.34, virtual_index: 0.46,
   };
-  for (const node of graph.nodes || []) {
+  for (const node of graphNodes) {
     const root = node.node_kind === 'root';
     const hub = node.node_kind === 'source_hub';
     const anchor = node.node_kind === 'claim_anchor' || node.node_kind === 'duplicate_cluster';
@@ -1716,16 +2583,22 @@ function graphElements(graph) {
       : cluster ? Math.max(15, Math.min(30, 12 + (node.cluster_count || 2) * 4))
       : anchor ? 7
       : Math.max(27, Math.min(54, 25 + provCount * 3.2));
+    const compactLeaf = anchor || historySession || node.node_kind === 'virtual_rule_ref';
     elements.push({ data: {
       id: node.id,
-      label: anchor ? '' : String(node.node_kind === 'topic' ? topicNodeLabel(node) : (node.label || '')).slice(0, 18),
+      label: compactLeaf ? '' : String(node.node_kind === 'topic' ? topicNodeLabel(node) : (node.label || '')).slice(0, 18),
       kind: node.node_kind,
+      parent_id: node.parent_id || '',
+      depth: nodeDepth(node),
       memory_id: node.memory_id || '',
-      record_kind: node.kind || '',
+      record_kind: node.record_kind || node.virtual_category || node.kind || '',
       cluster_count: node.cluster_count || 0,
       provenance_count: provCount,
       virtual_category: node.virtual_category || '',
       session_id: node.session_id || '',
+      status: node.status || '',
+      effective: node.effective === true ? 'true' : 'false',
+      excluded: node.excluded === true ? 'true' : 'false',
       size,
       bg: node.bg || kindColor(node.kind || node.label || ''),
       opacity: 0.85,
@@ -1735,22 +2608,30 @@ function graphElements(graph) {
   for (const edge of graph.edges || []) {
     const source = String(edge.source || '');
     const target = String(edge.target || '');
+    const sourceNode = nodeById.get(source) || {};
+    const targetNode = nodeById.get(target) || {};
+    const branchKind = targetNode.record_kind || targetNode.virtual_category
+      || sourceNode.record_kind || sourceNode.virtual_category || '';
     edgeKeys.add(`${source}:${target}`);
     elements.push({ data: {
       id: edge.id, source, target,
       etype: edge.edge_type || 'derived_from',
+      branch_kind: branchKind,
       strength: EDGE_STRENGTH[edge.edge_type] || 0.4,
     }});
   }
-  for (const node of graph.nodes || []) {
+  for (const node of graphNodes) {
     const parentId = String(node.parent_id || '');
     const nodeId = String(node.id || '');
     if (!parentId || !nodeId || parentId === nodeId || edgeKeys.has(`${parentId}:${nodeId}`)) continue;
     // 有些旧投影/虚拟叠加只写了 parent_id，忘了落边；这里补出树形连线，主光点到分类不会悬空。
     edgeKeys.add(`${parentId}:${nodeId}`);
+    const parentNode = nodeById.get(parentId) || {};
+    const branchKind = node.record_kind || node.virtual_category
+      || parentNode.record_kind || parentNode.virtual_category || '';
     elements.push({ data: {
       id: `parent-bridge:${parentId}:${nodeId}`, source: parentId, target: nodeId,
-      etype: 'derived_from', strength: 0.52,
+      etype: 'derived_from', branch_kind: branchKind, strength: 0.52,
     }});
   }
   return elements;
@@ -1781,7 +2662,7 @@ function projectionModeLabel(mode) {
 function sourceCategoryLabel(category) {
   return {
     native_memory: '原生记忆', project_memory: '项目记忆', knowledge_source: '知识文档',
-    shared_memory: 'MCP 实时记忆',
+    shared_memory: 'MCP 实时记忆', content_source: '内容连接器',
     conversation_history: '会话历史', runtime_evidence: '运行证据', ignored_runtime_data: '忽略运行数据',
     control_surface: '控制面', skill_surface: '技能面'
   }[category] || category || '未知';
@@ -1791,11 +2672,26 @@ function renderProjectionSourceMap(sourceMap) {
   const entries = sourceMap?.entries || [];
   const summary = sourceMap?.summary || {};
   const shared = sourceMap?.projection_kind === 'shared_memory_projection';
-  const rows = entries.length ? entries.map(renderProjectionSourceEntry).join('') : '<tr><td colspan="7" class="empty-note">暂无映射条目</td></tr>';
+  const sourceCount = entries.length;
+  const sourceDetailsId = 'projection-source-map-details';
+  const cards = entries.map(renderProjectionSourceEntry).join('');
+  const governedMemory = finiteFirst(summary.governed_memory, summary.shared_memory);
+  const connectorCount = finiteFirst(summary.selected_source_connectors, summary.enabled_connectors);
+  const connectorTotal = finiteFirst(summary.selected_source_connector_total, summary.source_connector_total);
+  const participatingCount = finiteFirst(summary.enabled, summary.governed_memory_eligible);
+  const emptyMappingNotice = !shared && !entries.length
+    ? `<div class="gate-warning"><strong>当前治理范围已设定，但尚未选择数据源。</strong>范围不等于数据源；请先到数据源页选择并启用 Agent、项目或来源，之后再构建投影。</div><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="switchTab('sources')">去数据源页选择数据源</button></div>`
+    : '';
+  const emptySourceNotice = !entries.length && shared
+    ? '<div class="source-map-empty" role="status"><strong>暂无共享记忆入库来源</strong><p>当前共享组没有可展示的受管记忆或连接器；来源出现后会在此处按需展开。</p></div>'
+    : '';
+  const toggle = sourceCount
+    ? `<div class="source-map-toggle-row"><button class="btn source-map-toggle" type="button" aria-expanded="false" aria-controls="${sourceDetailsId}" data-source-count="${sourceCount}" onclick="toggleSourceMapDetails(this)">展开 ${sourceCount} 条来源</button></div>`
+    : '';
   return `<section class="card projection-source-map">
     <div class="card-head"><div><h2>${shared ? '共享记忆入库来源' : '当前数据源映射'}</h2><p>${shared ? '共享图直接读取 SharedMemoryStore。这里展示 active 记忆最初由 MCP 写入或从哪个已授权来源导入；取消来源不会自动删除已经入库的记忆。' : '这里只读展示数据源页已勾选的 Agent / 项目 / 来源。勾选和取消请回到数据源页处理。'}</p></div>
-      <div class="chips">${shared ? `<span class="chip chip-info">入库来源 ${summary.shared_memory || 0}</span><span class="chip chip-info">参与投影 ${summary.enabled || 0}/${summary.total || 0}</span>` : `<span class="chip chip-info">启用 ${summary.enabled || 0}/${summary.total || 0}</span><span class="chip chip-info">原生 ${summary.native_memory || 0}</span><span class="chip chip-info">逻辑 ${summary.logical_reconstruction || 0}</span><span class="chip chip-medium">证据 ${summary.evidence_only || 0}</span>`}</div></div>
-    <div class="source-map-table-wrap"><table class="source-map-table"><thead><tr><th>状态</th><th>投影</th><th>来源</th><th>Agent</th><th>项目/范围</th><th>策略</th><th>路径</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="chips">${shared ? `<span class="chip chip-info">受管记忆 ${governedMemory}</span><span class="chip chip-info">连接器 ${connectorCount}/${connectorTotal}</span><span class="chip chip-info">参与投影 ${participatingCount}</span>` : `<span class="chip chip-info">启用 ${finiteFirst(summary.enabled)}/${finiteFirst(summary.total)}</span><span class="chip chip-info">原生 ${finiteFirst(summary.native_memory)}</span><span class="chip chip-info">逻辑 ${finiteFirst(summary.logical_reconstruction)}</span><span class="chip chip-medium">证据 ${finiteFirst(summary.evidence_only)}</span>`}</div></div>
+    ${emptyMappingNotice}${emptySourceNotice}${toggle}<div id="${sourceDetailsId}" class="source-map-details" hidden><div class="source-map-list">${cards}</div></div>
   </section>`;
 }
 
@@ -1803,17 +2699,34 @@ function renderProjectionSourceEntry(entry) {
   const eligible = entry.logical_eligible || entry.native_eligible;
   const sharedOrigin = entry.is_shared_memory_origin === true;
   const mode = projectionModeLabel(entry.projection_mode);
-  const path = guiPathText(entry.path, '受保护来源');
+  const sourceId = safeDisplayText(entry.source_id || entry.root_id || entry.surface_id, '未标识来源');
+  const sourceName = safeDisplayText(entry.display_name || entry.surface_id || entry.root_id, '未命名来源');
+  const path = guiPathText(entry.path, '无本地路径');
   const project = entry.project_ref || (entry.scope === 'project' ? '当前项目' : entry.scope || '未知');
-  return `<tr class="${entry.enabled ? '' : 'muted-row'}">
-    <td><span class="chip ${(sharedOrigin && entry.participates) || entry.enabled ? 'chip-confirmed' : 'chip-medium'}">${sharedOrigin ? (entry.participates ? `已入库 · ${entry.record_count || 0} 条` : '历史来源') : (entry.enabled ? '已勾选' : '未勾选')}</span></td>
-    <td><span class="chip ${eligible ? 'chip-confirmed' : 'chip-medium'}">${escapeHtml(mode)}</span></td>
-    <td><strong>${escapeHtml(entry.display_name || entry.surface_id || entry.root_id)}</strong><div class="surface-meta">${escapeHtml(sourceCategoryLabel(entry.source_category))}</div></td>
-    <td>${escapeHtml(entry.agent_instance_id || '未绑定')}<div class="surface-meta">${escapeHtml(entry.surface_id || '—')}</div></td>
-    <td>${escapeHtml(project)}</td>
-    <td>${escapeHtml(entry.ingestion_policy || '')}${sharedOrigin && entry.first_imported_at ? `<div class="surface-meta">${escapeHtml(entry.first_imported_at)}</div>` : ''}</td>
-    <td class="path-cell">${escapeHtml(path)}</td>
-  </tr>`;
+  const status = sharedOrigin
+    ? (entry.participates ? `已入库 · ${entry.record_count || 0} 条` : '历史来源')
+    : (entry.enabled ? '已勾选' : '未勾选');
+  const statusTone = (sharedOrigin && entry.participates) || entry.enabled ? 'chip-confirmed' : 'chip-medium';
+  return `<article class="source-map-entry ${entry.enabled ? '' : 'muted-row'}">
+    <div class="source-map-entry-header"><div class="source-map-entry-name"><strong title="${escapeHtml(sourceName)}">${escapeHtml(sourceName)}</strong><div class="surface-meta">${escapeHtml(sourceCategoryLabel(entry.source_category))}</div></div><div class="source-map-entry-status"><span class="chip ${statusTone}">${escapeHtml(status)}</span><span class="chip ${eligible ? 'chip-confirmed' : 'chip-medium'}">${escapeHtml(mode)}</span></div></div>
+    <dl class="source-map-fields">
+      <div><dt>来源 ID</dt><dd><code class="source-map-id" title="${escapeHtml(sourceId)}">${escapeHtml(sourceId)}</code></dd></div>
+      <div><dt>Agent</dt><dd>${escapeHtml(agentDisplayName(entry.agent_instance_id, '未绑定'))}</dd></div>
+      <div><dt>项目/范围</dt><dd>${escapeHtml(project)}</dd></div>
+      <div><dt>入库策略</dt><dd>${escapeHtml(entry.ingestion_policy || '—')}${sharedOrigin && entry.first_imported_at ? `<div class="surface-meta">${escapeHtml(entry.first_imported_at)}</div>` : ''}</dd></div>
+      <div><dt>路径</dt><dd>${escapeHtml(path)}</dd></div>
+    </dl>
+  </article>`;
+}
+
+function toggleSourceMapDetails(button) {
+  const detailsId = button && button.getAttribute('aria-controls');
+  const details = detailsId ? document.getElementById(detailsId) : null;
+  if (!button || !details) return;
+  const expanded = button.getAttribute('aria-expanded') === 'true';
+  button.setAttribute('aria-expanded', String(!expanded));
+  details.hidden = expanded;
+  button.textContent = expanded ? `展开 ${button.dataset.sourceCount || 0} 条来源` : '收起';
 }
 
 function projectionModeControls() {
@@ -1838,28 +2751,41 @@ function renderNeuronMetaBar(graph) {
   if (isShareGroupScope()) {
     const gid = (graph && graph.scope && graph.scope.share_group_id)
       || meta.share_group_id || activeShareGroupId || '—';
-    const agents = meta.bound_agents || [];
-    const memberChips = agents.length
-      ? agents.map(a => {
-          const label = a.display_name || a.product || '未知 Agent';
-          return `<span class="chip chip-info" title="${escapeHtml(a.agent_instance_id || '')}">成员 · ${escapeHtml(label)}</span>`;
+    const trustedMemberIds = Array.isArray(governanceScopeState.members)
+      ? governanceScopeState.members
+      : [];
+    const trustedBinding = governanceScopeState.binding || objectValue(state.governanceSnapshot?.active_binding);
+    const bindingAgentId = safeDisplayText(trustedBinding.agent_instance_id || trustedBinding.instance_id, '');
+    const memberIds = [...new Set([
+      ...trustedMemberIds,
+      ...(bindingAgentId ? [bindingAgentId] : []),
+    ])];
+    const memberChips = memberIds.length
+      ? memberIds.map(memberId => {
+          const label = agentDisplayName(memberId);
+          return `<span class="chip chip-info">成员 · ${escapeHtml(label)}</span>`;
         }).join('')
-      : '<span class="chip chip-medium">成员 · 无绑定</span>';
+      : '<span class="chip chip-medium">投影成员信息待加载</span>';
+    const snapshot = governanceSnapshot(state.governanceSnapshot);
+    const memberCount = memberIds.length ? memberIds.length : '待加载';
+    const activeRecords = finiteNumber(meta.active_records, snapshot.counts.active_memories);
+    const conflictCount = finiteNumber(meta.conflict_count, snapshot.counts.conflicts);
+    const coverage = safeDisplayText(meta.coverage_status, safeDisplayText(snapshot.coverage_status, 'unknown'));
     const groupLabel = memoryGroupLabel(gid);
     return `<section class="card" style="margin-bottom:14px"><div class="card-head"><div><h2>记忆核心状态</h2>
       <p>${groupLabel}状态（组名 · 成员 · 记忆 · 冲突）</p></div></div>
       <div class="chips">
         <span class="chip chip-confirmed" title="${escapeHtml(gid)}">${groupLabel} · ${escapeHtml(gid)}</span>
         ${memberChips}
-        <span class="chip chip-info">成员数 · ${meta.agent_count || agents.length || 0}</span>
-        <span class="chip chip-info">记忆 · ${meta.active_records || 0}</span>
-        <span class="chip chip-${(meta.conflict_count || 0) ? 'high' : 'confirmed'}">冲突 · ${meta.conflict_count || 0}</span>
-        <span class="chip chip-${meta.coverage_status === 'complete' ? 'confirmed' : 'medium'}">覆盖 · ${escapeHtml(meta.coverage_status || 'unknown')}</span>
+        <span class="chip chip-info">成员数 · ${memberCount}</span>
+        <span class="chip chip-info">记忆 · ${activeRecords}</span>
+        <span class="chip chip-${conflictCount ? 'high' : 'confirmed'}">冲突 · ${conflictCount}</span>
+        <span class="chip chip-${coverage === 'complete' ? 'confirmed' : 'medium'}">覆盖 · ${escapeHtml(coverage)}</span>
       </div></section>`;
   }
   const instances = meta.agent_instances || [];
   const instanceChips = instances.length ? instances.map(inst => {
-    return `<span class="chip chip-info" title="${escapeHtml(inst.instance_id)}">${escapeHtml(inst.product || 'agent')} · ${escapeHtml(inst.takeover_state || 'not_detected')}</span>
+     return `<span class="chip chip-info">${escapeHtml(agentDisplayName(inst))} · ${escapeHtml(inst.takeover_state || 'not_detected')}</span>
       <span class="chip chip-info">版本 · ${escapeHtml(inst.managed_version ? inst.managed_version.slice(0,8) : '—')}</span>
       <span class="chip chip-info">记录 · ${inst.record_count || 0}</span>`;
   }).join('') : '<span class="chip chip-info">Agent · 未发现</span>';
@@ -1879,6 +2805,7 @@ function renderNeuronGraph() {
   // 顶部状态：单 Agent 用实例条；共享组用组名 + 成员
   const meta = (graph && graph.meta) || {};
   const sourceMapPanel = renderProjectionSourceMap(graph?.source_map || {});
+  const engineControls = projectionEngineControls();
   const modeControls = projectionModeControls();
   const metaBar = renderNeuronMetaBar(graph);
   // 未构建时显示门控
@@ -1889,6 +2816,8 @@ function renderNeuronGraph() {
     const reasonText = {
       'not_built': '尚未构建投影。神经图是 Memory IR 的可视化投影，不是事实源。',
       'no_ir': 'Memory IR 为空，请先在数据源 tab 扫描来源。',
+      'no_projection_sources': '当前数据源映射为空；已设治理范围不等于已选择数据源，请先到数据源页启用来源。',
+      'blocked': '后端阻止了当前构建，请先处理阻止原因。',
       'error': '投影读取失败。',
     }[reason] || '尚未构建投影。';
     setContent(`<div class="view-heading"><span class="eyebrow">Live cognition map</span><h2>记忆核心</h2>
@@ -1896,6 +2825,7 @@ function renderNeuronGraph() {
       ${metaBar}
       ${modeControls}
       ${sourceMapPanel}
+      ${engineControls}
       <section class="card projection-gate">
         <div class="gate-orb" aria-hidden="true"></div>
         <div class="gate-body">
@@ -1906,7 +2836,9 @@ function renderNeuronGraph() {
             ${isShareGroupScope() ? '确认正式接管时打版本快照；Agent 通过 MCP 读写共享记忆，不再各自写原生文件。' : projectionMode === 'native' ? '此操作只生成当前原生记忆的可视化图。' : '重构结果保存在 MemoryGuard 管理层；原生记忆文件保持只读。'}
           </div>
           <div class="finding-actions">
-            <button class="btn btn-primary" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '构建原生投影' : '构建重构投影（含 LLM 整理）'}</button>
+            ${buildHasNoSources(graph) || !((graph && graph.source_map && graph.source_map.entries) || []).length
+              ? '<button class="btn btn-primary" type="button" onclick="switchTab(\'sources\')">去数据源页选择数据源</button>'
+              : `<button class="btn btn-primary" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '构建原生投影' : '构建重构投影'}</button>`}
           </div>
         </div>
       </section>`);
@@ -1915,12 +2847,6 @@ function renderNeuronGraph() {
   const stats = graph.stats || {};
   const publishActions = isShareGroupScope()
     ? `<button class="btn btn-primary" type="button" onclick="commitSharedMemoryGovernance()">确认正式接管</button>`
-    : '';
-  const enrichInfo = graph.enrichment || {};
-  const enrichPending = enrichInfo.pending_count || 0;
-  const enrichChip = (isShareGroupScope() || projectionMode === 'reconstructed')
-    ? `<span class="chip chip-info">待整理残留 · ${enrichPending}</span>`
-      + (enrichInfo.auto_applied ? `<span class="chip chip-confirmed">本次整理 · ${enrichInfo.auto_applied}</span>` : '')
     : '';
   const suggestions = [];
   selectedNeuronId = null;
@@ -1934,15 +2860,15 @@ function renderNeuronGraph() {
     ${metaBar}
     ${modeControls}
     ${sourceMapPanel}
+    ${engineControls}
     <section class="neuron-shell">
     <div class="neuron-toolbar">
       <div class="neuron-title"><span class="eyebrow">Cognition map</span><h2>可读神经图</h2>
         <p>点击节点查看记忆内容；接受、排除、隔离、合并等操作统一在治理台完成。</p></div>
       <div class="canvas-actions">
-        ${enrichChip}
         <button class="btn" type="button" onclick="fitNeuronGraph()">重置视野</button>
         <button class="btn" type="button" onclick="deleteProjection()">删除当前投影</button>
-        <button class="btn" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '重建原生投影' : '重建投影（含 LLM 整理）'}</button>
+        <button class="btn" type="button" onclick="buildProjection()">${projectionMode === 'native' ? '重建原生投影' : '重建投影'}</button>
         ${publishActions}
       </div>
     </div>
@@ -2016,12 +2942,12 @@ function renderNeuronGraph() {
         'border-color': '#d8ffe9', 'label': '',
       }},
       { selector: 'node[record_kind = "rules_habits"]', style: {
-        'background-color': '#f6ad55', 'background-opacity': .3,
+        'background-opacity': .48,
         'border-width': 2.2, 'border-color': '#ffe3a1', 'shape': 'ellipse',
         'font-size': 10.5,
       }},
       { selector: 'node[record_kind = "conversation_history"]', style: {
-        'background-color': '#7dd3fc', 'background-opacity': .28,
+        'background-opacity': .42,
         'border-width': 2.2, 'border-color': '#c5efff', 'shape': 'ellipse',
         'font-size': 10.5,
       }},
@@ -2040,6 +2966,21 @@ function renderNeuronGraph() {
         'width': 'mapData(strength, 0, 1, .55, 3.2)', 'line-color': '#6ee7c4', 'line-opacity': .22,
         'curve-style': 'unbundled-bezier', 'control-point-distances': 20, 'control-point-weights': .5,
         'target-arrow-shape': 'none', 'transition-property': 'line-opacity, width, line-color', 'transition-duration': '140ms',
+      }},
+      { selector: 'edge[branch_kind = "rules_habits"]', style: {
+        'line-color': '#f6ad55', 'line-opacity': .38, 'line-style': 'dotted',
+      }},
+      { selector: 'edge[branch_kind = "conversation_history"]', style: {
+        'line-color': '#7dd3fc', 'line-opacity': .34, 'line-style': 'dotted',
+      }},
+      { selector: 'node[record_kind = "rules_habits"][effective = "true"]', style: {
+        'background-opacity': .86, 'border-color': '#fff1bd', 'border-width': 2.6,
+      }},
+      { selector: 'node[record_kind = "rules_habits"][excluded = "true"]', style: {
+        'background-color': '#5f2c2c', 'background-opacity': .72, 'border-color': '#fc8181', 'border-style': 'dashed',
+      }},
+      { selector: 'node[record_kind = "rules_habits"][status = "observing"]', style: {
+        'border-color': '#f6ad55', 'border-style': 'dashed', 'background-opacity': .24,
       }},
       { selector: 'edge[etype = "related"]', style: { 'line-style': 'dashed', 'line-opacity': .2, 'line-color': '#9ae6b4' }},
       { selector: 'edge[etype = "shared_source"]', style: { 'line-style': 'dashed', 'line-color': '#63b3ed', 'line-opacity': .34 }},
@@ -2062,7 +3003,7 @@ function renderNeuronGraph() {
       }},
       { selector: 'node.focusPulse', style: {
         'border-width': 3.6, 'border-color': '#ffffff', 'border-opacity': 1,
-        'underlay-opacity': 0, 'underlay-padding': 0,
+        'underlay-color': '#6ee7c4', 'underlay-opacity': .12, 'underlay-padding': 9,
       }},
       { selector: '.neighborhood', style: { 'line-opacity': .62, 'width': 2.1 }},
       { selector: 'node.neighborhood', style: { 'border-color': '#bcffeb', 'border-width': 2.4 }},
@@ -2073,6 +3014,18 @@ function renderNeuronGraph() {
       { selector: 'node.pulse', style: {
         'border-width': 3.4, 'border-color': '#ffffff', 'border-opacity': 1,
         'underlay-opacity': 0, 'underlay-padding': 0,
+      }},
+      { selector: 'node.sourcePulse', style: {
+        'border-width': 3.7, 'border-color': '#eafff9', 'border-opacity': 1,
+        'underlay-color': '#6ee7c4', 'underlay-opacity': .18, 'underlay-padding': 13,
+      }},
+      { selector: 'node.nodeArrivalPulse', style: {
+        'border-width': 2.7, 'border-color': '#d8fff4', 'border-opacity': .96,
+        'underlay-color': '#6ee7c4', 'underlay-opacity': .08, 'underlay-padding': 7,
+      }},
+      { selector: 'node.terminalPulse', style: {
+        'border-width': 3.0, 'border-color': '#ffffff', 'border-opacity': 1,
+        'underlay-color': '#9ff6dc', 'underlay-opacity': .13, 'underlay-padding': 9,
       }},
     ],
     layout: {
@@ -2163,16 +3116,12 @@ function renderNeuronGraph() {
 
 function stopNeuronSignalPulses() {
   if (window.__neuronSignalTimer) {
-    clearInterval(window.__neuronSignalTimer);
+    clearTimeout(window.__neuronSignalTimer);
     window.__neuronSignalTimer = null;
   }
   if (window.__neuronSomaPulse) {
     clearInterval(window.__neuronSomaPulse);
     window.__neuronSomaPulse = null;
-  }
-  if (window.__neuronSparkPulse) {
-    clearInterval(window.__neuronSparkPulse);
-    window.__neuronSparkPulse = null;
   }
   const pending = window.__neuronSignalChains || [];
   pending.forEach(id => clearTimeout(id));
@@ -2181,14 +3130,13 @@ function stopNeuronSignalPulses() {
   frames.forEach(id => cancelAnimationFrame(id));
   window.__neuronSignalFrames = new Set();
   window.__neuronSignalWaveIndex = 0;
-  window.__neuronSparkIndex = 0;
   const particles = document.querySelectorAll('.neuron-edge-particle');
   particles.forEach(particle => particle.remove());
   window.__neuronSignalRefs = {};
   if (cyInstance) {
     try {
       cyInstance.edges().removeClass('signal signal-trail');
-      cyInstance.nodes().removeClass('signal');
+      cyInstance.nodes().removeClass('signal sourcePulse nodeArrivalPulse terminalPulse');
     } catch (e) { /* graph torn down */ }
   }
 }
@@ -2217,12 +3165,43 @@ function _releaseSignal(cy, eleId, cls) {
 }
 
 function isSignalNeuronEdge(edge) {
-  // Follow the rendered topology instead of one projection edge schema.
-  // The live graph is commonly composed entirely of virtual_index edges.
   return !!edge && edge.length > 0;
 }
 
-function buildNeuronSignalPath(cy, start) {
+function isOutwardNeuronEdge(edge, source = null) {
+  if (!isSignalNeuronEdge(edge)) return false;
+  const src = source && source.length ? source : edge.source();
+  const target = edge.target();
+  if (!src || !src.length || !target || !target.length || src.id() === target.id()) return false;
+  const parentId = String(target.data('parent_id') || '');
+  if (parentId && parentId === src.id()) return true;
+  const sourceDepth = Number(src.data('depth'));
+  const targetDepth = Number(target.data('depth'));
+  const type = String(edge.data('etype') || '');
+  return ['derived_from', 'virtual_index'].includes(type)
+    && Number.isFinite(sourceDepth) && Number.isFinite(targetDepth)
+    && targetDepth > sourceDepth;
+}
+
+function collectNeuronSignalSources(cy) {
+  if (!cy) return [];
+  const roots = [];
+  cy.nodes('node[kind = "root"]').forEach(node => {
+    if (node.outgoers('edge').filter(edge => isOutwardNeuronEdge(edge, node)).length) roots.push(node);
+  });
+  if (roots.length) return roots;
+  const fallback = [];
+  cy.nodes().forEach(node => {
+    if (!node || !node.length) return;
+    const outward = node.outgoers('edge').filter(edge => isOutwardNeuronEdge(edge, node));
+    if (!outward.length) return;
+    const parentId = String(node.data('parent_id') || '');
+    if (!parentId) fallback.push(node);
+  });
+  return fallback;
+}
+
+function buildNeuronSignalPath(cy, start, seed = 0, firstEdge = null) {
   if (!cy || !start || !start.length) return null;
   const pathNodes = [start];
   const pathEdges = [];
@@ -2230,14 +3209,18 @@ function buildNeuronSignalPath(cy, start) {
   const seen = new Set();
   while (cur && cur.length && !seen.has(cur.id())) {
     seen.add(cur.id());
-    const outgoers = cur.outgoers('edge').filter(isSignalNeuronEdge).sort((a, b) =>
+    const outgoers = cur.outgoers('edge').filter(edge => isOutwardNeuronEdge(edge, cur)).sort((a, b) =>
       String(a.id()).localeCompare(String(b.id()))
     );
     if (!outgoers.length) break;
-    const leafEdge = outgoers.find(edge =>
-      edge.target().outgoers('edge').filter(isSignalNeuronEdge).length === 0
-    );
-    const edge = leafEdge || outgoers[Math.floor(neuronHashUnit(cur.id() + ':' + pathEdges.length) * outgoers.length)];
+    let edge = null;
+    if (pathEdges.length === 0 && firstEdge && firstEdge.length) {
+      edge = firstEdge;
+    } else {
+      const unit = neuronHashUnit(`${cur.id()}:${seed}:${pathEdges.length}`);
+      edge = outgoers[Math.min(outgoers.length - 1, Math.floor(unit * outgoers.length))];
+    }
+    if (!edge || !edge.length) break;
     pathEdges.push(edge);
     cur = edge.target();
     if (cur && cur.length) pathNodes.push(cur);
@@ -2246,49 +3229,44 @@ function buildNeuronSignalPath(cy, start) {
   return { nodes: pathNodes, edges: pathEdges };
 }
 
-function collectNeuronSignalPaths(cy, limit = 6, waveIndex = 0) {
+function collectNeuronSignalPaths(cy, limit = 4, waveIndex = 0) {
   if (!cy || limit < 1) return [];
-  const starters = cy.nodes().filter(n => {
-    if (!n || !n.length || n.data('kind') === 'root') return false;
-    return n.outgoers('edge').filter(isSignalNeuronEdge).length > 0;
-  }).sort((a, b) => String(a.id()).localeCompare(String(b.id())));
-  if (starters.length) {
-    const start = Math.abs(waveIndex) % starters.length;
-    const paths = [];
-    const signatures = new Set();
-    for (let offset = 0; offset < starters.length; offset++) {
-      const starter = starters[(start + offset) % starters.length];
-      const path = buildNeuronSignalPath(cy, starter);
+  const sources = collectNeuronSignalSources(cy);
+  if (!sources.length) return [];
+  const paths = [];
+  const signatures = new Set();
+  const sourceStart = Math.abs(waveIndex) % sources.length;
+  for (let sourceOffset = 0; sourceOffset < sources.length && paths.length < limit; sourceOffset++) {
+    const source = sources[(sourceStart + sourceOffset) % sources.length];
+    const rootEdges = source.outgoers('edge').filter(edge => isOutwardNeuronEdge(edge, source)).sort((a, b) =>
+      String(a.id()).localeCompare(String(b.id()))
+    );
+    if (!rootEdges.length) continue;
+    const desiredForSource = Math.min(limit - paths.length, Math.max(1, Math.ceil(limit / sources.length)));
+    const first = Math.abs(waveIndex + sourceOffset) % rootEdges.length;
+    for (let offset = 0; offset < desiredForSource * 5 && paths.length < limit; offset++) {
+      const branch = rootEdges[(first + offset) % rootEdges.length];
+      const seed = waveIndex * 17 + sourceOffset * 43 + offset * 31;
+      const path = buildNeuronSignalPath(cy, source, seed, branch);
       if (!path) continue;
       const signature = path.edges.map(edge => edge.id()).join('>');
       if (!signature || signatures.has(signature)) continue;
       signatures.add(signature);
       paths.push(path);
-      if (paths.length >= limit) break;
     }
-    if (paths.length) return paths;
-  }
-  const edges = [];
-  cy.edges().filter(isSignalNeuronEdge).forEach(edge => edges.push(edge));
-  edges.sort((a, b) => String(a.id()).localeCompare(String(b.id())));
-  const edgeStart = edges.length ? Math.abs(waveIndex) % edges.length : 0;
-  const paths = [];
-  for (let offset = 0; offset < Math.min(limit, edges.length); offset++) {
-    const edge = edges[(edgeStart + offset) % edges.length];
-    paths.push({ nodes: [edge.source(), edge.target()], edges: [edge] });
   }
   return paths;
 }
 
 function pickNeuronSignalPath(cy) {
-  return collectNeuronSignalPaths(cy, 1)[0] || null;
+  return collectNeuronSignalPaths(cy, 1, Number(window.__neuronSignalWaveIndex || 0))[0] || null;
 }
 
 function runNeuronSignalPulse(cy, path) {
   if (!cy || !path || !path.edges.length) return;
-  // One continuous light travels branch -> leaf across the whole path.
-  const perEdgeMs = 520;
-  const totalMs = Math.max(900, path.edges.length * perEdgeMs);
+  // One soft wavefront travels root -> branch -> leaf and terminates there.
+  const perEdgeMs = 820;
+  const totalMs = Math.max(1250, path.edges.length * perEdgeMs);
   try {
     animateNeuronPathParticle(cy, path, totalMs);
   } catch (_) {
@@ -2308,6 +3286,9 @@ function runNeuronSignalPulse(cy, path) {
         _releaseSignal(cy, edge.id(), 'signal');
         _acquireSignal(cy, edge.id(), 'signal-trail');
         if (src && src.length) _releaseSignal(cy, src.id(), 'signal');
+        if (tgt && tgt.length && tgt.flashClass) {
+          tgt.flashClass(index === path.edges.length - 1 ? 'terminalPulse' : 'nodeArrivalPulse', index === path.edges.length - 1 ? 180 : 150);
+        }
         // Keep leaf lit until the path particle arrives.
         if (tgt && tgt.length && index < path.edges.length - 1) {
           _releaseSignal(cy, tgt.id(), 'signal');
@@ -2317,9 +3298,8 @@ function runNeuronSignalPulse(cy, path) {
           _releaseSignal(cy, edge.id(), 'signal-trail');
           if (tgt && tgt.length && index === path.edges.length - 1) {
             _releaseSignal(cy, tgt.id(), 'signal');
-            if (tgt.flashClass) tgt.flashClass('pulse', 700);
           }
-        }, 220);
+        }, 180);
         (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(trailId);
       }, perEdgeMs);
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(releaseId);
@@ -2359,28 +3339,22 @@ function _neuronBezierPoint(source, control, target, t) {
 function _spawnNeuronParticle() {
   const particle = document.createElement('span');
   particle.className = 'neuron-edge-particle';
-  const core = document.createElement('span');
-  core.className = 'neuron-edge-particle-core';
-  const trail = document.createElement('span');
-  trail.className = 'neuron-edge-particle-trail';
-  particle.appendChild(trail);
-  particle.appendChild(core);
   return particle;
 }
 
-function animateNeuronEdgeParticle(cy, edge, duration = 520) {
+function animateNeuronEdgeParticle(cy, edge, duration = 820) {
   if (!cy || !edge || !edge.length) return;
   animateNeuronPathParticle(cy, { edges: [edge], nodes: [edge.source(), edge.target()] }, duration);
 }
 
-function animateNeuronPathParticle(cy, path, duration = 900) {
+function animateNeuronPathParticle(cy, path, duration = 1250) {
   const layer = document.getElementById('neuron-particles');
   if (!layer || !cy || !path || !path.edges || !path.edges.length) return;
   const edges = path.edges.filter(edge => edge && edge.length);
   if (!edges.length) return;
   const particle = _spawnNeuronParticle();
   layer.appendChild(particle);
-  const size = 10;
+  const particleHeight = 5;
   const started = performance.now();
   let frameId = null;
   const cleanup = () => {
@@ -2420,11 +3394,13 @@ function animateNeuronPathParticle(cy, path, duration = 900) {
         return;
       }
       const point = _neuronBezierPoint(curve.source, curve.control, curve.target, local);
-      const x = point.x - size / 2;
-      const y = point.y - size / 2;
-      particle.style.setProperty('--particle-angle', `${point.angle}rad`);
+      const renderedEdgeLength = Math.hypot(curve.target.x - curve.source.x, curve.target.y - curve.source.y);
+      const particleWidth = Math.max(18, Math.min(36, renderedEdgeLength * .14));
+      const x = point.x - particleWidth / 2;
+      const y = point.y - particleHeight / 2;
+      particle.style.width = `${particleWidth}px`;
       particle.style.opacity = String(raw < .04 ? raw / .04 : (raw > .96 ? (1 - raw) / .04 : 1));
-      particle.style.transform = `translate3d(${x}px,${y}px,0)`;
+      particle.style.transform = `translate3d(${x}px,${y}px,0) rotate(${point.angle}rad)`;
       if (raw < 1) {
         frameId = requestAnimationFrame(frame);
         const frames = window.__neuronSignalFrames || (window.__neuronSignalFrames = new Set());
@@ -2442,45 +3418,26 @@ function animateNeuronPathParticle(cy, path, duration = 900) {
 function startNeuronSignalPulses(cy) {
   stopNeuronSignalPulses();
   if (!cy) return;
-  const rootPulse = () => {
-    if (!cyInstance || cyInstance !== cy) return;
-    try {
-      const root = cy.$('node[kind = "root"]');
-      if (root && root.length) {
-        root.flashClass('pulse', 1100);
-        root.flashClass('focusPulse', 720);
-      }
-    } catch (e) { /* ignore */ }
-  };
-  const spark = () => {
-    if (!cyInstance || cyInstance !== cy) return;
-    const candidates = cy.nodes('node[kind = "virtual_category"], node[kind = "topic"], node[kind = "source_hub"], node[kind = "virtual_bucket"], node[kind = "history_project"], node[kind = "history_agent"], node[kind = "claim_anchor"]');
-    if (!candidates || !candidates.length) return;
-    const count = Math.min(9, Math.max(5, Math.ceil(candidates.length * .16)));
-    const sparkIndex = Number(window.__neuronSparkIndex || 0);
-    window.__neuronSparkIndex = sparkIndex + count;
-    for (let i = 0; i < count; i++) {
-      const n = candidates[(sparkIndex + i) % candidates.length];
-      if (n && n.flashClass) n.flashClass('pulse', 900);
-    }
-    try {
-      const root = cy.$('node[kind = "root"]');
-      if (root && root.length) root.flashClass('focusPulse', 780);
-    } catch (_) { /* ignore */ }
-  };
-  rootPulse();
-  spark();
-  window.__neuronSomaPulse = setInterval(rootPulse, 2800);
-  window.__neuronSparkPulse = setInterval(spark, 2200);
   const fireWave = () => {
     if (!cyInstance || cyInstance !== cy) return;
-    // Always launch 5–8 concurrent full-path pulses with a tight stagger.
-    const desired = Math.min(8, Math.max(5, Math.min(8, cy.edges().length || 5)));
     const waveIndex = Number(window.__neuronSignalWaveIndex || 0);
     window.__neuronSignalWaveIndex = waveIndex + 1;
+    // Every burst begins at a real root/main node.  Two to four short
+    // wavefronts fan outward and die at leaves; lateral relation edges never
+    // participate, so there is no mid-edge spawning or reverse travel.
+    const desired = Math.min(4, Math.max(2, 2 + Math.floor(neuronHashUnit(`wave:${waveIndex}`) * 3)));
     const paths = collectNeuronSignalPaths(cy, desired, waveIndex);
+    if (!paths.length) return;
+    const pulsedSources = new Set();
+    paths.forEach(path => {
+      const source = path.nodes && path.nodes.length ? path.nodes[0] : null;
+      if (!source || !source.length || pulsedSources.has(source.id())) return;
+      pulsedSources.add(source.id());
+      if (source.flashClass) source.flashClass('sourcePulse', 420);
+    });
     paths.forEach((path, index) => {
-      const delay = index * 160;
+      const jitter = Math.floor(neuronHashUnit(`stagger:${waveIndex}:${index}`) * 120);
+      const delay = index * 120 + jitter;
       const tid = setTimeout(() => {
         if (!cyInstance || cyInstance !== cy) return;
         runNeuronSignalPulse(cy, path);
@@ -2488,9 +3445,22 @@ function startNeuronSignalPulses(cy) {
       (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(tid);
     });
   };
-  const initialWave = setTimeout(fireWave, 360);
+  const scheduleNext = () => {
+    if (!cyInstance || cyInstance !== cy) return;
+    const index = Number(window.__neuronSignalWaveIndex || 0);
+    const delay = 2200 + Math.floor(neuronHashUnit(`interval:${index}`) * 1300);
+    window.__neuronSignalTimer = setTimeout(() => {
+      if (!cyInstance || cyInstance !== cy) return;
+      fireWave();
+      scheduleNext();
+    }, delay);
+  };
+  const initialWave = setTimeout(() => {
+    if (!cyInstance || cyInstance !== cy) return;
+    fireWave();
+    scheduleNext();
+  }, 420);
   (window.__neuronSignalChains || (window.__neuronSignalChains = [])).push(initialWave);
-  window.__neuronSignalTimer = setInterval(fireWave, 1600);
 }
 
 function fitNeuronGraph() {
@@ -2591,6 +3561,46 @@ async function governNeuronRule(memoryId, method) {
   } catch (error) { showToast(`规则${deleting ? '删除' : '恢复'}失败：${error.message || error}`, 'error'); }
 }
 
+async function hydrateNeuronNodeDetail(nodeId) {
+  const node = (neuronGraph?.nodes || []).find(item => item.id === nodeId);
+  if (!node || !node.memory_id || displayBody(node) || node.body) return;
+  const requestSeq = ++neuronDetailHydrationSeq;
+  node._detail_loading = true;
+  node._detail_error = '';
+  try {
+    // V2 Projection stays reference-only.  Restore the V1 UX by hydrating the
+    // selected node from the canonical MemoryAtomStore on demand instead of
+    // copying memory bodies back into the durable projection payload.
+    const atom = await callApi('get_memory', node.memory_id, activeShareGroupId || '');
+    if (requestSeq !== neuronDetailHydrationSeq || selectedNeuronId !== nodeId) return;
+    if (!atom || atom.ok === false || atom.error || !atom.memory_id) {
+      node._detail_error = apiErrorMessage(atom || {}, '正文读取失败');
+      return;
+    }
+    node.body = String(atom.body || '');
+    node.kind = atom.kind || node.kind || '';
+    if (atom.confidence != null) node.confidence = atom.confidence;
+    node.status = atom.status || node.status || 'active';
+    const metadata = atom.metadata && typeof atom.metadata === 'object' ? atom.metadata : {};
+    node.title = metadata.title || node.title || node.label || atom.memory_id;
+    node.scope = metadata.scope || node.scope || (atom.project_ref ? 'project' : 'shared');
+    node.completeness = metadata.completeness || node.completeness || '';
+    if (Array.isArray(atom.provenance)) node.provenance_count = atom.provenance.length;
+  } catch (error) {
+    if (requestSeq === neuronDetailHydrationSeq) {
+      node._detail_error = String(error && (error.message || error) || '正文读取失败');
+    }
+  } finally {
+    if (requestSeq === neuronDetailHydrationSeq) {
+      node._detail_loading = false;
+      if (selectedNeuronId === nodeId) {
+        selectedNeuronNode = node;
+        renderStatusRail();
+      }
+    }
+  }
+}
+
 function selectNeuron(nodeId, focus = true) {
   const node = (neuronGraph.nodes || []).find(item => item.id === nodeId);
   const popover = document.getElementById('neuron-popover');
@@ -2636,6 +3646,9 @@ function selectNeuron(nodeId, focus = true) {
   if (popover) popover.classList.remove('show');
   renderStatusRail();
   if (focus) focusNeuronNode(nodeId);
+  if (selectedNeuronId === nodeId && node.memory_id && !displayBody(node) && !node.body) {
+    void hydrateNeuronNodeDetail(nodeId);
+  }
 }
 
 function selectNeuronByMemory(memoryId) {
@@ -2671,7 +3684,7 @@ const DECISION_REASON_OPTIONS = {
 };
 
 async function neuronAction(nodeId, action) {
-  // v3.1 §6.2：图上操作 → DecisionEvent → 轻量刷新投影（不跑 LLM）
+  // v3.1 §6.2：图上操作 → DecisionEvent → 轻量刷新投影
   let reason = '';
   if (action === 'exclude' || action === 'quarantine' || action === 'supersede') {
     reason = await pickDecisionReason(action);
@@ -2821,17 +3834,14 @@ async function doMerge(fromId, toId) {
 
 async function refreshNeuronGraph(message = '') {
   const [scope, agentId, groupId] = scopeApiArgs();
-  neuronGraph = await callApi('get_neuron_graph', projectionMode, scope, agentId, groupId);
+  neuronGraph = await callApi('get_memory_neuron_graph', projectionMode, scope, agentId, groupId);
   renderNeuronGraph();
   if (message) showToast(message, 'success');
 }
 
-let activeBuildRunId = '';
-
 async function pollBuildProgress(jobId) {
   const phases = [
     { id: 'engine', label: '引擎' },
-    { id: 'enrich', label: '整理' },
     { id: 'scan', label: '扫描' },
     { id: 'scope', label: '范围' },
     { id: 'evidence', label: '证据' },
@@ -2854,12 +3864,13 @@ async function pollBuildProgress(jobId) {
     renderBuildStatusRail(view);
   });
   activeBuildRunId = '';
+  buildCancelInFlight = false;
   if (result.execution_status === 'cancelled') {
     await restoreNeuronAfterBuild('构建已取消', false);
     return;
   }
-  if (!result.ok) {
-    await restoreNeuronAfterBuild(apiErrorMessage(result, '构建失败'), true);
+  if (!result.ok || buildHasNoSources(result) || buildIsBlocked(result) || result.pending) {
+    await restoreNeuronAfterBuild(buildResultMessage(result, '构建失败'), true);
     return;
   }
   await refreshNeuronGraph('投影构建完成');
@@ -2867,29 +3878,34 @@ async function pollBuildProgress(jobId) {
 
 async function restoreNeuronAfterBuild(message = '', isError = false) {
   activeBuildRunId = '';
+  buildStartInFlight = false;
+  buildCancelInFlight = false;
+  state.activeTab = 'neurons';
   try {
     await refreshNeuronGraph();
   } catch (e) {
     renderBuildRetryPage(message || '构建未完成');
   }
+  renderStatusRail();
   if (message) showToast(message, isError ? 'error' : 'info');
 }
 
 function renderBuildRetryPage(message) {
   setContent(`<div class="card empty-state"><div><div class="empty-orb"></div>
     <p>${escapeHtml(message || '构建未完成')}</p>
-    <p style="margin-top:6px;font-size:11px">可返回神经图页面重试。</p>
-    <div class="finding-actions" style="margin-top:12px">
-      <button class="btn btn-primary" type="button" onclick="renderNeuronGraph()">重试</button>
+      <p style="margin-top:6px;font-size:11px">可重新读取 Memory Projection，或返回记忆核心重试。</p>
+      <div class="finding-actions" style="margin-top:12px">
+       <button class="btn btn-primary" type="button" onclick="renderNeurons()">重新读取 Memory Projection</button>
     </div>
   </div></div>`);
+  renderStatusRail();
 }
 
 function renderBuildStartingPage() {
   setContent(`<div class="build-progress" role="status" aria-live="polite">
     <div class="bp-kicker">Build progress</div>
-    <h2>正在启动构建</h2>
-    <div class="bp-msg">准备中…</div>
+    <h2>正在创建构建任务</h2>
+    <div class="bp-msg">等待后端返回可追踪任务…</div>
     <div class="bp-bar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i style="width:0%"></i></div>
     <div class="bp-meta"><span>starting</span><span>0%</span></div>
     <div class="bp-phases"></div>
@@ -2897,7 +3913,7 @@ function renderBuildStartingPage() {
       <button class="btn" type="button" disabled>正在创建任务…</button>
     </div>
   </div>`);
-  renderBuildStatusRail({ phase: 'starting', message: '正在启动…', percent: 0, job_id: '' });
+  renderBuildStatusRail({ phase: 'starting', message: '正在创建任务…', percent: 0, job_id: '' });
 }
 
 function renderBuildProgressPage(prog, phases) {
@@ -2917,8 +3933,8 @@ function renderBuildProgressPage(prog, phases) {
     <div class="bp-bar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><i style="width:${pct}%"></i></div>
     <div class="bp-meta"><span>${escapeHtml(phase || 'starting')}</span><span>${pct}%</span></div>
     <div class="bp-phases">${chips}</div>
-    <div class="finding-actions" style="margin-top:8px">
-      <button class="btn" type="button" onclick="cancelActiveBuild()">取消构建</button>
+     <div class="finding-actions" style="margin-top:8px">
+       <button class="btn" type="button" ${prog.status === 'cancelling' || phase === 'cancelling' ? 'disabled' : 'onclick="cancelActiveBuild()"'}>${prog.status === 'cancelling' || phase === 'cancelling' ? '正在取消…' : '取消构建'}</button>
     </div>
   </div>`);
 }
@@ -2933,89 +3949,107 @@ function renderBuildStatusRail(prog) {
     <div class="status-item"><span class="status-label">阶段</span><span class="status-num" style="font-size:12px">${escapeHtml(prog.phase || '—')}</span></div>
     <div class="status-item"><span class="status-label">进度</span><span class="status-num">${pct}%</span></div>
     <div class="neuron-detail-body" style="margin-top:10px">${escapeHtml(prog.message || '构建中…')}</div>
-    ${prog.job_id
-      ? '<div class="rail-link" onclick="cancelActiveBuild()">取消构建</div>'
-      : '<div class="rail-link" style="opacity:.55;pointer-events:none">正在创建任务…</div>'}`;
+     ${prog.job_id && prog.status !== 'cancelling'
+       ? '<div class="rail-link" onclick="cancelActiveBuild()">取消构建</div>'
+       : prog.status === 'cancelling'
+       ? '<div class="rail-link" style="opacity:.7;pointer-events:none">正在取消…</div>'
+       : '<div class="rail-link" style="opacity:.55;pointer-events:none">正在创建任务…</div>'}`;
 }
 
 async function cancelActiveBuild(jobId) {
-  // 优先用页面内单一 activeBuildRunId；为空时后端按精确可信范围回退解析。
+  // 取消只能使用页面内已确认的精确 run id；没有 id 时不得伪造回退目标。
   const id = String(jobId || activeBuildRunId || '').trim();
+  if (!id) {
+    await restoreNeuronAfterBuild('当前没有可取消的构建', true);
+    return;
+  }
+  if (buildCancelInFlight) {
+    showToast('取消请求已提交，等待后端确认', 'info');
+    return;
+  }
+  buildCancelInFlight = true;
   try {
-    renderBuildStatusRail({ phase: 'cancelling', message: '正在取消…', percent: 0, job_id: id || 'scope-fallback' });
+    renderBuildStatusRail({ status: 'cancelling', phase: 'cancelling', message: '正在提交取消请求…', percent: 0, job_id: id });
     const result = await callApi('cancel_build_projection', id, true);
     if (!result || result.error || result.ok === false) {
-      await restoreNeuronAfterBuild(apiErrorMessage(result || {}, '取消失败'), true);
+      await restoreNeuronAfterBuild(buildResultMessage(result || {}, '取消失败'), true);
       return;
     }
     if (result.status === 'cancelled' || (result.task && result.task.state === 'cancelled')) {
       await restoreNeuronAfterBuild('构建已取消', false);
       return;
     }
-    showToast('已请求取消构建', 'info');
-  } catch (e) { await restoreNeuronAfterBuild('取消失败：' + e, true); }
+    if (String(result.status || '').toLowerCase() === 'failed') {
+      await restoreNeuronAfterBuild(buildResultMessage(result, '取消失败'), true);
+      return;
+    }
+    buildCancelInFlight = false;
+    showToast('已提交取消请求，等待后端确认；当前构建尚未确认停止', 'info');
+  } catch (e) {
+    await restoreNeuronAfterBuild('取消失败：' + (e.message || e), true);
+  }
 }
 
-async function buildProjection(llmAgent = '', llmCli = '', skipConfirm = false) {
+async function buildProjection(skipConfirm = false) {
+  if (buildStartInFlight || activeBuildRunId) {
+    showToast('已有构建任务正在创建或进行中，不能重复确认', 'info');
+    return;
+  }
   const native = projectionMode === 'native';
   const shared = isShareGroupScope();
-
-  // 多 Agent / 共享组：必须弹窗选整理引擎；多个 CLI 时也弹窗。
-  // 引擎列表只含真实可执行 CLI，不再出现合成「host」行。
-  let engineId = llmAgent || '';
-  if (!native && !engineId) {
-    try {
-      const agentsResp = await callApi('list_host_llm_agents');
-      const agents = (agentsResp && agentsResp.agents) || [];
-      const needPick = shared || agents.length > 1;
-      if (needPick && agents.length >= 1) {
-        showLlmPickModal({
-          agents,
-          suggested_agent: agentsResp.primary || (agents[0] && agents[0].agent) || '',
-          for_build: true,
-          title: shared ? '多 Agent 共享组：选择整理用 LLM' : '选择构建用 LLM',
-        });
-        return;
-      }
-      if (agents.length === 1) {
-        engineId = agents[0].agent || '';
-      } else {
-        showToast('未检测到可用的 Agent CLI，将用本地确定性构建', 'info');
-      }
-    } catch (e) {
-      showToast('检测 LLM 失败，将用确定性构建：' + e, 'info');
-    }
-  }
-
-  const llmHint = engineId
-    ? `\n· LLM：${engineId}（在后台任务中完成分类/翻译，无需外部对话）`
-    : '\n· LLM：确定性构建（不调用 LLM）';
   const message = shared
-    ? `构建共享 MCP 记忆投影？\n\n· 共享组：${activeShareGroupId}${llmHint}\n· 后台任务整理后生成投影\n\n继续？`
+    ? '构建共享 MCP 记忆投影？\n\n· 读取当前共享治理范围\n· 生成 Memory Projection\n· 不修改 Agent 原生记忆文件\n\n继续？'
     : native
-    ? '构建原生记忆投影？\n\n· 读取已勾选原生/项目记忆\n· 只生成当前真实记忆图\n· 不调用 LLM\n\n继续？'
-    : `构建重构治理投影？\n\n· 萃取、合并、清理已勾选来源${llmHint}\n· 分类/翻译后出图\n\n继续？`;
+    ? '构建原生记忆投影？\n\n· 读取当前治理范围内的原生/项目记忆\n· 生成当前真实记忆图\n· 不修改原生记忆文件\n\n继续？'
+    : '构建重构治理投影？\n\n· 读取当前治理范围内的来源\n· 生成 Memory Projection\n· 原生记忆文件保持只读\n\n继续？';
   if (!skipConfirm && !confirm(message)) return;
 
+  buildStartInFlight = true;
   renderBuildStartingPage();
   try {
     const ok = await ensureGovernanceScope();
     if (!ok) { await restoreNeuronAfterBuild('缺少治理范围，请先选择 Agent 或共享组', true); return; }
     const [scope, agentId, groupId] = scopeApiArgs();
+    const engineId = selectedProjectionEngine === 'deterministic' ? '' : selectedProjectionEngine;
     const enrichMode = engineId ? 'cli' : 'deterministic';
     const result = await callApi(
       'start_build_projection', true, projectionMode, scope, agentId, groupId, engineId, '', enrichMode,
     );
-    if (result.error && !result.job_id) { await restoreNeuronAfterBuild(result.error, true); return; }
-    if (result.job_id) {
-      activeBuildRunId = result.job_id;
-      if (result.focused) showToast('构建已在后台进行中，回到该任务', 'info');
-      await pollBuildProgress(result.job_id);
+    const task = normalizeTaskState(result || {});
+    const runId = task.run_id || (result && result.request && result.request.request_id) || '';
+    if (result.error && !runId) { await restoreNeuronAfterBuild(buildResultMessage(result, '构建启动失败'), true); return; }
+    if (runId) {
+      activeBuildRunId = runId;
+      buildStartInFlight = false;
+      const initialStatus = task.state && task.state !== 'unknown' ? task.state : (result.status || 'queued');
+      renderBuildProgressPage({
+        ...result,
+        job_id: runId,
+        status: initialStatus,
+        phase: task.stage || 'queued',
+        percent: task.progress || 0,
+        message: '构建任务已创建，正在运行…',
+      }, [
+        { id: 'engine', label: '引擎' }, { id: 'scan', label: '扫描' },
+        { id: 'scope', label: '范围' }, { id: 'evidence', label: '证据' },
+        { id: 'graph', label: '出图' }, { id: 'save', label: '保存' },
+        { id: 'complete', label: '完成' },
+      ]);
+      renderBuildStatusRail({job_id: runId, status: initialStatus, phase: task.stage || 'queued', percent: task.progress || 0, message: '构建任务已创建，正在运行…'});
+      await pollBuildProgress(runId);
       return;
     }
-    if (result.error) { await restoreNeuronAfterBuild(result.error, true); return; }
+    if (result.ok === false || result.error || result.status === 'queued' || result.status === 'running') {
+      await restoreNeuronAfterBuild(buildResultMessage(result, '构建启动失败：后端未返回可追踪任务 ID'), true);
+      return;
+    }
+    if (buildHasNoSources(result) || buildIsBlocked(result)) {
+      await restoreNeuronAfterBuild(buildResultMessage(result, '构建未完成'), true);
+      return;
+    }
     await refreshNeuronGraph(shared ? '共享组投影构建完成' : native ? '原生投影构建完成' : '重构投影构建完成');
-  } catch (e) { await restoreNeuronAfterBuild('构建失败：' + e, true); }
+  } catch (e) { await restoreNeuronAfterBuild(buildResultMessage({error: e.message || e}, '构建失败'), true); }
+  finally { buildStartInFlight = false; }
 }
 
 async function deleteProjection() {
@@ -3028,54 +4062,6 @@ async function deleteProjection() {
     if (result.error) return showToast(result.error, 'error');
     await refreshNeuronGraph('当前投影已删除，可随时重建');
   } catch (e) { showToast('删除失败：' + e, 'error'); }
-}
-
-function showLlmPickModal(payload) {
-  closeLlmPickModal();
-  const agents = payload.agents || [];
-  if (!agents.length) {
-    showToast(payload.message || '未检测到可用的 Agent CLI，将用确定性构建', 'info');
-    buildProjection('', '', false);
-    return;
-  }
-  const suggested = payload.suggested_agent || (agents[0] && agents[0].agent);
-  const rows = agents.map((a, i) => `<label class="release-option">
-    <input type="radio" name="llm-pick" value="${i}" ${a.agent === suggested || (!suggested && i === 0) ? 'checked' : ''}>
-    <span><div class="release-title">${escapeHtml(a.label || a.agent)}</div>
-      <div class="release-meta">${escapeHtml(a.agent)} · ${escapeHtml(a.display || '本机 Agent CLI · 后台任务整理')}</div></span>
-  </label>`).join('');
-  const head = payload.title || '选择构建用 LLM';
-  const modal = document.createElement('div');
-  modal.id = 'llm-pick-modal';
-  modal.className = 'modal-backdrop';
-  modal.innerHTML = `<div class="modal-card" role="dialog" aria-modal="true" aria-label="${escapeHtml(head)}">
-    <div class="modal-head"><h3>${escapeHtml(head)}</h3>
-      <p>多 Agent 必须选择整理引擎。所选本机 Agent CLI 会在后台任务里完成分类/翻译，无需在别处对话继续。</p></div>
-    <div class="modal-body">${rows}</div>
-    <div class="modal-actions">
-      <button class="btn" type="button" onclick="closeLlmPickModal()">取消</button>
-      <button class="btn btn-primary" type="button" onclick="confirmLlmPickModal()">确认并构建</button>
-    </div>
-  </div>`;
-  modal.__agents = agents;
-  modal.__forBuild = true;
-  modal.addEventListener('click', (event) => { if (event.target === modal) closeLlmPickModal(); });
-  document.body.appendChild(modal);
-}
-
-function closeLlmPickModal() {
-  const modal = document.getElementById('llm-pick-modal');
-  if (modal) modal.remove();
-}
-
-async function confirmLlmPickModal() {
-  const modal = document.getElementById('llm-pick-modal');
-  const selected = document.querySelector('input[name="llm-pick"]:checked');
-  if (!modal || !selected) return showToast('请选择一个 Agent LLM', 'error');
-  const agent = modal.__agents[Number(selected.value)];
-  closeLlmPickModal();
-  if (!agent) return;
-  await buildProjection(agent.agent || '', '', false);
 }
 
 async function commitSharedMemoryGovernance() {
@@ -3172,7 +4158,7 @@ function renderOverview() {
 
   const evtCard = evt ? `<div class="flow-card cyan" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('recent_events'),50)">
     <div class="flow-kicker">最新记忆写入</div>
-    <div class="flow-title">${escapeHtml(evt.agent_instance_id || 'unknown')}</div>
+     <div class="flow-title">${escapeHtml(agentDisplayName(evt.agent_instance_id, '未知 Agent'))}</div>
     <div class="flow-body">${escapeHtml(evt.raw_content_preview || '(无内容)')}${evt.auto_actions && evt.auto_actions.length ? '<br>自动处理：' + evt.auto_actions.map(a => escapeHtml(a.action)).join(', ') : ''}</div>
     <div class="flow-time">${escapeHtml(evt.created_at || '')}</div>
   </div>` : `<div class="flow-card empty cyan"><div class="flow-kicker">新写入</div><div class="flow-title">暂无事件</div></div>`;
@@ -3393,6 +4379,7 @@ async function selectAgentCard(instanceId) {
       return showToast((result && result.error) || '治理范围保存失败', 'error');
     }
     activeAgentInstanceId = instanceId;
+    activeScopeMemberIds = [instanceId];
     dataPageMode = 'single_agent';
     activeShareGroupId = '';
     if (state.activeTab === 'history') renderHistory();
@@ -3415,7 +4402,8 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const knownProfileCount = Number(agentCardsData?.known_profile_count || discoveryResult?.known_profile_count || 0);
   const lifecycleLabels = { installed: '已安装', installed_no_data: '已安装无数据', data_only: '原生数据待接入', uncertain: '待确认', ignored: '已忽略', not_detected: '未检测到' };
   const lifecycleChips = { installed: 'confirmed', installed_no_data: 'info', data_only: 'medium', uncertain: 'info', ignored: 'low', not_detected: 'low' };
-  const lifecycleLabel = (item) => {
+  const lifecycleLabel = (item, binding = null) => {
+    if (binding) return binding.group_kind === 'personal' ? '已启用个人层' : '已绑定共享组';
     const state = item?.lifecycle_state || 'uncertain';
     const discoveryOnly = Object.prototype.hasOwnProperty.call(item || {}, 'install_confidence')
       && finiteNumber(item.install_confidence, 0) <= 0
@@ -3425,7 +4413,8 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const agentCardsHtml = agents.length ? agents.map(a => {
     const isActive = a.instance_id === activeAgentInstanceId;
     const lifecycle = a.lifecycle_state || 'uncertain';
-    const binding = activeBindings.find(b => b.agent_instance_id === a.instance_id);
+    const summary = agentSummary(a);
+    const binding = activeBindings.find(b => sameNonEmptyAgentId(b.agent_instance_id, a.instance_id));
     const kindLabel = binding ? (binding.group_kind === 'personal' ? '个人记忆层' : '共享记忆层') : '未绑定';
     const bindingAction = binding
       ? `<button class="btn" type="button" onclick="event.stopPropagation(); viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button>
@@ -3433,10 +4422,10 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
          ${binding.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation(); leaveSharedToPersonal('${escapeHtml(a.instance_id)}')">退出共享组并回个人层</button>` : ''}`
       : `<button class="btn btn-primary" type="button" onclick="event.stopPropagation(); ensurePersonalLayer('${escapeHtml(a.instance_id)}')">启用个人记忆层</button>`;
     return `<div class="agent-card ${isActive ? 'active' : ''}" onclick="selectAgentCard('${escapeHtml(a.instance_id)}')">
-      <div class="agent-name">${escapeHtml(a.product)}</div>
-      <div class="agent-meta">${a.found_surface_count}/${a.surface_count} 表面 · 私有 ${a.private_data_surface_count || 0} · 共享 ${a.shared_surface_count || 0} · ${a.bound_source_count} 来源</div>
+       <div class="agent-name">${escapeHtml(agentDisplayName(a))}</div>
+      <div class="agent-meta">${summary.foundSurfaceCount}/${summary.surfaceCount} 表面 · 私有 ${summary.privateSurfaceCount} · 共享 ${summary.sharedSurfaceCount} · ${summary.sourceCount} 来源</div>
       <div class="agent-badge">${escapeHtml(a.target_capability || 'export_only')}</div>
-       <span class="chip chip-${lifecycleChips[lifecycle] || 'info'}">${escapeHtml(lifecycleLabel(a))}</span>
+       <span class="chip chip-${binding ? 'confirmed' : (lifecycleChips[lifecycle] || 'info')}">${escapeHtml(lifecycleLabel(a, binding))}</span>
       <div class="surface-meta">${kindLabel}${binding ? ` · ${escapeHtml(binding.share_group_id)} · ${escapeHtml(binding.canonical_store_path || '')}` : ''}</div>
       ${binding && binding.migration_required ? '<div class="chip chip-medium">待迁移（仅提示）</div>' : ''}
       <div class="finding-actions">${bindingAction}</div>
@@ -3445,7 +4434,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const residualCardsHtml = residuals.length ? residuals.map(r => {
     const lifecycle = r.lifecycle_state || 'uncertain';
     return `<div class="agent-card" onclick="showResidualCleanup('${escapeHtml(r.instance_id)}')">
-      <div class="agent-name">${escapeHtml(r.product)}</div>
+       <div class="agent-name">${escapeHtml(agentDisplayName(r))}</div>
       <div class="agent-meta">原生数据 ${r.private_data_surface_count || 0} · 共享表面 ${r.shared_surface_count || 0}${r.control_repair_required ? ' · V2 绑定待修复/接入' : ''}</div>
       <span class="chip chip-${lifecycleChips[lifecycle] || 'medium'}">${escapeHtml(lifecycleLabel(r))}</span>
       <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="event.stopPropagation(); ensurePersonalLayer('${escapeHtml(r.instance_id)}')">启用个人记忆层</button></div>
@@ -3611,7 +4600,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
         <p>${residuals.length} 个 Agent · 可恢复旧绑定、接入已有组或管理原生数据</p></div></summary>
       <div class="agent-cards" style="padding:16px">${residualCardsHtml}</div>
     </details>` : ''}
-    <section class="card"><div class="card-head"><div><h2>${agentInfo ? escapeHtml(agentInfo.product) + ' 数据视图' : 'Agent 数据视图'}</h2>
+    <section class="card"><div class="card-head"><div><h2>${agentInfo ? escapeHtml(agentDisplayName(agentInfo)) + ' 数据视图' : 'Agent 数据视图'}</h2>
       <p>${agentData ? agentData.total_files + ' 个文件，' + agentData.category_count + ' 个类别' : '选中 Agent 后显示数据'}</p></div>
       ${agentInfo ? `<div class="finding-actions"><button class="btn" type="button" onclick="selectAgentInstance('${escapeHtml(agentInfo.instance_id)}')">勾选授权</button>
         <button class="btn btn-primary" type="button" onclick="enterMultiAgentMode()">进入多 Agent 共享 MCP 模式</button></div>` : ''}</div>
@@ -3656,15 +4645,20 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
   }
   // 已有 active binding 的 agent 默认勾选
   const boundAgentSet = new Set(
-    existingBindings.filter(b => b.status === 'active').map(b => b.agent_instance_id)
+    existingBindings
+      .filter(b => b.status === 'active')
+      .map(b => safeDisplayText(b.agent_instance_id, '').trim())
+      .filter(Boolean)
   );
   const agentRowsHtml = agents.map(a => {
-    const bound = boundAgentSet.has(a.instance_id);
+    const agentId = safeDisplayText(a.instance_id, '').trim();
+    const bound = Boolean(agentId && boundAgentSet.has(agentId));
+    const summary = agentSummary(a);
     return `<label class="raw-file-row" style="cursor:pointer;grid-template-columns:auto 1fr auto;align-items:center">
       <input type="checkbox" data-agent-id="${escapeHtml(a.instance_id)}" ${bound ? 'checked' : ''}>
       <div>
-        <div class="finding-rule">${escapeHtml(a.product)}</div>
-        <div class="surface-meta">${a.found_surface_count}/${a.surface_count} 表面 · ${a.bound_source_count} 来源</div>
+         <div class="finding-rule">${escapeHtml(agentDisplayName(a))}</div>
+        <div class="surface-meta">${summary.foundSurfaceCount}/${summary.surfaceCount} 表面 · ${summary.sourceCount} 来源</div>
       </div>
       ${bound ? '<span class="chip chip-confirmed">已绑定</span>' : '<span class="chip chip-info">未绑定</span>'}
     </label>`;
@@ -3691,12 +4685,13 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
   const selectableGroups = [...groupById.values()]
     .filter(g => String(g.share_group_id || g.group_id || '').trim())
     .sort((left, right) => String(left.share_group_id || left.group_id).localeCompare(String(right.share_group_id || right.group_id)));
+  const agentNameById = new Map(agents.map(a => [a.instance_id, agentDisplayName(a)]));
   const groupOptionLabel = (group) => {
-    const gid = String(group.share_group_id || group.group_id || '');
     const kind = group.group_kind === 'personal' ? '个人' : '共享';
+    const memberNames = [...new Set((group.members || []).map(id => agentNameById.get(id) || agentDisplayName(id)))].filter(Boolean);
     const memberCount = Number(group.member_count || (group.members || []).length || 0);
     const recordCount = Number(group.active_records || group.active_count || 0);
-    return `${kind} · ${gid.slice(0, 20)} · ${memberCount} Agent · ${recordCount} active`;
+    return `${kind} · ${memberNames.join('、') || '未显示成员'} · ${memberCount} Agent · ${recordCount} active`;
   };
   const existingGroupSelector = (agentId, selectedGroupId = '') => {
     if (!selectableGroups.length) return '';
@@ -3706,13 +4701,13 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
     }).join('');
     return `<label class="surface-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <span>绑定已有记忆组</span>
-      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentId)} 选择已有记忆组">${options}</select>
+      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentDisplayName(agentId))} 选择已有记忆组">${options}</select>
       <button class="btn" type="button" onclick="bindSelectedExistingGroup('${escapeHtml(agentId)}')">应用</button>
     </label>`;
   };
   const personalLayerHtml = agents.map(a => {
-    const b = activeBindings.find(x => x.agent_instance_id === a.instance_id);
-    const hook = hookAgents.find(x => x.agent_instance_id === a.instance_id);
+    const b = activeBindings.find(x => sameNonEmptyAgentId(x.agent_instance_id, a.instance_id));
+    const hook = hookAgents.find(x => sameNonEmptyAgentId(x.agent_instance_id, a.instance_id));
     const label = b ? (b.group_kind === 'personal' ? '个人记忆层' : '共享记忆层') : '未启用个人记忆层';
     const action = b
       ? (b.group_kind === 'shared' ? '' : `<button class="btn" type="button" onclick="ensurePersonalLayer('${escapeHtml(a.instance_id)}')">保持个人层</button>`)
@@ -3726,7 +4721,7 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
          <button class="btn" type="button" onclick="setHostHookMode('${escapeHtml(hook.provider)}','${escapeHtml(a.instance_id)}','paused')">暂停 Hook</button>
          <button class="btn btn-danger" type="button" onclick="uninstallHostHook('${escapeHtml(hook.provider)}')">卸载 Hook</button>`
       : '';
-    return `<article class="plan-item"><div class="finding-header"><span class="finding-rule">${escapeHtml(a.product || a.instance_id)}</span><span class="chip chip-info">${label}</span><span class="chip chip-${hookChip}">${hookStatus}</span></div>
+    return `<article class="plan-item"><div class="finding-header"><span class="finding-rule">${escapeHtml(agentDisplayName(a))}</span><span class="chip chip-info">${label}</span><span class="chip chip-${hookChip}">${hookStatus}</span></div>
       <div class="row"><span class="key">group</span><code>${escapeHtml(b ? b.share_group_id : '未绑定')}</code></div>
       <div class="row"><span class="key">canonical DB</span><span>${escapeHtml(b ? (b.canonical_store_path || '') : '—')}</span></div>
       <div class="row"><span class="key">Hook</span><span>${escapeHtml(hookStatus)}${hook && hook.mode ? ` · ${escapeHtml(hook.mode)}` : ''}</span></div>
@@ -3736,7 +4731,6 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
   }).join('');
 
   // 已有记忆组分组展示：同时保留个人组、空共享组和只有数据的旧组。
-  const agentNameById = new Map(agents.map(a => [a.instance_id, a.product || a.instance_id]));
   const groupMap = new Map();
   existingBindings.forEach(b => {
     if (b.status !== 'active') return;
@@ -3819,7 +4813,7 @@ let rulePreviewProjectRef = '';
 let rulePreviewProvider = '';
 let rulePreviewRuntimeRole = '';
 let ruleRangeFilter = 'all';
-let ruleVisibilityFilter = 'effective';
+let ruleVisibilityFilter = 'all';
 let ruleRecordsById = new Map();
 let rulePreviewById = new Map();
 let ruleDecisionRows = [];
@@ -3827,6 +4821,58 @@ let ruleScopeMetrics = {};
 let ruleReceiptRows = [];
 let ruleExceptionRows = [];
 let ruleCreateResult = null;
+
+function rulePageBucket(record) {
+  const kind = String(record?.rule_kind || record?.kind || '').toLowerCase();
+  const strength = String(record?.rule_strength || '').toLowerCase();
+  const polarity = String(record?.polarity || '').toLowerCase();
+  if (['must', 'mandatory', 'required'].includes(strength)) return 'mandatory';
+  if (kind === 'preference') return 'preferences';
+  if (['procedure', 'workflow', 'instruction'].includes(kind)) return 'procedures';
+  if (['correction', 'constraint'].includes(kind) || polarity === 'negative') return 'corrections';
+  if (['project', 'decision'].includes(kind)) return 'projects';
+  return 'preferences';
+}
+
+function normalizeRulePageRecord(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const bindings = Array.isArray(source.bindings) ? source.bindings : [];
+  const assignments = bindings.map(binding => ({
+    assignment_id: binding.binding_id || '',
+    target_type: binding.target_type || '',
+    target_id: binding.target_id || '',
+    project_ref: binding.project_ref || '',
+    provider: binding.provider || '',
+    runtime_role: binding.runtime_role || '',
+    effect: binding.effect || 'include',
+    priority_override: Number.isFinite(Number(binding.priority)) ? Number(binding.priority) : null,
+  }));
+  const body = String(source.body || source.canonical_text || '').trim();
+  const memoryId = String(source.memory_id || source.definition_id || '').trim();
+  const priorities = bindings.map(item => Number(item.priority)).filter(Number.isFinite);
+  return {
+    ...source,
+    memory_id: memoryId,
+    rule_id: source.definition_id || memoryId,
+    body,
+    title: source.title || (body ? body.split(/\r?\n/, 1)[0].slice(0, 80) : memoryId),
+    kind: source.rule_kind || source.kind || 'procedure',
+    status: source.excluded ? 'excluded' : 'active',
+    injection_policy: bindings.length ? 'always' : 'relevant',
+    priority: priorities.length ? Math.max(...priorities) : 0,
+    assignments,
+  };
+}
+
+function rulePageBuckets(data) {
+  if (data?.buckets && typeof data.buckets === 'object') return data.buckets;
+  const buckets = {mandatory: [], preferences: [], procedures: [], corrections: [], projects: []};
+  for (const raw of (Array.isArray(data?.rules) ? data.rules : [])) {
+    const record = normalizeRulePageRecord(raw);
+    buckets[rulePageBucket(record)].push(record);
+  }
+  return buckets;
+}
 
 function ruleAudience(record) {
   const items = record.assignments || [];
@@ -3902,6 +4948,71 @@ function renderRuleReceiptActions(receipt) {
     ).join('')}</div></div>`;
 }
 
+function ruleDecisionScopeLabel(item) {
+  const value = String(item?.scope_type || item?.target_type || item?.scope || 'agent').trim().toLowerCase();
+  return ({
+    agent: '当前 Agent', current_agent: '当前 Agent',
+    project: '当前 Agent + 项目', current_project: '当前 Agent + 项目',
+    share_group: '共享组', shared: '共享组', system: '系统',
+  })[value] || value || '当前 Agent';
+}
+
+function groupRuleDecisions(decisions) {
+  const groups = new Map();
+  (decisions || []).forEach(item => {
+    const action = String(item?.action || 'auto_scope').trim().toLowerCase() || 'auto_scope';
+    if (!groups.has(action)) groups.set(action, {action, items: [], scopes: new Map(), confidences: [], latest: ''});
+    const group = groups.get(action);
+    group.items.push(item);
+    const scopeLabel = ruleDecisionScopeLabel(item);
+    if (!group.scopes.has(scopeLabel)) group.scopes.set(scopeLabel, []);
+    group.scopes.get(scopeLabel).push(item);
+    const confidence = Number(item?.scope_confidence ?? item?.confidence);
+    if (Number.isFinite(confidence)) group.confidences.push(Math.max(0, Math.min(1, confidence)));
+    group.latest = [group.latest, String(item?.created_at || '')].sort().at(-1) || '';
+  });
+  return [...groups.values()].map(group => ({
+    ...group,
+    count: group.items.length,
+    confidence: group.confidences.length
+      ? group.confidences.reduce((sum, value) => sum + value, 0) / group.confidences.length
+      : null,
+  })).sort((a, b) => b.count - a.count || String(b.latest).localeCompare(String(a.latest)) || a.action.localeCompare(b.action));
+}
+
+function ruleDecisionCanUndo(item) {
+  const id = item?.decision_id || item?.event_id || '';
+  return !!(item?.undo_id || id) && item?.status !== 'undone' && !item?.undone;
+}
+
+function renderRuleDecisionRow(item) {
+  const id = item.decision_id || item.event_id || '';
+  const confidence = item.scope_confidence ?? item.confidence;
+  const canUndo = ruleDecisionCanUndo(item);
+  const objectType = String(item.object_type || 'rule');
+  return `<div class="rule-decision-row"><div><span class="chip chip-info">${escapeHtml(objectType)}</span>
+    <span class="chip chip-info">${escapeHtml((item.rule_id || item.memory_id || '').slice(0, 14))}</span>
+    ${ruleConfidenceLabel(confidence)}</div>
+    <div class="muted">${escapeHtml(item.scope_reason || item.reason || '未提供原因')} · ${escapeHtml(item.created_at || '')}</div>
+    <div class="finding-actions"><code>${escapeHtml(id)}</code>${canUndo ? `<button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecision('${escapeHtml(id)}')">撤销自动决定</button>` : '<span class="chip chip-medium">已撤销</span>'}</div></div>`;
+}
+
+function renderRuleDecisionGroup(group, total) {
+  const collapsed = group.action === 'delete' && (group.count >= 3 || group.count / Math.max(1, total) >= .5);
+  const undoableCount = group.items.filter(ruleDecisionCanUndo).length;
+  const scopes = [...group.scopes.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const scopeSummary = scopes.length === 1 ? scopes[0][0] : `${scopes.length} 个范围`;
+  const scopeGroups = scopes.map(([scopeLabel, items]) => `<details class="rule-decision-subgroup" ${items.length <= 3 ? 'open' : ''}>
+    <summary>${escapeHtml(scopeLabel)} · ${items.length} 条</summary>
+    <div class="rule-decision-subgroup-body">${items.map(renderRuleDecisionRow).join('')}</div>
+  </details>`).join('');
+  return `<details class="rule-decision-group" ${collapsed ? '' : 'open'}>
+    <summary class="rule-decision-group-head"><span class="rule-decision-group-title"><strong>${escapeHtml(group.action)}</strong><span class="chip chip-info">${group.count} 条</span>${ruleConfidenceLabel(group.confidence)}</span>
+      <span class="rule-decision-group-meta"><span>${escapeHtml(scopeSummary)}</span><span>${escapeHtml(group.latest || '暂无时间')}</span></span></summary>
+    <div class="rule-decision-group-body">${undoableCount ? `<div class="finding-actions rule-decision-bulk"><button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecisionGroup('${encodeURIComponent(group.action)}')">批量撤销 ${undoableCount} 条</button></div>` : ''}${scopeGroups}</div>
+  </details>`;
+}
+
 function renderRuleAutoScopePanel() {
   const metrics = ruleScopeMetrics.auto_scope || ruleScopeMetrics.metrics || {};
   const decisions = ruleDecisionRows || [];
@@ -3909,19 +5020,11 @@ function renderRuleAutoScopePanel() {
   const low = Number(metrics.low_confidence ?? metrics.low_confidence_count ?? decisions.filter(d => Number(d.scope_confidence ?? d.confidence) < .5).length ?? 0);
   const narrowed = Number(metrics.narrowed ?? metrics.narrowed_count ?? 0);
   const undone = Number(metrics.undone ?? metrics.undone_count ?? decisions.filter(d => d.status === 'undone' || d.undone).length ?? 0);
-  const rows = decisions.slice(-20).reverse().map(item => {
-    const id = item.decision_id || item.event_id || '';
-    const confidence = item.scope_confidence ?? item.confidence;
-    const canUndo = !!(item.undo_id || id) && item.status !== 'undone' && !item.undone;
-    return `<div class="rule-decision-row"><div><strong>${escapeHtml(item.action || 'auto_scope')}</strong>
-      <span class="chip chip-info">${escapeHtml((item.rule_id || item.memory_id || '').slice(0, 14))}</span>
-      ${ruleConfidenceLabel(confidence)}</div>
-      <div class="muted">${escapeHtml(item.scope_reason || item.reason || '未提供原因')} · ${escapeHtml(item.created_at || '')}</div>
-      <div class="finding-actions"><code>${escapeHtml(id)}</code>${canUndo ? `<button class="btn btn-danger btn-icon" type="button" onclick="undoRuleDecision('${escapeHtml(id)}')">撤销自动决定</button>` : '<span class="chip chip-medium">已撤销</span>'}</div></div>`;
-  }).join('');
-  return `<section class="card rule-cockpit-panel"><div class="card-head"><div><h2>自动范围决策</h2><p>范围只从当前 Agent / 项目上下文推导；低置信度不会扩大到共享组或系统。</p></div>
+  const groups = groupRuleDecisions(decisions);
+  const rows = groups.map(group => renderRuleDecisionGroup(group, decisions.length)).join('');
+  return `<section class="card rule-cockpit-panel"><div class="card-head"><div><h2>自动范围决策</h2><p>按动作聚合并按范围二级折叠；高频 delete 默认收起，避免治理结果退化成删除流水账。</p></div>
     <div class="chips"><span class="chip chip-info">自动决定 ${total}</span><span class="chip ${low ? 'chip-high' : 'chip-confirmed'}">低置信度 ${low}</span><span class="chip chip-info">已收窄 ${narrowed}</span><span class="chip chip-info">已撤销 ${undone}</span></div></div>
-    ${rows || '<p class="muted">暂无自动范围决定。</p>'}</section>`;
+    <div class="rule-decision-groups">${rows || '<p class="muted">暂无自动范围决定。</p>'}</div></section>`;
 }
 
 function renderRuleCreatePanel(options) {
@@ -3967,19 +5070,42 @@ async function createRuleFromText() {
   }
 }
 
+async function requestRuleDecisionUndo(decisionId) {
+  const id = String(decisionId || '').trim();
+  if (!id) throw new Error('decision_id_required');
+  // Identity/scope comes only from the trusted native bridge.  Do not put
+  // Agent/group authority-shaped fields into browser metadata: SafeBridge
+  // correctly rejects those before dispatch.
+  const result = await callApi('undo_rule_decision', id, activeShareGroupId || 'default', true);
+  if (result?.error || result?.ok === false) throw new Error(result.error || result.code || '撤销失败');
+  return result;
+}
+
 async function undoRuleDecision(decisionId) {
   if (!decisionId || !confirm('确认撤销这条自动范围决定？')) return;
   try {
-    const result = await callApi('undo_rule_decision', decisionId, activeShareGroupId || 'default', true, {
-      // Preview selectors are diagnostic-only and cannot authorize undo.
-      agent_instance_id: activeAgentInstanceId || '',
-      share_group_id: activeShareGroupId || 'default',
-      project_ref: '',
-    });
-    if (result?.error || result?.ok === false) throw new Error(result.error || '撤销失败');
+    await requestRuleDecisionUndo(decisionId);
     showToast('自动范围决定已撤销。', 'success');
     await renderRulesHabits();
   } catch (error) { showToast(`撤销失败：${error.message || error}`, 'error'); }
+}
+
+async function undoRuleDecisionGroup(encodedAction) {
+  const action = decodeURIComponent(String(encodedAction || ''));
+  const ids = [...new Set((ruleDecisionRows || [])
+    .filter(item => String(item?.action || 'auto_scope').trim().toLowerCase() === action && ruleDecisionCanUndo(item))
+    .map(item => item.decision_id || item.event_id || '')
+    .filter(Boolean))];
+  if (!ids.length) return showToast('这一组没有可撤销的自动决定。', 'info');
+  if (!confirm(`确认批量撤销 ${action} 组中的 ${ids.length} 条自动范围决定？`)) return;
+  let failed = 0;
+  for (const decisionId of ids) {
+    try { await requestRuleDecisionUndo(decisionId); }
+    catch (_) { failed += 1; }
+  }
+  if (failed) showToast(`批量撤销完成：成功 ${ids.length - failed} 条，失败 ${failed} 条。`, 'error');
+  else showToast(`已批量撤销 ${ids.length} 条自动范围决定。`, 'success');
+  await renderRulesHabits();
 }
 
 async function submitRuleFeedback(receiptId, outcome) {
@@ -4215,7 +5341,7 @@ async function ensureRuleAudienceEditor(memoryId) {
     if (!ruleRecordsById.has(memoryId)) {
       const data = await callApi('list_rules_habits', groupId);
       if (data.error) throw new Error(data.error);
-      ruleRecordsById = new Map(Object.values(data.buckets || {}).flat().map(record => [record.memory_id, record]));
+      ruleRecordsById = new Map(Object.values(rulePageBuckets(data)).flat().map(record => [record.memory_id, record]));
     }
     openRuleAudienceEditor(memoryId);
   } catch (error) { showToast(`无法打开规则范围：${error.message || error}`, 'error'); }
@@ -4288,7 +5414,8 @@ async function renderRulesHabits() {
     if (!runtimeRoles.some(item => item.id === rulePreviewRuntimeRole)) rulePreviewRuntimeRole = '';
     rulePreviewById = new Map();
     const labels = {mandatory: '强制规则', preferences: '长期习惯与偏好', procedures: '工作流程', corrections: '纠错与禁忌', projects: '项目决策'};
-    const allRecords = Object.values(data.buckets || {}).flat();
+    const pageBuckets = rulePageBuckets(data);
+    const allRecords = Object.values(pageBuckets).flat();
     ruleRecordsById = new Map(allRecords.map(record => [record.memory_id, record]));
     if (rulePreviewAgentId) {
       const preview = await callApi(
@@ -4301,7 +5428,7 @@ async function renderRulesHabits() {
       (preview.unavailable || []).forEach(item => { rulePreviewById.set(item.memory_id, 'unavailable'); const r = ruleRecordsById.get(item.memory_id); if (r) r._preview = item; });
     }
     const blocks = Object.entries(labels).map(([key, label]) => {
-      const cards = ((data.buckets || {})[key] || []).map(ruleCard).filter(Boolean);
+      const cards = (pageBuckets[key] || []).map(ruleCard).filter(Boolean);
       if (!cards.length) return '';
       return `<details class="folder-group" open style="--folder-depth:0">
         <summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${label}</span><span class="folder-count">${cards.length} 条</span></summary>
@@ -4350,7 +5477,7 @@ function renderHistoryBackfillPanel(inventory) {
     const status = source.status || (source.supported ? 'importable' : 'unsupported');
     const label = { importable: '可导入', complete: '已完成', partial: '部分导入（会话已索引）', pending_binding: '待绑定 Agent', unsupported: '暂不支持', error: '扫描失败' }[status] || status;
     const tone = status === 'importable' ? 'chip-confirmed' : (status === 'unsupported' || status === 'pending_binding' || status === 'partial' ? 'chip-medium' : 'chip-high');
-    const bound = source.matched_agent_id ? ` → ${source.matched_agent_id}` : '';
+     const bound = source.matched_agent_id ? ` → ${agentDisplayName(source.matched_agent_id)}` : '';
     const location = source.path_count > 1 ? `${source.path_count} 个本地路径` : guiPathText(source.path, '受保护来源');
     return `<tr><td><strong>${escapeHtml(source.provider || 'unknown')}</strong></td><td class="path-cell">${escapeHtml(location)}</td><td>${Number(source.file_count || 0)}</td><td>${historyBytes(source.byte_count)}</td><td><span class="chip ${tone}">${escapeHtml(label)}</span><div class="surface-meta">${escapeHtml(source.support_reason || '')}${escapeHtml(bound)}</div></td></tr>`;
   }).join('') || '<tr><td colspan="5" class="empty-note">未发现可识别的本地会话来源。</td></tr>';
@@ -4359,23 +5486,81 @@ function renderHistoryBackfillPanel(inventory) {
 }
 
 async function runHistoryBackfill() {
-  if (!confirm('确认导入这一批本机旧会话？原文只进入独立对话历史库，不会写入长期记忆。')) return;
+  if (!confirm('确认导入本机旧会话？原文只进入独立对话历史库，不会写入长期记忆。')) return;
+  let continuation = historyBackfillContinuation;
+  let imported = 0;
+  let skipped = 0;
+  let errors = 0;
+  let turns = 0;
+  let batches = 0;
+  let retryableFailed = 0;
   try {
-    const data = await callApi('backfill_local_history', historyBackfillContinuation);
-    if (data.error) throw new Error(data.error);
-    historyBackfillContinuation = data.continuation || null;
-    const errors = Array.isArray(data.errors) ? data.errors.length : Number(data.errors || 0);
-    showToast(`旧会话批次完成：导入 ${Number(data.imported || 0)}，跳过 ${Number(data.skipped || 0)}${errors ? `，错误 ${errors}` : ''}`, errors ? 'info' : 'success');
+    // The backend intentionally bounds each task.  Follow its durable
+    // continuation until all never-before-processed sources have been visited;
+    // failed sources are reported but do not create an endless retry loop.
+    while (batches < 20) {
+      const accepted = await callApi('backfill_local_history', continuation);
+      if (accepted.error || accepted.ok === false) {
+        throw new Error(apiErrorMessage(accepted, '旧会话导入启动失败'));
+      }
+      const task = normalizeTaskState(accepted);
+      const runId = task.run_id || accepted.job_id || '';
+      const data = (accepted.deferred || runId)
+        ? await waitForTask(runId, '旧会话导入', 300000)
+        : accepted;
+      if (!data || data.ok === false || data.execution_status === 'failed') {
+        throw new Error(apiErrorMessage(data || {}, '旧会话导入失败'));
+      }
+      batches += 1;
+      imported += Number(data.imported ?? data.session_count ?? 0);
+      // ``skipped`` is a durable already-processed count at this batch's
+      // boundary, not a per-batch delta. Keep the latest value instead of
+      // summing it repeatedly across continuations.
+      skipped = Number(data.skipped || 0);
+      errors += Array.isArray(data.errors)
+        ? data.errors.length
+        : Number(data.errors ?? data.error_count ?? 0);
+      turns += Number(data.turn_count || 0);
+      retryableFailed = Number(data.retryable_failed_files || 0);
+      continuation = data.continuation || null;
+      historyBackfillContinuation = continuation;
+      const remaining = Number(data.remaining_files ?? data.remaining_fresh_files ?? 0);
+      if (!continuation || remaining <= 0) break;
+      showToast(`旧会话导入中：已完成 ${batches} 批，新增 ${imported} 个会话，剩余 ${remaining} 个来源`, 'info');
+    }
+    const suffix = `${turns ? `，${turns} 条消息` : ''}${errors ? `，错误 ${errors}` : ''}${retryableFailed ? `，待重试失败源 ${retryableFailed}` : ''}`;
+    showToast(`旧会话导入完成：新增 ${imported} 个会话，跳过已处理 ${skipped}${suffix}`, errors || retryableFailed ? 'info' : 'success');
     await renderHistory();
+    if (state.activeTab === 'neurons') await refreshNeuronGraph();
   } catch (e) { showToast(`旧会话导入失败：${e.message || e}`, 'error'); }
 }
 
 function historySessionTitle(session) {
+  const displayTitle = String(session?.display_title || '').trim();
+  if (displayTitle) return displayTitle;
   const title = String(session?.title || '').trim();
   if (title && title !== '未命名会话') return title;
   const provider = String(session?.provider || '本地').trim() || '本地';
   const stamp = String(session?.created_at || session?.imported_at || '').trim();
   return stamp ? `${provider} 对话 · ${stamp}` : `${provider} 对话`;
+}
+
+function buildHistoryReadRequest({sessionId = '', turnId = '', limit = 100, offset = 0} = {}) {
+  const session = String(sessionId || '').trim();
+  const turn = String(turnId || '').trim();
+  if (Boolean(session) === Boolean(turn)) throw new Error('conversation_selector_invalid');
+  const request = {limit: Number(limit) || 100, offset: Math.max(0, Number(offset) || 0)};
+  if (session) request.session_id = session;
+  else request.turn_id = turn;
+  return request;
+}
+
+function historyErrorMessage(result, fallback = '对话历史操作失败') {
+  const code = String(result?.code || result?.error?.code || result?.error || '').trim();
+  if (code === 'conversation_selector_invalid') {
+    return '读取会话需要且仅需要 session_id；读取单条消息需要且仅需要 turn_id。';
+  }
+  return apiErrorMessage(result, fallback);
 }
 
 function renderHistoryGrouped(data) {
@@ -4395,7 +5580,7 @@ function renderHistoryGrouped(data) {
     const sessionCount = [...group.agents.values()].reduce((n, sessions) => n + sessions.length, 0);
     const agents = [...group.agents.entries()].map(([owner, sessions]) => {
       const canDelete = !!activeAgentInstanceId && owner === activeAgentInstanceId;
-      return `<section class="history-agent-group"><h3>${escapeHtml(owner)}</h3>${sessions.map(s => `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(historySessionTitle(s))}</strong><span class="chip">${escapeHtml(s.provider || 'local')}</span></div><p>${escapeHtml(s.summary || '尚无摘要')}</p><div class="muted">${escapeHtml(s.created_at || s.imported_at || '')} · ${s.turn_count || 0} 条 · ${s.evidence_count || 0} 条已萃取证据</div><div class="finding-actions"><button class="btn" data-mg-action="history-read-session" data-session-id="${escapeHtml(s.session_id)}">阅读原文</button><button class="btn" data-mg-action="history-extract" data-session-id="${escapeHtml(s.session_id)}">萃取预览</button><button class="btn" data-mg-action="history-export" data-session-id="${escapeHtml(s.session_id)}">导出</button>${canDelete ? `<button class="btn" data-mg-action="history-delete" data-session-id="${escapeHtml(s.session_id)}">删除历史</button>` : '<span class="muted">仅会话 owner 可删除</span>'}</div></article>`).join('')}</section>`;
+      return `<section class="history-agent-group"><h3>${escapeHtml(agentDisplayName(owner))}</h3>${sessions.map(s => `<article class="memory-card"><div class="memory-card-top"><strong>${escapeHtml(historySessionTitle(s))}</strong><span class="chip">${escapeHtml(s.provider || 'local')}</span></div><p>${escapeHtml(s.summary || s.preview_excerpt || '尚无可用概要')}</p><div class="chips"><span class="chip ${s.summarized ? 'chip-confirmed' : 'chip-info'}">${s.summarized ? '已摘要' : '首条用户消息'}</span></div><div class="muted">${escapeHtml(s.created_at || s.imported_at || '')} · ${s.turn_count || 0} 条消息 · ${s.evidence_count || 0} 条已萃取证据</div><div class="finding-actions"><button class="btn" data-mg-action="history-read-session" data-session-id="${escapeHtml(s.session_id)}">阅读原文</button><button class="btn" data-mg-action="history-extract" data-session-id="${escapeHtml(s.session_id)}">萃取预览</button><button class="btn" data-mg-action="history-export" data-session-id="${escapeHtml(s.session_id)}">导出</button>${canDelete ? `<button class="btn" data-mg-action="history-delete" data-session-id="${escapeHtml(s.session_id)}">删除历史</button>` : '<span class="muted">仅会话 owner 可删除</span>'}</div></article>`).join('')}</section>`;
     }).join('');
     return `<details class="card history-project-group folder-group" open>
       <summary class="folder-row"><span class="folder-caret" aria-hidden="true"></span><span class="folder-name">${escapeHtml(meta.project_label || '未识别项目')}${escapeHtml(status + parent)}</span><span class="folder-count">${sessionCount} 个会话</span></summary>
@@ -4404,38 +5589,45 @@ function renderHistoryGrouped(data) {
   }).join('');
 }
 
-async function renderHistory() {
-  setContent('<div class="loading">正在读取本地对话历史…</div>');
-  let inventory = { sources: [] };
+async function refreshHistoryBackfillPanel() {
+  const host = document.getElementById('history-backfill-host');
+  if (!host) return;
   try {
-    inventory = await callApi('discover_local_history_sources');
-    if (inventory.error) throw new Error(inventory.error);
+    const inventory = await callApi('discover_local_history_sources');
+    if (inventory.error || inventory.ok === false) throw new Error(apiErrorMessage(inventory, '旧会话扫描失败'));
+    const current = document.getElementById('history-backfill-host');
+    if (current) current.innerHTML = renderHistoryBackfillPanel(inventory);
   } catch (e) {
-    setContent(`<div class="card empty-state"><p>旧会话扫描失败：${escapeHtml(e.message || e)}</p></div>`);
-    return;
+    const current = document.getElementById('history-backfill-host');
+    if (current) current.innerHTML = `<section class="card"><div class="card-head"><div><h2>扫描旧会话</h2><p>已索引会话仍可正常读取。</p></div></div><p class="muted">本地来源扫描失败：${escapeHtml(e.message || e)}</p></section>`;
   }
+}
+
+function historyBackfillLoadingPanel() {
+  return '<div id="history-backfill-host"><section class="card"><div class="card-head"><div><h2>扫描旧会话</h2><p>后台发现 Claude / Codex / Cursor 本地日志，不阻塞已索引会话。</p></div></div><div class="loading" style="min-height:72px">正在扫描本地来源…</div></section></div>';
+}
+
+async function renderHistory() {
+  // 已索引会话是主页面；本地日志发现可能扫描数 GB 文件，不能阻塞首屏。
+  setContent('<div class="loading">正在读取已索引对话历史…</div>');
   const scopeReady = await ensureGovernanceScope();
   if (!scopeReady) {
-    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引可显示在神经图；原文不会进入长期记忆或 bootstrap。</p></div></div>${renderHistoryBackfillPanel(inventory)}${renderHistoryScopeGate()}`);
+    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引可显示在神经图；原文不会进入长期记忆或 bootstrap。</p></div></div>${historyBackfillLoadingPanel()}${renderHistoryScopeGate()}`);
+    void refreshHistoryBackfillPanel();
     return;
   }
   try {
     const data = await callApi('list_history_sessions', historyScope(), 50, 0, null, '', '');
-    if (data.error) throw new Error(data.error);
+    if (data.error || data.ok === false) throw new Error(apiErrorMessage(data, '对话历史加载失败'));
     const cards = renderHistoryGrouped(data);
-    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>本地证据库，不会自动进入长期记忆或神经图。</p></div><div class="page-actions"><input id="history-search" placeholder="搜索历史" /><button class="btn" data-mg-action="history-search">搜索</button></div></div><section class="card"><p class="muted">检索顺序：搜索摘要 → 附近时间线 → 单条原文。原始对话归属 owner；当前共享组成员可查，仅 owner 可删。</p></section><div id="history-results">${cards || '<div class="card empty-state"><p>当前 Agent 没有对话历史；可从数据源页导入导出包。</p></div>'}</div>`);
-    const historyHead = document.querySelector('#content .page-head');
-    if (historyHead) {
-      const intro = historyHead.querySelector('p');
-      if (intro) intro.textContent = '会话索引会显示在神经图；原文不会进入长期记忆或 bootstrap，需在此页按需读取。';
-      historyHead.insertAdjacentHTML('afterend', renderHistoryBackfillPanel(inventory));
-    }
+    setContent(`<div class="page-head"><div><h1>对话历史</h1><p>会话索引会显示在神经图；原文不会进入长期记忆或 bootstrap，需在此页按需读取。</p></div><div class="page-actions"><input id="history-search" placeholder="搜索历史" /><button class="btn" data-mg-action="history-search">搜索</button></div></div>${historyBackfillLoadingPanel()}<section class="card"><p class="muted">检索顺序：搜索摘要 → 附近时间线 → 单条原文。原始对话归属 owner；当前共享组成员可查，仅 owner 可删。</p></section><div id="history-results">${cards || '<div class="card empty-state"><p>当前治理范围还没有已索引会话，可在上方导入本机旧会话。</p></div>'}</div>`);
+    void refreshHistoryBackfillPanel();
     if (historyFocusSessionId) {
       const sessionId = historyFocusSessionId;
       historyFocusSessionId = '';
       await readHistorySession(sessionId);
     }
-  } catch (e) { setContent(`<div class="card empty-state"><p>对话历史加载失败：${escapeHtml(e)}</p></div>`); }
+  } catch (e) { setContent(`<div class="card empty-state"><p>对话历史加载失败：${escapeHtml(e.message || e)}</p></div>`); }
 }
 
 async function searchHistory() {
@@ -4466,8 +5658,8 @@ async function showHistoryTimeline(sessionId, turnId) {
 
 async function readHistoryTurn(turnId) {
   try {
-    const data = await callApi('history_read', '', turnId, historyScope(), 1, 0);
-    if (data.error) throw new Error(data.error);
+    const data = await callApi('history_read', buildHistoryReadRequest({turnId, limit: 1, offset: 0}));
+    if (data.error || data.ok === false) throw new Error(historyErrorMessage(data, '原文读取失败'));
     const t = data.turn || {};
     document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button><article class="memory-card"><strong>${escapeHtml(t.role || '')}</strong><pre class="raw-content">${escapeHtml(t.content || '')}</pre></article>`;
   } catch (e) { showToast('原文读取失败：' + e, 'error'); }
@@ -4475,16 +5667,16 @@ async function readHistoryTurn(turnId) {
 
 async function readHistorySession(sessionId) {
   try {
-    const data = await callApi('history_read', sessionId, '', historyScope(), 100, 0);
-    if (data.error) throw new Error(data.error);
+    const data = await callApi('history_read', buildHistoryReadRequest({sessionId, limit: 100, offset: 0}));
+    if (data.error || data.ok === false) throw new Error(historyErrorMessage(data, '会话读取失败'));
     document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button>${(data.turns || []).map(t => `<article class="memory-card"><strong>${escapeHtml(t.role || '')}</strong><pre class="raw-content">${escapeHtml(t.content || '')}</pre></article>`).join('')}`;
   } catch (e) { showToast('会话读取失败：' + e, 'error'); }
 }
 
 async function previewHistoryExtract(sessionId) {
   try {
-    const data = await callApi('history_extract_preview', sessionId, null, historyScope(), 8);
-    if (data.error) throw new Error(data.error);
+    const data = await callApi('history_extract_preview', {session_id: String(sessionId || '').trim(), limit: 8});
+    if (data.error || data.ok === false) throw new Error(historyErrorMessage(data, '萃取预览失败'));
     const rows = (data.candidates || []).map(c => `<article class="memory-card"><strong>${escapeHtml(c.title)}</strong><p>${escapeHtml(c.body)}</p><div class="muted">证据：${escapeHtml(c.evidence?.turn_id || '')}</div></article>`).join('');
     document.getElementById('history-results').innerHTML = `<button class="btn" data-mg-action="history-back">返回会话</button><p class="muted">以下仅为候选预览，尚未写入长期记忆。</p>${rows || '<div class="card empty-state"><p>没有可萃取内容。</p></div>'}`;
   } catch (e) { showToast('萃取预览失败：' + e, 'error'); }
@@ -4492,8 +5684,8 @@ async function previewHistoryExtract(sessionId) {
 
 async function exportHistorySession(sessionId) {
   try {
-    const data = await callApi('export_history', [sessionId], historyScope());
-    if (data.error) throw new Error(data.error);
+    const data = await callApi('export_history', {session_ids: [String(sessionId || '').trim()]});
+    if (data.error || data.ok === false) throw new Error(historyErrorMessage(data, '历史导出失败'));
     const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json;charset=utf-8'});
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -4586,7 +5778,7 @@ function showSharedGroupPreview(groupId, preview) {
   const memStatus = (preview && preview.memory_status) || {};
   const bindingsHtml = bindings.length ? bindings.map(b => `<article class="plan-item verified">
     <div class="finding-header">
-      <span class="finding-rule">${escapeHtml(b.agent_instance_id)}</span>
+       <span class="finding-rule">${escapeHtml(agentDisplayName(b.agent_instance_id))}</span>
       <span class="chip chip-${b.status === 'active' ? 'confirmed' : 'medium'}">${escapeHtml(b.status || '')}</span>
     </div>
     <div class="row"><span class="key">binding_id</span><code>${escapeHtml(b.binding_id || '')}</code></div>
@@ -4619,20 +5811,21 @@ function showSharedGroupPreview(groupId, preview) {
 
 async function dissolveSharedGroup(groupId) {
   if (!groupId) return showToast('缺少共享组 ID', 'error');
-  if (!confirm(`确认解散共享组？\n\n· 解绑组内全部 Agent\n· 删除共享组投影\n· 归档 SharedMemoryStore 目录（可从 shared-memory-archived 找回）\n· 不清空已写入的 MCP 重定向文件（需手动恢复）\n\n继续？`)) return;
+  if (!confirm(`确认解散共享组？\n\n· 解绑共享组内全部 Agent\n· 移除匹配的 MemoryGuard Hook 条目\n· 将每位原成员返回其个人记忆层\n· 受管数据保留为仅审计 tombstone\n\n继续？`)) return;
   showToast('正在解散共享组…');
   try {
     const result = await callApi('dissolve_shared_group', groupId, true, true);
-    if (result.error) return showToast(result.error, 'error');
+    if (!result || result.error || result.ok === false) {
+      return showToast(apiErrorMessage(result, '解散共享组失败'), 'error');
+    }
     if (activeShareGroupId === groupId) {
       activeShareGroupId = '';
       dataPageMode = 'multi_agent_shared_mcp';
     }
     const n = result.unbound_count || 0;
-    const arch = result.archived_to ? '，数据已归档' : '';
-    showToast(`已解散共享组，解绑 ${n} 个 Agent${arch}`, 'success');
+    showToast(`共享组已解散：已解绑 ${n} 个 Agent，已移除匹配的 MemoryGuard Hook 条目，所有原成员已返回个人记忆层；受管数据保留为仅审计 tombstone`, 'success');
     renderMultiAgentBinding();
-  } catch (e) { showToast('解散失败：' + e, 'error'); }
+  } catch (e) { showToast('解散共享组失败：' + (e.message || e), 'error'); }
 }
 
 async function exitMultiAgentMode() {
@@ -4682,12 +5875,13 @@ function showDiscoveryResult(result, groupsResult = {}, bindingsResult = {}) {
     .filter(binding => binding.status === 'active');
   const existingGroups = ((groupsResult && groupsResult.groups) || [])
     .filter(group => String(group.share_group_id || group.group_id || '').trim());
+  const instanceNameById = new Map(instances.map(item => [item.instance_id, agentDisplayName(item)]));
   const groupLabel = (group) => {
-    const groupId = String(group.share_group_id || group.group_id || '');
     const kind = group.group_kind === 'personal' ? '个人' : '共享';
+    const memberNames = [...new Set((group.members || []).map(id => instanceNameById.get(id) || agentDisplayName(id)))].filter(Boolean);
     const members = Number(group.member_count || (group.members || []).length || 0);
     const records = Number(group.active_records || group.active_count || group.record_count || 0);
-    return `${kind} · ${groupId.slice(0, 24)} · ${members} Agent · ${records} 条记忆`;
+    return `${kind} · ${memberNames.join('、') || '未显示成员'} · ${members} Agent · ${records} 条记忆`;
   };
   const groupSelector = (agentId) => {
     if (!existingGroups.length) return '<span class="surface-meta">暂无已有记忆组，可新建个人记忆层。</span>';
@@ -4697,7 +5891,7 @@ function showDiscoveryResult(result, groupsResult = {}, bindingsResult = {}) {
     }).join('');
     return `<label class="surface-meta" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
       <span>已有记忆组</span>
-      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentId)} 选择已有记忆组">${options}</select>
+      <select class="scope-select" data-existing-group-agent="${escapeHtml(agentId)}" aria-label="为 ${escapeHtml(agentDisplayName(agentId))} 选择已有记忆组">${options}</select>
       <button class="btn btn-primary" type="button" onclick="bindSelectedExistingGroup('${escapeHtml(agentId)}')">接入已有记忆组</button>
     </label>`;
   };
@@ -4747,14 +5941,16 @@ function showDiscoveryResult(result, groupsResult = {}, bindingsResult = {}) {
     const foundCount = (inst.surfaces || []).filter(s => s.status === 'found').length;
     const totalCount = (inst.surfaces || []).length;
     const lifecycle = inst.lifecycle_state || inst.install_state || 'pending';
+    const binding = activeBindings.find(item => sameNonEmptyAgentId(item.agent_instance_id, inst.instance_id));
     const discoveryOnly = Object.prototype.hasOwnProperty.call(inst, 'install_confidence')
       && finiteNumber(inst.install_confidence, 0) <= 0
       && inst.target_capability === 'export_only';
-    const lifecycleLabel = discoveryOnly ? '已发现 · 待接入' : (LIFECYCLE_LABEL[lifecycle] || lifecycle);
-    const lifecycleChip = discoveryOnly ? 'info' : (LIFECYCLE_CHIP[lifecycle] || 'info');
+    const lifecycleLabel = binding
+      ? (binding.group_kind === 'personal' ? '已启用个人层' : '已绑定共享组')
+      : (discoveryOnly ? '已发现 · 待接入' : (LIFECYCLE_LABEL[lifecycle] || lifecycle));
+    const lifecycleChip = binding ? 'confirmed' : (discoveryOnly ? 'info' : (LIFECYCLE_CHIP[lifecycle] || 'info'));
     const supportLevel = inst.support_level || '';
     const supportChip = SUPPORT_CHIP[supportLevel] || 'info';
-    const binding = activeBindings.find(item => item.agent_instance_id === inst.instance_id);
     const nativeMemoryCount = (inst.surfaces || []).filter(surface =>
       surface.status === 'found' && (
         surface.category === 'native_memory' || surface.evidence_role === 'private_data_evidence'
@@ -4767,7 +5963,7 @@ function showDiscoveryResult(result, groupsResult = {}, bindingsResult = {}) {
          <button class="btn" type="button" onclick="ensurePersonalLayer('${escapeHtml(inst.instance_id)}')">新建个人记忆层</button>`;
     return `<article class="plan-item verified">
       <div class="finding-header">
-        <span class="finding-rule">${escapeHtml(inst.product)}</span>
+        <span class="finding-rule">${escapeHtml(agentDisplayName(inst))}</span>
         <span class="chip chip-confirmed">${foundCount}/${totalCount} 表面</span>
         <span class="chip chip-${lifecycleChip}">${escapeHtml(lifecycleLabel)}</span>
         ${supportLevel ? `<span class="chip chip-${supportChip}">支持 ${escapeHtml(supportLevel)}</span>` : ''}
@@ -4855,7 +6051,7 @@ async function showResidualCleanup(instanceId) {
     }).join('') : '<div class="empty-state"><div class="empty-orb"></div><p>无残留数据。</p></div>';
     const archivesHtml = (result.archives || []).slice(0, 10).map((a, idx) => `<div class="plan-item" data-archive-id="${escapeHtml(a.archive_id || '')}" data-instance-id="${escapeHtml(instanceId)}">
       <div class="finding-header">
-        <span class="finding-rule">${escapeHtml(a.product || '')} · ${escapeHtml(a.original_path || '')}</span>
+        <span class="finding-rule">${escapeHtml(agentDisplayName(a))} · ${escapeHtml(a.original_path || '')}</span>
         <span class="chip chip-info">${escapeHtml(a.archive_id || '')}</span>
       </div>
       <div class="finding-evidence">归档原因: ${escapeHtml(a.reason || '')} · 归档时间: ${escapeHtml(a.archived_at || '')}</div>
@@ -5524,7 +6720,7 @@ async function bindSelectedExistingGroup(agentId) {
   const groupId = String(select?.value || '').trim();
   if (!groupId) return showToast('请选择已有记忆组', 'error');
   const label = memoryGroupLabel(groupId);
-  if (!confirm(`确认将 ${agentId} 绑定到已有${label}？\n\n· 该 Agent 当前个人/共享绑定会切换到此组\n· 不删除原记忆组，也不改写原生记忆文件\n· 绑定后更新该组 MCP + Hook 配置\n\n继续？`)) return;
+  if (!confirm(`确认将 ${agentDisplayName(agentId)} 绑定到已有${label}？\n\n· 该 Agent 当前个人/共享绑定会切换到此组\n· 不删除原记忆组，也不改写原生记忆文件\n· 绑定后更新该组 MCP + Hook 配置\n\n继续？`)) return;
   showToast('正在绑定到已有记忆组…');
   try {
     const result = await waitForMutation(
@@ -5651,8 +6847,11 @@ async function renderGovernance() {
   setContent('<div class="loading">正在读取记忆治理组</div>');
   let groups = [];
   try {
-    const result = await callApi('list_share_groups');
-    groups = result.groups || [];
+    const [groupsResult, agentsResult] = await Promise.all([
+      callApi('list_share_groups'), callApi('list_agents'),
+    ]);
+    groups = groupsResult.groups || [];
+    agentCardsData = agentsResult || agentCardsData;
   } catch (e) {
     setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>记忆治理组加载失败：${escapeHtml(String(e))}</p></div></div>`);
     return;
@@ -5660,9 +6859,11 @@ async function renderGovernance() {
   if (activeShareGroupId && !groups.some(g => g.share_group_id === activeShareGroupId)) {
     activeShareGroupId = '';
   }
-  const groupOptions = groups.map(g => `<option value="${escapeHtml(g.share_group_id)}" ${g.share_group_id === activeShareGroupId ? 'selected' : ''}>
-    ${g.group_kind === 'personal' ? '个人' : '共享'} · ${escapeHtml(g.share_group_id)} · ${g.agent_count || 0} Agent · ${g.active_records || 0} active
-  </option>`).join('');
+  const groupOptions = groups.map(g => {
+    const memberNames = agentNamesForIds(g.members || g.agent_instance_ids || []);
+    const label = `${g.group_kind === 'personal' ? '个人' : '共享'} · ${memberNames.join('、') || '未显示成员'} · ${g.agent_count || g.member_count || memberNames.length || 0} Agent · ${g.active_records || 0} active`;
+    return `<option value="${escapeHtml(g.share_group_id)}" ${g.share_group_id === activeShareGroupId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
   const groupSelector = groups.length
     ? `<section class="card"><div class="card-head"><div><h2>治理范围</h2><p>选择个人或共享记忆层；所有读取和处置都严格绑定此组。</p></div></div>
         <select class="scope-select" aria-label="选择记忆治理组" onchange="selectGovernanceGroup(this.value)">
@@ -5706,11 +6907,16 @@ async function renderGovernance() {
 async function selectGovernanceGroup(groupId) {
   if (!groupId) {
     activeShareGroupId = '';
+    activeScopeMemberIds = [];
+    governanceScopeState = {status: 'unselected', share_group_id: '', reason: '', binding: null, members: []};
     state.governanceSnapshot = null;
     renderGovernance();
     renderStatusRail();
     return;
   }
+  const groupsResult = await callApi('list_share_groups');
+  const selected = (groupsResult.groups || []).find(group => group.share_group_id === groupId);
+  activeScopeMemberIds = selected?.members || selected?.agent_instance_ids || [];
   await setActiveShareGroup(groupId);
   await loadGovernanceSnapshot();
   renderGovernance();
@@ -5802,14 +7008,14 @@ async function renderRecentEvents() {
       const actions = (e.auto_actions || []).map(a => `<span class="chip chip-info">${escapeHtml(a.action || a.type || 'auto')}</span>`).join('');
       return `<article class="plan-item" onclick="toggleEventDetail('${escapeHtml(e.event_id)}')">
         <div class="finding-header">
-          <span class="finding-rule">${escapeHtml(e.agent_instance_id || 'unknown')}</span>
+           <span class="finding-rule">${escapeHtml(agentDisplayName(e.agent_instance_id || e.actor || e.provider, e.provider || '未知 Agent'))}</span>
           <span class="chip chip-info">${escapeHtml(e.created_at || '')}</span>
         </div>
         <div class="finding-evidence">${preview}${(e.raw_content || '').length > 100 ? '…' : ''}</div>
         ${actions ? `<div class="chips" style="margin-top:6px">${actions}</div>` : ''}
         <div class="finding-detail" id="event-detail-${escapeHtml(e.event_id)}" style="display:none">
           <div class="row"><span class="key">event_id</span><code>${escapeHtml(e.event_id || '')}</code></div>
-          <div class="row"><span class="key">agent</span><span>${escapeHtml(e.agent_instance_id || '')}</span></div>
+           <div class="row"><span class="key">agent</span><span>${escapeHtml(agentDisplayName(e.agent_instance_id || e.actor || e.provider, e.provider || '未知 Agent'))}</span></div>
           <div class="row"><span class="key">group</span><span>${escapeHtml(e.share_group_id || '')}</span></div>
           <div class="row"><span class="key">时间</span><span>${escapeHtml(e.created_at || '')}</span></div>
           <div class="row"><span class="key">完整内容</span></div>

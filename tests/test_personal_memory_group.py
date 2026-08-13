@@ -282,7 +282,12 @@ def test_projection_source_map_is_reference_only_and_uses_v2_connector(tmp_path:
     )
     result = ProjectionBuildService(tmp_path).source_map(scope=scope)
     assert result["ok"] is True
-    assert result["summary"] == {"total": 1, "enabled": 1}
+    assert result["summary"]["total"] == 1
+    assert result["summary"]["enabled"] == 1
+    assert result["summary"]["selected_source_connectors"] == 1
+    assert result["summary"]["selected_source_connector_total"] == 1
+    assert result["summary"]["governed_memory"] == 0
+    assert result["summary"]["buildable_atom_count"] == 0
     assert result["entries"][0]["source_id"] == "source-test"
     assert "body" not in json.dumps(result, ensure_ascii=False).lower()
 

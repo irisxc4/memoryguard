@@ -18,15 +18,14 @@ import hashlib
 import json
 from pathlib import PurePosixPath
 import re
-import shutil
 import sqlite3
-import subprocess
 from typing import Any, Mapping, Sequence
 
-try:
-    from graphify.memoryguard_export import export_repository as _graphify_export_repository
-except (ImportError, AttributeError):
-    _graphify_export_repository = None
+from ..graphify_core import (
+    CORE_VERSION as _GRAPHIFY_CORE_VERSION,
+    EXPORT_FORMAT as _CORE_EXPORT_FORMAT,
+    export_repository as _graphify_export_repository,
+)
 
 from .models import (
     CodeGraphError,
@@ -42,7 +41,7 @@ from .models import (
 from .store import CodeGraphStore, normalize_relative_path
 
 
-EXPORT_FORMAT = "memoryguard-graphify-metadata-v1"
+EXPORT_FORMAT = _CORE_EXPORT_FORMAT
 MAX_FILES = 20_000
 MAX_NODES = 500_000
 MAX_EDGES = 1_000_000
@@ -83,26 +82,17 @@ class GraphifyCapability:
 
     @classmethod
     def detect(cls) -> "GraphifyCapability":
-        executable = shutil.which("graphify") or shutil.which("graphifyy") or ""
-        module_export = callable(_graphify_export_repository)
-        if not executable:
-            return cls(module_export, metadata_export=module_export, code="" if module_export else "graphify_not_installed")
-        version = ""
-        try:
-            completed = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=5, check=False)
-            match = re.search(r"(\d+\.\d+\.\d+)", (completed.stdout or completed.stderr or ""))
-            version = match.group(1) if match else ""
-        except (OSError, subprocess.SubprocessError):
-            return cls(True, executable=executable, code="graphify_version_unavailable")
-        metadata_export = False
-        try:
-            help_result = subprocess.run([executable, "export", "--help"], capture_output=True, text=True, timeout=5, check=False)
-            help_text = (help_result.stdout or "") + (help_result.stderr or "")
-            metadata_export = EXPORT_FORMAT in help_text or "memoryguard-metadata" in help_text.casefold()
-        except (OSError, subprocess.SubprocessError):
-            pass
-        metadata_export = metadata_export or module_export
-        return cls(True, version, executable, metadata_export, "" if metadata_export else "graphify_metadata_export_unavailable")
+        # Graphify Core ships inside MemoryGuard.  Capability no longer depends
+        # on PATH, a separately installed graphifyy distribution, or a CLI
+        # subprocess.  Keep this legacy-shaped DTO so existing CodeGraph status
+        # and callers do not need a second capability contract.
+        return cls(
+            available=callable(_graphify_export_repository),
+            version=_GRAPHIFY_CORE_VERSION,
+            executable="",
+            metadata_export=callable(_graphify_export_repository),
+            code="" if callable(_graphify_export_repository) else "graphify_core_unavailable",
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {"available": self.available, "version": self.version, "metadata_export": self.metadata_export, "code": self.code}
@@ -254,7 +244,7 @@ class GraphifyExportAdapter:
         tombstoned = 0
 
         try:
-            with self.store._write_transaction(scope) as (conn, checked_scope, _scope_id, now):
+            with self.store._write_transaction(scope) as (conn, checked_scope, scope_id, now):
                 for raw in files:
                     external, path = self._file_key(raw)
                     if external in file_by_external or path in file_by_path:
@@ -377,6 +367,25 @@ class GraphifyExportAdapter:
                         }
                     )
                     symbol_external_ids_by_file.setdefault(persisted.file_id, []).append(external)
+
+                if full_snapshot:
+                    # A complete extraction is authoritative even when source
+                    # bytes (and therefore revision_id) did not change.  Engine
+                    # upgrades may change the symbol set for the same immutable
+                    # file revision; deactivate the prior head transactionally
+                    # and let canonical symbols/edges below reactivate when the
+                    # exact identity is still present.
+                    for persisted in file_by_path.values():
+                        conn.execute(
+                            "UPDATE edges SET active=0 WHERE scope_id=? AND active=1 AND ("
+                            "from_id IN (SELECT symbol_id FROM symbols WHERE file_id=? AND scope_id=? AND active=1) "
+                            "OR to_id IN (SELECT symbol_id FROM symbols WHERE file_id=? AND scope_id=? AND active=1))",
+                            (scope_id, persisted.file_id, scope_id, persisted.file_id, scope_id),
+                        )
+                        conn.execute(
+                            "UPDATE symbols SET active=0 WHERE file_id=? AND scope_id=? AND active=1",
+                            (persisted.file_id, scope_id),
+                        )
 
                 for persisted in sorted(file_by_path.values(), key=lambda item: item.path):
                     values = symbol_values_by_file.get(persisted.file_id, [])

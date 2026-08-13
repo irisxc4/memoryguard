@@ -279,6 +279,27 @@ class GroupControlService:
         return rows[0] if rows else None
 
     @staticmethod
+    def _group_lifecycle_key(group_id: str) -> str:
+        return "group_lifecycle:" + _digest(str(group_id))
+
+    def _dissolved_groups(self) -> set[str]:
+        if not self.store.db_path.is_file() or self.store._preflight() != "current":
+            return set()
+        with self.store.connection() as conn:
+            rows = conn.execute(
+                "SELECT value_json FROM control_preferences WHERE pref_key LIKE 'group_lifecycle:%'"
+            ).fetchall()
+        dissolved: set[str] = set()
+        for row in rows:
+            try:
+                value = json.loads(str(row[0] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if str(value.get("status") or "") == "dissolved" and str(value.get("group_id") or ""):
+                dissolved.add(str(value["group_id"]))
+        return dissolved
+
+    @staticmethod
     def _validate_memory_snapshot(conn: Any) -> None:
         tables = {
             str(row[0])
@@ -373,7 +394,7 @@ class GroupControlService:
                     "quarantined": status == "quarantined",
                 })
 
-        group_ids = sorted(set(members) | set(memory_groups))
+        group_ids = sorted((set(members) | set(memory_groups)) - self._dissolved_groups())
         groups: list[dict[str, Any]] = []
         total_status_counts: dict[str, int] = {}
         total_visibility_counts: dict[str, int] = {}
@@ -598,6 +619,34 @@ class GroupControlService:
     def _binding_id(agent_id: str, group_id: str, server: str) -> str:
         return "binding-" + _digest("v2-agent-binding", agent_id, group_id, server)
 
+    def _binding_state_seed(self, agent_ids: Sequence[str], group_id: str) -> list[tuple[str, str, str, int]]:
+        agents = sorted({str(item) for item in agent_ids if str(item)})
+        if not agents or not self.store.db_path.is_file() or self.store._preflight() != "current":
+            return []
+        placeholders = ",".join("?" for _ in agents)
+        with self.store.connection() as conn:
+            active = conn.execute(
+                "SELECT agent_instance_id,share_group_id,status,revision FROM agent_group_bindings "
+                f"WHERE agent_instance_id IN ({placeholders}) AND status='active' "
+                "ORDER BY agent_instance_id,share_group_id,binding_id",
+                tuple(agents),
+            ).fetchall()
+            lifecycle = conn.execute(
+                "SELECT value_json,revision FROM control_preferences WHERE pref_key=?",
+                (self._group_lifecycle_key(group_id),),
+            ).fetchone()
+        seed = [
+            (str(row[0]), str(row[1]), str(row[2]), int(row[3]))
+            for row in active if str(row[1]) != str(group_id)
+        ]
+        if lifecycle is not None:
+            try:
+                status = str(json.loads(str(lifecycle[0] or "{}")).get("status") or "")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                status = "invalid"
+            seed.append(("__group__", str(group_id), status, int(lifecycle[1])))
+        return seed
+
     @staticmethod
     def _validate_group(agent_id: str, group_id: str) -> None:
         if not agent_id:
@@ -654,6 +703,19 @@ class GroupControlService:
             "VALUES(?,?,?,?,?,?,?,'active',?,?,?) ON CONFLICT(binding_id) DO UPDATE SET native_memory_mode=excluded.native_memory_mode,redirect_paths_json=excluded.redirect_paths_json,status='active',revision=excluded.revision,updated_at=excluded.updated_at",
             (binding_id, agent_id, group_id, _group_kind(group_id), server, native_memory_mode, _json(clean_paths), revision, created_at, now),
         )
+        # Rebinding a previously dissolved group is an explicit restore.  Its
+        # governed data was preserved in place, so removing the lifecycle
+        # tombstone makes the group visible again without copying records.
+        lifecycle_key = self._group_lifecycle_key(group_id)
+        lifecycle = conn.execute(
+            "SELECT value_json,revision FROM control_preferences WHERE pref_key=?",
+            (lifecycle_key,),
+        ).fetchone()
+        if lifecycle is not None:
+            conn.execute(
+                "UPDATE control_preferences SET value_json=?,revision=revision+1,updated_at=? WHERE pref_key=?",
+                (_json({"group_id": group_id, "status": "active", "data_preserved": True}), now, lifecycle_key),
+            )
         return ({
             "binding_id": binding_id, "agent_instance_id": agent_id, "share_group_id": group_id,
             "group_id": group_id, "group_kind": _group_kind(group_id), "mcp_server_name": server,
@@ -675,7 +737,11 @@ class GroupControlService:
         group = str(share_group_id or "").strip()
         server = str(mcp_server_name or "memoryguard").strip() or "memoryguard"
         mode = str(native_memory_mode or "observed").strip() or "observed"
-        request = {"agent": agent, "group": group, "server": server, "mode": mode, "redirect_paths": list(redirect_paths)}
+        request = {
+            "agent": agent, "group": group, "server": server, "mode": mode,
+            "redirect_paths": list(redirect_paths),
+            "binding_state": self._binding_state_seed((agent,), group),
+        }
         key = str(idempotency_key or _digest("bind_agent", _json(request)))
 
         def apply(conn: Any) -> tuple[Mapping[str, Any], str]:
@@ -704,7 +770,11 @@ class GroupControlService:
             raise GroupControlError("personal_group_cannot_be_shared")
         modes = dict(native_memory_modes or {})
         redirects = dict(redirect_paths or {})
-        request = {"agents": agents, "group": group, "server": mcp_server_name, "modes": modes, "redirects": redirects}
+        request = {
+            "agents": agents, "group": group, "server": mcp_server_name,
+            "modes": modes, "redirects": redirects,
+            "binding_state": self._binding_state_seed(agents, group),
+        }
         key = str(idempotency_key or _digest("bind_agents", _json(request)))
 
         def apply(conn: Any) -> tuple[Mapping[str, Any], str]:
@@ -765,17 +835,102 @@ class GroupControlService:
         group = str(group_id or "").strip()
         if not group:
             raise GroupControlError("share_group_id_required")
-        request = {"group": group}
-        key = idempotency_key or _digest("dissolve", group)
+        preview = self.group_preview(group)
+        lifecycle_key = self._group_lifecycle_key(group)
+        revision_seed: list[tuple[str, int, str]] = []
+        lifecycle_revision = 0
+        if self.store.db_path.is_file() and self.store._preflight() == "current":
+            with self.store.connection() as conn:
+                revision_seed = [
+                    (str(row[0]), int(row[1]), str(row[2]))
+                    for row in conn.execute(
+                        "SELECT binding_id,revision,status FROM agent_group_bindings WHERE share_group_id=? ORDER BY binding_id",
+                        (group,),
+                    ).fetchall()
+                ]
+                lifecycle = conn.execute(
+                    "SELECT revision FROM control_preferences WHERE pref_key=?",
+                    (lifecycle_key,),
+                ).fetchone()
+                lifecycle_revision = int(lifecycle[0]) if lifecycle is not None else 0
+        request = {"group": group, "binding_revisions": revision_seed, "lifecycle_revision": lifecycle_revision}
+        key = idempotency_key or _digest("dissolve", _json(request))
+        hook_cleanup: Any = None
 
         def apply(conn: Any) -> tuple[Mapping[str, Any], str]:
-            rows = conn.execute("SELECT binding_id,agent_instance_id FROM agent_group_bindings WHERE share_group_id=? AND status='active' ORDER BY binding_id", (group,)).fetchall()
-            for row in rows:
-                conn.execute("UPDATE agent_group_bindings SET status='inactive',revision=revision+1,updated_at=? WHERE binding_id=?", (_now(), str(row[0])))
-            conn.execute("DELETE FROM governance_scopes WHERE share_group_id=?", (group,))
-            return ({"ok": True, "status": "succeeded", "share_group_id": group, "unbound_count": len(rows), "members": [str(row[1]) for row in rows], "changed": bool(rows)}, group)
+            nonlocal hook_cleanup
+            active_rows = conn.execute(
+                "SELECT binding_id,agent_instance_id,mcp_server_name FROM agent_group_bindings "
+                "WHERE share_group_id=? AND status='active' ORDER BY binding_id",
+                (group,),
+            ).fetchall()
+            hook_rows = conn.execute(
+                "SELECT agent_instance_id FROM agent_group_bindings "
+                "WHERE share_group_id=? ORDER BY binding_id",
+                (group,),
+            ).fetchall()
+            prior = conn.execute(
+                "SELECT value_json,revision FROM control_preferences WHERE pref_key=?",
+                (lifecycle_key,),
+            ).fetchone()
+            already_dissolved = False
+            if prior is not None:
+                try:
+                    already_dissolved = str(json.loads(str(prior[0] or "{}")).get("status") or "") == "dissolved"
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    already_dissolved = False
+            known = bool(active_rows) or bool(revision_seed) or int(preview.get("memory_count") or 0) > 0
+            # Host configs are user-level and can hold several MemoryGuard
+            # bindings for one provider.  Delete only generated commands that
+            # carry this former member's exact (provider, agent, shared-group)
+            # identity; never blanket-uninstall a provider.
+            from ..host_hook_executor import HostHookExecutor
 
-        return self.store.mutate("dissolve_shared_group", key, request, apply)
+            hook_cleanup = HostHookExecutor(self.workspace).remove_generated_bindings(
+                {
+                    "agent_instance_id": str(row[0]),
+                    "share_group_id": group,
+                }
+                for row in hook_rows
+            )
+            personal_bindings: list[dict[str, Any]] = []
+            for row in active_rows:
+                binding, _ = self._bind_tx(
+                    conn,
+                    agent_id=str(row[1]),
+                    group_id=personal_group_id(str(row[1])),
+                    server=str(row[2] or "memoryguard"),
+                    native_memory_mode="observed",
+                    redirect_paths=(),
+                )
+                personal_bindings.append(binding)
+            conn.execute("DELETE FROM governance_scopes WHERE share_group_id=?", (group,))
+            if known:
+                revision = int(prior[1]) + (0 if already_dissolved else 1) if prior is not None else 1
+                conn.execute(
+                    "INSERT INTO control_preferences(pref_key,value_json,revision,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(pref_key) DO UPDATE SET value_json=excluded.value_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                    (lifecycle_key, _json({"group_id": group, "status": "dissolved", "data_preserved": True}), revision, _now()),
+                )
+            changed = bool(active_rows) or (known and not already_dissolved)
+            return ({
+                "ok": True, "status": "succeeded", "share_group_id": group,
+                "unbound_count": len(active_rows), "members": [str(row[1]) for row in active_rows],
+                "changed": changed, "removed_from_active_groups": bool(known),
+                "data_preserved": True,
+                "personal_bindings": personal_bindings,
+                "personal_binding_count": len(personal_bindings),
+                "hook_cleanup": hook_cleanup.public_result(),
+            }, group)
+
+        try:
+            return self.store.mutate("dissolve_shared_group", key, request, apply)
+        except Exception:
+            # Hook files are outside system.db.  A failed DB mutation must not
+            # strand a valid shared binding without its generated Hook.
+            if hook_cleanup is not None:
+                hook_cleanup.restore()
+            raise
 
     def group_preview(self, group_id: str) -> dict[str, Any]:
         group = str(group_id or "").strip()
@@ -797,7 +952,7 @@ class GroupControlService:
         missing = [path for path in target["redirect_paths"] if path and not Path(path).expanduser().exists()]
         return {"ok": True, "status": "succeeded", "binding_id": target["binding_id"], "agent_instance_id": target["agent_instance_id"], "share_group_id": target["share_group_id"], "binding_status": "drifted" if missing else target["status"], "missing_redirect_paths": missing, "drifted": bool(missing)}
 
-    def scope_state(self, principal_agent_id: str) -> dict[str, Any]:
+    def scope_state(self, principal_agent_id: str, *, admin: bool = False) -> dict[str, Any]:
         principal = str(principal_agent_id or "").strip()
         if not self.store.db_path.is_file() or self.store._preflight() != "current":
             return {"ok": True, "status": "succeeded", "empty": True, "scope": None}
@@ -805,7 +960,70 @@ class GroupControlService:
             row = conn.execute("SELECT mode,agent_instance_id,share_group_id,revision,updated_at FROM governance_scopes WHERE principal_agent_id=?", (principal,)).fetchone()
         if row is None:
             return {"ok": True, "status": "succeeded", "empty": True, "scope": None}
-        return {"ok": True, "status": "succeeded", "empty": False, "scope": {"mode": str(row[0]), "agent_instance_id": str(row[1]), "share_group_id": str(row[2]), "revision": int(row[3]), "updated_at": str(row[4])}}
+        mode = str(row[0] or "")
+        target_agent = str(row[1] or principal)
+        group = str(row[2] or "")
+        # The desktop GUI stores its selection under the server-admin
+        # principal.  An admin read may therefore validate the selected target
+        # against its own active binding, while ordinary callers remain
+        # restricted to their own membership in the persisted scope.
+        binding_agent = target_agent if mode == "agent" and admin else principal
+        with self.store.connection() as conn:
+            if mode == "share_group":
+                binding_rows = conn.execute(
+                    "SELECT binding_id,agent_instance_id,share_group_id,group_kind,mcp_server_name,"
+                    "native_memory_mode,redirect_paths_json,status,revision,created_at,updated_at "
+                    "FROM agent_group_bindings WHERE "
+                    + ("share_group_id=? AND status='active' " if admin else "agent_instance_id=? AND share_group_id=? AND status='active' ")
+                    + "ORDER BY agent_instance_id,share_group_id,binding_id",
+                    (group,) if admin else (principal, group),
+                ).fetchall()
+            else:
+                binding_rows = conn.execute(
+                    "SELECT binding_id,agent_instance_id,share_group_id,group_kind,mcp_server_name,"
+                    "native_memory_mode,redirect_paths_json,status,revision,created_at,updated_at "
+                    "FROM agent_group_bindings WHERE agent_instance_id=? AND share_group_id=? "
+                    "AND status='active' ORDER BY binding_id",
+                    (binding_agent, group),
+                ).fetchone()
+                binding_rows = [] if binding_rows is None else [binding_rows]
+            if not binding_rows:
+                # A persisted GUI selection is not authority.  Once its
+                # principal leaves the group, expose an empty scope so the
+                # frontend clears the stale activeShareGroupId.
+                return {"ok": True, "status": "succeeded", "empty": True, "scope": None}
+            if mode == "agent" and len(binding_rows) != 1:
+                # Multiple active bindings make an agent scope ambiguous.  Do
+                # not choose one arbitrarily or expose a partial scope.
+                return {"ok": True, "status": "succeeded", "empty": True, "scope": None}
+            active_binding = self._binding(binding_rows[0])
+            members = [
+                str(item[0]) for item in conn.execute(
+                    "SELECT DISTINCT agent_instance_id FROM agent_group_bindings "
+                    "WHERE share_group_id=? AND status='active' ORDER BY agent_instance_id",
+                    (group,),
+                ).fetchall()
+            ]
+            if not members:
+                return {"ok": True, "status": "succeeded", "empty": True, "scope": None}
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "empty": False,
+            "active_binding": active_binding,
+            # Keep the long-lived ``scope`` object backward compatible.  The
+            # GUI may use these authoritative members for presentation, but
+            # older V2 clients compare ``scope`` as an exact persisted record.
+            "members": members,
+            "member_count": len(members),
+            "scope": {
+                "mode": mode,
+                "agent_instance_id": str(row[1] or ""),
+                "share_group_id": group,
+                "revision": int(row[3]),
+                "updated_at": str(row[4]),
+            },
+        }
 
     def set_scope(self, principal_agent_id: str, requested: Mapping[str, Any], *, admin: bool = False, idempotency_key: str = "") -> dict[str, Any]:
         principal = str(principal_agent_id or "").strip()

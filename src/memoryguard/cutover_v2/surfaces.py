@@ -32,6 +32,7 @@ MCP_TOOL_NAMES = frozenset({
     "memoryguard_history_export", "memoryguard_history_delete",
     "memoryguard_knowledge_list", "memoryguard_knowledge_search", "memoryguard_knowledge_read",
     "memoryguard_knowledge_book", "memoryguard_knowledge_candidates",
+    "memoryguard_codegraph_graph",
     "memoryguard_codegraph_query", "memoryguard_codegraph_path", "memoryguard_codegraph_explain",
     "memoryguard_codegraph_affected", "memoryguard_codegraph_update", "memoryguard_codegraph_status",
 })
@@ -164,7 +165,7 @@ _add("import_external_mcp_entries", "external_mcp_import", "external_mcp", "muta
 
 # Memory reads and governed writes.
 _same(("list_memory",), "memory", "read", "memory_list")
-_same(("get_memory",), "memory", "read", "memory_read")
+_add("get_memory", "memory_get", "memory", "read", "memory_read", parameters=("memory_id", "share_group_id"))
 _same(("search_memory",), "memory", "read", "memory_search")
 _same(("get_memory_status",), "memory", "read", "memory_status")
 _add("get_global_memory_status", "memory_global_status", "memory", "read", "memory_global_status")
@@ -232,7 +233,10 @@ _add("knowledge_update_settings", "knowledge_update_settings", "knowledge", "mut
 _add("knowledge_candidate_review", "knowledge_candidate_review", "knowledge", "mutation", "gui_knowledge_command", parameters=("candidate_id", "decision", "target_group_id"))
 
 # Projection / task lifecycle.
-_same(("get_neuron_graph",), "codegraph", "read", "codegraph_graph")
+_same(("get_neuron_graph", "get_memory_neuron_graph"), "projection", "read", "projection_graph")
+_add("get_codegraph_graph", "codegraph_graph", "codegraph", "read", "codegraph_graph", parameters=("request",))
+_add("list_codegraph_projects", "codegraph_projects", "codegraph", "read", "codegraph_projects")
+_add("build_codegraph", "codegraph_build", "codegraph", "mutation", "codegraph_build", execution="task", parameters=("source_id", "confirmed"), cancel_operation="task_cancel")
 _add("get_projection_source_map", "projection_source_map", "projection", "read", "gui_projection_query", parameters=("scope", "agent_instance_id", "share_group_id", "mode"))
 _add("get_build_progress", "task_status", "runtime", "read", "gui_task_status", parameters=("run_id",))
 _add("build_projection", "projection_build", "projection", "mutation", "gui_projection_command", execution="task", parameters=("confirmed", "mode", "scope", "agent_instance_id", "share_group_id", "progress", "llm_agent", "llm_cli", "enrich_mode"), cancel_operation="task_cancel")

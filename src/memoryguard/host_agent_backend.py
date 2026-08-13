@@ -57,30 +57,58 @@ def _hidden_subprocess_kwargs() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _probe_cli_launch(cli_path: str, *args: str) -> bool:
+    """Return whether a discovered CLI can actually be spawned by this process."""
+
+    try:
+        result = subprocess.run(
+            [cli_path, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            **_hidden_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
 def _find_codex_cli() -> str | None:
-    """查找 Codex CLI 路径。"""
-    # 1. PATH 中查找
-    p = shutil.which("codex")
-    if p:
-        return p
-    # 2. 常见安装位置
-    candidates = [
-        Path.home() / ".codex" / ".sandbox-bin" / "codex.exe",
-        Path.home() / ".codex" / "plugins" / ".plugin-appserver" / "codex.exe",
-    ]
-    # 3. 从 config.toml 读取 CODEX_CLI_PATH
+    """查找当前进程真正可启动的 Codex CLI 路径。
+
+    Windows Store / AppX 版 Codex 会把包内 ``WindowsApps`` 资源目录放进
+    PATH。文件虽然存在，普通 Python ``CreateProcess`` 却可能得到 WinError 5。
+    因此先尝试 Codex 自己暴露的用户级 launcher，再把 PATH 结果作为最后候选，
+    并用 ``--version`` 做无网络、无副作用的启动能力探测。
+    """
+    candidates: list[Path] = []
     try:
         config_toml = Path.home() / ".codex" / "config.toml"
         if config_toml.exists():
             for line in config_toml.read_text(encoding="utf-8").splitlines():
                 if "CODEX_CLI_PATH" in line and "=" in line:
                     val = line.split("=", 1)[1].strip().strip("'\"")
-                    candidates.insert(0, Path(val))
+                    candidates.append(Path(val))
     except Exception:
         pass
-    for c in candidates:
-        if c.exists():
-            return str(c)
+
+    candidates.extend([
+        Path.home() / ".codex" / ".sandbox-bin" / "codex.exe",
+        Path.home() / ".codex" / "plugins" / ".plugin-appserver" / "codex.exe",
+    ])
+    path_match = shutil.which("codex")
+    if path_match:
+        candidates.append(Path(path_match))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(os.fspath(candidate)))
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file() and _probe_cli_launch(str(candidate), "--version"):
+            return str(candidate)
     return None
 
 
@@ -662,9 +690,8 @@ def batch_enrich_via_cli(
         "只返回 JSON 数组,不要其他内容。"
     )
 
-    for start in range(0, len(tasks), batch_size):
-        batch_tasks = tasks[start:start + batch_size]
-        # P0-3: index 用批内局部下标,回写时直接用 batch_tasks[idx]
+    def invoke_batch(batch_tasks: list[dict]) -> dict[int, dict]:
+        """Invoke one LLM batch and return validated results keyed by local index."""
         items = []
         for i, task in enumerate(batch_tasks):
             inp = task.get("input", {})
@@ -675,28 +702,58 @@ def batch_enrich_via_cli(
                 "body": inp.get("body", "")[:800],
                 "kind_hint": inp.get("kind_hint", ""),
             })
-
         batch_user = json.dumps(items, ensure_ascii=False, indent=2)
-        # P1-6: expect_array=True；GUI 后台任务走可取消子进程
         if execution is not None:
             data = _call_llm_json_cancellable(
                 agent, cli_path, system, batch_user, timeout=120,
                 expect_array=True, execution=execution,
             )
         else:
-            data = _call_llm_json(agent, cli_path, system, batch_user, timeout=120, expect_array=True)
+            data = _call_llm_json(
+                agent, cli_path, system, batch_user, timeout=120, expect_array=True,
+            )
         if not data or not isinstance(data, list):
+            return {}
+        normalized: dict[int, dict] = {}
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(batch_tasks) and idx not in normalized:
+                normalized[idx] = item
+        return normalized
+
+    for start in range(0, len(tasks), batch_size):
+        batch_tasks = tasks[start:start + batch_size]
+        resolved = invoke_batch(batch_tasks)
+        missing = [idx for idx in range(len(batch_tasks)) if idx not in resolved]
+        if missing:
+            # Model CLIs occasionally omit one element from an otherwise valid
+            # JSON array.  Retry only the missing subset once.  We still return
+            # partial results if the retry also omits an item; the native build
+            # layer keeps the strict all-task completeness gate and will fail
+            # closed instead of applying a partial enrichment batch.
+            retry_tasks = [batch_tasks[idx] for idx in missing]
+            retried = invoke_batch(retry_tasks)
+            for retry_idx, item in retried.items():
+                if 0 <= retry_idx < len(missing):
+                    resolved[missing[retry_idx]] = item
+
+        if len(resolved) != len(batch_tasks):
             import logging
             logging.getLogger("memoryguard").warning(
-                "batch_enrich: batch %d-%d JSON parse failed", start, start + len(batch_tasks)
+                "batch_enrich: batch %d-%d incomplete after retry (%d/%d)",
+                start,
+                start + len(batch_tasks),
+                len(resolved),
+                len(batch_tasks),
             )
-            continue
 
-        for item in data:
-            idx = item.get("index", -1)
-            # P0-3: idx 是批内局部下标,直接索引 batch_tasks
-            if idx < 0 or idx >= len(batch_tasks):
-                continue
+        for idx in sorted(resolved):
+            item = resolved[idx]
             task = batch_tasks[idx]
             all_results.append({
                 "task_id": task["task_id"],

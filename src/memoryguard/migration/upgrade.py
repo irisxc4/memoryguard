@@ -21,9 +21,13 @@ from typing import Any, Mapping
 from ..cutover_v2.evidence_assembler import ReadinessEvidenceAssembler
 from ..cutover_v2.facade import get_v2_runtime_facade
 from ..data_home import resolve_data_home
+from ..evidence.store import EvidenceStore
+from ..governance_v2 import GovernanceV2
 from ..migration.v2_validator import V2MigrationValidator
+from ..memory.store import MemoryAtomStore
 from ..runtime_v2.group_native import GroupControlService, SystemControlStore
 from ..runtime_v2.phase4_acceptance import phase4_acceptance_evidence
+from ..storage.database import open_database
 from ..storage.transaction import transaction
 from ..system.manifest import ManifestManager, ManifestState
 from .gui_control import (
@@ -187,6 +191,112 @@ def _control_binding_health(workspace: Path) -> dict[str, Any]:
         "missing_binding_ids": missing,
         "status": "PASS" if not missing else "BLOCKED",
     }
+
+
+def _memory_activation_health(workspace: Path) -> dict[str, Any]:
+    """Report whether the migrated Memory domain is actually runtime-visible."""
+
+    store = MemoryAtomStore(workspace, readonly=True)
+    with store._connection() as conn:
+        state = conn.execute(
+            "SELECT state,generation FROM domain_state WHERE domain='memory'"
+        ).fetchone()
+        counts = conn.execute(
+            "SELECT visibility,COUNT(*) FROM atoms GROUP BY visibility ORDER BY visibility"
+        ).fetchall()
+    visibility = {str(row[0]): int(row[1]) for row in counts}
+    domain_state = str(state[0] if state is not None else "").upper()
+    total = sum(visibility.values())
+    healthy = total == 0 or (
+        domain_state == "ACTIVE"
+        and not visibility.get("building", 0)
+        and not visibility.get("ready", 0)
+    )
+    return {
+        "status": "PASS" if healthy else "BLOCKED",
+        "domain_state": domain_state or "MISSING",
+        "generation": int(state[1] if state is not None else 0),
+        "visibility_counts": visibility,
+    }
+
+
+def _activate_memory_domain(workspace: Path) -> dict[str, Any]:
+    """Expose the verified migration batch and prove the resulting domain state."""
+
+    before = _memory_activation_health(workspace)
+    changed = MemoryAtomStore(workspace).set_visibility("active")
+    after = _memory_activation_health(workspace)
+    if after["status"] != "PASS":
+        raise RuntimeError("memory_domain_activation_incomplete")
+    return {"before": before, "after": after, "changed": int(changed)}
+
+
+_GOVERNANCE_LEDGER_TABLES = frozenset({"decisions", "request_ledger", "decision_outbox"})
+_GOVERNANCE_DECISION_COLUMNS = frozenset({
+    "decision_id", "operation", "target_json", "reason", "confidence", "undo_hash",
+    "context_json", "before_json", "after_json", "status", "created_at",
+    "idempotency_key", "request_fingerprint",
+})
+
+
+def _governance_activation_health(workspace: Path) -> dict[str, Any]:
+    """Verify the GovernanceV2 ledger required by every native write path."""
+
+    ledger = workspace / ".memoryguard" / "governance_v2" / "decisions.db"
+    if not ledger.is_file() or ledger.stat().st_size == 0:
+        return {
+            "status": "BLOCKED",
+            "code": "v2_governance_ledger_missing",
+            "ledger_present": False,
+            "missing_tables": sorted(_GOVERNANCE_LEDGER_TABLES),
+            "missing_decision_columns": sorted(_GOVERNANCE_DECISION_COLUMNS),
+        }
+    try:
+        # ``sqlite3.Connection.__exit__`` commits/rolls back but does not close
+        # the file handle.  Use the project context manager so Windows upgrade
+        # flows never leave decisions.db locked after a health probe.
+        with open_database(ledger, readonly=True) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(decisions)")
+            }
+    except Exception:
+        return {
+            "status": "BLOCKED",
+            "code": "v2_governance_ledger_invalid",
+            "ledger_present": True,
+            "missing_tables": [],
+            "missing_decision_columns": [],
+        }
+    missing_tables = sorted(_GOVERNANCE_LEDGER_TABLES - tables)
+    missing_columns = sorted(_GOVERNANCE_DECISION_COLUMNS - columns)
+    healthy = not missing_tables and not missing_columns
+    return {
+        "status": "PASS" if healthy else "BLOCKED",
+        "code": "" if healthy else "v2_governance_ledger_partial",
+        "ledger_present": True,
+        "missing_tables": missing_tables,
+        "missing_decision_columns": missing_columns,
+    }
+
+
+def _activate_governance_domain(workspace: Path) -> dict[str, Any]:
+    """Create/upgrade the durable GovernanceV2 ledger, then prove it is usable."""
+
+    before = _governance_activation_health(workspace)
+    GovernanceV2(
+        workspace,
+        memory_store=MemoryAtomStore(workspace, readonly=False),
+        evidence_store=EvidenceStore(workspace, readonly=False),
+    )
+    after = _governance_activation_health(workspace)
+    if after["status"] != "PASS":
+        raise RuntimeError(str(after.get("code") or "governance_ledger_activation_incomplete"))
+    return {"before": before, "after": after, "changed": before["status"] != "PASS"}
 
 
 def _cleanup_active_migration(
@@ -437,6 +547,8 @@ def run_upgrade(
         try:
             control_preview = inspect_legacy_gui_control(root)
             control_health = _control_binding_health(root)
+            memory_health = _memory_activation_health(root)
+            governance_health = _governance_activation_health(root)
         except Exception as exc:
             code = _error_code(exc, "active_control_preflight_failed")
             stages["preflight"] = _stage("BLOCKED", code=code, detail={"error": str(exc)})
@@ -447,6 +559,8 @@ def run_upgrade(
                 detail={"error": str(exc)},
             )
         missing = list(control_health["missing_binding_ids"])
+        memory_repair_required = memory_health.get("status") != "PASS"
+        governance_repair_required = governance_health.get("status") != "PASS"
         if missing and not apply:
             stages["preflight"] = _stage(
                 "BLOCKED", code="active_control_repair_required", detail=control_health
@@ -458,6 +572,60 @@ def run_upgrade(
                 next_step="rerun with --apply to restore migrated Agent bindings",
                 detail=control_health,
             )
+        if governance_repair_required and not apply:
+            code = "active_runtime_repair_required" if memory_repair_required else "active_governance_repair_required"
+            detail = {"governance": governance_health, "memory": memory_health}
+            stages["preflight"] = _stage("BLOCKED", code=code, detail=detail)
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=False,
+                current=current, stages=stages, status="BLOCKED", ok=False,
+                stage="preflight", code=code,
+                next_step="rerun memoryguard upgrade with --apply to repair the active V2 runtime",
+                detail=detail,
+            )
+        if memory_repair_required and not apply:
+            stages["preflight"] = _stage(
+                "BLOCKED", code="active_memory_repair_required", detail=memory_health
+            )
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=False,
+                current=current, stages=stages, status="BLOCKED", ok=False,
+                stage="preflight", code="active_memory_repair_required",
+                next_step="rerun memoryguard upgrade to activate migrated memory",
+                detail=memory_health,
+            )
+        governance_repair: dict[str, Any] | None = None
+        if governance_repair_required:
+            try:
+                governance_repair = _activate_governance_domain(root)
+                governance_health = dict(governance_repair["after"])
+            except Exception as exc:
+                code = _error_code(exc, "active_governance_repair_failed")
+                stages["verify"] = _stage(
+                    "BLOCKED", writes_performed=True, code=code, detail={"error": str(exc)}
+                )
+                return _envelope(
+                    workspace=root, data_home=resolved_data_home, apply=True,
+                    current=current, stages=stages, status="BLOCKED", ok=False,
+                    stage="verify", code=code, next_step=_next_step("error"),
+                    writes_performed=True, detail={"error": str(exc)},
+                )
+        memory_repair: dict[str, Any] | None = None
+        if memory_repair_required:
+            try:
+                memory_repair = _activate_memory_domain(root)
+                memory_health = dict(memory_repair["after"])
+            except Exception as exc:
+                code = _error_code(exc, "active_memory_repair_failed")
+                stages["verify"] = _stage(
+                    "BLOCKED", writes_performed=True, code=code, detail={"error": str(exc)}
+                )
+                return _envelope(
+                    workspace=root, data_home=resolved_data_home, apply=True,
+                    current=current, stages=stages, status="BLOCKED", ok=False,
+                    stage="verify", code=code, next_step=_next_step("error"),
+                    writes_performed=True, detail={"error": str(exc)},
+                )
         if missing:
             stages["preflight"] = _stage("PASS", ok=True, detail=control_health)
             try:
@@ -480,7 +648,10 @@ def run_upgrade(
             stages["gui_control"] = _stage(
                 "PASS", ok=True, writes_performed=True, detail=repaired
             )
-            stages["verify"] = _stage("PASS", ok=True, detail=after)
+            stages["verify"] = _stage(
+                "PASS", ok=True, writes_performed=bool(memory_repair or governance_repair),
+                detail={"control": after, "memory": memory_health, "governance": governance_health},
+            )
             cleanup = _cleanup_active_migration(root, current, apply=True)
             stages["activate"] = _stage(
                 "IDEMPOTENT", ok=True, code="already_active",
@@ -489,14 +660,41 @@ def run_upgrade(
             return _envelope(
                 workspace=root, data_home=resolved_data_home, apply=True,
                 current=current, stages=stages, status=ManifestState.V2_ACTIVE.value,
-                ok=True, stage="complete", code="active_control_repaired",
+                ok=True, stage="complete", code=("active_runtime_repaired" if (memory_repair or governance_repair) else "active_control_repaired"),
                 next_step=_next_step("active"), writes_performed=True,
-                detail={"control": after, "cleanup": cleanup},
+                detail={"control": after, "memory": memory_health, "governance": governance_health, "cleanup": cleanup},
+            )
+        if memory_repair or governance_repair:
+            cleanup = _cleanup_active_migration(root, current, apply=True)
+            if memory_repair and governance_repair:
+                repair_code = "active_runtime_repaired"
+            elif governance_repair:
+                repair_code = "active_governance_repaired"
+            else:
+                repair_code = "active_memory_repaired"
+            runtime_health = {"memory": memory_health, "governance": governance_health}
+            stages["preflight"] = _stage(
+                "PASS", ok=True, writes_performed=True,
+                code=repair_code, detail=runtime_health,
+            )
+            stages["verify"] = _stage(
+                "PASS", ok=True, writes_performed=True, detail=runtime_health,
+            )
+            stages["activate"] = _stage(
+                "IDEMPOTENT", ok=True, writes_performed=True,
+                code="already_active", detail={**_manifest_summary(manager, current), "cleanup": cleanup},
+            )
+            return _envelope(
+                workspace=root, data_home=resolved_data_home, apply=True,
+                current=current, stages=stages, status=ManifestState.V2_ACTIVE.value,
+                ok=True, stage="complete", code=repair_code,
+                next_step=_next_step("active"), writes_performed=True,
+                detail={"control": control_health, **runtime_health, "cleanup": cleanup},
             )
         cleanup = _cleanup_active_migration(root, current, apply=apply)
         stages["preflight"] = _stage(
             "PASS", ok=True, code="already_active",
-            detail={**_manifest_summary(manager, current), "control": control_health},
+            detail={**_manifest_summary(manager, current), "control": control_health, "memory": memory_health, "governance": governance_health},
         )
         stages["activate"] = _stage(
             "IDEMPOTENT", ok=True, code="already_active",
@@ -514,7 +712,7 @@ def run_upgrade(
             code="already_active",
             next_step=_next_step("active"),
             activation_required=False,
-            detail={"control": control_health, "cleanup": cleanup},
+            detail={"control": control_health, "memory": memory_health, "governance": governance_health, "cleanup": cleanup},
         )
 
     if confirm is not None and not apply:
@@ -776,6 +974,18 @@ def run_upgrade(
         )
 
     try:
+        governance_activation = _activate_governance_domain(root)
+    except Exception as exc:
+        code = _error_code(exc, "governance_ledger_activation_failed")
+        stages["activate"] = _stage("BLOCKED", writes_performed=True, code=code, detail={"error": str(exc)})
+        return _envelope(
+            workspace=root, data_home=resolved_data_home, apply=True,
+            current=ready, stages=stages, status="BLOCKED", ok=False,
+            stage="activate", code=code, next_step="repair the GovernanceV2 ledger before activation",
+            writes_performed=True, activation_required=True, detail={"error": str(exc)},
+        )
+
+    try:
         active = manager.activate_v2(expected_generation=ready.generation)
     except Exception as exc:
         code = _error_code(exc, "activation_failed")
@@ -797,10 +1007,24 @@ def run_upgrade(
             detail={"error": str(exc)},
         )
 
+    try:
+        memory_activation = _activate_memory_domain(root)
+    except Exception as exc:
+        code = _error_code(exc, "memory_domain_activation_failed")
+        stages["activate"] = _stage(
+            "BLOCKED", writes_performed=True, code=code, detail={"error": str(exc)}
+        )
+        return _envelope(
+            workspace=root, data_home=resolved_data_home, apply=True,
+            current=active, stages=stages, status="BLOCKED", ok=False,
+            stage="activate", code=code, next_step="rerun memoryguard upgrade to repair the active memory domain",
+            writes_performed=True, detail={"error": str(exc)},
+        )
+
     cleanup = _cleanup_active_migration(root, active, apply=True)
     stages["activate"] = _stage(
         "PASS", ok=True, writes_performed=True, code="activated",
-        detail={**_manifest_summary(manager, active), "cleanup": cleanup},
+        detail={**_manifest_summary(manager, active), "memory": memory_activation, "cleanup": cleanup},
     )
     return _envelope(
         workspace=root,
@@ -815,7 +1039,7 @@ def run_upgrade(
         next_step=_next_step("active"),
         writes_performed=True,
         activation_required=False,
-        detail={"cleanup": cleanup},
+        detail={"memory": memory_activation, "cleanup": cleanup},
     )
 
 

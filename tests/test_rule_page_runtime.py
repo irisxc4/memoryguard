@@ -89,7 +89,18 @@ vm.runInContext(source, sandbox, { filename: 'memoryguard-interactive.js' });
 const calls = [];
 sandbox.callApi = async (method, ...args) => {
   calls.push({ method, args });
-  if (method === 'list_rules_habits') return { buckets: {}, total: 0 };
+  if (method === 'list_rules_habits') return {
+    rules: [{
+      definition_id: 'rule-canonical', canonical_text: 'canonical rule body',
+      rule_kind: 'procedure', rule_strength: 'normal', polarity: 'positive',
+      maturity_state: 'active', effective: true, excluded: false,
+      bindings: [{
+        binding_id: 'binding-1', target_type: 'agent', target_id: 'current-agent',
+        effect: 'include', priority: 10,
+      }],
+    }],
+    effective: [], excluded: [], total: 1,
+  };
   if (method === 'get_rule_scope_options') return {
     agents: [
       { id: 'current-agent', label: 'Current Agent' },
@@ -118,6 +129,8 @@ sandbox.callApi = async (method, ...args) => {
 
 (async () => {
   await sandbox.renderRulesHabits();
+  const canonicalVisible = element('content').innerHTML.includes('canonical rule body');
+  if (!canonicalVisible) throw new Error('canonical V2 rule was not rendered');
   await sandbox.setRulePreviewAgent('preview-agent');
   await sandbox.setRulePreviewProject('preview-project');
   element('rule-create-text').value = 'trusted rule';
@@ -127,7 +140,7 @@ sandbox.callApi = async (method, ...args) => {
   if (JSON.stringify(creates[0].args) !== JSON.stringify(['trusted rule'])) {
     throw new Error(`preview context leaked into create args: ${JSON.stringify(creates[0].args)}`);
   }
-  process.stdout.write(JSON.stringify({ ok: true, createArgs: creates[0].args }));
+  process.stdout.write(JSON.stringify({ ok: true, canonicalVisible, createArgs: creates[0].args }));
 })().catch(error => {
   console.error(error.stack || error);
   process.exitCode = 1;
@@ -243,6 +256,7 @@ sandbox.renderRulesHabits = async () => { refreshes += 1; };
 def test_rule_page_javascript_executes_without_reference_error():
     payload = _run_rule_page_smoke()
     assert payload["ok"] is True
+    assert payload["canonicalVisible"] is True
 
 
 @pytest.mark.skipif(not __import__("shutil").which("node"), reason="Node.js unavailable")

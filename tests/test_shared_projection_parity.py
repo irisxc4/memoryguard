@@ -140,9 +140,12 @@ def test_shared_graph_missing_group(tmp_path: Path) -> None:
     current = service.current(mode="reconstructed", scope=_scope(tmp_path, group_id))
     assert current["status"] == "succeeded"
     assert current["projection"] is None
-    result = service.build(mode="reconstructed", scope=_scope(tmp_path, group_id))
-    assert result["status"] == "NO_SOURCE"
-    assert result["atom_count"] == 0
+    try:
+        service.build(mode="reconstructed", scope=_scope(tmp_path, group_id))
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "no_projection_sources"
+    else:
+        raise AssertionError("empty shared scope must fail closed")
 
 
 def test_shared_graph_reuses_builder_beauty(tmp_path: Path) -> None:
@@ -217,9 +220,12 @@ def test_shared_empty_group_has_no_v2_projection(tmp_path: Path) -> None:
     _bind_group(tmp_path, gid)
     service = ProjectionBuildService(tmp_path)
     scope = _scope(tmp_path, gid)
-    result = service.build(mode="reconstructed", scope=scope, runtime_role="gui")
-    assert result["status"] == "NO_SOURCE"
-    assert result["atom_count"] == 0
+    try:
+        service.build(mode="reconstructed", scope=scope, runtime_role="gui")
+    except Exception as exc:
+        assert getattr(exc, "code", "") == "no_projection_sources"
+    else:
+        raise AssertionError("projection sources unexpectedly available")
     assert service.current(mode="reconstructed", scope=scope)["projection"] is None
 
 

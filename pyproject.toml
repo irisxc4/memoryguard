@@ -20,6 +20,31 @@ dependencies = [
     # Python 3.10 lacks the stdlib tomllib (added in 3.11); use the tomli
     # backport so the declared requires-python >=3.10 contract holds.
     "tomli>=2.0.1; python_version < '3.11'",
+    "tree-sitter>=0.23.0,<0.26",
+    "tree-sitter-python>=0.23,<0.26",
+    "tree-sitter-javascript>=0.23,<0.26",
+    "tree-sitter-typescript>=0.23,<0.25",
+    "tree-sitter-go>=0.23,<0.26",
+    "tree-sitter-rust>=0.23,<0.25",
+    "tree-sitter-java>=0.23,<0.25",
+    "tree-sitter-groovy>=0.1,<0.3",
+    "tree-sitter-c>=0.23,<0.25",
+    "tree-sitter-cpp>=0.23,<0.25",
+    "tree-sitter-c-sharp>=0.23,<0.25",
+    "tree-sitter-ruby>=0.23,<0.25",
+    "tree-sitter-kotlin>=1.0,<2.0",
+    "tree-sitter-scala>=0.23,<0.27",
+    "tree-sitter-php>=0.23,<0.25",
+    "tree-sitter-swift>=0.7,<0.9",
+    "tree-sitter-lua>=0.2,<0.6",
+    "tree-sitter-zig>=1.0,<2.0",
+    "tree-sitter-powershell>=0.26,<0.28",
+    "tree-sitter-elixir>=0.3,<0.5",
+    "tree-sitter-objc>=3.0,<4.0",
+    "tree-sitter-julia>=0.23,<0.25",
+    "tree-sitter-verilog>=1.0,<2.0",
+    "tree-sitter-fortran>=0.6,<0.8",
+    "tree-sitter-bash>=0.23,<0.27",
 ]
 
 [project.urls]
@@ -53,6 +78,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 memoryguard = ["static/*.js", "static/*.png", "static/*.ico"]
+"memoryguard.graphify_core" = ["LICENSE.graphify.txt", "NOTICE.md"]
 
 [tool.setuptools.exclude-package-data]
 "*" = ["*.py[cod]", "__pycache__/*"]

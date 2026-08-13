@@ -172,9 +172,14 @@ def _mcp_server_config(
         "global" if str(control_scope).strip().lower() == "global" else "project"
     )
     if memoryguard_workspace:
-        env["MEMORYGUARD_WORKSPACE"] = str(
-            Path(memoryguard_workspace).expanduser().resolve()
-        )
+        resolved_workspace = str(Path(memoryguard_workspace).expanduser().resolve())
+        env["MEMORYGUARD_WORKSPACE"] = resolved_workspace
+        # Global MemoryGuard is one user-level control/data plane, not a
+        # project workspace.  Persist its canonical Data Home explicitly so a
+        # provider launched later (or from another repository) resolves the
+        # same store even when the installer's shell environment is gone.
+        if env["MEMORYGUARD_CONTROL_SCOPE"] == "global":
+            env["MEMORYGUARD_HOME"] = resolved_workspace
     if env:
         config["env"] = env
     return config
@@ -218,6 +223,10 @@ def _mcp_toml_section(
         env_items.append(
             f"MEMORYGUARD_WORKSPACE = {json.dumps(resolved)}"
         )
+        if str(control_scope).strip().lower() == "global":
+            env_items.append(
+                f"MEMORYGUARD_HOME = {json.dumps(resolved)}"
+            )
     if env_items:
         lines.append(f"\nenv = {{ {', '.join(env_items)} }}")
     return "".join(lines)

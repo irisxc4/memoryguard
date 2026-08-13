@@ -67,7 +67,17 @@ def _knowledge_v2_fixture(
 
     workspace = root.resolve()
     _ensure_v2_knowledge_workspace(workspace)
-    GroupControlService(workspace, write=True).bind_agent(agent, group)
+    groups = GroupControlService(workspace, write=True)
+    groups.bind_agent(agent, group)
+    # The desktop server principal is a transport identity, not a governed
+    # Agent.  Model a real GUI range selection explicitly instead of relying
+    # on its legacy direct binding fallback.
+    if agent == "memoryguard-server-admin":
+        groups.set_scope(
+            agent,
+            {"mode": "share_group", "share_group_id": group},
+            admin=True,
+        )
     access = AccessContext(
         trusted_agent_id=agent,
         is_admin=True,
@@ -684,8 +694,8 @@ def test_book_detail_is_layered_and_never_renders_restricted_content(
 
         assert "知识详情" in html
         assert 'href="/knowledge"' in html
-        assert "V2 服务" in html
-        assert "background:#07110e" in html
+        assert "文档与片段" in html
+        assert "knowledge_read" in html
         assert "postgres://user:password" not in html
         assert "上传到远程服务" not in html
     finally:
@@ -698,11 +708,13 @@ def test_bookshelf_matches_main_panel_and_has_back_navigation() -> None:
     html = render_bookshelf_html()
 
     assert 'class="back-link" href="/"' in html
-    assert "返回主面板" in html
-    assert "V2 知识服务已接管" in html
-    assert "/api/knowledge_list" in html
-    assert "background:#07110e" in html
-    assert "color:#6ee7c4" in html
+    assert "返回治理面板" in html
+    assert 'id="bookshelf"' in html
+    assert "knowledge_list" in html
+    assert "knowledge_candidates_list" in html
+    assert "knowledge_deleted_list" in html
+    assert '<pre id="result">' not in html
+    assert "JSON.stringify(value, null, 2)" not in html
     assert "#efe9dd" not in html
 
 

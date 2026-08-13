@@ -2,9 +2,10 @@
 
 This module owns the canonical text database for V2.  It intentionally keeps
 the public surface small: callers write a canonical blob and then attach one
-or more source occurrences carrying the authorization context.  The schema
-bootstrap is additive because Phase 1 already shipped a compatible subset of
-the content tables in :mod:`memoryguard.storage.schema`.
+or more source occurrences carrying the authorization context.  The schema bootstrap is additive for ordinary Phase-1 extensions. Content
+schema V4 has one explicit identity migration: it rebuilds ``source_objects``
+to retire the obsolete global ``(source_kind, external_object_key)`` UNIQUE
+constraint after ``source_id`` became the canonical connector identity.
 
 The implementation does not import any V1 business store.  Every writable
 connection is selected through :class:`WorkspaceV2Layout`, opened with the
@@ -32,7 +33,7 @@ from ..storage.transaction import transaction
 
 
 NORMALIZER_ID = "utf8-nfc-newline-v1"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 UNKNOWN_ACL = "__UNKNOWN__"
 
 # ACL values are an explicit contract.  Providers are intentionally open
@@ -480,6 +481,46 @@ _AUX_REQUIRED_TABLES = frozenset(
     }
 )
 
+_SOURCE_OBJECT_COLUMNS = (
+    "source_object_id", "source_kind", "external_object_key", "title",
+    "metadata_json", "active", "first_seen_at", "last_seen_at", "source_id",
+    "object_type", "parent_object_id", "deleted_scan_id",
+)
+
+_SOURCE_OBJECTS_V4_SQL = """
+CREATE TABLE source_objects_v4 (
+    source_object_id TEXT PRIMARY KEY,
+    source_kind TEXT NOT NULL,
+    external_object_key TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    source_id TEXT NOT NULL DEFAULT '',
+    object_type TEXT NOT NULL DEFAULT 'object',
+    parent_object_id TEXT NOT NULL DEFAULT '',
+    deleted_scan_id TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+def _legacy_source_object_identity_present(conn: sqlite3.Connection) -> bool:
+    """Whether the retired global (source_kind, external key) UNIQUE remains."""
+
+    for row in conn.execute("PRAGMA index_list(source_objects)").fetchall():
+        # PRAGMA index_list: seq, name, unique, origin, partial.
+        if not bool(row[2]):
+            continue
+        name = str(row[1])
+        columns = tuple(
+            str(item[2]) for item in conn.execute(f'PRAGMA index_info("{name}")').fetchall()
+        )
+        if columns == ("source_kind", "external_object_key"):
+            return True
+    return False
+
+
 _AUX_REQUIRED_COLUMNS = {
     "source_objects": frozenset(
         {"source_id", "object_type", "parent_object_id", "deleted_scan_id"}
@@ -542,11 +583,11 @@ class ContentStore:
                     self._ensure_aux_schema()
 
     def _preflight_aux_schema(self) -> str:
-        """Return ``fresh``/``needs_aux``/``current`` after RO validation.
+        """Return the exact supported aux migration state after RO validation.
 
-        Only one aux migration is supported: absent aux schema to
-        ``SCHEMA_VERSION``.  Every other marker or incomplete current schema
-        fails closed; callers must ship an explicit migration before writing.
+        Fresh/marker-2/marker-3 databases have explicit upgrades to the current
+        schema. Future, malformed, or incomplete current schemas fail closed
+        before a writable connection is opened.
         """
 
         if not self.db_path.is_file():
@@ -591,6 +632,13 @@ class ContentStore:
                             "content schema marker 2 is incomplete: " + ",".join(missing_legacy)
                         )
                     return "upgrade_v3"
+                if marker == "3":
+                    missing_tables = sorted(_AUX_REQUIRED_TABLES - tables)
+                    if missing_tables:
+                        raise ContentError(
+                            "content schema marker 3 is incomplete: " + ",".join(missing_tables)
+                        )
+                    return "upgrade_v4"
                 if marker != str(SCHEMA_VERSION):
                     direction = "future" if marker.isdigit() and int(marker) > SCHEMA_VERSION else "unsupported"
                     raise ContentError(
@@ -613,6 +661,10 @@ class ContentStore:
                             f"content schema marker is current but columns are missing in {table}: "
                             + ",".join(missing)
                         )
+                if _legacy_source_object_identity_present(conn):
+                    raise ContentError(
+                        "content schema marker is current but legacy source-object identity remains"
+                    )
             # Validate Phase 1 schema marker/user_version read-only as well.
             initialize_database(
                 self.db_path, "content", layout=self.layout, readonly=True
@@ -625,52 +677,100 @@ class ContentStore:
                 f"cannot preflight content schema: {self.db_path}"
             ) from exc
 
+    @staticmethod
+    def _rebuild_source_objects_v4(conn: sqlite3.Connection) -> None:
+        """Replace the retired global source-object identity without changing IDs.
+
+        Phase 1 made ``(source_kind, external_object_key)`` globally unique.
+        Content Sync later introduced ``source_id`` and derives source/session
+        identity from ``(source_id, external_object_key)``.  Keeping both
+        constraints makes a migrated legacy conversation collide with the same
+        host conversation discovered from its live connector.  Rebuild only the
+        parent table, preserving every source_object_id referenced by child rows.
+        """
+
+        if not _legacy_source_object_identity_present(conn):
+            return
+        conn.execute("DROP TABLE IF EXISTS source_objects_v4")
+        execute_sql_script(conn, _SOURCE_OBJECTS_V4_SQL)
+        columns = ",".join(_SOURCE_OBJECT_COLUMNS)
+        conn.execute(
+            f"INSERT INTO source_objects_v4({columns}) SELECT {columns} FROM source_objects"
+        )
+        before = int(conn.execute("SELECT COUNT(*) FROM source_objects").fetchone()[0])
+        after = int(conn.execute("SELECT COUNT(*) FROM source_objects_v4").fetchone()[0])
+        if before != after:
+            raise ContentError("source_objects v4 migration row-count mismatch")
+        conn.execute("DROP TABLE source_objects")
+        conn.execute("ALTER TABLE source_objects_v4 RENAME TO source_objects")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_source_objects_source_external "
+            "ON source_objects(source_id, external_object_key)"
+        )
+
     def _ensure_aux_schema(self) -> None:
         with open_database(self.db_path) as conn:
-            with transaction(conn):
-                # Phase 1's source_objects and occurrences predate the source
-                # connector/sync ledger.  ALTER only when a column is absent;
-                # no existing content or identity is rewritten.
-                for table, column, ddl in (
-                    ("source_objects", "source_id", "ALTER TABLE source_objects ADD COLUMN source_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_objects", "object_type", "ALTER TABLE source_objects ADD COLUMN object_type TEXT NOT NULL DEFAULT 'object'"),
-                    ("source_objects", "parent_object_id", "ALTER TABLE source_objects ADD COLUMN parent_object_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_objects", "deleted_scan_id", "ALTER TABLE source_objects ADD COLUMN deleted_scan_id TEXT NOT NULL DEFAULT ''"),
-                    ("content_occurrences", "deleted_scan_id", "ALTER TABLE content_occurrences ADD COLUMN deleted_scan_id TEXT NOT NULL DEFAULT ''"),
-                    ("content_occurrences", "policy_class", "ALTER TABLE content_occurrences ADD COLUMN policy_class TEXT NOT NULL DEFAULT 'private'"),
-                    ("content_occurrences", "provider", "ALTER TABLE content_occurrences ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
-                    ("conversation_turns", "session_id", "ALTER TABLE conversation_turns ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"),
-                    ("conversation_turns", "event_key", "ALTER TABLE conversation_turns ADD COLUMN event_key TEXT NOT NULL DEFAULT ''"),
-                    ("conversation_turns", "content_type", "ALTER TABLE conversation_turns ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"),
-                    ("conversation_turns", "source_revision", "ALTER TABLE conversation_turns ADD COLUMN source_revision TEXT NOT NULL DEFAULT ''"),
-                ):
-                    cols = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
-                    if column not in cols:
-                        conn.execute(ddl)
-                execute_sql_script(conn, CONTENT_AUX_SCHEMA)
-                for table, column, ddl in (
-                    ("content_evidence_links", "blob_id", "ALTER TABLE content_evidence_links ADD COLUMN blob_id TEXT NOT NULL DEFAULT ''"),
-                    ("content_evidence_links", "source_revision", "ALTER TABLE content_evidence_links ADD COLUMN source_revision TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "owner_id", "ALTER TABLE source_sync_state ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "cursor_digest", "ALTER TABLE source_sync_state ADD COLUMN cursor_digest TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "cursor_source_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_source_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "cursor_run_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_run_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "cursor_owner_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_owner_id TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "cursor_revision", "ALTER TABLE source_sync_state ADD COLUMN cursor_revision INTEGER NOT NULL DEFAULT 0"),
-                    ("source_sync_state", "cursor_position", "ALTER TABLE source_sync_state ADD COLUMN cursor_position INTEGER NOT NULL DEFAULT 0"),
-                    ("source_sync_state", "cursor_batch_digest", "ALTER TABLE source_sync_state ADD COLUMN cursor_batch_digest TEXT NOT NULL DEFAULT ''"),
-                    ("source_sync_state", "expected_revision", "ALTER TABLE source_sync_state ADD COLUMN expected_revision INTEGER NOT NULL DEFAULT 0"),
-                    ("source_sync_state", "expected_manifest_digest", "ALTER TABLE source_sync_state ADD COLUMN expected_manifest_digest TEXT NOT NULL DEFAULT ''"),
-                ):
-                    cols = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
-                    if column not in cols:
-                        conn.execute(ddl)
-                conn.execute(
-                    "INSERT INTO content_schema_meta(key,value) VALUES('version',?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (str(SCHEMA_VERSION),),
-                )
-                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_source_objects_source_external ON source_objects(source_id, external_object_key)")
+            # Rebuilding a referenced parent table requires FK enforcement to be
+            # disabled before BEGIN. The migration remains one atomic transaction
+            # and performs an explicit foreign_key_check before commit.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                with transaction(conn):
+                    # Phase 1's source_objects and occurrences predate the source
+                    # connector/sync ledger. Add missing columns first; V4 then
+                    # performs the one explicit identity-table rebuild.
+                    for table, column, ddl in (
+                        ("source_objects", "source_id", "ALTER TABLE source_objects ADD COLUMN source_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_objects", "object_type", "ALTER TABLE source_objects ADD COLUMN object_type TEXT NOT NULL DEFAULT 'object'"),
+                        ("source_objects", "parent_object_id", "ALTER TABLE source_objects ADD COLUMN parent_object_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_objects", "deleted_scan_id", "ALTER TABLE source_objects ADD COLUMN deleted_scan_id TEXT NOT NULL DEFAULT ''"),
+                        ("content_occurrences", "deleted_scan_id", "ALTER TABLE content_occurrences ADD COLUMN deleted_scan_id TEXT NOT NULL DEFAULT ''"),
+                        ("content_occurrences", "policy_class", "ALTER TABLE content_occurrences ADD COLUMN policy_class TEXT NOT NULL DEFAULT 'private'"),
+                        ("content_occurrences", "provider", "ALTER TABLE content_occurrences ADD COLUMN provider TEXT NOT NULL DEFAULT ''"),
+                        ("conversation_turns", "session_id", "ALTER TABLE conversation_turns ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"),
+                        ("conversation_turns", "event_key", "ALTER TABLE conversation_turns ADD COLUMN event_key TEXT NOT NULL DEFAULT ''"),
+                        ("conversation_turns", "content_type", "ALTER TABLE conversation_turns ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"),
+                        ("conversation_turns", "source_revision", "ALTER TABLE conversation_turns ADD COLUMN source_revision TEXT NOT NULL DEFAULT ''"),
+                    ):
+                        cols = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+                        if column not in cols:
+                            conn.execute(ddl)
+
+                    execute_sql_script(conn, CONTENT_AUX_SCHEMA)
+
+                    for table, column, ddl in (
+                        ("content_evidence_links", "blob_id", "ALTER TABLE content_evidence_links ADD COLUMN blob_id TEXT NOT NULL DEFAULT ''"),
+                        ("content_evidence_links", "source_revision", "ALTER TABLE content_evidence_links ADD COLUMN source_revision TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "owner_id", "ALTER TABLE source_sync_state ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "cursor_digest", "ALTER TABLE source_sync_state ADD COLUMN cursor_digest TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "cursor_source_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_source_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "cursor_run_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_run_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "cursor_owner_id", "ALTER TABLE source_sync_state ADD COLUMN cursor_owner_id TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "cursor_revision", "ALTER TABLE source_sync_state ADD COLUMN cursor_revision INTEGER NOT NULL DEFAULT 0"),
+                        ("source_sync_state", "cursor_position", "ALTER TABLE source_sync_state ADD COLUMN cursor_position INTEGER NOT NULL DEFAULT 0"),
+                        ("source_sync_state", "cursor_batch_digest", "ALTER TABLE source_sync_state ADD COLUMN cursor_batch_digest TEXT NOT NULL DEFAULT ''"),
+                        ("source_sync_state", "expected_revision", "ALTER TABLE source_sync_state ADD COLUMN expected_revision INTEGER NOT NULL DEFAULT 0"),
+                        ("source_sync_state", "expected_manifest_digest", "ALTER TABLE source_sync_state ADD COLUMN expected_manifest_digest TEXT NOT NULL DEFAULT ''"),
+                    ):
+                        cols = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+                        if column not in cols:
+                            conn.execute(ddl)
+
+                    self._rebuild_source_objects_v4(conn)
+                    conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_source_objects_source_external "
+                        "ON source_objects(source_id, external_object_key)"
+                    )
+                    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise ContentError("content v4 migration foreign-key check failed")
+                    conn.execute(
+                        "INSERT INTO content_schema_meta(key,value) VALUES('version',?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(SCHEMA_VERSION),),
+                    )
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
 
     def connection(self):
         """Yield a configured connection for read-only inspection."""
@@ -896,9 +996,9 @@ class ContentStore:
             acl_anomalies.append(("provider", provider, "unsupported_value"))
 
         def apply(local: sqlite3.Connection) -> str:
-            if source_id:
+            if source_id and local.execute("SELECT 1 FROM source_connectors WHERE source_id=?", (source_id,)).fetchone() is None:
                 local.execute(
-                    "INSERT INTO source_connectors(source_id,workspace_id,provider,source_type,external_root_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET updated_at=excluded.updated_at",
+                    "INSERT INTO source_connectors(source_id,workspace_id,provider,source_type,external_root_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                     (source_id, workspace_id or self.workspace_id, source_kind, source_kind, object_key, now, now),
                 )
             local.execute(

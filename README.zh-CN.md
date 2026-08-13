@@ -58,7 +58,7 @@ v0.7.1 补齐 V2-only 切换后暴露的迁移与桌面生命周期缺口：
   Graphify 仍作为 MemoryGuard CodeGraph 后的可选 metadata Provider 集成，不是独立
   MemoryGuard runtime，也不单独发布 PyPI 包。
 
-本地全量回归：**1810 passed / 0 failed**。详见
+最终本地全量回归：**1884 passed / 0 failed**，覆盖 **205 个测试文件**。详见
 [v0.7.1 发布记录](docs/releases/v0.7.1.md)。
 
 ## v0.7.0 更新（V2-only；已于 2026-08-12 发布）

@@ -43,7 +43,8 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "已写入 Agent 原生记忆入口" not in html
     assert "renderNeuronMetaBar" in html
     assert "${groupLabel} ·" in html
-    assert "成员 · 无绑定" in html
+    assert "投影成员信息待加载" in html
+    assert "meta.bound_agents" not in html
     assert "点击任意光点，在右侧查看可读内容" in html
     assert "规则与习惯可直接在图内治理" in html
     assert "selectedNeuronNode" in html
@@ -54,7 +55,7 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "renderNeuronRailDetail" in html
     assert "selectNeuronByMemory" in html
     assert "cyInstance.animate({ center: { eles: cyNode }" in html
-    assert "flashClass('pulse'" in html
+    assert "flashClass('sourcePulse'" in html
     assert "startNeuronSignalPulses" in html
     assert "pickNeuronSignalPath" in html
     assert "edge.signal" in html
@@ -71,6 +72,9 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "setReaderLanguage('zh')" in html
     assert "displayTitle" in html
     assert "displayBody" in html
+    assert "let ruleVisibilityFilter = 'all';" in html
+    assert "hydrateNeuronNodeDetail" in html
+    assert "callApi('get_memory', node.memory_id" in html
     assert "background-color': 'data(bg)'" in html
     assert "kindColor" in html
     assert "name: 'preset'" in html
@@ -82,7 +86,8 @@ def test_neuron_graph_uses_status_rail_for_node_detail() -> None:
     assert "来源/类型主题" in html
     assert "node.derivation" in html
     assert 'edge[etype = "duplicate"]' in html
-    assert "构建重构投影（含 LLM 整理）" in html
+    assert "构建重构投影" in html
+    assert "构建重构投影（含 LLM 整理）" not in html
     assert "重构治理投影用于自动治理、萃取并发布回原生记忆" not in html
     assert "共享图直接读取 SharedMemoryStore" in html
 
@@ -171,9 +176,32 @@ def test_lifecycle_ui_matches_backend_enums_and_residual_split() -> None:
     assert "Agent 摘要" in html
     assert "已接入" in html
     assert "已发现 · 待接入" in html
+    assert "if (binding) return binding.group_kind === 'personal' ? '已启用个人层' : '已绑定共享组'" in html
+    assert "const lifecycleChip = binding ? 'confirmed'" in html
     assert "新建个人记忆层" in html
     assert "可接入 MemoryGuard 层" in html
     assert "const items = result.items || []" in html
+
+
+def test_agent_and_governance_display_fallbacks_match_current_api_shapes() -> None:
+    html = render_interactive_html()
+
+    assert "function agentSummary(agent, sourceCount = null)" in html
+    assert "item.found_surface_count" in html
+    assert "finiteNumber(item.surface_count, surfaces.length)" in html
+    assert "item.bound_source_count" in html
+    assert "${a.found_surface_count}" not in html
+    assert "${a.surface_count}" not in html
+    assert "${a.bound_source_count}" not in html
+    assert "function governanceSnapshot(raw)" in html
+    assert "memory.total" in html
+    assert "memory.status_counts" in html
+    assert "finiteNumber(counts.active_memories, 0)" in html
+    assert "clearSharedGovernance('stale_selection'" in html
+    assert "当前没有活动绑定，不能作为共享治理范围" in html
+    assert "audit_only" in html
+    assert "return id || fallback;" in html
+    assert "e.agent_instance_id || e.actor" in html
 
 
 def test_multi_agent_ui_keeps_existing_personal_and_shared_groups_selectable() -> None:
@@ -254,41 +282,79 @@ def test_pywebview_bridge_prefers_dispatch_and_keeps_safe_legacy_fallback() -> N
     assert "await bridge.call_readonly(method, args)" in html
 
 
-def test_neuron_graph_uses_edge_bound_signal_particles() -> None:
+def test_rule_auto_scope_groups_actions_and_collapses_dominant_delete() -> None:
+    html = render_interactive_html()
+
+    assert "function groupRuleDecisions" in html
+    assert "function renderRuleDecisionGroup" in html
+    assert "rule-decision-group" in html
+    assert "rule-decision-subgroup" in html
+    assert "group.action === 'delete'" in html
+    assert "scope_type" in html
+    assert "范围置信度" in html
+    assert "function undoRuleDecisionGroup" in html
+    assert "批量撤销 ${undoableCount} 条" in html
+    start = html.index("async function requestRuleDecisionUndo")
+    end = html.index("async function undoRuleDecision(decisionId)", start)
+    undo_request = html[start:end]
+    assert "callApi('undo_rule_decision', id, activeShareGroupId || 'default', true)" in undo_request
+    assert "agent_instance_id" not in undo_request
+    assert "share_group_id:" not in undo_request
+    assert "decisions.slice(-20).reverse()" not in html
+
+
+def test_history_reads_use_one_selector_structured_requests_and_readable_cards() -> None:
+    html = render_interactive_html()
+
+    assert "function buildHistoryReadRequest" in html
+    assert "buildHistoryReadRequest({sessionId, limit: 100, offset: 0})" in html
+    assert "buildHistoryReadRequest({turnId, limit: 1, offset: 0})" in html
+    assert "callApi('history_read', sessionId, '', historyScope(), 100, 0)" not in html
+    assert "callApi('history_read', '', turnId, historyScope(), 1, 0)" not in html
+    assert "callApi('history_extract_preview', {session_id:" in html
+    assert "callApi('export_history', {session_ids:" in html
+    assert "session?.display_title" in html
+    assert "s.summary || s.preview_excerpt" in html
+    assert "conversation_selector_invalid" in html
+
+
+def test_neuron_graph_uses_root_outward_soft_signal_bands() -> None:
     html = render_interactive_html()
 
     assert 'id="neuron-particles"' in html
-    assert "animateNeuronEdgeParticle" in html
     assert "animateNeuronPathParticle" in html
     assert "raw * edges.length" in html
     assert "renderedPosition()" in html
     assert "control-point-distances" in html
     assert "Math.atan2" in html
-    assert "isSignalNeuronEdge" in html
-    assert "virtual_index: 0.46" in html
-    assert "underlay-opacity" in html
-    assert "const particle = document.createElement('span')" in html
-    assert "const offsetX = cyRect.left - layerRect.left" in html
-    assert "'overlay-opacity': .82" not in html
-    assert "'overlay-opacity': .76" not in html
-    assert "'overlay-opacity': .7" not in html
-    assert "'line-opacity': 1, 'width': 'mapData(strength, 0, 1, 3.6, 6.4)'" not in html
-    assert "neuron-edge-particle::after" not in html
-    assert "neuron-edge-particle-core" in html
-    assert "neuron-edge-particle-trail" in html
+    assert "isOutwardNeuronEdge" in html
+    assert "collectNeuronSignalSources" in html
+    assert "collectNeuronSignalPaths" in html
+    assert "node[kind = \"root\"]" in html
+    assert "const desired = Math.min(4, Math.max(2" in html
+    assert "const perEdgeMs = 820" in html
+    assert "sourcePulse" in html
+    assert "terminalPulse" in html
+    assert "nodeArrivalPulse" in html
+    assert "neuron-edge-particle-core" not in html
+    assert "neuron-edge-particle-trail" not in html
+    assert "Always launch 5–8 concurrent full-path pulses" not in html
+    assert "setInterval(fireWave, 1600)" not in html
+    assert "const spark = () =>" not in html
     assert "'shape': 'ellipse'" in html
     assert "round-rectangle" not in html
-    assert "粒子层异常不能影响 Cytoscape 边/节点脉冲" in html
-    assert "const starters = cy.nodes().filter" in html
-    assert "const leafEdge = outgoers.find" in html
-    assert "collectNeuronSignalPaths" in html
-    assert "One continuous light travels branch -> leaf" in html
-    assert "Always launch 5–8 concurrent full-path pulses" in html
-    assert "const delay = index * 160" in html
-    assert "underlay-opacity': 0" in html
     assert "Math.random()" not in html[html.index("function buildNeuronSignalPath"):html.index("function fitNeuronGraph")]
-    assert "const initialWave = setTimeout(fireWave, 360)" in html
     assert "neuron-particle-travel" not in html
+
+
+def test_neuron_layout_keeps_primary_ring_close_and_clusters_compact() -> None:
+    html = render_interactive_html()
+
+    assert "const radius = 118 + Math.min(18" in html
+    assert "node.node_kind === 'history_session' ? 82" in html
+    assert "node.node_kind === 'virtual_rule_ref' ? 78 : 96" in html
+    assert "const clusterPadding = sameBranch ? 10 : 26" in html
+    assert "const radius = 300 + Math.min(90" not in html
 
 
 def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
@@ -356,6 +422,27 @@ def test_memory_layer_lifecycle_actions_are_explicit_and_safe() -> None:
     assert "原生文件不变" in html
 
 
+def test_shared_group_dissolve_copy_matches_final_lifecycle_contract() -> None:
+    html = render_interactive_html()
+    start = html.index("async function dissolveSharedGroup(groupId)")
+    end = html.index("async function exitMultiAgentMode", start)
+    dissolve = html[start:end]
+
+    assert "callApi('dissolve_shared_group', groupId, true, true)" in dissolve
+    assert "解绑共享组内全部 Agent" in dissolve
+    assert "移除匹配的 MemoryGuard Hook 条目" in dissolve
+    assert "将每位原成员返回其个人记忆层" in dissolve
+    assert "受管数据保留为仅审计 tombstone" in dissolve
+    assert "if (!result || result.error || result.ok === false)" in dissolve
+    assert "showToast(apiErrorMessage(result, '解散共享组失败'), 'error')" in dissolve
+    assert "所有原成员已返回个人记忆层" in dissolve
+    assert "；受管数据保留为仅审计 tombstone`" in dissolve
+    assert "删除共享组投影" not in dissolve
+    assert "归档 SharedMemoryStore 目录" not in dissolve
+    assert "需手动恢复" not in dissolve
+    assert "result.archived_to" not in dissolve
+
+
 def test_history_ui_routes_result_types_and_exposes_export() -> None:
     html = render_interactive_html()
 
@@ -364,14 +451,18 @@ def test_history_ui_routes_result_types_and_exposes_export() -> None:
     assert 'data-mg-action="history-read-session"' in html
     assert 'data-session-id="${escapeHtml(r.session_id)}"' in html
     assert "exportHistorySession" in html
-    assert "callApi('export_history', [sessionId], historyScope())" in html
+    assert "callApi('export_history', {session_ids:" in html
+    assert "callApi('export_history', [sessionId], historyScope())" not in html
 
 
-def test_history_ui_requires_real_agent_and_refreshes_on_agent_switch() -> None:
+def test_history_ui_requires_real_governance_scope_and_refreshes_on_agent_switch() -> None:
     html = render_interactive_html()
 
-    assert "agent_instance_id: activeAgentInstanceId || ''" in html
-    assert "if (!activeAgentInstanceId)" in html
+    assert "function historyScope()" in html
+    assert "if (isShareGroupScope())" in html
+    assert "if (activeAgentInstanceId)" in html
+    assert "const scopeReady = await ensureGovernanceScope();" in html
+    assert "需要有效治理范围" in html
     assert "if (state.activeTab === 'history') renderHistory()" in html
 
 
@@ -437,8 +528,140 @@ def test_projection_build_ui_closes_start_cancel_and_error_states() -> None:
     assert "let activeBuildRunId = '';" in html
     assert '<button class="btn" type="button" disabled>正在创建任务…</button>' in html
     assert "pointer-events:none\">正在创建任务…" in html
-    assert "phase: 'cancelling', message: '正在取消…'" in html
-    assert "await restoreNeuronAfterBuild(apiErrorMessage(result || {}, '取消失败'), true)" in html
+    assert "phase: 'cancelling', message: '正在提交取消请求…'" in html
+    assert "await restoreNeuronAfterBuild(buildResultMessage(result || {}, '取消失败'), true)" in html
     assert "await restoreNeuronAfterBuild('构建已取消', false)" in html
     assert "{ id: 'engine', label: '引擎' }" in html
-    assert "{ id: 'enrich', label: '整理' }" in html
+    assert "{ id: 'enrich', label: '整理' }" not in html
+
+
+def test_codegraph_has_an_independent_navigation_tab() -> None:
+    html = render_interactive_html()
+
+    assert 'data-tab="codegraph"' in html
+    assert "case 'codegraph': renderCodeGraph(); break;" in html
+    assert "let codeGraph = null;" in html
+    assert "let codeCyInstance = null;" in html
+    assert 'id="codegraph-canvas"' in html
+    assert "codeGraphElements" in html
+    assert "codeGraphElements(graph)" in html
+    assert "selectedCodeGraphNode" in html
+    assert "Memory Projection" in html
+
+
+def test_memory_core_requests_memory_projection_graph_endpoint() -> None:
+    html = render_interactive_html()
+
+    assert "async function renderNeurons()" in html
+    assert "neuronGraph = await callApi('get_memory_neuron_graph'" in html
+    assert "async function refreshNeuronGraph(message = '')" in html
+    assert html.count("callApi('get_memory_neuron_graph'") == 2
+
+
+def test_codegraph_requests_independent_endpoint_without_legacy_neuron_endpoint() -> None:
+    html = render_interactive_html()
+
+    assert "async function renderCodeGraph()" in html
+    assert "codeGraph = await callApi('get_codegraph_graph'" in html
+    assert html.count("callApi('get_codegraph_graph'") == 1
+    assert "get_neuron_graph" not in html
+    assert "callApi('codegraph_graph'" not in html
+
+
+def test_scope_selectors_render_agent_names_and_build_has_no_dialogue_path() -> None:
+    html = render_interactive_html()
+
+    assert "function agentDisplayName" in html
+    assert "agentNamesForIds" in html
+    assert "scopeSelectionLabel" in html
+    assert "governanceScopeState.status !== 'active'" in html
+    assert "return '未选择治理范围'" in html
+    assert "agentDisplayName(agentId)" in html
+    assert "memberNames.join('、')" in html
+    assert "list_host_llm_agents" in html
+    assert "function refreshProjectionEngines" in html
+    assert "未发现可执行整理引擎，确定性构建可用；LLM 整理不可选。" in html
+    assert "<option value=\"deterministic\">确定性构建（不使用 LLM）</option>" in html
+    assert "String(item.mode || 'cli').toLowerCase() === 'cli'" in html
+    assert "showLlmPickModal" not in html
+    assert "宿主 Skill" not in html
+    assert "须在 Cursor 对话" not in html
+    assert "无需在别处对话继续" not in html
+    assert "deterministic" in html
+    assert "后端未返回可追踪任务 ID" in html
+    assert "onclick=\"renderNeurons()\">重新读取 Memory Projection" in html
+
+
+def test_projection_build_ui_uses_honest_engine_and_task_lifecycle_contract() -> None:
+    html = render_interactive_html()
+
+    assert "let buildStartInFlight = false;" in html
+    assert "let buildCancelInFlight = false;" in html
+    assert "不能重复确认" in html
+    assert "构建任务已创建，正在运行" in html
+    assert "buildHasNoSources(result)" in html
+    assert "buildIsBlocked(result)" in html
+    assert "没有可构建的数据源：当前数据源映射为空" in html
+    assert "构建被后端阻止" in html
+    assert "当前没有可取消的构建" in html
+    assert "已提交取消请求，等待后端确认；当前构建尚未确认停止" in html
+    assert "scope-fallback" not in html
+
+
+def test_projection_source_mapping_empty_state_routes_to_sources() -> None:
+    html = render_interactive_html()
+
+    assert "当前治理范围已设定，但尚未选择数据源" in html
+    assert "范围不等于数据源" in html
+    assert "去数据源页选择数据源" in html
+    assert "no_projection_sources" in html
+    assert "请先到数据源页启用来源" in html
+
+
+def test_projection_source_map_defaults_to_accessible_collapsed_cards() -> None:
+    html = render_interactive_html()
+    start = html.index("function renderProjectionSourceMap")
+    end = html.index("function projectionModeControls", start)
+    source_map = html[start:end]
+
+    assert "aria-expanded=\"false\"" in source_map
+    assert 'aria-controls="${sourceDetailsId}"' in source_map
+    assert "展开 ${sourceCount} 条来源" in source_map
+    assert "function toggleSourceMapDetails(button)" in source_map
+    assert "details.hidden = expanded" in source_map
+    assert "source-map-list" in source_map
+    assert "<dl class=\"source-map-fields\">" in source_map
+    assert "<table" not in source_map
+
+
+def test_shared_source_summary_uses_governed_memory_connector_and_projection_counts() -> None:
+    html = render_interactive_html()
+    start = html.index("function renderProjectionSourceMap")
+    end = html.index("function projectionModeControls", start)
+    source_map = html[start:end]
+
+    assert "summary.governed_memory" in source_map
+    assert "summary.selected_source_connectors" in source_map
+    assert "summary.selected_source_connector_total" in source_map
+    assert "summary.enabled" in source_map
+    assert "受管记忆 ${governedMemory}" in source_map
+    assert "连接器 ${connectorCount}/${connectorTotal}" in source_map
+    assert "参与投影 ${participatingCount}" in source_map
+
+
+def test_projection_source_cards_keep_long_ids_single_line_and_responsive() -> None:
+    html = render_interactive_html()
+
+    assert ".source-map-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));" in html
+    assert ".source-map-fields dd code { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }" in html
+    assert 'class="source-map-id" title="${escapeHtml(sourceId)}"' in html
+    assert ".source-map-id { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }" in html
+    assert "@media (max-width: 680px)" in html
+    assert ".source-map-fields { grid-template-columns: minmax(0, 1fr); }" in html
+
+
+def test_projection_source_map_has_readable_shared_empty_state() -> None:
+    html = render_interactive_html()
+
+    assert "暂无共享记忆入库来源" in html
+    assert "当前共享组没有可展示的受管记忆或连接器" in html

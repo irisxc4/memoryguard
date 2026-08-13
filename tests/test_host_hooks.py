@@ -1767,6 +1767,49 @@ def test_subagent_start_receives_bounded_governance_context(
     assert "配置幂等" not in context
 
 
+def test_codex_child_agent_id_is_runtime_identity_not_binding_spoof(
+    tmp_path: Path,
+):
+    """Codex uses ``agent_id`` instead of ``subagent_id`` on child tools."""
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _activate_v2_host_workspace(workspace)
+    _bind(workspace, "codex-parent", "group-a")
+    payload = {
+        "session_id": "parent-session",
+        "agent_id": "codex-child",
+        "cwd": str(workspace),
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(workspace / "README.md")},
+    }
+
+    started = run_hook(
+        provider="codex",
+        event="subagent_start",
+        workspace=workspace,
+        agent_instance_id="codex-parent",
+        share_group_id="group-a",
+        payload=payload,
+    )
+    assert "hookSpecificOutput" in started
+    state = host_hooks._load_state(
+        workspace,
+        "codex",
+        "parent-session:subagent:codex-child",
+    )
+    assert state["context_identity"]["runtime_role"] == "subagent"
+
+    result = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-parent",
+        share_group_id="group-a",
+        payload=payload,
+    )
+    assert result == {}
+
+
 def test_cli_ensure_installs_only_explicit_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

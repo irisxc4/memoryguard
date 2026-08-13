@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -21,7 +21,7 @@ from .group_native import GroupControlError, GroupControlService, personal_group
 
 MAX_PAGE = 100
 MAX_TIMELINE_RADIUS = 25
-CONTENT_HISTORY_SCHEMA_VERSION = 3
+CONTENT_HISTORY_SCHEMA_VERSION = 4
 
 _REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "content_schema_meta": frozenset({"key", "value"}),
@@ -64,6 +64,66 @@ def _now() -> str:
 def _short(value: Any, limit: int = 220) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
+
+
+_GENERIC_SESSION_TITLES = frozenset({
+    "", "未命名会话", "无标题", "untitled", "untitled conversation",
+    "new chat", "new conversation", "conversation", "chat",
+})
+_REQUEST_PREFIX_RE = re.compile(
+    r"^(?:(?:请|麻烦)(?:你)?(?:帮我|帮忙)?|我需要你(?:帮我)?|我想让你|帮我|请帮我|请你)\s*",
+    re.IGNORECASE,
+)
+
+
+def _title_from_text(value: Any, *, limit: int = 28) -> str:
+    """Build a deterministic readable title for an imported conversation."""
+    text = str(value or "")
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\b[a-z][a-z0-9+.-]*://\S+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<!\w)[A-Za-z]:[\\/][^\s，。！？!?；;]+", " ", text)
+    text = re.sub(r"(?<!\w)/(?:[^/\s]+/)+[^\s，。！？!?；;]*", " ", text)
+    text = re.sub(r"\b[0-9a-f]{8}-[0-9a-f-]{20,}\b", " ", text, flags=re.IGNORECASE)
+    filtered_tokens: list[str] = []
+    for token in text.split():
+        probe = token.strip("，,。！？!?；;：:()[]{}<>\"'")
+        windows_path = len(probe) >= 3 and probe[1] == ":" and probe[2] in {"/", "\\"}
+        unix_path = probe.startswith("/") and "/" in probe[1:]
+        long_cli_arg = probe.startswith("--") and ("=" in probe or len(probe) > 16)
+        if windows_path or unix_path or long_cli_arg:
+            continue
+        filtered_tokens.append(token)
+    text = " ".join(filtered_tokens)
+    text = " ".join(text.replace("`", " ").replace("#", " ").replace("*", " ").split()).strip()
+    for _ in range(3):
+        cleaned = _REQUEST_PREFIX_RE.sub("", text, count=1).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    if not text:
+        return ""
+    text = re.split(r"[，,。！？!?；;\n\r]", text, maxsplit=1)[0].strip(" ：:-—")
+    if len(text) < 3:
+        return ""
+    return text if len(text) <= limit else text[:limit].rstrip(" ：:-—") + "…"
+
+
+def _history_session_projection(row: Mapping[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    first_user_text = str(item.pop("first_user_text", "") or "")
+    summary = str(item.get("summary") or "").strip()
+    source_title = str(item.get("title") or "").strip()
+    source_candidate = "" if source_title.casefold() in _GENERIC_SESSION_TITLES else _title_from_text(source_title)
+    display_title = _title_from_text(summary) or _title_from_text(first_user_text) or source_candidate
+    if not display_title:
+        provider = str(item.get("provider") or "local").strip() or "local"
+        stamp = str(item.get("created_at") or item.get("imported_at") or "").strip()
+        display_title = f"{provider} 对话 · {stamp}" if stamp else f"{provider} 对话"
+    item["source_title"] = source_title
+    item["display_title"] = display_title
+    item["preview_excerpt"] = _short(first_user_text, 220)
+    item["summarized"] = bool(summary)
+    return _safe_session_projection(item)
 
 
 def _normalize_project_ref(value: Any) -> str:
@@ -165,7 +225,9 @@ def content_history_schema_status(path: Path) -> str:
         return "missing"
     try:
         uri = "file:" + quote(str(path), safe="/:\\") + "?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=2) as conn:
+        # sqlite3.Connection.__exit__ does not close the connection; closing
+        # prevents repeated schema probes from pinning content.db on Windows.
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as conn:
             row = conn.execute(
                 "SELECT value FROM content_schema_meta WHERE key='version'"
             ).fetchone()
@@ -231,7 +293,7 @@ class ContentHistoryStore:
         sql = "s.active=1 AND s.agent_instance_id IN (" + ",".join("?" for _ in members) + ")"
         args: list[Any] = list(members)
         if scope.project_ref:
-            sql += " AND s.project_ref=?"
+            sql += " AND s.project_ref=? COLLATE NOCASE" if os.name == "nt" else " AND s.project_ref=?"
             args.append(scope.project_ref)
         if scope.provider:
             sql += " AND s.provider=?"
@@ -262,6 +324,10 @@ class ContentHistoryStore:
         sql = (
             "SELECT s.session_id,s.external_id,s.title,s.provider,s.agent_instance_id,s.project_ref,s.share_group_id,"
             "s.created_at,s.imported_at,COALESCE(MAX(sb.text),'') summary,"
+            "COALESCE((SELECT b2.text FROM conversation_turns t2 "
+            "JOIN content_occurrences o2 ON o2.occurrence_id=t2.occurrence_id AND o2.active=1 "
+            "JOIN content_blobs b2 ON b2.blob_id=o2.blob_id "
+            "WHERE t2.session_id=s.session_id AND LOWER(t2.role)='user' ORDER BY t2.ordinal LIMIT 1),'') first_user_text,"
             "COUNT(DISTINCT CASE WHEN o.active=1 THEN t.turn_id END) turn_count,"
             "COUNT(DISTINCT CASE WHEN e.status='valid' THEN e.link_id END) evidence_count "
             "FROM conversation_sessions s " + self._summary_join() + " "
@@ -274,7 +340,7 @@ class ContentHistoryStore:
         with self._connect() as conn:
             rows = conn.execute(sql, [*args, limit, offset]).fetchall()
             total = int(conn.execute(f"SELECT COUNT(*) FROM conversation_sessions s WHERE {where}{evidence}", args).fetchone()[0])
-        sessions = [_safe_session_projection(dict(row)) for row in rows]
+        sessions = [_history_session_projection(dict(row)) for row in rows]
         groups: dict[str, dict[str, Any]] = {}
         for item in sessions:
             key = str(item["project_key"])
@@ -341,7 +407,7 @@ class ContentHistoryStore:
 
     def read(self, scope: V2HistoryScope, *, session_id: str = "", turn_id: str = "", limit: int = 100, offset: int = 0) -> dict[str, Any]:
         if bool(session_id) == bool(turn_id):
-            raise ValueError("exactly_one_of_session_id_or_turn_id_required")
+            raise ValueError("conversation_selector_invalid")
         where, args = self._scope_where(scope)
         limit = max(1, min(int(limit), 250)); offset = max(0, int(offset))
         turn_select = (

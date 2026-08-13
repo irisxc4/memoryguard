@@ -366,6 +366,111 @@ def test_content_schema_marker_preflight_is_fail_closed_without_target_mutation(
     assert path.read_bytes() == before_bytes, "schema preflight mutated the live database"
 
 
+def test_content_schema_v3_to_v4_replaces_global_source_object_identity(tmp_path: Path) -> None:
+    store = ContentStore(tmp_path)
+    store.upsert_source_connector(
+        source_id="legacy-source", provider="codex", source_type="local_history",
+        external_root_key="history:legacy",
+    )
+    first_blob = store.put_blob("legacy conversation")
+    first_occurrence = store.upsert_occurrence(
+        source_object_id="legacy-object",
+        occurrence_key="turn-1",
+        blob_id=first_blob,
+        source_id="legacy-source",
+        source_kind="conversation",
+        external_object_key="same-session",
+        source_revision="legacy-revision",
+        content_role="conversation",
+        sensitivity="normal",
+        workspace_id=str(tmp_path.resolve()),
+        agent_instance_id="agent-a",
+        project_ref=str(tmp_path.resolve()),
+        share_group_id="group-a",
+        policy_class="private",
+        provider="codex",
+    )
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("DROP INDEX idx_source_objects_source_external")
+        conn.execute(
+            "CREATE TABLE source_objects_v3 ("
+            "source_object_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, "
+            "external_object_key TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', "
+            "metadata_json TEXT NOT NULL DEFAULT '{}', "
+            "active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)), "
+            "first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, "
+            "source_id TEXT NOT NULL DEFAULT '', object_type TEXT NOT NULL DEFAULT 'object', "
+            "parent_object_id TEXT NOT NULL DEFAULT '', deleted_scan_id TEXT NOT NULL DEFAULT '', "
+            "UNIQUE(source_kind, external_object_key))"
+        )
+        columns = (
+            "source_object_id,source_kind,external_object_key,title,metadata_json,active,"
+            "first_seen_at,last_seen_at,source_id,object_type,parent_object_id,deleted_scan_id"
+        )
+        conn.execute(
+            f"INSERT INTO source_objects_v3({columns}) SELECT {columns} FROM source_objects"
+        )
+        conn.execute("DROP TABLE source_objects")
+        conn.execute("ALTER TABLE source_objects_v3 RENAME TO source_objects")
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_source_objects_source_external "
+            "ON source_objects(source_id, external_object_key)"
+        )
+        conn.execute("UPDATE content_schema_meta SET value='3' WHERE key='version'")
+        conn.commit()
+
+    upgraded = ContentStore(tmp_path)
+    upgraded.upsert_source_connector(
+        source_id="live-source", provider="codex", source_type="local_history",
+        external_root_key="history:live",
+    )
+    second_blob = upgraded.put_blob("live conversation")
+    second_occurrence = upgraded.upsert_occurrence(
+        source_object_id="live-object",
+        occurrence_key="turn-1",
+        blob_id=second_blob,
+        source_id="live-source",
+        source_kind="conversation",
+        external_object_key="same-session",
+        source_revision="live-revision",
+        content_role="conversation",
+        sensitivity="normal",
+        workspace_id=str(tmp_path.resolve()),
+        agent_instance_id="agent-a",
+        project_ref=str(tmp_path.resolve()),
+        share_group_id="group-a",
+        policy_class="private",
+        provider="codex",
+    )
+
+    with sqlite3.connect(upgraded.db_path) as conn:
+        assert conn.execute(
+            "SELECT value FROM content_schema_meta WHERE key='version'"
+        ).fetchone()[0] == "4"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM source_objects "
+            "WHERE source_kind='conversation' AND external_object_key='same-session'"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT occurrence_id FROM content_occurrences WHERE occurrence_id=?",
+            (first_occurrence,),
+        ).fetchone()[0] == first_occurrence
+        assert conn.execute(
+            "SELECT occurrence_id FROM content_occurrences WHERE occurrence_id=?",
+            (second_occurrence,),
+        ).fetchone()[0] == second_occurrence
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        unique_columns = {
+            tuple(item[2] for item in conn.execute(f'PRAGMA index_info("{row[1]}")'))
+            for row in conn.execute("PRAGMA index_list(source_objects)")
+            if row[2]
+        }
+        assert ("source_kind", "external_object_key") not in unique_columns
+        assert ("source_id", "external_object_key") in unique_columns
+
+
 def test_partial_aux_schema_without_marker_is_not_inferred(tmp_path: Path) -> None:
     store = ContentStore(tmp_path)
     path = store.db_path
@@ -376,7 +481,7 @@ def test_partial_aux_schema_without_marker_is_not_inferred(tmp_path: Path) -> No
         ContentStore(tmp_path)
 
 
-def test_content_schema_v2_to_v3_adds_history_receipts_without_rewriting_data(tmp_path: Path) -> None:
+def test_content_schema_v2_upgrades_to_current_without_rewriting_data(tmp_path: Path) -> None:
     store = ContentStore(tmp_path)
     blob_id = store.put_blob("preserve existing V2 content")
     with sqlite3.connect(store.db_path) as conn:
@@ -386,7 +491,7 @@ def test_content_schema_v2_to_v3_adds_history_receipts_without_rewriting_data(tm
 
     upgraded = ContentStore(tmp_path)
     with sqlite3.connect(upgraded.db_path) as conn:
-        assert conn.execute("SELECT value FROM content_schema_meta WHERE key='version'").fetchone()[0] == "3"
+        assert conn.execute("SELECT value FROM content_schema_meta WHERE key='version'").fetchone()[0] == "4"
         assert conn.execute("SELECT blob_id,text FROM content_blobs WHERE blob_id=?", (blob_id,)).fetchone() == before
         assert conn.execute("SELECT COUNT(*) FROM history_mutation_receipts").fetchone()[0] == 0
 

@@ -85,6 +85,21 @@ def _write_codex_session(home: Path) -> Path:
     return path
 
 
+def _write_many_codex_sessions(home: Path, count: int) -> None:
+    root = home / ".codex" / "sessions" / "2026" / "08"
+    root.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        session_id = f"session-{index:03d}"
+        rows = [
+            {"type": "session_meta", "payload": {"id": session_id, "title": session_id, "cwd": f"project-{index % 3}"}},
+            {"type": "response_item", "payload": {"role": "user", "type": "message", "content": [{"type": "input_text", "text": f"message {index}"}], "id": f"msg-{index}"}},
+        ]
+        (root / f"rollout-{index:03d}.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+
+
 def _patch_codex_agent(monkeypatch, workspace: Path) -> None:
     GroupControlService(workspace, write=True).bind_agent("codex-agent", "group-a")
     monkeypatch.setattr(
@@ -187,6 +202,38 @@ def test_gui_history_discover_and_backfill_write_content_plane_only(
     assert turns == [("user",), ("assistant",)]
     assert bodies == ["Remember bounded parsing.", "Acknowledged."]
     port._task_service().shutdown(timeout=5.0)
+
+
+def test_v2_history_backfill_advances_across_multiple_bounded_batches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    _write_many_codex_sessions(home, 30)
+    _patch_codex_agent(monkeypatch, workspace)
+    service = HistoryControlService(workspace, home=home)
+
+    first = service.backfill()
+    assert first["imported"] == 25
+    assert first["processed_files"] == 25
+    assert first["remaining_fresh_files"] == 5
+    assert first["continuation"]
+
+    second = service.backfill(continuation=first["continuation"])
+    assert second["imported"] == 5
+    assert second["processed_files"] == 5
+    assert second["remaining_fresh_files"] == 0
+    assert second["continuation"] is None
+    assert second["skipped"] == 25
+
+    replay = service.backfill()
+    assert replay["imported"] == 0
+    assert replay["processed_files"] == 0
+    assert replay["skipped"] == 30
+    assert replay["remaining_fresh_files"] == 0
 
 
 def test_history_backfill_without_provider_binding_is_neutral_no_write(

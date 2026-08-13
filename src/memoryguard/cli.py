@@ -1491,14 +1491,15 @@ def build_parser() -> argparse.ArgumentParser:
         "workspace",
         nargs="?",
         default="",
-        help="workspace path (uses the current project when it contains .memoryguard)",
+        help="advanced: explicit MemoryGuard data home (default: global user data home)",
     )
     p_gui.add_argument(
         "-w",
         "--workspace",
+        "--data-home",
         dest="workspace_option",
         default="",
-        help="workspace path (same as the positional path)",
+        help="advanced: explicit MemoryGuard data home; this is not a project UI path",
     )
     p_gui.set_defaults(func=cmd_gui)
 
@@ -1515,11 +1516,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _default_gui_workspace() -> Path:
-    """Return the fixed user-level workspace used by a bare GUI launch.
+    """Return the one global user-level Data Home used by the GUI.
 
-    The installed package directory is an application location, not a data
-    location. Runtime UI and governance artifacts belong under the same
-    user-level home used by the Knowledge Library.
+    The installed package directory and the current project are execution or
+    source locations only. Runtime UI and governance state belong to the one
+    canonical Data Home shared by all Agent integrations.
     """
     from .data_home import resolve_data_home
 
@@ -1528,15 +1529,14 @@ def _default_gui_workspace() -> Path:
 
 def _resolve_gui_workspace(argv: list[str]) -> Path | None:
     if argv:
+        # Compatibility/diagnostic override: the positional value names an
+        # alternate MemoryGuard Data Home, never a project-local UI.
         return resolve_workspace(argv[0], explicit=True)
 
-    # A bare GUI is the user-level governance console.  It must not change
-    # databases merely because the terminal happens to be inside a project
-    # (or C:\Windows\System32).  MEMORYGUARD_WORKSPACE remains an explicit
-    # operator override; otherwise the canonical data home is authoritative.
-    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-    if configured:
-        return resolve_workspace(configured, explicit=True)
+    # A bare GUI is always the single global governance console. Ambient
+    # MEMORYGUARD_WORKSPACE may describe an older project/control context and
+    # must never redirect the GUI to a project database. resolve_data_home()
+    # already honors MEMORYGUARD_HOME for user-selected non-default locations.
     return _default_gui_workspace().expanduser().resolve()
 
 
@@ -1545,8 +1545,8 @@ def gui_main(argv: list[str] | None = None) -> int:
     workspace = _resolve_gui_workspace(argv)
     if workspace is None:
         print(
-            "error: no workspace selected. Run `memoryguard gui <project-path>` "
-            "or set MEMORYGUARD_WORKSPACE.",
+            "error: no global MemoryGuard data home could be resolved. "
+            "Set MEMORYGUARD_HOME or pass `memoryguard gui --data-home <path>`.",
             file=sys.stderr,
         )
         return 2
@@ -1555,15 +1555,15 @@ def gui_main(argv: list[str] | None = None) -> int:
         print(
             "error: refusing to use a Windows system directory as the workspace.\n"
             f"  resolved path: {workspace}\n"
-            "  run from your project directory or pass its path explicitly, for example:\n"
-            r"  memoryguard gui H:\ai\workspace\工具项目\memoryguard",
+            "  configure a non-system MemoryGuard data home, for example:\n"
+            r"  memoryguard gui --data-home H:\MemoryGuard",
             file=sys.stderr,
         )
         return 2
     if not workspace.is_dir():
         if workspace != _default_gui_workspace():
             print(
-                f"error: GUI workspace does not exist or is not a directory: {workspace}",
+                f"error: GUI data home does not exist or is not a directory: {workspace}",
                 file=sys.stderr,
             )
             return 2

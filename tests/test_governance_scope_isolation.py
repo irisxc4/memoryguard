@@ -244,14 +244,15 @@ def test_empty_projection_build_and_delete_are_non_creating_after_v2_init(tmp_pa
     GovernanceV2(tmp_path)
     service = ProjectionBuildService(tmp_path)
     scope = _projection_scope(tmp_path, "agent-a", "group-a")
-    built = service.build(mode="reconstructed", scope=scope, runtime_role="test")
-    assert built["status"] == "NO_SOURCE"
+    with pytest.raises(ProjectionBuildError, match="no_projection_sources") as exc_info:
+        service.build(mode="reconstructed", scope=scope, runtime_role="test")
+    assert exc_info.value.code == "no_projection_sources"
     first_delete = service.delete(mode="reconstructed", scope=scope)
     second_delete = service.delete(mode="reconstructed", scope=scope)
-    assert first_delete["deleted"] is True
-    assert first_delete["tombstone_id"]
+    assert first_delete["deleted"] is False
+    assert first_delete["tombstone_id"] == ""
     assert second_delete["deleted"] is False
-    assert second_delete["tombstone_id"] == first_delete["tombstone_id"]
+    assert second_delete["tombstone_id"] == ""
 
 
 def test_release_plan_is_bound_to_exact_scope(tmp_path: Path) -> None:
@@ -306,7 +307,9 @@ def test_group_scope_state_is_binding_backed(tmp_path: Path) -> None:
     assert service.scope_state("agent-a")["scope"]["share_group_id"] == "shared-team"
     moved = service.bind_agent("agent-a", "shared-other")
     assert moved["binding_id"] != first["binding_id"]
-    assert service.scope_state("agent-a")["scope"]["share_group_id"] == "shared-team"
+    stale = service.scope_state("agent-a")
+    assert stale["empty"] is True
+    assert stale["scope"] is None
 
 
 def test_v2_projection_payload_has_reference_only_hydration_fields(tmp_path: Path) -> None:

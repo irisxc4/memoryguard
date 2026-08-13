@@ -222,3 +222,27 @@ def test_active_binding_keeps_private_data_agent_out_of_residual_bucket(tmp_path
     assert listed["residuals"] == []
     assert listed["agents"][0]["binding_status"] == "active"
     assert listed["agents"][0]["binding"]["share_group_id"] == "shared-existing"
+
+
+def test_list_agents_emits_stable_surface_and_source_counts(tmp_path: Path) -> None:
+    data = tmp_path / "agent-data"
+    data.mkdir()
+    (data / "memory.md").write_text("hello", encoding="utf-8")
+    service = _service(tmp_path, data)
+
+    initial = service.list_agents()["agents"][0]
+    assert initial["found_surface_count"] == 1
+    assert initial["surface_count"] == 1
+    assert initial["bound_source_count"] == 0
+    assert all(isinstance(initial[key], int) for key in (
+        "found_surface_count", "surface_count", "bound_source_count",
+    ))
+
+    tree = service.get_selection_tree("agent-instance-a")
+    source_id = tree["scopes"][0]["categories"][0]["files"][0]["source_root_id"]
+    service.commit_selection(
+        "agent-instance-a",
+        [{"source_root_id": source_id, "category": "native_memory"}],
+    )
+    selected = service.list_agents()["agents"][0]
+    assert selected["bound_source_count"] == 1

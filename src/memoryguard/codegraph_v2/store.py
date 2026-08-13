@@ -1033,8 +1033,11 @@ class CodeGraphStore:
         existing = conn.execute("SELECT scope_id,revision_id,from_id,to_id,relation,context,provenance,source_location,metadata_json,weight,active FROM edges WHERE edge_id=?", (edge.edge_id,)).fetchone()
         values = (scope_id, edge.revision_id, edge.from_id, edge.to_id, edge.relation, edge.context, edge.provenance, edge.source_location, _json(edge.metadata), edge.weight, int(edge.active))
         if existing is not None:
-            if tuple(str(item) for item in existing) != tuple(str(item) for item in values):
+            existing_values = tuple(existing)
+            if tuple(str(item) for item in existing_values[:-1]) != tuple(str(item) for item in values[:-1]):
                 raise CodeGraphError("immutable edge identity collision")
+            if edge.active and not bool(existing_values[-1]):
+                conn.execute("UPDATE edges SET active=1 WHERE edge_id=?", (edge.edge_id,))
             return edge.edge_id
         conn.execute("INSERT INTO edges(edge_id,scope_id,revision_id,from_id,to_id,relation,context,provenance,source_location,metadata_json,weight,active,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (edge.edge_id, scope_id, edge.revision_id, edge.from_id, edge.to_id, edge.relation, edge.context, edge.provenance, edge.source_location, _json(edge.metadata), edge.weight, int(edge.active), now))
         return edge.edge_id

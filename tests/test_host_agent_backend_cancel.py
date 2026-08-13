@@ -113,3 +113,37 @@ def test_run_cli_cancellable_terminates_child_on_timeout(tmp_path: Path) -> None
     assert pidfile.exists()
     pid = int(pidfile.read_text())
     assert _wait_pid_dead(pid), "timed-out CLI subprocess was left running"
+
+
+def test_probe_cli_launch_rejects_spawn_permission_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import memoryguard.host_agent_backend as backend
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(backend.subprocess, "run", denied)
+    assert backend._probe_cli_launch("blocked-codex.exe", "--version") is False
+
+
+def test_find_codex_cli_prefers_spawnable_user_launcher_over_path_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import memoryguard.host_agent_backend as backend
+
+    sandbox = tmp_path / ".codex" / ".sandbox-bin" / "codex.exe"
+    sandbox.parent.mkdir(parents=True)
+    sandbox.write_bytes(b"launcher")
+    blocked = tmp_path / "WindowsApps" / "codex.exe"
+    blocked.parent.mkdir(parents=True)
+    blocked.write_bytes(b"protected")
+
+    monkeypatch.setattr(backend.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(backend.shutil, "which", lambda name: str(blocked) if name == "codex" else None)
+    monkeypatch.setattr(
+        backend,
+        "_probe_cli_launch",
+        lambda path, *args: Path(path) == sandbox,
+    )
+
+    assert backend._find_codex_cli() == str(sandbox)

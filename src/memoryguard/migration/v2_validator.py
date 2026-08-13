@@ -324,7 +324,7 @@ class V2MigrationValidator:
             schema_domain = "projection.profile" if domain == "projection" and path.name == "profile.db" else ("projection.scenario" if domain == "projection" else domain)
             self._check_db(phase1, path, marker=marker, schema_domain=schema_domain)
         result.domains["storage"] = phase1
-        self._check_db(result.domains.setdefault("content", DomainValidation("content")), layout.content_db, marker="memoryguard-v2-phase1", schema_domain="content", aux_marker="3")
+        self._check_db(result.domains.setdefault("content", DomainValidation("content")), layout.content_db, marker="memoryguard-v2-phase1", schema_domain="content", aux_marker="4")
         self._check_db(result.domains.setdefault("memory", DomainValidation("memory")), layout.memory_db, marker="memoryguard-v2-phase2-memory", schema_domain="memory")
         self._check_db(result.domains.setdefault("evidence", DomainValidation("evidence")), layout.evidence_db, marker="memoryguard-v2-phase2-evidence", schema_domain="evidence")
         self._check_db(result.domains.setdefault("rules", DomainValidation("rules")), layout.rules_db, marker="memoryguard-v2-phase2-rules", schema_domain="rules")

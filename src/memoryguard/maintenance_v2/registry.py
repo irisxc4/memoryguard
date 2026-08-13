@@ -345,7 +345,7 @@ _MARKERS: dict[str, tuple[tuple[str, ...], int]] = {
     "memory": (("memoryguard-v2-phase2-memory",), 1),
     "rules": (("memoryguard-v2-phase2-rules",), 2),
     "evidence": (("memoryguard-v2-phase2-evidence",), 1),
-    "content": (("3", "memoryguard-v2-phase2-content"), 3),
+    "content": (("4", "memoryguard-v2-phase2-content"), 4),
     "knowledge": (("memoryguard-v2-phase5-knowledge", "memoryguard-v2-phase1"), 1),
     # CodeGraph keeps the phase-1 SQLite user_version at 1 while its store-owned
     # auxiliary schema is now v2. SQLiteReadOnlyAdapter reports the aux marker,

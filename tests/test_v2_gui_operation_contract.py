@@ -10,10 +10,11 @@ from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort
 from memoryguard.security import ALL_ALLOWED_METHODS, MUTATION_API_METHODS, READONLY_API_METHODS
 
 
-def test_gui_operation_registry_is_single_162_method_truth_source() -> None:
-    assert len(GUI_OPERATION_SPECS) == 162
+def test_gui_operation_registry_is_single_166_method_truth_source() -> None:
+    assert len(GUI_OPERATION_SPECS) == 166
+    assert {"list_codegraph_projects", "build_codegraph"} <= set(GUI_OPERATION_SPECS)
     assert GUI_METHOD_NAMES == frozenset(GUI_OPERATION_SPECS)
-    assert len(GUI_MUTATION_NAMES) == 72
+    assert len(GUI_MUTATION_NAMES) == 73
     assert MUTATION_API_METHODS == GUI_MUTATION_NAMES
     assert ALL_ALLOWED_METHODS == GUI_METHOD_NAMES
     assert READONLY_API_METHODS == GUI_METHOD_NAMES - GUI_MUTATION_NAMES
@@ -37,9 +38,22 @@ def test_embedded_gui_literal_methods_are_known_to_registry() -> None:
     assert not [item for item in visible_registry_issues() if item["code"] == "visible_gui_method_unknown"]
 
 
+def test_projection_build_task_api_contract_exposes_run_id_engine_and_exact_cancel() -> None:
+    start = GUI_OPERATION_SPECS["start_build_projection"]
+    cancel = GUI_OPERATION_SPECS["cancel_build_projection"]
+    status = GUI_OPERATION_SPECS["get_build_progress"]
+
+    assert start.execution == "task"
+    assert start.cancel_operation == "task_cancel"
+    assert {"mode", "scope", "llm_agent", "llm_cli", "enrich_mode"} <= set(start.parameters)
+    assert cancel.execution == "sync"
+    assert tuple(cancel.parameters) == ("run_id", "confirmed")
+    assert tuple(status.parameters) == ("run_id",)
+
+
 def test_gui_native_registry_never_uses_retired_status(tmp_path) -> None:
     entries = NativeV2RuntimePort(tmp_path).coverage()["surfaces"]["gui"]["entries"]
-    assert len(entries) == 162
+    assert len(entries) == 166
     assert all(item["status"] in {"implemented", "blocker"} for item in entries)
     assert all(item["status"] != "retired" for item in entries)
     assert all(item["canonical_name"] for item in entries)

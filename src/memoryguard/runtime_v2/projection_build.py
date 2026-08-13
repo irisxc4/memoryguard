@@ -115,6 +115,7 @@ def _derive_reference_graph(atoms: list[Any]) -> tuple[dict[str, Any], dict[str,
                 "id": scope_id,
                 "node_kind": "topic",
                 "label": scope_label,
+                "kind": scope_name,
                 "parent_id": root_id,
                 "derivation": f"记忆胞体 -> {scope_label}",
             })
@@ -125,6 +126,7 @@ def _derive_reference_graph(atoms: list[Any]) -> tuple[dict[str, Any], dict[str,
             "id": kind_id,
             "node_kind": "topic",
             "label": kind_label,
+            "kind": kind_name,
             "parent_id": scope_id,
             "derivation": f"记忆胞体 -> {scope_label} -> {kind_label}",
         })
@@ -486,22 +488,24 @@ class ProjectionBuildService:
             execution.progress(5, "scan")
             execution.check_cancelled()
 
-        memory = self._memory()
-        evidence_store = self._evidence()
-        store = self._projection(write=True)
+        try:
+            memory = self._memory()
+        except ProjectionBuildError as exc:
+            # A build with no V2 memory plane has no eligible input.  Keep the
+            # public failure semantic about inputs rather than leaking a
+            # storage-initialization detail or allowing a task to succeed with
+            # an empty projection.
+            if exc.code == "memory_db_missing":
+                raise ProjectionBuildError("no_projection_sources") from exc
+            raise
         atoms = self._scoped_atoms(memory, scope, runtime_role=runtime_role)
         if execution is not None:
             execution.progress(25, "scope", item_count=len(atoms))
             execution.check_cancelled()
         if not atoms:
-            return {
-                "status": "NO_SOURCE",
-                "mode": checked_mode,
-                "kind": kind,
-                "key": key,
-                "atom_count": 0,
-                "evidence_count": 0,
-            }
+            raise ProjectionBuildError("no_projection_sources")
+
+        evidence_store = self._evidence()
 
         evidence_by_id: dict[str, Any] = {}
         item_evidence: dict[str, list[str]] = {}
@@ -578,8 +582,21 @@ class ProjectionBuildService:
                 "atom_hash_digest": _digest(
                     *sorted(f"{item['atom_id']}:{item['atom_hash']}" for item in full_atom_refs)
                 ),
+                # Full evidence refs are already persisted transactionally in
+                # projection_evidence_links, and atom->evidence associations in
+                # projection_items.  Keeping hundreds of the same refs again
+                # in payload_json can exceed ProjectionStore's 64 KiB safety
+                # ceiling without adding any authoritative information.
+                "evidence_refs_compacted": True,
+                "evidence_hash_digest": _digest(
+                    *sorted(f"{item['evidence_id']}:{item['evidence_hash']}" for item in evidence_refs)
+                ),
+                "evidence_refs_storage": "projection_evidence_links",
             })
             atom_refs = [{"atom_id": item["atom_id"]} for item in full_atom_refs]
+        # Do not initialize ProjectionStore until after the input gate.  An
+        # empty build must not create a successful-looking projection head.
+        store = self._projection(write=True)
         previous = store.get_projection(kind, key, scope=scope)
         projector_cls = ProfileProjector if kind == "profile" else ScenarioProjector
         projector = projector_cls(store)
@@ -639,6 +656,73 @@ class ProjectionBuildService:
             "projection": self._record(row) if row is not None else None,
         }
 
+    def graph(
+        self,
+        *,
+        mode: str,
+        scope: ProjectionReadScope,
+    ) -> dict[str, Any]:
+        """Read Memory Core graph exclusively from the current projection.
+
+        ProjectionStore metadata contains bounded reference-only graph data;
+        this read never opens MemoryAtomStore or CodeGraphStore and never
+        hydrates bodies into the graph response.
+        """
+        checked_mode = self._mode(mode)
+        kind = self._kind(checked_mode)
+        key = self._scope_key(checked_mode, scope)
+        layout = WorkspaceV2Layout(self.workspace)
+        path = layout.profile_db if kind == "profile" else layout.scenario_db
+        if not path.is_file():
+            return {
+                "status": "NO_SOURCE",
+                "mode": checked_mode,
+                "kind": kind,
+                "key": key,
+                "scope_digest": _digest(*scope.as_tuple()),
+                "empty": True,
+                "root_id": "main",
+                "nodes": [],
+                "edges": [],
+                "stats": {},
+            }
+        record = self._projection(write=False).get_projection(kind, key, scope=scope)
+        if record is None:
+            return {
+                "status": "NO_SOURCE",
+                "mode": checked_mode,
+                "kind": kind,
+                "key": key,
+                "scope_digest": _digest(*scope.as_tuple()),
+                "empty": True,
+                "root_id": "main",
+                "nodes": [],
+                "edges": [],
+                "stats": {},
+            }
+        metadata = record.payload.get("metadata")
+        graph = metadata.get("derived_graph") if isinstance(metadata, Mapping) else None
+        if not isinstance(graph, Mapping):
+            raise ProjectionBuildError("projection_graph_missing")
+        nodes = [dict(node) for node in graph.get("nodes", ()) if isinstance(node, Mapping)]
+        edges = [dict(edge) for edge in graph.get("edges", ()) if isinstance(edge, Mapping)]
+        return {
+            "status": "READY",
+            "mode": checked_mode,
+            "kind": kind,
+            "key": key,
+            "scope_digest": _digest(*scope.as_tuple()),
+            "empty": not nodes,
+            "projection_id": record.projection_id,
+            "projection_digest": record.projection_digest,
+            "generation": record.generation,
+            "root_id": str(graph.get("root_id") or "main"),
+            "nodes": nodes,
+            "edges": edges,
+            "truncated": bool(graph.get("truncated")),
+            "stats": dict(metadata.get("derived_stats") or {}) if isinstance(metadata, Mapping) else {},
+        }
+
     def delete(self, *, mode: str, scope: ProjectionReadScope) -> dict[str, Any]:
         checked_mode = self._mode(mode)
         kind = self._kind(checked_mode)
@@ -666,23 +750,98 @@ class ProjectionBuildService:
         }
 
     def source_map(self, *, scope: ProjectionReadScope) -> dict[str, Any]:
-        rows = self.content.list_source_connectors(workspace_id=str(self.workspace))
-        entries = [
+        layout = WorkspaceV2Layout(self.workspace)
+        rows = (
+            self.content.list_source_connectors(workspace_id=str(self.workspace))
+            if layout.content_db.is_file()
+            else []
+        )
+        connector_entries = [
             {
+                "entry_kind": "source_connector",
                 "source_id": str(row.get("source_id") or ""),
+                "root_id": str(row.get("source_id") or ""),
+                "surface_id": str(row.get("source_id") or ""),
+                "display_name": str(row.get("source_type") or row.get("provider") or "source connector"),
                 "provider": str(row.get("provider") or ""),
                 "source_type": str(row.get("source_type") or ""),
+                "source_category": "content_source",
+                "projection_mode": "logical_reconstruction_projection",
                 "enabled": bool(row.get("enabled")),
+                "participates": bool(row.get("enabled")),
+                "logical_eligible": bool(row.get("enabled")),
+                "native_eligible": False,
+                "is_shared_memory_origin": False,
+                "record_count": 0,
+                # A connector row has no authoritative Agent owner in the
+                # Content Plane.  Keep it blank rather than deriving/faking an
+                # Agent from a connector id.
+                "agent_instance_id": "",
+                "project_ref": "",
+                "ingestion_policy": "selected_source_connector",
+                "path": "",
             }
             for row in rows
+            if str(row.get("source_id") or "")
         ]
+
+        all_atoms: list[Any] = []
+        eligible_atoms: list[Any] = []
+        if layout.memory_db.is_file():
+            memory = self._memory()
+            all_atoms = list(memory.list_atoms(
+                scope=self._memory_scope(scope),
+                status="active",
+            ))
+            eligible_atoms = self._filter_enabled_content_sources(memory, all_atoms, scope)
+        eligible_ids = {str(getattr(atom, "atom_id", "")) for atom in eligible_atoms}
+        shared_scope = not str(scope.agent_instance_id or "").strip()
+        memory_entries = [
+            {
+                "entry_kind": "governed_memory",
+                "source_id": "v2-memory:" + str(getattr(atom, "atom_id", "")),
+                "root_id": "v2-memory:" + str(getattr(atom, "atom_id", "")),
+                "surface_id": "v2-memory",
+                "display_name": "V2 governed memory · " + str(getattr(atom, "memory_id", "")),
+                "provider": str(getattr(atom, "provider", "") or ""),
+                "source_type": "v2_governed_memory",
+                "source_category": "shared_memory" if shared_scope else "native_memory",
+                "projection_mode": "shared_memory_projection" if shared_scope else "logical_reconstruction_projection",
+                "enabled": str(getattr(atom, "atom_id", "")) in eligible_ids,
+                "participates": str(getattr(atom, "atom_id", "")) in eligible_ids,
+                "logical_eligible": str(getattr(atom, "atom_id", "")) in eligible_ids,
+                "native_eligible": True,
+                "is_shared_memory_origin": shared_scope,
+                "record_count": 1,
+                "agent_instance_id": str(getattr(atom, "agent_instance_id", "") or ""),
+                "project_ref": str(getattr(atom, "project_ref", "") or ""),
+                "ingestion_policy": "governed_v2_memory",
+                "path": "",
+            }
+            for atom in sorted(all_atoms, key=lambda item: str(getattr(item, "atom_id", "")))
+            if str(getattr(atom, "atom_id", ""))
+        ]
+        entries = connector_entries + memory_entries
+        connector_enabled = sum(1 for item in connector_entries if item["enabled"])
+        memory_eligible = len(eligible_atoms)
         return {
             "ok": True,
             "status": "succeeded",
             "entries": entries,
+            "projection_kind": "shared_memory_projection" if shared_scope else "logical_reconstruction_projection",
+            "scope_semantics": "share_group_members" if shared_scope else "agent",
             "summary": {
                 "total": len(entries),
                 "enabled": sum(1 for item in entries if item["enabled"]),
+                "selected_source_connectors": connector_enabled,
+                "selected_source_connector_total": len(connector_entries),
+                "governed_memory": len(all_atoms),
+                "governed_memory_eligible": memory_eligible,
+                "buildable_atom_count": memory_eligible,
+                "native_memory": len(memory_entries) if not shared_scope else 0,
+                "logical_reconstruction": connector_enabled,
+                "evidence_only": 0,
+                "shared_memory": len(memory_entries) if shared_scope else 0,
             },
         }
 

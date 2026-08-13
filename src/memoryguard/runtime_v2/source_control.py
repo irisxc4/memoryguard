@@ -421,6 +421,21 @@ class SourceControlService:
             raise SourceControlError("source_root_not_found")
         return match
 
+    def resolve_root(self, source_id: str, context: Mapping[str, Any]) -> tuple[Path, str]:
+        """Resolve one already-authorized connector to its canonical local root.
+
+        This is an internal capability seam for consumers such as CodeGraph.
+        Callers receive a root only after the same connector visibility and
+        containment checks used by file preview; a browser path is never an
+        alternative authorization source.
+        """
+
+        connector = self._connector(source_id, context)
+        root, kind = self._root(connector)
+        if _reparse_point(root):
+            raise SourceControlError("reparse_point_blocked")
+        return root, kind
+
     def resolve_file(self, source_id: str, relative_path: str, context: Mapping[str, Any]) -> tuple[Path, Path]:
         connector = self._connector(source_id, context)
         root, _kind = self._root(connector)

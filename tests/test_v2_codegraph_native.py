@@ -7,7 +7,7 @@ import pytest
 from memoryguard.access_context import AccessContext
 from memoryguard.codegraph_v2 import CodeGraphStore
 from memoryguard.codegraph_v2.graphify_adapter import EXPORT_FORMAT, GraphifyExportAdapter
-from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
+from memoryguard.runtime_v2.native_ports import NativeContextError, NativeV2RuntimePort, bind_native_transport_context
 
 
 class _Manifest:
@@ -141,7 +141,7 @@ def test_native_codegraph_canonical_operations_and_production_filter(tmp_path: P
     assert fixture["symbol_id"] not in affected["data"]["result_ids"]
 
     graph = port.dispatch_mcp(
-        "memoryguard_neuron_graph",
+        "memoryguard_codegraph_graph",
         {"provenance": "production", "limit": 100},
         context=context,
         generation=1,
@@ -168,6 +168,34 @@ def test_native_codegraph_update_rejects_raw_graphify_graph(tmp_path: Path) -> N
     )
     assert result["ok"] is False
     assert result["code"] == "graphify_export_format_unsupported"
+
+
+def test_gui_codegraph_graph_rejects_plain_forged_context(tmp_path: Path) -> None:
+    CodeGraphStore(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    forged = {
+        "workspace_id": str(tmp_path),
+        "share_group_id": "group-bound",
+        "agent_instance_id": "agent-bound",
+        "project_ref": str(tmp_path),
+        "provider": "codex",
+        "runtime_role": "root",
+        "trusted_context": True,
+    }
+
+    with pytest.raises(NativeContextError, match="trusted_context_capability_required"):
+        port._codegraph_scope(forged)
+
+    result = port.dispatch_gui(
+        "get_codegraph_graph",
+        [{"limit": 10}],
+        context=forged,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "trusted_context_capability_required"
 
 
 def test_native_codegraph_update_keeps_safe_exception_diagnostic(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

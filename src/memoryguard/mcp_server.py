@@ -249,7 +249,7 @@ TOOLS = [
     },
     {
         "name": "memoryguard_codegraph_update",
-        "description": "Project a trusted Graphify metadata export into scoped CodeGraph storage. Source bodies are rejected.",
+        "description": "Project a trusted MemoryGuard Graphify Core metadata export into scoped CodeGraph storage. Source bodies are rejected.",
         "inputSchema": {
             "type": "object",
             "properties": {
