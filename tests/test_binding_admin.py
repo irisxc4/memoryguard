@@ -32,6 +32,11 @@ def test_non_admin_binding_create_denied(monkeypatch):
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
     with tempfile.TemporaryDirectory() as ws:
+        # MCP request ``workspace`` is only a project hint; the trusted
+        # control plane comes from the environment.  Keep this fixture away
+        # from the user's live V2 data home and any active MCP cohort lease.
+        monkeypatch.setenv("MEMORYGUARD_HOME", ws)
+        monkeypatch.setenv("MEMORYGUARD_WORKSPACE", ws)
         _activate_v2_workspace(Path(ws))
         result = execute_tool("memoryguard_binding_create", {
             "workspace": ws,
@@ -51,6 +56,10 @@ def test_self_bind_then_read_still_denied(monkeypatch):
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
 
     with tempfile.TemporaryDirectory() as ws:
+        # The payload workspace cannot select the MCP control plane.  Isolate
+        # the real V2 control plane for this test before any tool call.
+        monkeypatch.setenv("MEMORYGUARD_HOME", ws)
+        monkeypatch.setenv("MEMORYGUARD_WORKSPACE", ws)
         _activate_v2_workspace(Path(ws))
         # 先用 admin 创建 group-a 并写入(模拟合法场景)
         monkeypatch.setenv("MEMORYGUARD_ADMIN", "1")

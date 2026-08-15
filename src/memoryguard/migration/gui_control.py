@@ -153,9 +153,21 @@ def inspect_legacy_gui_control(workspace: str | Path) -> dict[str, Any]:
     }
 
 
-def migrate_legacy_gui_control(workspace: str | Path) -> dict[str, Any]:
+def migrate_legacy_gui_control(
+    workspace: str | Path,
+    *,
+    records: list[Mapping[str, Any]] | None = None,
+    source_digest: str | None = None,
+) -> dict[str, Any]:
     root = Path(workspace).expanduser().resolve()
-    records, source_digest = _load_legacy_bindings(root)
+    if records is None:
+        loaded_records, loaded_digest = _load_legacy_bindings(root)
+        records = loaded_records
+        source_digest = loaded_digest
+    else:
+        records = [dict(record) for record in records]
+        source_digest = str(source_digest or _digest(records))
+    source_digest = str(source_digest or _digest(records))
     control = SystemControlStore(root, write=True)
     request = {
         "source": "legacy_agent_bindings_json",

@@ -40,6 +40,7 @@ from .schema_v3 import (
     stable_hash,
 )
 from .runtime_v2.group_native import GroupControlService
+from .runtime_v2.governance_semantics import classify_governance_relation
 
 
 @dataclass(frozen=True)
@@ -521,16 +522,73 @@ def _classify_scope(
 
 
 def _bundle_body(source_records: list[Any]) -> str:
-    bodies = [
-        str(record.body or "").strip() for record in source_records if record.body
-    ]
-    if not bodies:
+    """Choose one deterministic canonical surface for a safe semantic cluster.
+
+    Reconciliation must never manufacture a rule by concatenating independent
+    instructions.  For equivalent/update clusters we keep the most specific
+    safe winner selected by the shared governance classifier; unrelated or
+    conflicting records are partitioned before this function is called.
+    """
+
+    records = [record for record in source_records if str(record.body or "").strip()]
+    if not records:
         return ""
-    if len(bodies) == 1:
-        return bodies[0]
-    return "\n".join(
-        f"[{i}] {body}" for i, body in enumerate(bodies, 1)
-    )
+    winner = sorted(
+        records,
+        key=lambda record: (
+            -int(getattr(record, "priority", 0) or 0),
+            -len(str(getattr(record, "body", "") or "")),
+            str(getattr(record, "memory_id", "") or ""),
+        ),
+    )[0]
+    for record in sorted(records, key=lambda item: str(getattr(item, "memory_id", "") or "")):
+        if record is winner:
+            continue
+        relation = classify_governance_relation(str(winner.body or ""), str(record.body or ""))
+        if not relation.mergeable:
+            continue
+        if relation.winner == "right":
+            winner = record
+        elif relation.winner == "":
+            candidate_key = (
+                int(getattr(record, "priority", 0) or 0),
+                len(str(getattr(record, "body", "") or "")),
+                str(getattr(record, "updated_at", "") or ""),
+                str(getattr(record, "memory_id", "") or ""),
+            )
+            winner_key = (
+                int(getattr(winner, "priority", 0) or 0),
+                len(str(getattr(winner, "body", "") or "")),
+                str(getattr(winner, "updated_at", "") or ""),
+                str(getattr(winner, "memory_id", "") or ""),
+            )
+            if candidate_key > winner_key:
+                winner = record
+    return str(winner.body or "").strip()
+
+
+def _semantic_rule_clusters(source_records: list[Any]) -> list[list[Any]]:
+    """Partition same-scope rules into only deterministic-safe merge clusters."""
+
+    clusters: list[list[Any]] = []
+    for record in sorted(source_records, key=lambda item: str(item.memory_id)):
+        chosen: list[Any] | None = None
+        for cluster in clusters:
+            relations = [
+                classify_governance_relation(str(member.body or ""), str(record.body or ""))
+                for member in cluster
+            ]
+            # Every pair must be mergeable.  One conflicting/distinct member is
+            # enough to keep the new rule separate instead of building a blind
+            # transitive mega-cluster.
+            if relations and all(relation.mergeable for relation in relations):
+                chosen = cluster
+                break
+        if chosen is None:
+            clusters.append([record])
+        else:
+            chosen.append(record)
+    return clusters
 
 
 def build_bundles(
@@ -570,38 +628,40 @@ def build_bundles(
     kept_separate: list[str] = []
     for group in grouped.values():
         scope = group["scope"]
-        sources = sorted(group["sources"], key=lambda record: record.memory_id)
         classification = _classify_scope(scope, group_agent_ids)
-        if classification == "project":
-            if len(sources) == 1:
-                # Standalone project rule with no sibling to merge with: it
-                # keeps its own active definition (never folded into a shared
-                # baseline, which would widen the project audience).
-                kept_separate.append(sources[0].memory_id)
-                continue
-            kind = "project_overlay"
-            project_ref = sorted(scope["project_refs"])[0]
-            provider = sorted(scope["providers"])[0] if scope["providers"] else ""
-            runtime_role = sorted(scope["runtime_roles"])[0] if scope["runtime_roles"] else ""
-        elif classification == "agent_overlay":
-            kind = "agent_overlay"
-            project_ref = ""
-            provider = sorted(scope["providers"])[0] if scope["providers"] else ""
-            runtime_role = sorted(scope["runtime_roles"])[0] if scope["runtime_roles"] else ""
-        else:
-            kind = "shared_baseline"
-            project_ref = ""
-            provider = ""
-            runtime_role = ""
-        bundles.append(ScopeBundle(
-            bundle_kind=kind,
-            source_memory_ids=[record.memory_id for record in sources],
-            priority=max(int(record.priority or 0) for record in sources),
-            body=_bundle_body(sources),
-            project_ref=project_ref,
-            provider=provider,
-            runtime_role=runtime_role,
-        ))
+        for sources in _semantic_rule_clusters(
+            sorted(group["sources"], key=lambda record: record.memory_id)
+        ):
+            if classification == "project":
+                if len(sources) == 1:
+                    # Standalone project rules keep their exact audience and
+                    # never get folded merely because another unrelated rule
+                    # happens to share the same project.
+                    kept_separate.append(sources[0].memory_id)
+                    continue
+                kind = "project_overlay"
+                project_ref = sorted(scope["project_refs"])[0]
+                provider = sorted(scope["providers"])[0] if scope["providers"] else ""
+                runtime_role = sorted(scope["runtime_roles"])[0] if scope["runtime_roles"] else ""
+            elif classification == "agent_overlay":
+                kind = "agent_overlay"
+                project_ref = ""
+                provider = sorted(scope["providers"])[0] if scope["providers"] else ""
+                runtime_role = sorted(scope["runtime_roles"])[0] if scope["runtime_roles"] else ""
+            else:
+                kind = "shared_baseline"
+                project_ref = ""
+                provider = ""
+                runtime_role = ""
+            bundles.append(ScopeBundle(
+                bundle_kind=kind,
+                source_memory_ids=[record.memory_id for record in sources],
+                priority=max(int(record.priority or 0) for record in sources),
+                body=_bundle_body(sources),
+                project_ref=project_ref,
+                provider=provider,
+                runtime_role=runtime_role,
+            ))
     return {"bundles": bundles, "kept_separate": kept_separate}
 
 
@@ -648,23 +708,26 @@ def validate_bundles(
 def _is_deterministic_safe_plan(
     bundle_plan: dict[str, Any], source_records: Iterable[Any],
 ) -> bool:
-    """True only for structurally identical, risk-free deduplication.
+    """Allow only pairwise-safe semantic clusters in the offline fallback."""
 
-    A heuristic plan may still be used when it only keeps sources separate or
-    folds sources whose body and audience are already identical.  Any semantic
-    merge that rewrites a combined body requires a real model bundle.
-    """
     records = {str(record.memory_id): record for record in source_records}
     for raw in bundle_plan.get("bundles", []):
         bundle = raw if isinstance(raw, ScopeBundle) else ScopeBundle.from_dict(raw)
         source_ids = [str(x) for x in bundle.source_memory_ids]
         if len(source_ids) <= 1:
             continue
-        bodies = [
-            str(records[sid].body or "").strip()
-            for sid in source_ids if sid in records
-        ]
-        if not bodies or any(body != bodies[0] for body in bodies):
+        members = [records.get(source_id) for source_id in source_ids]
+        if any(member is None for member in members):
+            return False
+        concrete = [member for member in members if member is not None]
+        for index, left in enumerate(concrete):
+            for right in concrete[index + 1:]:
+                relation = classify_governance_relation(
+                    str(left.body or ""), str(right.body or ""),
+                )
+                if not relation.mergeable:
+                    return False
+        if str(bundle.body or "").strip() != _bundle_body(concrete):
             return False
     return True
 
@@ -1033,7 +1096,10 @@ class RuleReconciliationService:
         kept_separate = bundle_plan.get("kept_separate", [])
         for bundle in bundles:
             definition = build_definition(
-                bundle.body, kind=MemoryKind.PROCEDURE, confidence=1.0,
+                bundle.body,
+                kind=MemoryKind.PROCEDURE,
+                confidence=1.0,
+                rule_strength="must",
             )
             bundle.definition_id = definition.definition_id
             self.store.upsert_definition(definition)
@@ -1137,8 +1203,10 @@ class RuleReconciliationService:
             if source_record is None:
                 raise ValueError(f"kept_separate_source_missing: {source_id}")
             definition = build_definition(
-                source_record.body, kind=source_record.kind,
+                source_record.body,
+                kind=source_record.kind,
                 confidence=source_record.confidence,
+                rule_strength="must",
             )
             self.store.upsert_definition(definition)
             union_assignments = self._union_assignments(

@@ -22,7 +22,11 @@ class HostHookExecutor:
         self._manager = HostHookManager(self.workspace)
 
     def status(self, provider: str = "", *, agent_instance_id: str = "") -> dict[str, Any]:
-        return self._manager.status(provider, agent_instance_id=agent_instance_id)
+        return self._manager.status(
+            provider,
+            agent_instance_id=agent_instance_id,
+            inspect_trust=True,
+        )
 
     def install(
         self,
@@ -37,6 +41,7 @@ class HostHookExecutor:
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
             mode=mode,
+            reconcile_trust=(provider or "").strip().lower() == "codex",
         )
 
     def uninstall(self, provider: str) -> dict[str, Any]:

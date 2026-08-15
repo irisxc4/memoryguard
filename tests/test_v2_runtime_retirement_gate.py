@@ -57,6 +57,11 @@ MIGRATION_NAMESPACE = "memoryguard.migration"
 
 _IDENTIFIER_LIKE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 
+# This is a migration-only host-maintenance API.  It removes generated V1
+# hook registrations, but is not a legacy runtime dispatch surface.  Keep the
+# exception exact: broadening the name scan would hide real retired routes.
+_HOST_MAINTENANCE_NAMES = frozenset({"retire_legacy_generated_bindings"})
+
 
 @dataclass(frozen=True)
 class _Finding:
@@ -433,7 +438,12 @@ def _legacy_dispatch_findings(
         elif isinstance(node, ast.arg):
             add(node, node.arg, "argument")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            add(node, node.name, "definition")
+            if not (
+                module == "memoryguard.host_hooks"
+                and isinstance(node, ast.FunctionDef)
+                and node.name in _HOST_MAINTENANCE_NAMES
+            ):
+                add(node, node.name, "definition")
         elif isinstance(node, ast.Attribute):
             add(node, node.attr, "attribute")
         elif isinstance(node, ast.keyword) and node.arg:

@@ -11,6 +11,12 @@ import memoryguard.host_hooks as host_hooks
 import memoryguard.mcp_server as mcp_server
 
 
+@pytest.fixture(autouse=True)
+def _isolated_v2_data_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep cutover tests off the operator's live user-level V2 control plane."""
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(tmp_path))
+
+
 class _Facade:
     def __init__(self, state: str):
         self.state = state
@@ -32,6 +38,10 @@ class _Facade:
 
 
 def _mcp_call(monkeypatch, tmp_path: Path, facade: _Facade, name: str, args=None):
+    # Runtime control is user-Data-Home based. Tests that need an isolated V2
+    # control plane must override MEMORYGUARD_HOME explicitly; WORKSPACE is
+    # only a project/migration hint and must not redirect production control.
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
     return mcp_server.execute_tool(name, dict(args or {}))
@@ -137,6 +147,7 @@ def test_real_v2_facade_dispatches_mcp_and_hook_ports(monkeypatch, tmp_path):
     facade = V2RuntimeFacade(
         manifest=Manifest(), v2=native, hook_v2=native, workspace=str(tmp_path),
     )
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
     monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("group-1", None, None))
@@ -290,6 +301,34 @@ def test_hook_state_gate_fails_closed_before_native_dispatch(
         payload={"session_id": "session-1"},
     )
     assert result["code"] == code
+    assert not facade.hook_calls
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex", "cursor"])
+@pytest.mark.parametrize("state", ["V1_ACTIVE", "V2_BUILDING", "FUTURE"])
+def test_hook_stop_state_gate_is_fail_open_before_native_dispatch(
+    monkeypatch, tmp_path, provider, state,
+):
+    facade = _Facade(state)
+    monkeypatch.setattr(
+        host_hooks, "_v2_runtime_facade_factory", lambda workspace: facade,
+    )
+    monkeypatch.setattr(
+        host_hooks,
+        "_best_effort_codex_reconcile",
+        lambda **_kwargs: {"ok": True},
+    )
+
+    result = host_hooks.run_hook(
+        provider=provider,
+        event="stop",
+        workspace=tmp_path,
+        agent_instance_id="agent-1",
+        share_group_id="group-1",
+        payload={"session_id": "session-stop"},
+    )
+
+    assert result == {}
     assert not facade.hook_calls
 
 
@@ -645,6 +684,7 @@ def test_real_facade_receives_one_manifest_snapshot(monkeypatch, tmp_path):
     manifest = _Manifest()
     facade = V2RuntimeFacade(manifest=manifest, v2=_Port(), workspace=str(tmp_path))
     monkeypatch.setattr(mcp_server, "_v2_runtime_facade_factory", lambda workspace: facade)
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(tmp_path))
     monkeypatch.setattr(mcp_server, "_resolve_access", lambda args, workspace: ("bound-group", None, None))
     result = mcp_server.execute_tool("memoryguard_list_sources", {})

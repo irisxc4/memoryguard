@@ -854,7 +854,9 @@ def test_legacy_global_runtime_redirect_requires_migration_evidence(
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(legacy))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "old-codex")
     monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
-    assert _resolve_memory_workspace({}) == legacy.resolve()
+    # A legacy project remains migration evidence only; runtime control stays
+    # on the canonical user-level V2 data home even without an explicit scope.
+    assert _resolve_memory_workspace({}) == canonical.resolve()
 
     monkeypatch.setenv("MEMORYGUARD_CONTROL_SCOPE", "global")
     assert _resolve_memory_workspace({}) == canonical.resolve()
@@ -870,12 +872,12 @@ def test_legacy_global_runtime_redirect_requires_migration_evidence(
     atoms = MemoryAtomStore(canonical).list_atoms(scope=scope, include_building=True)
     assert [atom.memory_id for atom in atoms] == ["migrated-record"]
 
-    # Without an explicit global scope, cwd/workspace remains the caller's V2
-    # project.  A legacy path never silently jumps to the migration target.
+    # Without an explicit global scope, a legacy cwd remains a migration
+    # source hint; it never becomes the runtime control plane.
     monkeypatch.delenv("MEMORYGUARD_CONTROL_SCOPE", raising=False)
     monkeypatch.delenv("MEMORYGUARD_WORKSPACE", raising=False)
     monkeypatch.chdir(legacy)
-    assert _resolve_memory_workspace({}) == legacy.resolve()
+    assert _resolve_memory_workspace({}) == canonical.resolve()
 
 
 def test_explicit_project_scope_never_auto_redirects_legacy_workspace(

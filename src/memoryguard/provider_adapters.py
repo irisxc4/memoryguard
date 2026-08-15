@@ -636,6 +636,7 @@ class ProviderAdapter:
                 agent_instance_id=agent_instance_id,
                 share_group_id=share_group_id,
                 mode="enforce",
+                reconcile_trust=self.provider_name == "codex",
             )
         except Exception as exc:
             return {

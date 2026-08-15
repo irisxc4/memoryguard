@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..rule_scope import canonical_project_ref
+
 
 class V2GovernanceError(RuntimeError):
     """Base error for fail-closed V2 governance decisions."""
@@ -67,9 +69,9 @@ class V2MutationContext:
             "workspace_id": str(self.workspace_id or ""),
             "share_group_id": str(self.share_group_id or ""),
             "agent_instance_id": str(self.agent_instance_id or ""),
-            "project_ref": str(self.project_ref or ""),
-            "provider": str(self.provider or ""),
-            "runtime_role": str(self.runtime_role or ""),
+            "project_ref": canonical_project_ref(self.project_ref),
+            "provider": str(self.provider or "").strip().casefold(),
+            "runtime_role": str(self.runtime_role or "").strip().casefold(),
             "actor": str(self.actor or ""),
             "authority": str(self.authority or "manual").casefold(),
         }
@@ -160,9 +162,9 @@ class V2MutationContext:
             return
         dimensions = (
             ("agent_instance_id", agent_instance_id, self.agent_instance_id),
-            ("project_ref", project_ref, self.project_ref),
-            ("provider", provider, self.provider),
-            ("runtime_role", runtime_role, self.runtime_role),
+            ("project_ref", canonical_project_ref(project_ref), self.project_ref),
+            ("provider", str(provider or "").strip().casefold(), self.provider),
+            ("runtime_role", str(runtime_role or "").strip().casefold(), self.runtime_role),
         )
         for name, target, allowed in dimensions:
             target_text = str(target or "")

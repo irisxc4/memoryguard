@@ -26,6 +26,7 @@ from memoryguard.host_hooks import (
     set_hook_mode,
 )
 from memoryguard.provider_adapters import CodexAdapter
+from memoryguard.rule_scope import canonical_project_ref
 from memoryguard.storage.layout import WorkspaceV2Layout
 from memoryguard.storage.schema import initialize_all
 from memoryguard.system.manifest import ManifestManager, ManifestState
@@ -82,7 +83,7 @@ def _seed_v2_atom(
         "workspace_id": str(workspace.resolve()),
         "share_group_id": group,
         "agent_instance_id": agent,
-        "project_ref": str(workspace.resolve()).casefold(),
+        "project_ref": canonical_project_ref(str(workspace.resolve())),
         "provider": "codex",
         "runtime_role": "root",
         "actor": "host-hooks-fixture",
@@ -873,6 +874,191 @@ def test_paused_mode_is_emergency_bypass_for_tool_guard(
         },
     )
     assert result == {}
+
+
+def test_paused_mode_bypasses_v2_cutover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    set_hook_mode(workspace, "codex", "codex-agent", "paused")
+
+    def fail_if_v2_cutover_runs(_workspace):
+        raise AssertionError("paused mode must bypass V2 cutover")
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        fail_if_v2_cutover_runs,
+    )
+    result = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": "paused-session",
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(workspace / "README.md")},
+        },
+    )
+    assert result == {}
+
+
+def test_successful_bootstrap_clears_prior_mandatory_budget_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = "recover-mandatory-budget"
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            ok=False,
+            error="mandatory_budget_exceeded",
+        ),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "first attempt"},
+    )
+    state_path = _state_path(workspace, "codex", session_id)
+    failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed_state["mandatory_overflow"] is True
+    assert failed_state["bootstrap_error"] == "mandatory_budget_exceeded"
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "retry after repair"},
+    )
+    recovered_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recovered_state["mandatory_overflow"] is False
+    assert not recovered_state.get("bootstrap_error")
+
+    allowed = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(workspace / "README.md")},
+        },
+    )
+    assert allowed == {}
+
+
+@pytest.mark.parametrize(
+    ("provider", "tool_name", "tool_input"),
+    [
+        (
+            "codex",
+            "mcp__memoryguard__memoryguard_memory_update",
+            {"memory_id": "duplicate-rule", "injection_policy": "relevant"},
+        ),
+        (
+            "cursor",
+            "CallMcpTool",
+            {
+                "toolName": "memoryguard_memory_delete",
+                "arguments": {"memory_id": "duplicate-rule"},
+            },
+        ),
+    ],
+)
+def test_recovery_tools_bypass_broken_context_pretool_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    tool_name: str,
+    tool_input: dict,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+
+    def fail_if_bootstrap_runs(_workspace):
+        raise AssertionError("recovery PreToolUse must not enter broken V2 bootstrap")
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        fail_if_bootstrap_runs,
+    )
+    result = run_hook(
+        provider=provider,
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id=f"{provider}-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": "repair-session",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        },
+    )
+    assert result == {}
+
+
+def test_stop_fails_open_when_v2_reports_mandatory_budget_exceeded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            ok=False,
+            error="mandatory_budget_exceeded",
+        ),
+    )
+    monkeypatch.setattr(
+        host_hooks,
+        "_best_effort_codex_reconcile",
+        lambda **_kwargs: {"ok": True},
+    )
+
+    result = run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": "mandatory-budget-stop"},
+    )
+
+    assert result == {}
+    state = json.loads(
+        _state_path(workspace, "codex", "mandatory-budget-stop").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["mandatory_overflow"] is True
+    assert state["bootstrap_error"] == "mandatory_budget_exceeded"
 
 
 def test_v2_provider_install_routes_bound_identity_without_duplicate_hook_setup(

@@ -18,20 +18,29 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .. import host_hooks as _host_hooks
 from ..cutover_v2.evidence_assembler import ReadinessEvidenceAssembler
 from ..cutover_v2.facade import get_v2_runtime_facade
 from ..data_home import resolve_data_home
 from ..evidence.store import EvidenceStore
 from ..governance_v2 import GovernanceV2
+from ..host_hooks import HostHookManager
 from ..migration.v2_validator import V2MigrationValidator
 from ..memory.store import MemoryAtomStore
-from ..runtime_v2.group_native import GroupControlService, SystemControlStore
+from ..runtime_v2.group_native import (
+    GroupControlService,
+    SystemControlStore,
+    _group_kind,
+)
 from ..runtime_v2.phase4_acceptance import phase4_acceptance_evidence
 from ..storage.database import open_database
 from ..storage.transaction import transaction
 from ..system.manifest import ManifestManager, ManifestState
 from .gui_control import (
     GuiControlMigrationError,
+    _canonical,
+    _load_legacy_bindings,
+    _missing_legacy_bindings,
     inspect_legacy_gui_control,
     migrate_legacy_gui_control,
 )
@@ -160,24 +169,386 @@ def _envelope(
     return payload
 
 
-def _legacy_binding_ids(workspace: Path) -> set[str]:
-    root = workspace / ".memoryguard" / "agent-bindings"
-    result: set[str] = set()
-    if not root.is_dir():
-        return result
-    for path in sorted(root.glob("*.json")):
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, Mapping):
+def _legacy_binding_records(workspace: Path) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for directory in ("agent-bindings", "agent_bindings"):
+        root = workspace / ".memoryguard" / directory
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.json")):
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(raw, Mapping):
+                continue
             binding_id = str(raw.get("binding_id") or "").strip()
-            if binding_id:
-                result.add(binding_id)
+            agent_id = str(raw.get("agent_instance_id") or "").strip()
+            group_id = str(raw.get("share_group_id") or "").strip()
+            identity = binding_id or f"{agent_id}:{group_id}"
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            records.append({
+                "binding_id": binding_id,
+                "agent_instance_id": agent_id,
+                "share_group_id": group_id,
+                "status": str(raw.get("status") or "").strip(),
+            })
+    return records
+
+
+def _legacy_binding_ids(workspace: Path) -> set[str]:
+    return {
+        item["binding_id"]
+        for item in _legacy_binding_records(workspace)
+        if item.get("binding_id")
+    }
+
+
+def _remove_legacy_hook_fragments(
+    workspace: Path,
+    bindings: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Remove pre-share-group generated Hook commands for migrated bindings.
+
+    Older Codex registrations predate ``--share-group-id``.  The normal
+    HostHookManager cleanup intentionally rejects such incomplete identities,
+    so upgrade owns this narrow compatibility pass.  Only a generated command
+    bound to one migrated Agent and the exact legacy workspace is removed;
+    current V2 commands and user-owned handlers remain untouched.
+    """
+
+    targets = {
+        str(item.get("agent_instance_id") or "").strip(): str(
+            item.get("share_group_id") or ""
+        ).strip()
+        for item in bindings
+        if str(item.get("agent_instance_id") or "").strip()
+        and str(item.get("share_group_id") or "").strip()
+    }
+    result: dict[str, Any] = {
+        "binding_count": 0,
+        "handler_count": 0,
+        "bindings": [],
+    }
+    if not targets:
+        return result
+
+    root = Path(workspace).expanduser().resolve()
+    removed: dict[tuple[str, str, str], int] = {}
+    adapters = (
+        ("claude", _host_hooks.ClaudeHookAdapter),
+        ("codex", _host_hooks.CodexHookAdapter),
+        ("cursor", _host_hooks.CursorHookAdapter),
+    )
+
+    def is_legacy_handler(handler: Any, provider: str) -> tuple[str, str] | None:
+        if not _host_hooks._is_our_handler(handler):
+            return None
+        if not isinstance(handler, Mapping):
+            return None
+        for key in ("command", "commandWindows"):
+            command = str(handler.get(key) or "")
+            if not command:
+                continue
+            if _host_hooks._command_option(command, "--managed-by") != "memoryguard":
+                continue
+            if _host_hooks._command_option(command, "--provider").lower() != provider:
+                continue
+            agent_id = _host_hooks._command_option(command, "--agent-id")
+            if agent_id not in targets:
+                continue
+            bound_workspace = _host_hooks._command_option(command, "--workspace")
+            try:
+                same_workspace = (
+                    Path(bound_workspace).expanduser().resolve() == root
+                )
+            except (OSError, RuntimeError, ValueError):
+                same_workspace = False
+            if not same_workspace:
+                continue
+            # Current V2 commands have a complete binding identity and are
+            # handled by HostHookManager.  Missing group identity marks old
+            # provider registration, which is the only compatibility target.
+            if _host_hooks._command_option(command, "--share-group-id"):
+                return None
+            return agent_id, targets[agent_id]
+        return None
+
+    def filter_config(data: dict[str, Any], provider: str) -> list[tuple[str, str]]:
+        hooks = data.get("hooks")
+        if not isinstance(hooks, dict):
+            return []
+        found: list[tuple[str, str]] = []
+        for event_name in list(hooks):
+            entries = hooks.get(event_name)
+            if not isinstance(entries, list):
+                continue
+            kept_entries: list[Any] = []
+            for entry in entries:
+                direct = is_legacy_handler(entry, provider)
+                if direct is not None:
+                    found.append((direct[0], direct[1]))
+                    continue
+                if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                    kept_entries.append(entry)
+                    continue
+                kept_handlers: list[Any] = []
+                for handler in entry["hooks"]:
+                    target = is_legacy_handler(handler, provider)
+                    if target is None:
+                        kept_handlers.append(handler)
+                    else:
+                        found.append((target[0], target[1]))
+                if kept_handlers:
+                    copied = dict(entry)
+                    copied["hooks"] = kept_handlers
+                    kept_entries.append(copied)
+            if kept_entries:
+                hooks[event_name] = kept_entries
+            else:
+                hooks.pop(event_name, None)
+        if not hooks:
+            data.pop("hooks", None)
+        return found
+
+    snapshots: list[tuple[Path, dict[str, Any]]] = []
+    try:
+        for provider, adapter_cls in adapters:
+            adapter = adapter_cls(root)
+            path = adapter.config_path()
+            data = _host_hooks._load_json_config(path, strict=True)
+            original = json.loads(json.dumps(data))
+            found = filter_config(data, provider)
+            if not found:
+                continue
+            snapshots.append((path, original))
+            _host_hooks._write_json_config(path, data)
+            for agent_id, group_id in found:
+                key = (provider, agent_id, group_id)
+                removed[key] = removed.get(key, 0) + 1
+    except Exception:
+        for path, data in reversed(snapshots):
+            _host_hooks._write_json_config(path, data)
+        raise
+
+    result["bindings"] = [
+        {
+            "provider": provider,
+            "agent_instance_id": agent_id,
+            "share_group_id": group_id,
+            "handler_count": count,
+        }
+        for (provider, agent_id, group_id), count in sorted(removed.items())
+    ]
+    result["binding_count"] = len(result["bindings"])
+    result["handler_count"] = sum(
+        int(item["handler_count"]) for item in result["bindings"]
+    )
     return result
 
 
-def _control_binding_health(workspace: Path) -> dict[str, Any]:
+def _merge_hook_cleanup(
+    primary: Mapping[str, Any],
+    compatibility: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Merge exact current and legacy Hook cleanup receipts."""
+
+    merged: dict[tuple[str, str, str], int] = {}
+    for source in (primary, compatibility):
+        for item in source.get("bindings", []) or []:
+            if not isinstance(item, Mapping):
+                continue
+            key = (
+                str(item.get("provider") or ""),
+                str(item.get("agent_instance_id") or ""),
+                str(item.get("share_group_id") or ""),
+            )
+            merged[key] = merged.get(key, 0) + int(item.get("handler_count") or 0)
+    bindings = [
+        {
+            "provider": provider,
+            "agent_instance_id": agent_id,
+            "share_group_id": group_id,
+            "handler_count": count,
+        }
+        for (provider, agent_id, group_id), count in sorted(merged.items())
+    ]
+    return {
+        "binding_count": len(bindings),
+        "handler_count": sum(item["handler_count"] for item in bindings),
+        "bindings": bindings,
+    }
+
+
+def _binding_recovery_records(workspace: Path) -> tuple[list[dict[str, Any]], str]:
+    """Read immutable migrated binding evidence retained in the V2 manifest."""
+
+    try:
+        checkpoints = ManifestManager(workspace).current().checkpoints
+    except Exception:
+        return [], ""
+    raw = checkpoints.get("legacy_binding_recovery", {}) if isinstance(checkpoints, Mapping) else {}
+    metadata = raw.get("metadata", {}) if isinstance(raw, Mapping) else {}
+    if not isinstance(metadata, Mapping):
+        return [], ""
+    try:
+        decoded = json.loads(str(metadata.get("records_json") or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return [], ""
+    if not isinstance(decoded, list):
+        return [], ""
+    records = [dict(item) for item in decoded if isinstance(item, Mapping)]
+    return records, str(metadata.get("source_digest") or "")
+
+
+def _migrate_gui_control_to_target(
+    source_workspace: Path,
+    target_workspace: Path,
+    *,
+    records: list[dict[str, Any]] | None = None,
+    source_digest: str = "",
+) -> dict[str, Any]:
+    """Migrate V1 binding metadata from source into separate V2 target.
+
+    ``migration.gui_control`` historically read and wrote one workspace.  The
+    public single-plane upgrade can now have a project V1 source and user V2
+    target, so reuse its validation helpers while keeping target writes in the
+    target system database.
+    """
+
+    if records is None:
+        records, source_digest = _load_legacy_bindings(source_workspace)
+    else:
+        records = [dict(record) for record in records]
+        source_digest = str(source_digest or _canonical(records))
+    control = SystemControlStore(target_workspace, write=True)
+    request = {
+        "source": "legacy_agent_bindings_json",
+        "source_digest": source_digest,
+        "record_count": len(records),
+    }
+
+    def apply(conn: Any) -> tuple[Mapping[str, Any], str]:
+        missing = _missing_legacy_bindings(conn, records)
+        migrated = 0
+        active = 0
+        inactive = 0
+        for record in missing:
+            if record["status"] == "active":
+                conflicting = conn.execute(
+                    "SELECT binding_id,share_group_id FROM agent_group_bindings "
+                    "WHERE agent_instance_id=? AND status='active'",
+                    (record["agent_instance_id"],),
+                ).fetchone()
+                if conflicting is not None:
+                    raise GuiControlMigrationError("v2_active_binding_conflict")
+            created_at = (
+                record["bound_at"]
+                or record["last_drift_check"]
+                or "1970-01-01T00:00:00+00:00"
+            )
+            updated_at = record["last_drift_check"] or created_at
+            conn.execute(
+                "INSERT INTO agent_group_bindings(binding_id,agent_instance_id,"
+                "share_group_id,group_kind,mcp_server_name,native_memory_mode,"
+                "redirect_paths_json,status,revision,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,1,?,?) "
+                "ON CONFLICT(binding_id) DO UPDATE SET "
+                "agent_instance_id=excluded.agent_instance_id,"
+                "share_group_id=excluded.share_group_id,"
+                "group_kind=excluded.group_kind,"
+                "mcp_server_name=excluded.mcp_server_name,"
+                "native_memory_mode=excluded.native_memory_mode,"
+                "redirect_paths_json=excluded.redirect_paths_json,"
+                "status=excluded.status,"
+                "updated_at=excluded.updated_at",
+                (
+                    record["binding_id"],
+                    record["agent_instance_id"],
+                    record["share_group_id"],
+                    _group_kind(record["share_group_id"]),
+                    record["mcp_server_name"],
+                    record["native_memory_mode"],
+                    _canonical(record["redirect_paths"]),
+                    record["status"],
+                    created_at,
+                    updated_at,
+                ),
+            )
+            migrated += 1
+            if record["status"] == "active":
+                active += 1
+            else:
+                inactive += 1
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "source": "legacy_agent_bindings_json",
+            "source_digest": source_digest,
+            "record_count": len(records),
+            "migrated_count": migrated,
+            "active_count": active,
+            "inactive_count": inactive,
+            "changed": migrated > 0,
+        }, "gui-control-migration"
+
+    return dict(control.mutate(
+        "migrate_legacy_agent_bindings",
+        "legacy-agent-bindings-v1",
+        request,
+        apply,
+    ))
+
+
+def _migrate_gui_control(
+    source_workspace: Path,
+    target_workspace: Path,
+) -> dict[str, Any]:
+    recovered: list[dict[str, Any]] | None = None
+    recovered_digest = ""
+    try:
+        source_records, _source_digest = _load_legacy_bindings(source_workspace)
+        if not source_records:
+            recovered, recovered_digest = _binding_recovery_records(target_workspace)
+            if not recovered:
+                recovered = None
+    except Exception:
+        # Keep malformed present source files on the strict validation path.
+        recovered = None
+    if source_workspace == target_workspace:
+        return migrate_legacy_gui_control(
+            target_workspace,
+            records=recovered,
+            source_digest=recovered_digest or None,
+        )
+    return _migrate_gui_control_to_target(
+        source_workspace,
+        target_workspace,
+        records=recovered,
+        source_digest=recovered_digest,
+    )
+
+
+def _control_binding_health(
+    workspace: Path,
+    *,
+    source_workspace: str | Path | None = None,
+) -> dict[str, Any]:
     """Compare frozen V1 Agent bindings with authoritative V2 membership."""
 
-    legacy_ids = _legacy_binding_ids(workspace)
+    source = (
+        Path(source_workspace).expanduser().resolve()
+        if source_workspace is not None
+        else workspace
+    )
+    legacy_ids = _legacy_binding_ids(source)
+    if not legacy_ids:
+        recovered, _digest = _binding_recovery_records(workspace)
+        legacy_ids = {
+            str(item.get("binding_id") or "")
+            for item in recovered
+            if str(item.get("binding_id") or "")
+        }
     bindings = GroupControlService(workspace, write=False).list_bindings(include_inactive=True)
     v2_ids = {
         str(item.get("binding_id") or "")
@@ -299,27 +670,221 @@ def _activate_governance_domain(workspace: Path) -> dict[str, Any]:
     return {"before": before, "after": after, "changed": before["status"] != "PASS"}
 
 
+_LEGACY_RUNTIME_DIRS = (
+    "shared-memory", "shared_memory",
+    "managed-memory", "managed_memory",
+    "agent-bindings", "agent_bindings",
+)
+
+
+def _migrated_legacy_paths(
+    target_workspace: Path,
+    source_workspace: Path,
+    bindings: list[Mapping[str, Any]],
+) -> list[Path]:
+    """Return only source files consumed by the verified V2 migration."""
+
+    paths: set[Path] = set()
+    source_memory_roots = [
+        source_workspace / ".memoryguard" / name
+        for name in ("shared-memory", "shared_memory")
+    ]
+    for root in source_memory_roots:
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            candidate = child / "memory.db" if child.is_dir() else child
+            if (
+                candidate.is_file()
+                and candidate.suffix.casefold() in {".db", ".sqlite", ".sqlite3"}
+            ):
+                paths.add(candidate)
+
+    managed_roots = [
+        source_workspace / ".memoryguard" / name
+        for name in ("managed-memory", "managed_memory")
+    ]
+    for root in managed_roots:
+        if not root.is_dir():
+            continue
+        for agent_dir in root.iterdir():
+            if not agent_dir.is_dir():
+                continue
+            active = agent_dir / "active.json"
+            if active.is_file():
+                paths.add(active)
+            versions = agent_dir / "versions"
+            if not versions.is_dir():
+                continue
+            for records in versions.glob("*/records.jsonl"):
+                if records.is_file():
+                    paths.add(records)
+
+    migrated_binding_ids: set[str] = set()
+    try:
+        migrated_binding_ids = {
+            str(item.get("binding_id") or "")
+            for item in GroupControlService(
+                target_workspace, write=False,
+            ).list_bindings(include_inactive=True).get("bindings", [])
+            if isinstance(item, Mapping) and str(item.get("binding_id") or "")
+        }
+    except Exception:
+        # Do not delete binding files when target membership cannot be proved.
+        migrated_binding_ids = set()
+    for directory in ("agent-bindings", "agent_bindings"):
+        root = source_workspace / ".memoryguard" / directory
+        if not root.is_dir():
+            continue
+        for path in root.glob("*.json"):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if isinstance(raw, Mapping) and str(raw.get("binding_id") or "") in migrated_binding_ids:
+                paths.add(path)
+
+    return sorted(paths, key=lambda path: str(path).casefold())
+
+
+def _prune_empty_legacy_parents(paths: list[Path], source_workspace: Path) -> list[Path]:
+    """Remove only now-empty legacy containers, never non-empty data roots."""
+
+    roots = {
+        (source_workspace / ".memoryguard" / name).resolve()
+        for name in _LEGACY_RUNTIME_DIRS
+    }
+    candidates: set[Path] = set()
+    for path in paths:
+        current = path.parent.resolve()
+        while current in roots or any(root in current.parents for root in roots):
+            candidates.add(current)
+            if current in roots:
+                break
+            current = current.parent
+    removed: list[Path] = []
+    for directory in sorted(candidates, key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except (FileNotFoundError, OSError):
+            continue
+        removed.append(directory)
+    return removed
+
+
 def _cleanup_active_migration(
     workspace: Path,
     current: Any,
     *,
     apply: bool,
+    source_workspace: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Clean only the active batch, without changing activation outcome."""
+    """Retire verified V1 runtime artifacts after V2 activation.
+
+    Activation is authoritative and is never rolled back because cleanup has
+    debt.  The receipt therefore reports partial failures as warnings while
+    keeping the already-verified V2 state intact.  Re-running is idempotent.
+    """
 
     migration_id = str(getattr(current, "migration_id", "") or "")
+    source_root = (
+        Path(source_workspace).expanduser().resolve()
+        if source_workspace is not None
+        else workspace
+    )
+    bindings = _legacy_binding_records(source_root)
+    legacy_files = _migrated_legacy_paths(workspace, source_root, bindings)
+    result: dict[str, Any] = {
+        "status": "PASS",
+        "ok": True,
+        "cleanup_warning": False,
+        "migration_id": migration_id,
+        "removed": False,
+        "removed_legacy_paths": [],
+        "remaining": [],
+        "errors": [],
+        "hook_cleanup": {"binding_count": 0, "handler_count": 0, "bindings": []},
+    }
     try:
-        return cleanup_migration_backups(workspace, migration_id, dry_run=not apply)
-    except Exception as exc:  # cleanup debt must never demote V2_ACTIVE
-        return {
-            "status": "WARNING",
-            "ok": False,
-            "cleanup_warning": True,
-            "migration_id": migration_id,
-            "removed": False,
-            "remaining": [migration_id] if migration_id else [],
-            "errors": [{"path": migration_id or "<missing>", "error": f"{type(exc).__name__}: {exc}"}],
+        backup = cleanup_migration_backups(workspace, migration_id, dry_run=not apply)
+        result["backup_cleanup"] = backup
+        if not bool(backup.get("ok", True)):
+            result["cleanup_warning"] = True
+            result["status"] = "WARNING"
+            result["ok"] = False
+            result["errors"].extend(list(backup.get("errors") or []))
+            result["remaining"].extend(list(backup.get("remaining") or []))
+        else:
+            result["status"] = str(backup.get("status") or "PASS")
+    except Exception as exc:
+        result.update({"status": "WARNING", "ok": False, "cleanup_warning": True})
+        result["errors"].append({
+            "path": migration_id or "<migration-backup>",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+
+    if not apply:
+        result["planned_legacy_paths"] = [str(path) for path in legacy_files]
+        result["planned_hook_bindings"] = len(bindings)
+        return result
+
+    primary_hook_cleanup: Mapping[str, Any] = {
+        "binding_count": 0,
+        "handler_count": 0,
+        "bindings": [],
+    }
+    try:
+        hook_cleanup = HostHookManager(source_root).retire_legacy_generated_bindings(
+            bindings,
+            active_workspace=workspace,
+        )
+        primary_hook_cleanup = hook_cleanup.public_result()
+    except Exception as exc:
+        result.update({"status": "WARNING", "ok": False, "cleanup_warning": True})
+        result["errors"].append({
+            "path": "host_hooks",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    try:
+        compatibility_hook_cleanup = _remove_legacy_hook_fragments(
+            source_root, bindings,
+        )
+    except Exception as exc:
+        compatibility_hook_cleanup = {
+            "binding_count": 0,
+            "handler_count": 0,
+            "bindings": [],
         }
+        result.update({"status": "WARNING", "ok": False, "cleanup_warning": True})
+        result["errors"].append({
+            "path": "host_hooks.legacy",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    result["hook_cleanup"] = _merge_hook_cleanup(
+        primary_hook_cleanup, compatibility_hook_cleanup,
+    )
+
+    removed_files: list[Path] = []
+    for path in legacy_files:
+        try:
+            path.unlink(missing_ok=True)
+            removed_files.append(path)
+            result["removed_legacy_paths"].append(str(path))
+        except Exception as exc:
+            result.update({"status": "WARNING", "ok": False, "cleanup_warning": True})
+            result["remaining"].append(str(path))
+            result["errors"].append({
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+    for directory in _prune_empty_legacy_parents(removed_files, source_root):
+        result["removed_legacy_paths"].append(str(directory))
+    result["removed"] = bool(
+        result["removed_legacy_paths"]
+        or result["hook_cleanup"].get("handler_count")
+        or result.get("backup_cleanup", {}).get("removed")
+    )
+    return result
 
 
 def _verify_ready(
@@ -327,6 +892,8 @@ def _verify_ready(
     data_home: Path,
     manager: ManifestManager,
     control_preview: Mapping[str, Any],
+    *,
+    source_workspace: str | Path | None = None,
 ) -> dict[str, Any]:
     """Re-run the production readiness evidence after GUI control migration."""
 
@@ -339,7 +906,9 @@ def _verify_ready(
             "state": _state_value(current),
         }
 
-    binding_health = _control_binding_health(workspace)
+    binding_health = _control_binding_health(
+        workspace, source_workspace=source_workspace,
+    )
     missing_bindings = list(binding_health["missing_binding_ids"])
     control = {
         "legacy_record_count": int(control_preview.get("record_count") or 0),
@@ -501,6 +1070,36 @@ def _project_gui_control_outbox(workspace: Path) -> dict[str, Any]:
     return {"status": "PASS", "max_sequence": maximum}
 
 
+def _record_binding_recovery_checkpoint(
+    manager: ManifestManager,
+    migration_id: str,
+    source_workspace: Path,
+) -> None:
+    """Persist binding migration inputs before activation retires V1 files."""
+
+    current = manager.current()
+    if current.state is not ManifestState.V2_BUILDING:
+        return
+    records, source_digest = _load_legacy_bindings(source_workspace)
+    if not records:
+        return
+    manager.record_checkpoint(
+        {
+            "legacy_binding_recovery": {
+                "metadata": {
+                    "source": "legacy_agent_bindings_json",
+                    "source_digest": source_digest,
+                    # Keep migration inputs opaque to the generic JSON
+                    # reference auditor; these are recovery metadata, not
+                    # live foreign keys in another V2 plane.
+                    "records_json": _canonical(records),
+                },
+            }
+        },
+        migration_id=migration_id,
+    )
+
+
 def run_upgrade(
     workspace: str | Path = ".",
     *,
@@ -517,6 +1116,12 @@ def run_upgrade(
         Path(data_home).expanduser().resolve()
         if data_home is not None
         else resolve_data_home()
+    )
+    # ``workspace`` is V2 target; explicit ``data_home`` is V1 source for the
+    # public upgrade path.  Legacy source cleanup/GUI control checks must use
+    # that source while all manifests and runtime stores stay at ``root``.
+    source_root = (
+        resolved_data_home if data_home is not None else root
     )
     stages = _stages()
     manager = ManifestManager(root)
@@ -545,8 +1150,10 @@ def run_upgrade(
     state = current.state
     if state is ManifestState.V2_ACTIVE:
         try:
-            control_preview = inspect_legacy_gui_control(root)
-            control_health = _control_binding_health(root)
+            control_preview = inspect_legacy_gui_control(source_root)
+            control_health = _control_binding_health(
+                root, source_workspace=source_root,
+            )
             memory_health = _memory_activation_health(root)
             governance_health = _governance_activation_health(root)
         except Exception as exc:
@@ -629,9 +1236,11 @@ def run_upgrade(
         if missing:
             stages["preflight"] = _stage("PASS", ok=True, detail=control_health)
             try:
-                repaired = migrate_legacy_gui_control(root)
+                repaired = _migrate_gui_control(source_root, root)
                 repaired["projection"] = _project_gui_control_outbox(root)
-                after = _control_binding_health(root)
+                after = _control_binding_health(
+                    root, source_workspace=source_root,
+                )
                 if after["missing_binding_ids"]:
                     raise GuiControlMigrationError("active_control_repair_incomplete")
             except Exception as exc:
@@ -652,7 +1261,9 @@ def run_upgrade(
                 "PASS", ok=True, writes_performed=bool(memory_repair or governance_repair),
                 detail={"control": after, "memory": memory_health, "governance": governance_health},
             )
-            cleanup = _cleanup_active_migration(root, current, apply=True)
+            cleanup = _cleanup_active_migration(
+                root, current, apply=True, source_workspace=source_root,
+            )
             stages["activate"] = _stage(
                 "IDEMPOTENT", ok=True, code="already_active",
                 detail={**_manifest_summary(manager, current), "cleanup": cleanup},
@@ -665,7 +1276,9 @@ def run_upgrade(
                 detail={"control": after, "memory": memory_health, "governance": governance_health, "cleanup": cleanup},
             )
         if memory_repair or governance_repair:
-            cleanup = _cleanup_active_migration(root, current, apply=True)
+            cleanup = _cleanup_active_migration(
+                root, current, apply=True, source_workspace=source_root,
+            )
             if memory_repair and governance_repair:
                 repair_code = "active_runtime_repaired"
             elif governance_repair:
@@ -691,7 +1304,9 @@ def run_upgrade(
                 next_step=_next_step("active"), writes_performed=True,
                 detail={"control": control_health, **runtime_health, "cleanup": cleanup},
             )
-        cleanup = _cleanup_active_migration(root, current, apply=apply)
+        cleanup = _cleanup_active_migration(
+            root, current, apply=apply, source_workspace=source_root,
+        )
         stages["preflight"] = _stage(
             "PASS", ok=True, code="already_active",
             detail={**_manifest_summary(manager, current), "control": control_health, "memory": memory_health, "governance": governance_health},
@@ -770,7 +1385,7 @@ def run_upgrade(
 
     # The preflight is deliberately the only work done by the default path.
     try:
-        control_preview = inspect_legacy_gui_control(root)
+        control_preview = inspect_legacy_gui_control(source_root)
         if state is ManifestState.V2_READY:
             prepare_preview: dict[str, Any] = {
                 "status": "NOT_REQUIRED",
@@ -899,9 +1514,12 @@ def run_upgrade(
         )
 
     try:
-        control_result = migrate_legacy_gui_control(root)
+        control_result = _migrate_gui_control(source_root, root)
         if control_result.get("ok") is not True:
             raise GuiControlMigrationError("gui_control_migration_failed")
+        _record_binding_recovery_checkpoint(
+            manager, str(current.migration_id or working.migration_id), source_root,
+        )
         control_result["projection"] = _project_gui_control_outbox(root)
         stages["gui_control"] = _stage(
             "PASS", ok=True, writes_performed=True, detail=control_result
@@ -926,7 +1544,13 @@ def run_upgrade(
             detail={"error": str(exc)},
         )
 
-    verified = _verify_ready(root, resolved_data_home, manager, control_preview)
+    verified = _verify_ready(
+        root,
+        resolved_data_home,
+        manager,
+        control_preview,
+        source_workspace=source_root,
+    )
     if verified.get("ok") is not True:
         code = str(verified.get("code") or "v2_readiness_verification_failed")
         stages["verify"] = _stage("BLOCKED", writes_performed=True, code=code, detail=verified)
@@ -1021,7 +1645,9 @@ def run_upgrade(
             writes_performed=True, detail={"error": str(exc)},
         )
 
-    cleanup = _cleanup_active_migration(root, active, apply=True)
+    cleanup = _cleanup_active_migration(
+        root, active, apply=True, source_workspace=source_root,
+    )
     stages["activate"] = _stage(
         "PASS", ok=True, writes_performed=True, code="activated",
         detail={**_manifest_summary(manager, active), "memory": memory_activation, "cleanup": cleanup},

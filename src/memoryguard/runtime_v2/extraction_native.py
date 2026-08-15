@@ -642,8 +642,17 @@ class NativeExtractionEnrichmentService:
                 counts["other"] += 1
         return {**counts, "total": len(rows), "mode": "v2_content_plane"}
 
-    def _build_and_enrich_scope(self, scope: Mapping[str, Any]) -> dict[str, Any]:
-        atoms = self.memory.list_atoms(scope=scope, status="active")
+    def _build_and_enrich_scope(
+        self,
+        scope: Mapping[str, Any],
+        *,
+        read_scope: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # A validated projection may intentionally leave the Agent dimension
+        # empty for a shared-group read.  Keep that business scope for task
+        # identity and staging records, while using an explicit admin read
+        # scope only for the canonical memory plane.
+        atoms = self.memory.list_atoms(scope=read_scope or scope, status="active")
         queued = 0
         for atom in atoms:
             if not self._needs_enrichment(atom):
@@ -674,7 +683,13 @@ class NativeExtractionEnrichmentService:
 
     def build_and_enrich_projection(self, payload: Mapping[str, Any], *, scope: Any) -> dict[str, Any]:
         del payload
-        return self._build_and_enrich_scope(_projection_scope(scope, self.workspace))
+        projection_scope = _projection_scope(scope, self.workspace)
+        read_scope = (
+            {**projection_scope, "admin": True}
+            if not projection_scope["agent_instance_id"]
+            else projection_scope
+        )
+        return self._build_and_enrich_scope(projection_scope, read_scope=read_scope)
 
     def _apply_enrichments_scope(
         self,
@@ -682,6 +697,7 @@ class NativeExtractionEnrichmentService:
         scope: Mapping[str, Any],
         *,
         admin: bool,
+        read_scope: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw = payload.get("results")
         if not isinstance(raw, list) or not raw:
@@ -713,7 +729,7 @@ class NativeExtractionEnrichmentService:
         for item, row in normalized:
             meta = dict(row["metadata"])
             memory_id = str(meta.get("memory_id") or "")
-            current = self.memory.get_atom(memory_id, scope=scope)
+            current = self.memory.get_atom(memory_id, scope=read_scope or scope)
             if current is None:
                 raise NativePortError("enrichment_memory_not_found")
             body = str(item["body"])
@@ -777,10 +793,17 @@ class NativeExtractionEnrichmentService:
         return self._apply_enrichments_scope(payload, _scope(context), admin=False)
 
     def apply_enrichments_projection(self, payload: Mapping[str, Any], *, scope: Any) -> dict[str, Any]:
+        projection_scope = _projection_scope(scope, self.workspace)
+        read_scope = (
+            {**projection_scope, "admin": True}
+            if not projection_scope["agent_instance_id"]
+            else projection_scope
+        )
         return self._apply_enrichments_scope(
             payload,
-            _projection_scope(scope, self.workspace),
+            projection_scope,
             admin=True,
+            read_scope=read_scope,
         )
 
     def dispatch(self, operation: str, payload: Any = None, *, context: Any = None, **_: Any) -> dict[str, Any]:

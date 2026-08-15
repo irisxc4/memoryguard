@@ -40,16 +40,18 @@ def _event(agent: str, group: str, body: str, event_id: str) -> MemoryEvent:
     )
 
 
-def test_v2_same_group_exact_and_near_duplicate_merge_provenance(tmp_path):
+def test_v2_same_agent_scope_exact_duplicate_merges_provenance(tmp_path):
     organizer, store = _organizer(tmp_path, "team", threshold=0.50)
-    first, _ = organizer.organize(_event("agent-a", "team", "Team uses Python for backend tests.", "event-a"))
-    second, actions = organizer.organize(_event("agent-b", "team", "Team uses Python for backend tests every day.", "event-b"))
+    body = "Team uses Python for backend tests."
+    first, _ = organizer.organize(_event("agent-a", "team", body, "event-a"))
+    second, actions = organizer.organize(_event("agent-a", "team", body, "event-b"))
 
     assert first.memory_id == second.memory_id
     assert any(item["action"] == "merge_provenance" for item in actions)
     atoms = _atoms(store, tmp_path, "team")
     assert len(atoms) == 1
-    assert {item["agent_instance_id"] for item in atoms[0].provenance} == {"agent-a", "agent-b"}
+    assert len(atoms[0].provenance) == 2
+    assert {item["agent_instance_id"] for item in atoms[0].provenance} == {"agent-a"}
     assert "body" not in atoms[0].metadata
 
 
@@ -82,7 +84,7 @@ def test_v2_concurrent_same_group_writes_keep_one_canonical_atom(tmp_path):
             engine=engine,
         )
         return organizer.organize(
-            _event(f"agent-{index}", "team", "The shared deployment rule is required.", f"event-{index}")
+            _event("agent-a", "team", "The shared deployment rule is required.", f"event-{index}")
         )[0]
 
     with ThreadPoolExecutor(max_workers=6) as pool:

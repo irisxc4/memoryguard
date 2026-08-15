@@ -1,5 +1,99 @@
 # Changelog
 
+## [0.7.1.post16] - 2026-08-15
+
+### Fixed
+
+- Corrected verified Codex thread binding for globally installed Hooks: the payload `cwd`/project path is now matched against `state_5.sqlite`, instead of incorrectly comparing the thread cwd with MemoryGuard's control-data directory.
+- Real Codex acceptance now persists a non-empty `host_thread_id` on lifecycle leases, enabling later archive/delete cleanup for top-level conversations without treating ordinary turn `Stop` as terminal.
+- Keeps workspace isolation fail-closed: when Hook cwd is absent the older workspace-bound check remains, and a mismatched thread cannot authorize a global terminal sweep.
+
+## [0.7.1.post15] - 2026-08-15
+
+### Fixed
+
+- Binds each observed lifecycle lease to the verified Codex thread ID when host state can prove the session-to-thread mapping, without accepting an unverified payload identity.
+- Reclaims an idle exclusive cohort only after read-only `state_5.sqlite` evidence shows its bound Codex thread was archived or deleted. The current root thread, live rows, shared cohorts, ambiguous mappings, and leases without verified thread IDs remain protected.
+- Runs this indexed-terminal sweep after the existing `PostToolUse` and `Stop` reconciliation paths, preserving the seven-hook post14 design and generic observation-only lifecycle mode.
+
+## [0.7.1.post14] - 2026-08-15
+
+### Fixed
+
+- Finalized automatic Codex cleanup on the existing seven trusted MemoryGuard Hooks; no new `SubagentStop` Hook or trust migration is required.
+- `PostToolUse` and `Stop` reconcile Codex terminal/deleted child state, then reclaim a process cohort only when the terminal thread maps to exactly one exclusive live cohort. Shared, ambiguous, or still-active branches are preserved.
+- A missing child thread left behind by history deletion closes its orphan spawn edge, so stale sub-agent `处理中` indicators no longer remain backed by an `open` edge.
+- Ordinary conversation `Stop` remains resumable and never grants generic process-kill authority. Generic lifecycle `auto` stays observation-only; hard termination is derived only from Codex-owned terminal thread evidence.
+- Hook authorization tolerates Codex omitting `CODEX_THREAD_ID`: a session fallback is accepted only when `state_5.sqlite` proves the thread exists and its cwd matches the current workspace.
+
+## [0.7.1.post12] - 2026-08-15
+
+### Fixed
+
+- Turns Codex sub-agent cleanup into a hard-terminal lifecycle path instead of a PID-age heuristic. Ordinary turn `Stop` remains non-destructive; only thread IDs already proven terminal by Codex state are eligible for process reclamation.
+- A terminal sub-agent cohort is reclaimed automatically only when it maps to exactly one live cohort and no other live lease shares that cohort. Shared or ambiguous mappings remain untouched.
+- Global terminal reconciliation now runs on `PostToolUse` as well as session/prompt/stop boundaries, so a completed child is closed and its exclusive runtime can be released immediately after the parent receives the result.
+- History deletion now closes an orphan `thread_spawn_edges` row when its child thread no longer exists, while a missing node with any live/unknown descendant remains protected. This prevents deleted-history sub-agents from staying visually stuck as `处理中`.
+- When Codex omits `CODEX_THREAD_ID`, the conservative global sweep may use the Hook `session_id` only after `state_5.sqlite` proves that thread exists and its cwd belongs to the current workspace; root-scoped mutation retains the stricter host-owned identity rule.
+- Keeps generic MCP lifecycle `auto` mode observation-only. Automatic termination authority exists only in the hard-terminal sub-agent path above, where termination evidence comes from Codex thread state rather than process timing.
+
+## [0.7.1.post9] - 2026-08-15
+
+### Fixed
+
+- Reconciles Codex sub-agent UI state after history deletion: an open spawn edge whose child thread row has been deleted is now treated as a terminal orphan, while live/unknown descendants remain a hard safety boundary.
+- Runs the bounded global sub-agent reconciliation on `UserPromptSubmit` as well as session start/stop, so stale “处理中” badges are repaired on the next interaction without requiring a full Codex restart.
+- Keeps MCP lifecycle auto mode observation-only from post8; no automatic Hook path regains process-termination authority.
+- Reconciles only exact user-level MemoryGuard Hook hashes through Codex's official `hooks/list`, `config/read`, and `config/batchWrite` app-server APIs. Provider install, `memoryguard hooks install/ensure`, and GUI/MCP host-control installs now restore trusted+enabled Hook state without touching unrelated hooks.
+- Makes Hook status consult Codex's effective runtime view instead of treating the presence of `hooks.json` as proof. Disabled, modified, duplicate, or incomplete MemoryGuard Hook sets are reported as `configured_untrusted` and cannot masquerade as operational.
+- Replaces the emergency regex-based `config.toml` editor with the same optimistic-concurrency app-server reconciliation path.
+- Makes an explicit `MEMORYGUARD_HOME` outrank cwd/ancestor V2 discovery for bare MCP launches, preventing a nested project from silently selecting another workspace as the control plane.
+
+## [0.7.1.post8] - 2026-08-15
+
+### Fixed
+
+- Removed all automatic process termination from the default Codex lifecycle path. `auto` now records exact reclaim candidates but never calls `taskkill`; only an explicitly selected diagnostic `force` mode may terminate a validated cohort.
+- Added a second termination gate inside `WindowsProcessController`, so even an accidental call cannot kill a process unless the controller was constructed with explicit termination permission.
+- Lifecycle receipts now expose `termination_enabled` and `reclaim_candidate_pids`, distinguishing observation/quarantine from an actual process kill. This prevents an MCP transport replacement from invalidating in-flight tool outputs and triggering Codex session rebuild loops.
+- The Hook-only activation bridge now pins the clean `0.7.1.post8` wheel. Existing Codex Hooks remain disabled until the safe wheel is verified and deliberately re-enabled.
+
+## [0.7.1.post7] - 2026-08-15
+
+### Fixed
+
+- Isolated Codex lifecycle receipts by the concrete `codex.exe` generation (`PID + process start time`). Desktop Codex, parallel Desktop instances, ephemeral `codex exec`, and PID reuse no longer overwrite one another's thread leases or retirement evidence.
+- Added a bounded diagnostics index at `hook-runtime/codex-mcp-lifecycle.json`; mutable per-generation leases live in separate state shards. A matching pre-shard receipt is adopted once, while a receipt owned by another Codex generation is never imported.
+- Persisted generation key, state path, assignment reason, pulse count, and stable cohort counts so live lifecycle acceptance can distinguish a real `snapshot_delta` lease from a guessed association.
+- A unique current-generation snapshot delta now reserves its cohort before writer-lock reconciliation. A restored writer lock can neither steal that initial transport nor reassign a cohort already held by a proven `snapshot_delta` lease on later pulses.
+- Completed the MCP stdio read-only protocol surface for `resources/list`, `resources/templates/list`, and `ping`. Codex no longer logs method-not-found warnings merely because MemoryGuard exposes tools but no resources.
+
+## [0.7.1.post3] - 2026-08-15
+
+### Fixed
+
+- Corrected the Codex lifecycle model: `Stop` is a turn boundary, not a conversation-close event. Live stdio transports remain leased across stopped and resumed turns, and a bookkeeping timeout never kills a still-live cohort.
+- Automatic cleanup now requires positive replacement evidence for the same thread. Restored writer-lock cohorts and unknown legacy cohorts remain observe-only; one-generation legacy draining is available only through diagnostic `force` mode.
+- Native `agent` memory audiences now follow the trusted Agent across projects. Project narrowing is explicit through `agent_project`; stale optional project/provider/runtime metadata no longer makes a successful body-only write unreadable from another cwd.
+- Repaired the installed MemoryGuard Skill front matter so Codex no longer rejects its emoji as an invalid Unicode escape.
+
+## [0.7.1.post3] - 2026-08-15
+
+### Fixed
+
+- Protected direct Python stdio MCP roots from lifecycle termination. Cohort timing alone is not proof that a Python server is disposable; killing one can close a shared MemoryGuard transport for every restored conversation.
+- Added `scripts/repair_codex_memoryguard_transport.py` to atomically normalize the Codex MemoryGuard MCP entry, preserve the trusted binding, force UTF-8 stdio, recover even from duplicate invalid MemoryGuard sections, retain only the latest three config backups, and run live JSON-RPC initialize/list/status/read verification with a receipt.
+- Updated the normal provider installation path to emit `python -X utf8 -m memoryguard.mcp_server`, so a later provider reinstall or MemoryGuard update does not recreate the transport configuration that this repair removes.
+
+## [0.7.1.post2] - 2026-08-15
+
+### Fixed
+
+- Added a fail-open, opt-out Codex Desktop lifecycle compatibility shim for leaked Windows stdio MCP cohorts. Codex remains the startup/lifecycle authority; MemoryGuard waits through a native-cleanup grace period and only reclaims a cohort it previously observed as released or replaced.
+- Hardened ownership under restored conversations and parallel subagents. Exact ownership now prefers one-to-one Codex `thread-writer-locks` plus read-only `state_5.sqlite` activity evidence; a unique before/after process snapshot remains the safe late-start fallback.
+- Restored but inactive threads and superseded exact cohorts are retired conservatively. Ambiguous writer-lock mappings disable nearest/unique-unowned guesses and remain observe-only. PID, parent PID, executable name, and start time are revalidated before termination.
+- The shim is independently switchable with `MEMORYGUARD_CODEX_MCP_LIFECYCLE=auto|off|force`; the current editable-install bridge loads the pinned clean `0.7.1.post2` wheel only for the managed Codex Hook process and self-retires after a real package upgrade.
+
 ## [0.7.1] - 2026-08-14
 
 ### Fixed

@@ -118,6 +118,7 @@ def _write_public(
     body: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict:
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(workspace))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(workspace))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", agent)
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
@@ -169,7 +170,7 @@ def active_v2_workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_public_v2_same_group_exact_body_deduplicates_provenance(
+def test_public_v2_same_group_different_agent_audiences_stay_distinct(
     active_v2_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -195,12 +196,12 @@ def test_public_v2_same_group_exact_body_deduplicates_provenance(
     )
 
     assert first["mutation_kind"] == "created"
-    assert second["mutation_kind"] == "deduplicated", _dedup_failure_diagnostics(
+    assert second["mutation_kind"] == "created", _dedup_failure_diagnostics(
         active_v2_workspace,
         first,
         second,
     )
-    assert second["memory_id"] == first["memory_id"]
+    assert second["memory_id"] != first["memory_id"]
 
     store = MemoryAtomStore(active_v2_workspace, readonly=True)
     atoms = store.list_atoms(
@@ -212,9 +213,173 @@ def test_public_v2_same_group_exact_body_deduplicates_provenance(
         status="active",
         include_building=True,
     )
-    assert len(atoms) == 1
-    assert len(atoms[0].provenance) == 2
-    assert {item["agent_instance_id"] for item in atoms[0].provenance} == {
-        "agent-a",
-        "agent-b",
+    assert len(atoms) == 2
+    assert {atom.agent_instance_id for atom in atoms} == {"agent-a", "agent-b"}
+
+
+def test_public_v2_memory_write_accepts_descriptor_body_only_contract(
+    active_v2_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public MCP descriptor requires only ``body`` for a new write."""
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "0")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "0")
+    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(active_v2_workspace))
+
+    result = execute_tool(
+        "memoryguard_memory_write",
+        {
+            "workspace": str(active_v2_workspace),
+            "agent_instance_id": "agent-a",
+            "body": "Use the shared test fixture for body-only MCP writes.",
+            "kind": "procedure",
+            "injection_policy": "relevant",
+        },
+    )
+
+    assert result.get("isError") is not True, _public_result_failure(result)
+    payload = json.loads(result["content"][0]["text"])
+    data = payload["data"]
+    assert data["ok"] is True
+    assert data["atom"]["memory_id"]
+    assert data["atom"]["kind"] == "procedure"
+    assert data["atom"]["injection_policy"] == "relevant"
+
+
+def test_public_v2_memory_write_can_be_read_immediately(
+    active_v2_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful native write must be readable before async promotion."""
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "0")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "0")
+    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(active_v2_workspace))
+
+    written = execute_tool(
+        "memoryguard_memory_write",
+        {
+            "workspace": str(active_v2_workspace),
+            "agent_instance_id": "agent-a",
+            "body": "Read this immediately after the native write.",
+            "kind": "procedure",
+            "injection_policy": "relevant",
+        },
+    )
+    assert written.get("isError") is not True, _public_result_failure(written)
+    write_data = json.loads(written["content"][0]["text"])["data"]
+    memory_id = write_data["atom"]["memory_id"]
+    assert write_data["atom"]["visibility"] == "building"
+    audience = write_data["atom"]["metadata"]["audience"]
+    assert audience["target_type"] == "agent"
+    assert audience["target_id"] == "agent-a"
+    assert audience["project_ref"] == ""
+    assert audience["provider"] == ""
+    assert audience["runtime_role"] == ""
+
+    # The same trusted Agent must read its ordinary relevant memory from a
+    # different project cwd. Project narrowing requires agent_project.
+    other_project = active_v2_workspace / "another-project"
+    other_project.mkdir()
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(other_project))
+
+    read = execute_tool(
+        "memoryguard_memory_read",
+        {
+            "workspace": str(active_v2_workspace),
+            "agent_instance_id": "agent-a",
+            "memory_id": memory_id,
+        },
+    )
+    assert read.get("isError") is not True, _public_result_failure(read)
+    read_data = json.loads(read["content"][0]["text"])["data"]
+    assert read_data["memory_id"] == memory_id
+    assert read_data["body"] == "Read this immediately after the native write."
+    assert read_data["kind"] == "procedure"
+    assert read_data["injection_policy"] == "relevant"
+
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-b")
+    foreign_read = execute_tool(
+        "memoryguard_memory_read",
+        {
+            "workspace": str(active_v2_workspace),
+            "agent_instance_id": "agent-b",
+            "memory_id": memory_id,
+        },
+    )
+    assert foreign_read.get("isError") is not True, _public_result_failure(foreign_read)
+    foreign_data = json.loads(foreign_read["content"][0]["text"])["data"]
+    assert foreign_data is None
+
+
+def test_public_v2_body_only_write_preserves_explicit_retry_key(
+    active_v2_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(active_v2_workspace))
+    monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
+    monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "1")
+    monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "0")
+    monkeypatch.setenv("MEMORYGUARD_ADMIN", "0")
+    monkeypatch.setenv("MEMORYGUARD_PROVIDER", "codex")
+    monkeypatch.setenv("MEMORYGUARD_PROJECT_CWD", str(active_v2_workspace))
+    args = {
+        "workspace": str(active_v2_workspace),
+        "agent_instance_id": "agent-a",
+        "body": "Retry this body-only MCP write with the same key.",
+        "kind": "procedure",
+        "injection_policy": "relevant",
+        "idempotency_key": "body-only-retry",
     }
+
+    first_result = execute_tool("memoryguard_memory_write", args)
+    second_result = execute_tool("memoryguard_memory_write", args)
+    assert first_result.get("isError") is not True, _public_result_failure(first_result)
+    assert second_result.get("isError") is not True, _public_result_failure(second_result)
+    first = json.loads(first_result["content"][0]["text"])["data"]
+    second = json.loads(second_result["content"][0]["text"])["data"]
+    assert first["atom"]["memory_id"] == second["atom"]["memory_id"]
+    assert second["mutation_kind"] == "deduplicated"
+    assert second["idempotent_replay"] is True
+
+
+def test_public_v2_same_agent_exact_body_reuses_canonical_record(
+    active_v2_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = "The team uses Python for backend tests."
+    first = _write_public(
+        active_v2_workspace, "agent-a", "memory-a", "event-a", "write-a", body, monkeypatch,
+    )
+    second = _write_public(
+        active_v2_workspace, "agent-a", "memory-a-copy", "event-a-copy", "write-a-copy", body, monkeypatch,
+    )
+
+    assert first["mutation_kind"] == "created"
+    assert second["mutation_kind"] == "deduplicated"
+    assert second["memory_id"] == first["memory_id"]
+    assert second["governance_receipt"]["action"] == "merged"
+
+    store = MemoryAtomStore(active_v2_workspace, readonly=True)
+    atoms = store.list_atoms(
+        scope=MemoryReadScope(
+            workspace_id=str(active_v2_workspace.resolve()),
+            share_group_id="shared-team",
+            admin=True,
+        ),
+        status="active",
+        include_building=True,
+    )
+    same_agent = [atom for atom in atoms if atom.agent_instance_id == "agent-a"]
+    assert len(same_agent) == 1
+    assert len(same_agent[0].provenance) == 2

@@ -14,6 +14,29 @@ from pathlib import Path
 # 环境变量名
 _ENV_DATA_HOME = "MEMORYGUARD_HOME"
 
+# These are project-local control artifacts from the pre-V2 layout.  The
+# runtime only uses them as a negative safety check: it never opens, parses,
+# or imports their contents.  Migration code may still inspect the exact
+# paths as a source after the control plane has been selected.
+_PROJECT_CONTROL_ARTIFACTS = frozenset(
+    {
+        "agent-bindings",
+        "agent_bindings",
+        "config.json",
+        "config.local.json",
+        # governance.lock is also the V2 cross-process synchronization file.
+        # Treating its presence as a legacy-project marker makes a freshly
+        # configured Data Home fall back elsewhere immediately after its first
+        # mutation, splitting the control plane across two roots.
+        "managed-memory",
+        "managed_memory",
+        "manifest.json",
+        "shared-memory",
+        "shared_memory",
+    }
+)
+_V2_MANIFEST = Path(".memoryguard") / "system" / "manifest.db"
+
 
 def _user_data_dir() -> Path:
     """跨平台用户数据目录。"""
@@ -25,18 +48,70 @@ def _user_data_dir() -> Path:
     return Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))) / "MemoryGuard"
 
 
-def resolve_data_home(explicit: str | None = None) -> Path:
-    """解析统一存储目录。
-
-    优先级：显式参数 > MEMORYGUARD_HOME 环境变量 > 用户数据目录。
-    工作区（MEMORYGUARD_WORKSPACE）不是数据目录，知识书库不落到工作区。
-    """
-    if explicit and explicit.strip():
+def _raw_data_home(explicit: str | Path | None = None) -> Path:
+    """Resolve the configured path without applying runtime safety checks."""
+    if explicit is not None and str(explicit).strip():
         return Path(explicit).expanduser().resolve()
     env_home = os.environ.get(_ENV_DATA_HOME, "").strip()
     if env_home:
         return Path(env_home).expanduser().resolve()
     return _user_data_dir().resolve()
+
+
+def is_v2_data_home(path: str | Path) -> bool:
+    """Return whether *path* has the V2 control manifest marker."""
+    root = Path(path).expanduser().resolve()
+    return (root / _V2_MANIFEST).is_file()
+
+
+def _has_project_control_artifacts(path: str | Path) -> bool:
+    """Detect a known project-local control tree without reading its data."""
+    control_root = Path(path).expanduser().resolve() / ".memoryguard"
+    if not control_root.is_dir():
+        return False
+    return any((control_root / name).exists() for name in _PROJECT_CONTROL_ARTIFACTS)
+
+
+def _safe_default_data_home() -> Path:
+    """Return the configured V2 control root, avoiding a project tree."""
+    configured = _raw_data_home()
+    if is_v2_data_home(configured) or not _has_project_control_artifacts(configured):
+        return configured
+
+    fallback = _user_data_dir().resolve()
+    # A configured path that looks like a legacy project is never a runtime
+    # control root.  The user-level fallback remains the only safe destination
+    # even when an older installation left V1 artifacts there as well; runtime
+    # callers may create/use its V2 layout, while migration code is the only
+    # caller allowed to inspect those legacy paths.
+    if fallback != configured:
+        return fallback
+    return configured
+
+
+def resolve_data_home(explicit: str | Path | None = None) -> Path:
+    """解析统一存储目录。
+
+    优先级：显式参数 > MEMORYGUARD_HOME 环境变量 > 用户数据目录。
+    工作区（MEMORYGUARD_WORKSPACE）不是数据目录，知识书库不落到工作区。
+    """
+    if explicit is not None and str(explicit).strip():
+        candidate = Path(explicit).expanduser().resolve()
+        if is_v2_data_home(candidate) or not _has_project_control_artifacts(candidate):
+            return candidate
+        return _safe_default_data_home()
+    return _safe_default_data_home()
+
+
+def resolve_runtime_data_home(explicit: str | Path | None = None) -> Path:
+    """Resolve the sole V2 data plane used by production runtime surfaces.
+
+    ``MEMORYGUARD_WORKSPACE`` and the current directory are intentionally not
+    consulted here.  An explicit project-local legacy tree is rejected and
+    falls back to the configured user data home; an explicit V2/isolated root
+    remains available for tests and operator-managed V2 installations.
+    """
+    return resolve_data_home(explicit)
 
 
 def knowledge_db_path(data_home: Path | None = None) -> Path:

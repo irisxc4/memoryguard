@@ -14,16 +14,32 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .data_home import is_v2_data_home
+
 
 _MAX_ANCESTOR_DEPTH = 6
 _V2_RUNTIME_STATES = frozenset({"V2_ACTIVE", "V2_READY"})
 _STATE_PRIORITY = {
     "V2_ACTIVE": 0,
     "V2_READY": 1,
-    "V1_ACTIVE": 2,
-    "V2_BUILDING": 3,
-    "UNKNOWN": 4,
+    "V2_BUILDING": 2,
+    "UNKNOWN": 3,
 }
+
+_MIGRATION_SOURCE_ARTIFACTS = frozenset(
+    {
+        "agent-bindings",
+        "agent_bindings",
+        "config.json",
+        "config.local.json",
+        "governance.lock",
+        "managed-memory",
+        "managed_memory",
+        "manifest.json",
+        "shared-memory",
+        "shared_memory",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -75,6 +91,11 @@ ManifestReader = Callable[[Path], Any]
 
 def _default_manifest_reader(path: Path) -> tuple[str, int | None, Any]:
     """Read a candidate manifest without creating a workspace or database."""
+
+    # Runtime discovery is V2-only.  A non-V2 project tree is a migration
+    # source candidate, never a manifest reader input.
+    if not is_v2_data_home(path):
+        return "UNKNOWN", None, None
 
     from .system.manifest import ManifestManager
 
@@ -144,7 +165,12 @@ def _discover(cwd: Path, reader: ManifestReader) -> Path:
     seen: set[Path] = set()
     for raw_path, source, distance in _iter_bounded_candidates(cwd):
         path = _normalise(raw_path)
-        if path in seen or not path.is_dir() or not (path / ".memoryguard").is_dir():
+        if (
+            path in seen
+            or not path.is_dir()
+            or not (path / ".memoryguard").is_dir()
+            or not is_v2_data_home(path)
+        ):
             continue
         seen.add(path)
         candidates.append(
@@ -172,6 +198,43 @@ def _discover(cwd: Path, reader: ManifestReader) -> Path:
     if cwd in seen:
         return cwd
     return cwd
+
+
+def _looks_like_migration_source(path: Path) -> bool:
+    """Recognise only exact project-local artifacts eligible for upgrade."""
+    if is_v2_data_home(path):
+        return False
+    control_root = path / ".memoryguard"
+    if not control_root.is_dir():
+        return False
+    return any((control_root / name).exists() for name in _MIGRATION_SOURCE_ARTIFACTS)
+
+
+def discover_migration_source(
+    cwd: str | Path | None = None,
+    *,
+    data_home: str | Path | None = None,
+) -> Path | None:
+    """Find one bounded, trusted project source for a bare upgrade.
+
+    This is deliberately a migration seam.  It performs marker-only
+    inspection and never opens a legacy manifest, database, or binding.
+    Runtime callers must use :func:`resolve_data_home` for their control
+    plane instead.
+    """
+    base = _normalise(cwd or Path.cwd())
+    excluded = _normalise(data_home) if data_home is not None else None
+    for raw_path, source, _distance in _iter_bounded_candidates(base):
+        # A bare upgrade may inspect the current project and its bounded
+        # ancestors.  Child projects are not trusted as an implicit source.
+        if source == "cwd-child":
+            continue
+        path = _normalise(raw_path)
+        if excluded is not None and path == excluded:
+            continue
+        if _looks_like_migration_source(path):
+            return path
+    return None
 
 
 def resolve_workspace(
@@ -204,5 +267,6 @@ def resolve_workspace(
 __all__ = [
     "WorkspaceCandidate",
     "WorkspaceResolutionError",
+    "discover_migration_source",
     "resolve_workspace",
 ]

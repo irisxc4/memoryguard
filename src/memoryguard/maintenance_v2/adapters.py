@@ -179,7 +179,14 @@ class SQLiteReadOnlyAdapter:
                 ).fetchall()
             }
             for name in self._table_names(conn):
-                if not _shadow_table(name, fts_bases):
+                # FTS virtual tables and SQLite's generated shadow tables are
+                # rebuildable search projections, not authoritative domain
+                # tables.  ``fts_bases`` is derived from sqlite_master SQL,
+                # so this is an exact object classification rather than a
+                # broad name-prefix exemption.  Triggers are not returned by
+                # _table_names and therefore do not enter the authoritative
+                # table snapshot.
+                if name not in fts_bases and not _shadow_table(name, fts_bases):
                     tables[name] = self._columns(conn, name)
             marker, version = self._marker(conn)
             user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])

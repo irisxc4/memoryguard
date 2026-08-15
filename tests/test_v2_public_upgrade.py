@@ -50,6 +50,10 @@ def _legacy_0_6_2_fixture(root: Path) -> Path:
             ),
         )
         conn.commit()
+    # sqlite3.Connection's context manager commits/rolls back but does not
+    # close the handle.  Windows cannot retire the migrated V1 source while
+    # this fixture-owned connection remains open.
+    conn.close()
 
     binding = root / ".memoryguard" / "agent-bindings" / "binding-1.json"
     binding.parent.mkdir(parents=True, exist_ok=True)

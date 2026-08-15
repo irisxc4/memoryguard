@@ -363,6 +363,10 @@ class ProjectionBuildService:
 
     @staticmethod
     def _memory_scope(scope: ProjectionReadScope, *, runtime_role: str = "") -> MemoryReadScope:
+        # A blank Agent in a validated projection scope is the explicit
+        # server-admin/shared-group view.  MemoryAtomStore uses its separate
+        # ``admin`` flag to represent that group-wide read; leaving it false
+        # would apply the writer-agent fallback and hide every member atom.
         return MemoryReadScope(
             workspace_id=scope.workspace_id,
             share_group_id=scope.share_group_id,
@@ -370,6 +374,7 @@ class ProjectionBuildService:
             project_ref=scope.project_ref,
             provider=scope.provider,
             runtime_role=str(runtime_role or ""),
+            admin=not bool(str(scope.agent_instance_id or "").strip()),
         )
 
     def _filter_enabled_content_sources(

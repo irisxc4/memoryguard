@@ -107,6 +107,18 @@ class V2SemanticDeduplicator:
             and atom.status in allowed
         ]
 
+    def candidates(
+        self,
+        *,
+        statuses: Iterable[str] | None = None,
+    ) -> list[MemoryAtom]:
+        """Return deterministic scoped atoms for a higher-level governance classifier."""
+
+        return sorted(
+            self._atoms(statuses),
+            key=lambda atom: (atom.memory_id, atom.atom_id),
+        )
+
     def find(
         self,
         text: str,

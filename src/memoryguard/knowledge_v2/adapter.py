@@ -16,6 +16,7 @@ import re
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..content.store import ContentReadScope, ContentStore, UNKNOWN_ACL
+from ..rule_scope import canonical_project_ref
 
 
 _FORBIDDEN = frozenset(
@@ -208,7 +209,22 @@ class KnowledgeV2Adapter:
         )
         if any(not isinstance(value, str) or value != value.strip() or not value or value == UNKNOWN_ACL for value in dimensions):
             return None
-        return scope
+        try:
+            project_ref = canonical_project_ref(scope.project_ref)
+            if not project_ref:
+                return None
+            return ContentReadScope(
+                namespace_id=scope.namespace_id,
+                workspace_id=scope.workspace_id,
+                agent_instance_id=scope.agent_instance_id,
+                project_ref=project_ref,
+                provider=scope.provider,
+                share_group_id=scope.share_group_id,
+                sensitivity=scope.sensitivity,
+                policy_class=scope.policy_class,
+            )
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _reference(row: Mapping[str, Any]) -> KnowledgeReference:
@@ -242,10 +258,13 @@ class KnowledgeV2Adapter:
         predicates = [
             "o.active=1",
             "b.namespace_id=?",
-            "o.workspace_id=?",
+            "LOWER(REPLACE(o.workspace_id,char(92),'/'))="
+            "LOWER(REPLACE(?,char(92),'/'))",
             "o.agent_instance_id=?",
-            "o.project_ref=?",
-            "o.provider=?",
+            "(LOWER(REPLACE(o.project_ref,char(92),'/'))=? "
+            "OR ? LIKE LOWER(REPLACE(o.project_ref,char(92),'/')) || '/%' "
+            "OR LOWER(REPLACE(o.project_ref,char(92),'/')) LIKE ? || '/%')",
+            "LOWER(o.provider)=LOWER(?)",
             "o.share_group_id=?",
             "o.sensitivity=?",
             "o.policy_class=?",
@@ -254,6 +273,8 @@ class KnowledgeV2Adapter:
             namespace_id,
             checked.workspace_id,
             checked.agent_instance_id,
+            checked.project_ref,
+            checked.project_ref,
             checked.project_ref,
             checked.provider,
             checked.share_group_id,
@@ -268,12 +289,19 @@ class KnowledgeV2Adapter:
             params.append(str(occurrence_id))
         query_text = str(query or "").strip()
         if query_text:
-            # Search labels/locator only.  Never use ``b.text`` as a search
-            # source; doing so would turn this metadata adapter into a body
-            # disclosure path.
-            predicates.append("(so.title LIKE ? OR o.locator_json LIKE ?)")
-            like = f"%{query_text}%"
-            params.extend((like, like))
+            # Search safe labels/locator metadata by bounded query terms. A
+            # bootstrap task is usually a sentence, so requiring the entire
+            # sentence as one SQL substring silently drops relevant knowledge.
+            # Raw blob text is never searched here.
+            terms = re.findall(r"[\w\u4e00-\u9fff]{2,}", query_text.casefold())[:12]
+            terms = list(dict.fromkeys(terms)) or [query_text.casefold()]
+            predicates.append("(" + " OR ".join(
+                "(LOWER(so.title) LIKE ? OR LOWER(o.locator_json) LIKE ?)"
+                for _term in terms
+            ) + ")")
+            for term in terms:
+                like = f"%{term}%"
+                params.extend((like, like))
         sql = (
             "SELECT o.occurrence_id,o.source_object_id,o.occurrence_key,o.locator_json,"
             "o.content_role,o.sensitivity,o.policy_class,o.provider,"

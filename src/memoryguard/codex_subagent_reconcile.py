@@ -458,6 +458,53 @@ def _read_active_ids_from_env() -> set[str]:
     return _active_ids(part.strip() for part in raw.split(",") if part.strip())
 
 
+_SUBAGENT_STOP_ID_KEYS = frozenset({
+    "agent_id",
+    "agent_thread_id",
+    "child_thread_id",
+    "subagent_id",
+    "subagent_thread_id",
+    "thread_id",
+})
+_SUBAGENT_STOP_CONTAINERS = frozenset({
+    "agent",
+    "subagent",
+    "metadata",
+    "details",
+    "context",
+})
+
+
+def _subagent_stop_candidate_ids(payload: Mapping[str, Any] | None) -> set[str]:
+    """Extract only host-shaped subagent identifiers from a stop payload.
+
+    Tool inputs, prompt bodies, and arbitrary nested user content are not
+    traversed.  A candidate still has to match an existing open spawn edge
+    before any Codex-owned state can be changed.
+    """
+
+    if not isinstance(payload, Mapping):
+        return set()
+    found: set[str] = set()
+
+    def visit(mapping: Mapping[str, Any], depth: int) -> None:
+        for raw_key, value in mapping.items():
+            key = str(raw_key).strip().casefold()
+            if key in _SUBAGENT_STOP_ID_KEYS and isinstance(value, str):
+                normalized = _safe_id(value)
+                if normalized:
+                    found.add(normalized)
+            if (
+                depth < 2
+                and key in _SUBAGENT_STOP_CONTAINERS
+                and isinstance(value, Mapping)
+            ):
+                visit(value, depth + 1)
+
+    visit(payload, 0)
+    return found
+
+
 def _terminal_rollout_event(raw_path: Any, *, codex_home: Path) -> str:
     """Return one allow-listed terminal event without exposing rollout text."""
 
@@ -524,7 +571,7 @@ def _global_terminal_graph(
     open_children: dict[str, set[str]] = defaultdict(set)
     terminal: dict[str, str] = {}
     skipped_active: set[str] = set()
-    missing_threads = 0
+    missing_threads: set[str] = set()
     skipped_nonterminal = 0
 
     for raw_parent, raw_child, raw_status, archived, rollout_path in rows:
@@ -539,7 +586,14 @@ def _global_terminal_graph(
             skipped_active.add(child)
             continue
         if archived is None:
-            missing_threads += 1
+            # Codex history deletion can remove the child thread row while
+            # leaving its spawn edge open. The missing row is positive
+            # evidence that the edge can no longer represent a live indexed
+            # child. Treat it as a terminal orphan, but let the fixed-point
+            # pass below keep the edge open if it still has any live/unknown
+            # descendants. No phantom thread row is ever inserted or archived.
+            missing_threads.add(child)
+            terminal[child] = "missing_thread"
             continue
         event = "archived" if bool(archived) else _terminal_rollout_event(
             rollout_path, codex_home=codex_home
@@ -576,7 +630,8 @@ def _global_terminal_graph(
         "closed_edges": closed_edges,
         "candidate_threads": sorted(safe),
         "skipped_active": sorted(skipped_active),
-        "missing_thread_count": missing_threads,
+        "missing_thread_count": len(missing_threads),
+        "missing_thread_ids": sorted(missing_threads),
         "skipped_nonterminal_count": skipped_nonterminal,
         "terminal_event_counts": dict(sorted(event_counts.items())),
         "open_edge_count": len(open_rows),
@@ -857,6 +912,228 @@ def _reconcile_impl(
         conn.close()
 
 
+def _reconcile_subagent_stop_impl(
+    *,
+    payload: Mapping[str, Any],
+    state_db_path: Path,
+    codex_home: Path,
+    backup_dir: Path,
+    dry_run: bool,
+    active_thread_ids: set[str],
+    busy_timeout_ms: int,
+    backup_retention: int,
+    trusted_parent_thread_id: str = "",
+) -> dict[str, Any]:
+    """Close and archive one explicitly stopped Codex subagent branch.
+
+    The child id must come from host-shaped SubagentStop metadata and match one
+    existing open spawn edge.  If any active descendant remains, no mutation
+    occurs.  This path never guesses from timestamps or process names.
+    """
+
+    result = _base_result(
+        root_thread_id="", db_path=state_db_path, dry_run=dry_run
+    )
+    result["subagent_stop_reconcile"] = True
+    candidates = _subagent_stop_candidate_ids(payload)
+    if not candidates:
+        result.update({
+            "ok": True,
+            "status": "skipped",
+            "reason": "subagent_stop_child_id_missing",
+        })
+        return result
+    if not _is_within(state_db_path, codex_home):
+        raise _ReconcileError("state_db_path_outside_codex_home", status="unsafe_path")
+    if not _is_within(backup_dir, codex_home):
+        raise _ReconcileError("backup_path_outside_codex_home", status="unsafe_path")
+    if not state_db_path.is_file():
+        raise _ReconcileError("state_db_missing", status="missing")
+
+    uri = f"file:{state_db_path.as_posix()}?mode=rw"
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=max(0.001, min(int(busy_timeout_ms), 30_000) / 1000),
+        )
+    except sqlite3.OperationalError as exc:
+        reason = "state_db_locked" if "locked" in str(exc).casefold() else "state_db_open_failed"
+        raise _ReconcileError(reason) from exc
+
+    try:
+        _configure_connection(conn, busy_timeout_ms)
+        columns = _schema_preflight(conn)
+        placeholders = ",".join("?" for _ in candidates)
+        rows = conn.execute(
+            "SELECT parent_thread_id,child_thread_id,status "
+            "FROM thread_spawn_edges WHERE status<>'closed' "
+            f"AND child_thread_id IN ({placeholders})",
+            tuple(sorted(candidates)),
+        ).fetchall()
+        trusted_parent = _safe_id(trusted_parent_thread_id)
+        matched: list[tuple[str, str, str]] = []
+        for raw_parent, raw_child, raw_status in rows:
+            parent = _safe_id(raw_parent)
+            child = _safe_id(raw_child)
+            if not parent or not child or child in active_thread_ids:
+                continue
+            if trusted_parent and trusted_parent not in {parent, child}:
+                continue
+            matched.append((parent, child, str(raw_status or "")))
+        if len(matched) != 1:
+            result.update({
+                "ok": True,
+                "status": "skipped",
+                "reason": (
+                    "subagent_stop_edge_ambiguous"
+                    if matched
+                    else "subagent_stop_edge_not_found"
+                ),
+                "candidate_edge_count": len(matched),
+            })
+            return result
+
+        parent, child, incoming_status = matched[0]
+        graph = _descendants(
+            conn,
+            child,
+            active_thread_ids=active_thread_ids,
+        )
+        if graph["skipped_active"]:
+            result.update({
+                "ok": True,
+                "status": "skipped",
+                "reason": "subagent_stop_active_descendant",
+                "skipped_active_thread_ids": graph["skipped_active"],
+            })
+            return result
+
+        closed_edges = [
+            {
+                "parent_thread_id": parent,
+                "child_thread_id": child,
+                "previous_status": incoming_status,
+            },
+            *graph["closed_edges"],
+        ]
+        candidate_threads = [child, *graph["candidate_threads"]]
+        thread_rows = (
+            conn.execute(
+                "SELECT id,archived FROM threads WHERE id IN ({})".format(
+                    ",".join("?" for _ in candidate_threads) or "NULL"
+                ),
+                tuple(candidate_threads),
+            ).fetchall()
+            if candidate_threads
+            else []
+        )
+        unarchived_threads = {
+            str(row[0]) for row in thread_rows if not bool(row[1])
+        }
+        missing_threads = sorted(
+            set(candidate_threads) - {str(row[0]) for row in thread_rows}
+        )
+        result.update({
+            "root_thread_id": child,
+            "closed_edges": closed_edges,
+            "closed_edge_ids": [item["child_thread_id"] for item in closed_edges],
+            "candidate_edge_ids": [item["child_thread_id"] for item in closed_edges],
+            "candidate_thread_ids": list(candidate_threads),
+            "missing_thread_ids": missing_threads,
+            "skipped_active_thread_ids": [],
+        })
+        if dry_run:
+            result.update({
+                "ok": True,
+                "status": "dry_run",
+                "reason": "would_reconcile",
+                "closed_edge_count": len(closed_edges),
+                "archived_thread_count": len(unarchived_threads),
+            })
+            return result
+
+        now_ms = _now_ms()
+        backup_path, retained = _online_backup(
+            conn,
+            db_path=state_db_path,
+            backup_dir=backup_dir,
+            now_ms=now_ms,
+            retention=backup_retention,
+        )
+        result.update({
+            "backup_path": str(backup_path),
+            "restore_path": str(backup_path),
+            "backup_paths": [str(item) for item in retained],
+        })
+        now_sec = now_ms // 1000
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            closed: list[dict[str, str]] = []
+            for item in closed_edges:
+                cursor = conn.execute(
+                    "UPDATE thread_spawn_edges SET status='closed' "
+                    "WHERE parent_thread_id=? AND child_thread_id=? "
+                    "AND status<>'closed'",
+                    (item["parent_thread_id"], item["child_thread_id"]),
+                )
+                if cursor.rowcount:
+                    closed.append(item)
+
+            archived: list[str] = []
+            thread_update, thread_values = _columns_for_update(
+                columns["threads"], now_sec=now_sec, now_ms=now_ms
+            )
+            if not thread_update:
+                raise _ReconcileError(
+                    "state_db_threads_not_writable", status="schema_mismatch"
+                )
+            for thread_id in sorted(unarchived_threads):
+                cursor = conn.execute(
+                    f"UPDATE threads SET {thread_update} WHERE id=? AND archived=0",
+                    (*thread_values, thread_id),
+                )
+                if cursor.rowcount:
+                    archived.append(thread_id)
+
+            recency_fields: list[str] = []
+            recency_values: list[Any] = []
+            for name, value in (
+                ("updated_at", now_sec),
+                ("updated_at_ms", now_ms),
+                ("recency_at", now_sec),
+                ("recency_at_ms", now_ms),
+            ):
+                if name in columns["threads"]:
+                    recency_fields.append(f"{name}=?")
+                    recency_values.append(value)
+            if recency_fields:
+                conn.execute(
+                    f"UPDATE threads SET {', '.join(recency_fields)} WHERE id=?",
+                    (*recency_values, parent),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        result.update({
+            "ok": True,
+            "status": "reconciled",
+            "reason": "subagent_stopped",
+            "changed": bool(closed or archived),
+            "closed_edges": closed,
+            "closed_edge_ids": [item["child_thread_id"] for item in closed],
+            "archived_thread_ids": archived,
+            "closed_edge_count": len(closed),
+            "archived_thread_count": len(archived),
+            "terminal_thread_ids": sorted(set(candidate_threads)),
+        })
+        return result
+    finally:
+        conn.close()
+
+
 def _reconcile_global_impl(
     *,
     state_db_path: Path,
@@ -925,6 +1202,7 @@ def _reconcile_global_impl(
             "candidate_thread_ids": list(candidate_threads),
             "skipped_active_thread_ids": graph["skipped_active"],
             "missing_thread_count": graph["missing_thread_count"],
+            "missing_thread_ids": graph["missing_thread_ids"],
             "skipped_nonterminal_count": graph["skipped_nonterminal_count"],
             "terminal_event_counts": graph["terminal_event_counts"],
             "open_edge_count": graph["open_edge_count"],
@@ -1152,6 +1430,70 @@ class CodexSubagentReconciler:
         result["diagnostic_receipt"] = _write_receipt(result, self.receipt_dir)
         return _json_safe(result)
 
+    def reconcile_subagent_stop(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        active_thread_ids: Iterable[Any] | None = None,
+        trusted_parent_thread_id: str | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Close/archive exactly one host-confirmed stopped subagent branch."""
+
+        active = _active_ids(active_thread_ids) | _read_active_ids_from_env()
+        trusted_parent = _safe_id(trusted_parent_thread_id)
+        result = _base_result(
+            root_thread_id="", db_path=self.state_db_path, dry_run=dry_run
+        )
+        result["subagent_stop_reconcile"] = True
+        try:
+            result = _reconcile_subagent_stop_impl(
+                payload=payload,
+                state_db_path=self.state_db_path,
+                codex_home=self.codex_home,
+                backup_dir=self.backup_dir,
+                dry_run=dry_run,
+                active_thread_ids=active,
+                busy_timeout_ms=self.busy_timeout_ms,
+                backup_retention=self.backup_retention,
+                trusted_parent_thread_id=trusted_parent,
+            )
+        except _ReconcileError as exc:
+            result.update({
+                "ok": False,
+                "degraded": True,
+                "status": exc.status,
+                "reason": exc.reason,
+                "active_thread_ids": sorted(active),
+            })
+        except sqlite3.OperationalError as exc:
+            locked = "locked" in str(exc).casefold() or "busy" in str(exc).casefold()
+            result.update({
+                "ok": False,
+                "degraded": True,
+                "status": "locked" if locked else "degraded",
+                "reason": "state_db_locked" if locked else f"state_db_open_failed:{type(exc).__name__}",
+                "active_thread_ids": sorted(active),
+            })
+        except sqlite3.DatabaseError as exc:
+            result.update({
+                "ok": False,
+                "degraded": True,
+                "status": "corrupt",
+                "reason": f"state_db_error:{type(exc).__name__}",
+                "active_thread_ids": sorted(active),
+            })
+        except Exception as exc:
+            result.update({
+                "ok": False,
+                "degraded": True,
+                "status": "degraded",
+                "reason": f"subagent_stop_reconcile_failed:{type(exc).__name__}",
+                "active_thread_ids": sorted(active),
+            })
+        result["diagnostic_receipt"] = _write_receipt(result, self.receipt_dir)
+        return _json_safe(result)
+
     def dry_run(
         self,
         root_thread_id: str | None = None,
@@ -1289,6 +1631,36 @@ def dry_run_codex_subagents_json(
     return reconcile_codex_subagents_json(root_thread_id, **kwargs)
 
 
+def reconcile_codex_subagent_stop(
+    payload: Mapping[str, Any],
+    *,
+    state_db_path: str | Path | None = None,
+    codex_home: str | Path | None = None,
+    backup_dir: str | Path | None = None,
+    receipt_dir: str | Path | None = None,
+    active_thread_ids: Iterable[Any] | None = None,
+    trusted_parent_thread_id: str | None = None,
+    dry_run: bool = False,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    backup_retention: int = DEFAULT_BACKUP_RETENTION,
+) -> dict[str, Any]:
+    """Reconcile one explicit Codex SubagentStop host event."""
+
+    return CodexSubagentReconciler(
+        state_db_path,
+        codex_home=codex_home,
+        backup_dir=backup_dir,
+        receipt_dir=receipt_dir,
+        busy_timeout_ms=busy_timeout_ms,
+        backup_retention=backup_retention,
+    ).reconcile_subagent_stop(
+        payload,
+        active_thread_ids=active_thread_ids,
+        trusted_parent_thread_id=trusted_parent_thread_id,
+        dry_run=dry_run,
+    )
+
+
 def reconcile_global_codex_subagents(
     *,
     state_db_path: str | Path | None = None,
@@ -1334,6 +1706,7 @@ __all__ = [
     "reconcile",
     "reconcile_codex_subagents",
     "reconcile_codex_subagents_json",
+    "reconcile_codex_subagent_stop",
     "reconcile_global_codex_subagents",
     "resolve_codex_home",
     "resolve_state_db_path",

@@ -25,6 +25,10 @@ from .schema_v3 import (
 )
 from .rule_scope import effective_assignments, normalize_assignment
 from .rule_scope import canonical_project_ref
+from .runtime_v2.governance_semantics import (
+    classify_governance_relation,
+    governance_scope_key,
+)
 from .rule_read_path import (
     MODE_LEGACY,
     MODE_RULE_INTELLIGENCE,
@@ -94,6 +98,246 @@ def knowledge_reference_candidates(
     )
     return tuple(adapter.read(scope, query=query, limit=limit))
 
+
+def _trusted_group_members(
+    workspace: str | Path,
+    *,
+    agent_instance_id: str,
+    share_group_id: str,
+) -> tuple[str, ...]:
+    """Resolve a read-only group audience from persisted V2 bindings."""
+
+    from .runtime_v2.group_native import GroupControlService
+
+    agent = str(agent_instance_id or "").strip()
+    group = str(share_group_id or "").strip()
+    if not agent or not group:
+        return ()
+    try:
+        service = GroupControlService(workspace, write=False)
+        binding = service.active_binding_for_agent(agent)
+        # Native context already authenticated exact workspace/agent/group.
+        # Group-control bindings add shared-member expansion, but absence of
+        # a binding must not erase the caller's own personal history/graph
+        # scope during early V2 bootstrap.
+        if not binding or str(binding.get("share_group_id") or "") != group:
+            return (agent,)
+        members = tuple(sorted({
+            str(item.get("agent_instance_id") or "")
+            for item in service.list_bindings(include_inactive=False).get("bindings", [])
+            if str(item.get("share_group_id") or "") == group
+            and str(item.get("agent_instance_id") or "")
+        }))
+        return members or (agent,)
+    except Exception:
+        return ()
+
+
+def history_reference_candidates(
+    workspace: str | Path,
+    *,
+    agent_instance_id: str,
+    project_ref: str,
+    provider: str,
+    share_group_id: str,
+    query: str = "",
+    limit: int = 6,
+) -> tuple[dict[str, str], ...]:
+    """Read only bounded V2 history summaries as reference-only candidates."""
+
+    project = canonical_project_ref(project_ref)
+    agent = str(agent_instance_id or "").strip()
+    group = str(share_group_id or "").strip()
+    provider_value = str(provider or "").strip().casefold()
+    members = _trusted_group_members(
+        workspace,
+        agent_instance_id=agent,
+        share_group_id=group,
+    )
+    if not project or not provider_value or not members:
+        return ()
+    try:
+        from .runtime_v2.history_store import ContentHistoryStore, V2HistoryScope
+
+        scope = V2HistoryScope(
+            agent_instance_id=agent,
+            project_ref=project,
+            provider=provider_value,
+            share_group_id=group,
+            authorized_agent_ids=members,
+            shared_read=len(members) > 1,
+        )
+        store = ContentHistoryStore(workspace, readonly=True)
+        return tuple(store.summary_references(scope, query=query, limit=limit))
+    except Exception:
+        # Missing/partial content V2 is a safe omission, never a fallback to
+        # raw session files or the retired history store.
+        return ()
+
+
+def codegraph_reference_candidates(
+    workspace: str | Path,
+    *,
+    agent_instance_id: str,
+    project_ref: str,
+    share_group_id: str,
+    provider: str = "",
+    runtime_role: str = "",
+    limit: int = 1,
+) -> tuple[dict[str, str], ...]:
+    """Read nearest trusted graphify CodeGraph aggregate metadata only."""
+
+    project = canonical_project_ref(project_ref)
+    agent = str(agent_instance_id or "").strip()
+    group = str(share_group_id or "").strip()
+    provider_value = str(provider or "").strip().casefold()
+    if not project or not agent or not group or not provider_value:
+        return ()
+    members = _trusted_group_members(
+        workspace,
+        agent_instance_id=agent,
+        share_group_id=group,
+    )
+    if not members:
+        return ()
+    try:
+        from .codegraph_v2.store import CodeGraphStore
+
+        store = CodeGraphStore(workspace, initialize=False)
+        rows = store.reference_metadata(
+            project_ref=project,
+            share_group_id=group,
+            provider=provider_value,
+            limit=limit,
+        )
+        references: list[dict[str, str]] = []
+        for row in rows:
+            counts = row.get("counts") if isinstance(row.get("counts"), dict) else {}
+            files = row.get("files") if isinstance(row.get("files"), list) else []
+            file_parts: list[str] = []
+            for file in files[:8]:
+                if not isinstance(file, dict):
+                    continue
+                path = str(file.get("path") or "")
+                digest = str(file.get("hash") or "")
+                symbols = file.get("symbols") if isinstance(file.get("symbols"), list) else []
+                names = [
+                    str(symbol.get("name") or "")
+                    for symbol in symbols[:12]
+                    if isinstance(symbol, dict) and str(symbol.get("name") or "")
+                ]
+                detail = " ".join(item for item in (path, digest, *names) if item)
+                if detail:
+                    file_parts.append(detail[:240])
+            file_suffix = f"; indexed: {'; '.join(file_parts)}" if file_parts else ""
+            material = json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            digest = stable_hash("codegraph-reference", material)
+            references.append({
+                "summary": (
+                    f"CodeGraph metadata for {row.get('project_ref', '')}: "
+                    f"{int(counts.get('source_files', 0))} files, "
+                    f"{int(counts.get('symbols', 0))} symbols, "
+                    f"{int(counts.get('edges', 0))} edges{file_suffix}"
+                ),
+                "ref": f"codegraph:{row.get('scope_id', '')}",
+                "hash": digest,
+                "trust": "reference_only",
+            })
+        return tuple(references)
+    except Exception:
+        return ()
+
+
+def unified_reference_candidates(
+    workspace: str | Path,
+    *,
+    agent_instance_id: str,
+    project_ref: str,
+    provider: str,
+    share_group_id: str,
+    namespace_id: str = "",
+    sensitivity: str = "",
+    policy_class: str = "",
+    runtime_role: str = "",
+    query: str = "",
+    limit: int = 6,
+) -> tuple[dict[str, str], ...]:
+    """Return one deterministic, reference-only retrieval stream.
+
+    Knowledge, history and CodeGraph stay separate at source, then merge in
+    fixed channel order. Each adapter is fail-closed and may independently
+    return no data. No turn/blob/source body crosses this boundary.
+    """
+
+    channels: tuple[tuple[str, tuple[dict[str, str], ...]], ...] = (
+        (
+            "knowledge",
+            knowledge_reference_candidates(
+                str(workspace),
+                namespace_id=str(namespace_id or ""),
+                workspace_id=str(Path(workspace).resolve()),
+                agent_instance_id=str(agent_instance_id or ""),
+                project_ref=canonical_project_ref(project_ref),
+                provider=str(provider or ""),
+                share_group_id=str(share_group_id or ""),
+                sensitivity=str(sensitivity or ""),
+                policy_class=str(policy_class or ""),
+                query=query,
+                limit=limit,
+            ),
+        ),
+        (
+            "history",
+            history_reference_candidates(
+                workspace,
+                agent_instance_id=agent_instance_id,
+                project_ref=project_ref,
+                provider=provider,
+                share_group_id=share_group_id,
+                query=query,
+                limit=limit,
+            ),
+        ),
+        (
+            "codegraph",
+            codegraph_reference_candidates(
+                workspace,
+                agent_instance_id=agent_instance_id,
+                project_ref=project_ref,
+                share_group_id=share_group_id,
+                provider=provider,
+                runtime_role=runtime_role,
+                limit=min(limit, 4),
+            ),
+        ),
+    )
+    result: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for channel, values in channels:
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            summary = str(value.get("summary") or "").strip()[:1200]
+            ref = str(value.get("ref") or "").strip()[:512]
+            digest = str(value.get("hash") or "").strip()[:256]
+            if not summary and not ref and not digest:
+                continue
+            identity = (summary, ref, digest)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            # Internal source marker is consumed by ContextEngine before the
+            # public reference renderer strips all non-reference fields.
+            result.append({
+                "summary": summary,
+                "ref": ref,
+                "hash": digest,
+                "trust": "reference_only",
+                "source": f"native-v2-{channel}",
+                "id": f"{channel}:{ref or digest}",
+            })
+    return tuple(result)
+
 _REDACTED_MARKER = re.compile(r"\[REDACTED(?::[^\]]+)?\]", re.IGNORECASE)
 _WORD_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*")
 _HAN_PATTERN = re.compile(r"[\u4e00-\u9fff]+")
@@ -155,6 +399,131 @@ def _sort_key(candidate: _Candidate) -> tuple[Any, ...]:
         record.updated_at or record.created_at or "",
         record.memory_id,
     )
+
+
+def _mandatory_scope_key(
+    record: SharedMemoryRecord,
+    assignments_by_memory: dict[str, list[Any]],
+    *,
+    effective_context: EffectiveAgentContext,
+    group_id: str,
+    direct_compat: bool,
+) -> tuple[Any, ...]:
+    """Return full persisted audience identity for render-time collapse.
+
+    Matching one Agent is not enough to prove two rules have the same audience:
+    a group rule and an Agent overlay can both apply to that Agent while
+    widening different future readers.  Collapse only identical assignment
+    multisets.  Direct compatibility mode has no assignment plane, so its
+    explicit group is the whole scope.
+    """
+
+    assignments = assignments_by_memory.get(record.memory_id, [])
+    if direct_compat or not assignments:
+        return governance_scope_key(
+            metadata={
+                "audience": {
+                    "source": "native_v2",
+                    "target_type": "group",
+                    "target_id": group_id,
+                    "share_group_id": group_id,
+                },
+            },
+            share_group_id=group_id,
+        )
+    keys: list[tuple[str, str, str, str, str, str, str]] = []
+    for assignment in assignments:
+        keys.append(
+            governance_scope_key(
+                metadata={
+                    "audience": {
+                        "source": "native_v2",
+                        "target_type": str(getattr(assignment, "target_type", "") or ""),
+                        "target_id": str(getattr(assignment, "target_id", "") or ""),
+                        "share_group_id": group_id,
+                        "project_ref": str(getattr(assignment, "project_ref", "") or ""),
+                        "provider": str(getattr(assignment, "provider", "") or ""),
+                        "runtime_role": str(getattr(assignment, "runtime_role", "") or ""),
+                        "effect": str(getattr(assignment, "effect", "include") or "include"),
+                    },
+                },
+                share_group_id=group_id,
+                project_ref=effective_context.project_ref,
+                provider=effective_context.provider,
+                runtime_role=effective_context.runtime_role,
+            )
+        )
+    return tuple(sorted(keys))
+
+
+def _collapse_mandatory_semantic_duplicates(
+    records: list[SharedMemoryRecord],
+    assignments_by_memory: dict[str, list[Any]],
+    effective_priorities: dict[str, int],
+    *,
+    effective_context: EffectiveAgentContext,
+    group_id: str,
+    direct_compat: bool,
+) -> tuple[list[SharedMemoryRecord], list[dict[str, str]]]:
+    """Collapse safe same-scope rules before mandatory budget validation.
+
+    This is read-path governance only: it does not delete, shadow, or lock
+    records.  Reconciliation can later persist the same decision; until then,
+    a temporary duplicate cannot exhaust the mandatory package and prevent
+    ordinary recovery/approval calls.
+    """
+
+    def rank(record: SharedMemoryRecord) -> tuple[Any, ...]:
+        return (
+            -int(effective_priorities.get(record.memory_id, record.priority) or 0),
+            -int(bool(record.locked)),
+            -float(record.confidence or 0.0),
+            str(record.memory_id or ""),
+        )
+
+    kept: list[SharedMemoryRecord] = []
+    omissions: list[dict[str, str]] = []
+    for record in sorted(records, key=rank):
+        record_scope = _mandatory_scope_key(
+            record,
+            assignments_by_memory,
+            effective_context=effective_context,
+            group_id=group_id,
+            direct_compat=direct_compat,
+        )
+        matched = False
+        for index, existing in enumerate(kept):
+            existing_scope = _mandatory_scope_key(
+                existing,
+                assignments_by_memory,
+                effective_context=effective_context,
+                group_id=group_id,
+                direct_compat=direct_compat,
+            )
+            if existing_scope != record_scope:
+                continue
+            relation = classify_governance_relation(existing.body, record.body)
+            if not relation.mergeable:
+                continue
+            if relation.winner == "right":
+                kept[index] = record
+                winner = record
+            else:
+                winner = existing
+            omissions.append({
+                "memory_id": str(record.memory_id if winner is existing else existing.memory_id),
+                "canonical_memory_id": str(winner.memory_id),
+                "reason": (
+                    "governance_update_shadowed"
+                    if relation.kind in {"update", "additive"}
+                    else "governance_duplicate"
+                ),
+            })
+            matched = True
+            break
+        if not matched:
+            kept.append(record)
+    return kept, omissions
 
 
 def _folded_source_ids(store: Any, group_id: str) -> set[str]:
@@ -383,6 +752,7 @@ def build_context_packet(
         "unsupported_kind": 0,
     }
     omitted_details: list[dict[str, str]] = []
+    audit_actions: list[dict[str, str]] = []
 
     # Stage 1: a separate mandatory package.  It intentionally bypasses task
     # overlap and ordinary recall budgets, but remains status/safety/dedup
@@ -532,6 +902,34 @@ def build_context_packet(
             raw_mandatory, canonical_mapping, key=_mandatory_key,
         )
         read_path_summary["records_after"] += len(raw_mandatory)
+
+    # Canonical mapping may be unavailable during a recoverable reconciliation
+    # window.  Still collapse only safe same-audience semantic duplicates
+    # before locking mandatory budget.  This is a read projection; durable
+    # source rows remain active and recoverable until reconciliation commits.
+    raw_mandatory, semantic_omissions = _collapse_mandatory_semantic_duplicates(
+        raw_mandatory,
+        assignments_by_memory,
+        effective_priorities,
+        effective_context=effective_context,
+        group_id=store.group_id,
+        direct_compat=direct_compat,
+    )
+    for omission in semantic_omissions:
+        omitted["duplicate"] += 1
+        omitted_details.append({
+            "memory_id": omission["memory_id"],
+            "reason": omission["reason"],
+            "canonical_memory_id": omission["canonical_memory_id"],
+        })
+        audit_actions.append({
+            "action": "collapse",
+            "target_id": omission["canonical_memory_id"],
+            "old_id": omission["memory_id"],
+            "reason": omission["reason"],
+        })
+    if semantic_omissions:
+        read_path_summary["records_after"] = len(raw_mandatory)
 
     invalid_mandatory_priorities = [
         record for record in raw_mandatory
@@ -834,6 +1232,8 @@ def build_context_packet(
         "mandatory_overflow": mandatory_overflow,
         "mandatory_invalid_reason": mandatory_error,
         "error": mandatory_error,
+        "status": "blocked" if mandatory_error else "ok",
+        "audit_actions": audit_actions,
         "budget": {
             "max_items": max_items,
             "used_items": len(items),

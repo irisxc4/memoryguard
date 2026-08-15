@@ -1024,34 +1024,50 @@ def _mcp_json_error(
 
 def _resolve_workspace(args: dict[str, Any]) -> Path:
     """Resolve the configured MemoryGuard control workspace."""
-    from .data_home import resolve_data_home
-    from .workspace_resolver import resolve_workspace
+    from .data_home import resolve_runtime_data_home
 
-    explicit = str(args.get("workspace", "") or "").strip()
-    if explicit:
-        return resolve_workspace(explicit, explicit=True)
-    return resolve_data_home()
+    # MCP ``workspace`` is a project/scope hint, not a control-plane selector.
+    # The transport must stay on the one user-level V2 data home even when a
+    # caller supplies an empty or legacy project path.
+    del args
+    return resolve_runtime_data_home()
 
 
 def _resolve_memory_workspace(args: dict[str, Any]) -> Path:
-    """Resolve the V2 control plane without migration redirects."""
+    """Resolve the sole V2 control plane; workspace is only a project hint."""
     from .access_context import clear_runtime_connection_override
-    from .data_home import resolve_data_home
+    from .data_home import is_v2_data_home, resolve_runtime_data_home
     from .workspace_resolver import resolve_workspace
 
-    control_scope = os.environ.get("MEMORYGUARD_CONTROL_SCOPE", "").strip().lower()
-    if control_scope == "global":
-        clear_runtime_connection_override()
-        return resolve_data_home()
-    configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-    if configured:
-        clear_runtime_connection_override()
-        return resolve_workspace(configured, explicit=True)
     clear_runtime_connection_override()
-    explicit = str(args.get("workspace", "") or "").strip()
-    if explicit:
-        return resolve_workspace(explicit, explicit=True)
-    return resolve_workspace()
+    del args
+    # A host may explicitly provision an isolated V2 workspace through the
+    # trusted environment.  Let the canonical resolver reject known legacy
+    # project control trees, but do not require a manifest here: injected V2
+    # facades and test/operator bootstrap flows can legitimately create the
+    # domain databases before the manifest is available.  A request payload's
+    # ``workspace`` never selects the control plane.
+    configured_workspace = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+    if configured_workspace:
+        return resolve_runtime_data_home(Path(configured_workspace).expanduser().resolve())
+
+    # An explicit canonical Data Home outranks cwd discovery. Without this
+    # guard, launching from a project nested under another V2 workspace can
+    # silently switch the MCP control plane away from MEMORYGUARD_HOME.
+    configured_home = os.environ.get("MEMORYGUARD_HOME", "").strip()
+    if configured_home:
+        return resolve_runtime_data_home()
+
+    # Bare MCP launches still get the resolver's bounded V2 discovery (for
+    # example, a V2 child beside a legacy parent).  The resolver falls back to
+    # cwd when it finds no V2 candidate; that cwd is a project hint, not a
+    # control plane, so only accept it when it carries a V2 manifest.
+    cwd = Path.cwd().resolve()
+    if not is_v2_data_home(cwd):
+        discovered = resolve_workspace(cwd=cwd)
+        if is_v2_data_home(discovered):
+            return discovered
+    return resolve_runtime_data_home()
 
 
 def _get_share_group_id(
@@ -1155,7 +1171,10 @@ def _effective_agent_context(
         share_group_id=group_id,
         provider=effective_provider().strip().lower(),
         project_ref=canonical_project_ref(
-            os.environ.get("MEMORYGUARD_PROJECT_CWD") or os.getcwd()
+            args.get("project_ref")
+            or os.environ.get("MEMORYGUARD_PROJECT_CWD")
+            or args.get("workspace")
+            or os.getcwd()
         ),
         runtime_role=os.environ.get("MEMORYGUARD_RUNTIME_ROLE", "").strip(),
         runtime_agent_id=os.environ.get("MEMORYGUARD_RUNTIME_AGENT_ID", "").strip(),
@@ -1176,7 +1195,7 @@ _V2_PAYLOAD_IDENTITY_KEYS = frozenset({
     "agent_instance_id", "share_group_id", "workspace", "provider",
     "project_ref", "runtime_role", "runtime_agent_id", "parent_agent_id",
     "session_id", "context_hash", "session_source", "session_trusted",
-    "context", "access_context", "trusted_context",
+    "context", "access_context", "trusted_context", "trusted_identity", "identity",
 })
 
 
@@ -1283,15 +1302,26 @@ def _v2_facade_state(facade: Any, workspace: Path | str = "") -> tuple[str, Any]
 
 def _trusted_context_for_v2(args: dict[str, Any], workspace: Path) -> tuple[Any | None, str | None]:
     """Build context from the active binding/environment, never payload claims."""
-    # Resolve on a copy: legacy public argument shape remains untouched while
-    # ``_resolve_access`` replaces a claimed agent with the binding identity.
-    trusted_args = dict(args)
+    # Keep identity claims in the resolver input so AccessContext can reject a
+    # forged/mismatched principal.  After that consistency check, construct the
+    # process-issued context from the resolved identity only; identity-looking
+    # fields never reach the native business payload as a second authority.
+    resolver_args = dict(args)
     try:
-        group_id, error, access_context = _resolve_access(trusted_args, workspace)
+        group_id, error, access_context = _resolve_access(resolver_args, workspace)
     except Exception as exc:
         return None, f"trusted_context_unavailable:{type(exc).__name__}"
     if error or not group_id:
         return None, error or "trusted_context_unavailable"
+    trusted_args = {
+        key: value for key, value in resolver_args.items()
+        if key not in _V2_PAYLOAD_IDENTITY_KEYS
+    }
+    # _resolve_access replaces the checked claim with the connection-owned
+    # principal.  Carry that resolved value only for context construction.
+    trusted_args["agent_instance_id"] = str(
+        resolver_args.get("agent_instance_id") or ""
+    )
     try:
         context_builder = _effective_agent_context
         try:
@@ -1745,12 +1775,25 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
             },
         }
 
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
+
+    if method == "resources/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+
+    if method == "resources/templates/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"resourceTemplates": []},
+        }
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
     if method == "tools/call":
         name = params.get("name", "")

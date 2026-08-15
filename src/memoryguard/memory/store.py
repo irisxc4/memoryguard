@@ -177,6 +177,9 @@ class MemoryReadScope:
             raise ValueError("read scope requires share_group_id")
         if not str(self.workspace_id):
             raise ValueError("read scope requires workspace_id")
+        object.__setattr__(self, "project_ref", canonical_project_ref(self.project_ref))
+        object.__setattr__(self, "provider", str(self.provider or "").strip().casefold())
+        object.__setattr__(self, "runtime_role", str(self.runtime_role or "").strip().casefold())
 
     @classmethod
     def from_value(cls, value: "MemoryReadScope | Mapping[str, Any]") -> "MemoryReadScope":
@@ -248,6 +251,9 @@ class MemoryAtom:
         self.status = str(self.status or "active")
         self.confidence = float(self.confidence)
         self.priority = int(self.priority)
+        self.project_ref = canonical_project_ref(self.project_ref)
+        self.provider = str(self.provider or "").strip().casefold()
+        self.runtime_role = str(self.runtime_role or "").strip().casefold()
         self.revision = max(1, int(self.revision))
         self.supersedes = [str(item) for item in self.supersedes]
         raw_provenance = list(self.provenance or [])
@@ -506,6 +512,26 @@ class MemoryAtomStore:
                     continue
                 raise
 
+        # ``atoms_fts`` is a derived search index, not part of the memory
+        # authority schema.  Keep it optional so a Python/SQLite build without
+        # FTS5 can still read and write atoms through the LIKE fallback.
+        try:
+            for statement in (
+                "CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts USING fts5(memory_id UNINDEXED, body, content='atoms', content_rowid='rowid', tokenize='trigram')",
+                "CREATE TRIGGER IF NOT EXISTS atoms_fts_ai AFTER INSERT ON atoms BEGIN INSERT INTO atoms_fts(rowid, memory_id, body) VALUES (new.rowid, new.memory_id, new.body); END",
+                "CREATE TRIGGER IF NOT EXISTS atoms_fts_ad AFTER DELETE ON atoms BEGIN INSERT INTO atoms_fts(atoms_fts, rowid, memory_id, body) VALUES ('delete', old.rowid, old.memory_id, old.body); END",
+                "CREATE TRIGGER IF NOT EXISTS atoms_fts_au AFTER UPDATE ON atoms BEGIN INSERT INTO atoms_fts(atoms_fts, rowid, memory_id, body) VALUES ('delete', old.rowid, old.memory_id, old.body); INSERT INTO atoms_fts(rowid, memory_id, body) VALUES (new.rowid, new.memory_id, new.body); END",
+                "INSERT INTO atoms_fts(atoms_fts) VALUES ('rebuild')",
+            ):
+                conn.execute(statement)
+        except sqlite3.DatabaseError as exc:
+            # FTS5 is an acceleration/recall projection.  Do not make the
+            # canonical atom store unusable when the optional extension is
+            # absent or an old/corrupt index cannot be rebuilt.
+            message = str(exc).casefold()
+            if not any(marker in message for marker in ("fts5", "no such module", "malformed", "fts")):
+                raise
+
         # Validate shared Phase-1 metadata before allowing any write.  Only
         # the known early marker (version 1) may be repaired; future or
         # unknown metadata fails closed and transaction rollback preserves it.
@@ -537,8 +563,8 @@ class MemoryAtomStore:
             self._check_schema_connection(conn)
 
     @staticmethod
-    def atom_id_for(memory_id: str, share_group_id: str = "", *, agent_instance_id: str = "", project_ref: str = "") -> str:
-        return stable_digest({"memory_id": str(memory_id), "share_group_id": str(share_group_id), "agent_instance_id": str(agent_instance_id), "project_ref": str(project_ref)})
+    def atom_id_for(memory_id: str, share_group_id: str = "", *, agent_instance_id: str = "", project_ref: str = "", provider: str = "", runtime_role: str = "") -> str:
+        return stable_digest({"memory_id": str(memory_id), "share_group_id": str(share_group_id), "agent_instance_id": str(agent_instance_id), "project_ref": canonical_project_ref(project_ref), "provider": str(provider or "").strip().casefold(), "runtime_role": str(runtime_role or "").strip().casefold()})
 
     @staticmethod
     def _row_to_atom(row: sqlite3.Row) -> MemoryAtom:
@@ -576,7 +602,7 @@ class MemoryAtomStore:
         if not atom.workspace_id:
             atom.workspace_id = str(self.layout.workspace)
         if not atom.atom_id:
-            atom.atom_id = self.atom_id_for(atom.memory_id, atom.share_group_id, agent_instance_id=atom.agent_instance_id, project_ref=atom.project_ref)
+            atom.atom_id = self.atom_id_for(atom.memory_id, atom.share_group_id, agent_instance_id=atom.agent_instance_id, project_ref=atom.project_ref, provider=atom.provider, runtime_role=atom.runtime_role)
         if atom.visibility not in self.VISIBILITIES:
             raise ValueError(f"unsupported atom visibility: {atom.visibility!r}")
         if not atom.created_at:
@@ -719,8 +745,17 @@ class MemoryAtomStore:
             with (nullcontext(conn) if migration_conn is not None else transaction(conn)):
                 existing_by_id = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (item.atom_id,)).fetchone()
                 logical_existing = conn.execute(
-                    "SELECT * FROM atoms WHERE share_group_id=? AND memory_id=?",
-                    (item.share_group_id, item.memory_id),
+                    "SELECT * FROM atoms WHERE share_group_id=? AND memory_id=? "
+                    "AND agent_instance_id=? AND project_ref=? AND provider=? "
+                    "AND runtime_role=? ORDER BY revision DESC, updated_at DESC LIMIT 1",
+                    (
+                        item.share_group_id,
+                        item.memory_id,
+                        item.agent_instance_id,
+                        item.project_ref,
+                        item.provider,
+                        item.runtime_role,
+                    ),
                 ).fetchone()
                 logical_atom = self._row_to_atom(logical_existing) if logical_existing is not None else None
                 owner_atom = logical_atom
@@ -980,6 +1015,13 @@ class MemoryAtomStore:
             atom = self._row_to_atom(row)
             if self._atom_visible_to_scope(atom, scope):
                 return atom
+            # Pre-audience V2 migration rows retained their writer Agent in
+            # the owner column even though they belonged to the shared group
+            # memory plane.  Match the existing list/read compatibility seam
+            # for an explicitly group-only caller, while keeping all ordinary
+            # Agent/project/provider/runtime reads fail-closed.
+            if self._legacy_group_scope_visible(atom, scope):
+                return atom
         return None
 
     @staticmethod
@@ -1005,9 +1047,9 @@ class MemoryAtomStore:
         return {
             "target_type": target_type,
             "target_id": str(raw.get("target_id") or ""),
-            "project_ref": str(raw.get("project_ref") or ""),
-            "provider": str(raw.get("provider") or ""),
-            "runtime_role": str(raw.get("runtime_role") or ""),
+            "project_ref": canonical_project_ref(raw.get("project_ref") or ""),
+            "provider": str(raw.get("provider") or "").casefold(),
+            "runtime_role": str(raw.get("runtime_role") or "").casefold(),
             "effect": effect,
         }
 
@@ -1021,17 +1063,28 @@ class MemoryAtomStore:
             return True
         audience = cls._native_audience(atom)
         if audience is None:
-            # Existing V2 atoms without a native audience remain exact-scope
-            # records; an arbitrary metadata field cannot broaden them.
-            return all(
-                not value or str(getattr(atom, field) or "") == str(value)
-                for field, value in (
-                    ("agent_instance_id", scope.agent_instance_id),
-                    ("project_ref", scope.project_ref),
-                    ("provider", scope.provider),
-                    ("runtime_role", scope.runtime_role),
-                )
-            )
+            # Old V2 rows have no audience marker.  Their persisted owner
+            # columns are the trusted fallback: an agent-owned row must never
+            # become visible merely because the caller omitted an optional
+            # project/provider/runtime value.  A row without an agent owner is
+            # group-scoped and may be read by any agent already admitted to
+            # the exact group.
+            persisted_agent = str(atom.agent_instance_id or "")
+            if persisted_agent and persisted_agent != str(scope.agent_instance_id or ""):
+                return False
+            persisted_project = canonical_project_ref(atom.project_ref or "")
+            requested_project = canonical_project_ref(scope.project_ref or "")
+            if persisted_project and requested_project and persisted_project != requested_project:
+                return False
+            persisted_provider = str(atom.provider or "").casefold()
+            requested_provider = str(scope.provider or "").casefold()
+            if persisted_provider and requested_provider and persisted_provider != requested_provider:
+                return False
+            persisted_runtime = str(atom.runtime_role or "").casefold()
+            requested_runtime = str(scope.runtime_role or "").casefold()
+            if persisted_runtime and requested_runtime and persisted_runtime != requested_runtime:
+                return False
+            return True
 
         target_type = audience["target_type"]
         target_id = audience["target_id"]
@@ -1052,13 +1105,46 @@ class MemoryAtomStore:
             )
         elif target_type == "group":
             matches = target_id == scope.share_group_id
-        if matches and audience["provider"]:
-            matches = audience["provider"] == scope.provider
-        if matches and audience["runtime_role"]:
-            matches = audience["runtime_role"] == scope.runtime_role
+        # Audience type is the complete visibility contract. Optional fields
+        # left behind by older native writers must not silently narrow an
+        # ``agent`` or ``group`` audience into an undocumented compound scope.
+        # Project matching is already explicit in ``agent_project`` and
+        # ``project`` above; provider/runtime are ownership/provenance fields,
+        # not public memory audience dimensions.
         if audience["effect"] == "exclude":
             return not matches
         return matches
+
+    @classmethod
+    def _legacy_group_scope_visible(cls, atom: MemoryAtom, scope: MemoryReadScope) -> bool:
+        """Read an old atom through an explicit, exact group-only scope.
+
+        Pre-audience V2 rows were written to the group memory plane while
+        retaining the writer Agent in their owner columns.  A validated GUI
+        shared-group projection represents that plane with an empty Agent and
+        empty optional dimensions.  Keep that compatibility seam narrow:
+        native audience markers are never widened here, and any non-empty
+        Agent/project/provider/runtime value remains on the exact-owner path.
+        The workspace/group predicate is still enforced before this helper is
+        called by the public list path.
+        """
+
+        if any(
+            str(value or "").strip()
+            for value in (
+                scope.agent_instance_id,
+                scope.project_ref,
+                scope.provider,
+                scope.runtime_role,
+            )
+        ):
+            return False
+        metadata = atom.metadata if isinstance(atom.metadata, Mapping) else {}
+        # A malformed or non-group audience marker must not be treated as a
+        # wildcard.  Native group audiences are handled by the normal matcher.
+        if isinstance(metadata.get("audience"), Mapping):
+            return False
+        return bool(atom.workspace_id == scope.workspace_id and atom.share_group_id == scope.share_group_id)
 
     def _list_atoms_unscoped(self, *, share_group_id: str | None = None, status: str | None = None, include_building: bool = False, visibility: str | None = None) -> list[MemoryAtom]:
         query = "SELECT * FROM atoms WHERE 1=1"
@@ -1115,10 +1201,115 @@ class MemoryAtomStore:
         query += " ORDER BY created_at, atom_id"
         with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [
-            atom for row in rows
-            if self._atom_visible_to_scope(atom := self._row_to_atom(row), resolved)
-        ]
+        group_scope = not any(
+            str(value or "").strip()
+            for value in (
+                resolved.agent_instance_id,
+                resolved.project_ref,
+                resolved.provider,
+                resolved.runtime_role,
+            )
+        )
+        visible: list[MemoryAtom] = []
+        for row in rows:
+            atom = self._row_to_atom(row)
+            if self._atom_visible_to_scope(atom, resolved):
+                visible.append(atom)
+            elif group_scope and self._legacy_group_scope_visible(atom, resolved):
+                visible.append(atom)
+        return visible
+
+    @staticmethod
+    def _fts_query(query: str) -> str:
+        """Return a quoted, harmless FTS5 MATCH expression.
+
+        A user query is data, not an FTS expression.  Quoting each whitespace
+        separated term prevents operators/column selectors from changing the
+        query.  OR preserves recall when a query contains several keywords;
+        the scope and status filters below still constrain every result.
+        """
+
+        parts = [part.strip() for part in str(query or "").split() if part.strip()]
+        return " OR ".join('"' + part.replace('"', '""') + '"' for part in parts)
+
+    def search(
+        self,
+        query: str,
+        *,
+        scope: MemoryReadScope | Mapping[str, Any] | None = None,
+        status: str | None = "active",
+        kind: str | None = None,
+        limit: int | None = None,
+    ) -> list[MemoryAtom]:
+        """Search visible atoms with FTS5, falling back to body matching.
+
+        FTS5 is deliberately treated as a rebuildable projection.  Missing or
+        malformed FTS support must not make memory unreadable, so all database
+        MATCH failures fall back to the same scoped ``list_atoms`` read with a
+        deterministic occurrence score.
+        """
+
+        text = str(query or "").strip()
+        if not text:
+            return []
+        resolved = self._scope_from_args(scope)
+        if resolved is None:
+            return []
+        try:
+            requested_limit = int(limit) if limit is not None else 20
+        except (TypeError, ValueError):
+            requested_limit = 20
+        requested_limit = max(1, min(requested_limit, 100))
+
+        fts_query = self._fts_query(text)
+        # The trigram tokenizer cannot match one/two-character terms.  LIKE
+        # handles those queries (and Chinese text) without relying on a
+        # tokenizer-specific extension.
+        use_fts = bool(fts_query) and all(len(part) >= 3 for part in text.split())
+        if use_fts:
+            sql = (
+                "SELECT a.*, bm25(atoms_fts) AS _rank "
+                "FROM atoms_fts JOIN atoms AS a ON a.rowid=atoms_fts.rowid "
+                "WHERE atoms_fts MATCH ? AND a.workspace_id=? AND a.share_group_id=?"
+            )
+            params: list[Any] = [fts_query, resolved.workspace_id, resolved.share_group_id]
+            if status:
+                sql += " AND a.status=?"
+                params.append(str(status))
+            sql += " AND a.visibility IN ('ready','active')"
+            if kind:
+                sql += " AND a.kind=?"
+                params.append(str(kind))
+            sql += " ORDER BY _rank ASC, a.created_at ASC, a.atom_id ASC"
+            try:
+                with self._connection() as conn:
+                    rows = conn.execute(sql, params).fetchall()
+                results: list[MemoryAtom] = []
+                for row in rows:
+                    atom = self._row_to_atom(row)
+                    if self._atom_visible_to_scope(atom, resolved):
+                        results.append(atom)
+                        if len(results) >= requested_limit:
+                            break
+                return results
+            except (sqlite3.DatabaseError, ValueError, KeyError):
+                # Continue through the portable fallback below.  In
+                # particular, stale FTS shadow tables should never hide a
+                # valid canonical atom.
+                pass
+
+        candidates = self.list_atoms(scope=resolved, status=status)
+        if kind:
+            candidates = [atom for atom in candidates if atom.kind == str(kind)]
+        lowered_terms = [part.casefold() for part in text.split() if part.strip()]
+        scored: list[tuple[int, int, MemoryAtom]] = []
+        for index, atom in enumerate(candidates):
+            body = atom.body.casefold()
+            occurrences = sum(body.count(term) for term in lowered_terms if term)
+            if occurrences:
+                scored.append((occurrences, index, atom))
+        scored.sort(key=lambda item: (-item[0], item[1], item[2].atom_id))
+        return [atom for _, _, atom in scored[:requested_limit]]
 
     def list_building_atoms(self, *, scope: MemoryReadScope | Mapping[str, Any] | None = None, **kwargs: Any) -> list[MemoryAtom]:
         kwargs["include_building"] = True

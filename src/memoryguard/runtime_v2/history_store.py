@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.transaction import transaction
+from ..rule_scope import canonical_project_ref
 from .group_native import GroupControlError, GroupControlService, personal_group_id
 
 
@@ -127,18 +128,12 @@ def _history_session_projection(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_project_ref(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        return os.path.normcase(str(Path(text).expanduser().resolve()))
-    except (OSError, RuntimeError, ValueError):
-        return os.path.normcase(text)
+    return canonical_project_ref(str(value or ""))
 
 
 def _project_metadata(value: Any) -> dict[str, str]:
-    ref = str(value or "")
-    key = hashlib.sha256(_normalize_project_ref(ref).encode("utf-8")).hexdigest()[:16]
+    ref = _normalize_project_ref(value)
+    key = hashlib.sha256(ref.encode("utf-8")).hexdigest()[:16]
     path = Path(ref) if ref else None
     label = path.name if path is not None and path.name else ref
     parent = str(path.parent) if path is not None and ref else ""
@@ -292,9 +287,20 @@ class ContentHistoryStore:
         members = (scope.agent_instance_id,) if owner else (scope.authorized_agent_ids or (scope.agent_instance_id,))
         sql = "s.active=1 AND s.agent_instance_id IN (" + ",".join("?" for _ in members) + ")"
         args: list[Any] = list(members)
+        if scope.share_group_id:
+            sql += " AND s.share_group_id=?"
+            args.append(scope.share_group_id)
         if scope.project_ref:
-            sql += " AND s.project_ref=? COLLATE NOCASE" if os.name == "nt" else " AND s.project_ref=?"
-            args.append(scope.project_ref)
+            # A workspace can contain an indexed repository plus one or more
+            # subprojects. Treat parent/child project refs as one stable
+            # retrieval scope, while keeping sibling repositories isolated.
+            # REPLACE handles legacy rows persisted with Windows separators.
+            sql += (
+                " AND (LOWER(REPLACE(s.project_ref,char(92),'/'))=? "
+                "OR ? LIKE LOWER(REPLACE(s.project_ref,char(92),'/')) || '/%' "
+                "OR LOWER(REPLACE(s.project_ref,char(92),'/')) LIKE ? || '/%')"
+            )
+            args.extend((scope.project_ref, scope.project_ref, scope.project_ref))
         if scope.provider:
             sql += " AND s.provider=?"
             args.append(scope.provider)
@@ -381,6 +387,56 @@ class ContentHistoryStore:
             item.update({"anchor_turn_id": str(item.get("turn_id") or ""), "can_timeline": True, "read_target": "turn"})
             results.append(item)
         return {"query": query, "results": results, "limit": limit, "offset": offset}
+
+    def summary_references(
+        self,
+        scope: V2HistoryScope,
+        query: str = "",
+        *,
+        limit: int = 6,
+    ) -> tuple[dict[str, str], ...]:
+        """Return bounded summary-only history references.
+
+        The session listing internally joins turns so it can preserve the
+        existing history projection, but this adapter deliberately selects
+        only the persisted summary before crossing the context boundary.
+        Unsummarized sessions are not represented as empty/raw candidates.
+        """
+
+        limit = max(1, min(int(limit), 20))
+        tokens = re.findall(r"[\w\u4e00-\u9fff]{2,}", str(query or "").casefold())[:12]
+        rows = self.list_sessions(scope, limit=MAX_PAGE).get("sessions", [])
+        ranked: list[tuple[int, str, str, dict[str, str]]] = []
+        for row in rows:
+            # Persisted summaries are preferred. A safe session title is the
+            # only fallback; never derive a reference from first-turn text.
+            summary = str(row.get("summary") or "").strip()
+            if not summary:
+                title = str(row.get("source_title") or row.get("title") or "").strip()
+                if title.casefold() not in _GENERIC_SESSION_TITLES:
+                    summary = _short(title, 220)
+            if not summary:
+                continue
+            title = str(row.get("title") or "").casefold()
+            summary_folded = summary.casefold()
+            score = sum(summary_folded.count(token) * 2 + title.count(token) for token in tokens)
+            if tokens and score <= 0:
+                continue
+            digest = hashlib.sha256(summary.encode("utf-8")).hexdigest()
+            session_id = str(row.get("session_id") or "")
+            reference = {
+                "summary": summary[:1200],
+                "ref": f"history:{session_id}:{digest[:16]}",
+                "hash": digest,
+                "trust": "reference_only",
+            }
+            timestamp = str(row.get("created_at") or row.get("imported_at") or "")
+            ranked.append((score, timestamp, session_id, reference))
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]), reverse=False)
+        # Timestamp/session ordering is deterministic and newest-first after
+        # relevance; avoid exposing source row fields in the returned shape.
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+        return tuple(item[3] for item in ranked[:limit])
 
     def timeline(self, scope: V2HistoryScope, session_id: str, anchor_turn_id: str, *, radius: int = 4) -> dict[str, Any]:
         radius = max(0, min(int(radius), MAX_TIMELINE_RADIUS))
