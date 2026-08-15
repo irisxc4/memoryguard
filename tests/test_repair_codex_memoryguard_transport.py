@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import tomllib
 from pathlib import Path
 
+from memoryguard import toml_compat as tomllib
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "repair_codex_memoryguard_transport.py"
 SPEC = importlib.util.spec_from_file_location("repair_codex_memoryguard_transport", SCRIPT)

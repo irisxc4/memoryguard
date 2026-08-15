@@ -27,7 +27,7 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
+from memoryguard import toml_compat as tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path

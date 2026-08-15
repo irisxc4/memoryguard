@@ -36,6 +36,24 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.2
+
+v0.7.2 is a focused correctness and compatibility release:
+
+- **Write → read-back and scope:** trusted Agent/project scope now stays aligned
+  across the write and read paths, so a successful write can be read back under
+  the same scope without weakening isolation.
+- **Codex Hook lifecycle and transport:** lifecycle cleanup uses verified Codex
+  thread/workspace evidence, keeps ordinary `Stop` resumable, and reconciles
+  terminal or deleted threads conservatively. The transport repair normalizes
+  the current interpreter and UTF-8 stdio, then verifies `initialize`,
+  `tools/list`, `memory_status`, and `memory_read`.
+- **Python 3.10 compatibility:** the Codex transport repair path uses the
+  project's `memoryguard.toml_compat` interface, selecting stdlib `tomllib`
+  where available and `tomli` on Python 3.10.
+
+See [the v0.7.2 release record](docs/releases/v0.7.2.md).
+
 ## What's New in v0.7.1
 
 v0.7.1 closes the migration and desktop lifecycle gaps found after the V2-only
@@ -333,7 +351,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.1
+memoryguard --version                    # 0.7.2
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -638,6 +656,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.2 release record](docs/releases/v0.7.2.md)
 - [v0.7.1 release record](docs/releases/v0.7.1.md)
 - [v0.7.0 release gate](docs/releases/v0.7.0.md)
 - [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
@@ -647,10 +666,10 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.1 keeps the V2-only runtime boundary and closes
-  the one-command migration, Agent/Group recovery, executable projection-engine,
-  durable cancellation, and unified context-governance lifecycle. Local full
-  regression passed at `1810 / 1810`.
+- **Current release line:** v0.7.2 carries the write/read scope, Codex Hook
+  lifecycle and transport, and Python 3.10 compatibility corrections. The
+  v0.7.1 V2-only migration and desktop lifecycle work remains documented as
+  historical release context.
 - **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result
   plus the real full-repository export/projection described above. It does not
   claim that upstream Graphify's full-repository test suite passed.

@@ -34,6 +34,22 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.2 更新
+
+v0.7.2 是一次聚焦正确性与兼容性的修复版本：
+
+- **写入→读回与作用域：** trusted Agent/project scope 在写入与读回路径中保持一致，
+  成功写入的记忆可以在同一作用域下读回，同时不放宽隔离边界。
+- **Codex Hook 生命周期与传输：** 生命周期清理使用已验证的 Codex thread/workspace
+  证据，普通 `Stop` 仍可恢复，并谨慎收敛已终止或已删除的 thread。传输修复会规范当前
+  Python 解释器与 UTF-8 stdio，并验证 `initialize`、`tools/list`、`memory_status` 和
+  `memory_read`。
+- **Python 3.10 兼容：** Codex 传输修复路径统一使用项目的
+  `memoryguard.toml_compat` 接口；Python 3.11+ 使用标准库 `tomllib`，Python 3.10 使用
+  `tomli`。
+
+详见 [v0.7.2 发布记录](docs/releases/v0.7.2.md)。
+
 ## v0.7.1 更新
 
 v0.7.1 补齐 V2-only 切换后暴露的迁移与桌面生命周期缺口：
@@ -279,7 +295,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.1
+memoryguard --version                    # 0.7.2
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -432,6 +448,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.2 发布记录](docs/releases/v0.7.2.md)
 - [v0.7.1 发布记录](docs/releases/v0.7.1.md)
 - [v0.7.0 发布门禁](docs/releases/v0.7.0.md)
 - [长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)
@@ -441,9 +458,9 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.1 保持 V2-only runtime boundary，并补齐一键迁移、
-  Agent/Group 恢复、真实 CLI 构建引擎、持久取消和上下文治理收口。本地全量回归
-  `1810 / 1810` 通过。
+- **当前发布线：** v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+  以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
+  历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
   export/projection；不表示 upstream Graphify 的全仓测试套件通过。
 - **发布后下一步：** 扩展 CodeGraph/Skills ingestion、维护报告和迁移可观测性。
