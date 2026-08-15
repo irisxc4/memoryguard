@@ -76,7 +76,7 @@ def _assert_upgrade_result(result: dict) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _isolated_env(monkeypatch):
+def _isolated_env(monkeypatch, tmp_path):
     for name in (
         "MEMORYGUARD_WORKSPACE",
         "MEMORYGUARD_HOME",
@@ -85,6 +85,12 @@ def _isolated_env(monkeypatch):
         "MEMORYGUARD_CONTROL_SCOPE",
     ):
         monkeypatch.delenv(name, raising=False)
+    # V2 MCP treats ``workspace`` in a request as a project hint; the control
+    # plane comes from MEMORYGUARD_HOME.  Keep this suite on an isolated,
+    # uninitialized control root so ambient user-level V2 state (or a live
+    # MCP process) cannot turn the pre-activation assertions into identity or
+    # runtime-lease failures.
+    monkeypatch.setenv("MEMORYGUARD_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORYGUARD_STRICT_BINDING", "0")
     monkeypatch.setenv("MEMORYGUARD_ALLOW_ANON", "1")
 

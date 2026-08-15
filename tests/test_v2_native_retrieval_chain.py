@@ -6,10 +6,14 @@ import hashlib
 import pytest
 
 from memoryguard.content import ContentStore
+from memoryguard.evidence import EvidenceStore
+from memoryguard.governance_v2 import V2MutationContext
+from memoryguard.memory import MemoryAtom, MemoryAtomStore
 from memoryguard.rule_binding import RuleBinding
 from memoryguard.rule_definition import build_definition
 from memoryguard.rule_reconciliation import canonical_reconciliation_status
 from memoryguard.rules.v2_store import RuleV2Store
+from memoryguard.runtime_v2.context_engine import ContextEngine
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort
 
 
@@ -67,9 +71,13 @@ def test_native_rule_retrieval_exception_is_not_converted_to_an_empty_packet(tmp
         port.retrieve(_request())
 
 
-def test_native_rules_are_not_injected_before_canonical_readiness(tmp_path: Path) -> None:
+def test_native_rules_use_v2_compatibility_before_canonical_readiness(tmp_path: Path) -> None:
     rules = RuleV2Store(tmp_path)
-    definition = rules.upsert_definition(build_definition("must keep evidence", kind="procedure"))
+    definition = rules.upsert_definition(build_definition(
+        "keep evidence available",
+        kind="procedure",
+        rule_strength="observation",
+    ))
     rules.upsert_binding(RuleBinding(
         binding_id="binding-a",
         definition_id=definition.definition_id,
@@ -87,7 +95,171 @@ def test_native_rules_are_not_injected_before_canonical_readiness(tmp_path: Path
     port = NativeV2RuntimePort(tmp_path)
     result = port.retrieve(_request())
     assert result["mandatory"] == []
+    assert [item["item_id"] for item in result["relevant"]] == [definition.definition_id]
+
+
+def test_native_rule_v2_compatibility_keeps_excludes(tmp_path: Path) -> None:
+    rules = RuleV2Store(tmp_path)
+    definition = rules.upsert_definition(build_definition("do not inject this rule", kind="procedure"))
+    rules.upsert_binding(RuleBinding(
+        binding_id="include-rule",
+        definition_id=definition.definition_id,
+        share_group_id="group-a",
+        target_type="agent",
+        target_id="agent-a",
+        project_ref="project-a",
+        provider="codex",
+        runtime_role="root",
+        effect="include",
+    ))
+    rules.upsert_binding(RuleBinding(
+        binding_id="exclude-rule",
+        definition_id=definition.definition_id,
+        share_group_id="group-a",
+        target_type="agent",
+        target_id="agent-a",
+        project_ref="project-a",
+        provider="codex",
+        runtime_role="root",
+        effect="exclude",
+    ))
+
+    result = NativeV2RuntimePort(tmp_path).retrieve(_request())
+    assert result["mandatory"] == []
     assert result["relevant"] == []
+
+
+def _seed_rule_source_pair(
+    root: Path,
+    *,
+    index: int,
+    matched_agent: str = "agent-a",
+    width: int = 96,
+    rule_strength: str = "must",
+) -> tuple[str, str]:
+    source_memory_id = f"legacy-rule-{index}"
+    memory = MemoryAtomStore(root)
+    atom = memory.put_atom(
+        MemoryAtom(
+            memory_id=f"memory-{index}",
+            body=f"legacy source {index} " + ("x" * width),
+            kind="procedure",
+            injection_policy="always",
+            priority=10,
+            agent_instance_id="agent-a",
+            share_group_id="group-a",
+        ),
+        context=V2MutationContext(
+            workspace_id=str(root.resolve()),
+            share_group_id="group-a",
+            agent_instance_id="agent-a",
+            actor="native-retrieval-test",
+            authority="manual",
+            admin=True,
+        ),
+        evidence=[{"source_ref": f"legacy:{source_memory_id}"}],
+        source_mappings=[{
+            "source_domain": "shared_memory",
+            "source_ref": "group-a/memory.db",
+            "source_record_id": source_memory_id,
+            "source_revision": "1",
+        }],
+    )
+    memory.project_evidence(EvidenceStore(root))
+    memory.set_visibility("active", atom_ids=[atom.atom_id])
+
+    rules = RuleV2Store(root)
+    definition = rules.upsert_definition(build_definition(
+        f"canonical rule {index} " + ("y" * width),
+        kind="procedure",
+        rule_strength=rule_strength,
+    ))
+    rules.upsert_binding(RuleBinding(
+        binding_id=f"binding-{index}",
+        definition_id=definition.definition_id,
+        share_group_id="group-a",
+        target_type="agent",
+        target_id=matched_agent,
+        project_ref="project-a",
+        provider="codex",
+        runtime_role="root",
+    ))
+    rules.upsert_source_link(
+        source_kind="shared_memory",
+        share_group_id="group-a",
+        memory_id=source_memory_id,
+        source_ref="group-a/memory.db",
+        source_revision="1",
+        original_definition_id=definition.definition_id,
+        canonical_definition_id=definition.definition_id,
+        status="active",
+    )
+    return atom.memory_id, definition.definition_id
+
+
+def test_matched_canonical_rule_suppresses_its_source_memory_shadow(tmp_path: Path) -> None:
+    atom_id, definition_id = _seed_rule_source_pair(tmp_path, index=1)
+
+    result = NativeV2RuntimePort(tmp_path).retrieve(_request())
+
+    mandatory_ids = [item["item_id"] for item in result["mandatory"]]
+    assert mandatory_ids == [definition_id]
+    assert atom_id not in mandatory_ids
+
+
+def test_unmatched_canonical_rule_does_not_hide_source_memory(tmp_path: Path) -> None:
+    atom_id, definition_id = _seed_rule_source_pair(
+        tmp_path,
+        index=1,
+        matched_agent="agent-b",
+    )
+
+    result = NativeV2RuntimePort(tmp_path).retrieve(_request())
+
+    mandatory_ids = [item["item_id"] for item in result["mandatory"]]
+    assert mandatory_ids == [atom_id]
+    assert definition_id not in mandatory_ids
+
+
+def test_relevant_canonical_rule_cannot_downgrade_always_source_memory(tmp_path: Path) -> None:
+    atom_id, definition_id = _seed_rule_source_pair(
+        tmp_path,
+        index=1,
+        rule_strength="observation",
+    )
+
+    result = NativeV2RuntimePort(tmp_path).retrieve(_request())
+
+    assert [item["item_id"] for item in result["mandatory"]] == [atom_id]
+    assert definition_id in [item["item_id"] for item in result["relevant"]]
+
+
+def test_canonical_source_shadow_does_not_double_charge_mandatory_budget(tmp_path: Path) -> None:
+    for index in range(6):
+        _seed_rule_source_pair(tmp_path, index=index, width=96)
+
+    port = NativeV2RuntimePort(tmp_path)
+    request = _request(
+        workspace_id=str(tmp_path.resolve()),
+        trusted_identity={
+            "agent": "agent-a",
+            "group": "group-a",
+            "project": "project-a",
+            "provider": "codex",
+            "runtime": "root",
+            "workspace_id": str(tmp_path.resolve()),
+        },
+    )
+    packet = ContextEngine(
+        retriever=port,
+        ready=True,
+        state="V2_ACTIVE",
+    ).bootstrap(request).to_dict()
+
+    assert packet["status"] == "ok", packet
+    assert packet.get("error") in {None, ""}
+    assert len(packet["mandatory"]) == 6
+    assert packet["budget"]["mandatory"]["tokens"] < 1000
 
 
 def test_knowledge_references_use_exact_v2_acl_and_reference_only_shape(tmp_path: Path) -> None:
@@ -148,7 +320,10 @@ def test_knowledge_references_use_exact_v2_acl_and_reference_only_shape(tmp_path
         policy_class="private",
         task="Safe",
     ))
-    assert packet["reference_only"] == list(references)
+    assert len(packet["reference_only"]) == 1
+    projected = packet["reference_only"][0]
+    assert {key: projected[key] for key in ("summary", "ref", "hash", "trust")} == references[0]
+    assert projected["source"] == "native-v2-knowledge"
     assert "must not be returned" not in str(packet)
 
     denied_packet = NativeV2RuntimePort(tmp_path).retrieve(_request(

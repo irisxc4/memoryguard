@@ -1261,7 +1261,7 @@ class NativeV2RuntimePort:
         for canonical in _IDENTITY_ALIASES:
             context[canonical] = self._resolve_identity(source, canonical)
         workspace_id = context["workspace_id"] or self.workspace
-        if os.path.abspath(os.fspath(Path(workspace_id).expanduser())) != os.path.abspath(self.workspace):
+        if canonical_project_ref(workspace_id) != canonical_project_ref(self.workspace):
             raise NativeContextError("context_workspace_mismatch")
         context["workspace_id"] = self.workspace
         if required and not context["agent_instance_id"]:
@@ -1401,9 +1401,12 @@ class NativeV2RuntimePort:
                 "source": "native_v2",
                 "target_type": "agent",
                 "target_id": target_id,
-                "project_ref": canonical_trusted_project,
-                "provider": _text(requested.get("provider")) or _text(context.get("provider")),
-                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")) or _text(context.get("runtime_role")),
+                # Audience types are semantic contracts, not bags of optional
+                # filters. Agent scope follows the agent across projects,
+                # providers and runtime roles; use agent_project for narrowing.
+                "project_ref": "",
+                "provider": "",
+                "runtime_role": "",
                 "effect": "include",
             }
 
@@ -1418,8 +1421,8 @@ class NativeV2RuntimePort:
                 "target_type": "agent_project",
                 "target_id": target_id,
                 "project_ref": canonical_trusted_project,
-                "provider": _text(requested.get("provider")) or _text(context.get("provider")),
-                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")) or _text(context.get("runtime_role")),
+                "provider": "",
+                "runtime_role": "",
                 "effect": "include",
             }
 
@@ -1431,8 +1434,8 @@ class NativeV2RuntimePort:
                 "target_type": "project",
                 "target_id": canonical_trusted_project,
                 "project_ref": canonical_trusted_project,
-                "provider": _text(requested.get("provider")),
-                "runtime_role": _text(requested.get("runtime_role") or requested.get("runtime")),
+                "provider": "",
+                "runtime_role": "",
                 "effect": "include",
             }
 
@@ -1839,6 +1842,24 @@ class NativeV2RuntimePort:
         if not memory_id:
             raise NativePortError("memory_id_required")
         result = store.get_atom(memory_id, scope=scope, atom_id=_text(payload.get("atom_id")))
+        if result is None:
+            # Native writes are durable before the asynchronous evidence
+            # projection promotes them from ``building`` to ``active``.  An
+            # exact, already-authorized read must still observe that write;
+            # keep building rows out of list/search by limiting this fallback
+            # to explicit native audience markers (or trusted admin scope).
+            building = store.get_atom(
+                memory_id,
+                scope=scope,
+                atom_id=_text(payload.get("atom_id")),
+                include_building=True,
+            )
+            if building is not None:
+                from ..memory.store import MemoryAtomStore
+
+                audience = MemoryAtomStore._native_audience(building)
+                if self._trusted_admin(context) or audience is not None:
+                    result = building
         return result
 
     def _require_memory_owner(self, atom: Any, context: Mapping[str, Any]) -> None:
@@ -1994,12 +2015,13 @@ class NativeV2RuntimePort:
 
     def _memory_write_unlocked(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         clean = dict(payload)
-        memory_id = _text(clean.get("memory_id") or clean.get("id"))
-        if not memory_id or "body" not in clean:
+        # The public MCP create contract requires only ``body``.  The
+        # organizer owns generated logical IDs and fallback retry keys;
+        # explicit IDs/keys remain available for callers that need stable
+        # cross-request identity.
+        if "body" not in clean:
             raise NativePortError("memory_payload_required")
         idempotency_key = _text(clean.pop("idempotency_key", ""))
-        if not idempotency_key:
-            raise NativePortError("idempotency_key_required")
         gui_state_marker = clean.pop("_native_gui_state_capability", None)
         preserve_gui_state = gui_state_marker is _GUI_STATE_PRESERVATION_CAPABILITY
         gui_state_action = _text(clean.pop("_native_gui_state_action", ""))
@@ -2410,7 +2432,251 @@ class NativeV2RuntimePort:
             raise NativePortError("v2_context_engine_unavailable")
         return fn(request, candidates)
 
-    def retrieve(self, request: Any) -> dict[str, list[dict[str, Any]]]:
+    def _retrieve_v2_rules(
+        self,
+        *,
+        group: str,
+        scope_public: Mapping[str, Any],
+        result: dict[str, Any],
+    ) -> dict[str, set[str]]:
+        """Read V2 rules and return source records represented by layer.
+
+        A migrated ``always`` memory can remain in the memory domain while its
+        canonical rule is also available from the rules domain.  Once that
+        rule actually matches the current trusted scope, the canonical/compat
+        rule is the runtime representation for that source record; callers use
+        the returned IDs to suppress the memory shadow so one governed source
+        consumes context budget only once.
+        """
+
+        from ..rule_reconciliation import canonical_reconciliation_status
+
+        readiness = canonical_reconciliation_status(self.workspace, group)
+        failures = readiness.get("failures") or []
+        # ``initialize_all`` creates the Phase-1 rules placeholder before the
+        # optional V2 rule-intelligence schema is installed.  That is a valid
+        # no-rules state; do not construct RuleV2Store against the placeholder
+        # (it has no rules_schema_meta) and turn ordinary memory retrieval into
+        # context_build_failed.  Once the V2 schema exists, all read errors
+        # remain fail-closed below.
+        if failures == ["rule_intelligence_not_initialized"]:
+            return {"mandatory": set(), "relevant": set()}
+        if failures == ["native_canonical_status_unavailable"]:
+            raise RuntimeError("canonical status unavailable")
+        canonical_ready = bool(readiness.get("canonical_ready"))
+        rules = self._domain_store("rules")
+        definitions = rules.list_definitions(status="active")
+        represented_source_ids: dict[str, set[str]] = {
+            "mandatory": set(),
+            "relevant": set(),
+        }
+        links_by_definition: dict[str, list[dict[str, Any]]] = {}
+        read = getattr(rules, "_read", None)
+        if callable(read):
+            source_links = read(lambda conn: [
+                dict(row) for row in conn.execute(
+                    "SELECT * FROM rule_source_links "
+                    "WHERE share_group_id=? AND status='active' "
+                    "ORDER BY source_link_id",
+                    (group,),
+                ).fetchall()
+            ])
+            for link in source_links:
+                definition_id = _text(link.get("canonical_definition_id"))
+                if definition_id:
+                    links_by_definition.setdefault(definition_id, []).append(link)
+        for definition in definitions:
+            bindings = rules.list_bindings(
+                definition_id=definition.definition_id,
+                share_group_id=group,
+                status="active",
+            )
+            includes = [
+                item for item in bindings
+                if _text(getattr(item, "effect", "include")).casefold() != "exclude"
+            ]
+            excludes = [
+                item for item in bindings
+                if _text(getattr(item, "effect", "include")).casefold() == "exclude"
+            ]
+            matched = [item for item in includes if self._binding_matches_context(item, scope_public)]
+            if not matched:
+                continue
+            if any(self._binding_matches_context(item, scope_public) for item in excludes):
+                continue
+
+            source = "native-v2-rule-compat"
+            source_ref = f"v2:rule:{_text(definition.definition_id)}"
+            evidence_ref = source_ref
+            evidence_digest = _text(getattr(definition, "semantic_hash", ""))
+            matched_source_links = links_by_definition.get(
+                _text(definition.definition_id), []
+            )
+            if canonical_ready:
+                source = "native-v2-rule"
+                if not callable(read):
+                    raise RuntimeError("native rule provenance unavailable")
+                link = matched_source_links[0] if matched_source_links else {}
+                memory_id = _text(link.get("memory_id"))
+                if not memory_id:
+                    raise RuntimeError("native rule source link unavailable")
+                evidence_rows = read(lambda conn: [
+                    dict(row) for row in conn.execute(
+                        "SELECT * FROM rule_evidence_refs "
+                        "WHERE share_group_id=? AND definition_id=? "
+                        "AND source_rule_id=? ORDER BY evidence_id",
+                        (group, definition.definition_id, memory_id),
+                    ).fetchall()
+                ])
+                evidence = evidence_rows[0] if evidence_rows else {}
+                evidence_ref = _text(evidence.get("evidence_ref")) or _text(evidence.get("evidence_id"))
+                if not evidence_ref:
+                    raise RuntimeError("native rule evidence unavailable")
+                source_ref = _text(link.get("source_ref")) or memory_id
+                evidence_digest = _text(evidence.get("content_digest")) or evidence_digest
+
+            layer = (
+                "mandatory"
+                if _text(definition.rule_strength).casefold() == "must"
+                or _text(definition.maturity_state).casefold() == "trusted"
+                else "relevant"
+            )
+            represented_source_ids[layer].update(
+                _text(link.get("memory_id"))
+                for link in matched_source_links
+                if _text(link.get("memory_id"))
+            )
+            result[layer].append({
+                "item_id": _text(definition.definition_id),
+                "body": _text(definition.canonical_text),
+                "kind": _text(definition.rule_kind) or "rule",
+                "layer": layer,
+                "source": source,
+                "source_ref": source_ref,
+                "evidence": {"id": evidence_ref, "digest": evidence_digest},
+                "scope": dict(scope_public),
+                "priority": max((int(getattr(item, "priority", 0) or 0) for item in matched), default=0),
+                "score": float(getattr(definition, "confidence", 0.0) or 0.0),
+                "is_rule": True,
+                "rule_strength": _text(getattr(definition, "rule_strength", "")),
+                "status": _text(definition.status) or "active",
+            })
+        return represented_source_ids
+
+    def _reference_candidates(
+        self,
+        *,
+        request: Any,
+        agent: str,
+        scope: Any,
+        group: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """Read optional V2 reference channels independently.
+
+        Knowledge, history and CodeGraph are optional context enrichments. A
+        failure in one channel must not discard native memory/rule candidates
+        or hide which channel was unavailable. The adapters return only safe
+        reference fields; this method adds bounded source identity for the
+        ContextEngine dedup/receipt contract.
+        """
+
+        from ..context_bootstrap import (
+            codegraph_reference_candidates,
+            history_reference_candidates,
+            knowledge_reference_candidates,
+        )
+
+        namespace_id = _text(getattr(request, "namespace_id", ""))
+        sensitivity = _text(getattr(request, "sensitivity", ""))
+        policy_class = _text(getattr(request, "policy_class", ""))
+        project = _text(scope.project_ref)
+        provider = _text(scope.provider)
+        runtime_role = _text(scope.runtime_role)
+        query = _text(getattr(request, "task", ""))
+        limit = max(1, min(int(getattr(request, "max_items", None) or 6), 20))
+        calls: tuple[tuple[str, Callable[[], Any]], ...] = (
+            (
+                "knowledge",
+                lambda: knowledge_reference_candidates(
+                    self.workspace,
+                    namespace_id=namespace_id,
+                    workspace_id=self.workspace,
+                    agent_instance_id=agent,
+                    project_ref=project,
+                    provider=provider,
+                    share_group_id=group,
+                    sensitivity=sensitivity,
+                    policy_class=policy_class,
+                    query=query,
+                    limit=limit,
+                ),
+            ),
+            (
+                "history",
+                lambda: history_reference_candidates(
+                    self.workspace,
+                    agent_instance_id=agent,
+                    project_ref=project,
+                    provider=provider,
+                    share_group_id=group,
+                    query=query,
+                    limit=limit,
+                ),
+            ),
+            (
+                "codegraph",
+                lambda: codegraph_reference_candidates(
+                    self.workspace,
+                    agent_instance_id=agent,
+                    project_ref=project,
+                    provider=provider,
+                    share_group_id=group,
+                    runtime_role=runtime_role,
+                    limit=min(limit, 4),
+                ),
+            ),
+        )
+        references: list[dict[str, Any]] = []
+        omissions: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for channel, call in calls:
+            try:
+                values = call()
+            except Exception:
+                omissions.append({
+                    "layer": "reference_only",
+                    "reason": f"{channel}_source_unavailable",
+                })
+                continue
+            if not isinstance(values, (list, tuple)):
+                omissions.append({
+                    "layer": "reference_only",
+                    "reason": f"{channel}_source_unavailable",
+                })
+                continue
+            for value in values:
+                if not isinstance(value, Mapping):
+                    continue
+                summary = _text(value.get("summary"))[:1200]
+                reference = _text(value.get("ref"))[:512]
+                digest = _text(value.get("hash"))[:256]
+                if not summary and not reference and not digest:
+                    continue
+                identity = (summary, reference, digest)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                references.append({
+                    "summary": summary,
+                    "ref": reference,
+                    "hash": digest,
+                    "trust": "reference_only",
+                    "source": f"native-v2-{channel}",
+                    "id": f"{channel}:{reference or digest}",
+                })
+        return references, omissions
+
+    def retrieve(self, request: Any) -> dict[str, Any]:
         """Retrieve bounded candidates from native V2 memory/rule stores.
 
         This is the default :class:`ContextEngine` retrieval port.  It only
@@ -2425,7 +2691,11 @@ class NativeV2RuntimePort:
         group = _text(req.share_group_id or req.group)
         agent = _text(req.agent_instance_id or req.agent)
         if not group or not agent:
-            return {"mandatory": [], "relevant": []}
+            return {
+                "mandatory": [], "relevant": [], "knowledge": [],
+                "reference_only": [],
+                "omissions": [{"layer": "reference_only", "reason": "scope_omitted"}],
+            }
         scope = MemoryReadScope(
             workspace_id=self.workspace,
             share_group_id=group,
@@ -2434,9 +2704,11 @@ class NativeV2RuntimePort:
             provider=_text(req.provider),
             runtime_role=_text(req.runtime_role or req.runtime),
         )
-        result: dict[str, list[dict[str, Any]]] = {
-            "mandatory": [], "relevant": [], "reference_only": [],
+        result: dict[str, Any] = {
+            "mandatory": [], "relevant": [], "knowledge": [], "reference_only": [],
+            "omissions": [],
         }
+        memory_source_ids: dict[str, set[str]] = {}
         scope_public = {
             "workspace_id": self.workspace,
             "agent_instance_id": agent,
@@ -2453,14 +2725,21 @@ class NativeV2RuntimePort:
                     policy = _text(getattr(atom, "injection_policy", "relevant")).casefold()
                     layer = "mandatory" if policy == "always" else "relevant"
                     kind = _text(getattr(atom, "kind", "fact")) or "fact"
-                    atom_id = _text(getattr(atom, "atom_id", "")) or _text(getattr(atom, "memory_id", ""))
-                    evidence_ids = list(getattr(memory, "evidence_ids_for_atom", lambda *_: [])(atom_id) or [])
-                    mappings = list(getattr(memory, "list_source_mappings", lambda **_: [])(atom_id=atom_id) or [])
+                    storage_atom_id = _text(getattr(atom, "atom_id", "")) or _text(getattr(atom, "memory_id", ""))
+                    memory_id = _text(getattr(atom, "memory_id", "")) or storage_atom_id
+                    evidence_ids = list(getattr(memory, "evidence_ids_for_atom", lambda *_: [])(storage_atom_id) or [])
+                    mappings = list(getattr(memory, "list_source_mappings", lambda **_: [])(atom_id=storage_atom_id) or [])
                     mapping = mappings[0] if mappings else {}
-                    source_ref = _text(mapping.get("source_ref")) or _text(getattr(atom, "memory_id", ""))
+                    memory_source_ids[memory_id] = {
+                        _text(item.get("source_record_id"))
+                        for item in mappings
+                        if _text(item.get("source_record_id"))
+                    }
+                    source_ref = _text(mapping.get("source_ref")) or memory_id
                     evidence_ref = _text(evidence_ids[0] if evidence_ids else "") or source_ref
                     result[layer].append({
-                        "item_id": atom_id, "body": _text(getattr(atom, "body", "")),
+                        "item_id": memory_id, "memory_id": memory_id,
+                        "body": _text(getattr(atom, "body", "")),
                         "kind": kind, "layer": layer, "source": "native-v2-memory",
                         "source_ref": source_ref,
                         "evidence": {"id": evidence_ref, "digest": _text(getattr(atom, "canonical_hash", ""))},
@@ -2471,79 +2750,35 @@ class NativeV2RuntimePort:
                         "status": _text(getattr(atom, "status", "active")) or "active",
                     })
             if self.layout.rules_db.is_file():
-                from ..rule_reconciliation import canonical_reconciliation_status
-                readiness = canonical_reconciliation_status(self.workspace, group)
-                if readiness.get("failures") and readiness.get("failures") == ["native_canonical_status_unavailable"]:
-                    raise RuntimeError("canonical status unavailable")
-                if readiness.get("canonical_ready"):
-                    rules = self._domain_store("rules")
-                    definitions = rules.list_definitions(status="active")
-                    for definition in definitions:
-                        bindings = rules.list_bindings(definition_id=definition.definition_id, share_group_id=group, status="active")
-                        includes = [item for item in bindings if _text(getattr(item, "effect", "include")).casefold() != "exclude"]
-                        matched = [item for item in includes if self._binding_matches_context(item, scope_public)]
-                        if not matched:
-                            continue
-                        read = getattr(rules, "_read", None)
-                        if not callable(read):
-                            raise RuntimeError("native rule provenance unavailable")
-                        provenance = read(lambda conn: {
-                            "link": (
-                                lambda row: dict(row) if row is not None else None
-                            )(conn.execute(
-                                "SELECT * FROM rule_source_links "
-                                "WHERE share_group_id=? AND status='active' "
-                                "AND canonical_definition_id=? "
-                                "ORDER BY source_link_id LIMIT 1",
-                                (group, definition.definition_id),
-                            ).fetchone()),
-                            "evidence": [],
-                        })
-                        link = provenance.get("link") or {}
-                        memory_id = _text(link.get("memory_id"))
-                        if not memory_id:
-                            raise RuntimeError("native rule source link unavailable")
-                        evidence_rows = read(lambda conn: [
-                            dict(row) for row in conn.execute(
-                                "SELECT * FROM rule_evidence_refs "
-                                "WHERE share_group_id=? AND definition_id=? "
-                                "AND source_rule_id=? ORDER BY evidence_id",
-                                (group, definition.definition_id, memory_id),
-                            ).fetchall()
-                        ])
-                        evidence = evidence_rows[0] if evidence_rows else {}
-                        evidence_ref = _text(evidence.get("evidence_ref")) or _text(evidence.get("evidence_id"))
-                        if not evidence_ref:
-                            raise RuntimeError("native rule evidence unavailable")
-                        layer = "mandatory" if _text(definition.rule_strength).casefold() == "must" or _text(definition.maturity_state).casefold() == "trusted" else "relevant"
-                        result[layer].append({
-                            "item_id": _text(definition.definition_id), "body": _text(definition.canonical_text),
-                            "kind": _text(definition.rule_kind) or "rule", "layer": layer,
-                            "source": "native-v2-rule", "source_ref": _text(link.get("source_ref")) or memory_id,
-                            "evidence": {"id": evidence_ref, "digest": _text(evidence.get("content_digest")) or _text(getattr(definition, "semantic_hash", ""))},
-                            "scope": dict(scope_public),
-                            "priority": max((int(getattr(item, "priority", 0) or 0) for item in matched), default=0),
-                            "score": float(getattr(definition, "confidence", 0.0) or 0.0),
-                            "is_rule": True, "status": _text(definition.status) or "active",
-                        })
-            # Knowledge is always reference-only and uses the exact trusted
-            # ACL tuple. Missing identity yields no candidates; no legacy
-            # global knowledge store is consulted.
-            from ..context_bootstrap import knowledge_reference_candidates
-            references = knowledge_reference_candidates(
-                self.workspace,
-                namespace_id=_text(getattr(req, "namespace_id", "")),
-                workspace_id=self.workspace,
-                agent_instance_id=agent,
-                project_ref=scope.project_ref,
-                provider=scope.provider,
-                share_group_id=group,
-                sensitivity=_text(getattr(req, "sensitivity", "")),
-                policy_class=_text(getattr(req, "policy_class", "")),
-                query=_text(req.task),
-                limit=6,
+                represented_sources = self._retrieve_v2_rules(
+                    group=group,
+                    scope_public=scope_public,
+                    result=result,
+                )
+                if any(represented_sources.values()):
+                    for layer in ("mandatory", "relevant"):
+                        replacement_sources = set(represented_sources["mandatory"])
+                        if layer == "relevant":
+                            replacement_sources.update(represented_sources["relevant"])
+                        result[layer] = [
+                            item for item in result[layer]
+                            if item.get("source") != "native-v2-memory"
+                            or not (
+                                memory_source_ids.get(_text(item.get("item_id")), set())
+                                & replacement_sources
+                            )
+                        ]
+            # Optional reference channels fail independently. Their bounded
+            # diagnostics remain visible to ContextEngine; native memory and
+            # canonical/compatibility rule candidates stay intact.
+            references, omissions = self._reference_candidates(
+                request=req,
+                agent=agent,
+                scope=scope,
+                group=group,
             )
             result["reference_only"].extend(references)
+            result["omissions"].extend(omissions)
         except Exception as exc:
             raise RuntimeError("native_v2_retrieval_failed") from exc
         return result
@@ -4516,6 +4751,39 @@ class NativeV2RuntimePort:
                     "runtime_role": selected["runtime_role"],
                     "trusted_context": True,
                 })
+            # GUI Graphify builds are persisted as trusted group-level scopes,
+            # often for a repository nested below the caller's current
+            # project.  Exact Agent/provider lookup would return a valid but
+            # empty scope and hide that indexed repository.  Resolve nearest
+            # populated scope from the trusted group; payload selectors never
+            # participate in this decision.
+            requested = canonical_project_ref(authority.project_ref)
+            if requested and self.layout.codegraph_db.is_file():
+                try:
+                    store = self._domain_store("codegraph")
+                    nearest = store.nearest_scopes(
+                        project_ref=requested,
+                        share_group_id=_text(authority.share_group_id),
+                        agent_instance_id=_text(authority.agent_instance_id),
+                        provider=_text(authority.provider),
+                        runtime_role=_text(authority.runtime_role),
+                        limit=1,
+                    )
+                    if nearest:
+                        return nearest[0]
+                except NativePortError as exc:
+                    # A V1 graph cannot be opened through the read-only
+                    # compatibility path.  A confirmed native update must
+                    # still reach ``_domain_store(..., write=True)`` so its
+                    # existing V1->V2 migration can run.  Keep every other
+                    # preflight error fail-closed.
+                    if exc.code != "codegraph_schema_upgrade_required":
+                        raise
+                except Exception:
+                    # Missing/partial graph data must retain ordinary native
+                    # status/query behavior; exact trusted scope below gives
+                    # a bounded zero result without broadening access.
+                    pass
             return CodeGraphScope.from_value({
                 "workspace_id": self.workspace,
                 "share_group_id": authority.share_group_id,
@@ -6044,16 +6312,31 @@ class NativeV2RuntimePort:
                 if not members:
                     raise NativePortError("governance_scope_empty")
                 scoped_authority = authority.to_dict()
+                # Keep the process-issued capability attached while changing
+                # only the business selector.  _memory_status intentionally
+                # derives its admin bit from this immutable capability rather
+                # than trusting the copied mapping's ``admin`` field.
+                for private_key in ("__native_bound_context", "__native_transport_capability"):
+                    if private_key in context:
+                        scoped_authority[private_key] = context[private_key]
                 # Shared memory is one canonical group plane.  The binding's
                 # Agent identifies the selected member, not an atom-owner
                 # filter.  Personal groups keep their exact Agent scope.
+                shared_group = _text(binding.get("group_kind")).casefold() == "shared"
+                trusted_admin = self._trusted_admin(context)
+                # A shared-group selection is an all-member memory-plane read
+                # only for the trusted server-admin bridge.  Ordinary Agents
+                # retain their selected-member ACL even when the control-plane
+                # binding is marked shared.
                 scoped_authority["agent_instance_id"] = (
                     ""
-                    if _text(binding.get("group_kind")).casefold() == "shared"
+                    if shared_group and trusted_admin
                     else _text(binding.get("agent_instance_id"))
                 )
                 scoped_authority["trusted_agent_id"] = scoped_authority["agent_instance_id"]
                 scoped_authority["share_group_id"] = bound_group
+                scoped_authority["admin"] = bool(shared_group and trusted_admin)
+                scoped_authority["is_admin"] = bool(shared_group and trusted_admin)
                 memory = dict(self._memory_status({}, scoped_authority))
                 governance_state = "active_governance"
                 group_id = bound_group
@@ -7533,9 +7816,17 @@ class NativeV2RuntimePort:
                 and not effective_mutation
                 and name in _NEUTRAL_MCP_READS
             )
+            context_payload = raw_payload
+            if surface == "mcp" and "workspace" in raw_payload:
+                # MCP workspace is a project hint resolved into the trusted
+                # context by mcp_server.  It is not a second workspace
+                # authority and must not trip spoof checks against the V2
+                # control-plane workspace.  workspace_id remains protected.
+                context_payload = dict(raw_payload)
+                context_payload.pop("workspace", None)
             trusted = self._context(
                 context,
-                raw_payload,
+                context_payload,
                 required=(
                     effective_mutation
                     or surface in {"gui", "hook"}

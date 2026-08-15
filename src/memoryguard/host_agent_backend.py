@@ -1002,6 +1002,70 @@ def batch_bundle_via_cli(
         plan = build_bundles(
             None, facade, "", records, workspace=workspace or "",
         )
+        # ``build_bundles`` deliberately keeps semantically unrelated rules
+        # separate for the canonical reconciliation saga.  This host-facing
+        # planner also needs a deterministic scope bundle when the model is
+        # unavailable: combine only records with the exact same audience
+        # signature, never across project/provider/effect boundaries.  The
+        # scope-only fallback is a plan surface; canonical reconciliation
+        # still applies its semantic safety gate before persistence.
+        if not plan.get("bundles") and len(source_ids) > 1:
+            grouped: dict[tuple[tuple[str, ...], ...], list[dict[str, Any]]] = {}
+            for source in sources:
+                bindings = source.get("bindings") or []
+                entries = tuple(sorted(
+                    (
+                        str(binding.target_type or "agent").casefold(),
+                        str(binding.target_id or ""),
+                        str(binding.project_ref or ""),
+                        str(binding.provider or "").casefold(),
+                        str(binding.runtime_role or "").casefold(),
+                        str(binding.effect or "include").casefold(),
+                    )
+                    for binding in bindings
+                )) or (("group", "", "", "", "", "include"),)
+                grouped.setdefault(entries, []).append(source)
+
+            scope_bundles: list[ScopeBundle] = []
+            scope_kept: list[str] = []
+            for entries, members in grouped.items():
+                project_refs = {entry[2] for entry in entries if entry[2]}
+                providers = {entry[3] for entry in entries if entry[3]}
+                runtime_roles = {entry[4] for entry in entries if entry[4]}
+                effects = {entry[5] for entry in entries}
+                target_types = {entry[0] for entry in entries}
+                # Ambiguous/multi-audience bindings remain separate rather
+                # than being guessed into a broader scope.
+                if len(project_refs) > 1 or len(effects) > 1:
+                    scope_kept.extend(str(item["memory_id"]) for item in members)
+                    continue
+                if len(members) == 1 and project_refs:
+                    scope_kept.append(str(members[0]["memory_id"]))
+                    continue
+                if project_refs:
+                    bundle_kind = "project_overlay"
+                elif providers or runtime_roles or target_types == {"agent"}:
+                    bundle_kind = "agent_overlay"
+                else:
+                    bundle_kind = "shared_baseline"
+                body = "\n".join(
+                    f"[{index}] {item['body']}"
+                    for index, item in enumerate(
+                        sorted(members, key=lambda value: value["memory_id"]), 1
+                    )
+                )
+                scope_bundles.append(ScopeBundle(
+                    bundle_kind=bundle_kind,
+                    source_memory_ids=[str(item["memory_id"]) for item in members],
+                    priority=max(int(item.get("priority") or 0) for item in members),
+                    body=body,
+                    project_ref=next(iter(project_refs), ""),
+                    provider=next(iter(providers), ""),
+                    runtime_role=next(iter(runtime_roles), ""),
+                    effect=next(iter(effects), "include"),
+                ))
+            if scope_bundles:
+                plan = {"bundles": scope_bundles, "kept_separate": scope_kept}
         validate_bundles(plan, source_ids)
         return {
             "bundles": [_to_bundle_dict(b) for b in plan.get("bundles", [])],

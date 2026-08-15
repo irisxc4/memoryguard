@@ -49,10 +49,12 @@ def sanitize_public_payload(value: Any, *, error_code: str = "operation_failed")
             lowered = key.casefold()
             if lowered in _ERROR_KEYS:
                 if lowered == "error":
-                    output[key] = safe_error_code(raw_value, error_code)
+                    # Preserve explicit empty success diagnostics.  Only a
+                    # present error is normalized to a public fallback code.
+                    output[key] = raw_value if not raw_value else safe_error_code(raw_value, error_code)
                 continue
             if lowered == "code":
-                output[key] = safe_error_code(raw_value, error_code)
+                output[key] = raw_value if not raw_value else safe_error_code(raw_value, error_code)
                 continue
             if lowered in _PATH_KEYS:
                 output[key] = "<redacted>"

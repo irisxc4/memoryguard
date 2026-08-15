@@ -23,6 +23,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from ..storage.database import execute_sql_script, open_database, open_database_snapshot
 from ..storage.layout import WorkspaceV2Layout
+from ..rule_scope import canonical_project_ref
 from ..storage.schema import initialize_database
 from ..storage.transaction import transaction
 from .models import (
@@ -276,7 +277,13 @@ def _assert_no_reparse(path: str | Path) -> None:
 
 
 def normalize_relative_path(value: str | Path) -> str:
-    """Normalize a source reference while rejecting absolute/traversal paths."""
+    """Normalize source reference across provider/repository path spellings.
+
+    Graphify exports may identify a file from repository root (``repo/src``)
+    while native callers identify it from the indexed workspace root
+    (``src``). Collapse ordinary parent segments, but still reject traversal
+    above root and absolute paths.
+    """
 
     raw = str(value).strip().replace("\\", "/")
     if not raw or "\x00" in raw or any(ord(char) < 32 for char in raw):
@@ -284,12 +291,23 @@ def normalize_relative_path(value: str | Path) -> str:
     if raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw) or raw.startswith("//"):
         raise CodeGraphPathError("source path must be workspace-relative")
     path = PurePosixPath(raw)
-    parts = [part for part in path.parts if part not in ("", ".")]
-    if not parts or any(part == ".." for part in parts):
+    parts: list[str] = []
+    for part in path.parts:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise CodeGraphPathError("source path escapes workspace")
+            parts.pop()
+            continue
+        parts.append(part)
+    if not parts:
         raise CodeGraphPathError("source path escapes workspace")
+    # Some indexers include their repository directory in every exported
+    # relative path. It is a transport prefix, not part of file identity.
+    if len(parts) > 1 and parts[0].casefold() in {"repo", "repository"}:
+        parts = parts[1:]
     normalized = "/".join(parts)
-    if normalized.startswith("../") or normalized == "..":
-        raise CodeGraphPathError("source path escapes workspace")
     return normalized
 
 
@@ -459,8 +477,18 @@ class CodeGraphStore:
         checked = CodeGraphScope.from_value(scope)
         if not checked.trusted_context:
             raise CodeGraphScopeError("untrusted context cannot access codegraph")
-        if checked.workspace_id != self.workspace_id:
+        if canonical_project_ref(checked.workspace_id) != canonical_project_ref(self.workspace_id):
             raise CodeGraphScopeError("workspace scope mismatch")
+        # Persist and compare one canonical spelling across Windows drive
+        # case, slash direction and provider/runtime case.  Share group and
+        # Agent IDs remain exact security dimensions.
+        checked = replace(
+            checked,
+            workspace_id=self.workspace_id,
+            project_ref=canonical_project_ref(checked.project_ref),
+            provider=str(checked.provider or "").strip().casefold(),
+            runtime_role=str(checked.runtime_role or "").strip().casefold(),
+        )
         if any(value == UNKNOWN for value in checked.as_tuple()):
             raise CodeGraphScopeError("unknown ACL scope is blocked")
         if write and not checked.trusted_context:
@@ -1576,6 +1604,118 @@ class CodeGraphStore:
 
     table_counts = counts
 
+    def nearest_scopes(
+        self,
+        *,
+        project_ref: str,
+        share_group_id: str,
+        agent_instance_id: str = "",
+        provider: str = "",
+        runtime_role: str = "",
+        limit: int = 4,
+    ) -> tuple[CodeGraphScope, ...]:
+        """Resolve trusted graph scopes nearest to current project.
+
+        CodeGraph builds made by the GUI are group-level Graphify scopes
+        (empty agent/provider-independent identity), while MCP callers carry
+        a trusted Agent/provider context.  Exact tuple lookup therefore misses
+        an indexed child repository or a group-level build.  This read-only
+        resolver keeps the group/workspace/trusted boundary fixed, admits only
+        the current Agent or group-level Graphify scopes, then ranks exact and
+        parent/child project matches deterministically.
+        """
+
+        current = canonical_project_ref(project_ref)
+        group = str(share_group_id or "").strip()
+        agent = str(agent_instance_id or "").strip()
+        wanted_provider = str(provider or "").strip().casefold()
+        wanted_runtime = str(runtime_role or "").strip().casefold()
+        if not current or not group:
+            return ()
+
+        def distance(candidate: str) -> int | None:
+            candidate = canonical_project_ref(candidate)
+            if not candidate:
+                return None
+            if candidate == current:
+                return 0
+            left = candidate.rstrip("/")
+            right = current.rstrip("/")
+            if right.startswith(left + "/"):
+                return len(right) - len(left)
+            if left.startswith(right + "/"):
+                return len(left) - len(right)
+            return None
+
+        ranked: list[tuple[tuple[Any, ...], CodeGraphScope]] = []
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT scope_id,workspace_id,agent_instance_id,project_ref,provider,"
+                "share_group_id,runtime_role,trusted_context "
+                "FROM graph_scopes WHERE LOWER(REPLACE(workspace_id,char(92),'/'))="
+                "LOWER(REPLACE(?,char(92),'/')) AND share_group_id=? "
+                "AND trusted_context=1 ORDER BY project_ref,scope_id",
+                (self.workspace_id, group),
+            ).fetchall()
+            for row in rows:
+                candidate_agent = str(row[2] or "")
+                candidate_project = canonical_project_ref(row[3])
+                candidate_provider = str(row[4] or "").casefold()
+                candidate_runtime = str(row[6] or "").casefold()
+                gap = distance(candidate_project)
+                if gap is None:
+                    continue
+                group_graphify = (
+                    not candidate_agent
+                    and candidate_provider == "graphify"
+                    and not candidate_runtime
+                )
+                exact_agent = (
+                    bool(agent)
+                    and candidate_agent == agent
+                    and (not wanted_provider or candidate_provider == wanted_provider)
+                    and (not wanted_runtime or candidate_runtime == wanted_runtime)
+                )
+                if not (group_graphify or exact_agent):
+                    continue
+                scope_id = str(row[0])
+                data_count = int(conn.execute(
+                    "SELECT COUNT(*) FROM source_files WHERE scope_id=? AND active=1",
+                    (scope_id,),
+                ).fetchone()[0])
+                data_count += int(conn.execute(
+                    "SELECT COUNT(*) FROM symbols WHERE scope_id=? AND active=1",
+                    (scope_id,),
+                ).fetchone()[0])
+                try:
+                    scope = CodeGraphScope(
+                        # Store-owned workspace is canonical even when legacy
+                        # rows used different drive-case or slash spelling.
+                        workspace_id=self.workspace_id,
+                        agent_instance_id=candidate_agent,
+                        project_ref=candidate_project,
+                        provider=candidate_provider,
+                        share_group_id=str(row[5] or ""),
+                        runtime_role=candidate_runtime,
+                        trusted_context=True,
+                    )
+                except (TypeError, ValueError):
+                    continue
+                # Prefer populated exact scopes, then populated group-level
+                # scopes, then the nearest empty scope.  This avoids an empty
+                # compatibility row masking a real indexed child repository.
+                rank = (
+                    0 if data_count else 1,
+                    0 if exact_agent else 1,
+                    gap,
+                    -len(candidate_project),
+                    candidate_project,
+                    scope_id,
+                )
+                ranked.append((rank, scope))
+        ranked.sort(key=lambda item: item[0])
+        return tuple(scope for _rank, scope in ranked[: max(1, min(int(limit), 8))])
+
     def orphan_count(self, *, scope: CodeGraphScope | Mapping[str, Any] | None = None) -> int:
         checked_scope = self._scope(scope); scope_id = self._scope_id(checked_scope)
         with self.connection() as conn:
@@ -1591,6 +1731,124 @@ class CodeGraphStore:
 
     def status(self, *, scope: CodeGraphScope | Mapping[str, Any] | None = None) -> dict[str, Any]:
         return {"db_path": str(self.db_path), "schema_marker": CODEGRAPH_SCHEMA_MARKER, "counts": self.counts(scope=scope), "integrity": self.integrity_check(), "foreign_keys": self.foreign_key_check(), "orphan": self.orphan_count(scope=scope)}
+
+    def reference_metadata(
+        self,
+        *,
+        project_ref: str,
+        share_group_id: str,
+        provider: str = "graphify",
+        agent_instance_id: str = "",
+        runtime_role: str = "",
+        limit: int = 1,
+    ) -> tuple[dict[str, Any], ...]:
+        """Read nearest trusted repository metadata for bootstrap.
+
+        This is intentionally not a general graph query.  It filters by the
+        trusted workspace/group/provider tuple first, then selects a graph
+        scope whose canonical project path is the nearest ancestor/descendant
+        of the current project.  Only aggregate counts and bounded symbol/file
+        metadata cross the context boundary; source bodies and edges do not.
+        """
+
+        current = canonical_project_ref(project_ref)
+        group = str(share_group_id or "").strip()
+        wanted_provider = str(provider or "graphify").strip().casefold()
+        agent = str(agent_instance_id or "").strip()
+        wanted_runtime = str(runtime_role or "").strip().casefold()
+        if not current or not group or not wanted_provider:
+            return ()
+
+        def distance(candidate: str) -> int | None:
+            if not candidate:
+                return None
+            if candidate == current:
+                return 0
+            left = candidate.rstrip("/")
+            right = current.rstrip("/")
+            if right.startswith(left + "/"):
+                return len(right) - len(left)
+            if left.startswith(right + "/"):
+                return len(left) - len(right)
+            return None
+
+        selected: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        with self.connection() as conn:
+            clauses = [
+                "LOWER(REPLACE(workspace_id,char(92),'/'))=LOWER(REPLACE(?,char(92),'/'))",
+                "share_group_id=?",
+                "trusted_context=1",
+                "(LOWER(provider)=? OR (agent_instance_id='' "
+                "AND LOWER(provider)='graphify' AND runtime_role=''))",
+            ]
+            params: list[Any] = [self.workspace_id, group, wanted_provider]
+            if agent:
+                clauses.append(
+                    "(agent_instance_id=? OR (agent_instance_id='' "
+                    "AND LOWER(provider)='graphify' AND runtime_role=''))"
+                )
+                params.append(agent)
+            if wanted_runtime:
+                clauses.append("(LOWER(runtime_role)=? OR runtime_role='')")
+                params.append(wanted_runtime)
+            rows = conn.execute(
+                "SELECT scope_id,workspace_id,agent_instance_id,project_ref,provider,share_group_id,runtime_role,trusted_context "
+                "FROM graph_scopes WHERE " + " AND ".join(clauses) + " ORDER BY project_ref,scope_id",
+                params,
+            ).fetchall()
+            for row in rows:
+                candidate_project = canonical_project_ref(row["project_ref"])
+                gap = distance(candidate_project)
+                if gap is None:
+                    continue
+                scope_id = str(row["scope_id"])
+                counts = {
+                    "source_files": int(conn.execute("SELECT COUNT(*) FROM source_files WHERE scope_id=? AND active=1", (scope_id,)).fetchone()[0]),
+                    "symbols": int(conn.execute("SELECT COUNT(*) FROM symbols WHERE scope_id=? AND active=1", (scope_id,)).fetchone()[0]),
+                    "edges": int(conn.execute("SELECT COUNT(*) FROM edges WHERE scope_id=? AND active=1", (scope_id,)).fetchone()[0]),
+                    "outbox_pending": int(conn.execute("SELECT COUNT(*) FROM outbox WHERE scope_id=? AND status='pending'", (scope_id,)).fetchone()[0]),
+                }
+                file_rows = conn.execute(
+                    "SELECT file_id,path,content_hash,source_revision,language FROM source_files "
+                    "WHERE scope_id=? AND active=1 ORDER BY path,file_id LIMIT 8",
+                    (scope_id,),
+                ).fetchall()
+                files: list[dict[str, Any]] = []
+                for file_row in file_rows:
+                    file_id = str(file_row["file_id"])
+                    symbol_rows = conn.execute(
+                        "SELECT name,kind FROM symbols WHERE scope_id=? AND file_id=? "
+                        "AND active=1 ORDER BY name,kind LIMIT 12",
+                        (scope_id, file_id),
+                    ).fetchall()
+                    files.append({
+                        "path": normalize_relative_path(str(file_row["path"])),
+                        "hash": str(file_row["content_hash"] or ""),
+                        "revision": str(file_row["source_revision"] or ""),
+                        "language": str(file_row["language"] or ""),
+                        "symbols": [
+                            {"name": str(symbol["name"]), "kind": str(symbol["kind"])}
+                            for symbol in symbol_rows
+                        ],
+                    })
+                checkpoint = conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0),COALESCE(MAX(digest),'') FROM checkpoints WHERE scope_id=?",
+                    (scope_id,),
+                ).fetchone()
+                item = {
+                    "scope_id": scope_id,
+                    "project_ref": candidate_project,
+                    "provider": str(row["provider"] or wanted_provider).casefold(),
+                    "share_group_id": group,
+                    "runtime_role": str(row["runtime_role"] or ""),
+                    "counts": counts,
+                    "files": files,
+                    "checkpoint_sequence": int(checkpoint[0] or 0),
+                    "checkpoint_digest": str(checkpoint[1] or ""),
+                }
+                selected.append(((gap, -len(candidate_project), candidate_project, scope_id), item))
+        selected.sort(key=lambda item: item[0])
+        return tuple(item for _key, item in selected[: max(1, min(int(limit), 4))])
 
 
 CodeGraphStorage = CodeGraphStore

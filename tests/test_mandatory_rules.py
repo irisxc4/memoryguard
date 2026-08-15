@@ -16,6 +16,7 @@ from memoryguard.memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
 from memoryguard.mcp_server import TOOLS, execute_tool
 from memoryguard.migration import V1GroupReader, V1MemoryMigrator
 from memoryguard.rule_scope import canonical_project_ref
+from memoryguard.rules.v2_store import RuleV2Store
 from memoryguard.runtime_v2.context_engine import ContextEngine
 from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort
@@ -29,6 +30,7 @@ def _activate_v2(root: Path) -> GroupControlService:
     memory = MemoryAtomStore(root)
     evidence = EvidenceStore(root)
     GovernanceV2(root, memory_store=memory, evidence_store=evidence)
+    RuleV2Store(root)
     manager = ManifestManager(root)
     manager.transition(ManifestState.V2_BUILDING, migration_id="mandatory-rules-core")
     manager.transition(
@@ -154,6 +156,7 @@ def _native_packet(
 
 def _set_mcp_identity(monkeypatch: pytest.MonkeyPatch, root: Path, agent: str) -> None:
     values = {
+        "MEMORYGUARD_HOME": str(root.resolve()),
         "MEMORYGUARD_WORKSPACE": str(root.resolve()),
         "MEMORYGUARD_AGENT_ID": agent,
         "MEMORYGUARD_ADMIN": "1",
@@ -372,7 +375,7 @@ def test_update_to_always_is_rejected_until_delete_releases_capacity(tmp_path):
     memory.set_visibility("ready")
     accepted = _native_packet(root, agent, group)
     assert accepted["status"] == "ok"
-    assert any(item["item_id"] == updated.atom_id for item in accepted["mandatory"])
+    assert any(item["item_id"] == updated.memory_id for item in accepted["mandatory"])
 
 
 def test_duplicate_body_different_injection_semantics_stays_distinct(tmp_path):
@@ -389,8 +392,8 @@ def test_duplicate_body_different_injection_semantics_stays_distinct(tmp_path):
     assert {item.memory_id for item in atoms} >= {"first", "second"}
     assert first.atom_id != second.atom_id
     packet = _native_packet(root, agent, group, task=related_task)
-    assert [item["item_id"] for item in packet["mandatory"]] == [first.atom_id]
-    assert [item["item_id"] for item in packet["relevant"]] == [second.atom_id]
+    assert [item["item_id"] for item in packet["mandatory"]] == [first.memory_id]
+    assert [item["item_id"] for item in packet["relevant"]] == [second.memory_id]
 
 
 def test_interactive_memory_records_offer_visible_injection_toggle():
@@ -471,7 +474,7 @@ def test_readonly_open_old_schema_fails_closed_until_writable_migration(tmp_path
     refreshed_memory.set_visibility("ready")
     packet = _native_packet(target, agent, group, provider="codex", runtime_role="root")
     assert packet["status"] == "ok"
-    assert any(item["item_id"] == atom.atom_id for item in packet["mandatory"])
+    assert any(item["item_id"] == atom.memory_id for item in packet["mandatory"])
 
 
 def test_mcp_write_update_schema_exposes_persisted_injection_fields():

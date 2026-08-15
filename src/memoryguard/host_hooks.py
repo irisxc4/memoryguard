@@ -412,6 +412,45 @@ def _generated_handler_binding(handler: Any) -> tuple[str, str, str, str] | None
     return None
 
 
+def _generated_binding_events(
+    data: dict[str, Any],
+    *,
+    provider: str,
+    workspace: Path,
+) -> dict[tuple[str, str], set[str]]:
+    """Index generated hook events by exact provider/agent/group/workspace."""
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return {}
+    indexed: dict[tuple[str, str], set[str]] = {}
+
+    def collect(event_name: str, handler: Any) -> None:
+        binding = _generated_handler_binding(handler)
+        if binding is None:
+            return
+        bound_provider, agent_id, group_id, bound_workspace = binding
+        try:
+            same_workspace = Path(bound_workspace).expanduser().resolve() == workspace
+        except (OSError, RuntimeError, ValueError):
+            same_workspace = False
+        if bound_provider != provider or not same_workspace:
+            return
+        indexed.setdefault((agent_id, group_id), set()).add(str(event_name))
+
+    for event_name, entries in hooks.items():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if _generated_handler_binding(entry) is not None:
+                collect(str(event_name), entry)
+                continue
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                continue
+            for handler in entry["hooks"]:
+                collect(str(event_name), handler)
+    return indexed
+
+
 def _remove_generated_bindings(
     data: dict[str, Any],
     *,
@@ -1104,12 +1143,28 @@ class HostHookManager:
         agent_instance_id: str,
         share_group_id: str,
         mode: str = "enforce",
+        reconcile_trust: bool = False,
     ) -> dict[str, Any]:
-        return self.adapter(provider).install(
+        normalized = (provider or "").strip().lower()
+        result = self.adapter(provider).install(
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
             mode=mode,
         )
+        if (
+            normalized == "codex"
+            and reconcile_trust
+            and result.get("configured")
+        ):
+            from .codex_hook_trust import reconcile_codex_memoryguard_hooks
+
+            trust = reconcile_codex_memoryguard_hooks(
+                cwd=self.workspace,
+                enabled=True,
+            )
+            result["hook_trust"] = trust
+            result["trust_required"] = not bool(trust.get("verified"))
+        return result
 
     def uninstall(self, provider: str) -> dict[str, Any]:
         return self.adapter(provider).uninstall()
@@ -1164,27 +1219,116 @@ class HostHookManager:
             raise
         return cleanup
 
+    def retire_legacy_generated_bindings(
+        self,
+        bindings: Iterable[Mapping[str, Any]],
+        *,
+        active_workspace: str | Path,
+    ) -> "HookBindingCleanup":
+        """Remove obsolete V1-generated bindings without deleting valid V2 hooks.
+
+        Hooks that still point at a retired project workspace are always stale.
+        When an in-place upgrade promotes that same directory to the V2 Data
+        Home, a complete current-event binding is preserved; only partial/
+        legacy registrations are retired. User-owned handlers never match the
+        generated binding parser and are therefore untouched.
+        """
+        targets = {
+            (str(item.get("agent_instance_id") or "").strip(), str(item.get("share_group_id") or "").strip())
+            for item in bindings
+            if str(item.get("agent_instance_id") or "").strip()
+            and str(item.get("share_group_id") or "").strip()
+        }
+        cleanup = HookBindingCleanup()
+        if not targets:
+            return cleanup
+        active_root = Path(active_workspace).expanduser().resolve()
+        same_control_root = active_root == self.workspace
+        adapters = (
+            ("claude", ClaudeHookAdapter),
+            ("codex", CodexHookAdapter),
+            ("cursor", CursorHookAdapter),
+        )
+        try:
+            for provider, adapter_cls in adapters:
+                adapter = adapter_cls(self.workspace)
+                path = adapter.config_path()
+                data = _load_json_config(path, strict=True)
+                removable = set(targets)
+                if same_control_root:
+                    event_map = _generated_binding_events(
+                        data, provider=provider, workspace=self.workspace,
+                    )
+                    expected = set(adapter.capability().events)
+                    removable = {
+                        target for target in targets
+                        if not expected.issubset(event_map.get(target, set()))
+                    }
+                if not removable:
+                    continue
+                original = json.loads(json.dumps(data))
+                removed = _remove_generated_bindings(
+                    data,
+                    provider=provider,
+                    workspace=self.workspace,
+                    targets=removable,
+                )
+                if not removed:
+                    continue
+                cleanup.snapshots.append((path, original))
+                _write_json_config(path, data)
+                for identity in removed:
+                    cleanup.removed[identity] = cleanup.removed.get(identity, 0) + 1
+        except Exception:
+            cleanup.restore()
+            raise
+        return cleanup
+
+    def _attach_codex_trust_status(
+        self,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not result.get("configured"):
+            return result
+        from .codex_hook_trust import inspect_codex_memoryguard_hooks
+
+        trust = inspect_codex_memoryguard_hooks(cwd=self.workspace)
+        result["hook_trust"] = trust
+        verified = bool(trust.get("verified"))
+        result["trust_required"] = not verified
+        if not verified:
+            result["runtime_verified"] = False
+            result["status"] = "configured_untrusted"
+        return result
+
     def status(
         self,
         provider: str = "",
         *,
         agent_instance_id: str = "",
+        inspect_trust: bool = False,
     ) -> dict[str, Any]:
         if provider:
-            return self.adapter(provider).status(
+            normalized = (provider or "").strip().lower()
+            result = self.adapter(provider).status(
                 agent_instance_id=agent_instance_id,
             )
-        statuses = [
-            adapter_cls(self.workspace).status(
+            if normalized == "codex" and inspect_trust:
+                return self._attach_codex_trust_status(result)
+            return result
+        statuses: list[dict[str, Any]] = []
+        for adapter_cls in (
+            ClaudeHookAdapter,
+            CodexHookAdapter,
+            CursorHookAdapter,
+            TraeHookAdapter,
+        ):
+            result = adapter_cls(self.workspace).status(
                 agent_instance_id=agent_instance_id,
             )
-            for adapter_cls in (
-                ClaudeHookAdapter,
-                CodexHookAdapter,
-                CursorHookAdapter,
-                TraeHookAdapter,
-            )
-        ]
+            if adapter_cls is CodexHookAdapter and inspect_trust:
+                result = self._attach_codex_trust_status(result)
+            statuses.append(result)
         return {
             "providers": statuses,
             "configured_count": sum(
@@ -1424,6 +1568,127 @@ def _record_codex_reconcile_diagnostic(
         )
 
 
+def _codex_lifecycle_lease_id(payload: dict[str, Any]) -> str:
+    """Return a local-only lease identity for Codex MCP cohort ownership.
+
+    ``CODEX_THREAD_ID`` can be inherited by a nested Codex invocation.  Treat
+    it as fresh only when it agrees with the Hook's own session identity; a
+    mismatch falls back to the existing opaque session hash.  This validation
+    is lifecycle-local and never weakens the stricter SQLite reconciliation
+    authority, which still requires the host environment value directly.
+    """
+    from .codex_subagent_reconcile import trusted_codex_thread_id
+
+    session = _session_id(payload)
+    trusted = trusted_codex_thread_id()
+    if trusted:
+        session_root = session.split(":subagent:", 1)[0]
+        if session == "unknown-session" or session_root == trusted:
+            return f"thread:{trusted}"
+    if not session or session == "unknown-session":
+        return ""
+    return f"session:{_short_hash(session)}"
+
+
+def _best_effort_codex_mcp_lifecycle(
+    *,
+    event: str,
+    workspace: Path,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Run the optional Codex MCP compatibility shim without affecting Hook output."""
+    try:
+        from .codex_mcp_lifecycle import handle_codex_mcp_lifecycle
+
+        lease_id = _codex_lifecycle_lease_id(payload)
+        if not lease_id:
+            return {}
+        host_thread_id = _verified_codex_hook_thread_id(workspace, payload)
+        return handle_codex_mcp_lifecycle(
+            event=event,
+            workspace=workspace,
+            thread_id=lease_id,
+            host_thread_id=host_thread_id,
+        )
+    except Exception as exc:
+        _emit_runtime_write_diagnostic(
+            "codex_mcp_lifecycle_degraded", "codex", event, exc
+        )
+        return {}
+
+
+def _attach_terminal_cohort_reclaim(
+    workspace: Path,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Reclaim cohorts only for thread ids already proven terminal by Codex state."""
+
+    terminal_ids = {
+        str(value)
+        for key in (
+            "terminal_thread_ids",
+            "archived_thread_ids",
+            "closed_edge_ids",
+            "missing_thread_ids",
+        )
+        for value in (result.get(key) or [])
+        if str(value or "")
+    }
+    if not terminal_ids:
+        result.setdefault("terminal_cohort_reclaim_status", "noop")
+        result.setdefault("terminal_cohort_killed_count", 0)
+        return result
+    try:
+        from .codex_mcp_lifecycle import reclaim_terminal_codex_threads
+
+        reclaim = reclaim_terminal_codex_threads(
+            workspace=workspace,
+            thread_ids=sorted(terminal_ids),
+        )
+    except Exception as exc:
+        result["terminal_cohort_reclaim_status"] = "degraded"
+        result["terminal_cohort_reclaim_error"] = type(exc).__name__
+        return result
+    result["terminal_cohort_reclaim_status"] = str(reclaim.get("status") or "")
+    result["terminal_cohort_killed_count"] = len(reclaim.get("killed_pids") or [])
+    result["terminal_cohort_failed_count"] = len(reclaim.get("failed_pids") or [])
+    result["terminal_cohort_shared_skip_count"] = len(
+        reclaim.get("skipped_shared_thread_ids") or []
+    )
+    result["terminal_cohort_ambiguous_skip_count"] = len(
+        reclaim.get("skipped_ambiguous_thread_ids") or []
+    )
+    return result
+
+
+def _attach_indexed_terminal_cohort_reclaim(
+    workspace: Path,
+    result: dict[str, Any],
+    *,
+    protected_thread_ids: set[str],
+) -> dict[str, Any]:
+    """Reclaim idle root leases only after Codex archived/deleted their thread row."""
+
+    try:
+        from .codex_mcp_lifecycle import reclaim_indexed_terminal_codex_threads
+
+        reclaim = reclaim_indexed_terminal_codex_threads(
+            workspace=workspace,
+            protected_thread_ids=protected_thread_ids,
+        )
+    except Exception as exc:
+        result["indexed_terminal_reclaim_status"] = "degraded"
+        result["indexed_terminal_reclaim_error"] = type(exc).__name__
+        return result
+    result["indexed_terminal_reclaim_status"] = str(reclaim.get("status") or "")
+    result["indexed_terminal_reclaim_count"] = len(
+        reclaim.get("reclaimed_thread_ids") or []
+    )
+    result["indexed_terminal_killed_count"] = len(reclaim.get("killed_pids") or [])
+    result["indexed_terminal_failed_count"] = len(reclaim.get("failed_pids") or [])
+    return result
+
+
 def _best_effort_codex_reconcile(
     *,
     workspace: Path,
@@ -1451,6 +1716,7 @@ def _best_effort_codex_reconcile(
             active_thread_ids=active,
             receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
         )
+        result = _attach_terminal_cohort_reclaim(workspace, result)
         global_result = (
             reconcile_global_codex_subagents(
                 active_thread_ids=active,
@@ -1464,6 +1730,12 @@ def _best_effort_codex_reconcile(
                 "closed_edge_count": 0,
                 "archived_thread_count": 0,
             }
+        )
+        global_result = _attach_terminal_cohort_reclaim(workspace, global_result)
+        global_result = _attach_indexed_terminal_cohort_reclaim(
+            workspace,
+            global_result,
+            protected_thread_ids={root_thread_id},
         )
         # Root Stop reconciliation remains the primary receipt.  Aggregate the
         # terminal-event sweep counts without copying global thread IDs into a
@@ -1484,6 +1756,12 @@ def _best_effort_codex_reconcile(
         result["terminal_event_counts"] = dict(
             global_result.get("terminal_event_counts") or {}
         )
+        result["terminal_cohort_killed_count"] = int(
+            result.get("terminal_cohort_killed_count") or 0
+        ) + int(global_result.get("terminal_cohort_killed_count") or 0)
+        result["terminal_cohort_failed_count"] = int(
+            result.get("terminal_cohort_failed_count") or 0
+        ) + int(global_result.get("terminal_cohort_failed_count") or 0)
         _record_codex_reconcile_diagnostic(
             workspace, "codex", agent_instance_id, result
         )
@@ -1516,29 +1794,76 @@ def _best_effort_codex_reconcile(
         }
 
 
+def _verified_codex_hook_thread_id(
+    workspace: Path,
+    payload: dict[str, Any],
+) -> str:
+    """Authenticate a Codex Hook thread for lifecycle/terminal-sweep authority.
+
+    ``workspace`` may be MemoryGuard's control directory rather than the
+    Codex thread cwd. Prefer the Hook payload cwd/project path when present;
+    otherwise keep the older workspace-bound check. A host-owned
+    ``CODEX_THREAD_ID`` still has to belong to that effective cwd. If Codex
+    omits it, the Hook session id must pass the same read-only state DB check.
+    """
+
+    try:
+        from .codex_subagent_reconcile import (
+            codex_thread_matches_workspace,
+            trusted_codex_thread_id,
+        )
+
+        hook_cwd = str(
+            payload.get("cwd")
+            or payload.get("project_ref")
+            or payload.get("projectRef")
+            or workspace
+            or ""
+        ).strip()
+        trusted = trusted_codex_thread_id()
+        if (
+            trusted
+            and hook_cwd
+            and codex_thread_matches_workspace(trusted, hook_cwd)
+        ):
+            return trusted
+        session = _session_id(payload).split(":subagent:", 1)[0]
+        if (
+            session
+            and session != "unknown-session"
+            and hook_cwd
+            and codex_thread_matches_workspace(session, hook_cwd)
+        ):
+            return session
+    except Exception:
+        return ""
+    return ""
+
+
 def _best_effort_codex_global_reconcile(
     *,
     workspace: Path,
     agent_instance_id: str,
     payload: dict[str, Any],
+    event: str = "session_start",
 ) -> dict[str, Any]:
-    """Repair terminal stale tasks on startup without touching live branches."""
+    """Repair terminal/orphan stale tasks without touching live branches."""
 
     try:
-        from .codex_subagent_reconcile import (
-            codex_thread_matches_workspace,
-            reconcile_global_codex_subagents,
-            trusted_codex_thread_id,
-        )
+        from .codex_subagent_reconcile import reconcile_global_codex_subagents
 
-        root_thread_id = trusted_codex_thread_id()
-        if not root_thread_id or not codex_thread_matches_workspace(
-            root_thread_id, workspace
-        ):
+        root_thread_id = _verified_codex_hook_thread_id(workspace, payload)
+        if not root_thread_id:
             return {}
         result = reconcile_global_codex_subagents(
             active_thread_ids=_codex_active_thread_ids(payload) | {root_thread_id},
             receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
+        )
+        result = _attach_terminal_cohort_reclaim(workspace, result)
+        result = _attach_indexed_terminal_cohort_reclaim(
+            workspace,
+            result,
+            protected_thread_ids={root_thread_id},
         )
         _record_codex_reconcile_diagnostic(
             workspace, "codex", agent_instance_id, result
@@ -1547,7 +1872,7 @@ def _best_effort_codex_global_reconcile(
             _emit_runtime_write_diagnostic(
                 "codex_subagent_global_reconcile_degraded",
                 "codex",
-                "session_start",
+                event,
                 RuntimeError(str(result.get("reason") or result.get("status"))),
             )
         return result
@@ -1555,7 +1880,7 @@ def _best_effort_codex_global_reconcile(
         _emit_runtime_write_diagnostic(
             "codex_subagent_global_reconcile_failed",
             "codex",
-            "session_start",
+            event,
             exc,
         )
         return {
@@ -1838,6 +2163,39 @@ def _is_memoryguard_write(tool_name: str, tool_input: Any = None) -> bool:
     return bool(inner) and _is_memoryguard_tool(inner, "memory_write")
 
 
+_RECOVERY_TOOL_OPERATIONS = frozenset({
+    "context_bootstrap",
+    "memory_status", "memory_search", "memory_read", "memory_update", "memory_delete",
+    "canonical_status", "projection_status", "diagnostics_snapshot", "runtime_processes",
+    "audit", "explain", "semantic_check", "list_sources", "binding_list",
+    "rule_scope_stats", "rule_decision_read", "rule_feedback", "rule_undo",
+    "rule_merge_acknowledge", "rule_merge_approve", "rule_merge_capability_issue",
+    "rule_merge_cooldown_clear",
+})
+
+
+def _is_memoryguard_recovery_tool(tool_name: str, tool_input: Any = None) -> bool:
+    """Allow only bounded MemoryGuard repair surfaces through a broken hook.
+
+    The MCP/native V2 boundary still performs its own state, identity and
+    governance checks.  This helper merely prevents the host PreToolUse hook
+    from making those repair APIs unreachable when the context package itself
+    is the thing that needs repair.
+    """
+
+    candidates = [str(tool_name or "")]
+    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
+    if inner:
+        candidates.append(inner)
+    for candidate in candidates:
+        value = candidate.casefold()
+        if "memoryguard" not in value:
+            continue
+        if any(operation in value for operation in _RECOVERY_TOOL_OPERATIONS):
+            return True
+    return False
+
+
 def _is_other_memory_write(tool_name: str) -> bool:
     value = (tool_name or "").casefold()
     if "memoryguard" in value or "memory" not in value:
@@ -1986,12 +2344,6 @@ def _deny_output(provider: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _stop_continue_output(provider: str, reason: str) -> dict[str, Any]:
-    if provider == "cursor":
-        return {"followup_message": reason}
-    return {"decision": "block", "reason": reason}
-
-
 def _allow_output(provider: str, event: str) -> dict[str, Any]:
     if provider == "cursor" and event == "user_prompt":
         return {"continue": True}
@@ -1999,13 +2351,13 @@ def _allow_output(provider: str, event: str) -> dict[str, Any]:
 
 
 def _v2_upgrade_output(provider: str, event: str, state: str) -> dict[str, Any]:
-    """Fail closed with stable retirement guidance for every non-V2 state."""
+    """Fail closed for non-V2 runtime work; Stop is lifecycle-only fail-open."""
+    if event == "stop":
+        return {}
     payload = v2_upgrade_payload(state, surface="Hook")
     reason = v2_upgrade_message(state, surface="Hook")
     if event == "pre_tool":
         result = _deny_output(provider, reason)
-    elif event == "stop":
-        result = _stop_continue_output(provider, reason)
     elif provider == "cursor" and event == "user_prompt":
         result = {"continue": False}
     else:
@@ -2459,7 +2811,7 @@ def _v2_hook_cutover(
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
         if event == "stop":
-            return _stop_continue_output(provider, "MemoryGuard V2 hook failed; stop blocked.")
+            return {}
         if packet.get("mandatory_overflow"):
             return _context_output(
                 provider,
@@ -2486,6 +2838,7 @@ def _v2_hook_cutover(
             bootstrap_ok = False
         state_payload.update({
             "bootstrap_ok": bootstrap_ok,
+            "bootstrap_error": "",
             "mandatory_overflow": bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
             "mandatory_invalid_reason": str(
                 packet.get("mandatory_invalid_reason", data.get("error", "")) or ""
@@ -2579,18 +2932,55 @@ def run_hook(
     # even when the workspace still needs upgrade.  Stop remains observational
     # and best-effort; an upgrade response must not block host shutdown.
     if normalized_provider == "codex":
-        if event == "session_start":
+        if event in {"session_start", "user_prompt", "post_tool", "stop"}:
+            _best_effort_codex_mcp_lifecycle(
+                event=event,
+                workspace=root,
+                payload=payload,
+            )
+        if event in {"session_start", "user_prompt", "post_tool"}:
             _best_effort_codex_global_reconcile(
                 workspace=root,
                 agent_instance_id=agent_instance_id,
                 payload=payload,
+                event=event,
             )
-        elif event == "stop":
+        if event == "stop":
             _best_effort_codex_reconcile(
                 workspace=root,
                 agent_instance_id=agent_instance_id,
                 payload=payload,
             )
+
+    # Paused mode is the maintenance escape hatch.  It must bypass the V2
+    # data-plane entirely, otherwise a broken V2 gate can prevent operators
+    # from pausing the very hook that needs repair.  Codex lifecycle cleanup
+    # above remains best-effort and host-owned.
+    if mode == "paused":
+        return {}
+
+    # Keep a narrow, explicit repair lane reachable even when the context
+    # package or manifest gate is what is broken.  These operations still hit
+    # the native MCP V2 state/identity/governance gates; only the host hook's
+    # PreToolUse bootstrap is bypassed.  Ordinary shell/file/tool execution is
+    # never included here and remains fail-closed.
+    if event == "pre_tool":
+        recovery_tool = str(payload.get("tool_name", "") or "")
+        recovery_input = payload.get("tool_input", {})
+        if _is_memoryguard_recovery_tool(recovery_tool, recovery_input):
+            # The recovery lane intentionally bypasses the V2 hook dispatch,
+            # but a real Cursor CallMcpTool bootstrap must still satisfy the
+            # per-conversation tool gate.  Record only the bounded state bit;
+            # mandatory overflow remains fail-closed.
+            if normalized_provider == "cursor" and _is_memoryguard_bootstrap(
+                recovery_tool, recovery_input,
+            ):
+                state = _load_state(root, normalized_provider, session_id)
+                if not state.get("mandatory_overflow"):
+                    state["bootstrap_ok"] = True
+                    state["bootstrap_error"] = ""
+                    _save_state(root, normalized_provider, session_id, state)
+            return {}
 
     v2_result = _v2_hook_cutover(
         provider=normalized_provider,

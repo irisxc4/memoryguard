@@ -11,6 +11,8 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
+from ..rule_scope import canonical_project_ref
+from .governance_semantics import classify_governance_relation
 from .context_budget import (
     BudgetLedger,
     ContextBudget,
@@ -46,8 +48,15 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
-def _identity_value(mapping: Mapping[str, Any], names: tuple[str, ...], field_name: str) -> str:
+def _identity_value(
+    mapping: Mapping[str, Any],
+    names: tuple[str, ...],
+    field_name: str,
+    *,
+    normalizer: Any | None = None,
+) -> str:
     values = [_text(mapping[name]) for name in names if name in mapping and mapping[name] is not None]
+    values = [normalizer(value) if normalizer is not None else value for value in values]
     values = [value for value in values if value]
     if len(set(values)) > 1:
         raise ContextEngineError(f"conflicting_context_identity:{field_name}")
@@ -121,6 +130,7 @@ class ContextRequest:
             project_sources,
             ("project", "project_ref", "project_id", "trusted_project", "trusted_project_ref", "trusted_project_id"),
             "project",
+            normalizer=canonical_project_ref,
         )
         group_sources = {
             "group": self.group,
@@ -216,7 +226,12 @@ class ContextRequest:
             if alias in identity:
                 merged[key] = identity[alias]
         fields["agent"] = _identity_value(merged, ("agent", "agent_instance_id", "agent_id", "trusted_agent", "trusted_agent_instance_id", "trusted_agent_id"), "agent")
-        fields["project"] = _identity_value(merged, ("project", "project_ref", "project_id", "trusted_project", "trusted_project_ref", "trusted_project_id"), "project")
+        fields["project"] = _identity_value(
+            merged,
+            ("project", "project_ref", "project_id", "trusted_project", "trusted_project_ref", "trusted_project_id"),
+            "project",
+            normalizer=canonical_project_ref,
+        )
         fields["group"] = _identity_value(merged, ("group", "share_group_id", "group_id", "trusted_group", "trusted_share_group_id", "trusted_group_id"), "group")
         provider_values = dict(merged)
         if "provider" in identity:
@@ -254,6 +269,9 @@ class ContextRequest:
             "runtime": self.runtime,
             "runtime_role": self.runtime,
             "workspace_id": self.workspace_id,
+            "namespace_id": self.namespace_id,
+            "sensitivity": self.sensitivity,
+            "policy_class": self.policy_class,
             "trusted_identity": dict(self.trusted_identity),
         }
 
@@ -400,12 +418,21 @@ class ContextCandidate:
                 top_value = _text(data[alias])
                 if alias in {"target_type", "type", "scope_type"}:
                     nested_value, top_value = nested_value.casefold(), top_value.casefold()
+                elif alias in {"project", "project_id", "project_ref"}:
+                    nested_value, top_value = canonical_project_ref(nested_value), canonical_project_ref(top_value)
                 if alias in scope and nested_value and nested_value != top_value:
                     scope_invalid, scope_reason = True, "scope_alias_conflict"
                 scope[f"__top_{alias}"] = data[alias]
         evidence = data.get("evidence", data.get("evidence_ref", data.get("evidence_digest")))
         kind = _text(data.get("kind", "fact")).casefold() or "fact"
         source = _text(data.get("source", data.get("source_type", "retrieval"))) or "retrieval"
+        # Native memory adapters expose atom identity as item_id while source
+        # mapping retains logical memory_id. Preserve logical ID in public
+        # packet so revisions do not leak storage IDs into recall contract.
+        if source.casefold() == "native-v2-memory" and not memory_id:
+            memory_id = _text(data.get("source_ref", ""))
+        if source.casefold() == "native-v2-memory" and not _text(data.get("item_id", "")):
+            candidate_id = memory_id or candidate_id
         injection_policy = _text(data.get("injection_policy", data.get("dedup_domain", ""))).casefold()
         rule_strength = _text(data.get("rule_strength", data.get("strength", ""))).casefold()
         if source.casefold() == "native-v2-memory" and not injection_policy:
@@ -542,7 +569,11 @@ class ContextCandidate:
         relevant representation of the same body can both survive when their
         obligations differ.
         """
-        if not self.has_governance_semantics:
+        if self.layer == "reference_only":
+            # Reference identity is source/hash based, not summary based.
+            # Same digest from two adapters must consume one context slot.
+            parts = ("reference", self.content_hash or self.body, self.reference)
+        elif not self.has_governance_semantics:
             parts = ("content", self.body, self.layer, self.kind)
         else:
             parts = (
@@ -589,6 +620,15 @@ class ContextReceipt:
                 "scope_alias_conflict": "scope_rejected",
                 "scope_shape_rejected": "scope_rejected",
                 "scope_target_invalid": "scope_rejected",
+                "scope_omitted": "scope_omitted",
+                "knowledge_scope_required": "scope_required",
+                "history_scope_required": "scope_required",
+                "codegraph_scope_required": "scope_required",
+                "knowledge_source_unavailable": "source_unavailable",
+                "history_source_unavailable": "source_unavailable",
+                "codegraph_source_unavailable": "source_unavailable",
+                "history_unsummarized": "summary_omitted",
+                "retrieval_omitted": "omitted",
                 "raw_source_blocked": "source_rejected",
                 "lifecycle_status_rejected": "lifecycle_rejected",
                 "lifecycle_alias_conflict": "lifecycle_rejected",
@@ -606,6 +646,8 @@ class ContextReceipt:
                 "sensitive_blocked": "safety_rejected",
                 "mandatory_sensitive_blocked": "safety_rejected",
                 "duplicate": "duplicate_rejected",
+                "governance_duplicate": "governance_duplicate",
+                "governance_update_shadowed": "governance_update_shadowed",
                 "budget": "budget_rejected",
                 "item_budget": "budget_rejected",
                 "empty": "content_rejected",
@@ -654,9 +696,11 @@ class ContextPacket:
             "ready": self.ready,
             "state": self.state,
             "status": self.status,
+            # Keep the packet contract shape stable: successful packets carry
+            # an explicit empty error, while failures carry the same field
+            # with their diagnostic.
+            "error": self.error,
         }
-        if self.error:
-            payload["error"] = self.error
         return payload
 
     def __getitem__(self, key: str) -> Any:
@@ -748,7 +792,7 @@ class ContextEngine:
                     found = True
                     groups[layer].extend(value if isinstance(value, (list, tuple)) else [value])
             for layer, value in result.items():
-                if layer not in groups and layer not in {"items", "candidates"}:
+                if layer not in groups and layer not in {"items", "candidates", "omissions"}:
                     groups.setdefault("__unknown__", []).extend(value if isinstance(value, (list, tuple)) else [value])
             if found:
                 return groups
@@ -760,6 +804,56 @@ class ContextEngine:
             groups["relevant"].extend(result)
             return groups
         raise ContextEngineError("invalid_retrieval_result")
+
+    @staticmethod
+    def _omissions(result: Any) -> list[Mapping[str, Any]]:
+        if not isinstance(result, Mapping):
+            return []
+        raw = result.get("omissions", ())
+        values = raw if isinstance(raw, (list, tuple)) else [raw]
+        return [item for item in values if isinstance(item, Mapping)]
+
+    def _collapse_mandatory_render_duplicates(
+        self,
+        candidates: list[ContextCandidate],
+    ) -> tuple[list[ContextCandidate], list[tuple[ContextCandidate, ContextCandidate, str]]]:
+        """Collapse safe duplicate/update rules only for this rendered packet.
+
+        Persistence remains owned by governance/reconciliation.  This is the
+        emergency-safe read path that prevents temporary semantic duplicates
+        from exhausting the mandatory budget before reconciliation can run.
+        Conflicts and different resolved scopes are never collapsed.
+        """
+
+        kept: list[ContextCandidate] = []
+        omitted: list[tuple[ContextCandidate, ContextCandidate, str]] = []
+        for candidate in candidates:
+            matched = False
+            for index, existing in enumerate(kept):
+                if self._scope_public(existing.scope) != self._scope_public(candidate.scope):
+                    continue
+                relation = classify_governance_relation(existing.body, candidate.body)
+                if not relation.mergeable:
+                    continue
+                if relation.winner == "right":
+                    kept[index] = candidate
+                    omitted.append((
+                        existing,
+                        candidate,
+                        "governance_update_shadowed" if relation.kind in {"update", "additive"} else "governance_duplicate",
+                    ))
+                else:
+                    omitted.append((
+                        candidate,
+                        existing,
+                        "governance_update_shadowed" if relation.kind in {"update", "additive"} else "governance_duplicate",
+                    ))
+                matched = True
+                break
+            if not matched:
+                kept.append(candidate)
+        kept.sort(key=lambda c: (-c.priority, c.item_id, c.digest, c.dedup_key))
+        return kept, omitted
 
     def _ordered(self, candidates: list[ContextCandidate], request: ContextRequest) -> list[ContextCandidate]:
         if self.planner is None:
@@ -824,11 +918,19 @@ class ContextEngine:
         return {}
 
     @staticmethod
-    def _scope_alias(scope: Mapping[str, Any], names: tuple[str, ...], *, casefold: bool = False) -> tuple[str, bool]:
+    def _scope_alias(
+        scope: Mapping[str, Any],
+        names: tuple[str, ...],
+        *,
+        casefold: bool = False,
+        normalizer: Any | None = None,
+    ) -> tuple[str, bool]:
         values: list[str] = []
         for name in names:
             if name in scope and scope[name] is not None:
                 value = _text(scope[name])
+                if normalizer is not None:
+                    value = normalizer(value)
                 if casefold:
                     value = value.casefold()
                 if value:
@@ -852,9 +954,12 @@ class ContextEngine:
             "runtime": (("runtime", "runtime_role", "__top_runtime", "__top_runtime_role"), request.runtime),
         }
         for _key, (aliases, expected) in identity.items():
-            supplied, conflict = ContextEngine._scope_alias(scope, aliases)
+            normalizer = canonical_project_ref if _key == "project" else None
+            supplied, conflict = ContextEngine._scope_alias(scope, aliases, normalizer=normalizer)
             if conflict:
                 return False, "scope_alias_conflict"
+            if normalizer is not None:
+                expected = normalizer(expected)
             if supplied and expected and supplied != expected:
                 return False, "scope_mismatch"
             if supplied and not expected:
@@ -889,7 +994,9 @@ class ContextEngine:
         if target_type in {"agent", "agent_instance"}:
             return (bool(request.agent and target_id == request.agent), "included" if request.agent and target_id == request.agent else "scope_mismatch")
         if target_type == "project":
-            return (bool(request.project and target_id == request.project), "included" if request.project and target_id == request.project else "scope_mismatch")
+            target_project = canonical_project_ref(target_id)
+            request_project = canonical_project_ref(request.project)
+            return (bool(request_project and target_project == request_project), "included" if request_project and target_project == request_project else "scope_mismatch")
         if target_type in {"group", "share_group"}:
             return (bool(request.group and target_id == request.group), "included" if request.group and target_id == request.group else "scope_mismatch")
         if target_type == "provider":
@@ -985,9 +1092,28 @@ class ContextEngine:
                 error="missing_trusted_identity",
             )
         try:
-            groups_raw = self._groups(self._retrieve(req, candidates))
+            retrieved = self._retrieve(req, candidates)
+            groups_raw = self._groups(retrieved)
             groups: dict[str, list[ContextCandidate]] = {layer: [] for layer in groups_raw}
             index = 0
+            allowed_omission_reasons = {
+                "scope_omitted", "knowledge_scope_required", "history_scope_required",
+                "codegraph_scope_required", "knowledge_source_unavailable",
+                "history_source_unavailable", "codegraph_source_unavailable",
+                "history_unsummarized", "retrieval_omitted",
+            }
+            for omission in self._omissions(retrieved):
+                reason = _text(omission.get("reason"))
+                if reason not in allowed_omission_reasons:
+                    reason = "retrieval_omitted"
+                layer = _text(omission.get("layer")).casefold()
+                if layer not in {"mandatory", "relevant", "knowledge", "reference_only"}:
+                    layer = "reference_only"
+                # Omission receipts intentionally carry no source-controlled
+                # identifier, scope, or evidence.  The reason is a bounded
+                # public enum and cannot become a data oracle.
+                receipts.append(ContextReceipt("", layer, False, reason, {}, {}))
+                ledger.omit(reason)
             for layer, values in groups_raw.items():
                 for value in values:
                     if layer not in {"mandatory", "relevant", "knowledge", "reference_only"}:
@@ -1052,6 +1178,19 @@ class ContextEngine:
             for layer in ("relevant", "knowledge", "reference_only"):
                 groups[layer] = self._ordered(groups[layer], req)
             groups["mandatory"] = sorted(groups["mandatory"], key=lambda c: (-c.priority, c.item_id, c.digest, c.dedup_key))
+            groups["mandatory"], render_omissions = self._collapse_mandatory_render_duplicates(
+                groups["mandatory"]
+            )
+            for omitted_candidate, winner_candidate, reason in render_omissions:
+                receipts.append(ContextReceipt(
+                    omitted_candidate.item_id,
+                    "mandatory",
+                    False,
+                    reason,
+                    self._scope_public(omitted_candidate.scope),
+                    self._evidence_public(omitted_candidate.evidence),
+                ))
+                ledger.omit(reason)
 
             selected: dict[str, list[dict[str, Any]]] = {layer: [] for layer in groups}
             seen: set[str] = set()

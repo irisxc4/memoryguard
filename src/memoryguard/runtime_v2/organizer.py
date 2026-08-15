@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from threading import Lock, RLock
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -21,6 +22,11 @@ from ..memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
 from ..memory.store import stable_digest
 from ..sensitive_content import SENSITIVE_PATTERNS
 from .dedup import V2DedupMatch, V2SemanticDeduplicator, canonical_hash, canonical_text
+from .governance_semantics import (
+    GovernanceRelation,
+    classify_governance_relation,
+    governance_scope_key,
+)
 from .text_native import VALID_KINDS, classify_kind
 
 
@@ -158,6 +164,7 @@ class V2MemoryOrganizer:
                 "actions": "body-free action list",
                 "mutation_kind": "created|deduplicated|superseded|conflicted|quarantined",
                 "receipt": "V2Decision.to_dict()",
+                "governance_receipt": "unchanged|merged|updated|superseded|conflicted audit envelope",
             },
         }
 
@@ -336,6 +343,7 @@ class V2MemoryOrganizer:
             "evidence_ids": list(data.get("evidence_ids") or ()),
             "source_mappings": mappings,
             "memory_id": str(data.get("memory_id") or "").strip(),
+            "atom_id": str(data.get("atom_id") or "").strip(),
             "idempotency_key": str(data.get("idempotency_key") or "").strip(),
             "write_policy": str(data.get("write_policy") or "auto_accept"),
             "secret_match": self._secret_match(body, metadata),
@@ -349,6 +357,11 @@ class V2MemoryOrganizer:
                 "group": self.share_group_id,
                 "body": canonical_text(body),
                 "kind": prepared["kind"],
+                # Logical identity is scoped identity.  The physical atom ID
+                # already carries owner fields, but public receipts expose
+                # memory_id; omitting audience here falsely presents two
+                # private rules as one canonical record.
+                "scope": self._scope_key_for_prepared(prepared),
             })[:40]
         atom_metadata = dict(prepared.get("metadata") or {})
         atom_metadata.update({
@@ -402,6 +415,65 @@ class V2MemoryOrganizer:
             return dict(value)
         return {"value": str(value)}
 
+    def _scope_key_for_prepared(self, prepared: Mapping[str, Any]) -> tuple[str, str, str, str, str, str, str]:
+        return governance_scope_key(
+            metadata=prepared.get("metadata") if isinstance(prepared.get("metadata"), Mapping) else {},
+            agent_instance_id=str(prepared.get("agent_instance_id") or ""),
+            share_group_id=self.share_group_id,
+            project_ref=str(prepared.get("project_ref") or ""),
+            provider=str(prepared.get("provider") or ""),
+            runtime_role=str(prepared.get("runtime_role") or ""),
+        )
+
+    @staticmethod
+    def _scope_key_for_atom(atom: MemoryAtom) -> tuple[str, str, str, str, str, str, str]:
+        return governance_scope_key(
+            metadata=atom.metadata,
+            agent_instance_id=atom.agent_instance_id,
+            share_group_id=atom.share_group_id,
+            project_ref=atom.project_ref,
+            provider=atom.provider,
+            runtime_role=atom.runtime_role,
+        )
+
+    def _scope_memory_id(self, memory_id: str, prepared: Mapping[str, Any]) -> str:
+        """Namespace caller IDs when same logical ID exists in another scope."""
+
+        return str(memory_id) + "@scope-" + stable_digest({
+            "scope": self._scope_key_for_prepared(prepared),
+        })[:20]
+
+    def _atoms_for_memory_id(self, memory_id: str) -> list[MemoryAtom]:
+        return [
+            atom for atom in self.store.list_atoms(
+                scope=self.scope,
+                include_building=True,
+            )
+            if atom.memory_id == str(memory_id)
+        ]
+
+    @staticmethod
+    def _governance_receipt(
+        action: str,
+        *,
+        relation: GovernanceRelation | None = None,
+        target_id: str = "",
+        old_id: str = "",
+        native_receipt: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        receipt = {
+            "action": str(action),
+            "target_id": str(target_id or ""),
+            "old_id": str(old_id or ""),
+        }
+        if relation is not None:
+            receipt["relation"] = relation.to_dict()
+        if isinstance(native_receipt, Mapping):
+            receipt["decision_id"] = str(native_receipt.get("decision_id") or "")
+            receipt["operation"] = str(native_receipt.get("operation") or "")
+            receipt["status"] = str(native_receipt.get("status") or "")
+        return receipt
+
     @staticmethod
     def _idempotency_request(prepared: Mapping[str, Any]) -> dict[str, Any]:
         """Return request intent, excluding organizer-owned post-state."""
@@ -442,6 +514,13 @@ class V2MemoryOrganizer:
             "write_policy": str(prepared.get("write_policy") or ""),
         }
 
+    def _scoped_key(self, key: str, prepared: Mapping[str, Any]) -> str:
+        """Prevent retry-key reuse across audience partitions."""
+
+        return str(key) + ":scope-" + stable_digest({
+            "scope": self._scope_key_for_prepared(prepared),
+        })[:20]
+
     def _put(self, atom: MemoryAtom, prepared: Mapping[str, Any], *, reason: str, key: str) -> tuple[MemoryAtom, dict[str, Any] | None]:
         result = self.governance.put_atom(
             atom,
@@ -451,7 +530,7 @@ class V2MemoryOrganizer:
             source_mappings=prepared.get("source_mappings"),
             reason=reason,
             confidence=float(prepared["confidence"]),
-            idempotency_key=key,
+            idempotency_key=self._scoped_key(key, prepared),
             request_payload=self._idempotency_request(prepared),
         )
         if isinstance(result, tuple):
@@ -540,19 +619,197 @@ class V2MemoryOrganizer:
         persisted, receipt = self._put(updated, prepared, reason="automatic canonical provenance merge", key=key)
         return persisted, [{"action": "merge_provenance", "target_id": candidate.memory_id}], receipt, False
 
-    def _find(self, prepared: Mapping[str, Any]) -> list[V2DedupMatch]:
-        threshold = 1.0 if prepared.get("secret_match") else self.threshold
-        if self._is_correction(str(prepared["body"]), prepared["metadata"], str(prepared["kind"])):
-            threshold = min(threshold, 0.60)
-        statuses = {"active", "low_confidence", "conflicted", "deleted", "quarantined", "shadowed"}
-        if prepared.get("secret_match"):
-            statuses.add("quarantined")
-        found = self.deduplicator.find(
-            str(prepared["body"]), threshold=threshold, statuses=statuses,
+    @staticmethod
+    def _native_shared_plane(metadata: Any) -> bool:
+        audience = metadata.get("audience") if isinstance(metadata, Mapping) else None
+        return (
+            isinstance(audience, Mapping)
+            and str(audience.get("source") or "").casefold() == "native_v2"
         )
-        if prepared.get("secret_match"):
-            found = [item for item in found if item.exact]
-        return found
+
+    def _correction_relation(
+        self,
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+    ) -> GovernanceRelation | None:
+        """Match an explicit version/value correction to its old subject."""
+
+        metadata = prepared.get("metadata")
+        if not self._is_correction(
+            str(prepared.get("body") or ""),
+            metadata if isinstance(metadata, Mapping) else {},
+            str(prepared.get("kind") or ""),
+        ):
+            return None
+        if not self._native_shared_plane(candidate.metadata) or not self._native_shared_plane(metadata):
+            return None
+        marker = re.compile(
+            r"^\s*(?:correction|actually|update|wrong|instead)\s*[:,-]?\s*",
+            re.IGNORECASE,
+        )
+        version = re.compile(r"\b\d+(?:\.\d+)+\b")
+        incoming_subject = version.sub("", marker.sub("", str(prepared.get("body") or "")))
+        candidate_subject = version.sub("", str(candidate.body or ""))
+        if canonical_text(incoming_subject) != canonical_text(candidate_subject):
+            return None
+        return GovernanceRelation(
+            "update", 0.95, "explicit_correction_same_subject", "right",
+        )
+
+    def _find(self, prepared: Mapping[str, Any]) -> list[V2DedupMatch]:
+        """Find merge/conflict candidates inside the exact governed audience.
+
+        The embedding backend is intentionally not the authority here.  It is
+        useful for recall, but governance needs deterministic scope + semantic
+        classification so two agents in the same group cannot accidentally
+        collapse their private rules into one record.
+        """
+
+        statuses = {
+            "active", "low_confidence", "conflicted", "deleted",
+            "quarantined", "shadowed",
+        }
+        incoming_scope = self._scope_key_for_prepared(prepared)
+        body = str(prepared["body"])
+        ranked: list[tuple[int, float, str, str, V2DedupMatch]] = []
+        relation_order = {"exact": 0, "update": 1, "additive": 2, "equivalent": 3, "conflict": 4}
+        candidate_reader = getattr(self.deduplicator, "candidates", None)
+        atoms = (
+            candidate_reader(statuses=statuses)
+            if callable(candidate_reader)
+            else [item.atom for item in self.deduplicator.find(body, threshold=0.0, statuses=statuses)]
+        )
+
+        def native_shared_plane(metadata: Any) -> bool:
+            audience = metadata.get("audience") if isinstance(metadata, Mapping) else None
+            return (
+                isinstance(audience, Mapping)
+                and str(audience.get("source") or "").casefold() == "native_v2"
+            )
+
+        def exact_cross_agent_scope(left: MemoryAtom) -> bool:
+            """Allow exact provenance coalescing across same project audience.
+
+            A shared group can receive the same rule from multiple agents.  The
+            atom remains owned by its first writer, so broadening this check to
+            semantic relations would turn private rules into one audience.  A
+            canonical exact body is safe to merge only when all non-agent
+            audience dimensions still match.
+            """
+
+            candidate_scope = self._scope_key_for_atom(left)
+            if candidate_scope[0] != "agent" or incoming_scope[0] != "agent":
+                return False
+            if not native_shared_plane(left.metadata) or not native_shared_plane(
+                prepared.get("metadata")
+            ):
+                return False
+            # An unqualified native agent audience is private to that agent.
+            # A non-empty runtime role is the explicit shared execution plane
+            # used by native fan-in/correction callers; do not widen the
+            # default public MCP audience merely because the body is exact.
+            if not candidate_scope[5] or not incoming_scope[5]:
+                return False
+            return candidate_scope[2:] == incoming_scope[2:]
+
+        def correction_relation(left: MemoryAtom) -> GovernanceRelation | None:
+            """Match an explicit version/value correction to its old subject.
+
+            Governance's normal classifier intentionally treats different
+            lexical anchors as distinct.  A correction is a separate governed
+            operation: after removing its marker and version-like values, the
+            remaining subject must be identical before a supersession target is
+            considered.
+            """
+
+            if not self._is_correction(
+                body,
+                prepared.get("metadata") if isinstance(prepared.get("metadata"), Mapping) else {},
+                str(prepared.get("kind") or ""),
+            ):
+                return None
+            if not native_shared_plane(left.metadata) or not native_shared_plane(
+                prepared.get("metadata")
+            ):
+                return None
+            marker = re.compile(
+                r"^\s*(?:correction|actually|update|wrong|instead|鏇存|绾犳|涓嶅)"
+                r"\s*[:：,，\-]?\s*",
+                re.IGNORECASE,
+            )
+            version = re.compile(r"\b\d+(?:\.\d+)+\b")
+            incoming_subject = version.sub("", marker.sub("", body))
+            candidate_subject = version.sub("", str(left.body or ""))
+            if canonical_text(incoming_subject) != canonical_text(candidate_subject):
+                return None
+            return GovernanceRelation(
+                "update", 0.95, "explicit_correction_same_subject", "right",
+            )
+
+        for atom in atoms:
+            relation = classify_governance_relation(atom.body, body)
+            correction = self._correction_relation(atom, prepared)
+            if correction is not None:
+                relation = correction
+            if relation.kind not in relation_order:
+                continue
+            exact = relation.kind == "exact"
+            same_scope = self._scope_key_for_atom(atom) == incoming_scope
+            if not same_scope and not (
+                (exact and exact_cross_agent_scope(atom))
+                or (correction is not None and exact_cross_agent_scope(atom))
+            ):
+                continue
+            if prepared.get("secret_match") and not exact:
+                continue
+            match = V2DedupMatch(atom=atom, similarity=float(relation.score), exact=exact)
+            ranked.append((
+                relation_order[relation.kind],
+                -float(relation.score),
+                atom.memory_id,
+                atom.atom_id,
+                match,
+            ))
+        ranked.sort(key=lambda item: item[:4])
+        return [item[4] for item in ranked]
+
+    def _supersede_candidate(
+        self,
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+        *,
+        reason: str,
+        relation: GovernanceRelation,
+    ) -> tuple[MemoryAtom, dict[str, Any] | None]:
+        atom = self._new_atom(prepared, status="active", supersedes=[candidate.memory_id])
+        persisted, receipt = self._put(
+            atom,
+            prepared,
+            reason=reason,
+            key="supersede-put:" + stable_digest({
+                "group": self.share_group_id,
+                "old": candidate.atom_id,
+                "event": prepared["event_id"],
+                "relation": relation.kind,
+            }),
+        )
+        self.governance.supersede(
+            candidate.atom_id,
+            persisted.atom_id,
+            context=self._canonical_context,
+            reason=reason,
+            source_ref=str(prepared["source_ref"]),
+            idempotency_key="supersede-edge:" + stable_digest({
+                "old": candidate.atom_id,
+                "new": persisted.atom_id,
+            }),
+        )
+        refreshed = self.store.get_atom(
+            persisted.memory_id,
+            scope=self.scope,
+            include_building=True,
+        ) or persisted
+        return refreshed, receipt
 
     def write(self, payload: Mapping[str, Any] | None = None, *, context: Any | None = None, **kwargs: Any) -> dict[str, Any]:
         # Organizer normalization is allowed to consume nested metadata,
@@ -583,11 +840,28 @@ class V2MemoryOrganizer:
             matches = self._find(prepared)
             selected_match = matches[0] if matches else None
             candidate = selected_match.atom if selected_match else None
-            if requested_memory_id:
+            requested_atom_id = str(prepared.get("atom_id") or "").strip()
+            if requested_memory_id and requested_atom_id:
                 requested = self.store.get_atom(
                     requested_memory_id,
                     scope=self.scope,
+                    atom_id=requested_atom_id,
                     include_building=True,
+                )
+                if requested is not None:
+                    # An explicit physical atom selector is authoritative for
+                    # lifecycle updates, including migrated rows whose legacy
+                    # provider/project fields are intentionally blank.
+                    candidate = requested
+                    selected_match = None
+                    explicit_update = True
+            if requested_memory_id and not explicit_update:
+                requested = next(
+                    (
+                        atom for atom in self._atoms_for_memory_id(requested_memory_id)
+                        if self._scope_key_for_atom(atom) == self._scope_key_for_prepared(prepared)
+                    ),
+                    None,
                 )
                 if requested is not None:
                     # An existing logical id is an explicit governed update.
@@ -597,6 +871,42 @@ class V2MemoryOrganizer:
                     candidate = requested
                     selected_match = None
                     explicit_update = True
+                elif any(
+                    self._scope_key_for_atom(atom) != self._scope_key_for_prepared(prepared)
+                    for atom in self._atoms_for_memory_id(requested_memory_id)
+                ):
+                    # A caller-provided ID is an update selector only inside
+                    # its original audience.  Reusing it across agents,
+                    # projects, providers, or runtime roles would collapse
+                    # logical records even when semantic matching correctly
+                    # rejected the candidate.
+                    prepared = dict(prepared)
+                    prepared["memory_id"] = self._scope_memory_id(
+                        requested_memory_id,
+                        prepared,
+                    )
+                else:
+                    # A caller-provided logical ID is an explicit create when
+                    # that ID is absent from the current audience.  An exact
+                    # body is still a durable duplicate even when each retry
+                    # carries a fresh source ID (for example concurrent host
+                    # agents); only a broad semantic candidate must not
+                    # consume the requested record.
+                    if not (
+                        selected_match is not None
+                        and (
+                            selected_match.exact
+                            or self._is_correction(
+                                str(prepared["body"]),
+                                prepared.get("metadata")
+                                if isinstance(prepared.get("metadata"), Mapping)
+                                else {},
+                                str(prepared.get("kind") or ""),
+                            )
+                        )
+                    ):
+                        candidate = None
+                        selected_match = None
             elif candidate is None:
                 candidate = None
             actions: list[dict[str, Any]] = [{
@@ -605,6 +915,16 @@ class V2MemoryOrganizer:
                 "confidence": prepared["confidence"],
             }]
             exact_candidate = bool(selected_match and selected_match.exact)
+            correction_relation = (
+                self._correction_relation(candidate, prepared)
+                if candidate is not None else None
+            )
+            relation = (
+                classify_governance_relation(candidate.body, str(prepared["body"]))
+                if candidate is not None else None
+            )
+            if correction_relation is not None:
+                relation = correction_relation
             if explicit_update and candidate is not None:
                 persisted, merge_actions, receipt, replay = self._merge(candidate, prepared)
                 actions.extend(merge_actions)
@@ -616,6 +936,13 @@ class V2MemoryOrganizer:
                     "actions": actions,
                     "mutation_kind": "deduplicated",
                     "receipt": receipt,
+                    "governance_receipt": self._governance_receipt(
+                        "updated",
+                        relation=relation,
+                        target_id=persisted.memory_id,
+                        old_id=candidate.memory_id,
+                        native_receipt=receipt,
+                    ),
                     "idempotent_replay": replay,
                 }
             is_correction = self._is_correction(
@@ -640,6 +967,7 @@ class V2MemoryOrganizer:
                     confidence=float(prepared["confidence"]),
                     idempotency_key=suppression_key,
                 )
+                native_receipt = self._receipt(decision)
                 actions.append({"action": "manual_override_suppressed", "target_id": candidate.memory_id})
                 return {
                     "ok": True,
@@ -648,44 +976,177 @@ class V2MemoryOrganizer:
                     "memory_id": candidate.memory_id,
                     "actions": actions,
                     "mutation_kind": "deduplicated",
-                    "receipt": self._receipt(decision),
-                    "idempotent_replay": bool(decision.status == "applied" and decision.idempotency_key == suppression_key),
+                    "receipt": native_receipt,
+                    "governance_receipt": self._governance_receipt(
+                        "unchanged",
+                        relation=relation,
+                        target_id=candidate.memory_id,
+                        native_receipt=native_receipt,
+                    ),
+                    "idempotent_replay": bool(
+                        decision.status == "applied"
+                        and decision.idempotency_key == suppression_key
+                    ),
                 }
-            if candidate is not None and not is_correction:
-                if not exact_candidate and self._is_conflict(str(prepared["body"]), candidate, str(prepared["kind"]), prepared["metadata"]):
-                    conflict_id = "conflict-" + stable_digest({"group": self.share_group_id, "members": sorted([candidate.memory_id, str(prepared.get("memory_id") or prepared["digest"])])})[:32]
+
+            if candidate is not None and relation is not None:
+                conflict = relation.kind == "conflict" or (
+                    not exact_candidate
+                    and correction_relation is None
+                    and self._is_conflict(
+                        str(prepared["body"]), candidate,
+                        str(prepared["kind"]), prepared["metadata"],
+                    )
+                )
+                if conflict:
+                    conflict_id = "conflict-" + stable_digest({
+                        "group": self.share_group_id,
+                        "scope": self._scope_key_for_prepared(prepared),
+                        "members": sorted([
+                            candidate.memory_id,
+                            str(prepared.get("memory_id") or prepared["digest"]),
+                        ]),
+                    })[:32]
                     conflict_metadata = {
                         "conflict_group_id": conflict_id,
                         "conflict_peer_ids": [candidate.memory_id],
-                        "conflict_reason": "automatic semantic conflict",
+                        "conflict_reason": relation.reason or "automatic semantic conflict",
                     }
                     if candidate.status != "conflicted" and not candidate.locked:
-                        candidate, receipt = self._put(
-                            replace(candidate, status="conflicted", metadata={**dict(candidate.metadata), **conflict_metadata}),
+                        candidate, _peer_receipt = self._put(
+                            replace(
+                                candidate,
+                                status="conflicted",
+                                metadata={**dict(candidate.metadata), **conflict_metadata},
+                            ),
                             prepared,
                             reason="automatic conflict marking",
                             key="conflict-peer:" + conflict_id,
                         )
-                    atom = self._new_atom(prepared, status="conflicted", metadata=conflict_metadata)
-                    persisted, receipt = self._put(atom, prepared, reason="automatic semantic conflict", key="conflict:" + stable_digest({"group": self.share_group_id, "event": prepared["event_id"]}))
-                    actions.append({"action": "conflict", "conflict_group_id": conflict_id, "old_ids": [candidate.memory_id]})
-                    return {"ok": True, "status": persisted.status, "atom": persisted, "memory_id": persisted.memory_id, "actions": actions, "mutation_kind": "conflicted", "receipt": receipt}
+                    atom = self._new_atom(
+                        prepared,
+                        status="conflicted" if not candidate.locked else "low_confidence",
+                        metadata=conflict_metadata,
+                    )
+                    persisted, receipt = self._put(
+                        atom,
+                        prepared,
+                        reason="automatic semantic conflict",
+                        key="conflict:" + stable_digest({
+                            "group": self.share_group_id,
+                            "event": prepared["event_id"],
+                        }),
+                    )
+                    actions.append({
+                        "action": "conflict",
+                        "conflict_group_id": conflict_id,
+                        "old_ids": [candidate.memory_id],
+                    })
+                    return {
+                        "ok": True,
+                        "status": persisted.status,
+                        "atom": persisted,
+                        "memory_id": persisted.memory_id,
+                        "actions": actions,
+                        "mutation_kind": "conflicted",
+                        "receipt": receipt,
+                        "governance_receipt": self._governance_receipt(
+                            "conflicted",
+                            relation=relation,
+                            target_id=persisted.memory_id,
+                            old_id=candidate.memory_id,
+                            native_receipt=receipt,
+                        ),
+                    }
+
+                should_supersede = (
+                    not candidate.locked
+                    and (
+                        is_correction
+                        or (
+                            relation.kind in {"update", "additive"}
+                            and relation.winner == "right"
+                        )
+                    )
+                )
+                if should_supersede:
+                    refreshed, receipt = self._supersede_candidate(
+                        candidate,
+                        prepared,
+                        reason=(
+                            "automatic correction supersede"
+                            if is_correction
+                            else "automatic semantic update supersede"
+                        ),
+                        relation=relation,
+                    )
+                    actions.append({"action": "supersede", "old_id": candidate.memory_id})
+                    return {
+                        "ok": True,
+                        "status": refreshed.status,
+                        "atom": refreshed,
+                        "memory_id": refreshed.memory_id,
+                        "actions": actions,
+                        "mutation_kind": "superseded",
+                        "receipt": receipt,
+                        "governance_receipt": self._governance_receipt(
+                            "superseded",
+                            relation=relation,
+                            target_id=refreshed.memory_id,
+                            old_id=candidate.memory_id,
+                            native_receipt=receipt,
+                        ),
+                        "idempotent_replay": False,
+                    }
+
+                if is_correction and candidate.locked:
+                    atom = self._new_atom(
+                        prepared,
+                        status="low_confidence",
+                        metadata={"manual_override_target_id": candidate.memory_id},
+                    )
+                    persisted, receipt = self._put(
+                        atom,
+                        prepared,
+                        reason="manual override conflict candidate",
+                        key="manual-conflict:" + stable_digest({
+                            "group": self.share_group_id,
+                            "event": prepared["event_id"],
+                        }),
+                    )
+                    actions.append({
+                        "action": "manual_override_conflict_candidate",
+                        "target_id": candidate.memory_id,
+                    })
+                    return {
+                        "ok": True,
+                        "status": persisted.status,
+                        "atom": persisted,
+                        "memory_id": persisted.memory_id,
+                        "actions": actions,
+                        "mutation_kind": "conflicted",
+                        "receipt": receipt,
+                        "governance_receipt": self._governance_receipt(
+                            "conflicted",
+                            relation=relation,
+                            target_id=persisted.memory_id,
+                            old_id=candidate.memory_id,
+                            native_receipt=receipt,
+                        ),
+                        "idempotent_replay": False,
+                    }
+
                 persisted, merge_actions, receipt, replay = self._merge(candidate, prepared)
                 actions.extend(merge_actions)
-                return {"ok": True, "status": persisted.status, "atom": persisted, "memory_id": persisted.memory_id, "actions": actions, "mutation_kind": "deduplicated", "receipt": receipt, "idempotent_replay": replay}
-            if candidate is not None and is_correction and candidate.locked:
-                atom = self._new_atom(
-                    prepared,
-                    status="low_confidence",
-                    metadata={"manual_override_target_id": candidate.memory_id},
+                governance_action = (
+                    "unchanged"
+                    if replay
+                    else (
+                        "updated"
+                        if relation.kind in {"update", "additive"}
+                        else "merged"
+                    )
                 )
-                persisted, receipt = self._put(
-                    atom,
-                    prepared,
-                    reason="manual override conflict candidate",
-                    key="manual-conflict:" + stable_digest({"group": self.share_group_id, "event": prepared["event_id"]}),
-                )
-                actions.append({"action": "manual_override_conflict_candidate", "target_id": candidate.memory_id})
                 return {
                     "ok": True,
                     "status": persisted.status,
@@ -694,26 +1155,20 @@ class V2MemoryOrganizer:
                     "actions": actions,
                     "mutation_kind": "deduplicated",
                     "receipt": receipt,
-                    "idempotent_replay": False,
+                    "governance_receipt": self._governance_receipt(
+                        governance_action,
+                        relation=relation,
+                        target_id=persisted.memory_id,
+                        old_id=candidate.memory_id,
+                        native_receipt=receipt,
+                    ),
+                    "idempotent_replay": replay,
                 }
-            if candidate is not None and is_correction and not candidate.locked:
-                atom = self._new_atom(prepared, status="active", supersedes=[candidate.memory_id])
-                persisted, receipt = self._put(atom, prepared, reason="automatic correction supersede", key="supersede-put:" + stable_digest({"group": self.share_group_id, "event": prepared["event_id"]}))
-                self.governance.supersede(
-                    candidate.atom_id,
-                    persisted.atom_id,
-                    context=self._canonical_context,
-                    reason="automatic correction supersede",
-                    source_ref=str(prepared["source_ref"]),
-                    idempotency_key="supersede-edge:" + stable_digest({"old": candidate.atom_id, "new": persisted.atom_id}),
-                )
-                refreshed = self.store.get_atom(persisted.memory_id, scope=self.scope, include_building=True) or persisted
-                actions.append({"action": "supersede", "old_id": candidate.memory_id})
-                return {"ok": True, "status": refreshed.status, "atom": refreshed, "memory_id": refreshed.memory_id, "actions": actions, "mutation_kind": "superseded", "receipt": receipt}
             status = "quarantined" if prepared.get("secret_match") else ("low_confidence" if prepared["write_policy"] == "propose_only" or float(prepared["confidence"]) < 0.45 else "active")
             atom = self._new_atom(prepared, status=status)
             persisted, receipt = self._put(atom, prepared, reason="automatic memory organization", key=prepared["idempotency_key"] or "create:" + stable_digest({"group": self.share_group_id, "event": prepared["event_id"], "digest": prepared["digest"]}))
-            actions.append({"action": "quarantine" if status == "quarantined" else ("create_low_confidence" if status == "low_confidence" else "create_active")})
+            action = "quarantine" if status == "quarantined" else ("create_low_confidence" if status == "low_confidence" else "create_active")
+            actions.append({"action": action, "target_id": persisted.memory_id})
             return {"ok": True, "status": persisted.status, "atom": persisted, "memory_id": persisted.memory_id, "actions": actions, "mutation_kind": "quarantined" if status == "quarantined" else "created", "receipt": receipt, "idempotent_replay": False}
 
     def organize(self, event: Any, *, kind_override: str = "", write_policy: str = "auto_accept", context: Any | None = None) -> tuple[MemoryAtom, list[dict[str, Any]]]:

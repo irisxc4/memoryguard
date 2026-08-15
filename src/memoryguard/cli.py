@@ -40,7 +40,11 @@ from .rules import skill_rules  # noqa: F401
 from .rules import memory_rules  # noqa: F401
 from .rules import rag_rules  # noqa: F401
 from .runtime_v2.public_safety import v2_upgrade_payload
-from .workspace_resolver import WorkspaceResolutionError, resolve_workspace
+from .workspace_resolver import (
+    WorkspaceResolutionError,
+    discover_migration_source,
+    resolve_workspace,
+)
 from .schema import (
     Change,
     ChangeStatus,
@@ -1090,6 +1094,7 @@ def cmd_hooks(args: argparse.Namespace) -> int:
             result = manager.status(
                 "" if provider in {"", "all"} else provider,
                 agent_instance_id=agent_id,
+                inspect_trust=True,
             )
         elif args.action in {"install", "ensure"}:
             if not agent_id:
@@ -1112,6 +1117,7 @@ def cmd_hooks(args: argparse.Namespace) -> int:
                 agent_instance_id=agent_id,
                 share_group_id=group_id,
                 mode=args.mode,
+                reconcile_trust=provider == "codex",
             )
         elif args.action == "uninstall":
             result = manager.uninstall(provider)
@@ -1522,16 +1528,18 @@ def _default_gui_workspace() -> Path:
     source locations only. Runtime UI and governance state belong to the one
     canonical Data Home shared by all Agent integrations.
     """
-    from .data_home import resolve_data_home
+    from .data_home import resolve_runtime_data_home
 
-    return resolve_data_home()
+    return resolve_runtime_data_home()
 
 
 def _resolve_gui_workspace(argv: list[str]) -> Path | None:
     if argv:
         # Compatibility/diagnostic override: the positional value names an
         # alternate MemoryGuard Data Home, never a project-local UI.
-        return resolve_workspace(argv[0], explicit=True)
+        from .data_home import resolve_runtime_data_home
+
+        return resolve_runtime_data_home(argv[0])
 
     # A bare GUI is always the single global governance console. Ambient
     # MEMORYGUARD_WORKSPACE may describe an older project/control context and
@@ -1656,16 +1664,20 @@ def _cli_workspace(args: argparse.Namespace) -> Path:
     # Governance/control-plane commands operate on the one user-level shared
     # library when no path was explicitly supplied.  Project inspection
     # commands (audit/scan/open/...) intentionally retain bounded cwd lookup.
-    if not explicit and command in {
+    control_commands = {
         "doctor", "mcp-status", "hooks", "provider", "groups", "desktop",
         "gc", "storage", "source", "import",
-    }:
-        configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-        if configured:
-            return resolve_workspace(configured, explicit=True)
-        from .data_home import resolve_data_home
+    }
+    if command in control_commands:
+        from .data_home import resolve_runtime_data_home
 
-        return resolve_data_home().expanduser().resolve()
+        configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
+        requested = str(raw) if explicit else (configured or "")
+        return resolve_runtime_data_home(requested or None).expanduser().resolve()
+    if command == "gui":
+        from .data_home import resolve_runtime_data_home
+
+        return resolve_runtime_data_home(str(raw) if explicit else None).expanduser().resolve()
     return resolve_workspace(raw, explicit=explicit)
 
 
@@ -1821,14 +1833,22 @@ def main(argv: list[str] | None = None) -> int:
         upgrade_argv = raw_argv[1:]
         requested = build_upgrade_parser().parse_args(upgrade_argv)
         if not requested.workspace and not requested.workspace_arg:
-            configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-            if configured:
-                resolved = resolve_workspace(configured, explicit=True)
-            else:
-                from .data_home import resolve_data_home
+            from .data_home import resolve_runtime_data_home
 
-                resolved = resolve_data_home().expanduser().resolve()
-            upgrade_argv = [*upgrade_argv, "--workspace", str(resolved)]
+            control_home = resolve_runtime_data_home().expanduser().resolve()
+            # Bare upgrade is the one explicit migration affordance allowed to
+            # inspect a project-local V1 tree.  Ambient MEMORYGUARD_WORKSPACE
+            # must not redirect this decision: only cwd and bounded ancestors
+            # are eligible sources, and the runtime control home stays global.
+            source = discover_migration_source(
+                cwd=Path.cwd(), data_home=control_home,
+            )
+            # Upgrade target is canonical user V2 Data Home.  A discovered
+            # cwd/ancestor V1 tree is source only; never make it the V2
+            # control root or the runtime will split across two planes.
+            upgrade_argv = [*upgrade_argv, "--workspace", str(control_home)]
+            if source is not None:
+                upgrade_argv.extend(["--data-home", str(source)])
         # Product default: one command completes the verified cutover.  A
         # read-only plan remains available, but must be requested explicitly.
         if not requested.preview and not requested.apply and requested.confirm is None:

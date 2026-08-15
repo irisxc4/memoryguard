@@ -10,6 +10,7 @@ from memoryguard.codex_subagent_reconcile import (
     dry_run_global_codex_subagents,
     reconcile_codex_subagents,
     reconcile_codex_subagents_json,
+    reconcile_codex_subagent_stop,
     reconcile_global_codex_subagents,
 )
 from memoryguard.host_hooks import run_hook
@@ -116,6 +117,56 @@ def test_multi_root_nested_reconcile_isolated_and_bumps_root_recency(tmp_path: P
     assert str(home) not in receipt_text
     assert "root_thread_digest" in receipt_text
     assert "codex_home/state_5.sqlite" in receipt_text
+
+
+def test_explicit_subagent_stop_closes_incoming_edge_and_archives_branch(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("sub", 0, None, 2), ("grand", 0, None, 3)],
+        [("root", "sub", "open"), ("sub", "grand", "open")],
+    )
+
+    result = reconcile_codex_subagent_stop(
+        {"agent_id": "sub"},
+        codex_home=home,
+        trusted_parent_thread_id="root",
+    )
+
+    assert result["ok"] is True
+    assert result["reason"] == "subagent_stopped"
+    assert result["terminal_thread_ids"] == ["grand", "sub"]
+    assert _read(
+        db,
+        "SELECT child_thread_id,status FROM thread_spawn_edges ORDER BY child_thread_id",
+    ) == [("grand", "closed"), ("sub", "closed")]
+    assert _read(
+        db,
+        "SELECT id,archived FROM threads WHERE id IN ('sub','grand') ORDER BY id",
+    ) == [("grand", 1), ("sub", 1)]
+
+
+def test_explicit_subagent_stop_stays_open_with_active_descendant(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("sub", 0, None, 2), ("grand", 0, None, 3)],
+        [("root", "sub", "open"), ("sub", "grand", "open")],
+    )
+
+    result = reconcile_codex_subagent_stop(
+        {"subagent_id": "sub"},
+        codex_home=home,
+        trusted_parent_thread_id="root",
+        active_thread_ids={"grand"},
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "subagent_stop_active_descendant"
+    assert _read(
+        db,
+        "SELECT child_thread_id,status FROM thread_spawn_edges ORDER BY child_thread_id",
+    ) == [("grand", "open"), ("sub", "open")]
 
 
 def test_subagent_stop_only_closes_its_descendants_not_parent_edge(tmp_path: Path):
@@ -304,6 +355,53 @@ def test_global_reconcile_requires_terminal_rollout_and_preserves_live_branches(
     assert replay["reason"] == "already_reconciled"
 
 
+def test_global_reconcile_closes_missing_child_edge_after_history_delete(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1)],
+        [("root", "deleted-child", "open")],
+    )
+
+    dry = dry_run_global_codex_subagents(codex_home=home)
+    assert dry["closed_edge_count"] == 1
+    assert dry["archived_thread_count"] == 0
+    assert dry["missing_thread_count"] == 1
+    assert dry["missing_thread_ids"] == ["deleted-child"]
+    assert dry["terminal_event_counts"] == {"missing_thread": 1}
+
+    result = reconcile_global_codex_subagents(codex_home=home)
+    assert result["closed_edge_count"] == 1
+    assert result["archived_thread_count"] == 0
+    assert _read(
+        db,
+        "SELECT child_thread_id,status FROM thread_spawn_edges",
+    ) == [("deleted-child", "closed")]
+    assert _read(db, "SELECT id FROM threads ORDER BY id") == [("root",)]
+
+
+def test_missing_parent_branch_stays_open_when_live_descendant_exists(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("live-grand", 0, None, 2)],
+        [
+            ("root", "deleted-child", "open"),
+            ("deleted-child", "live-grand", "open"),
+        ],
+    )
+    _rollout(home, db, "live-grand", "agent_message")
+
+    dry = dry_run_global_codex_subagents(codex_home=home)
+    assert dry["closed_edge_count"] == 0
+    assert dry["missing_thread_count"] == 1
+    assert dry["skipped_nonterminal_count"] == 1
+    assert _read(
+        db,
+        "SELECT child_thread_id,status FROM thread_spawn_edges ORDER BY child_thread_id",
+    ) == [("deleted-child", "open"), ("live-grand", "open")]
+
+
 def test_host_session_start_globally_recovers_terminal_stale_edge(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -331,6 +429,41 @@ def test_host_session_start_globally_recovers_terminal_stale_edge(
         agent_instance_id="codex-agent",
         share_group_id="group-a",
         payload={"session_id": "host-start"},
+    )
+
+    assert _read(
+        db,
+        "SELECT status,archived FROM thread_spawn_edges JOIN threads ON child_thread_id=id",
+    ) == [("closed", 1)]
+
+
+def test_host_user_prompt_repairs_terminal_stale_edge_without_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    codex_home = home / ".codex"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    db = _db(
+        codex_home,
+        [("old-root", 0, None, 1), ("old-child", 0, None, 2), ("current", 0, None, 3)],
+        [("old-root", "old-child", "open")],
+    )
+    _rollout(codex_home, db, "old-child", "turn_aborted")
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE threads SET cwd=? WHERE id='current'", (str(workspace),))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("CODEX_THREAD_ID", "current")
+
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": "current", "prompt": "continue"},
     )
 
     assert _read(
