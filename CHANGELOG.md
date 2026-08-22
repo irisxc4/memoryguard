@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.3] - 2026-08-22
+
+### Fixed
+
+- Shared-group history reads no longer filter by the caller host provider. Group members can list/search/read each other sessions; owner-only delete and personal provider isolation stay unchanged.
+
 ## [0.7.1.post16] - 2026-08-15
 
 ### Fixed

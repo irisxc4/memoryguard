@@ -36,6 +36,12 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.3
+
+v0.7.3 is a focused shared-history visibility fix.
+
+See [the v0.7.3 release record](docs/releases/v0.7.3.md).
+
 ## What's New in v0.7.2
 
 v0.7.2 is a focused correctness and compatibility release:
@@ -351,7 +357,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.2
+memoryguard --version                    # 0.7.3
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -656,6 +662,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.3 release record](docs/releases/v0.7.3.md)
 - [v0.7.2 release record](docs/releases/v0.7.2.md)
 - [v0.7.1 release record](docs/releases/v0.7.1.md)
 - [v0.7.0 release gate](docs/releases/v0.7.0.md)
@@ -666,7 +673,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.2 carries the write/read scope, Codex Hook
+- **Current release line:** v0.7.3 opens shared-group history recall across host providers. The v0.7.2 write/read scope, Codex Hook
   lifecycle and transport, and Python 3.10 compatibility corrections. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.
