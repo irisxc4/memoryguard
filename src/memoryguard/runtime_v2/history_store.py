@@ -301,7 +301,7 @@ class ContentHistoryStore:
                 "OR LOWER(REPLACE(s.project_ref,char(92),'/')) LIKE ? || '/%')"
             )
             args.extend((scope.project_ref, scope.project_ref, scope.project_ref))
-        if scope.provider:
+        if scope.provider and not (scope.shared_read and not owner):
             sql += " AND s.provider=?"
             args.append(scope.provider)
         return sql, args

@@ -34,6 +34,12 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.3 更新
+
+v0.7.3 放开共享组跨 provider 的历史召回。删除仍只限 owner。
+
+详见 [v0.7.3 发布记录](docs/releases/v0.7.3.md)。
+
 ## v0.7.2 更新
 
 v0.7.2 是一次聚焦正确性与兼容性的修复版本：
@@ -295,7 +301,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.2
+memoryguard --version                    # 0.7.3
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -448,6 +454,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.3 发布记录](docs/releases/v0.7.3.md)
 - [v0.7.2 发布记录](docs/releases/v0.7.2.md)
 - [v0.7.1 发布记录](docs/releases/v0.7.1.md)
 - [v0.7.0 发布门禁](docs/releases/v0.7.0.md)
@@ -458,7 +465,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+- **当前发布线：** v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
   以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
