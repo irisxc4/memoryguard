@@ -179,6 +179,26 @@ def test_independent_mandatory_budget_and_optional_dual_limits():
     assert blocked.mandatory == ()
 
 
+def test_short_mandatory_count_warns_instead_of_blocking():
+    candidates = {
+        "mandatory": [
+            {"id": f"r{index}", "kind": "rule", "body": f"keep unique deploy gate {index}"}
+            for index in range(21)
+        ]
+    }
+    packet = ContextEngine(ready=True, state="V2_ACTIVE").bootstrap(_request(), candidates)
+    assert packet.status == "ok"
+    assert packet.error == ""
+    assert {item["item_id"] for item in packet.mandatory} == {f"r{index}" for index in range(21)}
+    assert len(packet.mandatory) == 21
+    assert all(not item.get("truncated") for item in packet.mandatory)
+    warning = packet.budget["warnings"][0]
+    assert warning["code"] == "mandatory_item_count_warning"
+    assert warning["count"] == 21
+    assert warning["threshold"] == 20
+    assert warning["governance_action"] == "rule_merge"
+
+
 def test_sensitive_mandatory_fail_closed_and_unicode_counter_is_stable():
     blocked = ContextEngine(state="V2_BUILDING").bootstrap(
         _request(), {"mandatory": [{"id": "secret", "kind": "rule", "body": "sk-1234567890abcdef"}]},

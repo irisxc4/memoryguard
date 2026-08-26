@@ -236,6 +236,7 @@ _add("knowledge_candidate_review", "knowledge_candidate_review", "knowledge", "m
 _same(("get_neuron_graph", "get_memory_neuron_graph"), "projection", "read", "projection_graph")
 _add("get_codegraph_graph", "codegraph_graph", "codegraph", "read", "codegraph_graph", parameters=("request",))
 _add("list_codegraph_projects", "codegraph_projects", "codegraph", "read", "codegraph_projects")
+_add("codegraph_status", "codegraph_status", "codegraph", "read", "codegraph_status", parameters=("request",))
 _add("build_codegraph", "codegraph_build", "codegraph", "mutation", "codegraph_build", execution="task", parameters=("source_id", "confirmed"), cancel_operation="task_cancel")
 _add("get_projection_source_map", "projection_source_map", "projection", "read", "gui_projection_query", parameters=("scope", "agent_instance_id", "share_group_id", "mode"))
 _add("get_build_progress", "task_status", "runtime", "read", "gui_task_status", parameters=("run_id",))

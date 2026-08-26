@@ -348,6 +348,7 @@ class RecallPlan:
     mandatory_overflow: bool = False
     layer_status: Mapping[str, str] = field(default_factory=dict)
     counts: Mapping[str, int] = field(default_factory=dict)
+    warnings: tuple[Mapping[str, Any], ...] = ()
     digest: str = ""
 
     def __post_init__(self) -> None:
@@ -360,6 +361,15 @@ class RecallPlan:
         object.__setattr__(self, "reason", _text(self.reason))
         object.__setattr__(self, "layer_status", dict(sorted((str(k), str(v)) for k, v in dict(self.layer_status or {}).items())))
         object.__setattr__(self, "counts", dict(sorted((str(k), int(v)) for k, v in dict(self.counts or {}).items())))
+        object.__setattr__(
+            self,
+            "warnings",
+            tuple(
+                dict(item)
+                for item in self.warnings
+                if isinstance(item, Mapping)
+            ),
+        )
         if not self.digest:
             object.__setattr__(self, "digest", stable_digest(self._digest_payload()))
 
@@ -374,6 +384,7 @@ class RecallPlan:
             "mandatory_overflow": self.mandatory_overflow,
             "layer_status": dict(self.layer_status),
             "counts": dict(self.counts),
+            "warnings": [dict(item) for item in self.warnings],
         }
 
     @property
@@ -408,6 +419,7 @@ class RecallPlan:
             "mandatory_overflow": self.mandatory_overflow,
             "layer_status": dict(self.layer_status),
             "counts": dict(self.counts),
+            "warnings": [dict(item) for item in self.warnings],
             "digest": self.digest,
         }
 

@@ -32,6 +32,7 @@ from .rule_definition import build_definition
 from .rule_evidence import build_evidence
 from .rule_merge_store import RuleMergeStore
 from .rule_scope import canonical_project_ref
+from .rules.v2_store import canonical_rule_kind_priority
 from .schema_v3 import (
     MemoryKind,
     SharedMemoryRecord,
@@ -41,6 +42,58 @@ from .schema_v3 import (
 )
 from .runtime_v2.group_native import GroupControlService
 from .runtime_v2.governance_semantics import classify_governance_relation
+
+
+def _compose_canonical_bodies(source_bodies: Iterable[str]) -> Any:
+    """Use the shared claim composer without duplicating its semantics."""
+
+    from .runtime_v2.canonical_claims import compose_canonical_bodies
+
+    return compose_canonical_bodies([str(body or "") for body in source_bodies])
+
+
+def _claim_pair_safe(left: str, right: str) -> Any | None:
+    """Apply hard governance gates around the shared claim composer."""
+
+    left_text, right_text = str(left or "").strip(), str(right or "").strip()
+    left_definition = build_definition(left_text)
+    right_definition = build_definition(right_text)
+    if str(left_definition.polarity or "").casefold() != str(
+        right_definition.polarity or ""
+    ).casefold():
+        return None
+    def shape(definition: Any) -> tuple[str, str]:
+        try:
+            payload = json.loads(definition.normalized_intent or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        return (
+            str(payload.get("action") or "").casefold(),
+            str(payload.get("object") or "").casefold(),
+        )
+
+    left_shape, right_shape = shape(left_definition), shape(right_definition)
+    def known(value: tuple[str, str]) -> bool:
+        return bool(value[0] and value[1])
+
+    # A missing action or object is an incomplete parse, not a different
+    # obligation.  Only two fully extracted and disagreeing shapes are a
+    # hard gate; otherwise the shared classifier decides mergeability.
+    if known(left_shape) and known(right_shape):
+        if left_shape != right_shape:
+            return None
+    else:
+        relation = classify_governance_relation(left_text, right_text)
+        if relation.kind not in {"exact", "equivalent", "update"}:
+            return None
+    result = _compose_canonical_bodies([left_text, right_text])
+    if (
+        getattr(result, "rejected_conflicts", ())
+        or getattr(result, "rejected_unrelated", ())
+        or not getattr(result, "claims", ())
+    ):
+        return None
+    return result
 
 
 @dataclass(frozen=True)
@@ -522,49 +575,15 @@ def _classify_scope(
 
 
 def _bundle_body(source_records: list[Any]) -> str:
-    """Choose one deterministic canonical surface for a safe semantic cluster.
-
-    Reconciliation must never manufacture a rule by concatenating independent
-    instructions.  For equivalent/update clusters we keep the most specific
-    safe winner selected by the shared governance classifier; unrelated or
-    conflicting records are partitioned before this function is called.
-    """
+    """Compose only source-traceable claims for one safe semantic cluster."""
 
     records = [record for record in source_records if str(record.body or "").strip()]
     if not records:
         return ""
-    winner = sorted(
-        records,
-        key=lambda record: (
-            -int(getattr(record, "priority", 0) or 0),
-            -len(str(getattr(record, "body", "") or "")),
-            str(getattr(record, "memory_id", "") or ""),
-        ),
-    )[0]
-    for record in sorted(records, key=lambda item: str(getattr(item, "memory_id", "") or "")):
-        if record is winner:
-            continue
-        relation = classify_governance_relation(str(winner.body or ""), str(record.body or ""))
-        if not relation.mergeable:
-            continue
-        if relation.winner == "right":
-            winner = record
-        elif relation.winner == "":
-            candidate_key = (
-                int(getattr(record, "priority", 0) or 0),
-                len(str(getattr(record, "body", "") or "")),
-                str(getattr(record, "updated_at", "") or ""),
-                str(getattr(record, "memory_id", "") or ""),
-            )
-            winner_key = (
-                int(getattr(winner, "priority", 0) or 0),
-                len(str(getattr(winner, "body", "") or "")),
-                str(getattr(winner, "updated_at", "") or ""),
-                str(getattr(winner, "memory_id", "") or ""),
-            )
-            if candidate_key > winner_key:
-                winner = record
-    return str(winner.body or "").strip()
+    result = _compose_canonical_bodies(
+        [str(record.body or "") for record in records]
+    )
+    return str(getattr(result, "body", "") or "").strip()
 
 
 def _semantic_rule_clusters(source_records: list[Any]) -> list[list[Any]]:
@@ -574,14 +593,23 @@ def _semantic_rule_clusters(source_records: list[Any]) -> list[list[Any]]:
     for record in sorted(source_records, key=lambda item: str(item.memory_id)):
         chosen: list[Any] | None = None
         for cluster in clusters:
-            relations = [
-                classify_governance_relation(str(member.body or ""), str(record.body or ""))
-                for member in cluster
-            ]
-            # Every pair must be mergeable.  One conflicting/distinct member is
-            # enough to keep the new rule separate instead of building a blind
-            # transitive mega-cluster.
-            if relations and all(relation.mergeable for relation in relations):
+            # Every pair must pass the shared claim composer.  The composer is
+            # stricter than surface similarity: it admits exact/equivalent/
+            # update/additive claims while returning conflicts and unrelated
+            # claims separately.  One rejected member keeps a new source out
+            # of the cluster, avoiding a transitive mega-bundle.
+            candidate = [*cluster, record]
+            safe = True
+            for index, left in enumerate(candidate):
+                for right in candidate[index + 1:]:
+                    if _claim_pair_safe(
+                        str(left.body or ""), str(right.body or "")
+                    ) is None:
+                        safe = False
+                        break
+                if not safe:
+                    break
+            if safe:
                 chosen = cluster
                 break
         if chosen is None:
@@ -722,10 +750,9 @@ def _is_deterministic_safe_plan(
         concrete = [member for member in members if member is not None]
         for index, left in enumerate(concrete):
             for right in concrete[index + 1:]:
-                relation = classify_governance_relation(
-                    str(left.body or ""), str(right.body or ""),
-                )
-                if not relation.mergeable:
+                if _claim_pair_safe(
+                    str(left.body or ""), str(right.body or "")
+                ) is None:
                     return False
         if str(bundle.body or "").strip() != _bundle_body(concrete):
             return False
@@ -1453,7 +1480,28 @@ class RuleReconciliationService:
             )
             if int(bundle.priority or 0) != max_priority:
                 raise ValueError(f"bundle_priority_not_source_max: {source_ids}")
-            if not model_plan and str(bundle.body or "") != _bundle_body(sources):
+            composed = _compose_canonical_bodies(
+                [str(source.body or "") for source in sources]
+            )
+            for index, left in enumerate(sources):
+                for right in sources[index + 1:]:
+                    if _claim_pair_safe(
+                        str(left.body or ""), str(right.body or "")
+                    ) is None:
+                        raise ValueError(f"bundle_body_contains_rejected_claim: {source_ids}")
+            if (
+                composed.rejected_conflicts
+                or composed.rejected_unrelated
+                or not composed.claims
+            ):
+                raise ValueError(f"bundle_body_contains_rejected_claim: {source_ids}")
+            # Model output is accepted only when every rendered claim is the
+            # deterministic, source-traceable composition.  This closes the
+            # hallucinated-summary path while allowing additive claims and
+            # equivalent/update normalization in both model and offline plans.
+            if str(bundle.body or "").strip() != str(composed.body or "").strip():
+                if model_plan:
+                    raise ValueError(f"bundle_body_claim_not_traceable: {source_ids}")
                 raise ValueError(f"bundle_body_not_source_exact: {source_ids}")
             if not str(bundle.body or "").strip():
                 raise ValueError(f"empty_bundle_body: {source_ids}")
@@ -2164,6 +2212,19 @@ def _actual_binding_multiset(
     }
 
 
+def _normalize_canonical_read_path(value: Any) -> str:
+    """Normalize read-path values from pre-cutover canonical-state rows."""
+    candidate = str(value or "").strip().casefold().replace("_", "-")
+    if candidate in {
+        "rule-intelligence", "ruleintelligence", "rule-intelligence-v2",
+        "rule-v2", "v2", "native", "native-v2", "nativev2", "rules",
+    }:
+        return "rule-intelligence"
+    if candidate in {"legacy", "v1", "shared-memory", "memory"}:
+        return "legacy"
+    return ""
+
+
 def _native_canonical_reconciliation_status(
     workspace: str | Path,
     share_group_id: str,
@@ -2234,11 +2295,29 @@ def _native_canonical_reconciliation_status(
             def rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
                 return [dict(row) for row in conn.execute(sql, params).fetchall()]
 
-            state = rows(
+            state_rows = rows(
                 "SELECT * FROM rule_canonical_state WHERE share_group_id=? "
-                "ORDER BY updated_at DESC, scope_id DESC LIMIT 1",
+                "ORDER BY updated_at DESC, scope_id DESC",
                 (group,),
             )
+            # A partial migration may leave a newer bookkeeping row with the
+            # old default ``legacy``/blank path in front of a valid native
+            # generation.  Prefer the newest *recognized active* generation;
+            # retain the newest row only when no valid candidate exists so the
+            # diagnostic remains concrete and fail-closed.
+            state = None
+            for candidate in state_rows:
+                raw_path = str(candidate.get("read_path") or "")
+                normalized_path = _normalize_canonical_read_path(raw_path)
+                activation = str(candidate.get("activation_status") or "").casefold()
+                if normalized_path == "rule-intelligence" and activation in {
+                    "active", "canonical_ready", "ready", "shadow",
+                }:
+                    state = dict(candidate)
+                    state["read_path"] = normalized_path
+                    break
+            if state is None and state_rows:
+                state = dict(state_rows[0])
             jobs = rows(
                 "SELECT * FROM rule_reconciliation_jobs WHERE share_group_id=? "
                 "ORDER BY updated_at, job_id",
@@ -2257,7 +2336,7 @@ def _native_canonical_reconciliation_status(
             checkpoints = rows(
                 "SELECT * FROM rule_projection_checkpoints WHERE scope_id=? "
                 "ORDER BY updated_at DESC, checkpoint_id DESC LIMIT 1",
-                (str(state[0].get("scope_id") or "") if state else "",),
+                (str(state.get("scope_id") or "") if state else "",),
             )
             pending_domain = rows(
                 "SELECT event_id FROM rule_domain_outbox WHERE source_group_id=? "
@@ -2270,7 +2349,7 @@ def _native_canonical_reconciliation_status(
                 (group,),
             )
             return {
-                "state": state[0] if state else None,
+                "state": state,
                 "jobs": jobs,
                 "links": links,
                 "evidence": evidence,
@@ -2324,9 +2403,12 @@ def _native_canonical_reconciliation_status(
         checks["canonical_state"] = bool(state)
         if not state or str(state.get("activation_status") or "").casefold() not in {"active", "canonical_ready", "ready"}:
             failures.append("canonical_not_activated")
-        read_path = str(state.get("read_path") or "")
+        raw_read_path = str(state.get("read_path") or "")
+        read_path = _normalize_canonical_read_path(raw_read_path)
+        if read_path:
+            state["read_path"] = read_path
         checks["read_path"] = read_path
-        if read_path.casefold() not in {"rule-intelligence", "v2", "native"}:
+        if read_path != "rule-intelligence":
             failures.append("canonical_read_path_unavailable")
 
         missing_definitions = sorted(definition_ids - set(definitions))
@@ -2451,6 +2533,208 @@ def canonical_reconciliation_status(
     )
 
 
+def reconcile_historical_duplicates(
+    workspace: str | Path,
+    share_group_id: str,
+    *,
+    store: Any = None,
+    actor: str = "memoryguard-reconciliation",
+) -> dict[str, Any]:
+    """Fold safe historical duplicate Definitions into one canonical head.
+
+    This is deliberately narrower than the interactive merge service: it only
+    folds active definitions with the same normalized intent, polarity,
+    strength and parameter schema *and* an identical group audience.  A
+    differing audience or governance field is reported as a conflict and is
+    left active.  The existing ``migrate_legacy_definition`` transaction owns
+    evidence/binding re-homing and alias lifecycle; this function adds the
+    stable source-link/version/receipt anchors around it.
+
+    Replaying the function is a no-op: aliases are not considered active,
+    ``record_definition_version``/``record_receipt`` use deterministic ids,
+    and source-link updates are exact repetitions.
+    """
+    from .rule_merge_store import RuleMergeStore
+    from .rules.v2_store import RuleV2Store
+
+    # Production V2 callers must stay on rules.db.  The legacy store remains
+    # only for explicit legacy-store callers and old migration tests; never
+    # silently create a sidecar when a V2 store was supplied or initialized.
+    native_store = store
+    if isinstance(native_store, RuleV2Store):
+        return native_store.reconcile_historical_duplicates(
+            share_group_id, actor=actor,
+        )
+    if native_store is None:
+        rules_db = Path(workspace).expanduser().resolve() / ".memoryguard" / "rules" / "rules.db"
+        if rules_db.is_file():
+            native_store = RuleV2Store(workspace)
+            return native_store.reconcile_historical_duplicates(
+                share_group_id, actor=actor,
+            )
+        native_store = RuleMergeStore(workspace)
+    group = str(share_group_id or "").strip()
+    if not group:
+        raise ValueError("share_group_id_required")
+
+    definitions = [
+        definition for definition in native_store.list_definitions(status="active")
+        if str(definition.status or "") == "active"
+    ]
+    links = native_store.list_source_links(
+        share_group_id=group, status="active",
+    )
+    links_by_definition: dict[str, list[dict[str, Any]]] = {}
+    for link in links:
+        definition_id = str(
+            link.get("canonical_definition_id")
+            or link.get("original_definition_id") or ""
+        )
+        if definition_id:
+            links_by_definition.setdefault(definition_id, []).append(link)
+
+    def compatibility_key(definition: Any) -> tuple[str, ...]:
+        intent = str(
+            getattr(definition, "normalized_intent", "")
+            or getattr(definition, "canonical_text", "")
+        ).strip().casefold()
+        return (
+            intent,
+            str(getattr(definition, "polarity", "") or "").casefold(),
+            str(getattr(definition, "rule_strength", "") or "").casefold(),
+            str(getattr(definition, "parameter_schema", "") or "{}"),
+        )
+
+    def audience_key(definition_id: str) -> frozenset[tuple[str, ...]]:
+        bindings = native_store.list_bindings(
+            definition_id=definition_id,
+            share_group_id=group,
+            status="active",
+        )
+        return frozenset(
+            (
+                str(getattr(binding, "target_type", "") or ""),
+                str(getattr(binding, "target_id", "") or ""),
+                canonical_project_ref(
+                    str(getattr(binding, "project_ref", "") or "")
+                ),
+                str(getattr(binding, "provider", "") or "").casefold(),
+                str(getattr(binding, "runtime_role", "") or "").casefold(),
+                str(getattr(binding, "effect", "include") or "include"),
+                str(int(getattr(binding, "priority", 0) or 0)),
+            )
+            for binding in bindings
+        )
+
+    groups: dict[tuple[str, ...], list[Any]] = {}
+    for definition in definitions:
+        groups.setdefault(compatibility_key(definition), []).append(definition)
+
+    merged = 0
+    conflicts = 0
+    details: list[dict[str, Any]] = []
+    for key, candidates in sorted(groups.items(), key=lambda item: item[0]):
+        if len(candidates) < 2:
+            continue
+        # Stronger/more mature definitions win, with id as the stable final
+        # tie-breaker.  No row is deleted, so the choice is recoverable.
+        ordered = sorted(
+            candidates,
+            key=lambda definition: (
+                -canonical_rule_kind_priority(
+                    getattr(definition, "rule_kind", "")
+                ),
+                -float(getattr(definition, "confidence", 0.0) or 0.0),
+                -int(getattr(definition, "revision", 0) or 0),
+                str(definition.definition_id),
+            ),
+        )
+        winner = ordered[0]
+        winner_audience = audience_key(winner.definition_id)
+        for loser in ordered[1:]:
+            if audience_key(loser.definition_id) != winner_audience:
+                conflicts += 1
+                details.append({
+                    "status": "preserved_conflict",
+                    "winner": winner.definition_id,
+                    "candidate": loser.definition_id,
+                    "reason": "audience_mismatch",
+                })
+                continue
+            decision_id = stable_hash(
+                "historical-reconciliation",
+                group,
+                winner.definition_id,
+                loser.definition_id,
+            )
+            source_ref = f"reconciliation:{decision_id}"
+            # Preserve the pre-fold definition snapshot and its revision.  The
+            # deterministic version id makes this safe to replay.
+            native_store.record_definition_version(
+                definition_id=loser.definition_id,
+                superseded_by=winner.definition_id,
+                old_strength=str(getattr(loser, "rule_strength", "") or ""),
+                new_strength=str(getattr(winner, "rule_strength", "") or ""),
+                change_reason="historical_duplicate_fold",
+                actor=actor,
+                evidence={
+                    "source_ref": source_ref,
+                    "decision_id": decision_id,
+                    "snapshot": loser.to_dict(),
+                },
+            )
+            migrated = native_store.migrate_legacy_definition(
+                loser.definition_id,
+                winner.definition_id,
+                migration_decision_id=decision_id,
+                source_rule_id=(
+                    links_by_definition.get(loser.definition_id, [{}])[0]
+                    .get("memory_id", "")
+                ),
+            )
+            if migrated is None:
+                # Already alias/superseded: never revive it or count it twice.
+                continue
+            for link in links_by_definition.get(loser.definition_id, []):
+                native_store.upsert_source_link(
+                    share_group_id=group,
+                    memory_id=link.get("memory_id", ""),
+                    source_revision=link.get("source_revision", ""),
+                    original_definition_id=(
+                        link.get("original_definition_id")
+                        or loser.definition_id
+                    ),
+                    canonical_definition_id=winner.definition_id,
+                    status="active",
+                )
+            receipt = getattr(native_store, "record_receipt", None)
+            if callable(receipt):
+                receipt({
+                    "receipt_id": stable_hash(
+                        "historical-reconciliation-receipt", decision_id,
+                    ),
+                    "source_ref": source_ref,
+                    "source_rule_id": loser.definition_id,
+                    "definition_id": winner.definition_id,
+                    "status": "accepted",
+                    "reason": "historical_duplicate_fold",
+                })
+            merged += 1
+            details.append({
+                "status": "merged",
+                "winner": winner.definition_id,
+                "merged": loser.definition_id,
+                "decision_id": decision_id,
+            })
+
+    return {
+        "share_group_id": group,
+        "merged_count": merged,
+        "conflict_count": conflicts,
+        "details": details,
+    }
+
+
 def settle_native_canonical_snapshot(
     workspace: str | Path,
     share_group_id: str,
@@ -2466,6 +2750,12 @@ def settle_native_canonical_snapshot(
     from .rules.v2_store import RuleV2Store
 
     native = store if isinstance(store, RuleV2Store) else RuleV2Store(workspace)
+    # Snapshot settlement is existing explicit migration/publication entry.
+    # Reconcile before readiness/digest calculation so historical duplicate
+    # heads cannot survive into a newly activated canonical generation.
+    reconcile_historical_duplicates(
+        workspace, share_group_id, store=native,
+    )
     probe = _native_canonical_reconciliation_status(
         workspace, share_group_id, store=native,
     )

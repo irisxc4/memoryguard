@@ -110,6 +110,27 @@ IGNORED_DIRS: set[str] = {
 }
 
 
+PRODUCT_DISPLAY_NAMES: dict[str, str] = {
+    "claude-code": "Claude",
+    "claude": "Claude",
+    "codex": "Codex",
+    "cursor": "Cursor",
+    "trae": "Trae",
+    "windsurf": "Windsurf",
+    "zcode": "zcode",
+    "lingma": "Lingma",
+    "comate": "Comate",
+    "qoder": "Qoder",
+    "workbuddy": "WorkBuddy",
+    "openclaw": "OpenClaw",
+    "opencode": "OpenCode",
+    "codebuddy": "CodeBuddy",
+    "codegeex": "CodeGeeX",
+    "echobird": "EchoBird",
+    "gumifox": "GumiFox",
+}
+
+
 def product_for_dot_dir(dot_dir_name: str) -> str | None:
     """返回点目录对应的产品名。未匹配返回 None。"""
     return AGENT_PRODUCT_MAP.get(dot_dir_name)
@@ -118,6 +139,17 @@ def product_for_dot_dir(dot_dir_name: str) -> str | None:
 def is_known_product(product_name: str) -> bool:
     """检查产品名是否在映射表中。"""
     return product_name in KNOWN_PRODUCTS
+
+
+def provider_display_name(product: str) -> str:
+    """User-facing program label for a provider/product id."""
+    key = str(product or "").strip().casefold()
+    if key in PRODUCT_DISPLAY_NAMES:
+        return PRODUCT_DISPLAY_NAMES[key]
+    text = str(product or "").strip()
+    if not text or text.casefold() == "unknown":
+        return "unknown"
+    return text.replace("-", " ").replace("_", " ").title()
 
 
 def candidate_agent_products() -> list[dict[str, Any]]:

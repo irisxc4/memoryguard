@@ -14,7 +14,8 @@ store after a read-only schema preflight has succeeded.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
@@ -34,6 +35,7 @@ from ..cutover_v2.surfaces import (
     MCP_TOOL_NAMES,
     get_gui_operation_spec,
 )
+from ..rule_read_path import normalize_canonical_read_path
 from ..rule_scope import canonical_project_ref
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.database import connect_database, open_database
@@ -653,6 +655,107 @@ def bind_native_test_store(domain: str, store: Any) -> _NativeInjectionCapabilit
     """Convenience wrapper for one explicit, schema-validated test store."""
 
     return bind_native_test_capability(stores={str(domain): store})
+
+
+_RISK_SEVERITY_LABELS = {
+    "critical": "极高风险",
+    "high": "高风险",
+    "medium": "中风险",
+    "low": "低风险",
+    "info": "提示",
+}
+_RISK_RULE_LABELS = {
+    "forbidden_path": "禁止访问路径",
+    "sensitive_path": "敏感路径",
+    "unsafe_path": "不安全路径",
+    "forbidden_write": "禁止写入",
+    "unsafe_write": "不安全写入",
+    "scope_violation": "范围越界",
+    "cross_scope_write": "跨范围写入",
+    "missing_evidence": "缺少证据",
+    "stale_reference": "引用已过期",
+    "reference_audit_blocker": "引用审计阻断",
+    "duplicate_memory": "重复记忆",
+    "conflict": "规则冲突",
+    "quarantine": "隔离风险",
+    "unverified_change": "变更未验证",
+    "missing_test": "缺少测试",
+    "schema_unreadable": "架构不可读",
+    "partial_schema": "架构不完整",
+    "unknown_authoritative_table": "未知权威表",
+    "unknown_authoritative_column": "未知权威列",
+    "integrity_check": "完整性检查失败",
+    "foreign_key_check": "外键检查失败",
+    "missing_database": "缺少数据库",
+    "storage_unreadable": "存储不可读",
+    "manifest_not_ready": "清单尚未就绪",
+    "manifest_unreadable": "清单不可读",
+}
+_RISK_DIMENSION_LABELS = {
+    "integrity": "数据完整性",
+    "consistency": "一致性",
+    "effectiveness": "有效性",
+    "security": "安全性",
+    "freshness": "内容新鲜度",
+    "maintainability": "可维护性",
+    "recoverability": "可恢复性",
+    "scope": "适用范围",
+    "provenance": "来源可信度",
+    "correctness": "正确性",
+    "reliability": "可靠性",
+    "audit": "审计",
+    "reference audit": "引用审计",
+}
+_RISK_SURFACE_LABELS = {
+    "runtime": "运行时",
+    "storage": "存储",
+    "filesystem": "文件系统",
+    "source": "数据源",
+    "api": "接口",
+    "gui": "管理界面",
+    "bridge": "本地桥接",
+    "governance": "治理层",
+    "memory": "记忆",
+    "evidence": "证据",
+}
+
+
+def _risk_label(value: Any, labels: Mapping[str, str], unknown: str) -> str:
+    key = _text(value).casefold()
+    return labels.get(key, unknown)
+
+
+def _readable_risk_finding(value: Mapping[str, Any], *, default_rule_id: str = "reference_audit_blocker") -> dict[str, Any]:
+    """Add GUI-safe risk labels while retaining every raw finding field."""
+
+    row = dict(value)
+    rule_id = _text(row.get("rule_id") or row.get("code") or default_rule_id)
+    severity = _text(row.get("severity") or "high").casefold()
+    dimension = _text(row.get("dimension") or "integrity").casefold()
+    surface = _text(row.get("surface") or "storage").casefold()
+    rule_label = _risk_label(rule_id, _RISK_RULE_LABELS, "未知风险")
+    severity_label = _risk_label(severity, _RISK_SEVERITY_LABELS, "未知严重度")
+    dimension_label = _risk_label(dimension, _RISK_DIMENSION_LABELS, "未知维度")
+    surface_label = _risk_label(surface, _RISK_SURFACE_LABELS, "未知来源")
+    row.setdefault("rule_id", rule_id)
+    row.setdefault("severity", severity)
+    row.setdefault("dimension", dimension)
+    row.setdefault("surface", surface)
+    row.setdefault("title", rule_label)
+    row.setdefault("title_zh", rule_label)
+    row.setdefault("type_label", rule_label)
+    row.setdefault("severity_label", severity_label)
+    row.setdefault("dimension_label", dimension_label)
+    row.setdefault("surface_label", surface_label)
+    summary = _text(row.get("summary") or row.get("message"))
+    if not summary:
+        domain = _text(row.get("domain"))
+        table = _text(row.get("table"))
+        target = " / ".join(item for item in (domain, table) if item)
+        summary = f"{rule_label}：{target}" if target else rule_label
+    row.setdefault("summary", summary)
+    row.setdefault("evidence_summary", summary)
+    return row
 
 
 class NativeV2RuntimePort:
@@ -1835,6 +1938,143 @@ class NativeV2RuntimePort:
             return value
 
     # ---- built-in semantic handlers -----------------------------------------
+    @staticmethod
+    def _row_value(row: Any, key: str, default: Any = "") -> Any:
+        if isinstance(row, Mapping):
+            return row.get(key, default)
+        return getattr(row, key, default)
+
+    @staticmethod
+    def _canonical_rule_id(store: Any, definition_id: Any) -> str:
+        value = _text(definition_id)
+        resolver = getattr(store, "resolve_canonical", None)
+        if not value or not callable(resolver):
+            return value
+        try:
+            resolved = _text(resolver(value)) or value
+            # ``resolve_canonical`` intentionally ignores a malformed active
+            # predecessor. Native reads still need to honor its explicit
+            # successor marker, otherwise one partially migrated row leaks
+            # beside its canonical head.
+            getter = getattr(store, "get_definition", None)
+            if callable(getter):
+                seen: set[str] = set()
+                while resolved and resolved not in seen:
+                    seen.add(resolved)
+                    definition = getter(resolved)
+                    successor = _text(
+                        definition.get("superseded_by")
+                        if isinstance(definition, Mapping)
+                        else getattr(definition, "superseded_by", "")
+                    ) if definition is not None else ""
+                    if not successor or successor == resolved:
+                        break
+                    resolved = successor
+            return resolved
+        except Exception:
+            # A partial rules store must not make neutral reads unavailable;
+            # retaining original ID still keeps projection deterministic.
+            return value
+
+    def _active_rule_source_memory_ids(self, context: Mapping[str, Any]) -> set[str]:
+        """Return memory IDs represented by active canonical rule rows."""
+
+        group = _text(context.get("share_group_id"))
+        if not group or not self.layout.rules_db.is_file():
+            return set()
+        try:
+            rules = self._domain_store("rules")
+            definitions = list(rules.list_definitions(status="active"))
+            canonical_ids = {
+                self._canonical_rule_id(rules, self._row_value(item, "definition_id"))
+                for item in definitions
+            }
+            canonical_ids.discard("")
+            links_reader = getattr(rules, "list_source_links", None)
+            if callable(links_reader):
+                links = links_reader(share_group_id=group, status="active")
+            else:
+                links = []
+            return {
+                _text(self._row_value(link, "memory_id"))
+                for link in links
+                if _text(self._row_value(link, "memory_id"))
+                and self._canonical_rule_id(
+                    rules, self._row_value(link, "canonical_definition_id"),
+                ) in canonical_ids
+            }
+        except Exception:
+            return set()
+
+    def _canonical_memory_rows(
+        self,
+        rows: list[Any] | tuple[Any, ...],
+        context: Mapping[str, Any],
+        *,
+        status: Any = "active",
+    ) -> list[Any]:
+        """Collapse active memory aliases/supersession chains by IDs.
+
+        Body text is intentionally never used as identity. Distinct conflict
+        rows therefore remain visible, while a canonical rule source wins over
+        its raw memory mirror in cross-category GUI/MCP projections.
+        """
+
+        source_memory_ids = self._active_rule_source_memory_ids(context)
+        candidates: list[tuple[str, str, Any]] = []
+        superseded_ids: set[str] = set()
+        for row in rows:
+            row_status = _text(self._row_value(row, "status")) or "active"
+            if status and row_status.casefold() != _text(status).casefold():
+                continue
+            memory_id = _text(self._row_value(row, "memory_id"))
+            atom_id = _text(self._row_value(row, "atom_id"))
+            if not memory_id and not atom_id:
+                continue
+            identity = memory_id or atom_id
+            supersedes = self._row_value(row, "supersedes", ())
+            if isinstance(supersedes, (list, tuple, set)):
+                superseded_ids.update(_text(item) for item in supersedes if _text(item))
+            metadata = self._row_value(row, "metadata", {})
+            if not isinstance(metadata, Mapping):
+                metadata = {}
+            canonical_id = next(
+                (
+                    _text(self._row_value(row, key))
+                    or _text(metadata.get(key))
+                    for key in ("canonical_memory_id", "canonical_id", "canonical_atom_id")
+                    if _text(self._row_value(row, key)) or _text(metadata.get(key))
+                ),
+                identity,
+            )
+            candidates.append((identity, canonical_id, row))
+
+        selected: dict[str, tuple[tuple[Any, ...], Any]] = {}
+        for identity, canonical_id, row in candidates:
+            if identity in superseded_ids or identity in source_memory_ids:
+                continue
+            revision = self._row_value(row, "revision", 0)
+            try:
+                revision_key = int(revision or 0)
+            except (TypeError, ValueError):
+                revision_key = 0
+            rank = (
+                revision_key,
+                _text(self._row_value(row, "updated_at")),
+                _text(self._row_value(row, "created_at")),
+                _text(self._row_value(row, "atom_id")),
+                identity,
+            )
+            current = selected.get(canonical_id)
+            if current is None or rank > current[0]:
+                selected[canonical_id] = (rank, row)
+
+        # Keep source/store ordering stable after selecting one row per ID.
+        return [
+            row for _identity, canonical_id, row in candidates
+            if selected.get(canonical_id, (None, None))[1] is row
+        ]
+
     def _memory_read(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         store = self._domain_store("memory")
         scope = self._scope(context)
@@ -1880,18 +2120,37 @@ class NativeV2RuntimePort:
 
     def _memory_list(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         store = self._domain_store("memory")
-        return store.list_atoms(scope=self._scope(context), status=payload.get("status"))
+        status = payload.get("status") or "active"
+        rows = store.list_atoms(scope=self._scope(context), status=status)
+        return self._canonical_memory_rows(rows, context, status=status)
 
     def _memory_search(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         store = self._domain_store("memory")
         query = _text(payload.get("query") or payload.get("text") or payload.get("q")).casefold()
+        status = payload.get("status") or "active"
         search = getattr(store, "search", None)
         if callable(search):
-            return search(query=query, scope=self._scope(context), limit=payload.get("limit"))
-        values = store.list_atoms(scope=self._scope(context), status=payload.get("status"))
+            try:
+                values = search(
+                    query=query,
+                    scope=self._scope(context),
+                    limit=payload.get("limit"),
+                    status=status,
+                )
+            except TypeError:
+                # Preserve compatibility with narrow read-only test/host
+                # adapters that predate the explicit status selector.
+                values = search(
+                    query=query,
+                    scope=self._scope(context),
+                    limit=payload.get("limit"),
+                )
+            return self._canonical_memory_rows(values, context, status=status)
+        values = store.list_atoms(scope=self._scope(context), status=status)
         if not query:
-            return values
-        return [item for item in values if query in _text(getattr(item, "body", "")).casefold()]
+            return self._canonical_memory_rows(values, context, status=status)
+        filtered = [item for item in values if query in _text(self._row_value(item, "body")).casefold()]
+        return self._canonical_memory_rows(filtered, context, status=status)
 
     def _memory_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
         del payload
@@ -2133,6 +2392,39 @@ class NativeV2RuntimePort:
         if not isinstance(result, Mapping) or "atom" not in result:
             raise NativePortError("v2_memory_organization_invalid")
         response = dict(result)
+        atom = response["atom"]
+        atom_status = _text(
+            getattr(atom, "status", "")
+            if not isinstance(atom, Mapping)
+            else atom.get("status", "")
+        ).casefold()
+        atom_id = _text(
+            getattr(atom, "atom_id", "")
+            if not isinstance(atom, Mapping)
+            else atom.get("atom_id", "")
+        )
+        # A successful public write must become injectable in the same
+        # operation.  Leaving an accepted atom in ``building`` makes the MCP
+        # return success while bootstrap silently omits it forever: there is
+        # no background promoter for ordinary memory writes.  Evidence is
+        # projected and verified before exposure; a failure stays fail-closed
+        # and is retried by the caller's idempotency key.
+        if atom_status == "active" and atom_id:
+            try:
+                projection = memory_store.project_evidence(governance_v2.evidence)
+                if int(projection.get("failed", 0)) or int(projection.get("pending", 0)):
+                    raise RuntimeError("evidence_projection_incomplete")
+                memory_store.set_visibility("active", atom_ids=[atom_id])
+            except Exception as exc:
+                raise NativePortError("v2_memory_publication_failed") from exc
+            if not isinstance(atom, Mapping):
+                response["atom"] = replace(atom, visibility="active")
+            else:
+                response["atom"] = {**atom, "visibility": "active"}
+            response["publication"] = {
+                "visibility": "active",
+                "evidence_projected": int(projection.get("projected", 0)),
+            }
         response.setdefault("actions", [])
         response.setdefault("mutation_kind", "created")
         response.setdefault("receipt", None)
@@ -2430,7 +2722,20 @@ class NativeV2RuntimePort:
         fn = getattr(engine, "bootstrap", None) or getattr(engine, "build_context", None)
         if not callable(fn):
             raise NativePortError("v2_context_engine_unavailable")
-        return fn(request, candidates)
+        packet = fn(request, candidates)
+        payload = packet.to_dict() if hasattr(packet, "to_dict") else dict(packet)
+        try:
+            from ..context_bootstrap import consume_codegraph_affected_receipt
+
+            receipt = consume_codegraph_affected_receipt(
+                self.workspace,
+                scope=self._codegraph_scope(context),
+            )
+            if receipt:
+                payload["codegraph_affected"] = receipt
+        except Exception:
+            pass
+        return payload
 
     def _retrieve_v2_rules(
         self,
@@ -4538,18 +4843,24 @@ class NativeV2RuntimePort:
 
             result = ReferenceAudit(self.workspace, mode="ro").audit()
             public = result.to_public_dict()
-            public["blockers"] = [
-                {
-                    **dict(item),
-                    "finding_id": self._audit_finding_id(
-                        str(item.get("code") or ""),
-                        str(item.get("domain") or ""),
-                        str(item.get("table") or ""),
-                    ),
-                }
-                for item in public.get("blockers", [])
-                if isinstance(item, Mapping)
-            ]
+            blockers: list[dict[str, Any]] = []
+            for item in public.get("blockers", []):
+                if not isinstance(item, Mapping):
+                    continue
+                row = dict(item)
+                row["finding_id"] = self._audit_finding_id(
+                    str(item.get("code") or ""),
+                    str(item.get("domain") or ""),
+                    str(item.get("table") or ""),
+                )
+                blockers.append(_readable_risk_finding(row))
+            public["blockers"] = blockers
+            # Stamp this successful read-only execution. get_audit and
+            # run_audit both re-run the audit; there is no cached receipt.
+            completed_at = datetime.now(timezone.utc).isoformat()
+            public["audit_state"] = "completed"
+            public["generated_at"] = completed_at
+            public["completed_at"] = completed_at
             return {"ok": True, "status": "ok", "data": public}
         except NativePortError:
             raise
@@ -4586,7 +4897,7 @@ class NativeV2RuntimePort:
                 suggestion = "classify the unknown authoritative data and add an explicit migration/disposition before promotion"
             else:
                 suggestion = "resolve this V2 reference-audit blocker and rerun validator/readiness"
-            return {
+            return _readable_risk_finding({
                 "finding_id": self._audit_finding_id(blocker.code, blocker.domain, blocker.table),
                 "code": code,
                 "domain": str(blocker.domain or ""),
@@ -4596,7 +4907,7 @@ class NativeV2RuntimePort:
                 "suggestion": suggestion,
                 "confidence": 1.0,
                 "fixable": True,
-            }
+            })
         except NativePortError:
             raise
         except Exception as exc:
@@ -5063,19 +5374,75 @@ class NativeV2RuntimePort:
             raise NativePortError(f"codegraph_update_failed_{name or 'unknown'}") from exc
 
     def _codegraph_status(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
-        del payload
-        scope = self._codegraph_scope(context)
+        scope = self._codegraph_scope(
+            context,
+            codegraph_project_ref=_text(payload.get("codegraph_project_ref")),
+            codegraph_source_id=_text(payload.get("codegraph_source_id") or payload.get("source_id")),
+        )
         try:
             from ..codegraph_v2.graphify_adapter import GraphifyCapability
+            from .group_native import GroupControlError, GroupControlService
 
             capability = GraphifyCapability.detect()
             store = self._domain_store("codegraph")
             counts = store.counts(scope=scope)
+            scope_id = store._scope_id(scope)
+            with store.connection() as conn:
+                # Older, already-built CodeGraph databases predate the
+                # incremental refresh tables.  Status is a read-only health
+                # surface and must remain usable for those graphs; do not
+                # migrate/create schema here.  Once the table exists, let
+                # every SQLite error propagate so corruption/integrity
+                # failures remain visible instead of being reported as an
+                # empty queue.
+                refresh_queue = conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='refresh_queue' LIMIT 1",
+                ).fetchone()
+                queue_depth = 0 if refresh_queue is None else int(conn.execute(
+                    "SELECT COUNT(*) FROM refresh_queue WHERE scope_id=?",
+                    (scope_id,),
+                ).fetchone()[0])
+            authority = resolve_native_transport_context(context)
+            group_id = _text(getattr(scope, "share_group_id", ""))
+            try:
+                if self._is_server_admin_gui_authority(authority):
+                    bindings = GroupControlService(self.workspace, write=False).list_bindings(
+                        include_inactive=False,
+                    ).get("bindings", [])
+                    active_binding = any(
+                        _text(item.get("share_group_id")) == group_id
+                        for item in bindings
+                    )
+                else:
+                    binding = GroupControlService(self.workspace, write=False).active_binding_for_agent(
+                        _text(getattr(authority, "agent_instance_id", "")),
+                    )
+                    active_binding = bool(binding and _text(binding.get("share_group_id")) == group_id)
+            except GroupControlError as exc:
+                # A workspace may have a CodeGraph DB before the control-plane
+                # DB has ever been initialized.  Status is a read-only health
+                # surface: report an inactive binding in that case, while
+                # preserving every other control-plane/data-integrity failure.
+                if str(exc) != "system_schema_marker_missing":
+                    raise
+                active_binding = False
+            built_scope = bool(int(counts.get("active_source_files") or 0))
+            incremental = {
+                # Trusted PostToolUse refresh is built into this native port;
+                # enabled still requires a real graph and a current binding.
+                "supported": True,
+                "built_scope": built_scope,
+                "active_binding": active_binding,
+                "queue_depth": queue_depth,
+                "enabled": bool(built_scope and active_binding),
+            }
             return {
                 "available": True,
                 "scope_digest": scope.digest,
                 "counts": counts,
                 "graphify": capability.to_dict(),
+                "incremental": incremental,
                 "update_ready": bool(capability.available and capability.metadata_export),
                 "capability_error": "" if capability.available and capability.metadata_export else (capability.code or "graphify_metadata_export_unavailable"),
             }
@@ -5341,6 +5708,82 @@ class NativeV2RuntimePort:
             return "projects", "项目决策"
         return "preferences", "长期习惯与偏好"
 
+    @staticmethod
+    def _canonical_rule_detail_branches(rule: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Build optional, body-free detail branches for one canonical rule.
+
+        Main graph keeps one canonical rule node per definition.  Branches are
+        metadata-only and are emitted only when the canonical row already
+        carries the corresponding field; absence never gets represented as a
+        fabricated source, version, conflict, or exception.
+        """
+        branches: list[dict[str, Any]] = []
+        source_ids = [
+            _text(value) for value in (rule.get("source_memory_ids") or ())
+            if _text(value)
+        ]
+        if source_ids:
+            branches.append({
+                "branch_type": "source",
+                "label": "来源",
+                "items": [{"memory_id": value} for value in source_ids],
+            })
+
+        classification = {
+            key: rule.get(key)
+            for key in ("rule_kind", "polarity", "rule_strength", "maturity_state")
+            if rule.get(key) not in (None, "")
+        }
+        if classification:
+            branches.append({
+                "branch_type": "classification",
+                "label": "自动分类",
+                "items": [classification],
+            })
+
+        scopes: list[dict[str, Any]] = []
+        for binding in (rule.get("bindings") or rule.get("assignments") or ()):
+            if not isinstance(binding, Mapping):
+                continue
+            item = {
+                key: binding.get(key)
+                for key in ("assignment_id", "target_type", "target_id", "project_ref", "provider", "runtime_role", "effect", "priority_override")
+                if binding.get(key) not in (None, "")
+            }
+            if item:
+                scopes.append(item)
+        if scopes:
+            branches.append({"branch_type": "scope", "label": "适用范围", "items": scopes})
+
+        revision = rule.get("revision")
+        try:
+            revision_number = int(revision)
+        except (TypeError, ValueError):
+            revision_number = 0
+        versions = rule.get("versions") or rule.get("history_versions")
+        if isinstance(versions, (list, tuple)) and versions:
+            branches.append({
+                "branch_type": "history",
+                "label": "历史版本",
+                "items": [dict(item) for item in versions if isinstance(item, Mapping)],
+            })
+        elif revision_number > 1:
+            branches.append({
+                "branch_type": "history",
+                "label": "历史版本",
+                "items": [{"revision": revision_number}],
+            })
+
+        for key, label in (("conflicts", "冲突"), ("exceptions", "例外"), ("negative_evidence", "冲突")):
+            values = rule.get(key)
+            if isinstance(values, (list, tuple)) and values:
+                branches.append({
+                    "branch_type": "conflict" if key != "exceptions" else "exception",
+                    "label": label,
+                    "items": [dict(item) if isinstance(item, Mapping) else {"value": item} for item in values],
+                })
+        return branches
+
     def _with_virtual_neuron_overlay(
         self,
         graph: Mapping[str, Any],
@@ -5456,6 +5899,8 @@ class NativeV2RuntimePort:
                     "id": ref_id,
                     "parent_id": bucket_id,
                     "node_kind": "virtual_rule_ref",
+                    "canonical": True,
+                    "canonical_node_kind": "canonical_rule",
                     "virtual_category": "rules_habits",
                     "definition_id": definition_id,
                     "memory_id": memory_id,
@@ -5470,6 +5915,7 @@ class NativeV2RuntimePort:
                     "bindings": list(rule.get("bindings") or ()),
                     "effective": bool(rule.get("effective")),
                     "excluded": bool(rule.get("excluded")),
+                    "detail_branches": self._canonical_rule_detail_branches(rule),
                     "virtual": True,
                 })
                 add_edge(bucket_id, ref_id)
@@ -5686,6 +6132,8 @@ class NativeV2RuntimePort:
             add_node({
                 "id": node_id,
                 "node_kind": "virtual_rule_ref",
+                "canonical": True,
+                "canonical_node_kind": "canonical_rule",
                 "record_kind": "rules_habits",
                 "virtual_category": "rules_habits",
                 "parent_id": "virtual-rules-habits",
@@ -5703,6 +6151,7 @@ class NativeV2RuntimePort:
                 "assignments": bindings,
                 "effective": bool(row.get("effective")),
                 "excluded": bool(row.get("excluded")),
+                "detail_branches": self._canonical_rule_detail_branches(row),
                 "injection_policy": "relevant",
                 "priority": 0,
                 "derivation": "记忆胞体 -> 规则与习惯 -> 规则",
@@ -6179,35 +6628,51 @@ class NativeV2RuntimePort:
             return {"status": "NO_SOURCE", "share_group_id": group, "canonical_state": "absent"}
         try:
             with open_database(self.layout.rules_db, readonly=True) as conn:
-                row = conn.execute(
-                    "SELECT activation_status,read_path,canonical_digest,source_digest,effective_digest,runtime_digest,assessment_digest,policy_version,updated_at "
-                    "FROM rule_canonical_state WHERE share_group_id=? ORDER BY updated_at DESC,scope_id LIMIT 1",
+                rows = conn.execute(
+                    "SELECT scope_id,activation_status,read_path,canonical_digest,source_digest,effective_digest,runtime_digest,assessment_digest,policy_version,updated_at "
+                    "FROM rule_canonical_state WHERE share_group_id=? ORDER BY updated_at DESC,scope_id DESC",
                     (group,),
-                ).fetchone()
-            if row is None:
+                ).fetchall()
+            if not rows:
                 return {"status": "NO_SOURCE", "share_group_id": group, "canonical_state": "absent"}
-            read_path = _text(row[1])
-            if read_path not in {"rule-intelligence", "v2", "native"}:
+            observed_read_path = _text(rows[0][2])
+            selected = None
+            selected_read_path = ""
+            for candidate in rows:
+                normalized_path = normalize_canonical_read_path(candidate[2])
+                activation_status = _text(candidate[1]).casefold()
+                if normalized_path == "rule-intelligence" and activation_status in {
+                    "active", "canonical_ready", "ready", "shadow",
+                }:
+                    selected = candidate
+                    selected_read_path = normalized_path
+                    break
+            if selected is None:
                 return {
                     "status": "BLOCKED",
                     "share_group_id": group,
                     "canonical_state": "unavailable",
                     "read_path": "unknown",
+                    "observed_read_path": observed_read_path,
                     "reason": "v2_canonical_read_path_unavailable",
                 }
-            return {
+            result = {
                 "status": "READY",
                 "share_group_id": group,
-                "canonical_state": str(row[0] or ""),
-                "read_path": read_path,
-                "canonical_digest": str(row[2] or ""),
-                "source_digest": str(row[3] or ""),
-                "effective_digest": str(row[4] or ""),
-                "runtime_digest": str(row[5] or ""),
-                "assessment_digest": str(row[6] or ""),
-                "policy_version": str(row[7] or ""),
-                "updated_at": str(row[8] or ""),
+                "canonical_state": str(selected[1] or ""),
+                "read_path": selected_read_path,
+                "canonical_digest": str(selected[3] or ""),
+                "source_digest": str(selected[4] or ""),
+                "effective_digest": str(selected[5] or ""),
+                "runtime_digest": str(selected[6] or ""),
+                "assessment_digest": str(selected[7] or ""),
+                "policy_version": str(selected[8] or ""),
+                "updated_at": str(selected[9] or ""),
+                "observed_read_path": observed_read_path,
             }
+            if observed_read_path and not normalize_canonical_read_path(observed_read_path):
+                result["reason"] = "newer_invalid_canonical_state_ignored"
+            return result
         except Exception as exc:
             raise NativePortError("v2_canonical_status_unavailable") from exc
 
@@ -6742,13 +7207,121 @@ class NativeV2RuntimePort:
         target_types = ["agent", "agent_project"]
         if admin:
             target_types.extend(["group", "project", "provider", "runtime_role", "system"])
+
+        current_agent = _text(context.get("agent_instance_id"))
+        current_project = _text(context.get("project_ref"))
+        current_provider = _text(context.get("provider"))
+        current_runtime_role = _text(context.get("runtime_role"))
+        current_group = _text(context.get("share_group_id"))
+
+        binding_rows: list[Mapping[str, Any]] = []
+        try:
+            group_service = self._group_service(write=False)
+            binding_result = group_service.list_bindings(include_inactive=False) if group_service is not None else {}
+            if isinstance(binding_result, Mapping):
+                binding_rows = [row for row in (binding_result.get("bindings") or ()) if isinstance(row, Mapping)]
+        except Exception:
+            binding_rows = []
+        # Rule scope editing is bound to the current trusted request.  Do not
+        # expose the global agent registry or unrelated active bindings here:
+        # those are for Agent management/discovery, not rule target selection.
+        discovered: dict[str, dict[str, Any]] = {}
+        if current_agent:
+            discovered[current_agent] = {
+                "provider": current_provider,
+                "project_ref": current_project,
+            }
+            # Rule target selection is still restricted to the trusted current
+            # Agent, but its display metadata should come from the same
+            # read-only registry used by the Agent UI.  Without this merge the
+            # scope editor only had provider/project context and rendered
+            # ``codex · project`` even when a readable program name existed.
+            try:
+                listed = self._agent_service().list_agents()
+                candidates = listed.get("agents", ()) if isinstance(listed, Mapping) else ()
+                for candidate in candidates:
+                    if not isinstance(candidate, Mapping):
+                        continue
+                    candidate_id = _text(
+                        candidate.get("instance_id")
+                        or candidate.get("agent_instance_id")
+                        or candidate.get("id")
+                    )
+                    if candidate_id == current_agent:
+                        discovered[current_agent].update(candidate)
+                        break
+            except Exception:
+                # Metadata is best effort; the trusted context remains enough
+                # to render a safe fallback and does not affect authorization.
+                pass
+
+        def project_label(value: Any) -> str:
+            text = _text(value).replace("\\", "/").rstrip("/")
+            return text.rsplit("/", 1)[-1] if text else ""
+
+        def identity_label(agent_id: str, row: Mapping[str, Any]) -> str:
+            def readable(value: Any) -> str:
+                text = _text(value)
+                return text if text and text != agent_id else ""
+
+            alias = next((readable(row.get(key)) for key in ("user_alias", "alias", "user_label") if readable(row.get(key))), "")
+            discovered_name = next((readable(row.get(key)) for key in ("display_name", "product", "label", "name") if readable(row.get(key))), "")
+            provider = readable(row.get("provider") or row.get("product"))
+            project = readable(project_label(row.get("project_ref") or row.get("project")))
+            base = alias or discovered_name
+            if not base and provider and project:
+                base = f"{provider} · {project}"
+            if not base:
+                suffix = agent_id[-4:] if len(agent_id) > 4 else ""
+                base = f"未知助手 · {suffix}" if suffix else "未知助手"
+            if agent_id == current_agent:
+                base += "（当前）"
+            return base
+
+        agents: list[dict[str, Any]] = []
+        for agent_id in sorted(discovered):
+            row = discovered[agent_id]
+            project_ref = _text(row.get("project_ref") or row.get("project"))
+            last_seen = next((_text(row.get(key)) for key in ("last_seen", "last_activity_at", "mtime_iso", "updated_at") if _text(row.get(key))), "")
+            agents.append({
+                "id": agent_id,
+                "label": identity_label(agent_id, row),
+                "product": _text(row.get("product") or row.get("provider")),
+                "current": agent_id == current_agent,
+                "last_seen": last_seen,
+                "project_ref": project_ref,
+            })
+
+        def option(value: Any, label: Any = "", **extra: Any) -> dict[str, Any]:
+            item_id = _text(value)
+            if not item_id:
+                return {}
+            return {"id": item_id, "label": _text(label) or item_id, **extra}
+
+        group_ids = {current_group}
+        project_refs = {current_project}
+        providers = {current_provider}
+        runtime_roles = {current_runtime_role}
+        for binding in binding_rows:
+            group_ids.add(_text(binding.get("share_group_id")))
+            project_refs.add(_text(binding.get("project_ref")))
+            providers.add(_text(binding.get("provider")))
+            runtime_roles.add(_text(binding.get("runtime_role")))
+        groups = [option(group, f"共享组 · …{group[-4:]}", current=group == current_group) for group in sorted(group_ids) if group]
+        projects = [option(project, "当前项目" if project == current_project else project_label(project) or project, current=project == current_project) for project in sorted(project_refs) if project]
+        provider_options = [option(provider, provider) for provider in sorted(providers) if provider]
+        role_options = [option(role, role) for role in sorted(runtime_roles) if role]
         return {
             "target_types": target_types,
-            "agents": ([{"id": _text(context.get("agent_instance_id"))}] if context.get("agent_instance_id") else []),
-            "groups": ([{"id": _text(context.get("share_group_id"))}] if context.get("share_group_id") else []),
-            "projects": ([{"id": _text(context.get("project_ref"))}] if context.get("project_ref") else []),
-            "providers": ([{"id": _text(context.get("provider"))}] if context.get("provider") else []),
-            "runtime_roles": ([{"id": _text(context.get("runtime_role"))}] if context.get("runtime_role") else []),
+            "agents": agents,
+            "groups": groups,
+            "projects": projects,
+            "providers": provider_options,
+            "runtime_roles": role_options,
+            "current_agent_id": current_agent,
+            "current_project_ref": current_project,
+            "current_project_available": bool(current_project),
+            "connected_agent_count": len(agents),
             "automatic_scope_policy": ["agent", "agent_project"],
         }
 
@@ -6760,21 +7333,66 @@ class NativeV2RuntimePort:
             store = self._domain_store("rules")
             group = _text(context.get("share_group_id"))
             bindings = [item for item in store.list_bindings(share_group_id=group, status="active")]
-            definitions = {item.definition_id: item for item in store.list_definitions(status="active")}
+            raw_definitions = list(store.list_definitions(status="active"))
+            definitions: dict[str, Any] = {}
+            for item in raw_definitions:
+                raw_id = _text(self._row_value(item, "definition_id"))
+                canonical_id = self._canonical_rule_id(store, raw_id)
+                if not canonical_id:
+                    continue
+                # Exact canonical head wins over an alias projection. Ties
+                # resolve by revision, update time, then ID for determinism.
+                try:
+                    revision = int(getattr(item, "revision", 0) or 0)
+                except (TypeError, ValueError):
+                    revision = 0
+                rank = (
+                    0 if raw_id == canonical_id else 1,
+                    -revision,
+                    _text(self._row_value(item, "updated_at")),
+                    raw_id,
+                )
+                previous = definitions.get(canonical_id)
+                if previous is None:
+                    definitions[canonical_id] = (rank, item)
+                elif rank < previous[0]:
+                    definitions[canonical_id] = (rank, item)
+            definitions = {
+                canonical_id: value[1]
+                for canonical_id, value in definitions.items()
+            }
             by_definition: dict[str, list[Any]] = {}
             for binding in bindings:
-                by_definition.setdefault(binding.definition_id, []).append(binding)
+                canonical_id = self._canonical_rule_id(
+                    store, self._row_value(binding, "definition_id"),
+                )
+                if canonical_id:
+                    by_definition.setdefault(canonical_id, []).append(binding)
             source_memories: dict[str, list[str]] = {}
-            with open_database(self.layout.rules_db, readonly=True) as conn:
-                for memory_id, definition_id in conn.execute(
-                    "SELECT memory_id,canonical_definition_id FROM rule_source_links "
-                    "WHERE share_group_id=? ORDER BY canonical_definition_id,memory_id",
-                    (group,),
-                ).fetchall():
-                    mid = _text(memory_id)
-                    did = _text(definition_id)
-                    if mid and did:
-                        source_memories.setdefault(did, []).append(mid)
+            links_reader = getattr(store, "list_source_links", None)
+            if callable(links_reader):
+                source_links = links_reader(share_group_id=group, status="active")
+            else:
+                with open_database(self.layout.rules_db, readonly=True) as conn:
+                    source_links = [
+                        {"memory_id": memory_id, "canonical_definition_id": definition_id}
+                        for memory_id, definition_id in conn.execute(
+                            "SELECT memory_id,canonical_definition_id FROM rule_source_links "
+                            "WHERE share_group_id=? ORDER BY canonical_definition_id,memory_id",
+                            (group,),
+                        ).fetchall()
+                    ]
+            for link in source_links:
+                mid = _text(self._row_value(link, "memory_id"))
+                did = self._canonical_rule_id(
+                    store, self._row_value(link, "canonical_definition_id"),
+                )
+                if mid and did in definitions:
+                    source_memories.setdefault(did, []).append(mid)
+            source_memories = {
+                did: list(dict.fromkeys(values))
+                for did, values in source_memories.items()
+            }
             rules: list[dict[str, Any]] = []
             effective: list[dict[str, Any]] = []
             excluded: list[dict[str, Any]] = []
@@ -6788,7 +7406,7 @@ class NativeV2RuntimePort:
                 includes = [item for item in visible_bindings if item.effect != "exclude" and self._binding_matches_context(item, context)]
                 excludes = [item for item in visible_bindings if item.effect == "exclude" and self._binding_matches_context(item, context)]
                 row = {
-                    "definition_id": definition.definition_id,
+                    "definition_id": definition_id,
                     "canonical_text": definition.canonical_text,
                     "rule_kind": definition.rule_kind,
                     "polarity": definition.polarity,

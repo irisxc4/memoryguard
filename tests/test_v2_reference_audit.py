@@ -292,6 +292,17 @@ def test_fully_initialized_v2_workspace_has_no_schema_blockers(tmp_path: Path):
     result = ReferenceAudit(tmp_path).audit()
     assert not {item.code for item in result.blockers} & {"unknown_authoritative_table", "unknown_authoritative_column", "partial_schema", "missing_or_unsupported_marker", "metadata_marker_drift", "future_schema"}
 
+    # CodeGraph's incremental-refresh tables are registered authoritative
+    # schema.  A genuinely unknown fourth table must still fail closed.
+    codegraph = layout.codegraph_db
+    with sqlite3.connect(codegraph) as conn:
+        conn.execute("CREATE TABLE unknown_refresh_table (id TEXT)")
+    blocked = ReferenceAudit(tmp_path).audit()
+    assert any(
+        item.code == "unknown_authoritative_table" and item.domain == "codegraph"
+        for item in blocked.blockers
+    )
+
 
 def test_non_core_column_drift_is_blocked(tmp_path: Path):
     from memoryguard.assets_v2.store import AssetStore

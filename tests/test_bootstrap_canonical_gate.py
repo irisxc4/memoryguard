@@ -161,6 +161,8 @@ def test_rule_intelligence_request_without_activation_falls_back(tmp_path: Path)
     packet = _bootstrap(tmp_path, "rule-intelligence")
     assert packet["ready"] is True
     assert packet["state"] == "V2_ACTIVE"
+    assert packet.get("mandatory_overflow") is not True
+    assert packet.get("error") in {"", None}
 
 
 def test_auto_request_without_activation_falls_back(tmp_path: Path) -> None:
@@ -169,6 +171,7 @@ def test_auto_request_without_activation_falls_back(tmp_path: Path) -> None:
     assert status["status"] == "NO_SOURCE"
     packet = _bootstrap(tmp_path, "auto")
     assert [item["body"] for item in packet["mandatory"]] == ["始终先运行定向测试"]
+    assert packet.get("mandatory_overflow") is not True
 
 
 def test_inactive_activation_is_not_a_switch(tmp_path: Path) -> None:

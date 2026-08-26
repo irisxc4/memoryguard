@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.7.4] - 2026-08-27
+
+### Fixed
+
+- Canonical governance now merges related rules, habits, and memories into one
+  evolving record while preserving derived graph branches, provenance, scope,
+  evidence, and reversible supersede history.
+- Mandatory rules beyond 20 produce a visible health warning instead of a hard
+  count limit. Character/token budget overflow, sensitive content, and corrupt
+  governance state remain fail-closed.
+- Agent, GUI, automatic-decision, and risk-signal labels expose readable names
+  and explanations instead of opaque identifiers; governance views default to
+  collapsed groups for safer, clearer navigation.
+- `run_audit` and `get_audit` now return explicit completion state and timezone-
+  aware timestamps. The GUI uses that same evidence, so a completed scan no
+  longer remains `待扫描`; missing numeric health evidence stays unknown rather
+  than becoming a fabricated score. The reader popover remains above the
+  navigation, conflict and risk summaries open their detail views, and risk
+  entries show reason, impact, and action. Governance phases show completed,
+  current, pending, or undetermined state with readable contrast.
+- CodeGraph and GUI governance paths now use the same controlled identity,
+  scope, evidence, and incremental-refresh contracts.
+- Codex Hook/bootstrap diagnostics distinguish mandatory-budget failures from
+  generic context-build failures and neutral `NO_SOURCE` canonical fallback.
+- Provider MCP installation avoids editable runtimes by selecting or building
+  content-keyed immutable snapshots, atomically refreshing package static
+  assets, and reporting PEP 610 copied-install origin diagnostics without
+  mutating runtime state during inspection.
+- GUI partial mutations and evidence publication conflicts now fail atomically
+  and preserve the prior valid state.
+- System `group_outbox` projection advances its event and checkpoint in one
+  transaction. A lagging checkpoint can be repaired safely; pending or failed
+  outbox events remain fail-closed and cannot be projected as successful.
+- Migration replay coverage now asserts idempotent, read-only failure evidence
+  and safe retry behavior.
+
+Validation for this release uses the existing incremental CI tail (`447/447`
+passed), related focused suites, and `git diff --check`; the full suite was not
+rerun for this release preparation.
+
 ## [0.7.3] - 2026-08-22
 
 ### Fixed

@@ -108,6 +108,21 @@ class NativeRuleLifecycleService:
             raise NativeRuleLifecycleError(str(exc)) from exc
         return authority, context
 
+    def _read_authority(self, raw: Any) -> tuple[Any, str, str]:
+        """Resolve the minimum trusted identity needed by read-only queries."""
+        try:
+            authority = resolve_native_transport_context(raw)
+        except NativeContextError as exc:
+            raise NativeRuleLifecycleError("trusted_context_capability_required") from exc
+        if Path(authority.workspace_id).expanduser().resolve() != self.workspace:
+            raise NativeRuleLifecycleError("context_workspace_mismatch")
+        agent = str(authority.agent_instance_id or "").strip()
+        group = str(authority.share_group_id or "").strip()
+        missing = [name for name, value in (("agent", agent), ("group", group)) if not value]
+        if missing:
+            raise NativeRuleLifecycleError(f"missing_rule_scope_context:{','.join(missing)}")
+        return authority, agent, group
+
     @staticmethod
     def _scope(payload: Mapping[str, Any], context: RuleMutationContext, *, manual: bool) -> dict[str, Any]:
         requested = payload.get("scope")
@@ -894,7 +909,7 @@ class NativeRuleLifecycleService:
         return self._decision_result(decision, exception_id=exception_id, revoked=True)
 
     def decision_read(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
-        _authority, trusted = self._context(context, automatic=False)
+        authority, agent, _group = self._read_authority(context)
         decision_id = str(payload.get("decision_id") or "").strip()
         if not decision_id:
             raise NativeRuleLifecycleError("decision_id_required")
@@ -902,21 +917,21 @@ class NativeRuleLifecycleService:
         if decision is None:
             raise NativeRuleLifecycleError("rule_decision_not_found")
         owner = str(decision.get("owner_agent_id") or decision.get("actor") or "")
-        if owner and owner != trusted.agent and not trusted.admin:
+        if owner and owner != agent and not authority.admin:
             raise NativeRuleLifecycleError("rule_decision_owner_mismatch")
         return {"decision": decision}
 
     def scope_stats(self, payload: Mapping[str, Any], *, context: Any) -> dict[str, Any]:
         del payload
-        _authority, trusted = self._context(context, automatic=False)
-        bindings = self.store.list_bindings(share_group_id=trusted.group)
-        visible = [item for item in bindings if item.owner_agent_id in {"", trusted.agent} or trusted.admin]
+        authority, agent, group = self._read_authority(context)
+        bindings = self.store.list_bindings(share_group_id=group)
+        visible = [item for item in bindings if item.owner_agent_id in {"", agent} or authority.admin]
         by_target: dict[str, int] = {}
         for item in visible:
             by_target[item.target_type] = by_target.get(item.target_type, 0) + 1
         return {
-            "share_group_id": trusted.group,
-            "agent_instance_id": trusted.agent,
+            "share_group_id": group,
+            "agent_instance_id": agent,
             "active": sum(1 for item in visible if item.status == "active"),
             "inactive": sum(1 for item in visible if item.status != "active"),
             "by_target_type": by_target,

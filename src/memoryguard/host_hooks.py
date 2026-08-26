@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -34,6 +35,16 @@ HOOK_MARKER = "memoryguard.host_hooks"
 HOOK_MODES = {"enforce", "observe", "paused"}
 _RUNTIME_DIR = "hook-runtime"
 _MAX_RECEIPT_AGE_DAYS = 30
+
+
+@dataclass
+class _PathThreadLockEntry:
+    lock: threading.Lock
+    users: int = 0
+
+
+_PATH_THREAD_LOCKS: dict[str, _PathThreadLockEntry] = {}
+_PATH_THREAD_LOCKS_GUARD = threading.Lock()
 _COMPACT_REMINDER = (
     "压缩前发现尚未沉淀的长期记忆候选；继续工作前用 "
     "memoryguard_memory_write 萃取保存，不得保存整段对话。"
@@ -168,6 +179,33 @@ def _short_hash(value: str) -> str:
 
 
 @contextmanager
+def _thread_lock_for_sidecar(lock_path: Path):
+    """Queue this process's threads and retire unused path entries."""
+    key = os.path.normcase(os.path.abspath(os.fspath(lock_path)))
+    with _PATH_THREAD_LOCKS_GUARD:
+        entry = _PATH_THREAD_LOCKS.get(key)
+        if entry is None:
+            entry = _PathThreadLockEntry(threading.Lock())
+            _PATH_THREAD_LOCKS[key] = entry
+        entry.users += 1
+
+    acquired = False
+    try:
+        entry.lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        with _PATH_THREAD_LOCKS_GUARD:
+            current = _PATH_THREAD_LOCKS.get(key)
+            if current is entry:
+                entry.users -= 1
+                if entry.users == 0:
+                    del _PATH_THREAD_LOCKS[key]
+
+
+@contextmanager
 def _cross_process_path_lock(path: Path, timeout_seconds: float = 3.0):
     """Serialize atomic replacements across Hook processes.
 
@@ -176,47 +214,48 @@ def _cross_process_path_lock(path: Path, timeout_seconds: float = 3.0):
     bounded replace retries cover short-lived antivirus/indexer handles.
     """
     lock_path = path.with_name(f".{path.name}.memoryguard.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_fd: int | None = None
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while lock_fd is None:
-            try:
-                lock_fd = os.open(
-                    lock_path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
-                os.write(lock_fd, f"{os.getpid()} {_now_iso()}".encode("ascii"))
-            except (FileExistsError, PermissionError):
-                # Recover only genuinely stale crash remnants.  Normal
-                # writers hold the lock for milliseconds and are never
-                # unlinked by a waiter.
+    with _thread_lock_for_sidecar(lock_path):
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd: int | None = None
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while lock_fd is None:
                 try:
-                    stale = time.time() - lock_path.stat().st_mtime > 30.0
-                    if stale:
-                        lock_path.unlink(missing_ok=True)
-                        continue
+                    lock_fd = os.open(
+                        lock_path,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                    os.write(lock_fd, f"{os.getpid()} {_now_iso()}".encode("ascii"))
+                except (FileExistsError, PermissionError):
+                    # Recover only genuinely stale crash remnants.  Normal
+                    # writers hold the lock for milliseconds and are never
+                    # unlinked by a waiter.
+                    try:
+                        stale = time.time() - lock_path.stat().st_mtime > 30.0
+                        if stale:
+                            lock_path.unlink(missing_ok=True)
+                            continue
+                    except OSError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out acquiring hook runtime lock: {path}")
+                    time.sleep(0.01)
+            yield
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
                 except OSError:
                     pass
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out acquiring hook runtime lock: {path}")
-                time.sleep(0.01)
-        yield
-    finally:
-        if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            for attempt in range(5):
-                try:
-                    lock_path.unlink(missing_ok=True)
-                    break
-                except PermissionError:
-                    if attempt == 4:
+                for attempt in range(5):
+                    try:
+                        lock_path.unlink(missing_ok=True)
                         break
-                    time.sleep(0.01 * (attempt + 1))
+                    except PermissionError:
+                        if attempt == 4:
+                            break
+                        time.sleep(0.01 * (attempt + 1))
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -946,10 +985,21 @@ class ClaudeHookAdapter(_NestedJsonHookAdapter):
 class CodexHookAdapter(_NestedJsonHookAdapter):
     provider = "codex"
 
+    def __init__(self, workspace: str | Path):
+        super().__init__(workspace)
+        self._config_home: Path | None = None
+
+    def set_config_home(self, config_home: str | Path | None) -> None:
+        self._config_home = (
+            Path(config_home).expanduser().resolve() if config_home else None
+        )
+
     def config_path(self) -> Path:
-        configured = os.environ.get("CODEX_HOME", "").strip()
-        root = Path(configured).expanduser() if configured else Path.home() / ".codex"
-        return root / "hooks.json"
+        if self._config_home is not None:
+            return self._config_home / "hooks.json"
+        from .agent_locator import current_codex_home
+
+        return current_codex_home() / "hooks.json"
 
     def capability(self) -> HookCapability:
         return HookCapability(
@@ -1144,9 +1194,13 @@ class HostHookManager:
         share_group_id: str,
         mode: str = "enforce",
         reconcile_trust: bool = False,
+        config_home: str | Path | None = None,
     ) -> dict[str, Any]:
         normalized = (provider or "").strip().lower()
-        result = self.adapter(provider).install(
+        adapter = self.adapter(provider)
+        if config_home is not None and hasattr(adapter, "set_config_home"):
+            adapter.set_config_home(config_home)
+        result = adapter.install(
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
             mode=mode,
@@ -1699,6 +1753,7 @@ def _best_effort_codex_reconcile(
     try:
         from .codex_subagent_reconcile import (
             codex_thread_matches_workspace,
+            reconcile_closed_edge_rollout_activities,
             reconcile_codex_subagents,
             reconcile_global_codex_subagents,
             trusted_codex_thread_id,
@@ -1716,6 +1771,20 @@ def _best_effort_codex_reconcile(
             active_thread_ids=active,
             receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
         )
+        activity_result = reconcile_closed_edge_rollout_activities(
+            result.get("closed_edges") or [],
+            active_thread_ids=active,
+            # This path runs only from Codex Stop: the current root turn has
+            # reached a stable append boundary even though the thread remains
+            # resumable and therefore appears in the active whitelist.
+            allow_active_parent_ids={root_thread_id},
+        )
+        result["rollout_activity_appended_count"] = int(
+            activity_result.get("appended_count") or 0
+        )
+        result["rollout_activity_status"] = str(
+            activity_result.get("status") or ""
+        )
         result = _attach_terminal_cohort_reclaim(workspace, result)
         global_result = (
             reconcile_global_codex_subagents(
@@ -1731,6 +1800,18 @@ def _best_effort_codex_reconcile(
                 "archived_thread_count": 0,
             }
         )
+        if workspace_matches:
+            global_activity = reconcile_closed_edge_rollout_activities(
+                global_result.get("closed_edges") or [],
+                active_thread_ids=active,
+                allow_active_parent_ids={root_thread_id},
+            )
+            global_result["rollout_activity_appended_count"] = int(
+                global_activity.get("appended_count") or 0
+            )
+            global_result["rollout_activity_status"] = str(
+                global_activity.get("status") or ""
+            )
         global_result = _attach_terminal_cohort_reclaim(workspace, global_result)
         global_result = _attach_indexed_terminal_cohort_reclaim(
             workspace,
@@ -1850,14 +1931,28 @@ def _best_effort_codex_global_reconcile(
     """Repair terminal/orphan stale tasks without touching live branches."""
 
     try:
-        from .codex_subagent_reconcile import reconcile_global_codex_subagents
+        from .codex_subagent_reconcile import (
+            reconcile_closed_edge_rollout_activities,
+            reconcile_global_codex_subagents,
+        )
 
         root_thread_id = _verified_codex_hook_thread_id(workspace, payload)
         if not root_thread_id:
             return {}
+        active = _codex_active_thread_ids(payload) | {root_thread_id}
         result = reconcile_global_codex_subagents(
-            active_thread_ids=_codex_active_thread_ids(payload) | {root_thread_id},
+            active_thread_ids=active,
             receipt_dir=workspace / ".memoryguard" / _RUNTIME_DIR / "codex-reconcile",
+        )
+        activity_result = reconcile_closed_edge_rollout_activities(
+            result.get("closed_edges") or [],
+            active_thread_ids=active,
+        )
+        result["rollout_activity_appended_count"] = int(
+            activity_result.get("appended_count") or 0
+        )
+        result["rollout_activity_status"] = str(
+            activity_result.get("status") or ""
         )
         result = _attach_terminal_cohort_reclaim(workspace, result)
         result = _attach_indexed_terminal_cohort_reclaim(
@@ -1891,6 +1986,57 @@ def _best_effort_codex_global_reconcile(
             "status": "degraded",
             "reason": f"reconcile_failed:{type(exc).__name__}",
         }
+
+
+def _best_effort_codex_profile_repair(
+    *,
+    workspace: Path,
+    agent_instance_id: str,
+    share_group_id: str,
+) -> dict[str, Any]:
+    """Repair the current CODEX_HOME profile to the canonical program identity."""
+    if not str(os.environ.get("CODEX_HOME", "") or "").strip():
+        return {}
+    try:
+        from .agent_locator import AgentLocator
+        from .provider_adapters import (
+            _record_codex_program_identity,
+            _repair_discovered_codex_homes,
+            _resolve_codex_canonical_identity,
+        )
+        from .runtime_v2.group_native import GroupControlService
+
+        store = GroupControlService(workspace, write=False)
+        instances, _ = AgentLocator(workspace).detect_instances()
+        canonical, group, aliases = _resolve_codex_canonical_identity(store, instances)
+        binding = None
+        if canonical:
+            binding = store.active_binding_for_agent(canonical)
+        if binding is None:
+            binding = store.active_binding_for_agent(agent_instance_id)
+        if binding is None:
+            return {}
+        agent_id = str(binding.get("agent_instance_id") or canonical or agent_instance_id)
+        group_id = str(binding.get("share_group_id") or group or share_group_id)
+        replica = _repair_discovered_codex_homes(
+            workspace,
+            agent_instance_id=agent_id,
+            share_group_id=group_id,
+            binding_id=str(binding.get("binding_id") or ""),
+        )
+        try:
+            recorded = _record_codex_program_identity(
+                workspace,
+                agent_instance_id=agent_id,
+                share_group_id=group_id,
+                aliases=list(aliases) + list(replica.get("aliases") or ()),
+            )
+            replica["aliases"] = list(recorded.get("aliases") or replica.get("aliases") or ())
+        except Exception:
+            pass
+        return replica
+    except Exception:
+        return {}
 
 
 def _read_heartbeat(
@@ -2196,6 +2342,30 @@ def _is_memoryguard_recovery_tool(tool_name: str, tool_input: Any = None) -> boo
     return False
 
 
+def _best_effort_codegraph_file_refresh(
+    *,
+    workspace: Path,
+    payload: dict[str, Any],
+    tool_name: str,
+    tool_input: Any,
+    tool_result: Any,
+) -> None:
+    try:
+        from .codegraph_v2.refresh import queue_host_file_refresh
+
+        queue_host_file_refresh(
+            workspace,
+            payload=payload,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_result=tool_result,
+            host_event="post_tool",
+            trusted_host=True,
+        )
+    except Exception:
+        return
+
+
 def _is_other_memory_write(tool_name: str) -> bool:
     value = (tool_name or "").casefold()
     if "memoryguard" in value or "memory" not in value:
@@ -2214,6 +2384,27 @@ def _load_store(
     share_group_id: str,
 ):
     raise RuntimeError(v2_upgrade_message("UNKNOWN", surface="Hook"))
+
+
+def _budget_count_warning_message(packet: Mapping[str, Any] | None) -> str:
+    if not isinstance(packet, Mapping):
+        return ""
+    budget = packet.get("budget")
+    if not isinstance(budget, Mapping):
+        nested = packet.get("context_packet")
+        if isinstance(nested, Mapping):
+            budget = nested.get("budget")
+    if not isinstance(budget, Mapping):
+        return ""
+    for warning in budget.get("warnings") or ():
+        if not isinstance(warning, Mapping):
+            continue
+        if str(warning.get("code") or "") != "mandatory_item_count_warning":
+            continue
+        message = str(warning.get("message") or "").strip()
+        if message:
+            return message
+    return ""
 
 
 def _render_context(packet: dict[str, Any]) -> str:
@@ -2235,6 +2426,11 @@ def _render_context(packet: dict[str, Any]) -> str:
                 lines.append(f"- {item.get('kind', 'fact')}: {body}")
     else:
         lines.append("- 本轮没有生效的强制规则。")
+    warning_message = _budget_count_warning_message(packet) or _budget_count_warning_message(
+        context_packet if isinstance(context_packet, dict) else None
+    )
+    if warning_message:
+        lines.append(f"- {warning_message}")
     lines.extend([
         "[MemoryGuard 相关长期记忆]",
         "仅用于补充长期规则/偏好/项目决策；当前宿主对话保持原样。",
@@ -2572,6 +2768,102 @@ def _hook_data(result: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     return data, packet if isinstance(packet, dict) else {}
 
 
+_MANDATORY_FAIL_CLOSED_ERRORS = frozenset({
+    "injection_policy_invalid",
+    "injection_policy_layer_conflict",
+    "mandatory_content_blocked",
+    "mandatory_policy_requires_rule",
+    "mandatory_sensitive_blocked",
+    "mandatory_item_limit_exceeded",
+    "mandatory_budget_exceeded",
+    "mandatory_overflow",
+    "mandatory_rule_package_invalid",
+})
+_BOOTSTRAP_RUNTIME_ERRORS = frozenset({
+    "context_build_failed",
+    "unknown_runtime_state",
+    "missing_trusted_identity",
+    "context_budget_required",
+    "v2_hook_bootstrap_failed",
+})
+_NEUTRAL_CANONICAL_MARKERS = frozenset({
+    "no_source", "absent", "empty", "not_configured",
+})
+
+
+def _error_code(value: Any) -> str:
+    text = str(value or "").strip()
+    if ":" in text:
+        text = text.split(":", 1)[0].strip()
+    return text
+
+
+def _is_neutral_canonical_fallback(
+    packet: Mapping[str, Any] | None = None,
+    error: str = "",
+) -> bool:
+    markers = [_error_code(error).casefold()]
+    if isinstance(packet, Mapping):
+        for key in ("status", "canonical_state", "canonical_status", "error"):
+            markers.append(str(packet.get(key) or "").strip().casefold())
+    return any(marker in _NEUTRAL_CANONICAL_MARKERS for marker in markers if marker)
+
+
+def _is_mandatory_overflow_error(
+    error: str = "",
+    packet: Mapping[str, Any] | None = None,
+) -> bool:
+    """True only for fail-closed mandatory package failures.
+
+    Generic bootstrap/runtime errors such as ``context_build_failed`` and the
+    canonical ``NO_SOURCE``/``absent`` fallback are not budget overflow.
+    """
+    if _is_neutral_canonical_fallback(packet, error):
+        return False
+    code = _error_code(error)
+    packet_error = ""
+    if isinstance(packet, Mapping):
+        packet_error = _error_code(packet.get("error") or packet.get("mandatory_invalid_reason") or "")
+        if _error_code(packet_error) in _BOOTSTRAP_RUNTIME_ERRORS or code in _BOOTSTRAP_RUNTIME_ERRORS:
+            return False
+        if str(packet.get("mandatory_overflow")).strip().casefold() in {"true", "1"}:
+            if packet_error.startswith("mandatory_") or code.startswith("mandatory_"):
+                return True
+            if packet_error in _MANDATORY_FAIL_CLOSED_ERRORS or code in _MANDATORY_FAIL_CLOSED_ERRORS:
+                return True
+            if not packet_error and not code:
+                return True
+    if code in _BOOTSTRAP_RUNTIME_ERRORS or packet_error in _BOOTSTRAP_RUNTIME_ERRORS:
+        return False
+    if code.startswith("mandatory_") or packet_error.startswith("mandatory_"):
+        return True
+    return code in _MANDATORY_FAIL_CLOSED_ERRORS or packet_error in _MANDATORY_FAIL_CLOSED_ERRORS
+
+
+def _bootstrap_failure_state(
+    reason: str,
+    packet: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    overflow = _is_mandatory_overflow_error(reason, packet)
+    neutral = _is_neutral_canonical_fallback(packet, reason)
+    if neutral and not overflow:
+        return {
+            "bootstrap_ok": True,
+            "bootstrap_error": "",
+            "mandatory_overflow": False,
+            "mandatory_invalid_reason": "",
+            "mandatory_match_receipts": [],
+        }
+    clipped = str(reason or "")[:500]
+    return {
+        "bootstrap_ok": False,
+        "bootstrap_error": clipped,
+        "mandatory_overflow": overflow,
+        "mandatory_invalid_reason": clipped if overflow else "",
+        "mandatory_match_receipts": [],
+    }
+
+
 def _normalize_native_v2_packet(
     packet: dict[str, Any],
     *,
@@ -2658,13 +2950,8 @@ def _normalize_native_v2_packet(
         })
     normalized["mandatory_rule_ids"] = rule_ids
     normalized["mandatory_match_receipts"] = receipts
-    status = str(packet.get("status") or "").casefold()
     error = str(packet.get("error") or "").strip()
-    normalized["mandatory_overflow"] = bool(
-        packet.get("mandatory_overflow")
-        or status in {"blocked", "error", "failed"}
-        or error.startswith("mandatory_")
-    )
+    normalized["mandatory_overflow"] = _is_mandatory_overflow_error(error, packet)
     normalized["mandatory_invalid_reason"] = str(
         packet.get("mandatory_invalid_reason") or error or ""
     )
@@ -2765,17 +3052,11 @@ def _v2_hook_cutover(
     if not isinstance(result, dict):
         reason = "v2 hook returned invalid envelope"
         state_payload = _load_state(workspace, provider, session_id)
-        state_payload.update({
-            "bootstrap_ok": False,
-            "bootstrap_error": reason,
-            "mandatory_overflow": True,
-            "mandatory_invalid_reason": reason,
-            "mandatory_match_receipts": [],
-        })
+        state_payload.update(_bootstrap_failure_state(reason))
         _save_state(workspace, provider, session_id, state_payload)
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event, error=reason,
-            mandatory_overflow=True,
+            mandatory_overflow=False,
         )
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
@@ -2792,27 +3073,33 @@ def _v2_hook_cutover(
         event=event,
     )
     status = str(data.get("status", "") or "").strip().casefold()
-    if data.get("ok") is False or status in {"error", "blocked", "failed"} or data.get("error"):
-        reason = str(data.get("error") or data.get("code") or "v2_hook_bootstrap_failed")
+    packet_status = str(packet.get("status", "") or "").strip().casefold()
+    combined_error = str(
+        data.get("error") or packet.get("error") or data.get("code") or ""
+    ).strip()
+    envelope_failed = (
+        data.get("ok") is False
+        or status in {"error", "blocked", "failed"}
+        or packet_status in {"error", "blocked", "failed"}
+        or bool(data.get("error"))
+        or bool(packet.get("error"))
+    )
+    if envelope_failed and not _is_neutral_canonical_fallback(packet, combined_error):
+        reason = combined_error or "v2_hook_bootstrap_failed"
         state_payload = _load_state(workspace, provider, session_id)
-        state_payload.update({
-            "bootstrap_ok": False,
-            "bootstrap_error": reason[:500],
-            "mandatory_overflow": True,
-            "mandatory_invalid_reason": reason[:500],
-            "mandatory_match_receipts": [],
-        })
+        state_payload.update(_bootstrap_failure_state(reason, packet))
         _save_state(workspace, provider, session_id, state_payload)
+        overflow = _is_mandatory_overflow_error(reason, packet)
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,
             error=f"v2_hook_envelope_failed:{reason}",
-            mandatory_overflow=True,
+            mandatory_overflow=overflow,
         )
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
         if event == "stop":
             return {}
-        if packet.get("mandatory_overflow"):
+        if overflow:
             return _context_output(
                 provider,
                 event,
@@ -2826,9 +3113,11 @@ def _v2_hook_cutover(
             data.get("mandatory_match_receipts", []),
         )
         state_payload = _load_state(workspace, provider, session_id)
-        bootstrap_ok = not bool(
-            packet.get("mandatory_overflow", data.get("mandatory_overflow", False))
-        )
+        packet_error = str(packet.get("error") or data.get("error") or "").strip()
+        overflow = _is_mandatory_overflow_error(packet_error, packet)
+        blocked = packet_status in {"error", "blocked", "failed"}
+        neutral = _is_neutral_canonical_fallback(packet, packet_error)
+        bootstrap_ok = not overflow and (neutral or not (blocked or packet_error))
         # Cursor's beforeSubmitPrompt hook is only the conversation receipt
         # boundary.  Its first ordinary tool must remain locked until the
         # host has actually executed memoryguard_context_bootstrap through
@@ -2838,10 +3127,12 @@ def _v2_hook_cutover(
             bootstrap_ok = False
         state_payload.update({
             "bootstrap_ok": bootstrap_ok,
-            "bootstrap_error": "",
-            "mandatory_overflow": bool(packet.get("mandatory_overflow", data.get("mandatory_overflow", False))),
-            "mandatory_invalid_reason": str(
-                packet.get("mandatory_invalid_reason", data.get("error", "")) or ""
+            "bootstrap_error": packet_error[:500] if not bootstrap_ok else "",
+            "mandatory_overflow": overflow,
+            "mandatory_invalid_reason": (
+                str(packet.get("mandatory_invalid_reason") or packet_error or "")[:500]
+                if overflow
+                else ""
             ),
             "mandatory_rule_ids": list(
                 packet.get("mandatory_rule_ids", data.get("mandatory_rule_ids", [])) or []
@@ -2944,6 +3235,12 @@ def run_hook(
                 agent_instance_id=agent_instance_id,
                 payload=payload,
                 event=event,
+            )
+        if event in {"session_start", "user_prompt"}:
+            _best_effort_codex_profile_repair(
+                workspace=root,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
             )
         if event == "stop":
             _best_effort_codex_reconcile(
@@ -3076,6 +3373,17 @@ def run_hook(
                 changed = True
         if changed:
             _save_state(root, normalized_provider, session_id, state)
+        _best_effort_codegraph_file_refresh(
+            workspace=root,
+            payload={
+                **payload,
+                "share_group_id": share_group_id,
+                "agent_instance_id": agent_instance_id,
+            },
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_result=tool_result,
+        )
         return v2_result
 
     if event == "pre_compact" and not v2_result:

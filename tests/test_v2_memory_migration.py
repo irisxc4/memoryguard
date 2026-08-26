@@ -193,7 +193,7 @@ def test_edits_use_revision_delta_ledger_and_replay_digest(tmp_path: Path):
     memory = MemoryAtomStore(tmp_path)
     evidence = EvidenceStore(tmp_path)
     ctx = _ctx(tmp_path)
-    atom = memory.put_atom(MemoryAtom(memory_id="x", body="v0", share_group_id="g"), evidence=[{"source_ref": "x"}], context=ctx)
+    atom = memory.put_atom(MemoryAtom(memory_id="x", body="v0", share_group_id="g", visibility="ready"), evidence=[{"source_ref": "x"}], context=ctx)
     for index in range(100):
         atom.body = f"v{index + 1}"
         atom.canonical_hash = ""
@@ -203,6 +203,10 @@ def test_edits_use_revision_delta_ledger_and_replay_digest(tmp_path: Path):
         assert conn.execute("SELECT COUNT(*) FROM atom_revisions").fetchone()[0] == 101
         assert conn.execute("SELECT COUNT(*) FROM atom_deltas").fetchone()[0] == 100
         final_revision = conn.execute("SELECT MAX(revision) FROM atom_revisions").fetchone()[0]
+    # Revision replay is a published read.  The initial write is building
+    # until its evidence outbox is projected; keep the ledger assertions above
+    # independent from publication, then replay only after that boundary.
+    assert memory.project_evidence(evidence)["failed"] == 0
     replayed = memory.replay_revision(atom.atom_id, int(final_revision))
     assert replayed is not None
     assert memory.revision_digest(atom.atom_id, int(final_revision)) == memory.revision_digest(atom.atom_id)

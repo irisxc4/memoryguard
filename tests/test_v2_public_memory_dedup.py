@@ -251,11 +251,11 @@ def test_public_v2_memory_write_accepts_descriptor_body_only_contract(
     assert data["atom"]["injection_policy"] == "relevant"
 
 
-def test_public_v2_memory_write_can_be_read_immediately(
+def test_public_v2_memory_write_is_published_for_immediate_recall(
     active_v2_workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A successful native write must be readable before async promotion."""
+    """A successful native write must be immediately eligible for recall."""
     monkeypatch.setenv("MEMORYGUARD_HOME", str(active_v2_workspace))
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(active_v2_workspace))
     monkeypatch.setenv("MEMORYGUARD_AGENT_ID", "agent-a")
@@ -278,7 +278,7 @@ def test_public_v2_memory_write_can_be_read_immediately(
     assert written.get("isError") is not True, _public_result_failure(written)
     write_data = json.loads(written["content"][0]["text"])["data"]
     memory_id = write_data["atom"]["memory_id"]
-    assert write_data["atom"]["visibility"] == "building"
+    assert write_data["atom"]["visibility"] == "active"
     audience = write_data["atom"]["metadata"]["audience"]
     assert audience["target_type"] == "agent"
     assert audience["target_id"] == "agent-a"

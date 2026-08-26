@@ -10,9 +10,9 @@ from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort
 from memoryguard.security import ALL_ALLOWED_METHODS, MUTATION_API_METHODS, READONLY_API_METHODS
 
 
-def test_gui_operation_registry_is_single_166_method_truth_source() -> None:
-    assert len(GUI_OPERATION_SPECS) == 166
-    assert {"list_codegraph_projects", "build_codegraph"} <= set(GUI_OPERATION_SPECS)
+def test_gui_operation_registry_is_single_167_method_truth_source() -> None:
+    assert len(GUI_OPERATION_SPECS) == 167
+    assert {"list_codegraph_projects", "codegraph_status", "build_codegraph"} <= set(GUI_OPERATION_SPECS)
     assert GUI_METHOD_NAMES == frozenset(GUI_OPERATION_SPECS)
     assert len(GUI_MUTATION_NAMES) == 73
     assert MUTATION_API_METHODS == GUI_MUTATION_NAMES
@@ -53,7 +53,7 @@ def test_projection_build_task_api_contract_exposes_run_id_engine_and_exact_canc
 
 def test_gui_native_registry_never_uses_retired_status(tmp_path) -> None:
     entries = NativeV2RuntimePort(tmp_path).coverage()["surfaces"]["gui"]["entries"]
-    assert len(entries) == 166
+    assert len(entries) == 167
     assert all(item["status"] in {"implemented", "blocker"} for item in entries)
     assert all(item["status"] != "retired" for item in entries)
     assert all(item["canonical_name"] for item in entries)

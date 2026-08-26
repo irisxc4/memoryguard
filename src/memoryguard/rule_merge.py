@@ -1479,23 +1479,23 @@ class RuleMergeService:
     ) -> list[tuple[RuleDefinition, RuleDefinition]]:
         """Recall compatible pairs with bounded deterministic top-k blocking.
 
-        The primary key keeps kind/strength/polarity/parameters aligned.  A
-        secondary key intentionally crosses strength only so strength conflicts
-        remain auditable.  This avoids the old semantic-hash-only blind spot
-        while keeping large compatible populations bounded.
+        The primary key keeps strength/polarity/parameters aligned while
+        deliberately crossing ``rule_kind``.  Kind is descriptive evidence,
+        not semantic identity.  A secondary key intentionally crosses
+        strength only so strength conflicts remain auditable.  Polarity and
+        parameter partitions remain safety gates in ``evaluate_candidate``.
         """
         primary: dict[tuple[Any, ...], list[RuleDefinition]] = {}
         strength_conflicts: dict[tuple[Any, ...], list[RuleDefinition]] = {}
         for definition in definitions:
             params = tuple(sorted(parameters_of(definition)))
-            kind = str(definition.rule_kind or "")
             polarity = str(definition.polarity or "")
             strength = str(definition.rule_strength or "")
             primary.setdefault(
-                (kind, strength, polarity, params), [],
+                (strength, polarity, params), [],
             ).append(definition)
             strength_conflicts.setdefault(
-                (kind, polarity, params), [],
+                (polarity, params), [],
             ).append(definition)
 
         pair_ids: set[tuple[str, str]] = set()

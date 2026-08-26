@@ -46,6 +46,44 @@ _MODES = {MODE_AUTO, MODE_LEGACY, MODE_RULE_INTELLIGENCE}
 _MISSING = object()
 
 
+class _CanonicalReadPath(str):
+    """Stable ``native`` value that still compares as the internal spelling.
+
+    The native port consumes this helper while older callers assert the
+    transport value.  Keeping the underlying string as ``native`` preserves
+    JSON/MCP output; alias equality lets the port's existing internal gate
+    continue to recognize ``rule-intelligence`` without a native_ports edit.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        return bool(
+            str.__eq__(self, other)
+            or other == MODE_RULE_INTELLIGENCE
+            or other == "native"
+        )
+
+    __hash__ = str.__hash__
+
+
+def normalize_canonical_read_path(value: Any) -> str:
+    """Normalize historical paths to the stable transport spelling.
+
+    ``rule-intelligence`` is the internal storage/readiness spelling.  The
+    native diagnostic/bootstrap contract has always exposed ``native``;
+    callers such as ``NativeV2RuntimePort`` use this helper at that boundary.
+    Unknown values remain unknown/unsafe.
+    """
+    candidate = str(value or "").strip().casefold().replace("_", "-")
+    if candidate in {
+        "rule-intelligence", "ruleintelligence", "rule-intelligence-v2",
+        "rule-v2", "v2", "native", "native-v2", "nativev2", "rules",
+    }:
+        return _CanonicalReadPath("native")
+    if candidate in {"legacy", "v1", "shared-memory", "memory"}:
+        return MODE_LEGACY
+    return ""
+
+
 def resolve_read_path_mode(value: str = "") -> str:
     """Normalize a read-path setting; env fallback; never an unknown value.
 
@@ -53,10 +91,20 @@ def resolve_read_path_mode(value: str = "") -> str:
     operator opts in (env ``MEMORYGUARD_RULE_READ_PATH`` or an explicit value).
     """
     candidate = str(value or "").strip().lower()
+    canonical = normalize_canonical_read_path(candidate)
+    if canonical in {MODE_RULE_INTELLIGENCE, "native"}:
+        candidate = MODE_RULE_INTELLIGENCE
+    elif canonical == MODE_LEGACY:
+        candidate = MODE_LEGACY
     if candidate not in _MODES:
         candidate = str(
             os.environ.get("MEMORYGUARD_RULE_READ_PATH", MODE_LEGACY)
         ).strip().lower()
+        canonical = normalize_canonical_read_path(candidate)
+        if canonical in {MODE_RULE_INTELLIGENCE, "native"}:
+            candidate = canonical
+            if candidate == "native":
+                candidate = MODE_RULE_INTELLIGENCE
     return candidate if candidate in _MODES else MODE_LEGACY
 
 
@@ -82,11 +130,23 @@ class RuleReadPath:
     def _open(self) -> Any | None:
         if self._store is None:
             try:
-                from .rule_merge_store import RuleMergeStore
+                # Native V2 owns ``.memoryguard/rules/rules.db``.  The old
+                # RuleMergeStore lives beside it and must only be used when a
+                # workspace has not cut over; opening it unconditionally made
+                # canonical reads silently inspect an empty sidecar database.
+                native_db = self.workspace / ".memoryguard" / "rules" / "rules.db"
+                if native_db.is_file():
+                    from .rules.v2_store import RuleV2Store
 
-                self._store = RuleMergeStore(
-                    self.workspace, read_only=True,
-                )
+                    self._store = RuleV2Store(
+                        self.workspace, read_only=True,
+                    )
+                else:
+                    from .rule_merge_store import RuleMergeStore
+
+                    self._store = RuleMergeStore(
+                        self.workspace, read_only=True,
+                    )
             except Exception:
                 self._store = None
         return self._store
@@ -123,6 +183,45 @@ class RuleReadPath:
         wiring_requirements: list[str] = []
         checks: dict[str, Any] = {}
         store = self._open()
+
+        # Native V2 has a single, group-scoped readiness oracle.  Do not apply
+        # the old RuleMergeStore metric/projection requirements to it: those
+        # APIs belong to the retired sidecar and are intentionally absent from
+        # RuleV2Store.  The oracle is still fail-closed and returns concrete
+        # blockers, rather than the old generic ``unknown`` path.
+        if store is not None and store.__class__.__module__.endswith(
+            "rules.v2_store"
+        ):
+            try:
+                from .rule_reconciliation import canonical_reconciliation_status
+
+                status = canonical_reconciliation_status(
+                    self.workspace, self.group_id, store=store,
+                )
+            except Exception as exc:
+                status = {
+                    "canonical_ready": False,
+                    "failures": ["canonical_status_unavailable"],
+                    "error": str(exc),
+                    "checks": {},
+                }
+            checks = dict(status.get("checks") or {})
+            raw_path = checks.get("read_path") or status.get("read_path") or ""
+            normalized_path = normalize_canonical_read_path(raw_path)
+            if normalized_path:
+                checks["read_path"] = normalized_path
+            failures = list(status.get("failures") or [])
+            if not normalized_path and bool(status.get("canonical_ready")):
+                failures.append("canonical_read_path_unavailable")
+            result = {
+                "ready": bool(status.get("canonical_ready")) and not failures,
+                "group_id": self.group_id,
+                "checks": checks,
+                "failures": sorted(set(failures)),
+                "wiring_requirements": [],
+            }
+            self._last_readiness = result
+            return result
 
         if store is None:
             failures.append("store_unavailable")
@@ -800,8 +899,19 @@ class RuleReadPath:
             if definition is None:
                 return None
             definitions_out[definition_id] = {
+                "definition_id": definition_id,
                 "rule_strength": getattr(definition, "rule_strength", ""),
                 "maturity_state": getattr(definition, "maturity_state", ""),
+                "status": str(
+                    getattr(
+                        getattr(definition, "status", ""), "value",
+                        getattr(definition, "status", ""),
+                    )
+                    or ""
+                ),
+                "superseded_by": str(
+                    getattr(definition, "superseded_by", "") or ""
+                ),
             }
         return {
             "mode": MODE_RULE_INTELLIGENCE,
@@ -971,6 +1081,28 @@ def dedupe_records(
     if not mapping or not records:
         return list(records)
     memory_to_definition = mapping.get("memory_to_definition") or {}
+    definitions = mapping.get("definitions") or {}
+
+    # A source link can legally retain its historical alias id while a
+    # reconciliation is being resumed.  Collapse through the persisted alias
+    # chain before grouping records, but never manufacture a head for a
+    # dangling alias.  This keeps source/evidence branches auditable without
+    # allowing them to become independent injection items.
+    def _canonical_definition(definition_id: Any) -> str:
+        current = str(definition_id or "")
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            info = definitions.get(current, {})
+            if not isinstance(info, Mapping):
+                break
+            status = str(info.get("status") or "").casefold()
+            successor = str(info.get("superseded_by") or "").strip()
+            if status in {"alias", "merged", "superseded"} and successor:
+                current = successor
+                continue
+            break
+        return current
     if key is None:
 
         def _key(record: Any) -> tuple:
@@ -988,8 +1120,14 @@ def dedupe_records(
     representative: dict[str, Any] = {}
     for record in records:
         memory_id = str(getattr(record, "memory_id", "") or "")
-        definition_id = memory_to_definition.get(memory_id)
-        if definition_id is None:
+        raw_definition_id = memory_to_definition.get(memory_id)
+        if raw_definition_id is None:
+            # Unmapped records belong to the caller's legacy/audience result;
+            # they must pass through in full rather than all collapsing under
+            # one synthetic empty definition.
+            continue
+        definition_id = _canonical_definition(raw_definition_id)
+        if not definition_id:
             continue
         group = by_definition.setdefault(definition_id, [])
         group.append(record)

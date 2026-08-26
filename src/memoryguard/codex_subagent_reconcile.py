@@ -5,9 +5,12 @@ Codex keeps the UI index in ``state_5.sqlite``.  A stopped child can leave an
 running, which makes the parent appear to have work in progress forever.
 Root-scoped reconciliation is driven by the trusted Stop hook.  Global crash
 recovery is stricter: it reads only the final structured event of an existing
-rollout and closes a branch only when every open descendant has an explicit
-terminal event.  Rollout files are never modified and prompt/response bodies
-are never persisted in diagnostics.
+rollout and closes a branch only when every open descendant has explicit
+terminal evidence.  When a proven terminal spawn edge is closed, MemoryGuard
+may append one native ``sub_agent_activity(kind=interrupted)`` event to the
+parent rollout so Codex UI reconstruction cannot resurrect a deleted child as
+"processing". Existing rollout lines are never rewritten, and prompt/response
+bodies are never persisted in diagnostics.
 
 The module is intentionally defensive because the database is owned by Codex:
 
@@ -505,19 +508,32 @@ def _subagent_stop_candidate_ids(payload: Mapping[str, Any] | None) -> set[str]:
     return found
 
 
+def _rollout_path_state(
+    raw_path: Any,
+    *,
+    codex_home: Path,
+) -> tuple[str, Path | None]:
+    """Classify a Codex-owned rollout path without creating or following data out of home."""
+
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return "invalid", None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute() or path.is_symlink():
+        return "invalid", None
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return "invalid", None
+    if not _is_within(resolved, codex_home):
+        return "invalid", None
+    return ("file", resolved) if resolved.is_file() else ("missing", resolved)
+
+
 def _terminal_rollout_event(raw_path: Any, *, codex_home: Path) -> str:
     """Return one allow-listed terminal event without exposing rollout text."""
 
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return ""
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute() or path.is_symlink():
-        return ""
-    try:
-        path = path.resolve(strict=True)
-    except (OSError, RuntimeError):
-        return ""
-    if not _is_within(path, codex_home) or not path.is_file():
+    state, path = _rollout_path_state(raw_path, codex_home=codex_home)
+    if state != "file" or path is None:
         return ""
     try:
         with path.open("rb") as stream:
@@ -544,6 +560,187 @@ def _terminal_rollout_event(raw_path: Any, *, codex_home: Path) -> str:
         # after an older task_complete means the task may have resumed.
         return ""
     return ""
+
+
+def _tail_subagent_activity_kind(
+    path: Path,
+    child_thread_id: str,
+) -> str:
+    """Return the newest activity kind for one child from a bounded rollout tail."""
+
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - MAX_ROLLOUT_TAIL_BYTES))
+            lines = stream.read(MAX_ROLLOUT_TAIL_BYTES).decode(
+                "utf-8", errors="replace"
+            ).splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if child_thread_id not in line or '"sub_agent_activity"' not in line:
+            continue
+        try:
+            item = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        payload = item.get("payload") if isinstance(item, Mapping) else None
+        if (
+            isinstance(payload, Mapping)
+            and str(item.get("type") or "") == "event_msg"
+            and str(payload.get("type") or "") == "sub_agent_activity"
+            and str(payload.get("agent_thread_id") or "") == child_thread_id
+        ):
+            return str(payload.get("kind") or "")
+    return ""
+
+
+def reconcile_closed_edge_rollout_activities(
+    closed_edges: Iterable[Mapping[str, Any]],
+    *,
+    active_thread_ids: Iterable[str] = (),
+    allow_active_parent_ids: Iterable[str] = (),
+    codex_home: str | Path | None = None,
+) -> dict[str, Any]:
+    """Append native terminal activity for spawn edges already proven closed.
+
+    This function never decides whether a child is terminal.  The caller must
+    pass edges produced by the database reconciler.  It independently verifies
+    that the edge is currently ``closed`` and that the child is either gone or
+    archived before appending one small Codex-native ``interrupted`` event to
+    the parent rollout.  Existing rollout bytes are never rewritten.
+    """
+
+    home = resolve_codex_home(codex_home)
+    db_path = resolve_state_db_path(codex_home=home)
+    result: dict[str, Any] = {
+        "ok": True,
+        "status": "noop",
+        "appended_count": 0,
+        "skipped_active_parent_count": 0,
+        "skipped_unproven_count": 0,
+        "skipped_already_terminal_count": 0,
+        "appended_thread_ids": [],
+    }
+    if not db_path.is_file() or not _is_within(db_path, home):
+        result.update(ok=False, status="degraded", reason="state_db_missing")
+        return result
+
+    active = _active_ids(active_thread_ids)
+    allowed_active = _active_ids(allow_active_parent_ids)
+    normalized_edges: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for edge in closed_edges:
+        if not isinstance(edge, Mapping):
+            continue
+        parent = _safe_id(edge.get("parent_thread_id"))
+        child = _safe_id(edge.get("child_thread_id"))
+        pair = (parent, child)
+        if parent and child and pair not in seen:
+            seen.add(pair)
+            normalized_edges.append(pair)
+    if not normalized_edges:
+        return result
+
+    try:
+        conn = sqlite3.connect(
+            f"file:{db_path.as_posix()}?mode=ro", uri=True, timeout=0.5
+        )
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        result.update(ok=False, status="degraded", reason="state_db_open_failed")
+        return result
+
+    try:
+        for parent, child in normalized_edges:
+            if parent in active and parent not in allowed_active:
+                result["skipped_active_parent_count"] += 1
+                continue
+            edge_row = conn.execute(
+                "SELECT status FROM thread_spawn_edges "
+                "WHERE parent_thread_id=? AND child_thread_id=?",
+                (parent, child),
+            ).fetchone()
+            parent_row = conn.execute(
+                "SELECT rollout_path FROM threads WHERE id=?", (parent,)
+            ).fetchone()
+            child_row = conn.execute(
+                "SELECT archived, rollout_path FROM threads WHERE id=?", (child,)
+            ).fetchone()
+            proven_terminal = child_row is None or bool(child_row["archived"])
+            if child_row is not None and not proven_terminal:
+                child_state, _ = _rollout_path_state(
+                    child_row["rollout_path"], codex_home=home
+                )
+                proven_terminal = child_state == "missing" or bool(
+                    _terminal_rollout_event(child_row["rollout_path"], codex_home=home)
+                )
+            if (
+                edge_row is None
+                or str(edge_row["status"] or "").casefold() != "closed"
+                or parent_row is None
+                or not proven_terminal
+            ):
+                result["skipped_unproven_count"] += 1
+                continue
+            parent_state, parent_path = _rollout_path_state(
+                parent_row["rollout_path"], codex_home=home
+            )
+            if parent_state != "file" or parent_path is None:
+                result["skipped_unproven_count"] += 1
+                continue
+            if _tail_subagent_activity_kind(parent_path, child) == "interrupted":
+                result["skipped_already_terminal_count"] += 1
+                continue
+
+            now = datetime.now(timezone.utc)
+            now_ms = int(now.timestamp() * 1000)
+            digest = hashlib.sha256(
+                f"{parent}:{child}:memoryguard-rollout-terminal".encode("utf-8")
+            ).hexdigest()[:24]
+            event = {
+                "timestamp": now.isoformat(timespec="milliseconds").replace(
+                    "+00:00", "Z"
+                ),
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "event_id": f"call_{digest}",
+                    "occurred_at_ms": now_ms,
+                    "agent_thread_id": child,
+                    "agent_path": None,
+                    "kind": "interrupted",
+                },
+            }
+            payload = (
+                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            try:
+                original_size = parent_path.stat().st_size
+                needs_newline = False
+                if original_size:
+                    with parent_path.open("rb") as source:
+                        source.seek(-1, os.SEEK_END)
+                        needs_newline = source.read(1) != b"\n"
+                with parent_path.open("ab") as stream:
+                    if needs_newline:
+                        stream.write(b"\n")
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError:
+                result.update(ok=False, status="degraded", reason="rollout_append_failed")
+                continue
+            result["appended_count"] += 1
+            result["appended_thread_ids"].append(child)
+    finally:
+        conn.close()
+
+    if result["appended_count"]:
+        result["status"] = "reconciled"
+        result["reason"] = "terminal_activity_appended"
+    return result
 
 
 def _global_terminal_graph(
@@ -595,9 +792,21 @@ def _global_terminal_graph(
             missing_threads.add(child)
             terminal[child] = "missing_thread"
             continue
-        event = "archived" if bool(archived) else _terminal_rollout_event(
-            rollout_path, codex_home=codex_home
+        if bool(archived):
+            terminal[child] = "archived"
+            continue
+        rollout_state, _resolved_rollout = _rollout_path_state(
+            rollout_path,
+            codex_home=codex_home,
         )
+        if rollout_state == "missing":
+            # A non-active indexed child whose Codex-owned rollout has already
+            # disappeared cannot be resumed from local history. Treat the
+            # dangling row like a deleted child so its parent edge/UI state can
+            # converge instead of remaining "processing" forever.
+            terminal[child] = "missing_rollout"
+            continue
+        event = _terminal_rollout_event(rollout_path, codex_home=codex_home)
         if event:
             terminal[child] = event
         else:
@@ -1708,6 +1917,7 @@ __all__ = [
     "reconcile_codex_subagents_json",
     "reconcile_codex_subagent_stop",
     "reconcile_global_codex_subagents",
+    "reconcile_closed_edge_rollout_activities",
     "resolve_codex_home",
     "resolve_state_db_path",
     "sanitize_reconcile_result",

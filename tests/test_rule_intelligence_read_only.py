@@ -8,6 +8,7 @@ import pytest
 
 from memoryguard.access_context import AccessContext
 from memoryguard.memory.store import MemoryAtomStore
+from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
 from memoryguard.rules.v2_store import RuleV2Store
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
@@ -22,11 +23,13 @@ class _Manifest:
         return {"state": self.state, "generation": self.generation}
 
 
-def _context(workspace: Path, *, agent: str = "agent-a"):
+def _context(
+    workspace: Path, *, agent: str = "agent-a", runtime_role: str = "test", admin: bool = True,
+):
     return bind_native_transport_context(
         AccessContext(
             trusted_agent_id=agent,
-            is_admin=True,
+            is_admin=admin,
             strict_binding=True,
             allow_anon=False,
             session_id=f"readonly-{agent}",
@@ -34,13 +37,30 @@ def _context(workspace: Path, *, agent: str = "agent-a"):
             session_trusted=True,
         ),
         workspace_id=str(workspace.resolve()), share_group_id="group-a",
-        project_ref="project-a", provider="codex", runtime_role="test",
+        project_ref="project-a", provider="codex", runtime_role=runtime_role,
     )
 
 
 def _seed_rule(workspace: Path):
     store = RuleV2Store(workspace)
     return store.upsert_definition(build_definition("record provenance", kind="procedure", rule_strength="must"))
+
+
+def _seed_scope_bindings(workspace: Path, count: int = 3):
+    store = RuleV2Store(workspace)
+    for index in range(count):
+        definition = store.upsert_definition(
+            build_definition(f"scoped rule {index}", kind="procedure", rule_strength="must")
+        )
+        store.upsert_binding(
+            build_binding(
+                definition.definition_id,
+                share_group_id="group-a",
+                target_type="agent",
+                target_id="agent-a",
+                owner_agent_id="agent-a",
+            )
+        )
 
 
 def test_read_only_store_never_initializes_rule_db(tmp_path):
@@ -79,6 +99,59 @@ def test_rule_intelligence_read_apis_do_not_mutate_db(tmp_path):
     )
     assert result["ok"] is True, result
     assert dump() == before
+
+
+def test_rule_scope_stats_read_without_runtime_keeps_mutation_gate(tmp_path):
+    _seed_scope_bindings(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    read_context = _context(tmp_path, runtime_role="")
+
+    stats = port.dispatch_mcp(
+        "memoryguard_rule_scope_stats", {}, context=read_context,
+        generation=7, state="V2_ACTIVE",
+    )
+    assert stats["ok"] is True, stats
+    assert stats["data"]["active"] == 3
+    assert stats["data"]["by_target_type"] == {"agent": 3}
+
+    write = port.dispatch_mcp(
+        "memoryguard_rule_create_auto",
+        {"text": "must remain gated", "idempotency_key": "runtime-required"},
+        context=read_context, generation=7, state="V2_ACTIVE",
+    )
+    assert write["ok"] is False, write
+    assert write["code"] == "missing_rule_mutation_context:runtime"
+    assert len(RuleV2Store(tmp_path).list_definitions()) == 3
+
+
+def test_rule_decision_read_without_runtime_preserves_owner_gate(tmp_path):
+    store = RuleV2Store(tmp_path)
+    definition = store.upsert_definition(build_definition("owner-only decision", kind="procedure"))
+    store.record_decision({
+        "decision_id": "owner-decision",
+        "rule_id": definition.definition_id,
+        "action": "rule_create_auto",
+        "actor": "agent-a",
+        "owner_agent_id": "agent-a",
+        "reason": "read contract",
+    })
+    port = NativeV2RuntimePort(tmp_path, state_provider=_Manifest())
+    owner_context = _context(tmp_path, runtime_role="", admin=False)
+
+    owner = port.dispatch_mcp(
+        "memoryguard_rule_decision_read", {"decision_id": "owner-decision"},
+        context=owner_context, generation=7, state="V2_ACTIVE",
+    )
+    assert owner["ok"] is True, owner
+    assert owner["data"]["decision"]["decision_id"] == "owner-decision"
+
+    non_owner = port.dispatch_mcp(
+        "memoryguard_rule_decision_read", {"decision_id": "owner-decision"},
+        context=_context(tmp_path, agent="agent-b", runtime_role="", admin=False),
+        generation=7, state="V2_ACTIVE",
+    )
+    assert non_owner["ok"] is False, non_owner
+    assert non_owner["code"] == "rule_decision_owner_mismatch"
 
 
 def test_rule_read_only_reader_observes_committed_concurrent_write(tmp_path):

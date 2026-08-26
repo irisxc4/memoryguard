@@ -825,10 +825,12 @@ class RuntimeDiagnosticsService:
         *,
         version_provider: Any = None,
         status_provider: Any = None,
+        origin_provider: Any = None,
     ) -> None:
         self.workspace = _canonical(Path(workspace))
         self.version_provider = version_provider
         self.status_provider = status_provider
+        self.origin_provider = origin_provider
 
     def _version(self) -> str:
         provider = self.version_provider
@@ -857,6 +859,20 @@ class RuntimeDiagnosticsService:
             return {}
         return value if isinstance(value, Mapping) else {"state": _text(value)}
 
+    def _origin(self) -> Mapping[str, Any]:
+        provider = self.origin_provider
+        if provider is None:
+            try:
+                from ..runtime_lease import inspect_distribution_origin
+                provider = inspect_distribution_origin
+            except Exception:  # pragma: no cover - package import failure
+                return {}
+        try:
+            value = _call_provider(provider, self.workspace)
+        except Exception:  # noqa: BLE001 - diagnostics never mutate or fail open
+            return {}
+        return value if isinstance(value, Mapping) else {}
+
     def memoryguard_runtime_processes(self, payload: Any = None, *, context: Any = None, **_: Any) -> dict[str, Any]:
         del payload
         details = self._status()
@@ -870,13 +886,39 @@ class RuntimeDiagnosticsService:
             details.get("state") or details.get("status") or "V2_ACTIVE",
             "UNKNOWN",
         )
+        origin = self._origin()
+        install_kind = _safe_marker(origin.get("install_kind"), "unknown").casefold()
+        if install_kind not in {"editable", "local_source", "installed", "unknown"}:
+            install_kind = "unknown"
+        install_reason = _safe_marker(origin.get("install_reason"), "metadata_unavailable")
+        if install_reason not in {
+            "direct_url_editable",
+            "direct_url_local_path",
+            "source_tree_on_sys_path",
+            "distribution_installed",
+            "metadata_unavailable",
+        }:
+            install_reason = "metadata_unavailable"
+        editable_install = bool(origin.get("editable")) or install_kind == "editable"
+        source_drift_risk = bool(origin.get("source_drift_risk")) or editable_install or install_kind == "local_source"
+        split_brain = bool(details.get("split_brain", False))
         summary = {
             "live_processes": _count(live_count),
             "stale_leases": _count(stale_count),
             "conflicts": _count(conflict_count),
-            "split_brain": bool(details.get("split_brain", False)),
+            "split_brain": split_brain,
             "restart_required": bool(details.get("restart_required", False)),
+            "install_kind": install_kind,
+            "install_reason": install_reason,
+            "editable_install": editable_install,
+            "source_drift_risk": source_drift_risk,
         }
+        if split_brain:
+            summary["split_brain_reason"] = (
+                "editable_source_fingerprint_drift"
+                if source_drift_risk
+                else "version_or_fingerprint_mismatch"
+            )
         result = _ready(
             self.service_name,
             memoryguard_version=self._version(),
@@ -886,12 +928,26 @@ class RuntimeDiagnosticsService:
         if _is_admin(context):
             # Details use a fixed allow-list and the sanitizer as a second
             # fence.  No path, command line, token or secret is ever exposed.
-            allow = {"pid", "memoryguard_version", "code_fingerprint", "split_brain", "restart_required"}
+            allow = {
+                "pid", "memoryguard_version", "code_fingerprint",
+                "split_brain", "restart_required",
+                "install_kind", "install_reason", "editable_install",
+                "source_drift_risk", "split_brain_reason",
+            }
             raw_details = {
                 key: details[key]
                 for key in allow
                 if key in details
             }
+            for key, value in (
+                ("install_kind", install_kind),
+                ("install_reason", install_reason),
+                ("editable_install", editable_install),
+                ("source_drift_risk", source_drift_risk),
+            ):
+                raw_details.setdefault(key, value)
+            if split_brain:
+                raw_details.setdefault("split_brain_reason", summary["split_brain_reason"])
             if isinstance(live, (list, tuple)):
                 raw_details["live"] = live
             if isinstance(stale, (list, tuple)):

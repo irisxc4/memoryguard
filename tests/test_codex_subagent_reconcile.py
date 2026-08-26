@@ -11,6 +11,7 @@ from memoryguard.codex_subagent_reconcile import (
     reconcile_codex_subagents,
     reconcile_codex_subagents_json,
     reconcile_codex_subagent_stop,
+    reconcile_closed_edge_rollout_activities,
     reconcile_global_codex_subagents,
 )
 from memoryguard.host_hooks import run_hook
@@ -380,6 +381,125 @@ def test_global_reconcile_closes_missing_child_edge_after_history_delete(tmp_pat
     assert _read(db, "SELECT id FROM threads ORDER BY id") == [("root",)]
 
 
+def test_global_reconcile_closes_child_with_missing_rollout_file(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("stale-child", 0, None, 2)],
+        [("root", "stale-child", "open")],
+    )
+    missing = home / "sessions" / "deleted-child.jsonl"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE threads SET rollout_path=? WHERE id='stale-child'", (str(missing),)
+    )
+    conn.commit()
+    conn.close()
+
+    dry = dry_run_global_codex_subagents(codex_home=home)
+    assert dry["closed_edge_count"] == 1
+    assert dry["terminal_event_counts"] == {"missing_rollout": 1}
+
+    result = reconcile_global_codex_subagents(codex_home=home)
+    assert result["closed_edge_count"] == 1
+    assert result["archived_thread_ids"] == ["stale-child"]
+    assert _read(
+        db,
+        "SELECT status FROM thread_spawn_edges WHERE child_thread_id='stale-child'",
+    ) == [("closed",)]
+
+
+def test_closed_edge_appends_terminal_activity_and_is_idempotent(tmp_path: Path):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("child", 1, 10, 2)],
+        [("root", "child", "closed")],
+    )
+    parent = home / "sessions" / "root.jsonl"
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    parent.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "agent_thread_id": "child",
+                    "agent_path": "/root/test",
+                    "kind": "interacted",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE threads SET rollout_path=? WHERE id='root'", (str(parent),))
+    conn.commit()
+    conn.close()
+    edge = {"parent_thread_id": "root", "child_thread_id": "child"}
+
+    first = reconcile_closed_edge_rollout_activities([edge], codex_home=home)
+    assert first["appended_count"] == 1
+    last = json.loads(parent.read_text(encoding="utf-8").splitlines()[-1])
+    assert last["payload"]["type"] == "sub_agent_activity"
+    assert last["payload"]["agent_thread_id"] == "child"
+    assert last["payload"]["kind"] == "interrupted"
+    assert last["payload"]["agent_path"] is None
+
+    size = parent.stat().st_size
+    second = reconcile_closed_edge_rollout_activities([edge], codex_home=home)
+    assert second["appended_count"] == 0
+    assert second["skipped_already_terminal_count"] == 1
+    assert parent.stat().st_size == size
+
+
+def test_closed_edge_activity_skips_active_parent_unless_stop_boundary_allows_it(
+    tmp_path: Path,
+):
+    home = tmp_path / "codex"
+    db = _db(
+        home,
+        [("root", 0, None, 1), ("child", 1, 10, 2)],
+        [("root", "child", "closed")],
+    )
+    parent = home / "sessions" / "root.jsonl"
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    parent.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "agent_thread_id": "child",
+                    "kind": "started",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE threads SET rollout_path=? WHERE id='root'", (str(parent),))
+    conn.commit()
+    conn.close()
+    edge = {"parent_thread_id": "root", "child_thread_id": "child"}
+
+    skipped = reconcile_closed_edge_rollout_activities(
+        [edge], codex_home=home, active_thread_ids={"root"}
+    )
+    assert skipped["appended_count"] == 0
+    assert skipped["skipped_active_parent_count"] == 1
+
+    allowed = reconcile_closed_edge_rollout_activities(
+        [edge],
+        codex_home=home,
+        active_thread_ids={"root"},
+        allow_active_parent_ids={"root"},
+    )
+    assert allowed["appended_count"] == 1
+
+
 def test_missing_parent_branch_stays_open_when_live_descendant_exists(tmp_path: Path):
     home = tmp_path / "codex"
     db = _db(
@@ -507,6 +627,64 @@ def test_host_session_start_workspace_mismatch_never_touches_global_state(
         db,
         "SELECT status,archived FROM thread_spawn_edges JOIN threads ON child_thread_id=id",
     ) == [("open", 0)]
+
+
+def test_host_stop_closes_edge_and_persists_terminal_subagent_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    home = tmp_path / "home"
+    codex_home = home / ".codex"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    db = _db(
+        codex_home,
+        [("root", 0, None, 1), ("child", 0, None, 2)],
+        [("root", "child", "open")],
+    )
+    parent_rollout = codex_home / "sessions" / "root.jsonl"
+    parent_rollout.parent.mkdir(parents=True, exist_ok=True)
+    parent_rollout.write_text(
+        json.dumps(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "sub_agent_activity",
+                    "agent_thread_id": "child",
+                    "agent_path": "/root/test",
+                    "kind": "interacted",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "UPDATE threads SET cwd=?, rollout_path=? WHERE id='root'",
+        (str(workspace), str(parent_rollout)),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("CODEX_THREAD_ID", "root")
+
+    run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": "root", "cwd": str(workspace)},
+    )
+
+    assert _read(
+        db,
+        "SELECT status FROM thread_spawn_edges WHERE child_thread_id='child'",
+    ) == [("closed",)]
+    last = json.loads(parent_rollout.read_text(encoding="utf-8").splitlines()[-1])
+    assert last["payload"]["type"] == "sub_agent_activity"
+    assert last["payload"]["agent_thread_id"] == "child"
+    assert last["payload"]["kind"] == "interrupted"
 
 
 def test_host_stop_reconcile_is_best_effort_when_db_is_corrupt(

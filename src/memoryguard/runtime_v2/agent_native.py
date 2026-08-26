@@ -20,6 +20,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from ..agent_locator import AgentLocator
+from ..agent_mapping import provider_display_name
 from ..content.store import ContentStore, stable_id
 from ..storage.database import open_database
 from ..storage.transaction import transaction
@@ -166,6 +167,8 @@ class AgentNativeService:
             item = dict(instance.to_dict())
             candidate = _candidate_id(str(instance.product))
             mark = marks.get(candidate, {})
+            item["display_name"] = provider_display_name(instance.product)
+            item["label"] = item["display_name"]
             item["candidate_id"] = candidate
             item["lifecycle_state"] = "ignored" if mark.get("status") == "uninstalled" else "installed"
             # Keep the support grade (A/B/C/D) separate from the takeover

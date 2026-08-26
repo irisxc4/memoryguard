@@ -3,8 +3,15 @@
 验证意图：神经图用于查看内容，治理动作统一进入治理台；其余治理视图必须复用同一套视觉语义。
 """
 
+from html import unescape
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
 import sys
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -289,7 +296,8 @@ def test_rule_auto_scope_groups_actions_and_collapses_dominant_delete() -> None:
     assert "function renderRuleDecisionGroup" in html
     assert "rule-decision-group" in html
     assert "rule-decision-subgroup" in html
-    assert "group.action === 'delete'" in html
+    assert "function ruleDecisionActionLabel" in html
+    assert '<details class="rule-decision-group">' in html
     assert "scope_type" in html
     assert "范围置信度" in html
     assert "function undoRuleDecisionGroup" in html
@@ -367,8 +375,8 @@ def test_risk_signals_offer_agent_handoff_without_blind_auto_fix() -> None:
     assert "copyAllFindingsForAgent" in html
     assert "完成后重新扫描验证" in html
     assert "不要修改 MemoryGuard 的来源文件" in html
-    assert "aria-expanded=\"${index === 0 ? 'true' : 'false'}\"" in html
-    assert "index === 0 ? '收起详情' : '展开详情'" in html
+    assert 'aria-expanded="false"' in html
+    assert 'style="display:none"' in html
     assert "element.closest('.finding-item')" in html
 
 
@@ -562,7 +570,8 @@ def test_codegraph_requests_independent_endpoint_without_legacy_neuron_endpoint(
     html = render_interactive_html()
 
     assert "async function renderCodeGraph()" in html
-    assert "codeGraph = await callApi('get_codegraph_graph'" in html
+    assert "callApi('get_codegraph_graph', request)" in html
+    assert "codeGraph = {...graph, codegraph_status: codegraphStatus};" in html
     assert html.count("callApi('get_codegraph_graph'") == 1
     assert "get_neuron_graph" not in html
     assert "callApi('codegraph_graph'" not in html
@@ -660,8 +669,345 @@ def test_projection_source_cards_keep_long_ids_single_line_and_responsive() -> N
     assert ".source-map-fields { grid-template-columns: minmax(0, 1fr); }" in html
 
 
+def test_dashboard_chrome_exposes_seven_readable_pages() -> None:
+    html = render_interactive_html()
+
+    assert 'class="topbar-brand"' in html
+    assert 'id="topbar-context"' in html
+    assert "const PAGE_CHROME =" in html
+    for tab in ("overview", "sources", "neurons", "codegraph", "rules", "history", "findings"):
+        assert f"{tab}: {{index:" in html
+        assert f'data-tab="{tab}"' in html
+    assert ".page-heading::before" in html
+    assert ".page-heading::after" in html
+    assert "program_name || match.program" in html
+    assert '<h2>规则与习惯</h2>' in html
+    assert '<h2>对话历史</h2>' in html
+    assert '<h2>风险信号与治理控制台</h2>' in html
+    assert '<div class="page-head">' not in html
+    assert ".nav-item { justify-content: center; font-size: 0;" in html
+    assert ".page-actions { display: flex; flex-wrap: wrap;" in html
+    assert "const knownGuiTabs =" in html
+    assert "history.replaceState(null, '', '#' + tab)" in html
+
+
+def test_agent_labels_do_not_expose_opaque_suffix_as_primary_name() -> None:
+    html = render_interactive_html()
+
+    assert "if (id) label = '未命名助手';" in html
+    assert "id.slice(-4)" not in html
+    assert "function looksLikeOpaqueAgentId" in html
+    assert "readableAgentPart(program, id) || readableAgentPart(provider, id)" in html
+
+
+def test_codegraph_ui_reports_automation_only_from_backend_state() -> None:
+    html = render_interactive_html()
+
+    assert "function codeGraphAutomationState(graph = {})" in html
+    assert "const incremental = source.codegraph_status" in html
+    assert "incremental.enabled === true && supported && builtScope && activeBinding" in html
+    assert "自动增量已启用" in html
+    assert "自动增量待建图" in html
+    assert "自动增量待绑定" in html
+    assert "callApi('codegraph_status', request)" in html
+    assert "source.automatic === true" in html
+    assert "自动更新状态待后端确认" in html
+    assert "当前页面不伪造运行状态" in html
+    assert "自动更新不可用" in html
+    assert "写入成功后按变更文件刷新" not in html
+    assert "自动增量更新'," not in html
+
+
+def test_overview_uses_api_payloads_not_fake_screenshot_stats() -> None:
+    html = render_interactive_html()
+
+    assert "12.4K" not in html
+    assert "暂不可用" in html
+    assert "暂无扫描时间" in html
+    assert "不补造统计" in html
+    assert "function eventActionLabel" in html
+    assert "auto_supersede: '自动覆盖'" in html
+
+
+def test_overview_uses_explicit_scan_state_and_does_not_fabricate_health() -> None:
+    html = render_interactive_html()
+
+    assert "function normalizeAuditState(value)" in html
+    assert "const explicitState = normalizeAuditState(report.audit_state || report.auditStatus || report.status);" in html
+    assert "const completed = auditIsCompleted(report);" in html
+    assert "health === null ? '健康度 ' + (findings.length ? `需处理 ${findings.length} 项` : '扫描完成')" in html
+    assert "const healthText = health === null" in html
+    assert "扫描完成/需处理" not in html
+
+
+def test_overview_exposes_readable_detail_routes_for_conflicts_and_risks() -> None:
+    html = render_interactive_html()
+
+    assert "function openGovernanceSubtab(subTab)" in html
+    assert "function openFinding(findingId)" in html
+    assert "onclick=\"openGovernanceSubtab('conflicts')\"" in html
+    assert "aria-label=\"打开风险信号详情\"" in html
+    assert "原因：${escapeHtml(riskReasonText(finding))}" in html
+    assert "建议：${escapeHtml(riskActionText(finding))}" in html
+
+
+def test_overview_stage_statuses_are_explicit_or_unknown() -> None:
+    html = render_interactive_html()
+
+    assert "function governanceStageStates(report = {})" in html
+    assert "只展示后端明确状态；缺少证据的阶段标为不可判定。" in html
+    assert "stageStateLabel(stage)" in html
+    assert "unknown: '不可判定'" in html
+
+
+def test_reader_layer_is_above_horizontal_navigation() -> None:
+    html = render_interactive_html()
+
+    assert "position: relative; z-index: 30; min-height: 56px" in html
+    assert ".topbar-reader { position: relative; z-index: 40; }" in html
+    assert "z-index: 50; top: calc(100% + 7px)" in html
+
+
+def test_risk_entries_explain_reason_impact_and_action_in_chinese() -> None:
+    html = render_interactive_html()
+
+    assert "function riskReasonText" in html
+    assert "function riskImpactText" in html
+    assert "function riskActionText" in html
+    assert "<strong>原因</strong>" in html
+    assert "<strong>影响</strong>" in html
+    assert "<strong>建议动作</strong>" in html
+    assert "打开治理台" in html
+    assert "escapeHtml(finding.impact)" not in html
+    assert "escapeHtml(finding.suggestion)" not in html
+
+
+def test_risk_localization_hides_internal_target_from_summary_but_keeps_detail() -> None:
+    html = render_interactive_html()
+
+    assert "unknown_authoritative_table: '未知权威表'" in html
+    assert "function riskTechnicalSource(finding = {})" in html
+    assert "function riskAuditTargetLabel(finding = {})" in html
+    assert "'system / group_outbox': '系统域的共享组出站记录'" in html
+    assert '引用审计未能确认“${target}”的结构或引用完整性。' in html
+    assert '<span class="key">技术来源</span>' in html
+
+
+def test_unconsumed_outbox_payload_has_specific_chinese_title_and_reason() -> None:
+    html = render_interactive_html()
+
+    assert "unconsumed_outbox: '共享组事件待消费'" in html
+    assert "function isUnconsumedOutboxFinding" in html
+    assert "source === 'system / group_outbox' && title === 'unconsumed outbox'" in html
+    assert "共享组事件队列存在未消费记录。" in html
+
+
+def test_codegraph_label_strategy_is_explicit_and_zoom_safe() -> None:
+    html = render_interactive_html()
+
+    assert "function codeGraphKeyLabelIds(graph, limit = 8)" in html
+    assert "label_priority: keyLabelIds.has(String(node.id || '')) ? 'true' : 'false'" in html
+    assert "'label': ''" in html
+    assert 'node[label_priority = "true"], node:selected, node.codegraph-label-hover, node.codegraph-label-zoomed' in html
+    assert "codeCyInstance.on('mouseover', 'node'" in html
+    assert "codeCyInstance.on('zoom', updateCodeGraphLabelPolicy);" in html
+    assert "默认仅标重点节点，悬停或选中显示标签，放大后显示全部。" in html
+
+
+def test_automatic_scope_decisions_stay_collapsed_with_chinese_event_labels() -> None:
+    html = render_interactive_html()
+
+    assert '<details class="rule-decision-group">' in html
+    assert '<details class="rule-decision-group" open' not in html
+    assert "eventActionLabel(a.action || a.type || 'auto')" in html
+    assert "有效记忆" in html
+    assert "Active memories" not in html
+
+
 def test_projection_source_map_has_readable_shared_empty_state() -> None:
     html = render_interactive_html()
 
     assert "暂无共享记忆入库来源" in html
     assert "当前共享组没有可展示的受管记忆或连接器" in html
+
+
+def test_reference_information_architecture_keeps_seven_primary_views_and_contextual_rails() -> None:
+    """Reference layout is a working IA change, not a cosmetic card skin."""
+    html = render_interactive_html()
+
+    for css_class in ("dashboard-view", "compact-toolbar", "page-tabs", "kpi-grid", "data-table", "detail-rail"):
+        assert css_class in html
+    for tab in ("overview", "sources", "neurons", "codegraph", "rules", "history", "findings"):
+        assert f'data-tab="{tab}"' in html
+    assert 'data-tab="releases"' not in html
+    assert 'data-tab="governance"' not in html
+    assert "function renderOverviewRail" in html
+    assert "function renderSourcesRail" in html
+    assert "function renderRulesRail" in html
+    assert "function renderHistoryRail" in html
+    assert "function renderRiskRail" in html
+    assert "let selectedSourceId = ''" in html
+    assert "let selectedRuleId = ''" in html
+    assert "let selectedHistorySessionId = ''" in html
+    assert "let selectedFindingId = ''" in html
+    assert "function filterNeuronGraph" in html
+    assert "function sortNeuronGraph" in html
+    assert "@media (max-width: 768px)" in html
+    assert "@media (max-width: 1024px)" in html
+
+
+def test_overview_narrow_layout_stacks_kpis_and_governance_stages() -> None:
+    html = render_interactive_html()
+    mobile_start = html.rindex("@media (max-width: 640px)")
+    mobile = html[mobile_start:html.index("</style>", mobile_start)]
+
+    assert "html, body, .app-shell, .main-wrapper, .content, .dashboard-view, .dashboard-main" in mobile
+    assert "min-inline-size: 0;" in mobile
+    assert ".dashboard-main > *, #content .overview-view section { min-width: 0; max-width: 100%; }" in mobile
+    assert "overflow-x: hidden" not in mobile
+    assert "#content .overview-view .kpi-grid { grid-template-columns: minmax(0, 1fr);" in mobile
+    assert "#content .overview-view .governance-timeline { grid-template-columns: minmax(0, 1fr);" in mobile
+    assert "#content .overview-view .governance-stage { min-width: 0; width: 100%;" in mobile
+
+
+def test_agent_display_name_uses_provider_fallback_for_history_rows_and_rail() -> None:
+    html = render_interactive_html()
+    start = html.index("function agentDisplayName")
+    end = html.index("function agentIdentityDetail", start)
+    display_name = html[start:end]
+
+    assert "const fallbackLabel = readableAgentPart(fallback, id);" in display_name
+    assert "readableAgentPart(alias, id) || readableAgentPart(program, id) || readableAgentPart(provider, id)" in display_name
+    assert "|| fallbackLabel" in display_name
+    assert "if (/^codex$/i.test(label)) label = 'Codex';" in display_name
+    assert html.count("agentDisplayName(owner, session.provider || '未知 Agent')") >= 2
+    assert "agentDisplayName(id, item.provider || '未知 Agent')" in html
+
+
+def test_initial_hash_navigation_and_shared_sources_rail_have_explicit_state_paths() -> None:
+    html = render_interactive_html()
+
+    assert "const guiTabHashAliases = {memory: 'neurons'};" in html
+    assert "const hashTab = guiTabFromHash();" in html
+    assert html.count("syncNavigationState(state.activeTab);") >= 2
+    assert "window.addEventListener('hashchange'" in html
+
+    start = html.rindex("function renderSourcesRail()")
+    end = html.index("function renderSourcesView", start)
+    rail = html[start:end]
+    assert "if (isShareGroupScope())" in rail
+    assert "共享治理 · 已激活" in rail
+    assert "const memberCount = memberIds.length;" in rail
+    assert "选择 Agent 卡片后，才切换到该 Agent 的详情。" in rail
+    assert "share_group_id:" in rail
+
+
+def _edge_executable() -> Path | None:
+    for candidate in (
+        Path(r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"),
+        Path(r"C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"),
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def test_edge_narrow_layout_hash_and_shared_sources_rail(tmp_path: Path) -> None:
+    """Probe final CSS/JS in Chromium when Edge is installed, without a GUI host."""
+    if os.environ.get("MEMORYGUARD_EDGE_PROBE") != "1":
+        pytest.skip("run one-shot Edge probe only with MEMORYGUARD_EDGE_PROBE=1")
+    edge = _edge_executable()
+    if edge is None:
+        pytest.skip("Microsoft Edge is not installed for the optional DOM probe")
+
+    probe = r'''
+<pre id="layout-probe"></pre>
+<script>
+(() => {
+  const content = document.getElementById('content');
+  content.innerHTML = `<div class="dashboard-view overview-view"><div class="dashboard-main">
+    <div class="kpi-grid"><div class="kpi">1</div><div class="kpi">2</div><div class="kpi">3</div><div class="kpi">4</div></div>
+    <section><div class="governance-timeline">${Array.from({length: 6}, (_, index) => `<div class="governance-stage">${index + 1}. stage</div>`).join('')}</div></section>
+  </div></div>`;
+  const kpi = document.querySelector('.kpi-grid');
+  const timeline = document.querySelector('.governance-timeline');
+  const initialTab = state.activeTab;
+  const initialActive = document.querySelector('.nav-item.active')?.dataset.tab || '';
+  const memoryHashTab = guiTabFromHash('#memory');
+  syncNavigationState(memoryHashTab);
+  const memoryActive = document.querySelector('.nav-item.active')?.dataset.tab || '';
+  syncNavigationState('history');
+  const historyActive = document.querySelector('.nav-item.active')?.dataset.tab || '';
+  syncNavigationState(initialTab);
+  const memberIds = Array.from({length: 6}, (_, index) => `member-${index + 1}`);
+  state.activeTab = 'sources';
+  dataPageMode = 'multi_agent_shared_mcp';
+  activeShareGroupId = 'shared-6767d0c38b9cc5f1';
+  activeScopeMemberIds = memberIds;
+  activeAgentInstanceId = 'runtime-principal';
+  selectedSourceRecord = null;
+  agentCardsData = {agents: memberIds.map((instance_id, index) => ({instance_id, provider: `Provider ${index + 1}`}))};
+  governanceScopeState = {status: 'active', share_group_id: activeShareGroupId, members: memberIds};
+  state.governanceSnapshot = {counts: {active_memories: 9}, members: memberIds};
+  renderSourcesRail();
+  const timelineRect = timeline.getBoundingClientRect();
+  const stagesFit = Array.from(document.querySelectorAll('.governance-stage')).every(stage => {
+    const rect = stage.getBoundingClientRect();
+    return rect.left >= timelineRect.left && rect.right <= timelineRect.right;
+  });
+  const columns = element => getComputedStyle(element).gridTemplateColumns.trim().split(/\s+/).filter(Boolean).length;
+  document.getElementById('layout-probe').textContent = JSON.stringify({
+    initialTab,
+    initialActive,
+    memoryHashTab,
+    memoryActive,
+    historyActive,
+    kpiColumns: columns(kpi),
+    timelineColumns: columns(timeline),
+    stagesFit,
+    viewport: document.documentElement.clientWidth,
+    documentWidth: document.documentElement.scrollWidth,
+    rail: document.getElementById('status-rail-content').textContent,
+  });
+})();
+</script>
+'''
+    page = tmp_path / "interactive-probe.html"
+    page.write_text(render_interactive_html().replace("</body>", probe + "</body>"), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            str(edge),
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--disable-background-networking",
+            "--user-data-dir=" + str(tmp_path / "edge-profile"),
+            "--virtual-time-budget=100",
+            "--dump-dom",
+            "--window-size=420,1000",
+            page.as_uri() + "#sources",
+        ],
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+        errors="replace",
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr[-1000:]
+    match = re.search(r'<pre id="layout-probe">(.*?)</pre>', completed.stdout, re.DOTALL)
+    assert match, completed.stderr[-1000:]
+    payload = json.loads(unescape(match.group(1)))
+
+    assert payload["initialTab"] == "sources"
+    assert payload["initialActive"] == "sources"
+    assert payload["memoryHashTab"] == "neurons"
+    assert payload["memoryActive"] == "neurons"
+    assert payload["historyActive"] == "history"
+    assert payload["kpiColumns"] == 1
+    assert payload["timelineColumns"] == 1
+    assert payload["stagesFit"] is True
+    assert payload["documentWidth"] <= payload["viewport"]
+    assert "共享治理 · 已激活" in payload["rail"]
+    assert "6 个" in payload["rail"]
+    assert "未选择 Agent" not in payload["rail"]

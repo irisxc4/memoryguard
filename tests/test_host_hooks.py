@@ -1777,6 +1777,169 @@ def test_hook_mandatory_receipt_and_overflow_fail_closed(
         )
     )
     assert heartbeat["mandatory_overflow"] is True
+
+
+def test_context_build_failed_is_bootstrap_error_not_mandatory_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            ok=False,
+            error="context_build_failed",
+            packet={
+                "status": "blocked",
+                "error": "context_build_failed",
+                "mandatory": [],
+                "relevant": [],
+                "receipts": [],
+            },
+        ),
+    )
+    session_id = "context-build-failed"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "generic runtime failure"},
+    )
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["mandatory_overflow"] is False
+    assert state["bootstrap_ok"] is False
+    assert state["bootstrap_error"] == "context_build_failed"
+    heartbeat = json.loads(
+        host_hooks._heartbeat_path(workspace, "codex", "codex-agent").read_text(
+            encoding="utf-8",
+        )
+    )
+    assert heartbeat["mandatory_overflow"] is False
+    denied = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(workspace / "README.md")},
+        },
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    recovered = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "mcp__memoryguard__memoryguard_runtime_processes",
+            "tool_input": {},
+        },
+    )
+    assert recovered == {}
+
+
+def test_no_source_absent_packet_is_not_mandatory_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            packet={
+                "status": "NO_SOURCE",
+                "canonical_state": "absent",
+                "error": "",
+                "mandatory": [],
+                "relevant": [],
+                "receipts": [],
+                "ready": True,
+            },
+        ),
+    )
+    session_id = "no-source-session"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "neutral fallback"},
+    )
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["mandatory_overflow"] is False
+    assert state["bootstrap_ok"] is True
+    assert not state.get("bootstrap_error")
+
+
+def test_mandatory_sensitive_still_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            ok=False,
+            error="mandatory_sensitive_blocked",
+        ),
+    )
+    session_id = "mandatory-sensitive"
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "sensitive rule"},
+    )
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["mandatory_overflow"] is True
+    assert state["bootstrap_ok"] is False
+    denied = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "Write",
+            "tool_input": {"file_path": str(workspace / "secret.md")},
+        },
+    )
+    assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+    recovered = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "mcp__memoryguard__memoryguard_diagnostics_snapshot",
+            "tool_input": {},
+        },
+    )
+    assert recovered == {}
+
+
 def _retired_v1_reference_history_capture_global_disable_is_visible_in_receipt(tmp_path: Path, monkeypatch, disable_mode: str):
     workspace = tmp_path / "control"
     workspace.mkdir()
@@ -1829,6 +1992,49 @@ def test_concurrent_runtime_receipt_writes_remain_valid_json(tmp_path: Path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["index"] in range(80)
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_thread_lock_registry_releases_unique_paths(tmp_path: Path):
+    baseline = set(host_hooks._PATH_THREAD_LOCKS)
+    paths = [tmp_path / f"heartbeat-{index}.json" for index in range(8)]
+    with ThreadPoolExecutor(max_workers=len(paths)) as pool:
+        list(pool.map(lambda path: host_hooks._write_json_config(path, {"ok": True}), paths))
+    assert set(host_hooks._PATH_THREAD_LOCKS) == baseline
+    assert all(entry.users == 0 for entry in host_hooks._PATH_THREAD_LOCKS.values())
+
+
+def test_cross_process_runtime_lock_still_times_out(tmp_path: Path):
+    path = tmp_path / "heartbeat.json"
+    lock_path = path.with_name(f".{path.name}.memoryguard.lock")
+    child_code = "\n".join(
+        [
+            "import sys, time",
+            "from pathlib import Path",
+            "from memoryguard.host_hooks import _cross_process_path_lock",
+            "path = Path(sys.argv[1])",
+            "with _cross_process_path_lock(path):",
+            "    print('locked', flush=True)",
+            "    time.sleep(5)",
+        ]
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "locked"
+        with pytest.raises(TimeoutError, match="hook runtime lock"):
+            with host_hooks._cross_process_path_lock(path):
+                pass
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.communicate(timeout=10)
+        lock_path.unlink(missing_ok=True)
 
 
 def test_atomic_runtime_replace_retries_windows_access_denied(tmp_path: Path, monkeypatch):

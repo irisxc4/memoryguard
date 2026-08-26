@@ -93,7 +93,7 @@ def _write(
                 "visibility": "ready",
                 "evidence": [{
                     "source_ref": f"e2e:{memory_id}",
-                    "authority": "test",
+                    "authority": "observed",
                 }],
                 "idempotency_key": key,
             },

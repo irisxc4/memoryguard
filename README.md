@@ -36,6 +36,43 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.4
+
+v0.7.4 is a governance correctness and runtime reliability release:
+
+- **Canonical updates:** related rules, habits, and memories merge into one
+  evolving canonical record while graph branches, provenance, scope, evidence,
+  and reversible history remain available.
+- **Bounded mandatory context:** more than 20 mandatory rules raises a health
+  warning instead of truncating storage or injection; character/token budget,
+  sensitive-content, and corrupt-state failures remain fail-closed.
+- **Readable governance:** Agent identities, automatic decisions, and risk
+  signals use readable labels and explanations. GUI governance groups start
+  collapsed; conflict and risk summaries open their details; risk entries
+  explain reason, impact, and action; CodeGraph shares the same governed
+  identity/scope/evidence path.
+- **Reliable audit state:** `run_audit` and `get_audit` return explicit
+  completion state and timezone-aware timestamps. The GUI no longer leaves a
+  completed scan at `待扫描` and keeps the reader popover above navigation;
+  missing numeric health evidence remains unknown instead of becoming a
+  fabricated score. Governance phases show readable completed/current/
+  pending/undetermined states.
+- **Codex runtime safety:** Hook/bootstrap errors are classified accurately;
+  `NO_SOURCE` is a neutral fallback. Provider installation uses content-keyed,
+  non-editable MCP snapshots with atomic failure behavior, packaged static
+  asset refresh, and PEP 610 copied-install diagnostics.
+- **Safe mutation and migration:** GUI partial mutations and evidence
+  conflicts preserve the last valid state. System `group_outbox` projection
+  advances event and checkpoint atomically; safe repair handles old lag while
+  pending/failed events remain fail-closed. Migration replay contracts verify
+  idempotent retries and failure evidence.
+
+Validation for this release uses the existing incremental CI tail (`447/447`
+passed), related focused suites, and `git diff --check`; the full suite was not
+rerun for this release preparation.
+
+See [the v0.7.4 release record](docs/releases/v0.7.4.md).
+
 ## What's New in v0.7.3
 
 v0.7.3 is a focused shared-history visibility fix.
@@ -329,6 +366,14 @@ Provider-specific setup and behavior:
 - [Codex installation](docs/install-codex.md)
 - [Cursor installation](docs/install-cursor.md)
 
+### Stable Codex / Router binding
+
+Codex/Router binds MemoryGuard to the stable local Codex program and control
+installation. An account profile is an endpoint/alias, not a new memory owner:
+switching profiles automatically discovers or repairs the profile and reuses the
+verified Agent binding and active group. Request identity remains fail-closed;
+this does not share records across machines or with arbitrary accounts.
+
 ## Upgrade
 
 MemoryGuard currently upgrades through Python's package manager:
@@ -357,7 +402,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.3
+memoryguard --version                    # 0.7.4
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -417,6 +462,31 @@ Open the desktop console and choose **Knowledge Library**. Remote embedding or
 model-backed indexing is opt-in and requires explicit authorization; local
 full-text retrieval remains available without sending source text to a remote
 provider.
+
+### CodeGraph refresh
+
+The first CodeGraph build is an explicit, confirmed full build. After a scope
+has been built, each successful trusted file write can trigger an incremental
+refresh for that scope, subject to strict source-path and active-binding
+validation. Unchanged content hashes are a no-op; deleted files are retired;
+the next context receives one bounded `affected` receipt. MemoryGuard does not
+run a daemon or watcher for this path and does not infer paths from shell or
+free-form text.
+
+### Desktop console surfaces
+
+The GUI follows a seven-page information architecture:
+
+1. Governance Overview
+2. Data Sources & Agents
+3. Memory Core
+4. CodeGraph
+5. Rules & Habits
+6. Conversation History
+7. Risk Signals & Governance Console
+
+Agent lists use readable program/provider names; the underlying ID remains
+available in the detail view. Empty data is shown as an explicit empty state.
 
 ## Write and governance lifecycle
 
@@ -505,7 +575,7 @@ history on different paths.
 
 | Surface | Purpose | Context behavior |
 |---|---|---|
-| **Rules and habits** | Preferences, procedures, corrections, facts, projects, and scoped mandatory rules | Mandatory rules use a bounded independent budget; ordinary records are recalled when relevant |
+| **Rules and habits** | Preferences, procedures, corrections, facts, projects, and scoped mandatory rules | Mandatory rules use an independent char/token budget after scope, exclude, conflict, and semantic dedup. Effective count above 20 is a health warning, not a hard block; storage is not capped by count. Sensitive, corrupt, per-item oversize, and aggregate overflow still fail closed with no silent truncation. Ordinary records are recalled when relevant |
 | **Conversation history** | Local raw-evidence archive with owner and shared-group access controls | Never enters bootstrap automatically; raw text is read only through explicit history tools |
 | **Neuron graph** | Navigation and governance over memory, rules, projects, agents, and sessions | History nodes contain safe metadata and summaries, not raw chat content |
 
@@ -662,6 +732,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.4 release record](docs/releases/v0.7.4.md)
 - [v0.7.3 release record](docs/releases/v0.7.3.md)
 - [v0.7.2 release record](docs/releases/v0.7.2.md)
 - [v0.7.1 release record](docs/releases/v0.7.1.md)
@@ -673,7 +744,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.3 opens shared-group history recall across host providers. The v0.7.2 write/read scope, Codex Hook
+- **Current release line:** v0.7.4 unifies canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
   lifecycle and transport, and Python 3.10 compatibility corrections. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.

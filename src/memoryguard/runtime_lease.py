@@ -30,7 +30,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .governance_lock import WorkspaceGovernanceLock
 from .storage.layout import WorkspaceV2Layout
@@ -76,6 +76,169 @@ def memoryguard_version() -> str:
         return str(__version__ or "")
     except Exception:  # noqa: BLE001
         return "unknown"
+
+
+_INSTALL_KINDS = frozenset({"editable", "local_source", "installed", "unknown"})
+_INSTALL_REASONS = frozenset({
+    "direct_url_editable",
+    "direct_url_local_path",
+    "source_tree_on_sys_path",
+    "distribution_installed",
+    "metadata_unavailable",
+})
+
+
+def _public_install_origin(
+    *,
+    install_kind: str,
+    reason: str,
+    editable: bool,
+) -> dict[str, Any]:
+    """Machine-readable install origin. Never includes paths or URLs."""
+    kind = str(install_kind or "unknown")
+    if kind not in _INSTALL_KINDS:
+        kind = "unknown"
+    marker = str(reason or "metadata_unavailable")
+    if marker not in _INSTALL_REASONS:
+        marker = "metadata_unavailable"
+    drift = kind in {"editable", "local_source"}
+    return {
+        "install_kind": kind,
+        "install_reason": marker,
+        "editable": bool(editable),
+        "source_drift_risk": drift,
+    }
+
+
+def _parse_direct_url(direct_url: str | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if isinstance(direct_url, Mapping):
+        return dict(direct_url)
+    text = str(direct_url or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:  # noqa: BLE001 - diagnostics never fail closed on metadata
+        return None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _looks_like_source_checkout(package_file: str | Path | None) -> bool:
+    if package_file is None or not str(package_file).strip():
+        return False
+    try:
+        path = Path(package_file).expanduser().resolve()
+    except OSError:
+        return False
+    current = path
+    while True:
+        if current.name == "src" and (current / "memoryguard").exists():
+            return (current.parent / "pyproject.toml").is_file()
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
+def _looks_like_copied_install(package_file: str | Path | None) -> bool:
+    """True when the live import is a copied install, not the source tree."""
+    if package_file is None or not str(package_file).strip():
+        return False
+    try:
+        path = Path(package_file).expanduser().resolve()
+    except OSError:
+        return False
+    return any(
+        part.casefold() in {"site-packages", "dist-packages"}
+        for part in path.parts
+    )
+
+
+def _live_direct_url_text(dist_name: str = "agent-memguard") -> str:
+    try:
+        import importlib.metadata
+        text = importlib.metadata.distribution(dist_name).read_text("direct_url.json")
+    except Exception:  # noqa: BLE001
+        return ""
+    return str(text or "")
+
+
+def _live_package_file() -> Path | None:
+    try:
+        from . import __file__ as package_file
+        return Path(package_file)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def inspect_distribution_origin(
+    workspace: str | Path | None = None,
+    *,
+    direct_url: str | Mapping[str, Any] | None = None,
+    package_file: str | Path | None = None,
+    dist_name: str = "agent-memguard",
+) -> dict[str, Any]:
+    """Read-only PEP 610 / import origin. Never mutates the user install.
+
+    Mutability follows the live import path and editable flag, not a file://
+    provenance URL. A non-editable copy in site-packages is installed.
+    ``workspace`` is accepted so diagnostics providers can be called with the
+    control root; origin inspection does not read or write that path.
+    """
+    del workspace
+    injected = direct_url is not None or package_file is not None
+    payload = _parse_direct_url(direct_url)
+    if not injected:
+        payload = _parse_direct_url(_live_direct_url_text(dist_name))
+        package_file = _live_package_file()
+    dir_info = payload.get("dir_info") if isinstance(payload, Mapping) else None
+    archive_info = payload.get("archive_info") if isinstance(payload, Mapping) else None
+    url = str((payload or {}).get("url") or "") if isinstance(payload, Mapping) else ""
+    editable = False
+    if isinstance(dir_info, Mapping):
+        editable = dir_info.get("editable") is True
+    if editable:
+        return _public_install_origin(
+            install_kind="editable",
+            reason="direct_url_editable",
+            editable=True,
+        )
+    if isinstance(archive_info, Mapping) or url.startswith(("https://", "http://")):
+        return _public_install_origin(
+            install_kind="installed",
+            reason="distribution_installed",
+            editable=False,
+        )
+    # PEP 610 file:// names the source directory pip copied from. A live
+    # import under site-packages/dist-packages is an immutable copy.
+    if _looks_like_copied_install(package_file):
+        return _public_install_origin(
+            install_kind="installed",
+            reason="distribution_installed",
+            editable=False,
+        )
+    if url.startswith("file:") and isinstance(dir_info, Mapping):
+        return _public_install_origin(
+            install_kind="local_source",
+            reason="direct_url_local_path",
+            editable=False,
+        )
+    if _looks_like_source_checkout(package_file):
+        return _public_install_origin(
+            install_kind="local_source",
+            reason="source_tree_on_sys_path",
+            editable=False,
+        )
+    if payload is None and injected and package_file is None:
+        return _public_install_origin(
+            install_kind="unknown",
+            reason="metadata_unavailable",
+            editable=False,
+        )
+    return _public_install_origin(
+        install_kind="installed",
+        reason="distribution_installed",
+        editable=False,
+    )
 
 
 _FINGERPRINT_CACHE: dict[tuple[Any, ...], str] = {}

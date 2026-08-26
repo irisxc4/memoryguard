@@ -196,6 +196,7 @@ def test_successful_upgrade_cleans_v1_hooks_and_artifacts_but_preserves_v2(
     fake_home = tmp_path / "host-home"
     codex = fake_home / ".codex"
     codex.mkdir(parents=True)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     generated = host_hooks._command(
         "codex", "session_start", root, "agent-1", "shared-team", windows=False
@@ -251,6 +252,7 @@ def test_upgrade_uses_user_data_home_as_v2_target_and_v1_as_source(
     fake_home = tmp_path / "host-home"
     codex = fake_home / ".codex"
     codex.mkdir(parents=True)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
     source_hook = host_hooks._command(
         "codex", "session_start", source, "agent-1", "shared-team", windows=False

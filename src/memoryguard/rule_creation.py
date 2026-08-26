@@ -876,6 +876,23 @@ class RuleCreationService:
                 decision=inverse,
             )
             return inverse
+        elif action == "historical_duplicate_fold":
+            from .rules.v2_store import RuleV2Store
+
+            native = RuleV2Store(self.workspace)
+            group = str(metadata.get("share_group_id") or self.group_id)
+            result = native.undo_historical_duplicate(
+                decision.decision_id,
+                share_group_id=group,
+                actor=actor,
+            )
+            inverse = _inverse()
+            inverse.metadata.update({
+                "historical_reconciliation": True,
+                "share_group_id": group,
+                "undo_result": dict(result),
+            })
+            return inverse
         else:
             raise ValueError(f"structured_inverse_unsupported:{action or 'unknown'}")
 
@@ -925,6 +942,8 @@ class RuleCreationService:
                 structured_original = candidates[0] if candidates else None
             except Exception:
                 structured_original = None
+        if structured_original is None:
+            structured_original = self.read_decision(token)
         if structured_original is None:
             return self._blocked(
                 action="rule_undo", reason="structured_decision_required",
@@ -1019,6 +1038,44 @@ class RuleCreationService:
                 structured = None
             if structured is not None:
                 return structured
+        try:
+            from .rules.v2_store import RuleV2Store
+
+            native = RuleV2Store(self.workspace, read_only=True)
+            native_row = native.get_decision(target)
+        except Exception:
+            native_row = None
+        if native_row is not None and str(native_row.get("action") or "") == "historical_duplicate_fold":
+            def _json_value(value: Any, default: Any) -> Any:
+                if isinstance(value, str):
+                    try:
+                        return json.loads(value)
+                    except (TypeError, ValueError):
+                        return default
+                return value if value is not None else default
+
+            native_metadata = _json_value(native_row.get("metadata_json"), {})
+            if not isinstance(native_metadata, dict):
+                native_metadata = {}
+            target_ids = _json_value(native_row.get("target_ids_json"), [])
+            if not isinstance(target_ids, list):
+                target_ids = []
+            return RuleDecision(
+                decision_id=str(native_row.get("decision_id") or target),
+                actor=str(native_row.get("actor") or "memoryguard-reconciliation"),
+                before=_json_value(native_row.get("before_json"), {}),
+                after=_json_value(native_row.get("after_json"), {}),
+                reason=str(native_row.get("reason") or ""),
+                confidence=1.0,
+                undo_id=str(native_row.get("undo_id") or target),
+                created_at=str(native_row.get("created_at") or ""),
+                rule_id=str(native_row.get("rule_id") or ""),
+                action=str(native_row.get("action") or ""),
+                target_ids=target_ids,
+                status=str(native_metadata.get("undo_state") or "recorded"),
+                memory_id=str(native_row.get("rule_id") or ""),
+                metadata=native_metadata,
+            )
         try:
             event = next((item for item in self.store.list_decisions() if item.event_id == target), None)
         except Exception:

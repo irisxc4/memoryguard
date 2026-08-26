@@ -14,17 +14,24 @@
 - 纯标准库，不引入新依赖
 - 有 workspace 时优先项目级配置，避免不同项目的 Agent 身份互相覆盖
 - 无 workspace 时才使用 Path.home() / 环境变量指向的用户级配置
-- MCP 启动命令用 python（要求 memoryguard 已 pip install），跨机器可移植
+- MCP 启动命令用当前解释器或不可变 runtime snapshot 的 python -X utf8 -m memoryguard.mcp_server
+- 官方 Codex/provider 安装在写入 MCP 配置前选择已安装的非 editable wheel，或按当前打包源码内容键（Python 与 package data，忽略 cache/bytecode）选择/原子构建 snapshot；诊断不改用户安装
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import shutil
+import sys
 import tempfile
+from datetime import datetime, timezone
 from . import toml_compat as tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
+from .runtime_lease import inspect_distribution_origin
 from .runtime_v2.public_safety import v2_upgrade_payload
 
 
@@ -34,6 +41,30 @@ from .runtime_v2.public_safety import v2_upgrade_payload
 
 MCP_SERVER_NAME = "memoryguard"
 MCP_MODULE = "memoryguard.mcp_server"
+MCP_UTF8_ARGS = ["-X", "utf8", "-m", MCP_MODULE]
+MCP_RUNTIME_DIRNAME = "mcp-runtime"
+_RUNTIME_PYTHON_ENV = "MEMORYGUARD_RUNTIME_PYTHON"
+_SNAPSHOT_KEY_LEN = 16
+_SNAPSHOT_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".tox",
+        "node_modules",
+        "graphify-out",
+        MCP_RUNTIME_DIRNAME,
+    }
+)
+_SNAPSHOT_SKIP_SUFFIXES = frozenset({".pyc", ".pyo"})
+_SNAPSHOT_ROOT_NAMES = frozenset(
+    {"pyproject.toml", "setup.py", "setup.cfg", "MANIFEST.in"}
+)
 
 
 def _binding_plane_for_workspace(workspace: str | Path) -> str:
@@ -86,6 +117,7 @@ _END_MARKER = "<!-- END memoryguard:provider-redirect -->"
 # Codex TOML 配置使用的标记（# 注释）
 _TOML_BEGIN = "# BEGIN memoryguard:provider-redirect"
 _TOML_END = "# END memoryguard:provider-redirect"
+_TOML_TABLE_HEADER = re.compile(r"^\s*\[([^\[\]]+)\]\s*(?:#.*)?$")
 
 
 # 共用指令正文：告诉 Agent 所有记忆操作走 MCP 工具
@@ -143,12 +175,403 @@ _INSTRUCTION_BODY = _instruction_body()
 
 
 def _mcp_command() -> list[str]:
-    """返回启动 MemoryGuard MCP 服务器的 command + args。
+    """Return MemoryGuard MCP argv for provider config.
 
-    用 "python"（要求 memoryguard 已 pip install），跨机器可移植，
-    避免 sys.executable 把机器特定路径写入 .mcp.json。
+    PyPI/wheel installs keep the current interpreter. Editable or local-source
+    installs must select or build an immutable snapshot before config write.
+    Repository tests keep using src and do not run pip.
     """
-    return ["python", "-m", MCP_MODULE]
+    launch = prepare_provider_mcp_launch(mutate=True)
+    if not launch.get("ok"):
+        raise ValueError(str(launch.get("reason") or "mcp_runtime_unavailable"))
+    return list(launch["argv"])
+
+
+def _is_immutable_install(origin: Mapping[str, Any] | None) -> bool:
+    if not isinstance(origin, Mapping):
+        return False
+    kind = str(origin.get("install_kind") or "")
+    return kind == "installed" and origin.get("editable") is not True
+
+
+def _venv_python(snapshot_root: Path) -> Path:
+    if os.name == "nt":
+        return Path(snapshot_root) / "venv" / "Scripts" / "python.exe"
+    return Path(snapshot_root) / "venv" / "bin" / "python"
+
+
+def _path_from_file_url(url: str) -> Path | None:
+    raw = str(url or "").strip()
+    if not raw.startswith("file:"):
+        return None
+    from urllib.parse import unquote, urlparse
+
+    parsed = urlparse(raw)
+    path = unquote(parsed.path or "")
+    if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+        path = f"//{parsed.netloc}{path}"
+    if os.name == "nt" and path.startswith("/") and len(path) >= 3 and path[2] == ":":
+        path = path.lstrip("/")
+    try:
+        resolved = Path(path)
+    except Exception:
+        return None
+    return resolved if str(resolved) else None
+
+
+def _source_root_from_direct_url(direct_url: str | Mapping[str, Any] | None) -> Path | None:
+    if isinstance(direct_url, Mapping):
+        payload = dict(direct_url)
+    else:
+        text = str(direct_url or "").strip()
+        if not text:
+            return None
+        try:
+            loaded = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(loaded, Mapping):
+            return None
+        payload = dict(loaded)
+    return _path_from_file_url(str(payload.get("url") or ""))
+
+
+def _live_source_root() -> Path | None:
+    try:
+        import importlib.metadata
+        text = importlib.metadata.distribution("agent-memguard").read_text("direct_url.json")
+    except Exception:
+        return None
+    root = _source_root_from_direct_url(text)
+    if root is None:
+        return None
+    if root.is_file() and root.suffix == ".whl":
+        return root
+    if (root / "pyproject.toml").is_file() or (root / "setup.py").is_file():
+        return root
+    return root if root.exists() else None
+
+
+def _explicit_runtime_python(snapshot_python: str | None = None) -> str:
+    """Honor an explicit interpreter. Never overwritten by snapshot selection."""
+    text = str(snapshot_python or "").strip()
+    if text:
+        path = Path(text).expanduser()
+        if path.is_file():
+            return str(path)
+    explicit = os.environ.get(_RUNTIME_PYTHON_ENV, "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.is_file():
+            return str(path)
+    return ""
+
+
+def _snapshot_path_excluded(path: Path, rel_parts: tuple[str, ...]) -> bool:
+    if any(part in _SNAPSHOT_SKIP_DIRS for part in rel_parts):
+        return True
+    return path.suffix in _SNAPSHOT_SKIP_SUFFIXES
+
+
+def _iter_snapshot_source_files(source_root: Path) -> list[Path]:
+    """Collect packaged runtime files for the snapshot content key.
+
+    Package roots include every shippable file (Python, GUI JS/icons, licenses,
+    and other package data). Build/cache/VCS directories and generated bytecode
+    are skipped. Repo tests/docs/dist outside those roots are not scanned; only
+    existing root packaging manifests are added besides the package trees.
+    """
+    root = Path(source_root)
+    files: list[Path] = []
+    for name in sorted(_SNAPSHOT_ROOT_NAMES):
+        candidate = root / name
+        if candidate.is_file():
+            files.append(candidate)
+    package_dirs = [root / "src" / "memoryguard", root / "memoryguard"]
+    scanned = False
+    for package_dir in package_dirs:
+        if not package_dir.is_dir():
+            continue
+        scanned = True
+        try:
+            for path in package_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                try:
+                    rel_parts = path.relative_to(package_dir).parts
+                except (OSError, ValueError):
+                    continue
+                if _snapshot_path_excluded(path, rel_parts):
+                    continue
+                files.append(path)
+        except OSError:
+            continue
+    if scanned:
+        return files
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel_parts = path.relative_to(root).parts
+            if any(part in _SNAPSHOT_SKIP_DIRS for part in rel_parts):
+                continue
+            if path.suffix == ".py" or path.name in _SNAPSHOT_ROOT_NAMES:
+                files.append(path)
+    except OSError:
+        return files
+    return files
+
+
+def _source_snapshot_key(source_root: Path) -> str:
+    """Stable content key for an editable/local source tree or wheel file.
+
+    Directory keys hash deterministic relative paths and bytes of packaged
+    runtime files plus root packaging manifests.
+    """
+    digest = hashlib.sha256()
+    root = Path(source_root)
+    if root.is_file():
+        digest.update(b"file\x00")
+        digest.update(root.name.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+        try:
+            digest.update(root.read_bytes())
+        except OSError:
+            digest.update(b"unreadable")
+        return digest.hexdigest()[:_SNAPSHOT_KEY_LEN]
+    digest.update(b"dir\x00")
+    files = _iter_snapshot_source_files(root)
+    unique: dict[str, Path] = {}
+    for path in files:
+        try:
+            unique[path.relative_to(root).as_posix()] = path
+        except (OSError, ValueError):
+            continue
+    for rel, path in sorted(unique.items()):
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            continue
+        digest.update(rel.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+        digest.update(payload)
+        digest.update(b"\x00")
+    return digest.hexdigest()[:_SNAPSHOT_KEY_LEN]
+
+
+def _snapshot_python_if_ready(snapshot_root: Path | None) -> str:
+    if snapshot_root is None:
+        return ""
+    python = _venv_python(snapshot_root)
+    return str(python) if python.is_file() else ""
+
+
+def _run_snapshot_command(argv: list[str]) -> None:
+    import subprocess
+
+    completed = subprocess.run(argv, check=False, capture_output=True, text=True)
+    if int(completed.returncode or 0) != 0:
+        raise RuntimeError("editable_install_snapshot_failed")
+
+
+def _clear_empty_snapshot_dest(snapshot_root: Path) -> None:
+    if not snapshot_root.exists():
+        return
+    try:
+        empty = not any(snapshot_root.iterdir())
+    except OSError as exc:
+        raise RuntimeError("editable_install_snapshot_failed") from exc
+    if not empty:
+        raise RuntimeError("editable_install_snapshot_failed")
+    snapshot_root.rmdir()
+
+
+def _build_runtime_snapshot(
+    *,
+    snapshot_root: Path,
+    source_root: Path,
+    runner: Any = None,
+) -> str:
+    """Atomically install a non-editable copy into snapshot_root/venv. Never uses -e.
+
+    Builds in a sibling staging directory and only publishes snapshot_root after
+    pip and origin.json succeed. Failure leaves snapshot_root untouched.
+    """
+    snapshot_root = Path(snapshot_root)
+    source_root = Path(source_root)
+    existing = _snapshot_python_if_ready(snapshot_root)
+    if existing:
+        return existing
+    _clear_empty_snapshot_dest(snapshot_root)
+    run = runner or _run_snapshot_command
+    snapshot_root.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=".mg-snap-", dir=str(snapshot_root.parent))
+    )
+    published = False
+    try:
+        python = _venv_python(staging)
+        run(
+            [
+                sys.executable,
+                "-m",
+                "venv",
+                "--system-site-packages",
+                str(staging / "venv"),
+            ]
+        )
+        run(
+            [
+                str(python),
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--upgrade",
+                str(source_root),
+            ]
+        )
+        marker = {
+            "install_kind": "installed",
+            "install_reason": "runtime_snapshot",
+            "editable": False,
+            "source_key": _source_snapshot_key(source_root),
+        }
+        (staging / "origin.json").write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if not python.is_file():
+            raise RuntimeError("editable_install_snapshot_failed")
+        try:
+            os.replace(str(staging), str(snapshot_root))
+            published = True
+        except OSError:
+            reused = _snapshot_python_if_ready(snapshot_root)
+            if reused:
+                return reused
+            raise RuntimeError("editable_install_snapshot_failed")
+        return str(_venv_python(snapshot_root))
+    finally:
+        if not published:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _mcp_launch_argv(python: str) -> list[str]:
+    return [str(python), *MCP_UTF8_ARGS]
+
+
+def _in_repository_tests() -> bool:
+    return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _unavailable_launch(result: Mapping[str, Any], reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "reason": reason,
+        "install_kind": result["install_kind"],
+        "install_reason": result["install_reason"],
+        "editable": result["editable"],
+        "snapshot": False,
+        "mutated": False,
+        "argv": _mcp_launch_argv(sys.executable),
+        "python": sys.executable,
+    }
+
+
+def prepare_provider_mcp_launch(
+    *,
+    mutate: bool = False,
+    origin: Mapping[str, Any] | None = None,
+    snapshot_python: str | None = None,
+    snapshot_root: str | Path | None = None,
+    source_root: str | Path | None = None,
+    direct_url: str | Mapping[str, Any] | None = None,
+    builder: Any = None,
+) -> dict[str, Any]:
+    """Select an immutable MCP interpreter, or build a snapshot when allowed.
+
+    Diagnostics must call this with ``mutate=False`` so the user install is
+    never changed. Official provider install uses ``mutate=True``.
+    Editable/local-source installs key the snapshot to current packaged source
+    (Python and package data such as GUI JS/icons) and publish it atomically;
+    unchanged source reuses the existing snapshot. Cache/bytecode is ignored.
+    """
+    inspected = dict(origin or inspect_distribution_origin())
+    root = Path(snapshot_root).expanduser() if snapshot_root else None
+    if root is None:
+        try:
+            from .data_home import resolve_data_home
+            root = resolve_data_home() / MCP_RUNTIME_DIRNAME
+        except Exception:
+            root = None
+    selected = _explicit_runtime_python(snapshot_python)
+    argv_python = selected or sys.executable
+    result: dict[str, Any] = {
+        "ok": True,
+        "python": argv_python,
+        "argv": _mcp_launch_argv(argv_python),
+        "install_kind": str(inspected.get("install_kind") or "unknown"),
+        "install_reason": str(inspected.get("install_reason") or "metadata_unavailable"),
+        "editable": bool(inspected.get("editable")),
+        "snapshot": bool(selected),
+        "mutated": False,
+    }
+    if selected:
+        result["python"] = selected
+        result["argv"] = _mcp_launch_argv(selected)
+        return result
+    if _is_immutable_install(inspected):
+        result["python"] = sys.executable
+        result["argv"] = _mcp_launch_argv(sys.executable)
+        result["snapshot"] = False
+        return result
+    if not mutate:
+        result["ok"] = True
+        result["reason"] = "editable_install_snapshot_required"
+        return result
+    if _in_repository_tests() and builder is None:
+        # Repository tests import src via pytest pythonpath and must not pip.
+        result["reason"] = "repository_tests_use_src"
+        return result
+    src = Path(source_root).expanduser() if source_root else _source_root_from_direct_url(direct_url)
+    if src is None:
+        src = _live_source_root()
+    if src is None or root is None:
+        return _unavailable_launch(result, "editable_install_source_unavailable")
+    keyed_root = root / _source_snapshot_key(src)
+    ready = _snapshot_python_if_ready(keyed_root)
+    if ready:
+        return {
+            "ok": True,
+            "python": ready,
+            "argv": _mcp_launch_argv(ready),
+            "install_kind": result["install_kind"],
+            "install_reason": result["install_reason"],
+            "editable": result["editable"],
+            "snapshot": True,
+            "mutated": False,
+            "reason": "runtime_snapshot",
+        }
+    build = builder or _build_runtime_snapshot
+    try:
+        python = build(snapshot_root=keyed_root, source_root=src)
+    except Exception:
+        return _unavailable_launch(result, "editable_install_snapshot_failed")
+    python_text = str(python or "").strip()
+    if not python_text or not Path(python_text).is_file():
+        return _unavailable_launch(result, "editable_install_snapshot_failed")
+    return {
+        "ok": True,
+        "python": python_text,
+        "argv": _mcp_launch_argv(python_text),
+        "install_kind": result["install_kind"],
+        "install_reason": result["install_reason"],
+        "editable": result["editable"],
+        "snapshot": True,
+        "mutated": True,
+        "reason": "runtime_snapshot",
+    }
 
 
 def _mcp_server_config(
@@ -168,9 +591,10 @@ def _mcp_server_config(
         env["MEMORYGUARD_AGENT_ID"] = agent_instance_id
     if provider:
         env["MEMORYGUARD_PROVIDER"] = provider
-    env["MEMORYGUARD_CONTROL_SCOPE"] = (
+    control_scope_value = (
         "global" if str(control_scope).strip().lower() == "global" else "project"
     )
+    env["MEMORYGUARD_CONTROL_SCOPE"] = control_scope_value
     if memoryguard_workspace:
         resolved_workspace = str(Path(memoryguard_workspace).expanduser().resolve())
         env["MEMORYGUARD_WORKSPACE"] = resolved_workspace
@@ -178,8 +602,19 @@ def _mcp_server_config(
         # project workspace.  Persist its canonical Data Home explicitly so a
         # provider launched later (or from another repository) resolves the
         # same store even when the installer's shell environment is gone.
-        if env["MEMORYGUARD_CONTROL_SCOPE"] == "global":
+        if control_scope_value == "global":
             env["MEMORYGUARD_HOME"] = resolved_workspace
+    # The user-level control plane must be able to repair its own provider
+    # integration.  It is launched from user-owned MCP configuration and
+    # already has a pinned agent/workspace identity; persist the matching
+    # local control capability rather than leaving global installs unable to
+    # invoke their only repair route.  Project-scoped servers stay unprivileged.
+    if control_scope_value == "global":
+        env["MEMORYGUARD_ADMIN"] = "1"
+        env["MEMORYGUARD_SESSION_ID"] = (
+            f"provider-{provider or 'memoryguard'}-{agent_instance_id or 'control'}"
+        )
+        env["MEMORYGUARD_SESSION_SOURCE"] = "host"
     if env:
         config["env"] = env
     return config
@@ -212,21 +647,27 @@ def _mcp_toml_section(
         env_items.append(
             f"MEMORYGUARD_PROVIDER = {json.dumps(provider)}"
         )
-    env_items.append(
-        "MEMORYGUARD_CONTROL_SCOPE = "
-        + json.dumps(
-            "global" if str(control_scope).strip().lower() == "global" else "project"
-        )
+    control_scope_value = (
+        "global" if str(control_scope).strip().lower() == "global" else "project"
     )
+    env_items.append("MEMORYGUARD_CONTROL_SCOPE = " + json.dumps(control_scope_value))
     if memoryguard_workspace:
         resolved = str(Path(memoryguard_workspace).expanduser().resolve())
         env_items.append(
             f"MEMORYGUARD_WORKSPACE = {json.dumps(resolved)}"
         )
-        if str(control_scope).strip().lower() == "global":
+        if control_scope_value == "global":
             env_items.append(
                 f"MEMORYGUARD_HOME = {json.dumps(resolved)}"
             )
+    if control_scope_value == "global":
+        env_items.extend([
+            "MEMORYGUARD_ADMIN = \"1\"",
+            "MEMORYGUARD_SESSION_ID = " + json.dumps(
+                f"provider-{provider or 'memoryguard'}-{agent_instance_id or 'control'}"
+            ),
+            "MEMORYGUARD_SESSION_SOURCE = \"host\"",
+        ])
     if env_items:
         lines.append(f"\nenv = {{ {', '.join(env_items)} }}")
     return "".join(lines)
@@ -298,19 +739,148 @@ def _remove_unmanaged_toml_table(text: str, table_name: str) -> str:
     return "".join(result)
 
 
-def _reconcile_memoryguard_toml_tables(text: str) -> str:
-    """Remove every safely-identifiable legacy/owned MemoryGuard table.
+def _toml_table_name(line: str) -> str:
+    """Return a normalized bare TOML table name, or an empty string."""
+    match = _TOML_TABLE_HEADER.match(line)
+    if match is None:
+        return ""
+    return ".".join(
+        part.strip().strip("\"").strip("'").casefold()
+        for part in match.group(1).split(".")
+    )
 
-    TOML parsers reject duplicate table declarations before normal upsert can
-    run.  Only exact `mcp_servers.memoryguard` sections that identify this
-    module (or live in our marked block) are removed; an unknown same-named
-    section fails closed instead of silently deleting user configuration.
+
+def _toml_assignment(line: str) -> tuple[str, Any] | None:
+    """Parse one standalone TOML assignment without accepting malformed TOML."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, raw = stripped.split("=", 1)
+    key = key.strip().strip("\"").strip("'")
+    if not key:
+        return None
+    try:
+        value = tomllib.loads("value = " + raw)["value"]
+    except (KeyError, tomllib.TOMLDecodeError):
+        return None
+    return key, value
+
+
+def _memoryguard_env_blocks(text: str) -> list[dict[str, str]]:
+    """Recover MemoryGuard env maps from valid or duplicate-invalid TOML.
+
+    This is evidence extraction only.  Full TOML validation remains mandatory
+    before a repaired document can be written.
     """
-    target = f"[mcp_servers.{MCP_SERVER_NAME}]"
-    # Markers are exclusively ours.  Strip every orphan/duplicate marker first
-    # and append one canonical block later via _replace_section; this prevents
-    # BEGIN/END accumulation when a previously interrupted install left only
-    # one side behind.
+    target = f"mcp_servers.{MCP_SERVER_NAME}"
+    blocks: list[dict[str, str]] = []
+    active: dict[str, str] | None = None
+    mode = ""
+    for line in text.splitlines():
+        header = _toml_table_name(line)
+        if header:
+            if header == target:
+                active = {}
+                blocks.append(active)
+                mode = "server"
+            elif header == target + ".env" and active is not None:
+                mode = "env"
+            else:
+                active = None
+                mode = ""
+            continue
+        if active is None:
+            continue
+        assignment = _toml_assignment(line)
+        if assignment is None:
+            continue
+        key, value = assignment
+        if mode == "server" and key == "env" and isinstance(value, dict):
+            active.update({str(k): str(v) for k, v in value.items()})
+        elif mode == "env":
+            active[str(key)] = str(value)
+    return blocks
+
+
+def _owned_memoryguard_env_table(lines: list[str]) -> bool:
+    """Recognize an orphan env table only when all assignments are ours."""
+    assignments = [item for item in (_toml_assignment(line) for line in lines[1:]) if item]
+    return bool(assignments) and all(
+        str(key).startswith("MEMORYGUARD_") for key, _value in assignments
+    )
+
+
+def _owned_memoryguard_inline_server(line: str) -> bool:
+    """Recognize `[mcp_servers] memoryguard = { ... }` only when ours."""
+    assignment = _toml_assignment(line)
+    if assignment is None or str(assignment[0]).casefold() != MCP_SERVER_NAME:
+        return False
+    _key, value = assignment
+    if not isinstance(value, dict):
+        return False
+    return MCP_MODULE in " ".join(str(item) for item in value.get("args") or ())
+
+
+def _toml_inline_value(value: Any) -> str:
+    """Serialize a narrow TOML inline value, refusing unknown value types."""
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_inline_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        parts = [
+            f"{json.dumps(str(key))} = {_toml_inline_value(item)}"
+            for key, item in value.items()
+        ]
+        return "{ " + ", ".join(parts) + " }"
+    raise ValueError("cannot safely reconcile unsupported inline TOML value")
+
+
+def _reconcile_root_inline_mcp_servers(line: str) -> list[str] | None:
+    """Drop an owned server from root `mcp_servers = { ... }` safely."""
+    assignment = _toml_assignment(line)
+    if assignment is None or str(assignment[0]).casefold() != "mcp_servers":
+        return None
+    _key, servers = assignment
+    if not isinstance(servers, dict) or MCP_SERVER_NAME not in servers:
+        return None
+    server = servers[MCP_SERVER_NAME]
+    if not isinstance(server, dict) or MCP_MODULE not in " ".join(
+        str(item) for item in server.get("args") or ()
+    ):
+        raise ValueError(
+            "cannot safely reconcile duplicate "
+            "[mcp_servers.memoryguard]: inline server is not MemoryGuard-owned"
+        )
+    remaining = {key: value for key, value in servers.items() if key != MCP_SERVER_NAME}
+    normalized: list[str] = []
+    for name, config in remaining.items():
+        if not isinstance(config, dict):
+            raise ValueError("cannot safely reconcile non-table mcp_servers entry")
+        normalized.append(f"[mcp_servers.{json.dumps(str(name))}]\n")
+        normalized.extend(
+            f"{json.dumps(str(key))} = {_toml_inline_value(value)}\n"
+            for key, value in config.items()
+        )
+        normalized.append("\n")
+    return normalized
+
+
+def _reconcile_memoryguard_toml_tables(text: str) -> str:
+    """Remove all owned MemoryGuard tables before one canonical upsert.
+
+    Duplicate TOML table errors must be recoverable only when every removed
+    MemoryGuard table identifies this MCP module.  Unknown same-named tables
+    and all non-MemoryGuard syntax remain fail-closed: the candidate document
+    is parsed before any write and rejected if it is still invalid.
+    """
+    target = f"mcp_servers.{MCP_SERVER_NAME}"
     lines = [
         line for line in text.splitlines(keepends=True)
         if line.strip() not in {_TOML_BEGIN, _TOML_END}
@@ -318,30 +888,64 @@ def _reconcile_memoryguard_toml_tables(text: str) -> str:
     result: list[str] = []
     index = 0
     while index < len(lines):
-        header = lines[index].strip().split("#", 1)[0].strip()
-        if header != target:
+        table = _toml_table_name(lines[index])
+        if not table:
+            replacement = _reconcile_root_inline_mcp_servers(lines[index])
+            if replacement is None:
+                result.append(lines[index])
+            else:
+                result.extend(replacement)
+            index += 1
+            continue
+        if table == "mcp_servers":
+            end = index + 1
+            while end < len(lines) and not _toml_table_name(lines[end]):
+                end += 1
+            section = lines[index:end]
+            result.append(section[0])
+            for line in section[1:]:
+                assignment = _toml_assignment(line)
+                if assignment is None or str(assignment[0]).casefold() != MCP_SERVER_NAME:
+                    result.append(line)
+                    continue
+                if not _owned_memoryguard_inline_server(line):
+                    raise ValueError(
+                        "cannot safely reconcile duplicate "
+                        "[mcp_servers.memoryguard]: inline server is not MemoryGuard-owned"
+                    )
+            index = end
+            continue
+        if table != target and not table.startswith(target + "."):
             result.append(lines[index])
             index += 1
             continue
+
         end = index + 1
-        while end < len(lines):
-            candidate = lines[end].strip().split("#", 1)[0].strip()
-            if candidate.startswith("[") and candidate.endswith("]"):
-                break
-            end += 1
-        section = lines[index:end]
-        section_text = "".join(section)
-        if MCP_MODULE not in section_text:
+        if table == target:
+            while end < len(lines):
+                next_table = _toml_table_name(lines[end])
+                if next_table and next_table != target and not next_table.startswith(target + "."):
+                    break
+                end += 1
+            section = lines[index:end]
+            owned = MCP_MODULE in "".join(section)
+        else:
+            while end < len(lines) and not _toml_table_name(lines[end]):
+                end += 1
+            section = lines[index:end]
+            owned = table == target + ".env" and _owned_memoryguard_env_table(section)
+
+        if not owned:
             raise ValueError(
                 "cannot safely reconcile duplicate "
                 "[mcp_servers.memoryguard]: section is not MemoryGuard-owned"
             )
-        # Keep comments/blank lines: they can belong to the next user table;
-        # remove only the owned table header and its TOML assignments.
-        for line in section:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                result.append(line)
+        # Preserve standalone comments and blank lines.  They may document an
+        # adjacent user table; all owned assignments and headers are removed.
+        result.extend(
+            line for line in section
+            if not line.strip() or line.lstrip().startswith("#")
+        )
         index = end
     return "".join(result)
 
@@ -399,6 +1003,35 @@ def _validate_toml(text: str, path: Path) -> None:
         tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"invalid TOML config: {path}: {exc}") from exc
+
+
+def _backup_toml_before_repair(path: Path, original: str, replacement: str) -> Path | None:
+    """Create a durable pre-repair copy only for a semantic TOML mutation."""
+    if original == replacement or not path.is_file():
+        return None
+    # An existing complete provider block is already a recoverable,
+    # MemoryGuard-owned representation.  Its canonical reserialization must
+    # not accumulate backups on every idempotent repair pass.
+    if _TOML_BEGIN in original and _TOML_END in original:
+        return None
+    # Keep the first pre-repair snapshot as the recovery point.  Some Codex
+    # hook reconciliation paths temporarily remove our marker before their
+    # final canonical rewrite; creating another timestamped copy there would
+    # make a byte-identical second repair look mutating.
+    if any(path.parent.glob(path.name + ".memoryguard-provider-*.bak")):
+        return None
+    try:
+        if tomllib.loads(original) == tomllib.loads(replacement):
+            return None
+    except tomllib.TOMLDecodeError:
+        # A duplicate owned table is invalid by definition.  Preserve its
+        # exact bytes before normalization; a later non-owned parse failure
+        # never reaches this helper because validation happens first.
+        pass
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup = path.with_name(path.name + f".memoryguard-provider-{stamp}.bak")
+    _atomic_write_bytes(backup, original.encode("utf-8"))
+    return backup
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -532,7 +1165,12 @@ class ProviderAdapter:
         if global_scope:
             from .data_home import resolve_data_home
 
-            data_home = resolve_data_home()
+            selected = getattr(self, "_repair_data_home", None)
+            data_home = (
+                Path(selected).expanduser().resolve()
+                if selected is not None
+                else resolve_data_home()
+            )
             if workspace:
                 requested = Path(workspace).expanduser().resolve()
                 if requested != data_home:
@@ -617,6 +1255,7 @@ class ProviderAdapter:
         enabled: bool,
         agent_instance_id: str,
         share_group_id: str,
+        config_home: str | Path | None = None,
     ) -> dict[str, Any]:
         """Install the user-level hook only for an explicit global takeover."""
         from .host_hooks import HostHookManager
@@ -637,6 +1276,7 @@ class ProviderAdapter:
                 share_group_id=share_group_id,
                 mode="enforce",
                 reconcile_trust=self.provider_name == "codex",
+                config_home=config_home,
             )
         except Exception as exc:
             return {
@@ -840,26 +1480,38 @@ class ClaudeAdapter(ProviderAdapter):
 class CodexAdapter(ProviderAdapter):
     """Codex CLI adapter。
 
-    - 指令文件：<workspace>/AGENTS.md（项目级）；无 workspace 时 ~/.codex/AGENTS.md
-    - MCP 配置：<workspace>/.codex/config.toml（项目级）；无 workspace 时 ~/.codex/config.toml
+    - 指令文件：<workspace>/AGENTS.md（项目级）；无 workspace 时 $CODEX_HOME/AGENTS.md
+    - MCP 配置：<workspace>/.codex/config.toml（项目级）；无 workspace 时 $CODEX_HOME/config.toml
       段落：[mcp_servers.memoryguard]
+    Router account/profile directories are transport aliases of one Codex
+    program identity; they never become a new MemoryGuard principal.
     """
 
     provider_name = "codex"
 
-    def __init__(self, workspace: str | Path = ""):
+    def __init__(self, workspace: str | Path = "", *, config_home: str | Path = ""):
         self._has_workspace = bool(workspace)
         self.workspace = Path(workspace).resolve() if workspace else Path.home()
+        self._config_home = (
+            Path(config_home).expanduser().resolve() if config_home else None
+        )
+
+    def _codex_user_dir(self) -> Path:
+        if self._config_home is not None:
+            return self._config_home
+        from .agent_locator import current_codex_home
+
+        return current_codex_home()
 
     def _instruction_path(self) -> Path:
         if self._has_workspace:
             return self.workspace / "AGENTS.md"
-        return Path.home() / ".codex" / "AGENTS.md"
+        return self._codex_user_dir() / "AGENTS.md"
 
     def _mcp_config_path(self) -> Path:
         if self._has_workspace:
             return self.workspace / ".codex" / "config.toml"
-        return Path.home() / ".codex" / "config.toml"
+        return self._codex_user_dir() / "config.toml"
 
     def install(self, workspace: str | Path = "", share_group_id: str = "default",
                 agent_instance_id: str = "",
@@ -884,6 +1536,7 @@ class CodexAdapter(ProviderAdapter):
         )
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
         _validate_toml(new_toml, mcp_path)
+        _backup_toml_before_repair(mcp_path, toml_content, new_toml)
         _apply_file_transaction([
             (instr_path, new_content),
             (mcp_path, new_toml),
@@ -892,13 +1545,36 @@ class CodexAdapter(ProviderAdapter):
             enabled=global_scope,
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
+            config_home=None if self._has_workspace else self._codex_user_dir(),
         )
         warnings = (
             ["Codex 仅在用户信任该项目后加载项目级 .codex/config.toml"]
             if self._has_workspace else []
         )
         warnings.extend(self._cleanup_superseded_project_override())
-        global_path = Path.home() / ".codex" / "config.toml"
+        replica: dict[str, Any] = {}
+        if global_scope:
+            replica = _repair_discovered_codex_homes(
+                self.workspace,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+                binding_id=binding_id,
+                skip_config_home=self._codex_user_dir(),
+                homes=getattr(self, "_repair_codex_homes", None),
+            )
+            warnings.extend(str(item) for item in replica.get("warnings") or ())
+            try:
+                _record_codex_program_identity(
+                    self.workspace,
+                    agent_instance_id=agent_instance_id,
+                    share_group_id=share_group_id,
+                    aliases=replica.get("aliases") or (),
+                )
+            except Exception:
+                pass
+        from .agent_locator import current_codex_home
+
+        global_path = current_codex_home() / "config.toml"
         if self._has_workspace and global_path != mcp_path:
             global_text = _read_text(global_path)
             if _TOML_BEGIN in global_text or (
@@ -908,13 +1584,18 @@ class CodexAdapter(ProviderAdapter):
                     "检测到旧用户级 MemoryGuard MCP 配置；项目配置优先，"
                     "验证项目连接后可移除旧全局条目"
                 )
-        return self._configured_result(
+        result = self._configured_result(
             instruction_path=instr_path,
             mcp_path=mcp_path,
             binding_id=binding_id,
             warnings=warnings,
             hook=hook,
         )
+        if replica.get("aliases"):
+            result["aliases"] = list(replica.get("aliases") or ())
+        if replica.get("warnings"):
+            result["profile_repair_errors"] = list(replica["warnings"])
+        return result
 
     def uninstall(self) -> dict[str, Any]:
         _require_provider_state(self.workspace, mutation=True)
@@ -1330,6 +2011,567 @@ def get_provider_adapter_class(product: str) -> type[ProviderAdapter] | None:
     return PROVIDER_ADAPTERS.get((product or "").strip().lower())
 
 
+def _read_codex_profile_agent_id(config_home: Path) -> str:
+    """Read MEMORYGUARD_AGENT_ID from one Codex home; empty if absent/unreadable."""
+    config_path = Path(config_home) / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+        data = tomllib.loads(text) if text.strip() else {}
+    except Exception:
+        ids = {
+            str(block.get("MEMORYGUARD_AGENT_ID") or "").strip()
+            for block in _memoryguard_env_blocks(
+                config_path.read_text(encoding="utf-8", errors="replace")
+            )
+        }
+        ids.discard("")
+        return next(iter(ids)) if len(ids) == 1 else ""
+    env = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {}).get("env") or {}
+    return str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+
+
+def _read_codex_profile_control_hints(config_home: Path) -> set[Path]:
+    """Extract explicit control-home hints from MemoryGuard-owned MCP env."""
+    config_path = Path(config_home) / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    found: set[Path] = set()
+    for env in _memoryguard_env_blocks(text):
+        for name in (
+            "MEMORYGUARD_HOME",
+            "MEMORYGUARD_WORKSPACE",
+            "MEMORYGUARD_CONTROL_WORKSPACE",
+        ):
+            raw = str(env.get(name) or "").strip()
+            if not raw:
+                continue
+            try:
+                found.add(Path(raw).expanduser().resolve())
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return found
+
+
+def _read_codex_profile_config_bindings(config_home: Path) -> set[tuple[str, str]]:
+    """Extract legacy MCP identity only as installation evidence."""
+    config_path = Path(config_home) / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    found: set[tuple[str, str]] = set()
+    for env in _memoryguard_env_blocks(text):
+        agent_id = str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+        group_id = str(
+            env.get("MEMORYGUARD_SHARE_GROUP_ID")
+            or env.get("MEMORYGUARD_GROUP_ID")
+            or ""
+        ).strip()
+        if agent_id and group_id:
+            found.add((agent_id, group_id))
+    return found
+
+
+def _iter_codex_homes(*, include_default_router: bool = False) -> list[Path]:
+    """Current CODEX_HOME first, then other discovered Router/user Codex roots."""
+    from .agent_locator import current_codex_home, discover_codex_homes
+
+    homes = list(discover_codex_homes(include_default_router=include_default_router))
+    current = current_codex_home()
+    if current not in homes:
+        homes.insert(0, current)
+    return homes
+
+
+def _is_router_codex_home(home: Path) -> bool:
+    return (
+        home.name.casefold() == "codex-home"
+        and home.parent.parent.name.casefold() == "profiles"
+    )
+
+
+def _codex_repair_homes() -> list[Path]:
+    """Repair Router account profiles as one program identity when present."""
+    from .agent_locator import current_codex_home
+
+    homes = _iter_codex_homes()
+    router_homes = [home for home in homes if _is_router_codex_home(home)]
+    router_env = any(
+        str(os.environ.get(name, "") or "").strip()
+        for name in (
+            "CODEXROUTER_DATA", "CODEX_ROUTER_DATA",
+            "CODEXROUTER_HOME", "CODEX_ROUTER_HOME",
+        )
+    )
+    if router_homes and (_is_router_codex_home(current_codex_home()) or router_env):
+        return router_homes
+    non_router_homes = [home for home in homes if not _is_router_codex_home(home)]
+    return non_router_homes or homes
+
+
+def _collect_codex_configured_agent_ids() -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for home in _iter_codex_homes():
+        agent_id = _read_codex_profile_agent_id(home)
+        if not agent_id or agent_id in seen:
+            continue
+        seen.add(agent_id)
+        found.append(agent_id)
+    return found
+
+
+def _read_codex_profile_hook_bindings(config_home: Path) -> list[tuple[str, str]]:
+    """Read only MemoryGuard-owned Codex hook identities from one profile."""
+    from .host_hooks import _generated_handler_binding, _load_json_config
+
+    try:
+        data = _load_json_config(Path(config_home) / "hooks.json", strict=False)
+    except Exception:
+        return []
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return []
+    found: set[tuple[str, str]] = set()
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            handlers = [entry]
+            if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                handlers.extend(entry["hooks"])
+            for handler in handlers:
+                binding = _generated_handler_binding(handler)
+                if binding is None:
+                    continue
+                provider, agent_id, group_id, _workspace = binding
+                if provider == "codex" and agent_id and group_id:
+                    found.add((agent_id, group_id))
+    return sorted(found)
+
+
+def _read_codex_profile_hook_evidence(
+    config_home: Path,
+) -> set[tuple[str, str, Path]]:
+    """Return generated Codex hook bindings with their pinned control home."""
+    from .host_hooks import _generated_handler_binding, _load_json_config
+
+    try:
+        data = _load_json_config(Path(config_home) / "hooks.json", strict=False)
+    except Exception:
+        return set()
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return set()
+    found: set[tuple[str, str, Path]] = set()
+    for entries in hooks.values():
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            handlers = [entry]
+            if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+                handlers.extend(entry["hooks"])
+            for handler in handlers:
+                binding = _generated_handler_binding(handler)
+                if binding is None:
+                    continue
+                provider, agent_id, group_id, workspace = binding
+                if provider != "codex" or not agent_id or not group_id or not workspace:
+                    continue
+                try:
+                    found.add((agent_id, group_id, Path(workspace).expanduser().resolve()))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+    return found
+
+
+def _collect_codex_profile_hook_bindings() -> list[tuple[str, str]]:
+    found: set[tuple[str, str]] = set()
+    for home in _iter_codex_homes():
+        found.update(_read_codex_profile_hook_bindings(home))
+    return sorted(found)
+
+
+def _verified_v2_control_state(path: Path) -> str:
+    """Return a usable V2 manifest state without opening legacy data planes."""
+    from .system.manifest import ManifestManager
+
+    try:
+        current = ManifestManager(path).current()
+        state = current.get("state", current.get("status", "")) if isinstance(current, dict) else current.state
+    except Exception:
+        return ""
+    marker = str(getattr(state, "value", state) or "").strip().upper()
+    return marker if marker in {"V2_READY", "V2_ACTIVE"} else ""
+
+
+def _absolute_control_home(raw: object) -> Path | None:
+    """Normalize one explicit provider control-home value, never a relative hint."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            return None
+        return candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _read_codex_profile_mcp_control_evidence(
+    config_home: Path,
+) -> set[tuple[str, Path]]:
+    """Read one valid MemoryGuard-owned Codex MCP config as install evidence.
+
+    ``MEMORYGUARD_HOME`` is the only accepted control pointer.  Legacy
+    ``MEMORYGUARD_WORKSPACE`` can describe a project, so it must not redirect a
+    bare program control command.  A profile path or account alone is never
+    an identity: each candidate retains its configured agent id for active
+    binding verification below.
+    """
+    config_path = Path(config_home) / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+        data = tomllib.loads(text) if text.strip() else {}
+    except Exception:
+        return set()
+    server = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {})
+    if not isinstance(server, dict):
+        return set()
+    if MCP_MODULE not in " ".join(str(item) for item in server.get("args") or ()):
+        return set()
+    env = server.get("env") or {}
+    if not isinstance(env, dict):
+        return set()
+    agent_id = str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+    candidate = _absolute_control_home(env.get("MEMORYGUARD_HOME"))
+    return {(agent_id, candidate)} if agent_id and candidate is not None else set()
+
+
+def _has_verified_codex_binding(
+    control_home: Path,
+    agent_id: str,
+    expected_group_id: str = "",
+) -> bool:
+    """Accept installed-profile evidence only with its still-active binding."""
+    if not _verified_v2_control_state(control_home):
+        return False
+    try:
+        from .runtime_v2.group_native import GroupControlService
+
+        binding = GroupControlService(control_home, write=False).active_binding_for_agent(
+            agent_id,
+        )
+    except Exception:
+        return False
+    if binding is None:
+        return False
+    group_id = str(binding.get("share_group_id") or "").strip()
+    return bool(group_id and (not expected_group_id or group_id == expected_group_id))
+
+
+def discover_verified_codex_control_homes() -> tuple[Path, ...]:
+    """Return verified global Codex control homes from installed provider state.
+
+    Discovery is read-only and bounded to known Codex profile locations.  A
+    candidate needs all of: an absolute MemoryGuard-owned MCP/home pointer (or
+    generated hook pointer), a READY/ACTIVE V2 manifest, and a matching active
+    agent binding.  Multiple profiles that verify one path collapse to one
+    candidate; different paths stay distinct so callers can fail closed.
+    """
+    candidates: set[Path] = set()
+    for profile_home in _iter_codex_homes(include_default_router=True):
+        for agent_id, control_home in _read_codex_profile_mcp_control_evidence(
+            profile_home,
+        ):
+            if _has_verified_codex_binding(control_home, agent_id):
+                candidates.add(control_home)
+        for agent_id, group_id, control_home in _read_codex_profile_hook_evidence(
+            profile_home,
+        ):
+            if _has_verified_codex_binding(control_home, agent_id, group_id):
+                candidates.add(control_home)
+    return tuple(sorted(candidates, key=lambda path: str(path).casefold()))
+
+
+def _select_verified_codex_control_home() -> Path:
+    """Select exactly one V2 control home evidenced by existing Codex setup.
+
+    A V1/default home is never repaired merely because it is the process
+    default.  Old managed MCP env and generated hooks are candidates only once
+    their target has an independently verified V2 manifest.  More than one
+    verified target is an operator decision, not something repair may guess.
+    """
+    from .data_home import resolve_data_home
+
+    default_home = resolve_data_home()
+    # Explicit process/default control selection wins over recovered provider
+    # hints.  Repair must not turn a valid operator-selected V2 home into an
+    # ambiguity just because stale installed profiles still name another one.
+    if _verified_v2_control_state(default_home):
+        return default_home
+
+    candidates: dict[Path, set[str]] = {}
+
+    def offer(raw: Path, source: str) -> None:
+        try:
+            candidate = raw.expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return
+        state = _verified_v2_control_state(candidate)
+        if state:
+            candidates.setdefault(candidate, set()).add(f"{source}:{state}")
+
+    for home in _iter_codex_homes():
+        for candidate in _read_codex_profile_control_hints(home):
+            offer(candidate, f"mcp:{home}")
+        for _agent_id, _group_id, candidate in _read_codex_profile_hook_evidence(home):
+            offer(candidate, f"hook:{home}")
+
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    if not candidates:
+        raise ValueError("verified_v2_control_home_not_found")
+    detail = ", ".join(sorted(str(path) for path in candidates))
+    raise ValueError(f"verified_v2_control_home_ambiguous: {detail}")
+
+
+def _bootstrap_codex_binding_from_verified_installation(
+    binding_store: Any,
+    data_home: Path,
+) -> bool:
+    """Bind one unambiguous prior Codex installation, then re-verify it.
+
+    This recovery path is intentionally narrow: no request payload is read,
+    no V1 store is inspected, and no identity is minted from Router paths.
+    It accepts only one exact generated-hook/config/provider-record identity
+    for the already selected V2 control home, and only when no active binding
+    exists yet.
+    """
+    try:
+        active = binding_store.list_bindings(include_inactive=False).get("bindings") or []
+    except Exception:
+        return False
+    if active:
+        return False
+
+    candidates: set[tuple[str, str]] = set()
+    recorded = binding_store.provider_identity("codex")
+    if recorded:
+        agent_id = str(recorded.get("canonical_id") or "").strip()
+        group_id = str(recorded.get("share_group_id") or "").strip()
+        if agent_id and group_id:
+            candidates.add((agent_id, group_id))
+    for home in _iter_codex_homes():
+        candidates.update(_read_codex_profile_config_bindings(home))
+        candidates.update(
+            (agent_id, group_id)
+            for agent_id, group_id, workspace in _read_codex_profile_hook_evidence(home)
+            if workspace == data_home
+        )
+    if len(candidates) != 1:
+        return False
+    agent_id, group_id = next(iter(candidates))
+    binding_store.bind_agent(
+        agent_id,
+        group_id,
+        idempotency_key=f"codex-repair-bootstrap:{agent_id}:{group_id}",
+    )
+    return binding_store.active_binding_for_agent(agent_id) is not None
+
+
+def _record_codex_program_identity(
+    data_home: str | Path,
+    *,
+    agent_instance_id: str,
+    share_group_id: str,
+    aliases: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Persist Codex program identity; prior profile IDs stay aliases."""
+    from .runtime_v2.group_native import GroupControlService
+
+    return GroupControlService(data_home, write=True).record_provider_identity(
+        "codex",
+        str(agent_instance_id or "").strip(),
+        str(share_group_id or "").strip(),
+        aliases,
+    )
+
+
+def _codex_hooks_document(
+    workspace: Path,
+    config_home: Path,
+    agent_instance_id: str,
+    share_group_id: str,
+) -> str:
+    from .host_hooks import CodexHookAdapter, _load_json_config
+
+    adapter = CodexHookAdapter(workspace)
+    adapter.set_config_home(config_home)
+    data = _load_json_config(adapter.config_path(), strict=False)
+    data = adapter._remove_owned(data)
+    data = adapter._add_owned(data, agent_instance_id, share_group_id)
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def _write_codex_global_home(
+    data_home: Path,
+    config_home: Path,
+    *,
+    agent_instance_id: str,
+    share_group_id: str,
+) -> dict[str, Any]:
+    """Atomically write MCP env, AGENTS.md, and hooks for one Codex home."""
+    from .host_hooks import set_hook_mode
+
+    adapter = CodexAdapter(data_home, config_home=config_home)
+    adapter._has_workspace = False
+    adapter.workspace = Path(data_home).expanduser().resolve()
+    instr_path = adapter._instruction_path()
+    content = _read_text_for_update(instr_path)
+    new_content = _replace_section(
+        content, _BEGIN_MARKER, _END_MARKER, _instruction_body(share_group_id),
+    )
+    mcp_path = adapter._mcp_config_path()
+    toml_content = _reconcile_memoryguard_toml_tables(_read_text_for_update(mcp_path))
+    section = _mcp_toml_section(
+        agent_instance_id, adapter.workspace, control_scope="global",
+    )
+    new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
+    _validate_toml(new_toml, mcp_path)
+    backup = _backup_toml_before_repair(mcp_path, toml_content, new_toml)
+    hooks_path = Path(config_home) / "hooks.json"
+    hooks_text = _codex_hooks_document(
+        adapter.workspace, Path(config_home), agent_instance_id, share_group_id,
+    )
+    _apply_file_transaction([
+        (instr_path, new_content),
+        (mcp_path, new_toml),
+        (hooks_path, hooks_text),
+    ])
+    set_hook_mode(adapter.workspace, "codex", agent_instance_id, "enforce")
+    return {
+        "config_home": str(Path(config_home)),
+        "instruction_file": str(instr_path),
+        "mcp_config_file": str(mcp_path),
+        "hooks_file": str(hooks_path),
+        "config_backup": str(backup) if backup else "",
+        "agent_instance_id": agent_instance_id,
+        "share_group_id": share_group_id,
+    }
+
+
+def _repair_discovered_codex_homes(
+    data_home: str | Path,
+    *,
+    agent_instance_id: str,
+    share_group_id: str,
+    binding_id: str = "",
+    skip_config_home: Path | None = None,
+    homes: list[Path] | tuple[Path, ...] | None = None,
+) -> dict[str, Any]:
+    """Repair every discovered Codex home to the same program identity."""
+    from .agent_locator import current_codex_home
+
+    homes = list(homes) if homes is not None else _iter_codex_homes()
+    current = current_codex_home()
+    written: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    aliases: list[str] = []
+    for home in homes:
+        if skip_config_home is not None and home == skip_config_home:
+            continue
+        previous = _read_codex_profile_agent_id(home)
+        if previous and previous != agent_instance_id:
+            aliases.append(previous)
+        for previous_agent_id, _previous_group_id in _read_codex_profile_hook_bindings(home):
+            if previous_agent_id != agent_instance_id:
+                aliases.append(previous_agent_id)
+        try:
+            written.append(_write_codex_global_home(
+                Path(data_home),
+                home,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+            ))
+        except Exception as exc:
+            warnings.append(
+                f"{home}: {type(exc).__name__}: {exc}"
+            )
+    return {
+        "homes": written,
+        "current_codex_home": str(current),
+        "aliases": sorted(set(aliases)),
+        "binding_id": binding_id,
+        "warnings": warnings,
+    }
+
+
+def _resolve_codex_canonical_identity(
+    binding_store: Any,
+    instances: list[Any],
+) -> tuple[str, str, list[str]]:
+    """Reuse the installed Codex principal; never mint a profile-path identity."""
+    configured = _collect_codex_configured_agent_ids()
+    hook_bindings = _collect_codex_profile_hook_bindings()
+    recorded = binding_store.provider_identity("codex")
+    if recorded:
+        binding = binding_store.active_binding_for_agent(recorded["canonical_id"])
+        if binding is not None:
+            canonical = recorded["canonical_id"]
+            aliases = [
+                item for item in {
+                    *list(recorded.get("aliases") or ()),
+                    *configured,
+                }
+                if item and item != canonical
+            ]
+            return (
+                canonical,
+                str(binding.get("share_group_id") or recorded.get("share_group_id") or ""),
+                aliases,
+            )
+
+    matches: list[Any] = []
+    for item in instances:
+        cls = get_provider_adapter_class(getattr(item, "product", ""))
+        if cls is not None and cls.provider_name == "codex":
+            matches.append(item)
+
+    aliases = {
+        *configured,
+        *(agent_id for agent_id, _group_id in hook_bindings),
+    }
+    candidates: set[tuple[str, str]] = set()
+
+    def add_active_candidate(agent_id: str, expected_group_id: str = "") -> None:
+        binding = binding_store.active_binding_for_agent(agent_id)
+        if binding is None:
+            return
+        group_id = str(binding.get("share_group_id") or "")
+        if expected_group_id and group_id != expected_group_id:
+            return
+        if group_id:
+            candidates.add((str(binding.get("agent_instance_id") or agent_id), group_id))
+
+    # A prior generated hook is installation evidence, not request data.  Its
+    # identity is usable only when it still matches an active canonical binding.
+    for agent_id, group_id in hook_bindings:
+        add_active_candidate(agent_id, group_id)
+    for agent_id in configured:
+        add_active_candidate(agent_id)
+    for instance in matches:
+        add_active_candidate(instance.instance_id)
+
+    if len(candidates) == 1:
+        canonical, group_id = next(iter(candidates))
+        return canonical, group_id, sorted(aliases - {canonical})
+    return "", "", sorted(aliases)
+
+
 def repair_global_provider_configs(
     providers: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
@@ -1340,16 +2582,15 @@ def repair_global_provider_configs(
     current instances are rediscovered, then each provider is installed from
     the one active binding stored in the canonical user data home.
     """
-    from .agent_locator import AgentLocator
-    from .data_home import resolve_data_home
+    from .agent_locator import AgentLocator, current_codex_home
 
-    data_home = resolve_data_home()
+    data_home = _select_verified_codex_control_home()
     _require_provider_state(data_home, mutation=True)
     data_home.mkdir(parents=True, exist_ok=True)
     instances, _ = AgentLocator(data_home).detect_instances()
     from .runtime_v2.group_native import GroupControlService
 
-    binding_store: Any = GroupControlService(data_home, write=False)
+    binding_store: Any = GroupControlService(data_home, write=True)
 
     requested: set[str] = set()
     for raw in providers or ():
@@ -1372,6 +2613,98 @@ def repair_global_provider_configs(
 
     repaired: list[dict[str, Any]] = []
     for provider in sorted(requested):
+        if provider == "codex":
+            repair_homes = _codex_repair_homes()
+            agent_id, group_id, alias_ids = _resolve_codex_canonical_identity(
+                binding_store, instances,
+            )
+            if not agent_id and _bootstrap_codex_binding_from_verified_installation(
+                binding_store, data_home,
+            ):
+                agent_id, group_id, alias_ids = _resolve_codex_canonical_identity(
+                    binding_store, instances,
+                )
+            matches = by_provider.get(provider, [])
+            if not agent_id and len(matches) > 1:
+                repaired.append({
+                    "provider": provider,
+                    "status": "error",
+                    "reason": "multiple_provider_instances_detected",
+                    "agent_instance_ids": sorted(item.instance_id for item in matches),
+                })
+                continue
+            if not agent_id and not matches and not repair_homes:
+                repaired.append({
+                    "provider": provider,
+                    "status": "skipped",
+                    "reason": "provider_instance_not_detected",
+                })
+                continue
+            if not agent_id and matches:
+                agent_id = matches[0].instance_id
+            binding = (
+                binding_store.active_binding_for_agent(agent_id) if agent_id else None
+            )
+            binding_data = dict(binding) if isinstance(binding, dict) else None
+            if binding_data is None:
+                repaired.append({
+                    "provider": provider,
+                    "status": "error",
+                    "reason": "active_binding_not_found",
+                    "agent_instance_id": agent_id,
+                })
+                continue
+            group_id = str(binding_data.get("share_group_id") or group_id or "")
+            try:
+                adapter = CodexAdapter(data_home, config_home=repair_homes[0] if repair_homes else "")
+                # Selection above verified this V2 home from existing managed
+                # Codex evidence.  Keep the generic installer from falling
+                # back to an unrelated default (often a V1 legacy home).
+                adapter._repair_data_home = data_home
+                adapter._repair_codex_homes = tuple(repair_homes)
+                result = adapter.install(
+                    data_home,
+                    share_group_id=group_id,
+                    agent_instance_id=agent_id,
+                    global_scope=True,
+                )
+                merged_aliases = [
+                    item for item in {
+                        *alias_ids,
+                        *list(result.get("aliases") or ()),
+                    }
+                    if item and item != agent_id
+                ]
+                recorded = _record_codex_program_identity(
+                    data_home,
+                    agent_instance_id=agent_id,
+                    share_group_id=group_id,
+                    aliases=merged_aliases,
+                )
+                profile_errors = list(result.get("profile_repair_errors") or ())
+                repaired.append({
+                    "provider": provider,
+                    "status": "partial" if profile_errors else "configured",
+                    "agent_instance_id": agent_id,
+                    "share_group_id": group_id,
+                    "display_name": "Codex",
+                    "current_codex_home": str(current_codex_home()),
+                    "aliases": list(recorded.get("aliases") or merged_aliases),
+                    "result": result,
+                    **(
+                        {"reason": "codex_profile_repair_failed", "profile_errors": profile_errors}
+                        if profile_errors else {}
+                    ),
+                })
+            except Exception as exc:
+                repaired.append({
+                    "provider": provider,
+                    "status": "error",
+                    "agent_instance_id": agent_id,
+                    "share_group_id": group_id,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+            continue
         matches = by_provider.get(provider, [])
         if not matches:
             repaired.append({
@@ -1428,15 +2761,17 @@ def repair_global_provider_configs(
 
     configured = sum(item["status"] == "configured" for item in repaired)
     errors = sum(item["status"] == "error" for item in repaired)
+    partial = sum(item["status"] == "partial" for item in repaired)
     skipped = sum(item["status"] == "skipped" for item in repaired)
     return {
-        "ok": errors == 0,
+        "ok": errors == 0 and partial == 0,
         "data_home": str(data_home),
         "configured": configured,
         "errors": errors,
+        "partial": partial,
         "skipped": skipped,
         "providers": repaired,
-        "restart_required": configured > 0,
+        "restart_required": configured > 0 or partial > 0,
     }
 
 

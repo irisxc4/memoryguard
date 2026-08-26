@@ -22,6 +22,7 @@ from ..memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
 from ..memory.store import stable_digest
 from ..sensitive_content import SENSITIVE_PATTERNS
 from .dedup import V2DedupMatch, V2SemanticDeduplicator, canonical_hash, canonical_text
+from .canonical_claims import claims_related, compose_canonical_bodies, topic_affinity
 from .governance_semantics import (
     GovernanceRelation,
     classify_governance_relation,
@@ -32,6 +33,7 @@ from .text_native import VALID_KINDS, classify_kind
 
 _LOCK_GUARD = Lock()
 _BODY_LOCKS: dict[str, RLock] = {}
+_COMPOSITION_RELATIONS = frozenset({"exact", "equivalent", "update", "additive"})
 _FORBIDDEN_METADATA_KEYS = frozenset({
     "body", "raw", "raw_content", "content", "text", "full_text",
     "document", "document_body", "document_text", "conversation",
@@ -94,6 +96,33 @@ def _provenance_key(value: Mapping[str, Any]) -> str:
         "agent_instance_id": value.get("agent_instance_id", ""),
         "digest": value.get("digest", ""),
     })
+
+
+def _canonical_injection_policy(left: Any, right: Any) -> str:
+    """Choose the strongest valid policy when folding duplicate evidence."""
+
+    policies = {str(left or "").casefold(), str(right or "").casefold()}
+    # Ordinary deduplication must never weaken an explicit always policy.
+    return "always" if "always" in policies else "relevant"
+
+
+# A canonical atom may receive the same durable fact through several native
+# categories.  Classification is provenance, but the visible head still needs
+# one deterministic category.  Correction is an explicit user override;
+# procedure/preference/project are progressively more specific durable kinds
+# than an unqualified fact or an episode.
+_KIND_SPECIFICITY = {
+    "episode": 0,
+    "fact": 1,
+    "project": 2,
+    "preference": 3,
+    "procedure": 4,
+    "correction": 5,
+}
+
+
+def _kind_rank(kind: Any) -> int:
+    return int(_KIND_SPECIFICITY.get(str(kind or "").casefold(), 1))
 
 
 class V2MemoryOrganizer:
@@ -230,8 +259,9 @@ class V2MemoryOrganizer:
     def _is_conflict(body: str, candidate: MemoryAtom, kind: str, metadata: Mapping[str, Any]) -> bool:
         if metadata.get("conflict") is True or metadata.get("type") == "conflict":
             return True
-        if kind != candidate.kind and canonical_text(body) != canonical_text(candidate.body):
-            return True
+        # Kind is provenance/classification, not semantic identity.  Cross-kind
+        # observations may share one canonical node; polarity, parameters,
+        # scope, and explicit conflict metadata remain the safety gates.
         text = canonical_text(body)
         old = canonical_text(candidate.body)
         preference_markers = ("prefer", "like", "preference", "偏好", "喜欢")
@@ -240,6 +270,41 @@ class V2MemoryOrganizer:
             and any(item in old for item in preference_markers)
             and text != old
         )
+
+    @staticmethod
+    def _classification_override(value: Any) -> bool:
+        """Return whether a source explicitly overrides its classification."""
+
+        if isinstance(value, Mapping):
+            return bool(
+                value.get("classification_override")
+                or value.get("kind_override")
+                or value.get("type") == "classification_override"
+            )
+        return False
+
+    @classmethod
+    def _select_canonical_kind(
+        cls, candidate: MemoryAtom, prepared: Mapping[str, Any],
+    ) -> str:
+        """Choose one category without making the result arrival-order based."""
+
+        candidate_kind = str(candidate.kind or "fact").casefold()
+        incoming_kind = str(prepared.get("kind") or "fact").casefold()
+        candidate_override = cls._classification_override(candidate.metadata)
+        if not candidate_override:
+            candidate_override = any(
+                cls._classification_override(item)
+                for item in candidate.provenance
+            )
+        incoming_override = bool(prepared.get("classification_override"))
+        if incoming_override != candidate_override:
+            return incoming_kind if incoming_override else candidate_kind
+        candidate_rank = _kind_rank(candidate_kind)
+        incoming_rank = _kind_rank(incoming_kind)
+        if incoming_rank > candidate_rank:
+            return incoming_kind
+        return candidate_kind
 
     @staticmethod
     def _source_ref(data: Mapping[str, Any], metadata: Mapping[str, Any], event_id: str) -> str:
@@ -275,6 +340,12 @@ class V2MemoryOrganizer:
             kind = classify_kind(body, metadata)
             if kind not in VALID_KINDS:
                 kind = "fact"
+        classification_override = bool(
+            kind_override
+            or data.get("kind_override")
+            or self._classification_override(data)
+            or self._classification_override(metadata)
+        )
         policy = str(data.get("injection_policy") or metadata.get("injection_policy") or "relevant")
         priority = int(data.get("priority", metadata.get("priority", 0)) or 0)
         confidence = float(data.get("confidence") if data.get("confidence") is not None else self._confidence(body, kind))
@@ -289,19 +360,33 @@ class V2MemoryOrganizer:
             "agent_instance_id": agent,
             "share_group_id": self.share_group_id,
             "digest": digest,
+            # Preserve each source classification as evidence; it is not part
+            # of canonical identity and must not block cross-kind coalescing.
+            "kind": kind,
+            "classification_override": classification_override,
+            "injection_policy": policy,
             "locator": str(metadata.get("locator") or "event")[:256],
             "source_revision": str(metadata.get("source_revision") or ""),
         }
         evidence = list(data.get("evidence") or ())
-        if not evidence and not data.get("evidence_ids"):
+        # Native GUI lifecycle updates carry the complete existing atom and
+        # deliberately preserve its provenance.  They must not synthesize a
+        # fresh evidence record from the changed policy/lock metadata: the
+        # evidence ID is content/source-stable and the evidence store treats
+        # metadata changes under that ID as a conflict.  Body edits and public
+        # writes still receive their normal automatic evidence below.
+        if not evidence and not data.get("evidence_ids") and not data.get("_preserve_provenance"):
             evidence = [{
                 "source_ref": source_ref,
                 "digest": digest,
                 "authority": "observed",
-                "metadata": {
-                    "source_event_id": event_id,
-                    "agent_instance_id": agent,
-                    "share_group_id": self.share_group_id,
+                    "metadata": {
+                        "source_event_id": event_id,
+                        "agent_instance_id": agent,
+                        "share_group_id": self.share_group_id,
+                        "kind": kind,
+                    "classification_override": classification_override,
+                    "injection_policy": policy,
                 },
             }]
         mappings = list(data.get("source_mappings") or ())
@@ -315,6 +400,9 @@ class V2MemoryOrganizer:
                 "metadata": {
                     "agent_instance_id": agent,
                     "share_group_id": self.share_group_id,
+                    "kind": kind,
+                    "classification_override": classification_override,
+                    "injection_policy": policy,
                 },
             }]
         return {
@@ -327,6 +415,7 @@ class V2MemoryOrganizer:
             "event_id": event_id,
             "source_ref": source_ref,
             "kind": kind,
+            "classification_override": classification_override,
             "injection_policy": policy,
             "priority": priority,
             "confidence": confidence,
@@ -521,6 +610,256 @@ class V2MemoryOrganizer:
             "scope": self._scope_key_for_prepared(prepared),
         })[:20]
 
+    @staticmethod
+    def _composition_value(value: Any, name: str, default: Any = None) -> Any:
+        """Read composer result fields without coupling to its concrete type."""
+
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
+
+    @staticmethod
+    def _composition_claims(value: Any) -> tuple[str, ...]:
+        """Parse claim boundaries without retaining claim text in metadata."""
+
+        pieces = re.split(
+            r"[\r\n]+|(?<=[。！？!?；;])\s*|(?<=[.!?])(?=\s|$)",
+            str(value or ""),
+        )
+        claims: list[str] = []
+        for piece in pieces:
+            claim = re.sub(
+                r"^\s*(?:(?:[-*+•◦▪▸‣])\s+|\[\d+\]\s+|\d+[.)]\s+)+",
+                "",
+                piece,
+            ).strip()
+            if claim and canonical_text(claim) not in {canonical_text(item) for item in claims}:
+                claims.append(claim)
+        return tuple(claims)
+
+    @staticmethod
+    def _composition_claim_maps(source: str, final: str) -> bool:
+        """Return whether source claim can account for final claim surface."""
+
+        if canonical_text(source) == canonical_text(final):
+            return True
+        relation = classify_governance_relation(source, final)
+        return relation.kind in _COMPOSITION_RELATIONS
+
+    @staticmethod
+    def _composition_metadata(
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+        composition: Any,
+        relation: GovernanceRelation,
+    ) -> dict[str, Any]:
+        """Record claim/source digests, never another copy of claim text."""
+
+        existing = candidate.metadata.get("composition")
+        previous = existing if isinstance(existing, Mapping) else {}
+        previous_records = [
+            dict(item)
+            for item in (previous.get("claims", []) if isinstance(previous, Mapping) else [])
+            if isinstance(item, Mapping)
+        ]
+        old_claims = V2MemoryOrganizer._composition_claims(candidate.body)
+        incoming_claims = V2MemoryOrganizer._composition_claims(prepared.get("body"))
+        claims = tuple(
+            str(item).strip()
+            for item in (V2MemoryOrganizer._composition_value(composition, "claims", ()) or ())
+            if str(item).strip()
+        )
+        incoming_source = {
+            "source_event_id": str(prepared.get("event_id") or ""),
+            "source_ref": str(prepared.get("source_ref") or ""),
+            "body_digest": str(prepared.get("digest") or canonical_hash(prepared.get("body", ""))),
+            "source_role": "incoming_body",
+        }
+        records: list[dict[str, Any]] = []
+
+        def add_record(value: Mapping[str, Any], final_digest: str, *, relation_name: str) -> None:
+            record = {
+                "claim_digest": final_digest,
+                "relation": str(value.get("relation") or relation_name),
+            }
+            for key in ("source_event_id", "source_ref", "body_digest", "source_role"):
+                if value.get(key) not in (None, ""):
+                    record[key] = str(value[key])
+            if not any(stable_digest(item) == stable_digest(record) for item in records):
+                records.append(record)
+
+        for final_claim in claims:
+            final_digest = canonical_hash(final_claim)
+            matching_old = [
+                old_claim
+                for old_claim in old_claims
+                if V2MemoryOrganizer._composition_claim_maps(old_claim, final_claim)
+            ]
+            matching_incoming = [
+                incoming_claim
+                for incoming_claim in incoming_claims
+                if V2MemoryOrganizer._composition_claim_maps(incoming_claim, final_claim)
+            ]
+            old_digests = {canonical_hash(old_claim) for old_claim in matching_old}
+            old_records = [
+                item
+                for item in previous_records
+                if str(item.get("claim_digest") or "") in old_digests
+            ]
+            for item in old_records:
+                add_record(item, final_digest, relation_name="candidate_composition")
+            if matching_old and not old_records:
+                # Metadata may predate composition.  Provenance is fallback
+                # evidence for candidate body only, never incoming evidence.
+                for provenance in candidate.provenance:
+                    if not isinstance(provenance, Mapping):
+                        continue
+                    fallback = {
+                        "source_event_id": str(provenance.get("source_event_id") or ""),
+                        "source_ref": str(provenance.get("source_ref") or ""),
+                        "body_digest": str(provenance.get("digest") or ""),
+                        "source_role": "candidate_body_provenance",
+                    }
+                    if any(
+                        fallback[key]
+                        for key in ("source_event_id", "source_ref", "body_digest")
+                    ):
+                        add_record(fallback, final_digest, relation_name="candidate_body_provenance")
+            if matching_incoming:
+                add_record(incoming_source, final_digest, relation_name=relation.kind)
+        records.sort(key=lambda item: stable_digest(item))
+        sources = []
+        for item in records:
+            source_item = {
+                key: item[key]
+                for key in ("source_event_id", "source_ref", "body_digest", "source_role")
+                if key in item
+            }
+            if source_item and source_item not in sources:
+                sources.append(source_item)
+        composition_changed = bool(
+            V2MemoryOrganizer._composition_value(composition, "changed", False)
+        )
+        # The shared composer renders every multi-input component as bullets.
+        # An exact duplicate is still one canonical claim, so the organizer
+        # preserves the already-persisted body surface instead of turning a
+        # stable write into a formatting-only revision.
+        if (
+            relation.kind == "exact"
+            and canonical_text(candidate.body) == canonical_text(prepared.get("body", ""))
+        ):
+            composition_changed = False
+        return {
+            "changed": composition_changed,
+            "relation": relation.to_dict(),
+            "claims": records,
+            "sources": sources,
+        }
+
+    def _compose_candidate(
+        self,
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+        relation: GovernanceRelation | None,
+    ) -> Any | None:
+        """Ask the shared claim composer whether two bodies share a topic."""
+
+        if relation is None:
+            return None
+        result = compose_canonical_bodies([str(candidate.body or ""), str(prepared["body"])])
+        return result
+
+    @classmethod
+    def _relation_from_composition(
+        cls,
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+        relation: GovernanceRelation,
+        composition: Any | None,
+    ) -> GovernanceRelation:
+        """Use canonical claim affinity to widen recall without weakening gates.
+
+        ``classify_governance_relation`` compares complete bodies.  A body may
+        contain several claims, so that result can be ``distinct`` (or a
+        polarity conflict) even though the canonical claim composer proves the
+        two bodies form one safe topic component.  The composer is the sole
+        source of that wider relation: rejected conflict edges remain a hard
+        conflict, and rejected unrelated claims remain separate records.
+        """
+
+        if composition is None:
+            return relation
+        metadata = prepared.get("metadata")
+        explicit_conflict = isinstance(metadata, Mapping) and (
+            metadata.get("conflict") is True or metadata.get("type") == "conflict"
+        )
+        rejected_conflicts = tuple(
+            str(item).strip()
+            for item in (cls._composition_value(composition, "rejected_conflicts", ()) or ())
+            if str(item).strip()
+        )
+        rejected_unrelated = tuple(
+            str(item).strip()
+            for item in (cls._composition_value(composition, "rejected_unrelated", ()) or ())
+            if str(item).strip()
+        )
+        claims = tuple(
+            str(item).strip()
+            for item in (cls._composition_value(composition, "claims", ()) or ())
+            if str(item).strip()
+        )
+        candidate_claims = cls._composition_claims(candidate.body)
+        incoming_claims = cls._composition_claims(prepared.get("body"))
+        related_pairs = [
+            (left, right)
+            for left in candidate_claims
+            for right in incoming_claims
+            if claims_related(left, right)
+        ]
+        if explicit_conflict and relation.kind == "distinct":
+            return GovernanceRelation("conflict", 1.0, "explicit_composition_conflict", "")
+        if rejected_conflicts:
+            # A broad polarity classifier can mark unrelated bodies as a
+            # conflict.  Keep conflict only when the shared helper also finds
+            # a strong topic edge; explicit contradiction edges remain hard
+            # conflicts through the composer.
+            affinity = max(
+                (topic_affinity(left, right) for left in candidate_claims for right in incoming_claims),
+                default=0.0,
+            )
+            if not related_pairs and affinity < 0.5:
+                return GovernanceRelation(
+                    "distinct",
+                    float(relation.score),
+                    "canonical_composition_unrelated",
+                    "",
+                )
+            return GovernanceRelation(
+                "conflict",
+                max(float(relation.score), 0.8),
+                "canonical_composition_conflict",
+                "",
+            )
+        if rejected_unrelated:
+            return GovernanceRelation(
+                "distinct",
+                float(relation.score),
+                "canonical_composition_unrelated",
+                "",
+            )
+        if claims and related_pairs and relation.kind in {"distinct", "conflict"}:
+            affinity = max(
+                (topic_affinity(left, right) for left, right in related_pairs),
+                default=float(relation.score),
+            )
+            return GovernanceRelation(
+                "additive",
+                float(affinity),
+                "canonical_topic_affinity",
+                "",
+            )
+        return relation
+
     def _put(self, atom: MemoryAtom, prepared: Mapping[str, Any], *, reason: str, key: str) -> tuple[MemoryAtom, dict[str, Any] | None]:
         result = self.governance.put_atom(
             atom,
@@ -545,7 +884,14 @@ class V2MemoryOrganizer:
             persisted = MemoryAtom.from_value(persisted)
         return persisted, receipt
 
-    def _merge(self, candidate: MemoryAtom, prepared: Mapping[str, Any]) -> tuple[MemoryAtom, list[dict[str, Any]], dict[str, Any] | None, bool]:
+    def _merge(
+        self,
+        candidate: MemoryAtom,
+        prepared: Mapping[str, Any],
+        *,
+        composition: Any | None = None,
+        relation: GovernanceRelation | None = None,
+    ) -> tuple[MemoryAtom, list[dict[str, Any]], dict[str, Any] | None, bool]:
         incoming = dict(prepared["provenance"])
         incoming_key = _provenance_key(incoming)
         existing = {_provenance_key(item) for item in candidate.provenance}
@@ -558,6 +904,7 @@ class V2MemoryOrganizer:
             provenance = list(candidate.provenance)
             if not prepared.get("preserve_provenance") and incoming_key not in existing:
                 provenance.append(incoming)
+            canonical_kind = self._select_canonical_kind(candidate, prepared)
             status = str(prepared.get("status") or candidate.status)
             locked = candidate.locked if prepared.get("locked") is None else bool(prepared.get("locked"))
             metadata = (
@@ -568,11 +915,14 @@ class V2MemoryOrganizer:
             updated = replace(
                 candidate,
                 body=str(prepared["body"]),
+                kind=canonical_kind,
                 provenance=provenance,
                 status=status,
                 locked=locked,
                 injection_policy=str(prepared["injection_policy"]),
-                dedup_domain=str(prepared["injection_policy"]),
+                dedup_domain=str(
+                    prepared.get("dedup_domain") or prepared["injection_policy"]
+                ),
                 priority=int(prepared["priority"]),
                 confidence=max(float(candidate.confidence), float(prepared["confidence"])),
                 canonical_hash=str(prepared["digest"]),
@@ -608,12 +958,70 @@ class V2MemoryOrganizer:
             )
             return candidate if persisted is None else persisted, [{"action": "idempotent_replay", "target_id": candidate.memory_id}], receipt, True
         provenance = list(candidate.provenance) + [incoming]
+        effective_policy = _canonical_injection_policy(
+            candidate.injection_policy, prepared.get("injection_policy"),
+        )
+        canonical_kind = self._select_canonical_kind(candidate, prepared)
+        merge_metadata = {
+            **dict(candidate.metadata),
+            "last_source_event_id": prepared["event_id"],
+        }
+        if canonical_kind != str(candidate.kind or "").casefold():
+            merge_metadata["canonical_kind_reconciled"] = {
+                "canonical": canonical_kind,
+                "incoming": str(prepared.get("kind") or "fact").casefold(),
+                "source_event_id": str(prepared.get("event_id") or ""),
+            }
+        incoming_policy = str(prepared.get("injection_policy") or "").casefold()
+        if incoming_policy and incoming_policy != str(candidate.injection_policy or "").casefold():
+            # Keep the canonical node singular, but leave a body-free audit
+            # marker whenever duplicate evidence carried a different policy.
+            merge_metadata["canonical_policy_reconciled"] = {
+                "canonical": effective_policy,
+                "incoming": incoming_policy,
+                "source_event_id": str(prepared.get("event_id") or ""),
+            }
+        composed_body = str(candidate.body or "")
+        composition_metadata: dict[str, Any] | None = None
+        if composition is not None:
+            candidate_body = self._composition_value(composition, "body", None)
+            rejected_conflicts = tuple(
+                str(item).strip()
+                for item in (self._composition_value(composition, "rejected_conflicts", ()) or ())
+                if str(item).strip()
+            )
+            if candidate_body and not rejected_conflicts:
+                composed_body = str(candidate_body)
+                # Exact duplicate writes must retain the canonical body's
+                # original formatting.  Otherwise the claim composer changes
+                # a single record into a bullet merely because a second
+                # provenance source arrived, making direct body reads miss
+                # the canonical record and needlessly rewriting its hash.
+                if (
+                    relation is not None
+                    and relation.kind == "exact"
+                    and canonical_text(candidate.body)
+                    == canonical_text(prepared.get("body", ""))
+                ):
+                    composed_body = str(candidate.body or "")
+            if relation is not None:
+                composition_metadata = self._composition_metadata(
+                    candidate, prepared, composition, relation,
+                )
+                merge_metadata["composition"] = composition_metadata
         updated = replace(
             candidate,
+            body=composed_body,
+            kind=canonical_kind,
             provenance=provenance,
             confidence=max(float(candidate.confidence), float(prepared["confidence"])),
             priority=max(int(candidate.priority), int(prepared["priority"])),
-            metadata={**dict(candidate.metadata), "last_source_event_id": prepared["event_id"]},
+            injection_policy=effective_policy,
+            # ``dedup_domain`` may carry a canonical/scope namespace on
+            # migrated atoms; never replace it with the incoming policy.
+            dedup_domain=candidate.dedup_domain,
+            canonical_hash=canonical_hash(composed_body),
+            metadata=merge_metadata,
         )
         key = "merge:" + stable_digest({"atom": candidate.atom_id, "provenance": incoming_key})
         persisted, receipt = self._put(updated, prepared, reason="automatic canonical provenance merge", key=key)
@@ -748,6 +1156,10 @@ class V2MemoryOrganizer:
 
         for atom in atoms:
             relation = classify_governance_relation(atom.body, body)
+            composition = self._compose_candidate(atom, prepared, relation)
+            relation = self._relation_from_composition(
+                atom, prepared, relation, composition,
+            )
             correction = self._correction_relation(atom, prepared)
             if correction is not None:
                 relation = correction
@@ -780,11 +1192,44 @@ class V2MemoryOrganizer:
         *,
         reason: str,
         relation: GovernanceRelation,
+        allow_policy_change: bool = False,
+        composition: Any | None = None,
     ) -> tuple[MemoryAtom, dict[str, Any] | None]:
-        atom = self._new_atom(prepared, status="active", supersedes=[candidate.memory_id])
+        # Semantic update/additive writes are new versions, but they are still
+        # ordinary evidence unless explicitly marked as a correction.  Carry
+        # forward the strongest policy/priority so a relevant rephrase cannot
+        # silently weaken an always canonical node.
+        effective_prepared = dict(prepared)
+        effective_prepared["dedup_domain"] = candidate.dedup_domain
+        if not allow_policy_change:
+            policy = _canonical_injection_policy(
+                candidate.injection_policy, prepared.get("injection_policy"),
+            )
+            effective_prepared["injection_policy"] = policy
+            effective_prepared["priority"] = max(
+                int(candidate.priority), int(prepared.get("priority") or 0),
+            )
+            if (
+                policy != str(prepared.get("injection_policy") or "")
+                or effective_prepared["priority"] != int(prepared.get("priority") or 0)
+            ):
+                effective_prepared["metadata"] = {
+                    **dict(prepared.get("metadata") or {}),
+                    "canonical_policy_preserved": policy,
+                }
+        if composition is not None:
+            effective_prepared["metadata"] = {
+                **dict(effective_prepared.get("metadata") or {}),
+                "composition": self._composition_metadata(
+                    candidate, prepared, composition, relation,
+                ),
+            }
+        atom = self._new_atom(
+            effective_prepared, status="active", supersedes=[candidate.memory_id],
+        )
         persisted, receipt = self._put(
             atom,
-            prepared,
+            effective_prepared,
             reason=reason,
             key="supersede-put:" + stable_digest({
                 "group": self.share_group_id,
@@ -923,6 +1368,15 @@ class V2MemoryOrganizer:
                 classify_governance_relation(candidate.body, str(prepared["body"]))
                 if candidate is not None else None
             )
+            composition = (
+                self._compose_candidate(candidate, prepared, relation)
+                if candidate is not None and relation is not None
+                else None
+            )
+            if candidate is not None and relation is not None:
+                relation = self._relation_from_composition(
+                    candidate, prepared, relation, composition,
+                )
             if correction_relation is not None:
                 relation = correction_relation
             if explicit_update and candidate is not None:
@@ -948,6 +1402,36 @@ class V2MemoryOrganizer:
             is_correction = self._is_correction(
                 str(prepared["body"]), prepared["metadata"], str(prepared["kind"]),
             )
+            if is_correction:
+                composition = None
+            composition_conflicts = tuple(
+                str(item).strip()
+                for item in (
+                    self._composition_value(composition, "rejected_conflicts", ())
+                    or ()
+                )
+                if str(item).strip()
+            )
+            composition_unrelated = tuple(
+                str(item).strip()
+                for item in (
+                    self._composition_value(composition, "rejected_unrelated", ())
+                    or ()
+                )
+                if str(item).strip()
+            )
+            if composition_unrelated and not composition_conflicts:
+                # Composer rejected a separate claim.  Do not silently retain
+                # only candidate body or merge provenance; persist incoming as
+                # its own governed record through normal create path.
+                candidate = None
+                relation = GovernanceRelation(
+                    "distinct",
+                    float(relation.score) if relation is not None else 0.0,
+                    "composer_rejected_unrelated",
+                    "",
+                )
+                composition = None
             if (
                 candidate is not None
                 and not explicit_update
@@ -997,7 +1481,7 @@ class V2MemoryOrganizer:
                         str(prepared["body"]), candidate,
                         str(prepared["kind"]), prepared["metadata"],
                     )
-                )
+                ) or bool(composition_conflicts)
                 if conflict:
                     conflict_id = "conflict-" + stable_digest({
                         "group": self.share_group_id,
@@ -1012,6 +1496,10 @@ class V2MemoryOrganizer:
                         "conflict_peer_ids": [candidate.memory_id],
                         "conflict_reason": relation.reason or "automatic semantic conflict",
                     }
+                    if composition_conflicts:
+                        conflict_metadata["composition_rejected_conflict_digests"] = [
+                            canonical_hash(item) for item in composition_conflicts
+                        ]
                     if candidate.status != "conflicted" and not candidate.locked:
                         candidate, _peer_receipt = self._put(
                             replace(
@@ -1061,6 +1549,15 @@ class V2MemoryOrganizer:
 
                 should_supersede = (
                     not candidate.locked
+                    and not (
+                        composition is not None
+                        and len(
+                            tuple(
+                                self._composition_value(composition, "claims", ())
+                                or ()
+                            )
+                        ) > 1
+                    )
                     and (
                         is_correction
                         or (
@@ -1079,6 +1576,8 @@ class V2MemoryOrganizer:
                             else "automatic semantic update supersede"
                         ),
                         relation=relation,
+                        allow_policy_change=is_correction,
+                        composition=composition,
                     )
                     actions.append({"action": "supersede", "old_id": candidate.memory_id})
                     return {
@@ -1136,7 +1635,12 @@ class V2MemoryOrganizer:
                         "idempotent_replay": False,
                     }
 
-                persisted, merge_actions, receipt, replay = self._merge(candidate, prepared)
+                persisted, merge_actions, receipt, replay = self._merge(
+                    candidate,
+                    prepared,
+                    composition=composition,
+                    relation=relation,
+                )
                 actions.extend(merge_actions)
                 governance_action = (
                     "unchanged"

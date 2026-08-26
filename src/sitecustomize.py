@@ -13,8 +13,8 @@ import os
 import sys
 
 
-HOTFIX_VERSION = "0.7.1.post6"
-HOTFIX_WHEEL = "agent_memguard-0.7.1.post6-py3-none-any.whl"
+HOTFIX_VERSION = "0.7.1.post18"
+HOTFIX_WHEEL = "agent_memguard-0.7.1.post18-py3-none-any.whl"
 BRIDGEABLE_VERSIONS = frozenset({
     "0.7.1",
     "0.7.1.post1",
@@ -22,6 +22,18 @@ BRIDGEABLE_VERSIONS = frozenset({
     "0.7.1.post3",
     "0.7.1.post4",
     "0.7.1.post5",
+    "0.7.1.post6",
+    "0.7.1.post7",
+    "0.7.1.post8",
+    "0.7.1.post9",
+    "0.7.1.post10",
+    "0.7.1.post11",
+    "0.7.1.post12",
+    "0.7.1.post13",
+    "0.7.1.post14",
+    "0.7.1.post15",
+    "0.7.1.post16",
+    "0.7.1.post17",
 })
 
 
@@ -60,25 +72,31 @@ def _wheel_is_expected(path: object) -> bool:
             if len(metadata_names) != 1:
                 return False
             metadata = archive.read(metadata_names[0]).decode("utf-8", errors="strict")
-            if f"\nVersion: {HOTFIX_VERSION}\n" not in "\n" + metadata:
+            if f"Version: {HOTFIX_VERSION}" not in {
+                line.strip() for line in metadata.splitlines()
+            }:
                 return False
             lifecycle_name = "memoryguard/codex_mcp_lifecycle.py"
             hook_name = "memoryguard/host_hooks.py"
             provider_name = "memoryguard/provider_adapters.py"
+            subagent_name = "memoryguard/codex_subagent_reconcile.py"
             if (
                 lifecycle_name not in names
                 or hook_name not in names
                 or provider_name not in names
+                or subagent_name not in names
             ):
                 return False
             lifecycle = archive.read(lifecycle_name).decode("utf-8", errors="strict")
             hooks = archive.read(hook_name).decode("utf-8", errors="strict")
-            providers = archive.read(provider_name).decode("utf-8", errors="strict")
+            subagents = archive.read(subagent_name).decode("utf-8", errors="strict")
             return (
-                f'SHIM_VERSION = "{HOTFIX_VERSION}"' in lifecycle
-                and 'PROTECTED_ROOT_NAMES = frozenset({"python.exe"})' in lifecycle
+                'if mode != "force"' in lifecycle
+                and 'allow_termination=selected_mode == "force"' in lifecycle
                 and "_best_effort_codex_mcp_lifecycle" in hooks
-                and '["-X", "utf8", "-m", "memoryguard.mcp_server"]' in providers
+                and "reconcile_closed_edge_rollout_activities" in hooks
+                and "reconcile_closed_edge_rollout_activities" in subagents
+                and 'terminal[child] = "missing_rollout"' in subagents
             )
     except Exception:
         return False
@@ -94,7 +112,7 @@ if _is_managed_codex_hook():
         installed = importlib.metadata.version("agent-memguard")
         if installed in BRIDGEABLE_VERSIONS:
             repo_root = Path(__file__).resolve().parents[1]
-            wheel = repo_root / "dist-hotfix-final13" / HOTFIX_WHEEL
+            wheel = repo_root / "dist-hotfix-subagent-rollout-post18" / HOTFIX_WHEEL
             if wheel.is_file() and _wheel_is_expected(wheel):
                 wheel_text = str(wheel)
                 sys.path[:] = [item for item in sys.path if item != wheel_text]

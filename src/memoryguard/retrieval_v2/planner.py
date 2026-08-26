@@ -17,6 +17,7 @@ from typing import Any
 
 from .models import RecallDecision, RecallPlan, RecallRequest, RecallScope, stable_digest
 from .ports import LayerPort
+from ..runtime_v2.context_budget import ContextBudget, DeterministicTokenCounter
 
 
 _LAYER_ORDER = (
@@ -510,10 +511,25 @@ class RecallPlanner:
 
         ranked = sorted(deduped, key=lambda item: item.rank_key)
         mandatory = [item for item in ranked if item.trust == "mandatory"]
+        # Mandatory and optional recall have independent budgets.  The request
+        # budget belongs only to optional candidates; mandatory safety limits
+        # come from the single runtime source of truth.
+        context_budget = ContextBudget()
+        token_counter = DeterministicTokenCounter()
         mandatory_chars = sum(len(item.summary) for item in mandatory)
-        mandatory_overflow = len(mandatory) > req.budget_items or mandatory_chars > req.budget_chars
+        mandatory_tokens = sum(token_counter.count(item.summary) for item in mandatory)
+        mandatory_item_overflow = any(
+            context_budget.mandatory_item_oversize(
+                len(item.summary), token_counter.count(item.summary),
+            )
+            for item in mandatory
+        )
+        mandatory_overflow = mandatory_item_overflow or context_budget.mandatory_aggregate_overflow(
+            mandatory_chars, mandatory_tokens,
+        )
         selected: list[_Candidate] = []
         decisions: list[RecallDecision] = []
+        warnings: list[dict[str, Any]] = []
         if mandatory_overflow:
             for item in ranked:
                 decisions.append(
@@ -527,22 +543,27 @@ class RecallPlanner:
             reason = "mandatory_budget_overflow"
         else:
             selected.extend(mandatory)
-            used_chars = mandatory_chars
+            optional_count = 0
+            optional_chars = 0
             for item in ranked:
                 if item.trust == "mandatory":
                     decisions.append(self._decision(item, action="include", reason="selected_mandatory"))
                     continue
-                if len(selected) >= req.budget_items:
+                if optional_count >= req.budget_items:
                     decisions.append(self._decision(item, action="exclude", reason="budget"))
                     continue
-                if used_chars + len(item.summary) > req.budget_chars:
+                if optional_chars + len(item.summary) > req.budget_chars:
                     decisions.append(self._decision(item, action="exclude", reason="budget"))
                     continue
                 selected.append(item)
-                used_chars += len(item.summary)
+                optional_count += 1
+                optional_chars += len(item.summary)
                 decisions.append(self._decision(item, action="include", reason="selected"))
             status = "ok"
             reason = ""
+            warning = context_budget.item_count_warning(len(mandatory))
+            if warning:
+                warnings.append(warning)
 
         # Deterministic audit order: selected/ranked decisions first, then
         # scope/status/dedupe/port exclusions sorted by stable fields.
@@ -574,6 +595,7 @@ class RecallPlanner:
             mandatory_overflow=mandatory_overflow,
             layer_status=layer_status,
             counts=counts,
+            warnings=tuple(warnings),
         )
 
     # Common aliases used by embedding callers.

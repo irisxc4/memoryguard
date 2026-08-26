@@ -32,6 +32,11 @@ from memoryguard.system.manifest import ManifestManager, ManifestState
 
 def _patch_home(monkeypatch, home: Path) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CODEXROUTER_DATA", raising=False)
+    monkeypatch.delenv("CODEX_ROUTER_DATA", raising=False)
+    monkeypatch.delenv("CODEXROUTER_HOME", raising=False)
+    monkeypatch.delenv("CODEX_ROUTER_HOME", raising=False)
 
 
 def _activate_v2_workspace(workspace: Path) -> None:
@@ -281,6 +286,9 @@ def test_claude_global_scope_uses_user_config_and_stable_workspace(
         "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
         "MEMORYGUARD_HOME": str(workspace.resolve()),
+        "MEMORYGUARD_ADMIN": "1",
+        "MEMORYGUARD_SESSION_ID": "provider-claude-claude-global",
+        "MEMORYGUARD_SESSION_SOURCE": "host",
     }
     assert result["mcp_config_file"] == str(home / ".claude.json")
     assert (home / ".claude" / "CLAUDE.md").exists()
@@ -375,7 +383,8 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
         'enabled = true\n'
         'command = "python"\n'
         'args = ["-m", "memoryguard.mcp_server"]\n'
-        'env = { MEMORYGUARD_AGENT_ID = "old-agent" }\n\n'
+        '[mcp_servers.memoryguard.env]\n'
+        'MEMORYGUARD_AGENT_ID = "old-agent"\n\n'
         "# preserve this unrelated comment\n"
         '[features]\nkeep = true\n',
         encoding="utf-8",
@@ -403,6 +412,9 @@ def test_codex_global_install_migrates_unmarked_legacy_section(
         "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(workspace.resolve()),
         "MEMORYGUARD_HOME": str(workspace.resolve()),
+        "MEMORYGUARD_ADMIN": "1",
+        "MEMORYGUARD_SESSION_ID": "provider-codex-codex-legacy",
+        "MEMORYGUARD_SESSION_SOURCE": "host",
     }
     assert parsed["mcp_servers"]["other"]["command"] == "keep-me"
     assert parsed["features"]["keep"] is True
@@ -440,6 +452,9 @@ def test_repair_global_provider_configs_rebuilds_from_canonical_binding(
         "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(data_home.resolve()),
         "MEMORYGUARD_HOME": str(data_home.resolve()),
+        "MEMORYGUARD_ADMIN": "1",
+        "MEMORYGUARD_SESSION_ID": "provider-codex-codex-current",
+        "MEMORYGUARD_SESSION_SOURCE": "host",
     }
 
 
@@ -491,6 +506,9 @@ def test_codex_global_takeover_removes_superseded_project_override(
         "MEMORYGUARD_CONTROL_SCOPE": "global",
         "MEMORYGUARD_WORKSPACE": str(data_home.resolve()),
         "MEMORYGUARD_HOME": str(data_home.resolve()),
+        "MEMORYGUARD_ADMIN": "1",
+        "MEMORYGUARD_SESSION_ID": "provider-codex-codex-current",
+        "MEMORYGUARD_SESSION_SOURCE": "host",
     }
     assert not project_config.exists()
     assert not (project / "AGENTS.md").exists()

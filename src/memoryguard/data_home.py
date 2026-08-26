@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 # 环境变量名
 _ENV_DATA_HOME = "MEMORYGUARD_HOME"
@@ -36,6 +37,31 @@ _PROJECT_CONTROL_ARTIFACTS = frozenset(
     }
 )
 _V2_MANIFEST = Path(".memoryguard") / "system" / "manifest.db"
+
+
+class ControlHomeResolutionError(ValueError):
+    """Bare control commands found conflicting verified provider control homes."""
+
+    code = "stable_control_home_ambiguous"
+
+    def __init__(self, candidates: tuple[Path, ...]) -> None:
+        self.candidates = tuple(candidates)
+        detail = ", ".join(str(path) for path in self.candidates)
+        super().__init__(
+            "multiple verified MemoryGuard control homes; pass --data-home explicitly"
+            + (f": {detail}" if detail else "")
+        )
+
+    def to_payload(self, *, surface: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "code": self.code,
+            "error": self.code,
+            "surface": surface,
+            "message": str(self),
+            "candidates": [str(path) for path in self.candidates],
+        }
 
 
 def _user_data_dir() -> Path:
@@ -103,15 +129,42 @@ def resolve_data_home(explicit: str | Path | None = None) -> Path:
     return _safe_default_data_home()
 
 
-def resolve_runtime_data_home(explicit: str | Path | None = None) -> Path:
+def resolve_runtime_data_home(
+    explicit: str | Path | None = None,
+    *,
+    discover_stable_control_home: bool = False,
+) -> Path:
     """Resolve the sole V2 data plane used by production runtime surfaces.
 
     ``MEMORYGUARD_WORKSPACE`` and the current directory are intentionally not
     consulted here.  An explicit project-local legacy tree is rejected and
     falls back to the configured user data home; an explicit V2/isolated root
-    remains available for tests and operator-managed V2 installations.
+    remains available for tests and operator-managed V2 installations.  Bare
+    program-level CLI controls may additionally opt into a narrowly verified
+    provider lookup when their default global home is still V1.
     """
-    return resolve_data_home(explicit)
+    resolved = resolve_data_home(explicit)
+    explicit_or_env = bool(
+        (explicit is not None and str(explicit).strip())
+        or os.environ.get(_ENV_DATA_HOME, "").strip()
+    )
+    if (
+        not discover_stable_control_home
+        or explicit_or_env
+        or is_v2_data_home(resolved)
+    ):
+        return resolved
+
+    # Provider configuration is evidence only for bare program controls.  It
+    # never affects MCP/runtime data-plane selection and never examines cwd.
+    from .provider_adapters import discover_verified_codex_control_homes
+
+    candidates = discover_verified_codex_control_homes()
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise ControlHomeResolutionError(candidates)
+    return resolved
 
 
 def knowledge_db_path(data_home: Path | None = None) -> Path:

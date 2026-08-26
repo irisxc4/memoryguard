@@ -32,6 +32,149 @@ from ..storage.layout import WorkspaceV2Layout
 RULES_SCHEMA_VERSION = 2
 RULES_SCHEMA_MARKER = "memoryguard-v2-phase2-rules"
 
+# Classification is provenance, but historical reconciliation still needs one
+# deterministic canonical head.  Keep this ordering shared with the legacy
+# reconciliation adapter; it must be applied before confidence/revision/ID so
+# a lexical ID cannot make an ordinary fact outrank a durable procedure.
+_CANONICAL_RULE_KIND_PRIORITY = {
+    "episode": 0,
+    "fact": 1,
+    "project": 2,
+    "preference": 3,
+    "procedure": 4,
+    "correction": 5,
+}
+
+# ``RuleDefinition`` keeps modality as provenance, but modality also selects
+# the runtime injection channel.  A historical fold may therefore never cross
+# the mandatory/relevant boundary: the same body must remain available in both
+# channels when both governed definitions exist.  Within one channel this
+# ordering still selects the deterministic canonical head.
+_CANONICAL_RULE_STRENGTH_PRIORITY = {
+    "unknown": -1,
+    "observation": 0,
+    "suggestion": 1,
+    "recommended": 2,
+    "should": 3,
+    "must": 4,
+    "mandatory": 4,
+    "required": 4,
+}
+
+
+def canonical_rule_kind_priority(value: Any) -> int:
+    """Return the stable cross-kind canonicalization priority."""
+
+    return int(_CANONICAL_RULE_KIND_PRIORITY.get(str(value or "").casefold(), 1))
+
+
+def canonical_rule_strength_priority(value: Any) -> int:
+    """Return the stable priority used for canonical strength selection."""
+
+    return int(_CANONICAL_RULE_STRENGTH_PRIORITY.get(str(value or "").casefold(), 0))
+
+
+def _canonical_rule_strength(value: Any) -> str:
+    normalized = str(value or "").casefold().strip()
+    if normalized in {"mandatory", "required"}:
+        return "must"
+    if normalized not in {
+        "must", "should", "recommended", "suggestion", "observation",
+    }:
+        return "observation"
+    return normalized
+
+
+def _runtime_injection_layer(definition: RuleDefinition) -> str:
+    """Map stored strength/maturity onto the runtime injection channel."""
+
+    strength = _canonical_rule_strength(definition.rule_strength)
+    maturity = str(definition.maturity_state or "").casefold()
+    return "mandatory" if strength == "must" or maturity == "trusted" else "relevant"
+
+
+def _canonical_definition_metadata(
+    definitions: Sequence[RuleDefinition],
+) -> dict[str, Any]:
+    """Choose canonical metadata from all members of one safe topic fold.
+
+    The old winner ordering preferred kind before strength, so a procedure
+    carrying an observation could accidentally downgrade a MUST fact.  Keep
+    the strongest modality first, then the most durable kind, then confidence
+    and revision as deterministic tie-breakers.  These fields are metadata;
+    semantic safety is still decided solely by the shared claim composer.
+    """
+
+    if not definitions:
+        return {
+            "rule_strength": "observation",
+            "rule_kind": "fact",
+            "confidence": 0.0,
+            "maturity_state": "observing",
+        }
+    strength = max(
+        definitions,
+        key=lambda definition: (
+            canonical_rule_strength_priority(definition.rule_strength),
+            _canonical_rule_strength(definition.rule_strength),
+        ),
+    )
+    kind = max(
+        definitions,
+        key=lambda definition: (
+            canonical_rule_kind_priority(definition.rule_kind),
+            str(definition.rule_kind or ""),
+        ),
+    )
+    maturity_order = {
+        "observing": 0,
+        "candidate": 1,
+        "validated": 2,
+        "trusted": 3,
+    }
+    maturity = max(
+        definitions,
+        key=lambda definition: (
+            maturity_order.get(str(definition.maturity_state or "").casefold(), 0),
+            float(definition.confidence or 0.0),
+            int(definition.revision or 0),
+            str(definition.definition_id),
+        ),
+    )
+    return {
+        "rule_strength": _canonical_rule_strength(strength.rule_strength),
+        "rule_kind": str(kind.rule_kind or "fact"),
+        "confidence": max(float(definition.confidence or 0.0) for definition in definitions),
+        "maturity_state": str(maturity.maturity_state or "observing"),
+    }
+
+
+def _compose_canonical_bodies(bodies: Sequence[str]) -> Any:
+    """Call the shared claim composer at the V2 storage boundary."""
+
+    from ..runtime_v2.canonical_claims import compose_canonical_bodies
+
+    return compose_canonical_bodies([str(body or "") for body in bodies])
+
+
+def _claims_share_canonical_topic(left: str, right: str) -> bool:
+    """Use the canonical claim module's shared topic predicate."""
+
+    from ..runtime_v2.canonical_claims import claims_related
+
+    return bool(claims_related(str(left or ""), str(right or "")))
+
+
+def _canonical_relation_kind(left: str, right: str) -> str:
+    """Return the shared governance relation without making provenance a gate."""
+
+    from ..runtime_v2.governance_semantics import classify_governance_relation
+
+    return str(
+        classify_governance_relation(str(left or ""), str(right or "")).kind
+        or ""
+    ).casefold()
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1147,6 +1290,68 @@ class RuleV2Store:
         value = dict(value); value.setdefault("source_link_id", stable_digest((value.get("source_kind", "shared_memory"), value.get("share_group_id", ""), value.get("memory_id", ""), value.get("source_ref", ""))))
         return self._insert_natural_exact("rule_source_links", "source_link_id", ("source_kind", "share_group_id", "memory_id", "source_ref"), value)
 
+    def get_source_link(
+        self, share_group_id: str, memory_id: str,
+    ) -> dict[str, Any] | None:
+        """Read one native source link using the canonical V2 table."""
+        row = self._read(lambda conn: conn.execute(
+            "SELECT * FROM rule_source_links WHERE share_group_id=? AND memory_id=? "
+            "ORDER BY updated_at DESC, source_link_id DESC LIMIT 1",
+            (str(share_group_id or ""), str(memory_id or "")),
+        ).fetchone())
+        return None if row is None else _row_dict(row)
+
+    def list_source_links(
+        self,
+        *,
+        share_group_id: str | None = None,
+        status: str | None = None,
+        canonical_definition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List native source links without exposing evidence as ownership."""
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            clauses, params = ["1=1"], []
+            for column, value in (
+                ("share_group_id", share_group_id),
+                ("status", status),
+                ("canonical_definition_id", canonical_definition_id),
+            ):
+                if value is not None:
+                    clauses.append(column + "=?")
+                    params.append(value)
+            rows = conn.execute(
+                "SELECT * FROM rule_source_links WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY share_group_id, memory_id, source_link_id",
+                params,
+            ).fetchall()
+            return [_row_dict(row) for row in rows]
+        return self._read(op)
+
+    def resolve_canonical(self, definition_id: str) -> str:
+        """Follow native alias/supersession rows without reviving old heads."""
+        current = str(definition_id or "")
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            definition = self.get_definition(current)
+            if definition is None:
+                break
+            status = str(getattr(definition, "status", "") or "").casefold()
+            successor = str(getattr(definition, "superseded_by", "") or "")
+            if not successor:
+                alias = self._read(lambda conn: conn.execute(
+                    "SELECT new_definition_id FROM rule_definition_aliases "
+                    "WHERE old_definition_id=?",
+                    (current,),
+                ).fetchone())
+                successor = str(alias[0] or "") if alias is not None else ""
+            if status in {"alias", "merged", "superseded"} and successor:
+                current = successor
+                continue
+            break
+        return current
+
     def upsert_exception(self, value: Mapping[str, Any]) -> str:
         value = dict(value); value.setdefault("exception_id", stable_digest((value.get("parent_rule_id", value.get("parent_rule", "")), value.get("child_exception_id", value.get("child_exception", "")), value.get("source_ref", ""))))
         return self._insert_natural_exact("rule_exceptions", "exception_id", ("parent_rule_id", "child_exception_id", "source_ref"), value)
@@ -1569,8 +1774,1044 @@ class RuleV2Store:
             "created_at": _now(),
         })
 
+    @staticmethod
+    def _binding_identity_row(row: sqlite3.Row) -> tuple[str, ...]:
+        """Return the audience identity used when folding bindings.
+
+        Priority is a policy weight, not audience scope.  Excluding it here
+        lets equal audiences with different priorities fold to one binding;
+        the merge path raises that binding to the maximum priority first.
+        """
+
+        return (
+            str(row["target_type"] or ""), str(row["target_id"] or ""),
+            str(row["project_ref"] or ""), str(row["provider"] or "").casefold(),
+            str(row["runtime_role"] or "").casefold(),
+            str(row["effect"] or "include").casefold(),
+        )
+
+    def _canonicalize_binding_policy_conn(
+        self,
+        conn: sqlite3.Connection,
+        winner_definition_id: str,
+        loser_definition_id: str,
+    ) -> None:
+        """Raise canonical binding policy without dropping provenance rows."""
+
+        winner_bindings = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active' "
+            "ORDER BY binding_id",
+            (winner_definition_id,),
+        ).fetchall()
+        loser_bindings = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active' "
+            "ORDER BY binding_id",
+            (loser_definition_id,),
+        ).fetchall()
+        winner_by_scope = {
+            self._binding_identity_row(row): row for row in winner_bindings
+        }
+        now = _now()
+        for loser in loser_bindings:
+            winner = winner_by_scope.get(self._binding_identity_row(loser))
+            if winner is None:
+                continue
+            winner_priority = max(
+                int(winner["priority"] or 0), int(loser["priority"] or 0),
+            )
+            if winner_priority != int(winner["priority"] or 0):
+                conn.execute(
+                    "UPDATE rule_bindings SET priority=?,revision=revision+1,"
+                    "updated_at=? WHERE binding_id=?",
+                    (winner_priority, now, str(winner["binding_id"])),
+                )
+
+    def _migrate_legacy_definition_conn(
+        self,
+        conn: sqlite3.Connection,
+        old_definition_id: str,
+        new_definition_id: str,
+        *,
+        migration_decision_id: str = "",
+        source_rule_id: str = "",
+    ) -> list[tuple[str, ...]] | None:
+        """Move one V2 definition inside caller transaction.
+
+        V2 has no legacy sidecar evidence tables.  Repoint every native
+        definition-owned projection in this transaction, preserve old
+        bindings as superseded rows, and append an immutable alias.  Alias
+        existence is the replay fence: a second call performs no writes.
+        """
+        if old_definition_id == new_definition_id:
+            return None
+        old = conn.execute(
+            "SELECT * FROM rule_definitions WHERE definition_id=?",
+            (old_definition_id,),
+        ).fetchone()
+        if old is None or str(old["status"] or "").casefold() in {
+            "alias", "merged", "superseded",
+        }:
+            return None
+        alias = conn.execute(
+            "SELECT new_definition_id FROM rule_definition_aliases "
+            "WHERE old_definition_id=?",
+            (old_definition_id,),
+        ).fetchone()
+        if alias is not None:
+            if str(alias[0] or "") != str(new_definition_id):
+                raise ValueError("immutable rule_definition_aliases conflict")
+            return None
+        if conn.execute(
+            "SELECT 1 FROM rule_definitions WHERE definition_id=?",
+            (new_definition_id,),
+        ).fetchone() is None:
+            raise ValueError("canonical_definition_missing")
+
+        now = _now()
+        old_bindings = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active' "
+            "ORDER BY binding_id",
+            (old_definition_id,),
+        ).fetchall()
+        new_bindings = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active' "
+            "ORDER BY binding_id",
+            (new_definition_id,),
+        ).fetchall()
+        removed_audiences = [self._binding_identity_row(row) for row in old_bindings]
+        new_by_audience = {
+            self._binding_identity_row(row): row for row in new_bindings
+        }
+
+        for old_binding in old_bindings:
+            old_binding_id = str(old_binding["binding_id"])
+            target = new_by_audience.get(self._binding_identity_row(old_binding))
+            target_id = str(target["binding_id"]) if target is not None else ""
+            contributions = conn.execute(
+                "SELECT * FROM rule_binding_contributions WHERE binding_id=? "
+                "ORDER BY contribution_id",
+                (old_binding_id,),
+            ).fetchall()
+            for contribution in contributions:
+                contribution_id = str(contribution["contribution_id"])
+                if target_id:
+                    existing = conn.execute(
+                        "SELECT contribution_id FROM rule_binding_contributions "
+                        "WHERE share_group_id=? AND source_memory_id=? "
+                        "AND legacy_assignment_hash=? AND contribution_id<>?",
+                        (
+                            str(contribution["share_group_id"] or ""),
+                            str(contribution["source_memory_id"] or ""),
+                            str(contribution["legacy_assignment_hash"] or ""),
+                            contribution_id,
+                        ),
+                    ).fetchone()
+                    if existing is not None:
+                        # Keep both provenance rows, but only one contributes
+                        # to active readback.
+                        conn.execute(
+                            "UPDATE rule_binding_contributions SET definition_id=?, "
+                            "active=0,status='superseded',updated_at=? "
+                            "WHERE contribution_id=?",
+                            (new_definition_id, now, contribution_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE rule_binding_contributions SET definition_id=?, "
+                            "binding_id=?,updated_at=? WHERE contribution_id=?",
+                            (new_definition_id, target_id, now, contribution_id),
+                        )
+                else:
+                    conn.execute(
+                        "UPDATE rule_binding_contributions SET definition_id=?, "
+                        "updated_at=? WHERE contribution_id=?",
+                        (new_definition_id, now, contribution_id),
+                    )
+            if target_id:
+                conn.execute(
+                    "UPDATE rule_bindings SET status='superseded',revision=revision+1,"
+                    "updated_at=? WHERE binding_id=?",
+                    (now, old_binding_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE rule_bindings SET definition_id=?,revision=revision+1,"
+                    "updated_at=? WHERE binding_id=?",
+                    (new_definition_id, now, old_binding_id),
+                )
+
+        # All native evidence/projection rows remain auditable; only their
+        # canonical owner changes.  Tables are schema-owned, so explicit SQL
+        # makes missing/unknown columns fail closed inside this transaction.
+        for table in (
+            "rule_evidence_refs", "rule_negative_evidence_refs",
+            "rule_evidence_contributions", "rule_evidence_effective",
+            "rule_effective_feedback_projection", "rule_evidence_outbox",
+            "rule_receipt_refs", "rule_feedback_refs",
+            "rule_runtime_feedback_refs", "rule_runtime_stats",
+        ):
+            conn.execute(
+                f"UPDATE {table} SET definition_id=? WHERE definition_id=?",
+                (new_definition_id, old_definition_id),
+            )
+        conn.execute(
+            "UPDATE rule_source_links SET canonical_definition_id=?,updated_at=? "
+            "WHERE canonical_definition_id=?",
+            (new_definition_id, now, old_definition_id),
+        )
+        conn.execute(
+            "UPDATE rule_definitions SET status='alias',superseded_by=?,"
+            "revision=revision+1,updated_at=? WHERE definition_id=?",
+            (new_definition_id, now, old_definition_id),
+        )
+        conn.execute(
+            "INSERT INTO rule_definition_aliases(old_definition_id,new_definition_id,"
+            "migration_decision_id,source_ref,created_at) VALUES(?,?,?,?,?)",
+            (
+                old_definition_id, new_definition_id,
+                str(migration_decision_id or ""),
+                f"reconciliation:{migration_decision_id}" if migration_decision_id else "",
+                now,
+            ),
+        )
+        return removed_audiences
+
+    def migrate_legacy_definition(
+        self,
+        old_definition_id: str,
+        new_definition_id: str,
+        *,
+        migration_decision_id: str = "",
+        source_rule_id: str = "",
+    ) -> list[tuple[str, ...]] | None:
+        """Atomically alias one native V2 definition to another."""
+        return self._write(lambda conn: self._migrate_legacy_definition_conn(
+            conn, old_definition_id, new_definition_id,
+            migration_decision_id=migration_decision_id,
+            source_rule_id=source_rule_id,
+        ))
+
+    @staticmethod
+    def _reconciliation_primary_keys() -> dict[str, str]:
+        return {
+            "rule_definitions": "definition_id",
+            "rule_bindings": "binding_id",
+            "rule_binding_contributions": "contribution_id",
+            "rule_evidence_refs": "evidence_id",
+            "rule_negative_evidence_refs": "evidence_id",
+            "rule_evidence_contributions": "contribution_id",
+            "rule_evidence_effective": "effective_id",
+            "rule_effective_feedback_projection": "receipt_id",
+            "rule_evidence_outbox": "event_id",
+            "rule_receipt_refs": "receipt_id",
+            "rule_feedback_refs": "feedback_id",
+            "rule_runtime_feedback_refs": "feedback_id",
+            "rule_runtime_stats": "stats_id",
+            "rule_source_links": "source_link_id",
+            "rule_definition_versions": "version_id",
+            "rule_definition_aliases": "old_definition_id",
+            "rule_decisions": "decision_id",
+        }
+
+    def _reconciliation_before_conn(
+        self,
+        conn: sqlite3.Connection,
+        old_definition_id: str,
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """Capture exact rows touched by one native alias migration."""
+        rows: dict[str, dict[str, dict[str, Any]]] = {}
+
+        def add(table: str, query: str, params: tuple[Any, ...]) -> None:
+            primary = self._reconciliation_primary_keys()[table]
+            selected = conn.execute(query, params).fetchall()
+            rows[table] = {
+                str(row[primary]): _row_dict(row) for row in selected
+            }
+
+        add(
+            "rule_definitions",
+            "SELECT * FROM rule_definitions WHERE definition_id=?",
+            (old_definition_id,),
+        )
+        add(
+            "rule_bindings",
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active'",
+            (old_definition_id,),
+        )
+        binding_ids = tuple(rows["rule_bindings"])
+        if binding_ids:
+            marks = ",".join("?" for _ in binding_ids)
+            add(
+                "rule_binding_contributions",
+                f"SELECT * FROM rule_binding_contributions WHERE binding_id IN ({marks})",
+                binding_ids,
+            )
+        else:
+            rows["rule_binding_contributions"] = {}
+        for table in (
+            "rule_evidence_refs", "rule_negative_evidence_refs",
+            "rule_evidence_contributions", "rule_evidence_effective",
+            "rule_effective_feedback_projection", "rule_evidence_outbox",
+            "rule_receipt_refs", "rule_feedback_refs",
+            "rule_runtime_feedback_refs", "rule_runtime_stats",
+        ):
+            add(
+                table,
+                f"SELECT * FROM {table} WHERE definition_id=?",
+                (old_definition_id,),
+            )
+        add(
+            "rule_source_links",
+            "SELECT * FROM rule_source_links WHERE canonical_definition_id=?",
+            (old_definition_id,),
+        )
+        rows["rule_definition_versions"] = {}
+        rows["rule_definition_aliases"] = {}
+        rows["rule_decisions"] = {}
+        return rows
+
+    def _reconciliation_after_conn(
+        self,
+        conn: sqlite3.Connection,
+        before: Mapping[str, Mapping[str, Mapping[str, Any]]],
+        created: Mapping[str, Sequence[str]],
+    ) -> dict[str, Any]:
+        primary_keys = self._reconciliation_primary_keys()
+        delta: dict[str, Any] = {"updated": {}, "created": {}}
+        for table, prior_rows in before.items():
+            primary = primary_keys[table]
+            pairs = []
+            for row_id, prior in prior_rows.items():
+                current = conn.execute(
+                    f"SELECT * FROM {table} WHERE {primary}=?", (row_id,),
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError(f"reconciliation_delta_row_missing:{table}:{row_id}")
+                pairs.append({"before": dict(prior), "after": _row_dict(current)})
+            if pairs:
+                delta["updated"][table] = pairs
+        for table, row_ids in created.items():
+            primary = primary_keys[table]
+            created_rows = []
+            for row_id in row_ids:
+                current = conn.execute(
+                    f"SELECT * FROM {table} WHERE {primary}=?", (row_id,),
+                ).fetchone()
+                if current is None:
+                    raise RuntimeError(f"reconciliation_delta_created_missing:{table}:{row_id}")
+                created_rows.append(_row_dict(current))
+            if created_rows:
+                delta["created"][table] = created_rows
+        return delta
+
+    @staticmethod
+    def _reconciliation_scope_digest(scope: Mapping[str, Any]) -> str:
+        return stable_digest(scope)
+
+    @staticmethod
+    def _cross_audience_scope_compatible(
+        left_scope: Mapping[str, Any],
+        right_scope: Mapping[str, Any],
+    ) -> bool:
+        """Allow audience fan-out without crossing project/runtime scope."""
+
+        def non_audience_scope(scope: Mapping[str, Any]) -> set[tuple[str, ...]]:
+            projected: set[tuple[str, ...]] = set()
+            for item in scope.get("bindings", ()):
+                share_group, target_type, target_id, project_ref, provider, runtime_role, effect = item
+                normalized_type = str(target_type or "").casefold()
+                # Group/agent target_id is the audience dimension.  A project
+                # target_id identifies the project scope itself and must stay
+                # in the compatibility key.
+                project_target = str(target_id or "") if normalized_type == "project" else ""
+                projected.add((
+                    str(share_group or ""), normalized_type, project_target,
+                    str(project_ref or ""), str(provider or "").casefold(),
+                    str(runtime_role or "").casefold(), str(effect or "").casefold(),
+                ))
+            return projected
+
+        return non_audience_scope(left_scope) == non_audience_scope(right_scope)
+
+    def _reconciliation_scope_conn(
+        self,
+        conn: sqlite3.Connection,
+        definition_id: str,
+    ) -> dict[str, Any]:
+        bindings = conn.execute(
+            "SELECT * FROM rule_bindings WHERE definition_id=? AND status='active' "
+            "ORDER BY share_group_id,binding_id",
+            (definition_id,),
+        ).fetchall()
+        # Audience identity is a set: repeated active bindings for the same
+        # audience are provenance/policy duplicates, not a distinct scope.
+        binding_scope = {
+            (
+                str(row["share_group_id"] or ""),
+                *self._binding_identity_row(row),
+            )
+            for row in bindings
+        }
+        # Source links are provenance, not audience.  Their source_kind,
+        # source_ref, multiplicity, and status must never make equal active
+        # bindings look like different scopes.
+        return {
+            "bindings": sorted(binding_scope),
+        }
+
+    def _reconciliation_decision_conn(
+        self,
+        conn: sqlite3.Connection,
+        payload: Mapping[str, Any],
+    ) -> str:
+        """Insert or reactivate deterministic reconciliation decision."""
+        item = dict(payload)
+        decision_id = str(item["decision_id"])
+        existing = conn.execute(
+            "SELECT metadata_json FROM rule_decisions WHERE decision_id=?",
+            (decision_id,),
+        ).fetchone()
+        if existing is None:
+            return self.record_decision(item)
+        metadata = _json_object(existing["metadata_json"])
+        if str(metadata.get("undo_state") or "") != "undone":
+            raise ValueError("immutable reconciliation decision conflict")
+        prior_undo = metadata.get("undo_history", [])
+        if not isinstance(prior_undo, list):
+            prior_undo = [prior_undo]
+        prior_undo.append(metadata)
+        item_metadata = _json_object(item.get("metadata_json", {}))
+        item_metadata["undo_history"] = prior_undo
+        item["metadata_json"] = _json(item_metadata)
+        columns = (
+            "actor", "rule_id", "action", "before_hash", "after_hash",
+            "before_json", "after_json", "reason", "undo_id",
+            "metadata_json", "source_ref",
+        )
+        conn.execute(
+            "UPDATE rule_decisions SET "
+            + ",".join(f"{column}=?" for column in columns)
+            + " WHERE decision_id=?",
+            tuple(item.get(column, "") for column in columns) + (decision_id,),
+        )
+        return decision_id
+
+    def _update_composed_definition_conn(
+        self,
+        conn: sqlite3.Connection,
+        winner: RuleDefinition,
+        body: str,
+        *,
+        canonical_metadata: Mapping[str, Any] | None = None,
+    ) -> RuleDefinition:
+        """Rebuild and atomically persist one canonical definition body."""
+
+        composed_body = str(body or "").strip()
+        if not composed_body:
+            raise ValueError("canonical_composed_body_empty")
+        metadata = dict(canonical_metadata or {})
+        canonical_kind = str(metadata.get("rule_kind") or winner.rule_kind or "fact")
+        canonical_strength = str(
+            metadata.get("rule_strength") or winner.rule_strength or "observation"
+        )
+        canonical_confidence = float(
+            metadata.get("confidence")
+            if metadata.get("confidence") is not None
+            else (winner.confidence or 0.0)
+        )
+        rebuilt = build_definition(
+            composed_body,
+            kind=canonical_kind,
+            confidence=canonical_confidence,
+            created_at=winner.created_at,
+            rule_strength=canonical_strength,
+        )
+        now = _now()
+        conn.execute(
+            "UPDATE rule_definitions SET text=?,canonical_text=?,"
+            "normalized_intent=?,semantic_hash=?,parameter_schema=?,"
+            "polarity=?,rule_kind=?,confidence=?,revision=?,status='active',"
+            "state='active',maturity_state=?,superseded_by='',updated_at=? "
+            "WHERE definition_id=?",
+            (
+                composed_body,
+                rebuilt.canonical_text,
+                rebuilt.normalized_intent,
+                rebuilt.semantic_hash,
+                rebuilt.parameter_schema,
+                # The composed body is the canonical claim surface.  Recompute
+                # polarity from it so a stale historical projection cannot
+                # relabel a mixed positive/safety topic by winner accident.
+                str(rebuilt.polarity),
+                canonical_kind,
+                canonical_confidence,
+                int(winner.revision or 1) + 1,
+                str(metadata.get("maturity_state") or winner.maturity_state or rebuilt.maturity_state),
+                now,
+                winner.definition_id,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM rule_definitions WHERE definition_id=?",
+            (winner.definition_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("canonical_winner_missing_after_composition")
+        return self._definition_row(row)
+
+    def reconcile_historical_duplicates(
+        self,
+        share_group_id: str,
+        *,
+        actor: str = "memoryguard-reconciliation",
+    ) -> dict[str, Any]:
+        """Fold safe historical duplicates in production V2 storage.
+
+        One transaction covers selection, versions, ownership moves, alias,
+        receipt, and rollback decision.  Same-audience compatibility is
+        claim/topic-level through the shared composer; cross-audience folds
+        are limited to exact/equivalent, non-expanding claims.  Polarity,
+        strength, and noisy intent projections are canonicalized metadata,
+        not duplicate gates.
+        """
+        group = str(share_group_id or "").strip()
+        if not group:
+            raise ValueError("share_group_id_required")
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            links = [
+                _row_dict(row) for row in conn.execute(
+                    "SELECT * FROM rule_source_links WHERE share_group_id=? "
+                    "AND status='active' ORDER BY source_link_id",
+                    (group,),
+                ).fetchall()
+            ]
+            links_by_definition: dict[str, list[dict[str, Any]]] = {}
+            for link in links:
+                definition_id = str(
+                    link.get("canonical_definition_id")
+                    or link.get("original_definition_id") or ""
+                )
+                if definition_id:
+                    links_by_definition.setdefault(definition_id, []).append(link)
+
+            reachable_ids = {
+                str(row["definition_id"] or "")
+                for row in conn.execute(
+                    "SELECT DISTINCT definition_id FROM rule_bindings "
+                    "WHERE share_group_id=? AND status='active' AND effect='include'",
+                    (group,),
+                ).fetchall()
+            }
+            reachable_ids.update(links_by_definition)
+            definition_rows = [
+                row for row in conn.execute(
+                    "SELECT * FROM rule_definitions WHERE status='active' "
+                    "ORDER BY definition_id"
+                ).fetchall()
+                if str(row["definition_id"] or "") in reachable_ids
+            ]
+            definitions = [self._definition_row(row) for row in definition_rows]
+            definition_bodies = {
+                str(row["definition_id"]): str(
+                    row["text"] or row["canonical_text"] or ""
+                ).strip()
+                for row in definition_rows
+            }
+
+            # Build conservative pairwise-safe clusters.  Exact compatibility
+            # keys miss additive claims; a transitive semantic cluster can also
+            # swallow a conflict.  Every pair must pass the shared topic
+            # composer plus the hard audience-scope gate.  Equal/equivalent
+            # claims on opposite injection channels must coexist; additive
+            # topic members still fold and canonicalize stored metadata.
+            clusters: list[list[RuleDefinition]] = []
+
+            def pair_result(
+                left: RuleDefinition, right: RuleDefinition,
+            ) -> Any | None:
+                left_scope = self._reconciliation_scope_conn(
+                    conn, left.definition_id,
+                )
+                right_scope = self._reconciliation_scope_conn(
+                    conn, right.definition_id,
+                )
+                same_scope = left_scope == right_scope
+                left_share_groups = {
+                    str(item[0] or "")
+                    for item in left_scope.get("bindings", ())
+                }
+                right_share_groups = {
+                    str(item[0] or "")
+                    for item in right_scope.get("bindings", ())
+                }
+                same_share_groups = left_share_groups == right_share_groups
+                left_body = definition_bodies.get(
+                    left.definition_id, left.canonical_text,
+                )
+                right_body = definition_bodies.get(
+                    right.definition_id, right.canonical_text,
+                )
+                topic_related = _claims_share_canonical_topic(left_body, right_body)
+                relation_kind = _canonical_relation_kind(left_body, right_body)
+                if (
+                    _runtime_injection_layer(left)
+                    != _runtime_injection_layer(right)
+                    and relation_kind in {"exact", "equivalent", "update"}
+                ):
+                    return None
+                result = _compose_canonical_bodies([
+                    left_body,
+                    right_body,
+                ])
+                if (
+                    not topic_related
+                    or getattr(result, "rejected_conflicts", ())
+                    or getattr(result, "rejected_unrelated", ())
+                    or not getattr(result, "claims", ())
+                ):
+                    return None
+                if (
+                    _runtime_injection_layer(left)
+                    != _runtime_injection_layer(right)
+                ):
+                    left_count = len(
+                        _compose_canonical_bodies([left_body]).claims or (),
+                    )
+                    right_count = len(
+                        _compose_canonical_bodies([right_body]).claims or (),
+                    )
+                    if len(result.claims) <= max(left_count, right_count):
+                        return None
+                if same_scope:
+                    # Same audience may safely retain additive claims within
+                    # one topic, subject to the composer and topic predicate.
+                    return result if topic_related else None
+
+                # Across different audiences, only an exact/equivalent claim
+                # may be canonicalized.  Compare the composed claim count to
+                # each single-source composition so the fold cannot expand one
+                # audience's content into another audience's additive topic.
+                if not same_share_groups:
+                    return None
+                if not self._cross_audience_scope_compatible(left_scope, right_scope):
+                    return None
+                if relation_kind not in {"exact", "equivalent"}:
+                    return None
+                left_single = _compose_canonical_bodies([left_body])
+                right_single = _compose_canonical_bodies([right_body])
+                if (
+                    left_single.rejected_conflicts
+                    or left_single.rejected_unrelated
+                    or right_single.rejected_conflicts
+                    or right_single.rejected_unrelated
+                    or not left_single.claims
+                    or not right_single.claims
+                    or len(result.claims) > max(
+                        len(left_single.claims), len(right_single.claims),
+                    )
+                ):
+                    return None
+                return result
+
+            for definition in definitions:
+                chosen: list[RuleDefinition] | None = None
+                for cluster in clusters:
+                    candidate = [*cluster, definition]
+                    if all(
+                        pair_result(left, right) is not None
+                        for index, left in enumerate(candidate)
+                        for right in candidate[index + 1:]
+                    ):
+                        chosen = cluster
+                        break
+                if chosen is None:
+                    clusters.append([definition])
+                else:
+                    chosen.append(definition)
+
+            merged = 0
+            conflicts = 0
+            details: list[dict[str, Any]] = []
+            rejected_pairs: set[tuple[str, str]] = set()
+            # Preserve an explicit diagnostic for same-topic siblings that
+            # fail a scope/semantic policy.  They are intentionally kept in
+            # separate clusters, so counting only inside the merge loop would
+            # lose the conflict entirely.
+            for index, left in enumerate(definitions):
+                for right in definitions[index + 1:]:
+                    rough_same_intent = _claims_share_canonical_topic(
+                        definition_bodies.get(
+                            left.definition_id, left.canonical_text,
+                        ),
+                        definition_bodies.get(
+                            right.definition_id, right.canonical_text,
+                        ),
+                    )
+                    if rough_same_intent and pair_result(left, right) is None:
+                        pair_key = tuple(sorted((left.definition_id, right.definition_id)))
+                        rejected_pairs.add(pair_key)
+                        conflicts += 1
+                        left_scope = self._reconciliation_scope_conn(
+                            conn, left.definition_id,
+                        )
+                        right_scope = self._reconciliation_scope_conn(
+                            conn, right.definition_id,
+                        )
+                        details.append({
+                            "status": "preserved_conflict",
+                            "winner": left.definition_id,
+                            "candidate": right.definition_id,
+                            "reason": (
+                                "scope_mismatch"
+                                if left_scope != right_scope
+                                else "governance_conflict"
+                            ),
+                            "winner_scope_digest": self._reconciliation_scope_digest(left_scope),
+                            "candidate_scope_digest": self._reconciliation_scope_digest(right_scope),
+                        })
+            for candidates in sorted(
+                clusters,
+                key=lambda items: tuple(item.definition_id for item in items),
+            ):
+                if len(candidates) < 2:
+                    continue
+                ordered = sorted(
+                    candidates,
+                    key=lambda definition: (
+                        -canonical_rule_strength_priority(definition.rule_strength),
+                        -canonical_rule_kind_priority(definition.rule_kind),
+                        -float(definition.confidence or 0.0),
+                        -int(definition.revision or 0),
+                        str(definition.definition_id),
+                    ),
+                )
+                winner = ordered[0]
+                for loser in ordered[1:]:
+                    winner_scope = self._reconciliation_scope_conn(
+                        conn, winner.definition_id,
+                    )
+                    loser_scope = self._reconciliation_scope_conn(
+                        conn, loser.definition_id,
+                    )
+                    pair = pair_result(winner, loser)
+                    if pair is None:
+                        pair_key = tuple(sorted((winner.definition_id, loser.definition_id)))
+                        if pair_key not in rejected_pairs:
+                            conflicts += 1
+                            rejected_pairs.add(pair_key)
+                        details.append({
+                            "status": "preserved_conflict",
+                            "winner": winner.definition_id,
+                            "candidate": loser.definition_id,
+                            "reason": (
+                                "scope_mismatch"
+                                if loser_scope != winner_scope
+                                else "governance_conflict"
+                            ),
+                            "winner_scope_digest": self._reconciliation_scope_digest(winner_scope),
+                            "candidate_scope_digest": self._reconciliation_scope_digest(loser_scope),
+                        })
+                        continue
+                    decision_id = stable_digest((
+                        "historical-reconciliation", group,
+                        winner.definition_id, loser.definition_id,
+                    ))
+                    source_ref = f"reconciliation:{decision_id}"
+                    winner_before = self._reconciliation_before_conn(
+                        conn, winner.definition_id,
+                    )
+                    loser_before = self._reconciliation_before_conn(
+                        conn, loser.definition_id,
+                    )
+                    before_delta = {
+                        table: {
+                            **winner_before.get(table, {}),
+                            **loser_before.get(table, {}),
+                        }
+                        for table in set(winner_before) | set(loser_before)
+                    }
+                    source_rule_id = str(
+                        links_by_definition.get(loser.definition_id, [{}])[0]
+                        .get("memory_id", "")
+                    )
+                    winner_snapshot = winner.to_dict()
+                    loser_snapshot = loser.to_dict()
+                    winner_version_id = stable_digest((
+                        "historical-reconciliation-winner-version", decision_id,
+                    ))
+                    loser_version_id = stable_digest((
+                        "historical-reconciliation-loser-version", decision_id,
+                    ))
+                    receipt_id = stable_digest((
+                        "historical-reconciliation-receipt", decision_id,
+                    ))
+                    self.record_definition_version(
+                        winner.definition_id,
+                        snapshot=winner_snapshot,
+                        reason="historical_duplicate_fold_winner",
+                        actor=actor,
+                        source_ref=source_ref,
+                        version_id=winner_version_id,
+                    )
+                    self.record_definition_version(
+                        loser.definition_id,
+                        snapshot=loser_snapshot,
+                        reason="historical_duplicate_fold_loser",
+                        actor=actor,
+                        source_ref=source_ref,
+                        version_id=loser_version_id,
+                    )
+                    composed = _compose_canonical_bodies([
+                        definition_bodies.get(
+                            winner.definition_id, winner.canonical_text,
+                        ),
+                        definition_bodies.get(
+                            loser.definition_id, loser.canonical_text,
+                        ),
+                    ])
+                    if (
+                        composed.rejected_conflicts
+                        or composed.rejected_unrelated
+                        or not composed.claims
+                    ):
+                        raise ValueError("canonical_composition_rejected")
+                    winner = self._update_composed_definition_conn(
+                        conn,
+                        winner,
+                        str(composed.body or ""),
+                        canonical_metadata=_canonical_definition_metadata(
+                            (winner, loser),
+                        ),
+                    )
+                    definition_bodies[winner.definition_id] = str(
+                        composed.body or ""
+                    ).strip()
+                    self._canonicalize_binding_policy_conn(
+                        conn, winner.definition_id, loser.definition_id,
+                    )
+                    migrated = self._migrate_legacy_definition_conn(
+                        conn, loser.definition_id, winner.definition_id,
+                        migration_decision_id=decision_id,
+                        source_rule_id=source_rule_id,
+                    )
+                    if migrated is None:
+                        continue
+                    self.record_receipt({
+                        "receipt_id": receipt_id,
+                        "source_ref": source_ref,
+                        "source_rule_id": loser.definition_id,
+                        "definition_id": winner.definition_id,
+                        "share_group_id": group,
+                        "metadata_json": _json({
+                            "status": "accepted",
+                            "reason": "historical_duplicate_fold",
+                        }),
+                    })
+                    delta = self._reconciliation_after_conn(
+                        conn,
+                        before_delta,
+                        {
+                            "rule_definition_versions": [
+                                winner_version_id, loser_version_id,
+                            ],
+                            "rule_definition_aliases": [loser.definition_id],
+                            "rule_receipt_refs": [receipt_id],
+                        },
+                    )
+                    decision_payload = {
+                        "decision_id": decision_id,
+                        "actor": actor,
+                        "rule_id": loser.definition_id,
+                        "action": "historical_duplicate_fold",
+                        "before_hash": stable_digest({
+                            "winner": winner_snapshot,
+                            "loser": loser_snapshot,
+                        }),
+                        "after_hash": stable_digest({
+                            "definition_id": winner.definition_id,
+                            "body": composed.body,
+                        }),
+                        "before_json": _json({
+                            "winner": winner_snapshot,
+                            "loser": loser_snapshot,
+                        }),
+                        "after_json": _json({
+                            "definition_id": winner.definition_id,
+                            "body": composed.body,
+                            "claims": list(composed.claims),
+                        }),
+                        "reason": "historical_duplicate_fold",
+                        "undo_id": decision_id,
+                        "source_ref": source_ref,
+                        "metadata_json": _json({
+                            "reconciliation": True,
+                            "undo_state": "active",
+                            "share_group_id": group,
+                            "winner_definition_id": winner.definition_id,
+                            "loser_definition_id": loser.definition_id,
+                            "source_scope": winner_scope,
+                        "inverse_delta": delta,
+                            "winner_before": winner_snapshot,
+                            "loser_before": loser_snapshot,
+                        }),
+                    }
+                    self._reconciliation_decision_conn(conn, decision_payload)
+                    merged += 1
+                    details.append({
+                        "status": "merged",
+                        "winner": winner.definition_id,
+                        "merged": loser.definition_id,
+                        "decision_id": decision_id,
+                        "undo_id": decision_id,
+                    })
+            return {
+                "share_group_id": group,
+                "merged_count": merged,
+                "conflict_count": conflicts,
+                "details": details,
+            }
+
+        return self._write(op)
+
+    def undo_historical_duplicate(
+        self,
+        decision_id: str,
+        *,
+        share_group_id: str = "",
+        actor: str = "",
+    ) -> dict[str, Any]:
+        """Apply persisted inverse delta for one historical fold.
+
+        Current rows must still equal recorded ``after`` rows.  This narrow
+        optimistic check prevents undo from overwriting later evidence or
+        governance changes.  All restoration/deletion/decision marking stays
+        in one transaction.
+        """
+        token = str(decision_id or "").strip()
+        if not token:
+            raise ValueError("historical_reconciliation_decision_required")
+
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            row = conn.execute(
+                "SELECT * FROM rule_decisions WHERE decision_id=?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("historical_reconciliation_decision_not_found")
+            if str(row["action"] or "") != "historical_duplicate_fold":
+                raise ValueError("historical_reconciliation_action_invalid")
+            metadata = _json_object(row["metadata_json"])
+            if not metadata.get("reconciliation"):
+                raise ValueError("historical_reconciliation_inverse_missing")
+            expected_group = str(metadata.get("share_group_id") or "")
+            requested_group = str(share_group_id or "")
+            if requested_group and requested_group != expected_group:
+                raise ValueError("historical_reconciliation_scope_mismatch")
+            if metadata.get("undo_state") == "undone":
+                return {
+                    "status": "undone",
+                    "already_undone": True,
+                    "decision_id": token,
+                }
+            delta = metadata.get("inverse_delta")
+            if not isinstance(delta, Mapping):
+                raise ValueError("historical_reconciliation_inverse_missing")
+            primary_keys = self._reconciliation_primary_keys()
+
+            def same_row(current: sqlite3.Row, expected: Mapping[str, Any]) -> bool:
+                return all(current[key] == value for key, value in expected.items())
+
+            # Validate every optimistic after-image before changing anything.
+            for table, pairs in _json_object(delta.get("updated", {})).items():
+                if table not in primary_keys or not isinstance(pairs, list):
+                    raise ValueError("historical_reconciliation_inverse_invalid")
+                primary = primary_keys[table]
+                for pair in pairs:
+                    if not isinstance(pair, Mapping):
+                        raise ValueError("historical_reconciliation_inverse_invalid")
+                    after = pair.get("after")
+                    if not isinstance(after, Mapping):
+                        raise ValueError("historical_reconciliation_inverse_invalid")
+                    row_id = str(after.get(primary) or "")
+                    current = conn.execute(
+                        f"SELECT * FROM {table} WHERE {primary}=?", (row_id,),
+                    ).fetchone()
+                    if current is None or not same_row(current, after):
+                        raise RuntimeError(
+                            f"historical_reconciliation_external_change:{table}:{row_id}"
+                        )
+            for table, created_rows in _json_object(delta.get("created", {})).items():
+                if table not in primary_keys or not isinstance(created_rows, list):
+                    raise ValueError("historical_reconciliation_inverse_invalid")
+                primary = primary_keys[table]
+                for expected in created_rows:
+                    if not isinstance(expected, Mapping):
+                        raise ValueError("historical_reconciliation_inverse_invalid")
+                    row_id = str(expected.get(primary) or "")
+                    current = conn.execute(
+                        f"SELECT * FROM {table} WHERE {primary}=?", (row_id,),
+                    ).fetchone()
+                    if current is None or not same_row(current, expected):
+                        raise RuntimeError(
+                            f"historical_reconciliation_external_change:{table}:{row_id}"
+                        )
+
+            # Remove only merge-generated identity/ledger rows.  Decision row
+            # stays as an immutable undo audit marker and replay fence.
+            for table, created_rows in _json_object(delta.get("created", {})).items():
+                if table == "rule_decisions":
+                    continue
+                primary = primary_keys[table]
+                for expected in created_rows:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE {primary}=?",
+                        (str(expected[primary]),),
+                    )
+            for table, pairs in _json_object(delta.get("updated", {})).items():
+                primary = primary_keys[table]
+                for pair in pairs:
+                    before = dict(pair["before"])
+                    row_id = str(before[primary])
+                    assignments = [key for key in before if key != primary]
+                    conn.execute(
+                        f"UPDATE {table} SET "
+                        + ",".join(f"{key}=?" for key in assignments)
+                        + f" WHERE {primary}=?",
+                        tuple(before[key] for key in assignments) + (row_id,),
+                    )
+            metadata["undo_state"] = "undone"
+            metadata["undo_actor"] = str(actor or "")
+            metadata["undone_at"] = _now()
+            conn.execute(
+                "UPDATE rule_decisions SET metadata_json=? WHERE decision_id=?",
+                (_json(metadata), token),
+            )
+            return {"status": "undone", "decision_id": token}
+
+        return self._write(op)
+
     def record_canonical_state(self, value: Mapping[str, Any]) -> str:
-        value = dict(value); value.setdefault("scope_id", stable_digest((value.get("share_group_id", ""), value.get("source_ref", "")))); return self._insert_generic("rule_canonical_state", "scope_id", value)
+        value = dict(value)
+        # Historical writers used BLOCKED as a diagnostic/readiness state even
+        # when the native generation was valid but not activated.  The native
+        # status contract treats that state as a readable shadow generation;
+        # retain BLOCKED for legacy-path rows, but normalize canonical paths so
+        # the status endpoint is not spuriously blocked by activation metadata.
+        path = str(value.get("read_path") or "").strip().casefold().replace("_", "-")
+        if (
+            str(value.get("activation_status") or "").casefold() == "blocked"
+            and path in {
+                "rule-intelligence", "ruleintelligence", "rule-intelligence-v2",
+                "rule-v2", "v2", "native", "native-v2", "nativev2", "rules",
+            }
+        ):
+            value["activation_status"] = "shadow"
+        value.setdefault(
+            "scope_id",
+            stable_digest((value.get("share_group_id", ""), value.get("source_ref", ""))),
+        )
+        return self._insert_generic("rule_canonical_state", "scope_id", value)
 
     def record_reconciliation_job(self, value: Mapping[str, Any]) -> str:
         value = dict(value); value.setdefault("job_id", stable_digest(value)); return self._insert_generic("rule_reconciliation_jobs", "job_id", value)

@@ -34,6 +34,32 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.4 更新
+
+v0.7.4 是一次治理正确性与运行时可靠性修复版本：
+
+- **Canonical 合并更新：** 相关规则、习惯和记忆合并为持续演进的一条
+  canonical 记录，同时保留神经图分支、来源、作用域、证据和可逆历史。
+- **强制上下文有界治理：** 超过 20 条强制规则只产生健康告警，不再截断存储或注入；
+  字符/Token 预算、敏感内容和损坏治理状态仍然 fail-closed。
+- **治理信息可读：** Agent、自动决策和风险信号显示可读名称与解释；治理分组默认收起，
+  冲突和风险摘要可直接打开详情；风险条目显示原因、影响和建议；CodeGraph 与 GUI
+  共用受治理的身份、作用域和证据链路。
+- **审计状态可靠：** `run_audit` 和 `get_audit` 返回明确的完成状态与带时区时间；GUI
+  完成扫描后不再停留在“待扫描”，阅读弹层保持在导航之上；缺少数字健康证据时保持
+  不可用，不伪造分数。治理阶段显示可读的已完成、当前、待开始或不可判定状态。
+- **Codex 运行时安全：** Hook/bootstrap 错误分类准确，`NO_SOURCE` 作为中性回退；
+  Provider 安装使用内容键不可变、非 editable 的 MCP snapshot，构建失败原子保留旧运行时，
+  自动刷新包静态资源，并提供 PEP 610 copied-install 来源诊断。
+- **安全变更与迁移：** GUI 局部变更和 evidence 冲突保持原子性并保留最近有效状态；
+  system `group_outbox` 投影与 checkpoint 在同一事务推进，旧滞后 checkpoint 可安全修复，
+  pending/failed 事件保持 fail-closed，不会被当作成功投影；迁移 replay 契约验证幂等重试和失败证据。
+
+本版本采用既有增量 CI 尾段（`447/447` 通过）、相关专项测试和 `git diff --check` 作为证据；
+本次发布准备未重新运行全量测试。
+
+详见 [v0.7.4 发布记录](docs/releases/v0.7.4.md)。
+
 ## v0.7.3 更新
 
 v0.7.3 放开共享组跨 provider 的历史召回。删除仍只限 owner。
@@ -275,6 +301,13 @@ memoryguard gui
 详细说明：[Claude Code](docs/install-claude-code.md) ·
 [Codex](docs/install-codex.md) · [Cursor](docs/install-cursor.md)
 
+### 稳定的 Codex / Router 绑定
+
+Codex/Router 绑定的是本机稳定的 Codex 程序与控制安装。账号 Profile 只是
+endpoint/alias，不会成为新的记忆所有者：切换 Profile 时会自动发现或修复该
+Profile，并复用已验证的 Agent 绑定和当前 active group。请求身份仍然
+fail-closed；这不会让不同机器或任意账号共享记录。
+
 ## 升级
 
 当前版本通过 Python 包管理器升级：
@@ -301,7 +334,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.3
+memoryguard --version                    # 0.7.4
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -355,11 +388,34 @@ Knowledge metadata 不会变成第二个正文存储。
 从桌面治理台进入**知识库**。远程 Embedding 或模型索引必须显式授权；未授权时，
 本地全文检索仍可使用，不会把资料正文发送给远程 Provider。
 
+### CodeGraph 刷新
+
+首次构建 CodeGraph 仍必须显式确认并执行全量构建。Scope 建图后，每次成功的受信任
+文件写入都可以触发该 Scope 的增量刷新，但仍要通过严格的源路径和 active binding
+校验。内容 hash 未变化时不产生新 revision；删除的文件会失活；下一轮上下文只注入
+一次有界的 `affected` receipt。该路径不运行 daemon 或 watcher，也不会从 shell 或
+自由文本猜测路径。
+
+### 桌面治理台页面
+
+GUI 按七页信息架构组织：
+
+1. 治理总览
+2. 数据源与 Agent
+3. 记忆核心
+4. CodeGraph
+5. 规则与习惯
+6. 对话历史
+7. 风险信号与治理控制台
+
+Agent 列表显示可读的程序/provider 名称，底层 ID 只在详情中展示；没有数据时明确
+显示空态。
+
 ## 规则、历史与知识分层
 
 | 数据面 | 用途 | 上下文行为 |
 |---|---|---|
-| **长期记忆与规则** | 偏好、流程、纠错、事实、项目和范围化强制规则 | 强制规则使用独立有界预算；普通记录按任务相关性召回 |
+| **长期记忆与规则** | 偏好、流程、纠错、事实、项目和范围化强制规则 | 强制规则在作用域/排除/冲突与语义去重后使用独立字符/Token 预算。生效条数超过 20 只是健康告警，不是硬上限，存储也不按条数封顶。敏感、损坏、单条超限和总量溢出仍失败关闭且不会静默截断；普通记录按任务相关性召回 |
 | **对话历史** | 带 owner 和共享组权限的本地原文证据 | 永不自动进入 bootstrap，只能经历史工具显式读取 |
 | **知识库** | 用户选择的文档资料、切片和派生索引 | 仅返回有界相关片段；候选不会静默变成长时记忆 |
 | **神经图** | 导航记忆、规则、项目、Agent、会话和知识投影 | 展示安全元数据和摘要，不展示原始聊天正文 |
@@ -439,7 +495,7 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 MCP 服务提供：
 
 - 长期记忆读、搜索、写、更新、删除和状态查询；
-- 强制规则隔离预算与有界上下文 bootstrap；
+- 强制规则隔离预算与有界上下文 bootstrap（条数告警、字符/Token 失败关闭）；
 - 规则创建、反馈、合并治理、撤销和作用域统计；
 - Agent 绑定与共享组检查；
 - 来源扫描、神经图投影、导入预览和构建规划；
@@ -454,6 +510,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.4 发布记录](docs/releases/v0.7.4.md)
 - [v0.7.3 发布记录](docs/releases/v0.7.3.md)
 - [v0.7.2 发布记录](docs/releases/v0.7.2.md)
 - [v0.7.1 发布记录](docs/releases/v0.7.1.md)
@@ -465,7 +522,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+- **当前发布线：** v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
   以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓

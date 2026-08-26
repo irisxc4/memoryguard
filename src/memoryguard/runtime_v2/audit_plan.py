@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..codegraph_v2.models import CodeGraphScope
+from ..codegraph_v2.store import CodeGraphStore
 from ..evidence.store import EvidenceStore
 from ..maintenance_v2.reference_audit import Blocker, ReferenceAudit, Result
 from ..memory.store import MemoryAtomStore
@@ -45,6 +47,8 @@ class AuditPlanService:
     _SUPPORTED = {
         ("unconsumed_outbox", "memory", "domain_outbox"): "project_memory_outbox",
         ("unconsumed_outbox", "rules", "rule_evidence_outbox"): "project_rule_evidence_outbox",
+        ("unconsumed_outbox", "codegraph", "outbox"): "project_codegraph_outbox",
+        ("unconsumed_outbox", "system", "group_outbox"): "project_system_outbox",
     }
 
     def __init__(self, workspace: str | Path) -> None:
@@ -175,11 +179,32 @@ class AuditPlanService:
         except GroupControlError as exc:
             raise AuditPlanError(exc.code) from exc
 
+    def _finalize_and_project_system(
+        self,
+        plan: Mapping[str, Any],
+        repair: Mapping[str, Any],
+        *,
+        recovered: bool,
+    ) -> dict[str, Any]:
+        """Write the durable plan receipt, then checkpoint its projected event.
+
+        Claim/finalize receipts themselves are system outbox events.  They are
+        synchronously projected by ``SystemControlStore.mutate`` but still need
+        the system checkpoint advanced, otherwise applying any unrelated plan
+        creates a fresh audit blocker after the repair has succeeded.
+        """
+        result = self._finalize(plan, repair, recovered=recovered)
+        try:
+            SystemControlStore(self.workspace, write=True).project_outbox()
+        except GroupControlError as exc:
+            raise AuditPlanError(exc.code) from exc
+        except Exception as exc:
+            raise AuditPlanError("system_outbox_projection_failed") from exc
+        return result
+
     def _repair(self, action: str) -> dict[str, Any]:
-        if not self.layout.evidence_db.is_file():
-            raise AuditPlanError("audit_plan_dependency_missing")
         if action == "project_memory_outbox":
-            if not self.layout.memory_db.is_file():
+            if not self.layout.memory_db.is_file() or not self.layout.evidence_db.is_file():
                 raise AuditPlanError("audit_plan_dependency_missing")
             try:
                 memory = MemoryAtomStore(self.workspace, readonly=False)
@@ -192,7 +217,7 @@ class AuditPlanService:
                 "remaining_count": int(result.get("pending") or 0),
             }
         if action == "project_rule_evidence_outbox":
-            if not self.layout.rules_db.is_file():
+            if not self.layout.rules_db.is_file() or not self.layout.evidence_db.is_file():
                 raise AuditPlanError("audit_plan_dependency_missing")
             try:
                 rules = RuleV2Store(self.workspace)
@@ -203,6 +228,62 @@ class AuditPlanService:
             return {
                 "processed_count": int(result.get("consumed") or 0),
                 "remaining_count": int(result.get("pending") or 0),
+            }
+        if action == "project_codegraph_outbox":
+            if not self.layout.codegraph_db.is_file():
+                raise AuditPlanError("audit_plan_dependency_missing")
+            try:
+                graph = CodeGraphStore(self.workspace, initialize=False)
+                with graph.connection() as conn:
+                    pending_scope_ids = {
+                        str(row[0]) for row in conn.execute(
+                            "SELECT DISTINCT scope_id FROM outbox "
+                            "WHERE status IN ('pending','failed')"
+                        ).fetchall()
+                    }
+                    rows = conn.execute(
+                        "SELECT scope_id,workspace_id,agent_instance_id,project_ref,"
+                        "provider,share_group_id,runtime_role,trusted_context "
+                        "FROM graph_scopes WHERE trusted_context=1 ORDER BY scope_id"
+                    ).fetchall()
+                scopes = {
+                    str(row[0]): CodeGraphScope(
+                        workspace_id=str(row[1]),
+                        agent_instance_id=str(row[2]),
+                        project_ref=str(row[3]),
+                        provider=str(row[4]),
+                        share_group_id=str(row[5]),
+                        runtime_role=str(row[6]),
+                        trusted_context=bool(row[7]),
+                    )
+                    for row in rows
+                }
+                unknown = pending_scope_ids - set(scopes)
+                if unknown:
+                    raise AuditPlanError("codegraph_outbox_scope_untrusted")
+                results = [
+                    graph.drain_outbox(scope=scope)
+                    for scope_id, scope in scopes.items()
+                    if scope_id in pending_scope_ids
+                ]
+            except AuditPlanError:
+                raise
+            except Exception as exc:
+                raise AuditPlanError("codegraph_outbox_projection_failed") from exc
+            return {
+                "processed_count": sum(int(result.get("projected") or 0) for result in results),
+                "remaining_count": sum(int(result.get("pending") or 0) for result in results),
+            }
+        if action == "project_system_outbox":
+            try:
+                result = SystemControlStore(self.workspace, write=True).project_outbox()
+            except GroupControlError as exc:
+                raise AuditPlanError(exc.code) from exc
+            except Exception as exc:
+                raise AuditPlanError("system_outbox_projection_failed") from exc
+            return {
+                "processed_count": int(result.get("projected") or 0),
+                "remaining_count": int(result.get("remaining") or 0),
             }
         raise AuditPlanError("audit_plan_not_fixable")
 
@@ -234,7 +315,11 @@ class AuditPlanService:
             finding_id = str(plan.get("finding_id") or "")
             if any(_finding_id(item) == finding_id for item in result.blockers):
                 raise AuditPlanError("audit_plan_stale")
-            return self._finalize(plan, {"processed_count": 0, "remaining_count": 0}, recovered=True)
+            return self._finalize_and_project_system(
+                plan,
+                {"processed_count": 0, "remaining_count": 0},
+                recovered=True,
+            )
 
         blocker, plan = located
         if not bool(plan["fixable"]):
@@ -248,7 +333,7 @@ class AuditPlanService:
         after = self._audit()
         if any(_finding_id(item) == str(plan["finding_id"]) for item in after.blockers):
             raise AuditPlanError("audit_plan_not_resolved")
-        return self._finalize(plan, repair, recovered=False)
+        return self._finalize_and_project_system(plan, repair, recovered=False)
 
     def undo(self, change_id: str) -> dict[str, Any]:
         target = str(change_id or "").strip()

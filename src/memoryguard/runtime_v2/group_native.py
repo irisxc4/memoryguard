@@ -210,6 +210,18 @@ class SystemControlStore:
                     "VALUES(?,?,?,?,?,'projected',1,?,?)",
                     (event_id, self._next_sequence(conn), operation, str(aggregate or operation), _json({"receipt_ref": key}), now, now),
                 )
+                sequence_row = conn.execute(
+                    "SELECT sequence FROM group_outbox WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()
+                if sequence_row is None:
+                    raise GroupControlError("group_outbox_event_missing")
+                sequence = int(sequence_row[0])
+                conn.execute(
+                    "UPDATE outbox_checkpoints SET last_sequence=?,updated_at=? "
+                    "WHERE domain='system' AND last_sequence<?",
+                    (sequence, now, sequence),
+                )
                 receipt_id = "group-receipt-" + _digest(operation, key)
                 conn.execute(
                     "INSERT INTO group_operation_receipts(receipt_id,operation,idempotency_key,request_digest,result_json,created_at) VALUES(?,?,?,?,?,?)",
@@ -217,6 +229,41 @@ class SystemControlStore:
                 )
                 public.setdefault("receipt", {"receipt_id": receipt_id, "event_id": event_id})
                 return public
+
+    def project_outbox(self) -> dict[str, int]:
+        """Advance the system checkpoint only for already-projected receipts.
+
+        Group-control mutations are committed synchronously, so their outbox
+        rows are created as ``projected``.  A lagging checkpoint is therefore
+        repairable without replaying business writes.  Pending or failed rows
+        remain a fail-closed condition for a real consumer.
+        """
+        self._ensure_aux()
+        with open_database(self.db_path) as conn:
+            with transaction(conn):
+                unresolved = int(conn.execute(
+                    "SELECT COUNT(*) FROM group_outbox "
+                    "WHERE status IN ('pending','failed')"
+                ).fetchone()[0])
+                if unresolved:
+                    raise GroupControlError("system_outbox_projection_pending")
+                maximum = int(conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) FROM group_outbox"
+                ).fetchone()[0])
+                checkpoint = int(conn.execute(
+                    "SELECT COALESCE(MAX(last_sequence),0) "
+                    "FROM outbox_checkpoints WHERE domain='system'"
+                ).fetchone()[0])
+                if maximum > checkpoint:
+                    conn.execute(
+                        "UPDATE outbox_checkpoints SET last_sequence=?,updated_at=? "
+                        "WHERE domain='system' AND last_sequence<?",
+                        (maximum, _now(), maximum),
+                    )
+                return {
+                    "projected": max(0, maximum - checkpoint),
+                    "remaining": 0,
+                }
 
 
 class GroupControlService:
@@ -1094,6 +1141,122 @@ class GroupControlService:
             return ({"ok": True, "status": "succeeded", "mode": value, "changed": changed, "revision": revision}, "host_mode")
 
         return self.store.mutate("set_host_mode", key, request, apply)
+
+    @staticmethod
+    def _provider_identity_key(provider: str) -> str:
+        return "canonical_provider_identity:" + str(provider or "").strip().casefold()
+
+    def provider_identity(self, provider: str) -> dict[str, Any] | None:
+        key = self._provider_identity_key(provider)
+        if not key.endswith(":") and self.store.db_path.is_file() and self.store._preflight() == "current":
+            with self.store.connection() as conn:
+                row = conn.execute(
+                    "SELECT value_json FROM control_preferences WHERE pref_key=?",
+                    (key,),
+                ).fetchone()
+            if row is None:
+                return None
+            try:
+                data = json.loads(str(row[0] or "{}"))
+            except Exception:
+                return None
+            if not isinstance(data, dict):
+                return None
+            canonical = str(data.get("canonical_id") or "").strip()
+            if not canonical:
+                return None
+            aliases = [
+                str(item).strip()
+                for item in (data.get("aliases") or ())
+                if str(item).strip() and str(item).strip() != canonical
+            ]
+            return {
+                "provider": str(provider or "").strip().casefold(),
+                "canonical_id": canonical,
+                "share_group_id": str(data.get("share_group_id") or "").strip(),
+                "aliases": aliases,
+            }
+        return None
+
+    def record_provider_identity(
+        self,
+        provider: str,
+        canonical_id: str,
+        share_group_id: str,
+        aliases: Sequence[str] = (),
+        *,
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        product = str(provider or "").strip().casefold()
+        canonical = str(canonical_id or "").strip()
+        group = str(share_group_id or "").strip()
+        extra = sorted({
+            str(item).strip()
+            for item in aliases
+            if str(item).strip() and str(item).strip() != canonical
+        })
+        if not product or not canonical:
+            raise GroupControlError("provider_identity_required")
+        pref_key = self._provider_identity_key(product)
+        request = {
+            "provider": product,
+            "canonical_id": canonical,
+            "share_group_id": group,
+            "aliases": extra,
+        }
+        key = idempotency_key or _digest("provider-identity", product, canonical, group, *extra)
+
+        def apply(conn: Any) -> tuple[Mapping[str, Any], str]:
+            now = _now()
+            row = conn.execute(
+                "SELECT value_json,revision FROM control_preferences WHERE pref_key=?",
+                (pref_key,),
+            ).fetchone()
+            previous_aliases: list[str] = []
+            previous_canonical = ""
+            previous_group = ""
+            if row is not None:
+                try:
+                    previous = json.loads(str(row[0] or "{}"))
+                except Exception:
+                    previous = {}
+                if isinstance(previous, dict):
+                    previous_canonical = str(previous.get("canonical_id") or "").strip()
+                    previous_group = str(previous.get("share_group_id") or "").strip()
+                    previous_aliases = [
+                        str(item).strip()
+                        for item in (previous.get("aliases") or ())
+                        if str(item).strip()
+                    ]
+            merged = sorted({
+                *previous_aliases,
+                *extra,
+                *(
+                    [previous_canonical]
+                    if previous_canonical and previous_canonical != canonical
+                    else []
+                ),
+            })
+            payload = {
+                "provider": product,
+                "canonical_id": canonical,
+                "share_group_id": group or previous_group,
+                "aliases": merged,
+            }
+            changed = (
+                previous_canonical != canonical
+                or previous_group != payload["share_group_id"]
+                or previous_aliases != merged
+            )
+            revision = int(row[1]) + (1 if changed else 0) if row else 1
+            conn.execute(
+                "INSERT INTO control_preferences(pref_key,value_json,revision,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(pref_key) DO UPDATE SET value_json=excluded.value_json,revision=excluded.revision,updated_at=excluded.updated_at",
+                (pref_key, _json(payload), revision, now),
+            )
+            return ({"ok": True, "status": "succeeded", "changed": changed, "revision": revision, **payload}, pref_key)
+
+        return self.store.mutate("record_provider_identity", key, request, apply)
 
     def record_selection(self, agent_instance_id: str, source_ids: Sequence[str], selection_digest: str, *, idempotency_key: str = "") -> dict[str, Any]:
         agent = str(agent_instance_id or "").strip()

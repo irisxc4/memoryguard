@@ -323,10 +323,16 @@ def test_mandatory_limit_rejects_writes_and_legacy_overflow_fails_closed():
         },
         candidates,
     ).to_dict()
-    assert packet["status"] == "blocked"
-    assert packet["error"] == "mandatory_budget_exceeded"
-    assert packet["mandatory"] == []
-    assert "mandatory rule 20" not in str(packet)
+    assert packet["status"] == "ok"
+    assert packet["error"] == ""
+    bodies = [item["body"] for item in packet["mandatory"]]
+    assert set(bodies) == {f"mandatory rule {index}" for index in range(21)}
+    assert len(bodies) == 21
+    assert all(not item.get("truncated") for item in packet["mandatory"])
+    warnings = packet["budget"]["warnings"]
+    assert warnings[0]["code"] == "mandatory_item_count_warning"
+    assert warnings[0]["count"] == 21
+    assert warnings[0]["threshold"] == 20
 
 
 def test_update_to_always_is_rejected_until_delete_releases_capacity(tmp_path):
@@ -362,9 +368,14 @@ def test_update_to_always_is_rejected_until_delete_releases_capacity(tmp_path):
     memory.project_evidence(evidence)
     memory.set_visibility("ready")
     assert updated.injection_policy == "always"
-    blocked = _native_packet(root, agent, group)
-    assert blocked["status"] == "blocked"
-    assert blocked["error"] == "mandatory_budget_exceeded"
+    accepted = _native_packet(root, agent, group)
+    assert accepted["status"] == "ok"
+    assert accepted["error"] == ""
+    injected_ids = {item["item_id"] for item in accepted["mandatory"]}
+    assert updated.memory_id in injected_ids
+    assert len(accepted["mandatory"]) == 21
+    assert accepted["budget"]["warnings"][0]["code"] == "mandatory_item_count_warning"
+    assert accepted["budget"]["warnings"][0]["count"] == 21
 
     governance.tombstone(
         "full-0",
@@ -373,9 +384,11 @@ def test_update_to_always_is_rejected_until_delete_releases_capacity(tmp_path):
         idempotency_key="delete-full-0",
     )
     memory.set_visibility("ready")
-    accepted = _native_packet(root, agent, group)
-    assert accepted["status"] == "ok"
-    assert any(item["item_id"] == updated.memory_id for item in accepted["mandatory"])
+    after_delete = _native_packet(root, agent, group)
+    assert after_delete["status"] == "ok"
+    assert any(item["item_id"] == updated.memory_id for item in after_delete["mandatory"])
+    assert len(after_delete["mandatory"]) == 20
+    assert after_delete["budget"]["warnings"] == []
 
 
 def test_duplicate_body_different_injection_semantics_stays_distinct(tmp_path):
@@ -576,13 +589,15 @@ def _seed_overflow(
     runtime_role: str = "root",
     prefix: str,
 ) -> None:
-    for index in range(21):
+    # Each body stays under the per-item cap; aggregate chars/tokens overflow.
+    pads = (("alpha", "A"), ("bravo", "B"), ("charlie", "C"), ("delta", "D"))
+    for index, (name, letter) in enumerate(pads):
         _seed_atom(
             root,
             group,
             agent,
             f"{prefix}-{index}",
-            f"{prefix} mandatory rule {index}",
+            f"{prefix} {name} overflow gate " + (letter * 400),
             policy="always",
             provider="codex",
             runtime_role=runtime_role,

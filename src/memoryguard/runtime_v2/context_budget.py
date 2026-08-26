@@ -3,11 +3,26 @@
 The runtime adapter is intentionally small: callers provide a token counter
 and retrieval candidates, while this module enforces independent mandatory
 and optional limits without importing any legacy store or runtime hook.
+
+``mandatory_max_items`` is a health/warning threshold for the *effective*
+injected set after scope/exclude/conflict resolution and semantic
+dedup/consolidation.  It is not a storage ceiling and not a hard injection
+block.  Aggregate char/token overflow, per-item oversize, sensitive content,
+and corrupt governance still fail closed with no partial mandatory packet.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, runtime_checkable
+
+# Effective-count health threshold.  Storage may hold more; injection warns
+# instead of blocking when the post-dedup mandatory set exceeds this.
+MANDATORY_ITEM_WARNING_THRESHOLD = 20
+MANDATORY_ITEM_COUNT_WARNING = "mandatory_item_count_warning"
+MANDATORY_ITEM_COUNT_WARNING_MESSAGE = (
+    "生效强制规则数量超过健康阈值，建议通过现有规则合并/治理收敛，不要截断。"
+)
+MANDATORY_ITEM_COUNT_GOVERNANCE_ACTION = "rule_merge"
 
 
 class ContextBudgetError(ValueError):
@@ -50,18 +65,38 @@ DeterministicCounter = DeterministicTokenCounter
 Utf8TokenCounter = DeterministicTokenCounter
 
 
+def mandatory_item_count_warning(
+    count: int,
+    *,
+    threshold: int = MANDATORY_ITEM_WARNING_THRESHOLD,
+) -> dict[str, Any] | None:
+    """Return the machine-readable count warning, or None when under threshold."""
+
+    if type(count) is not int or type(threshold) is not int or count <= threshold:
+        return None
+    return {
+        "code": MANDATORY_ITEM_COUNT_WARNING,
+        "count": count,
+        "threshold": threshold,
+        "message": MANDATORY_ITEM_COUNT_WARNING_MESSAGE,
+        "governance_action": MANDATORY_ITEM_COUNT_GOVERNANCE_ACTION,
+    }
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     """Independent mandatory and optional context limits.
 
-    ``max_*`` limits optional layers.  Mandatory rules have their own cap so
-    relevant recall cannot crowd them out.  ``item_*`` bounds one candidate.
+    ``max_*`` limits optional layers.  Mandatory rules have their own char and
+    token caps so relevant recall cannot crowd them out.  ``mandatory_max_items``
+    is the effective-count warning threshold, not a hard block.  ``item_*``
+    bounds one candidate.
     """
 
     max_items: int = 32
     max_chars: int = 12_000
     max_tokens: int = 3_000
-    mandatory_max_items: int = 20
+    mandatory_max_items: int = MANDATORY_ITEM_WARNING_THRESHOLD
     mandatory_max_chars: int = 6_000
     mandatory_max_tokens: int = 1_000
     item_max_chars: int = 4_000
@@ -100,10 +135,12 @@ class ContextBudget:
             "mandatory_max_tokens": self.mandatory_max_tokens,
             "item_max_chars": self.item_max_chars,
             "item_max_tokens": self.item_max_tokens,
+            "mandatory_item_warning_threshold": self.mandatory_max_items,
             "mandatory_cap": {
                 "items": self.mandatory_max_items,
                 "chars": self.mandatory_max_chars,
                 "tokens": self.mandatory_max_tokens,
+                "item_count_warning_threshold": self.mandatory_max_items,
             },
             "optional_cap": {
                 "items": self.max_items,
@@ -139,6 +176,15 @@ class ContextBudget:
                 known[target] = value[source]
         return cls(**known)
 
+    def mandatory_item_oversize(self, chars: int, tokens: int) -> bool:
+        return chars > self.item_max_chars or tokens > self.item_max_tokens
+
+    def mandatory_aggregate_overflow(self, chars: int, tokens: int) -> bool:
+        return chars > self.mandatory_max_chars or tokens > self.mandatory_max_tokens
+
+    def item_count_warning(self, count: int) -> dict[str, Any] | None:
+        return mandatory_item_count_warning(count, threshold=self.mandatory_max_items)
+
 
 @dataclass
 class BudgetLedger:
@@ -152,10 +198,15 @@ class BudgetLedger:
     optional_tokens: int = 0
     omitted: int = 0
     reasons: dict[str, int] = field(default_factory=dict)
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
     def omit(self, reason: str) -> None:
         self.omitted += 1
         self.reasons[reason] = self.reasons.get(reason, 0) + 1
+
+    def warn(self, warning: Mapping[str, Any] | None) -> None:
+        if warning:
+            self.warnings.append(dict(warning))
 
     @property
     def total_items(self) -> int:
@@ -189,6 +240,7 @@ class BudgetLedger:
             "tokens": self.total_tokens,
             "omitted": self.omitted,
             "reasons": dict(sorted(self.reasons.items())),
+            "warnings": [dict(item) for item in self.warnings],
         }
 
 
@@ -196,4 +248,7 @@ __all__ = [
     "ContextBudgetError", "ContextSafetyError", "TokenCounter",
     "DeterministicTokenCounter", "DeterministicCounter", "Utf8TokenCounter",
     "ContextBudget", "BudgetLedger",
+    "MANDATORY_ITEM_WARNING_THRESHOLD", "MANDATORY_ITEM_COUNT_WARNING",
+    "MANDATORY_ITEM_COUNT_WARNING_MESSAGE",
+    "MANDATORY_ITEM_COUNT_GOVERNANCE_ACTION", "mandatory_item_count_warning",
 ]

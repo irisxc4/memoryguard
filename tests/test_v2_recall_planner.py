@@ -129,15 +129,54 @@ def test_dedupe_filter_and_deterministic_sorting_are_idempotent():
     assert {decision.reason for decision in first.excluded} >= {"locked", "deleted", "conflict"}
 
 
-def test_mandatory_budget_overflow_fails_closed_without_expansion():
+def test_mandatory_budget_is_independent_from_optional_request_budget():
     rows = [item("must-1", mandatory=True, summary="12345"), item("must-2", mandatory=True, summary="67890")]
-    plan = RecallPlanner([StaticLayerPort("rules", rows)]).plan(
-        request(layers=("rules",), budget_items=1, budget_chars=5)
+    plan = RecallPlanner([
+        StaticLayerPort("rules", rows),
+        StaticLayerPort("working", [item("optional", summary="abc")]),
+    ]).plan(
+        request(layers=("rules", "working"), budget_items=1, budget_chars=3)
     )
+    assert plan.status == "ok"
+    assert plan.mandatory_overflow is False
+    assert {decision.item_id for decision in plan.mandatory} == {"must-1", "must-2"}
+    assert [decision.item_id for decision in plan.relevant] == ["optional"]
+    assert plan.warnings == ()
+
+
+def test_mandatory_aggregate_overflow_fails_closed_without_partial_packet():
+    rows = [item(f"must-{index}", mandatory=True, summary="x" * 2048) for index in range(3)]
+    plan = RecallPlanner([StaticLayerPort("rules", rows)]).plan(request(layers=("rules",)))
     assert plan.status == "blocked"
     assert plan.mandatory_overflow is True
     assert plan.selected == ()
+    assert plan.warnings == ()
     assert all(decision.action == "exclude" for decision in plan.decisions)
+
+
+def test_mandatory_per_item_token_overflow_fails_closed():
+    plan = RecallPlanner([
+        StaticLayerPort("rules", [item("must", mandatory=True, summary="x" * 801)])
+    ]).plan(request(layers=("rules",)))
+    assert plan.status == "blocked"
+    assert plan.mandatory_overflow is True
+    assert plan.selected == ()
+
+
+def test_mandatory_count_is_warning_not_hard_block():
+    rows = [
+        item(f"must-{index}", mandatory=True, summary=f"gate {index}")
+        for index in range(21)
+    ]
+    plan = RecallPlanner([StaticLayerPort("rules", rows)]).plan(
+        request(layers=("rules",), budget_items=1, budget_chars=12_000)
+    )
+    assert plan.status == "ok"
+    assert plan.mandatory_overflow is False
+    assert {decision.item_id for decision in plan.selected} == {f"must-{index}" for index in range(21)}
+    assert len(plan.selected) == 21
+    assert plan.warnings[0]["code"] == "mandatory_item_count_warning"
+    assert plan.warnings[0]["count"] == 21
 
 
 def test_budget_is_hard_and_plan_digest_stable():

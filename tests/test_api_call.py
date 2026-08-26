@@ -1,4 +1,5 @@
 """GovernanceApi smoke tests."""
+from datetime import datetime
 import os
 from pathlib import Path
 import sys
@@ -58,6 +59,24 @@ def test_run_audit_returns_v2_report_summary(tmp_path) -> None:
     assert isinstance(result["data"]["domains"], list)
     assert isinstance(result["data"]["blocker_codes"], list)
     assert isinstance(result["data"]["candidate_count"], int)
+
+
+def test_run_audit_and_get_audit_carry_completion_evidence(tmp_path) -> None:
+    api = _active_gui_api(tmp_path)
+
+    for result in (api.run_audit(), api.get_audit()):
+        assert result["ok"] is True
+        data = result["data"]
+        assert data["audit_state"] == "completed"
+        stamp = data.get("generated_at") or data.get("completed_at")
+        parsed = datetime.fromisoformat(str(stamp))
+        assert parsed.tzinfo is not None
+        assert parsed.utcoffset() is not None
+        assert data["status"] in {"PASS", "BLOCKED"}
+        assert isinstance(data["blocked"], bool)
+        assert isinstance(data["blockers"], list)
+        assert isinstance(data["blocker_codes"], list)
+        assert "health_score" not in data
 
 
 def test_get_neuron_graph_supports_empty_projection(tmp_path) -> None:

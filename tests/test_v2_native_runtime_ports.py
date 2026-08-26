@@ -513,12 +513,14 @@ def test_registry_is_complete_and_digest_is_stable(tmp_path):
     )
     # Phase-11 acceptance requires every canonical GUI operation to resolve to
     # a native handler. A missing handler is a blocker, never a retired success.
-    assert coverage["surfaces"]["gui"]["total"] == 166
-    assert coverage["surfaces"]["gui"]["implemented"] == 166
+    assert coverage["surfaces"]["gui"]["total"] == 167
+    assert coverage["surfaces"]["gui"]["implemented"] == 167
     assert coverage["surfaces"]["gui"]["blocker"] == 0
     gui_by_name = {
         item["name"]: item for item in coverage["surfaces"]["gui"]["entries"]
     }
+    assert gui_by_name["codegraph_status"]["status"] == "implemented"
+    assert gui_by_name["codegraph_status"]["mutation"] is False
     for name in (
         "edit_memory", "lock_memory", "unlock_memory",
         "set_memory_injection_policy", "restore_memory", "delete_memory",

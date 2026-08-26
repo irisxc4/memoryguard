@@ -1208,11 +1208,12 @@ class ContextEngine:
                 if not text:
                     receipts.append(ContextReceipt(candidate.item_id, "mandatory", False, "mandatory_content_blocked", {}, {}))
                     raise ContextSafetyError("mandatory_content_blocked")
-                if truncated or len(candidate.body) > active_budget.item_max_chars or self._count(candidate.body) > active_budget.item_max_tokens:
+                if truncated or active_budget.mandatory_item_oversize(len(candidate.body), self._count(candidate.body)):
                     raise ContextSafetyError("mandatory_item_limit_exceeded")
-                if len(selected["mandatory"]) >= active_budget.mandatory_max_items:
-                    raise ContextSafetyError("mandatory_budget_exceeded")
-                if ledger.mandatory_chars + char_cost > active_budget.mandatory_max_chars or ledger.mandatory_tokens + token_cost > active_budget.mandatory_max_tokens:
+                if active_budget.mandatory_aggregate_overflow(
+                    ledger.mandatory_chars + char_cost,
+                    ledger.mandatory_tokens + token_cost,
+                ):
                     raise ContextSafetyError("mandatory_budget_exceeded")
                 selected["mandatory"].append(self._render(candidate, text, layer="mandatory"))
                 seen.add(candidate.dedup_key)
@@ -1221,6 +1222,7 @@ class ContextEngine:
                 ledger.mandatory_chars += char_cost
                 ledger.mandatory_tokens += token_cost
                 receipts.append(ContextReceipt(candidate.item_id, "mandatory", True, "included", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence), token_cost, char_cost))
+            ledger.warn(active_budget.item_count_warning(ledger.mandatory_items))
 
             for layer in ("relevant", "knowledge", "reference_only"):
                 for candidate in groups[layer]:

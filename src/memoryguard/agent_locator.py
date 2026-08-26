@@ -34,6 +34,7 @@ from .agent_profiles import AgentProfileRegistry, detect_surface
 from .agent_mapping import (
     AGENT_PRODUCT_MAP, IGNORED_DIRS,
     product_for_dot_dir, is_known_product, detect_stale_status,
+    provider_display_name,
 )
 from .schema_v3 import (
     AgentInstance, AgentProfile, DiscoveryEntry, DiscoveryLedger,
@@ -107,6 +108,99 @@ HIDDEN_SURFACE_CATEGORIES: frozenset[str] = frozenset({
     "ignored_runtime_data",
 })
 SESSION_DISPLAY_CATEGORIES: frozenset[str] = EXTRACT_DISPLAY_CATEGORIES
+
+
+_CODEX_HOME_NAMES = frozenset({".codex", "codex-home"})
+_ROUTER_DATA_ENV = (
+    "CODEXROUTER_DATA",
+    "CODEX_ROUTER_DATA",
+    "CODEXROUTER_HOME",
+    "CODEX_ROUTER_HOME",
+)
+
+
+def current_codex_home() -> Path:
+    """Return the Codex user root for this process: CODEX_HOME, else ~/.codex."""
+    configured = str(os.environ.get("CODEX_HOME", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".codex").resolve()
+
+
+def _looks_like_codex_home(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    name = path.name.casefold()
+    if name in _CODEX_HOME_NAMES:
+        return True
+    return (path / "config.toml").is_file() or (path / "hooks.json").is_file()
+
+
+def _add_codex_home(found: list[Path], seen: set[str], raw: Path) -> None:
+    try:
+        resolved = raw.expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return
+    if not _looks_like_codex_home(resolved):
+        return
+    key = str(resolved).casefold()
+    if key in seen:
+        return
+    seen.add(key)
+    found.append(resolved)
+
+
+def _scan_router_profiles(found: list[Path], seen: set[str], profiles_root: Path) -> None:
+    if not profiles_root.is_dir() or profiles_root.name.casefold() != "profiles":
+        return
+    try:
+        children = list(profiles_root.iterdir())
+    except (OSError, PermissionError):
+        return
+    for child in children:
+        if not child.is_dir():
+            continue
+        _add_codex_home(found, seen, child / "codex-home")
+        _add_codex_home(found, seen, child / ".codex")
+        if _looks_like_codex_home(child):
+            _add_codex_home(found, seen, child)
+
+
+def discover_codex_homes(*, include_default_router: bool = False) -> tuple[Path, ...]:
+    """Discover current and sibling Codex roots without scanning $HOME recursively.
+
+    Router account directories are transport aliases of one Codex program.
+    The current CODEX_HOME, ~/.codex, and bounded Router profile roots are
+    included when they exist.  The documented per-user CodexRouter root is
+    opt-in because only bare control-home recovery may inspect it; ordinary
+    provider writes must not fan out to profiles selected by a clean shell.
+    """
+    found: list[Path] = []
+    seen: set[str] = set()
+    current = current_codex_home()
+    _add_codex_home(found, seen, current)
+    _add_codex_home(found, seen, Path.home() / ".codex")
+    if current.name.casefold() in _CODEX_HOME_NAMES:
+        _scan_router_profiles(found, seen, current.parent.parent)
+    if include_default_router:
+        # Bare system launchers do not inherit CODEX_HOME.  CodexRouter's own
+        # fixed LocalAppData root remains a bounded provider-owned discovery
+        # root; this is not a cwd or generic user-directory scan.
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        router_root = (
+            Path(local_appdata) / "CodexRouter"
+            if local_appdata
+            else Path.home() / "AppData" / "Local" / "CodexRouter"
+        )
+        _scan_router_profiles(found, seen, router_root / "profiles")
+    for env_name in _ROUTER_DATA_ENV:
+        raw = str(os.environ.get(env_name, "") or "").strip()
+        if not raw:
+            continue
+        root = Path(raw).expanduser()
+        _scan_router_profiles(found, seen, root / "profiles")
+        _scan_router_profiles(found, seen, root)
+    return tuple(found)
 
 
 def _read_codex_memories_flags(config_path: Path) -> dict[str, bool | None]:
@@ -290,6 +384,7 @@ class AgentLocator:
         )
         surfaces_results: list[dict[str, Any]] = []
         entries: list[DiscoveryEntry] = []
+        overlay_roots = discover_codex_homes() if profile.product == "codex" else ()
         for surface in profile.surfaces:
             status, resolved = detect_surface(
                 surface,
@@ -297,6 +392,20 @@ class AgentLocator:
                 workspace=self.workspace,
                 appdata=os.environ.get("APPDATA", str(Path.home())),
             )
+            if (
+                profile.product == "codex"
+                and status != SurfaceStatus.FOUND
+                and str(surface.path_template or "").startswith("%HOME%/.codex")
+            ):
+                rest = str(surface.path_template)[len("%HOME%/.codex"):].lstrip("/\\")
+                for overlay in overlay_roots:
+                    candidate = overlay.joinpath(*rest.split("/")) if rest else overlay
+                    try:
+                        if candidate.exists():
+                            status, resolved = SurfaceStatus.FOUND, str(candidate)
+                            break
+                    except OSError:
+                        continue
             entries.append(DiscoveryEntry(
                 profile_id=profile.profile_id,
                 surface_id=surface.surface_id,
@@ -563,6 +672,8 @@ class AgentLocator:
             "instance_id": instance_id,
             "profile_id": instance.profile_id,
             "product": instance.product,
+            "display_name": provider_display_name(instance.product),
+            "label": provider_display_name(instance.product),
             "scopes": scopes_output,
             "discovery_notes": notes,
         }
@@ -602,7 +713,7 @@ class AgentLocator:
             None,
         )
         mem_path = Path((mem_surface or {}).get("resolved_path") or "")
-        cfg_path = Path.home() / ".codex" / "config.toml"
+        cfg_path = current_codex_home() / "config.toml"
         flags = _read_codex_memories_flags(cfg_path)
         if flags.get("generate_memories") is False or flags.get("use_memories") is False:
             notes.append({

@@ -45,8 +45,23 @@ def test_budget_rejects_any_overlapping_effective_context(tmp_path):
     store = RuleV2Store(tmp_path)
     for index in range(25):
         _rule(store, str(index))
-    packet = _bootstrap(tmp_path)
-    assert packet["ok"] and len(packet["data"]["mandatory"]) <= 20
+    b_rule, _ = _rule(store, "under-limit", target_id="agent-b")
+    warned = _bootstrap(tmp_path)
+    assert warned["ok"] is True
+    packet = warned["data"]
+    assert packet["status"] == "ok"
+    assert packet["error"] == ""
+    assert packet["effective_agent"] == "agent-a"
+    assert len(packet["mandatory"]) == 25
+    assert packet["budget"]["mandatory"]["items"] == 25
+    warning = packet["budget"]["warnings"][0]
+    assert warning["code"] == "mandatory_item_count_warning"
+    assert warning["count"] == 25
+
+    under_limit = _bootstrap(tmp_path, agent="agent-b")
+    assert under_limit["ok"] is True
+    assert [item["body"] for item in under_limit["data"]["mandatory"]] == [b_rule.canonical_text]
+    assert under_limit["data"]["budget"]["warnings"] == []
 
 
 def test_overlapping_but_non_equivalent_audiences_never_dedup(tmp_path):

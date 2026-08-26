@@ -16,8 +16,8 @@ import zipfile
 from pathlib import Path
 
 
-EXPECTED_VERSION = "0.7.1.post6"
-WHEEL_NAME = "agent_memguard-0.7.1.post6-py3-none-any.whl"
+EXPECTED_VERSION = "0.7.1.post18"
+WHEEL_NAME = "agent_memguard-0.7.1.post18-py3-none-any.whl"
 
 
 def _verify_wheel(wheel: Path) -> str:
@@ -28,34 +28,45 @@ def _verify_wheel(wheel: Path) -> str:
         if len(metadata_names) != 1:
             raise SystemExit("hotfix wheel metadata is missing or ambiguous")
         metadata = archive.read(metadata_names[0]).decode("utf-8", errors="strict")
-        if f"\nVersion: {EXPECTED_VERSION}\n" not in "\n" + metadata:
+        if f"Version: {EXPECTED_VERSION}" not in {
+            line.strip() for line in metadata.splitlines()
+        }:
             raise SystemExit("hotfix wheel version mismatch")
         lifecycle_name = "memoryguard/codex_mcp_lifecycle.py"
         hook_name = "memoryguard/host_hooks.py"
         provider_name = "memoryguard/provider_adapters.py"
+        subagent_name = "memoryguard/codex_subagent_reconcile.py"
         if (
             lifecycle_name not in names
             or hook_name not in names
             or provider_name not in names
+            or subagent_name not in names
         ):
-            raise SystemExit("hotfix wheel is missing lifecycle, hook, or provider integration")
+            raise SystemExit("hotfix wheel is missing lifecycle, hook, provider, or subagent integration")
         lifecycle = archive.read(lifecycle_name).decode("utf-8", errors="strict")
         hooks = archive.read(hook_name).decode("utf-8", errors="strict")
-        providers = archive.read(provider_name).decode("utf-8", errors="strict")
-        if f'SHIM_VERSION = "{EXPECTED_VERSION}"' not in lifecycle:
-            raise SystemExit("hotfix wheel lifecycle version mismatch")
-        if 'PROTECTED_ROOT_NAMES = frozenset({"python.exe"})' not in lifecycle:
-            raise SystemExit("hotfix wheel does not protect Python stdio transports")
-        if "_best_effort_codex_mcp_lifecycle" not in hooks:
+        subagents = archive.read(subagent_name).decode("utf-8", errors="strict")
+        if (
+            'if mode != "force"' not in lifecycle
+            or 'allow_termination=selected_mode == "force"' not in lifecycle
+        ):
+            raise SystemExit("hotfix wheel is missing the auto-mode termination gate")
+        if (
+            "_best_effort_codex_mcp_lifecycle" not in hooks
+            or "reconcile_closed_edge_rollout_activities" not in hooks
+        ):
             raise SystemExit("hotfix wheel is missing host-hook integration")
-        if '["-X", "utf8", "-m", "memoryguard.mcp_server"]' not in providers:
-            raise SystemExit("hotfix wheel would reinstall the unsafe MCP launch arguments")
+        if (
+            "reconcile_closed_edge_rollout_activities" not in subagents
+            or 'terminal[child] = "missing_rollout"' not in subagents
+        ):
+            raise SystemExit("hotfix wheel is missing subagent rollout reconciliation")
     return digest
 
 
 def main() -> int:
     repo = Path(__file__).resolve().parents[1]
-    wheel = repo / "dist-hotfix-final13" / WHEEL_NAME
+    wheel = repo / "dist-hotfix-subagent-rollout-post18" / WHEEL_NAME
     if not wheel.is_file():
         raise SystemExit(f"hotfix wheel missing: {wheel}")
     digest = _verify_wheel(wheel)
@@ -85,11 +96,12 @@ def main() -> int:
                 "import importlib.metadata as m; "
                 "import memoryguard.host_hooks as h; "
                 "import memoryguard.codex_mcp_lifecycle as c; "
+                "import memoryguard.codex_subagent_reconcile as s; "
                 f"assert m.version('agent-memguard') == '{EXPECTED_VERSION}'; "
                 "assert hasattr(h, '_best_effort_codex_mcp_lifecycle'); "
-                f"assert c.SHIM_VERSION == '{EXPECTED_VERSION}'; "
-                "assert 'python.exe' in c.PROTECTED_ROOT_NAMES; "
-                "print('memoryguard codex lifecycle hotfix: installed')"
+                "assert hasattr(s, 'reconcile_closed_edge_rollout_activities'); "
+                "assert c.WindowsProcessController().allow_termination is False; "
+                "print('memoryguard codex subagent rollout hotfix: installed')"
             ),
         ],
         check=False,

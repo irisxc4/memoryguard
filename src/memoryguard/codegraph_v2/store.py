@@ -231,6 +231,46 @@ CREATE VIEW IF NOT EXISTS codegraph_outbox AS SELECT * FROM outbox;
 CREATE VIEW IF NOT EXISTS codegraph_checkpoints AS SELECT * FROM checkpoints;
 """
 
+CODEGRAPH_REFRESH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS source_fingerprints (
+    fingerprint_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    mtime_ns INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    UNIQUE(scope_id, path),
+    FOREIGN KEY(scope_id) REFERENCES graph_scopes(scope_id)
+);
+CREATE TABLE IF NOT EXISTS affected_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    start_ids_json TEXT NOT NULL DEFAULT '[]',
+    result_json TEXT NOT NULL DEFAULT '[]',
+    digest TEXT NOT NULL DEFAULT '',
+    depth INTEGER NOT NULL DEFAULT 2,
+    result_limit INTEGER NOT NULL DEFAULT 32,
+    provenance_filter TEXT NOT NULL DEFAULT 'production',
+    consumed INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
+    created_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(scope_id) REFERENCES graph_scopes(scope_id)
+);
+CREATE TABLE IF NOT EXISTS refresh_queue (
+    queue_id TEXT PRIMARY KEY,
+    scope_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    UNIQUE(scope_id, path),
+    FOREIGN KEY(scope_id) REFERENCES graph_scopes(scope_id)
+);
+"""
+
+_MAX_AFFECTED_RECEIPT_DEPTH = 4
+_MAX_AFFECTED_RECEIPT_RESULTS = 64
+_MAX_AFFECTED_RECEIPT_STARTS = 16
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -361,7 +401,10 @@ class CodeGraphStore:
             state = self._preflight()
             if state == "v1":
                 self._migrate_v1_to_v2()
-            elif state != "current":
+                self._ensure_refresh_schema()
+            elif state == "current":
+                self._ensure_refresh_schema()
+            else:
                 initialize_database(self.db_path, "codegraph", layout=self.layout)
                 self._ensure_aux_schema()
 
@@ -402,10 +445,20 @@ class CodeGraphStore:
         with open_database(self.db_path) as conn:
             with transaction(conn):
                 execute_sql_script(conn, CODEGRAPH_AUX_SCHEMA)
+                execute_sql_script(conn, CODEGRAPH_REFRESH_SCHEMA)
                 conn.execute(
                     "INSERT INTO codegraph_schema_meta(key,value) VALUES('version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(CODEGRAPH_SCHEMA_VERSION),),
                 )
+
+    def _ensure_refresh_schema(self) -> None:
+        with open_database(self.db_path) as conn:
+            with transaction(conn):
+                self._ensure_refresh_schema_conn(conn)
+
+    @staticmethod
+    def _ensure_refresh_schema_conn(conn: sqlite3.Connection) -> None:
+        execute_sql_script(conn, CODEGRAPH_REFRESH_SCHEMA)
 
     def _migrate_v1_to_v2(self) -> None:
         """Known additive CodeGraph aux migration; no source-body columns exist."""
@@ -526,6 +579,7 @@ class CodeGraphStore:
             with transaction(conn):
                 scope_id = self._ensure_scope(conn, checked_scope)
                 self._ensure_symbol_external_schema(conn)
+                self._ensure_refresh_schema_conn(conn)
                 yield conn, checked_scope, scope_id, _now()
 
     @staticmethod
@@ -1479,10 +1533,11 @@ class CodeGraphStore:
             scope = CodeGraphScope(workspace_id=str(row["workspace_id"]) if "workspace_id" in row.keys() else self.workspace_id)
         return OutboxEvent(event_id=str(row["event_id"]), scope=scope, event_type=str(row["event_type"]), aggregate_id=str(row["aggregate_id"]), payload_hash=str(row["payload_hash"]), sequence=int(row["sequence"]), status=str(row["status"]), attempts=int(row["attempts"]), error=str(row["error"]), created_at=str(row["created_at"]), projected_at=str(row["projected_at"]))
 
-    def pending_outbox(self, *, scope: CodeGraphScope | Mapping[str, Any] | None = None, limit: int | None = None) -> tuple[OutboxEvent, ...]:
+    def pending_outbox(self, *, scope: CodeGraphScope | Mapping[str, Any] | None = None, limit: int | None = None, include_failed: bool = False) -> tuple[OutboxEvent, ...]:
         checked_scope = self._scope(scope)
         scope_id = self._scope_id(checked_scope)
-        sql = "SELECT * FROM outbox WHERE scope_id=? AND status='pending' ORDER BY sequence"
+        statuses = "('pending','failed')" if include_failed else "('pending')"
+        sql = f"SELECT * FROM outbox WHERE scope_id=? AND status IN {statuses} ORDER BY sequence"
         params: list[Any] = [scope_id]
         if limit is not None:
             sql += " LIMIT ?"; params.append(max(0, int(limit)))
@@ -1494,23 +1549,40 @@ class CodeGraphStore:
 
     def drain_outbox(self, *, scope: CodeGraphScope | Mapping[str, Any] | None = None, projector: Any | None = None, limit: int | None = None) -> dict[str, int]:
         checked_scope = self._scope(scope, write=True)
-        events = self.pending_outbox(scope=checked_scope, limit=limit)
-        projected = failed = 0
+        events = self.pending_outbox(scope=checked_scope, limit=limit, include_failed=True)
+        projected: list[str] = []
+        failed: list[tuple[str, str]] = []
         for event in events:
             try:
                 if projector is not None:
                     callback = getattr(projector, "project", projector)
                     callback(event)
-                with open_database(self.db_path) as conn:
-                    with transaction(conn):
-                        conn.execute("UPDATE outbox SET status='projected',attempts=attempts+1,projected_at=?,error='' WHERE event_id=? AND status='pending'", (_now(), event.event_id))
-                projected += 1
+                projected.append(event.event_id)
             except Exception as exc:
-                with open_database(self.db_path) as conn:
-                    with transaction(conn):
-                        conn.execute("UPDATE outbox SET status='failed',attempts=attempts+1,error=? WHERE event_id=?", (f"{type(exc).__name__}:{exc}", event.event_id))
-                failed += 1
-        return {"projected": projected, "failed": failed, "pending": len(self.pending_outbox(scope=checked_scope))}
+                failed.append((event.event_id, f"{type(exc).__name__}:{exc}"))
+        # Keep the durable state transition in one short transaction.  The
+        # prior per-event connection loop could churn WAL sidecars on Windows
+        # and leave a partially projected queue when a later write failed.
+        # If this transaction cannot commit, no event is marked failed merely
+        # because the storage layer was temporarily unavailable.
+        if projected or failed:
+            now = _now()
+            with open_database(self.db_path) as conn:
+                with transaction(conn):
+                    for event_id in projected:
+                        conn.execute(
+                            "UPDATE outbox SET status='projected',attempts=attempts+1,projected_at=?,error='' "
+                            "WHERE event_id=? AND status IN ('pending','failed')",
+                            (now, event_id),
+                        )
+                    for event_id, error in failed:
+                        conn.execute(
+                            "UPDATE outbox SET status='failed',attempts=attempts+1,error=? "
+                            "WHERE event_id=? AND status IN ('pending','failed')",
+                            (error, event_id),
+                        )
+        remaining = self.pending_outbox(scope=checked_scope, include_failed=True)
+        return {"projected": len(projected), "failed": len(failed), "pending": len(remaining)}
 
     project_outbox = drain_outbox
 
@@ -1542,6 +1614,257 @@ class CodeGraphStore:
                 return Checkpoint(checkpoint_id, checked_scope, str(row["domain"]), int(row["sequence"]), str(row["digest"]), str(row["updated_at"]))
 
     update_checkpoint = save_checkpoint
+
+    def _fingerprint_id(self, scope_id: str, path: str) -> str:
+        return stable_id("fingerprint", scope_id, path)
+
+    def get_fingerprint(self, path: str, *, scope: CodeGraphScope | Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        checked_scope = self._scope(scope)
+        scope_id = self._scope_id(checked_scope)
+        normalized = self._check_source_path(path)
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT path,mtime_ns,size,content_hash FROM source_fingerprints WHERE scope_id=? AND path=?",
+                (scope_id, normalized),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "path": str(row["path"]),
+            "mtime_ns": int(row["mtime_ns"]),
+            "size": int(row["size"]),
+            "content_hash": str(row["content_hash"]),
+        }
+
+    def _upsert_fingerprint_conn(
+        self,
+        conn: sqlite3.Connection,
+        checked_scope: CodeGraphScope,
+        *,
+        path: str,
+        mtime_ns: int,
+        size: int,
+        content_hash: str,
+        now: str | None = None,
+    ) -> None:
+        self._ensure_refresh_schema_conn(conn)
+        scope_id = self._scope_id(checked_scope)
+        normalized = self._check_source_path(path)
+        fingerprint_id = self._fingerprint_id(scope_id, normalized)
+        conn.execute(
+            "INSERT INTO source_fingerprints(fingerprint_id,scope_id,path,mtime_ns,size,content_hash,updated_at) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(scope_id,path) DO UPDATE SET "
+            "mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,updated_at=excluded.updated_at",
+            (fingerprint_id, scope_id, normalized, int(mtime_ns), int(size), str(content_hash), str(now or _now())),
+        )
+
+    def _delete_fingerprint_conn(
+        self,
+        conn: sqlite3.Connection,
+        checked_scope: CodeGraphScope,
+        path: str,
+    ) -> None:
+        self._ensure_refresh_schema_conn(conn)
+        scope_id = self._scope_id(checked_scope)
+        normalized = self._check_source_path(path)
+        conn.execute(
+            "DELETE FROM source_fingerprints WHERE scope_id=? AND path=?",
+            (scope_id, normalized),
+        )
+
+    def enqueue_refresh_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        scope: CodeGraphScope | Mapping[str, Any] | None = None,
+    ) -> tuple[str, ...]:
+        checked_scope = self._scope(scope, write=True)
+        scope_id = self._scope_id(checked_scope)
+        now = _now()
+        queued: list[str] = []
+        with open_database(self.db_path) as conn:
+            with transaction(conn):
+                self._ensure_scope(conn, checked_scope)
+                self._ensure_refresh_schema_conn(conn)
+                for raw in paths:
+                    normalized = self._check_source_path(raw)
+                    queue_id = stable_id("refresh-queue", scope_id, normalized)
+                    conn.execute(
+                        "INSERT INTO refresh_queue(queue_id,scope_id,path,queued_at) VALUES(?,?,?,?) "
+                        "ON CONFLICT(scope_id,path) DO UPDATE SET queued_at=excluded.queued_at",
+                        (queue_id, scope_id, normalized, now),
+                    )
+                    queued.append(normalized)
+                rows = conn.execute(
+                    "SELECT path FROM refresh_queue WHERE scope_id=? ORDER BY path",
+                    (scope_id,),
+                ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def drain_refresh_queue(
+        self,
+        *,
+        scope: CodeGraphScope | Mapping[str, Any] | None = None,
+    ) -> tuple[str, ...]:
+        checked_scope = self._scope(scope, write=True)
+        scope_id = self._scope_id(checked_scope)
+        with open_database(self.db_path) as conn:
+            with transaction(conn):
+                self._ensure_refresh_schema_conn(conn)
+                rows = conn.execute(
+                    "SELECT path FROM refresh_queue WHERE scope_id=? ORDER BY path",
+                    (scope_id,),
+                ).fetchall()
+                conn.execute("DELETE FROM refresh_queue WHERE scope_id=?", (scope_id,))
+        return tuple(str(row[0]) for row in rows)
+
+    def _put_affected_receipt_conn(
+        self,
+        conn: sqlite3.Connection,
+        checked_scope: CodeGraphScope,
+        *,
+        start_ids: Sequence[str],
+        result_ids: Sequence[str],
+        depth: int,
+        limit: int,
+        provenance: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_refresh_schema_conn(conn)
+        scope_id = self._scope_id(checked_scope)
+        starts = tuple(dict.fromkeys(
+            str(item).strip() for item in start_ids if str(item).strip()
+        ))[:_MAX_AFFECTED_RECEIPT_STARTS]
+        bounded_depth = min(max(0, int(depth)), _MAX_AFFECTED_RECEIPT_DEPTH)
+        bounded_limit = min(
+            max(1, int(limit)),
+            _MAX_AFFECTED_RECEIPT_RESULTS,
+        )
+        results = tuple(dict.fromkeys(
+            str(item).strip() for item in result_ids if str(item).strip()
+        ))[:bounded_limit]
+        provenance_filter = normalize_provenance(provenance or "production")
+        digest = stable_digest((starts, results, bounded_depth, bounded_limit, provenance_filter))
+        receipt_id = stable_id("affected-receipt", scope_id, digest, str(now or _now()))
+        payload = {
+            "receipt_id": receipt_id,
+            "scope_id": scope_id,
+            "start_ids": list(starts),
+            "result_ids": list(results),
+            "depth": bounded_depth,
+            "limit": bounded_limit,
+            "provenance": provenance_filter,
+            "digest": digest,
+        }
+        conn.execute("DELETE FROM affected_receipts WHERE scope_id=? AND consumed=0", (scope_id,))
+        conn.execute(
+            "INSERT INTO affected_receipts(receipt_id,scope_id,start_ids_json,result_json,digest,depth,result_limit,provenance_filter,consumed,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,0,?)",
+            (
+                receipt_id,
+                scope_id,
+                _json(list(starts)),
+                _json(list(results)),
+                digest,
+                bounded_depth,
+                bounded_limit,
+                provenance_filter,
+                str(now or _now()),
+            ),
+        )
+        return payload
+
+    def consume_affected_receipt(
+        self,
+        *,
+        scope: CodeGraphScope | Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        checked_scope = self._scope(scope, write=True)
+        scope_id = self._scope_id(checked_scope)
+        now = _now()
+        with open_database(self.db_path) as conn:
+            with transaction(conn):
+                self._ensure_refresh_schema_conn(conn)
+                row = conn.execute(
+                    "SELECT receipt_id,start_ids_json,result_json,digest,depth,result_limit,provenance_filter "
+                    "FROM affected_receipts WHERE scope_id=? AND consumed=0 ORDER BY created_at,receipt_id LIMIT 1",
+                    (scope_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                conn.execute(
+                    "UPDATE affected_receipts SET consumed=1,consumed_at=? WHERE receipt_id=? AND consumed=0",
+                    (now, str(row["receipt_id"])),
+                )
+                changed = conn.execute("SELECT changes()").fetchone()
+                if changed is None or int(changed[0]) != 1:
+                    return None
+        return {
+            "receipt_id": str(row["receipt_id"]),
+            "scope_id": scope_id,
+            "start_ids": json.loads(str(row["start_ids_json"] or "[]")),
+            "result_ids": json.loads(str(row["result_json"] or "[]")),
+            "depth": int(row["depth"]),
+            "limit": int(row["result_limit"]),
+            "provenance": str(row["provenance_filter"]),
+            "digest": str(row["digest"]),
+            "consumed": True,
+        }
+
+    def related_source_paths(
+        self,
+        paths: Sequence[str],
+        *,
+        scope: CodeGraphScope | Mapping[str, Any] | None = None,
+        limit: int = 32,
+    ) -> tuple[str, ...]:
+        """Return direct active graph neighbours for bounded re-export.
+
+        Re-exporting an unchanged neighbour restores edges that originate in it
+        after a changed file's old symbols are replaced.  This is deliberately
+        one hop and bounded: never a hidden full build.
+        """
+
+        checked_scope = self._scope(scope)
+        scope_id = self._scope_id(checked_scope)
+        normalized = tuple(dict.fromkeys(
+            self._check_source_path(path) for path in paths if str(path).strip()
+        ))
+        if not normalized:
+            return ()
+        bounded_limit = min(max(1, int(limit)), 128)
+        placeholders = ",".join("?" for _ in normalized)
+        with self.connection() as conn:
+            changed_rows = conn.execute(
+                "SELECT file_id FROM source_files WHERE scope_id=? AND active=1 AND path IN (" + placeholders + ")",
+                (scope_id, *normalized),
+            ).fetchall()
+            changed_ids = tuple(str(row[0]) for row in changed_rows)
+            if not changed_ids:
+                return ()
+            changed_placeholders = ",".join("?" for _ in changed_ids)
+            rows = conn.execute(
+                "SELECT DISTINCT CASE "
+                "WHEN source_symbols.file_id IN (" + changed_placeholders + ") THEN target_symbols.file_id "
+                "ELSE source_symbols.file_id END AS file_id "
+                "FROM edges "
+                "JOIN symbols AS source_symbols ON source_symbols.symbol_id=edges.from_id AND source_symbols.scope_id=edges.scope_id "
+                "JOIN symbols AS target_symbols ON target_symbols.symbol_id=edges.to_id AND target_symbols.scope_id=edges.scope_id "
+                "WHERE edges.scope_id=? AND edges.active=1 AND source_symbols.active=1 AND target_symbols.active=1 "
+                "AND (source_symbols.file_id IN (" + changed_placeholders + ") "
+                "OR target_symbols.file_id IN (" + changed_placeholders + ")) "
+                "ORDER BY file_id LIMIT ?",
+                (*changed_ids, scope_id, *changed_ids, *changed_ids, bounded_limit),
+            ).fetchall()
+            neighbour_ids = tuple(str(row[0]) for row in rows if str(row[0]) not in changed_ids)
+            if not neighbour_ids:
+                return ()
+            neighbours = ",".join("?" for _ in neighbour_ids)
+            path_rows = conn.execute(
+                "SELECT path FROM source_files WHERE scope_id=? AND active=1 AND file_id IN (" + neighbours + ") ORDER BY path",
+                (scope_id, *neighbour_ids),
+            ).fetchall()
+        return tuple(str(row[0]) for row in path_rows[:bounded_limit])
 
     def record_migration_map(self, source_db: str, source_table: str, source_pk: str, source_hash: str, *, target_id: str = "", target_type: str = "", status: str = "mapped") -> str:
         now = _now(); source_db = str(source_db); source_table = str(source_table); source_pk = str(source_pk); source_hash = str(source_hash)

@@ -160,6 +160,22 @@ _FORBIDDEN_METADATA_KEYS = frozenset({
 })
 
 
+def _evidence_payload_authority(payload: Mapping[str, Any]) -> str:
+    nested = payload.get("evidence")
+    if isinstance(nested, Mapping):
+        return str(nested.get("authority") or payload.get("authority") or "observed")
+    return str(payload.get("authority") or "observed")
+
+
+def _validate_evidence_authorities(payloads: Sequence[Mapping[str, Any]]) -> None:
+    """Reuse the evidence-domain allowlist before any memory/outbox write."""
+
+    from ..evidence.store import validate_authority
+
+    for payload in payloads:
+        validate_authority(_evidence_payload_authority(payload))
+
+
 @dataclass(frozen=True)
 class MemoryReadScope:
     """Explicit visibility scope required by public memory read methods."""
@@ -737,6 +753,7 @@ class MemoryAtomStore:
                 "status": "valid",
                 "evidence_type": "reference",
             })
+        _validate_evidence_authorities(evidence_payload)
         # Evidence records are projected separately.  Keep only references in
         # memory.db; full evidence payloads are deliberately not stored here.
         migration_conn = getattr(self._migration_state, "conn", None)
@@ -771,6 +788,16 @@ class MemoryAtomStore:
                 if existing is not None and not replace:
                     return self._row_to_atom(existing)
                 if existing is not None:
+                    existing_visibility = str(existing["visibility"] or "")
+                    visibility_matches = (
+                        existing_visibility == item.visibility
+                        or (
+                            existing_visibility == "building"
+                            and item.visibility in {"ready", "active"}
+                            and bool(evidence_payload)
+                            and str(existing["status"] or "") == "active"
+                        )
+                    )
                     same_payload = (
                         str(existing["body"] or "") == item.body
                         and str(existing["kind"] or "") == item.kind
@@ -791,18 +818,31 @@ class MemoryAtomStore:
                         and str(existing["project_ref"] or "") == item.project_ref
                         and str(existing["provider"] or "") == item.provider
                         and str(existing["runtime_role"] or "") == item.runtime_role
-                        and str(existing["visibility"] or "") == item.visibility
+                        and visibility_matches
                     )
                     if same_payload:
                         return self._row_to_atom(existing)
+                publication_visibility = ""
+                stage_visible_update = False
+                if evidence_payload:
+                    existing_visibility = str(existing["visibility"] or "") if existing is not None else ""
+                    if existing is not None and existing_visibility in {"ready", "active"}:
+                        stage_visible_update = True
+                        publication_visibility = item.visibility if item.visibility in {"ready", "active"} else existing_visibility
+                    elif item.visibility in {"ready", "active"} and str(item.status or "active") == "active":
+                        publication_visibility = item.visibility
+                        item.visibility = "building"
+                    if publication_visibility:
+                        for payload in evidence_payload:
+                            payload["publication_visibility"] = publication_visibility
                 revision = int(existing["revision"]) if existing is not None else 0
+                if existing is not None:
+                    max_rev = int(conn.execute("SELECT COALESCE(MAX(revision),0) FROM atom_revisions WHERE atom_id=?", (item.atom_id,)).fetchone()[0] or 0)
+                    revision = max(revision, max_rev)
                 if existing is not None and revision >= item.revision:
                     item.revision = revision + 1
-                conn.execute(
-                    "INSERT INTO atoms(atom_id,memory_id,body,kind,status,confidence,locked,injection_policy,priority,canonical_hash,dedup_domain,supersedes_json,provenance_json,metadata_json,revision,visibility,created_at,updated_at,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(atom_id) DO UPDATE SET memory_id=excluded.memory_id,body=excluded.body,kind=excluded.kind,status=excluded.status,confidence=excluded.confidence,locked=excluded.locked,injection_policy=excluded.injection_policy,priority=excluded.priority,canonical_hash=excluded.canonical_hash,dedup_domain=excluded.dedup_domain,supersedes_json=excluded.supersedes_json,provenance_json=excluded.provenance_json,metadata_json=excluded.metadata_json,revision=excluded.revision,visibility=excluded.visibility,updated_at=excluded.updated_at,workspace_id=excluded.workspace_id,agent_instance_id=excluded.agent_instance_id,share_group_id=excluded.share_group_id,project_ref=excluded.project_ref,provider=excluded.provider,runtime_role=excluded.runtime_role",
-                    (item.atom_id,item.memory_id,item.body,item.kind,item.status,item.confidence,1 if item.locked else 0,item.injection_policy,item.priority,item.canonical_hash,item.dedup_domain,_json(item.supersedes),_json(item.provenance),_json(item.metadata),item.revision,item.visibility,item.created_at,item.updated_at,item.workspace_id,item.agent_instance_id,item.share_group_id,item.project_ref,item.provider,item.runtime_role),
-                )
+                if not stage_visible_update:
+                    self._upsert_atom_row(conn, item)
                 rev_id = stable_digest({"atom_id": item.atom_id, "revision": item.revision})
                 rev_digest = stable_digest({"body": item.body, "status": item.status, "canonical_hash": item.canonical_hash, "metadata": item.metadata})
                 conn.execute(
@@ -811,25 +851,23 @@ class MemoryAtomStore:
                 )
                 if existing is not None and int(existing["revision"]) != item.revision:
                     before = int(existing["revision"])
-                    delta = {"body": item.body, "status": item.status, "confidence": item.confidence, "locked": item.locked, "canonical_hash": item.canonical_hash, "metadata": dict(item.metadata)}
+                    if stage_visible_update:
+                        delta = item.to_dict()
+                        delta["staged_acl"] = dict(acl or {})
+                        delta["staged_source_mappings"] = [dict(value) for value in (source_mappings or ()) if isinstance(value, Mapping)]
+                        self._write_scope_acl(conn, item, acl, persist=False)
+                        self._write_source_mappings(conn, item, source_mappings, persist=False)
+                    else:
+                        delta = {"body": item.body, "status": item.status, "confidence": item.confidence, "locked": item.locked, "canonical_hash": item.canonical_hash, "metadata": dict(item.metadata)}
                     delta_id = stable_digest({"atom_id": item.atom_id, "from": before, "to": item.revision})
                     conn.execute("INSERT INTO atom_deltas(delta_id,atom_id,from_revision,to_revision,delta_json,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(atom_id,from_revision,to_revision) DO UPDATE SET delta_json=excluded.delta_json", (delta_id,item.atom_id,before,item.revision,_json(delta),item.updated_at))
-                scope = {"workspace_id": item.workspace_id, "agent_instance_id": item.agent_instance_id, "share_group_id": item.share_group_id, "project_ref": item.project_ref, "provider": item.provider, "runtime_role": item.runtime_role, "effect": "allow"}
-                if acl:
-                    scope.update({str(key): value for key, value in acl.items()})
-                acl_id = stable_digest({"atom_id": item.atom_id, **scope})
-                acl_metadata = _validate_metadata({key: value for key, value in scope.items() if key not in {"workspace_id","agent_instance_id","share_group_id","project_ref","provider","runtime_role","effect"}}, label="ACL metadata")
-                conn.execute("INSERT INTO scope_acl(acl_id,atom_id,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role,effect,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(atom_id,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role) DO UPDATE SET effect=excluded.effect,metadata_json=excluded.metadata_json", (acl_id,item.atom_id,str(scope.get("workspace_id") or ""),str(scope.get("agent_instance_id") or ""),str(scope.get("share_group_id") or ""),str(scope.get("project_ref") or ""),str(scope.get("provider") or ""),str(scope.get("runtime_role") or ""),str(scope.get("effect") or "allow"),_json(acl_metadata),item.updated_at))
-                for mapping in source_mappings or ():
-                    source_ref = str(mapping.get("source_ref") or "")
-                    if not source_ref:
-                        continue
-                    map_id = stable_digest({"atom_id": item.atom_id, "source_domain": mapping.get("source_domain", ""), "source_ref": source_ref, "source_record_id": mapping.get("source_record_id", "")})
-                    mapping_metadata = _validate_metadata(mapping.get("provenance") or mapping.get("metadata") or {}, label="source mapping metadata")
-                    conn.execute("INSERT INTO source_mappings(mapping_id,atom_id,source_domain,source_ref,source_record_id,source_revision,digest,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(atom_id,source_domain,source_ref,source_record_id) DO UPDATE SET source_revision=excluded.source_revision,digest=excluded.digest,provenance_json=excluded.provenance_json", (map_id,item.atom_id,str(mapping.get("source_domain") or ""),source_ref,str(mapping.get("source_record_id") or ""),str(mapping.get("source_revision") or mapping.get("revision") or ""),str(mapping.get("digest") or ""),_json(mapping_metadata),item.updated_at))
+                if not stage_visible_update:
+                    self._write_scope_acl(conn, item, acl)
+                    self._write_source_mappings(conn, item, source_mappings)
                 for payload in evidence_payload:
                     payload.setdefault("subject_type", "atom")
                     payload.setdefault("subject_id", item.atom_id)
+                    payload["publication_revision"] = int(item.revision)
                     checked_payload = _validate_metadata_tree(payload, label="evidence outbox payload")
                     if not isinstance(checked_payload, Mapping):
                         raise ValueError("evidence outbox payload must be a JSON object")
@@ -907,6 +945,7 @@ class MemoryAtomStore:
         if "link_metadata" in payload:
             payload["link_metadata"] = _validate_metadata(payload.get("link_metadata"), label="evidence link metadata")
         payload.update({"subject_type": subject_type, "subject_id": subject_id or aggregate_id, "relation": relation})
+        _validate_evidence_authorities([payload])
         migration_conn = getattr(self._migration_state, "conn", None)
         conn = migration_conn or self._checked_connect(readonly=False)
         try:
@@ -1587,6 +1626,182 @@ class MemoryAtomStore:
     def _write_atom_row(self, conn: sqlite3.Connection, item: MemoryAtom) -> None:
         conn.execute("UPDATE atoms SET status=?,supersedes_json=?,revision=?,updated_at=?,visibility=? WHERE atom_id=?", (item.status,_json(item.supersedes),item.revision,item.updated_at,item.visibility,item.atom_id))
 
+    def _upsert_atom_row(self, conn: sqlite3.Connection, item: MemoryAtom) -> None:
+        conn.execute(
+            "INSERT INTO atoms(atom_id,memory_id,body,kind,status,confidence,locked,injection_policy,priority,canonical_hash,dedup_domain,supersedes_json,provenance_json,metadata_json,revision,visibility,created_at,updated_at,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(atom_id) DO UPDATE SET memory_id=excluded.memory_id,body=excluded.body,kind=excluded.kind,status=excluded.status,confidence=excluded.confidence,locked=excluded.locked,injection_policy=excluded.injection_policy,priority=excluded.priority,canonical_hash=excluded.canonical_hash,dedup_domain=excluded.dedup_domain,supersedes_json=excluded.supersedes_json,provenance_json=excluded.provenance_json,metadata_json=excluded.metadata_json,revision=excluded.revision,visibility=excluded.visibility,updated_at=excluded.updated_at,workspace_id=excluded.workspace_id,agent_instance_id=excluded.agent_instance_id,share_group_id=excluded.share_group_id,project_ref=excluded.project_ref,provider=excluded.provider,runtime_role=excluded.runtime_role",
+            (item.atom_id,item.memory_id,item.body,item.kind,item.status,item.confidence,1 if item.locked else 0,item.injection_policy,item.priority,item.canonical_hash,item.dedup_domain,_json(item.supersedes),_json(item.provenance),_json(item.metadata),item.revision,item.visibility,item.created_at,item.updated_at,item.workspace_id,item.agent_instance_id,item.share_group_id,item.project_ref,item.provider,item.runtime_role),
+        )
+
+    def _write_scope_acl(
+        self,
+        conn: sqlite3.Connection,
+        item: MemoryAtom,
+        acl: Mapping[str, Any] | None = None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        scope = {
+            "workspace_id": item.workspace_id,
+            "agent_instance_id": item.agent_instance_id,
+            "share_group_id": item.share_group_id,
+            "project_ref": item.project_ref,
+            "provider": item.provider,
+            "runtime_role": item.runtime_role,
+            "effect": "allow",
+        }
+        if acl:
+            scope.update({str(key): value for key, value in acl.items()})
+        acl_id = stable_digest({"atom_id": item.atom_id, **scope})
+        acl_metadata = _validate_metadata(
+            {key: value for key, value in scope.items() if key not in {"workspace_id", "agent_instance_id", "share_group_id", "project_ref", "provider", "runtime_role", "effect"}},
+            label="ACL metadata",
+        )
+        if not persist:
+            return
+        conn.execute(
+            "INSERT INTO scope_acl(acl_id,atom_id,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role,effect,metadata_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(atom_id,workspace_id,agent_instance_id,share_group_id,project_ref,provider,runtime_role) DO UPDATE SET effect=excluded.effect,metadata_json=excluded.metadata_json",
+            (acl_id, item.atom_id, str(scope.get("workspace_id") or ""), str(scope.get("agent_instance_id") or ""), str(scope.get("share_group_id") or ""), str(scope.get("project_ref") or ""), str(scope.get("provider") or ""), str(scope.get("runtime_role") or ""), str(scope.get("effect") or "allow"), _json(acl_metadata), item.updated_at),
+        )
+
+    def _write_source_mappings(
+        self,
+        conn: sqlite3.Connection,
+        item: MemoryAtom,
+        source_mappings: Sequence[Mapping[str, Any]] | None,
+        *,
+        persist: bool = True,
+    ) -> None:
+        for mapping in source_mappings or ():
+            if not isinstance(mapping, Mapping):
+                continue
+            source_ref = str(mapping.get("source_ref") or "")
+            if not source_ref:
+                continue
+            map_id = stable_digest({"atom_id": item.atom_id, "source_domain": mapping.get("source_domain", ""), "source_ref": source_ref, "source_record_id": mapping.get("source_record_id", "")})
+            mapping_metadata = _validate_metadata(mapping.get("provenance") or mapping.get("metadata") or {}, label="source mapping metadata")
+            if not persist:
+                continue
+            conn.execute(
+                "INSERT INTO source_mappings(mapping_id,atom_id,source_domain,source_ref,source_record_id,source_revision,digest,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(atom_id,source_domain,source_ref,source_record_id) DO UPDATE SET source_revision=excluded.source_revision,digest=excluded.digest,provenance_json=excluded.provenance_json",
+                (map_id, item.atom_id, str(mapping.get("source_domain") or ""), source_ref, str(mapping.get("source_record_id") or ""), str(mapping.get("source_revision") or mapping.get("revision") or ""), str(mapping.get("digest") or ""), _json(mapping_metadata), item.updated_at),
+            )
+
+    def _apply_staged_relationships(self, conn: sqlite3.Connection, item: MemoryAtom, delta: Mapping[str, Any] | None) -> None:
+        if not isinstance(delta, Mapping) or ("staged_acl" not in delta and "staged_source_mappings" not in delta):
+            return
+        staged_acl = delta.get("staged_acl")
+        self._write_scope_acl(conn, item, staged_acl if isinstance(staged_acl, Mapping) else None)
+        staged_mappings = delta.get("staged_source_mappings")
+        if isinstance(staged_mappings, Sequence) and not isinstance(staged_mappings, (str, bytes, bytearray)):
+            self._write_source_mappings(conn, item, [item_map for item_map in staged_mappings if isinstance(item_map, Mapping)])
+
+    def _apply_staged_revision(self, conn: sqlite3.Connection, atom_id: str, revision: int) -> None:
+        """Promote a staged, already-evidenced revision onto the visible atom row."""
+
+        atom_row = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (atom_id,)).fetchone()
+        if atom_row is None:
+            return
+        current = self._row_to_atom(atom_row)
+        delta: Mapping[str, Any] | None = None
+        delta_row = conn.execute(
+            "SELECT delta_json FROM atom_deltas WHERE atom_id=? AND to_revision=?",
+            (atom_id, int(revision)),
+        ).fetchone()
+        if delta_row is not None:
+            try:
+                loaded = json.loads(delta_row[0] or "{}")
+            except (TypeError, ValueError):
+                loaded = {}
+            if isinstance(loaded, Mapping):
+                delta = loaded
+                if delta.get("atom_id") or delta.get("memory_id"):
+                    staged = MemoryAtom.from_value(delta)
+                    staged.atom_id = atom_id
+                    staged.created_at = current.created_at or staged.created_at
+                    staged.revision = int(revision)
+                    persisted = self._coerce_atom(staged)
+                    self._upsert_atom_row(conn, persisted)
+                    self._apply_staged_relationships(conn, persisted, delta)
+                    return
+                if "body" in delta:
+                    current.body = str(delta.get("body") or "")
+                if "status" in delta:
+                    current.status = str(delta.get("status") or current.status)
+                if "confidence" in delta:
+                    current.confidence = float(delta.get("confidence") if delta.get("confidence") is not None else current.confidence)
+                if "locked" in delta:
+                    current.locked = bool(delta.get("locked"))
+                if "canonical_hash" in delta:
+                    current.canonical_hash = str(delta.get("canonical_hash") or current.canonical_hash)
+                if "metadata" in delta and isinstance(delta.get("metadata"), Mapping):
+                    current.metadata = dict(delta.get("metadata") or {})
+        rev_row = conn.execute(
+            "SELECT body,status,canonical_hash,metadata_json FROM atom_revisions WHERE atom_id=? AND revision=?",
+            (atom_id, int(revision)),
+        ).fetchone()
+        if rev_row is not None:
+            current.body = str(rev_row[0] or "")
+            current.status = str(rev_row[1] or current.status)
+            current.canonical_hash = str(rev_row[2] or current.canonical_hash)
+            try:
+                revision_metadata = json.loads(rev_row[3] or "{}")
+            except (TypeError, ValueError):
+                revision_metadata = {}
+            if isinstance(revision_metadata, Mapping):
+                current.metadata = _validate_metadata(revision_metadata, label="atom revision metadata")
+        current.revision = int(revision)
+        current.updated_at = _now()
+        persisted = self._coerce_atom(current)
+        self._upsert_atom_row(conn, persisted)
+        self._apply_staged_relationships(conn, persisted, delta)
+
+    def _publish_evidenced_atoms(self, conn: sqlite3.Connection, events: Sequence[Mapping[str, Any]]) -> None:
+        """Expose atoms whose evidence outbox for this aggregate is fully projected."""
+
+        payloads_by_atom: dict[str, Mapping[str, Any]] = {}
+        for event in events:
+            if str(event.get("event_type") or "") != "evidence.put_link":
+                continue
+            atom_id = str(event.get("aggregate_id") or "")
+            if not atom_id:
+                continue
+            payload = event.get("payload") or {}
+            if isinstance(payload, Mapping):
+                payloads_by_atom.setdefault(atom_id, payload)
+        for atom_id in payloads_by_atom:
+            pending = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM domain_outbox WHERE aggregate_id=? AND event_type='evidence.put_link' AND status IN ('pending','failed')",
+                    (atom_id,),
+                ).fetchone()[0]
+            )
+            if pending:
+                continue
+            row = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (atom_id,)).fetchone()
+            if row is None:
+                continue
+            max_rev = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(revision),0) FROM atom_revisions WHERE atom_id=?",
+                    (atom_id,),
+                ).fetchone()[0]
+                or 0
+            )
+            current_rev = int(row["revision"] or 1)
+            if max_rev > current_rev:
+                self._apply_staged_revision(conn, atom_id, max_rev)
+                row = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (atom_id,)).fetchone()
+                if row is None:
+                    continue
+            intended = str((payloads_by_atom.get(atom_id) or {}).get("publication_visibility") or "")
+            current_vis = str(row["visibility"] or "")
+            if intended in {"ready", "active"} and current_vis == "building":
+                conn.execute(
+                    "UPDATE atoms SET visibility=?,updated_at=? WHERE atom_id=?",
+                    (intended, _now(), atom_id),
+                )
+
     def set_visibility(self, visibility: str, *, atom_ids: Sequence[str] | None = None) -> int:
         if self.readonly:
             raise PermissionError("memory store is read-only")
@@ -1669,6 +1884,7 @@ class MemoryAtomStore:
                         "UPDATE outbox_checkpoints SET last_sequence=?,updated_at=? WHERE domain='memory' AND last_sequence<?",
                         (high_water, now, high_water),
                     )
+                self._publish_evidenced_atoms(conn, events)
             return len(events)
         finally:
             conn.close()
@@ -1757,12 +1973,18 @@ class MemoryAtomStore:
 
     def replay_revision(self, atom_id: str, revision: int | None = None) -> MemoryAtom | None:
         with self._connection() as conn:
-            if revision is None:
-                row = conn.execute("SELECT MAX(revision) FROM atom_revisions WHERE atom_id=?", (atom_id,)).fetchone()
-                revision = int(row[0] or 0)
-            row = conn.execute("SELECT * FROM atom_revisions WHERE atom_id=? AND revision=?", (atom_id, int(revision))).fetchone()
             atom_row = conn.execute("SELECT * FROM atoms WHERE atom_id=?", (atom_id,)).fetchone()
-        if row is None or atom_row is None:
+            if atom_row is None:
+                return None
+            committed = int(atom_row["revision"] or 1)
+            if str(atom_row["visibility"] or "") not in {"ready", "active"}:
+                return None
+            if revision is None:
+                revision = committed
+            elif int(revision) > committed or int(revision) < 1:
+                return None
+            row = conn.execute("SELECT * FROM atom_revisions WHERE atom_id=? AND revision=?", (atom_id, int(revision))).fetchone()
+        if row is None:
             return None
         item = self._row_to_atom(atom_row)
         item.body = str(row["body"] or "")
@@ -1802,7 +2024,8 @@ class MemoryAtomStore:
         query = (
             "SELECT r.revision_id,r.atom_id,a.memory_id,r.revision,r.status,"
             "r.canonical_hash,r.revision_digest,r.created_at,a.share_group_id "
-            "FROM atom_revisions r JOIN atoms a ON a.atom_id=r.atom_id WHERE 1=1"
+            "FROM atom_revisions r JOIN atoms a ON a.atom_id=r.atom_id "
+            "WHERE r.revision <= a.revision AND a.visibility IN ('ready','active')"
         )
         params: list[Any] = []
         for column, value in (

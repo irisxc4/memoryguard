@@ -223,6 +223,9 @@ class GraphifyExportAdapter:
         full_snapshot: bool,
         graphify_version: str,
         source_digest: str,
+        extra_tombstones: Sequence[str] = (),
+        fingerprints: Sequence[Mapping[str, Any]] = (),
+        affected_receipt: Mapping[str, Any] | None = None,
     ) -> GraphifyImportResult:
         """Apply Graphify export as one DB transaction.
 
@@ -472,6 +475,40 @@ class GraphifyExportAdapter:
                             now=now,
                         )
                         tombstoned += int(changed)
+                for raw_path in extra_tombstones:
+                    _tombstone_id, changed = self.store._tombstone_source_file_conn(
+                        conn,
+                        checked_scope,
+                        str(raw_path),
+                        reason="incremental_removed",
+                        now=now,
+                    )
+                    tombstoned += int(changed)
+                    try:
+                        self.store._delete_fingerprint_conn(conn, checked_scope, str(raw_path))
+                    except Exception:
+                        pass
+                for row in fingerprints:
+                    self.store._upsert_fingerprint_conn(
+                        conn,
+                        checked_scope,
+                        path=str(row.get("path") or ""),
+                        mtime_ns=int(row.get("mtime_ns") or 0),
+                        size=int(row.get("size") or 0),
+                        content_hash=str(row.get("content_hash") or ""),
+                        now=now,
+                    )
+                if affected_receipt:
+                    self.store._put_affected_receipt_conn(
+                        conn,
+                        checked_scope,
+                        start_ids=list(affected_receipt.get("start_ids") or ()),
+                        result_ids=list(affected_receipt.get("result_ids") or ()),
+                        depth=int(affected_receipt.get("depth") or 2),
+                        limit=int(affected_receipt.get("limit") or 32),
+                        provenance=str(affected_receipt.get("provenance") or "production"),
+                        now=now,
+                    )
 
                 if not source_digest:
                     source_digest = stable_digest(
@@ -514,6 +551,9 @@ class GraphifyExportAdapter:
         *,
         scope: CodeGraphScope,
         full_snapshot: bool | None = None,
+        extra_tombstones: Sequence[str] = (),
+        fingerprints: Sequence[Mapping[str, Any]] = (),
+        affected_receipt: Mapping[str, Any] | None = None,
     ) -> GraphifyImportResult:
         if not isinstance(payload, Mapping):
             raise GraphifyExportError("graphify_export_object_required")
@@ -551,6 +591,9 @@ class GraphifyExportAdapter:
             full_snapshot=bool(full_snapshot),
             graphify_version=graphify_version,
             source_digest=source_digest,
+            extra_tombstones=extra_tombstones,
+            fingerprints=fingerprints,
+            affected_receipt=affected_receipt,
         )
 
         file_by_external: dict[str, SourceFile] = {}

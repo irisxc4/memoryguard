@@ -1530,7 +1530,7 @@ def _default_gui_workspace() -> Path:
     """
     from .data_home import resolve_runtime_data_home
 
-    return resolve_runtime_data_home()
+    return resolve_runtime_data_home(discover_stable_control_home=True)
 
 
 def _resolve_gui_workspace(argv: list[str]) -> Path | None:
@@ -1550,7 +1550,18 @@ def _resolve_gui_workspace(argv: list[str]) -> Path | None:
 
 def gui_main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    workspace = _resolve_gui_workspace(argv)
+    try:
+        workspace = _resolve_gui_workspace(argv)
+    except Exception as exc:
+        from .data_home import ControlHomeResolutionError
+
+        if not isinstance(exc, ControlHomeResolutionError):
+            raise
+        print(
+            json.dumps(exc.to_payload(surface="GUI"), ensure_ascii=False, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 2
     if workspace is None:
         print(
             "error: no global MemoryGuard data home could be resolved. "
@@ -1665,15 +1676,19 @@ def _cli_workspace(args: argparse.Namespace) -> Path:
     # library when no path was explicitly supplied.  Project inspection
     # commands (audit/scan/open/...) intentionally retain bounded cwd lookup.
     control_commands = {
-        "doctor", "mcp-status", "hooks", "provider", "groups", "desktop",
+        "doctor", "mcp-status", "hooks", "provider", "groups", "desktop", "open",
         "gc", "storage", "source", "import",
     }
     if command in control_commands:
         from .data_home import resolve_runtime_data_home
 
-        configured = os.environ.get("MEMORYGUARD_WORKSPACE", "").strip()
-        requested = str(raw) if explicit else (configured or "")
-        return resolve_runtime_data_home(requested or None).expanduser().resolve()
+        # Bare program controls never use MEMORYGUARD_WORKSPACE, cwd, or
+        # nearby projects as their store selector.  Explicit CLI paths and
+        # MEMORYGUARD_HOME retain their documented priority inside resolver.
+        return resolve_runtime_data_home(
+            str(raw) if explicit else None,
+            discover_stable_control_home=not explicit,
+        ).expanduser().resolve()
     if command == "gui":
         from .data_home import resolve_runtime_data_home
 
@@ -1739,6 +1754,13 @@ def _dispatch_cutover(args: argparse.Namespace) -> int:
     except WorkspaceResolutionError as exc:
         print(json.dumps(exc.to_payload(surface="CLI"), ensure_ascii=False, sort_keys=True))
         return 2
+    except Exception as exc:
+        from .data_home import ControlHomeResolutionError
+
+        if not isinstance(exc, ControlHomeResolutionError):
+            raise
+        print(json.dumps(exc.to_payload(surface="CLI"), ensure_ascii=False, sort_keys=True))
+        return 2
     setattr(args, "_resolved_workspace", workspace)
     state, generation, manifest_record = _cli_manifest_snapshot(workspace)
     if state not in {"V2_READY", "V2_ACTIVE"}:
@@ -1747,6 +1769,11 @@ def _dispatch_cutover(args: argparse.Namespace) -> int:
             "command": str(getattr(args, "command", "") or ""),
             "path": "v2",
             "status": "blocked",
+            "guidance": (
+                "Run `memoryguard upgrade`, or explicitly select an active V2 "
+                "control home with --data-home/MEMORYGUARD_HOME and repair its "
+                "provider binding."
+            ),
         })
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 2

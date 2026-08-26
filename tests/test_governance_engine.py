@@ -184,7 +184,7 @@ def test_engine_result_contract_locked_guard_and_idempotency(tmp_path):
             "body": "long-term preference: use pytest -q",
             "kind": "preference",
             "visibility": "ready",
-            "evidence": [{"source_ref": "fixture:memory-a", "authority": "test"}],
+            "evidence": [{"source_ref": "fixture:memory-a", "authority": "observed"}],
             "idempotency_key": "seed-memory-a",
         },
         context=context,

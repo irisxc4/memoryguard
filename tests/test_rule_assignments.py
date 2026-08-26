@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from memoryguard.access_context import AccessContext
 from memoryguard.rule_binding import build_binding
 from memoryguard.rule_definition import build_definition
@@ -61,7 +63,7 @@ def _seed_rule(store: RuleV2Store, memory_id: str, *, target_type: str = "agent"
     return definition, binding
 
 
-def _bootstrap(workspace: Path, *, agent: str = "a", project: str = "p", provider: str = "codex", runtime: str = "terra"):
+def _bootstrap(workspace: Path, *, agent: str = "a", project: str = "p", provider: str = "codex", runtime: str = "terra", allow_blocked: bool = False):
     store = RuleV2Store(workspace)
     for definition in store.list_definitions(status="active"):
         bindings = store.list_bindings(
@@ -100,7 +102,10 @@ def _bootstrap(workspace: Path, *, agent: str = "a", project: str = "p", provide
         generation=7,
         state="V2_ACTIVE",
     )
-    assert result["ok"] is True, result
+    if not result["ok"]:
+        if not allow_blocked:
+            assert result["ok"] is True, result
+        return result
     return result["data"]
 
 
@@ -162,13 +167,27 @@ def test_unscoped_rule_is_quarantined_from_injection_without_group_dos(tmp_path)
     assert _bootstrap(tmp_path, agent="b")["mandatory"] == []
 
 
-def test_equal_body_relevant_and_mandatory_do_not_collapse_in_either_order(tmp_path):
-    store = RuleV2Store(tmp_path)
-    relevant = store.upsert_definition(build_definition("shared release process", kind="procedure"))
-    mandatory = store.upsert_definition(build_definition("shared release process", kind="procedure", rule_strength="must"))
-    store.upsert_binding(build_binding(relevant.definition_id, share_group_id="team", target_type="agent", target_id="a", owner_agent_id="a", binding_id="relevant"))
-    store.upsert_binding(build_binding(mandatory.definition_id, share_group_id="team", target_type="agent", target_id="a", owner_agent_id="a", binding_id="mandatory"))
-    packet = _bootstrap(tmp_path)
+@pytest.mark.parametrize("first_layer", ["relevant", "mandatory"])
+def test_equal_body_relevant_and_mandatory_do_not_collapse_in_either_order(tmp_path, first_layer):
+    store = RuleV2Store(tmp_path / first_layer)
+    definitions = {}
+    for layer in (first_layer, "mandatory" if first_layer == "relevant" else "relevant"):
+        definitions[layer] = store.upsert_definition(build_definition(
+            "shared release process",
+            kind="procedure",
+            rule_strength="must" if layer == "mandatory" else "",
+        ))
+        store.upsert_binding(build_binding(
+            definitions[layer].definition_id,
+            share_group_id="team",
+            target_type="agent",
+            target_id="a",
+            owner_agent_id="a",
+            binding_id=layer,
+        ))
+    relevant = definitions["relevant"]
+    mandatory = definitions["mandatory"]
+    packet = _bootstrap(tmp_path / first_layer)
     assert {item["body"] for item in packet["mandatory"]} == {mandatory.canonical_text}
     assert {item["body"] for item in packet["relevant"]} == {relevant.canonical_text}
     assert relevant.definition_id != mandatory.definition_id
@@ -180,9 +199,19 @@ def test_mandatory_budget_is_per_agent(tmp_path):
         _seed_rule(store, f"a-{index}", target_id="a")
     b_first, _ = _seed_rule(store, "b-first", target_id="b")
     a_packet = _bootstrap(tmp_path, agent="a")
+    assert a_packet["status"] == "ok"
+    assert a_packet["error"] == ""
+    assert a_packet["effective_agent"] == "a"
+    assert len(a_packet["mandatory"]) == 25
+    assert all(not item.get("truncated") for item in a_packet["mandatory"])
+    assert a_packet["budget"]["limits"]["mandatory_max_items"] == 20
+    warning = a_packet["budget"]["warnings"][0]
+    assert warning["code"] == "mandatory_item_count_warning"
+    assert warning["count"] == 25
+    assert warning["threshold"] == 20
     b_packet = _bootstrap(tmp_path, agent="b")
-    assert len(a_packet["mandatory"]) <= 20
     assert [item["body"] for item in b_packet["mandatory"]] == [b_first.canonical_text]
+    assert b_packet["budget"]["warnings"] == []
 
 
 def test_priority_override_orders_and_receipts_stable_assignment_id(tmp_path):

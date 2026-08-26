@@ -191,6 +191,15 @@ _ALLOWED_AUTHORITIES = frozenset({
     "audit", "system",
 })
 
+
+def validate_authority(authority: str | None) -> str:
+    """Reject unknown evidence authorities before any durable mutation."""
+
+    value = str(authority or "observed")
+    if value not in _ALLOWED_AUTHORITIES:
+        raise ValueError(f"unknown evidence authority: {value!r}")
+    return value
+
 # Module-private capability used by V1 migration adapters.  Public callers
 # must use a V2MutationContext; a copied value/string cannot satisfy identity.
 _MIGRATION_CAPABILITY = object()
@@ -227,6 +236,7 @@ class EvidenceStore:
     SCHEMA_META_TABLE = "evidence_schema_meta"
     ALLOWED_AUTHORITIES = _ALLOWED_AUTHORITIES
     VALID_STATUSES = frozenset({"valid", "stale", "superseded", "source_deleted", "invalidated"})
+    validate_authority = staticmethod(validate_authority)
 
     def __init__(
         self,
@@ -507,8 +517,7 @@ class EvidenceStore:
         if not isinstance(evidence_value, (Evidence, Mapping)):
             raise ValueError("outbox evidence payload must be an object")
         item = self._coerce_evidence(evidence_value)
-        if item.authority not in _ALLOWED_AUTHORITIES:
-            raise ValueError(f"unknown evidence authority: {item.authority!r}")
+        validate_authority(item.authority)
         item = Evidence.from_value(item, created_at=item.created_at or _now())
         meta = self._validate_metadata(item.metadata)
         existing_before = conn.execute("SELECT 1 FROM evidence WHERE evidence_id=?", (item.evidence_id,)).fetchone()
@@ -674,8 +683,7 @@ class EvidenceStore:
                     }.items() if value is not None
                 })
         item = self._coerce_evidence(evidence)
-        if item.authority not in _ALLOWED_AUTHORITIES:
-            raise ValueError(f"unknown evidence authority: {item.authority!r}")
+        validate_authority(item.authority)
         item = Evidence.from_value(item, created_at=item.created_at or _now())
         meta = self._validate_metadata(item.metadata)
         conn = self._checked_connect(readonly=False)

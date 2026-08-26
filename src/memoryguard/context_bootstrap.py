@@ -29,17 +29,23 @@ from .runtime_v2.governance_semantics import (
     classify_governance_relation,
     governance_scope_key,
 )
+from .runtime_v2.context_budget import (
+    ContextBudget,
+    DeterministicTokenCounter,
+    MANDATORY_ITEM_WARNING_THRESHOLD,
+)
 from .rule_read_path import (
     MODE_LEGACY,
     MODE_RULE_INTELLIGENCE,
     resolve_read_path_mode,
 )
 
-# Native V2 memory stores use the same bounded bootstrap contract.  Keep the
-# limits local so importing this read-only helper cannot re-open the retired
-# store module.
-MANDATORY_MAX_ITEMS = 20
-MANDATORY_MAX_CHARS = 12000
+# Mandatory injection limits live in runtime_v2.context_budget.  Optional
+# recall still uses the local request ceilings below.
+_MANDATORY_BUDGET = ContextBudget()
+_MANDATORY_TOKEN_COUNTER = DeterministicTokenCounter()
+MANDATORY_MAX_ITEMS = MANDATORY_ITEM_WARNING_THRESHOLD
+MANDATORY_MAX_CHARS = _MANDATORY_BUDGET.mandatory_max_chars
 
 
 DEFAULT_MAX_ITEMS = 12
@@ -246,6 +252,28 @@ def codegraph_reference_candidates(
         return tuple(references)
     except Exception:
         return ()
+
+
+def consume_codegraph_affected_receipt(
+    workspace: str | Path,
+    *,
+    scope: Any,
+) -> dict[str, Any] | None:
+    """Consume one already-bounded incremental CodeGraph receipt.
+
+    This path never builds, updates, or traverses CodeGraph.  Its only write
+    is marking one persisted receipt consumed, which makes injection finite.
+    Caller owns trusted scope resolution.
+    """
+
+    try:
+        from .codegraph_v2.store import CodeGraphStore
+
+        return CodeGraphStore(workspace, initialize=False).consume_affected_receipt(
+            scope=scope,
+        )
+    except Exception:
+        return None
 
 
 def unified_reference_candidates(
@@ -941,27 +969,41 @@ def build_context_packet(
         record for record in raw_mandatory
         if _contains_sensitive_content(record.body)
     ]
+    oversized_mandatory = [
+        record for record in raw_mandatory
+        if _MANDATORY_BUDGET.mandatory_item_oversize(
+            len(record.body or ""),
+            _MANDATORY_TOKEN_COUNTER.count(record.body or ""),
+        )
+    ]
     mandatory_chars = sum(len(record.body or "") for record in raw_mandatory)
-    mandatory_overflow = (
-        len(raw_mandatory) > MANDATORY_MAX_ITEMS
-        or mandatory_chars > MANDATORY_MAX_CHARS
-        or bool(invalid_mandatory_priorities)
-        or bool(sensitive_mandatory)
-        or bool(scoped_corrupt)
+    mandatory_tokens = sum(
+        _MANDATORY_TOKEN_COUNTER.count(record.body or "") for record in raw_mandatory
     )
     mandatory_error = ""
+    if sensitive_mandatory:
+        omitted["sensitive"] += len(sensitive_mandatory)
+        omitted_details.extend(
+            {"memory_id": record.memory_id, "reason": "mandatory_sensitive"}
+            for record in sensitive_mandatory
+        )
+        mandatory_error = "mandatory_sensitive_blocked"
+    elif invalid_mandatory_priorities or scoped_corrupt:
+        mandatory_error = (
+            "mandatory_rule_package_invalid: active always rules are sensitive, "
+            "contain invalid settings, or have a corrupt matched rule"
+        )
+    elif oversized_mandatory:
+        omitted_details.extend(
+            {"memory_id": record.memory_id, "reason": "mandatory_item_limit"}
+            for record in oversized_mandatory
+        )
+        mandatory_error = "mandatory_item_limit_exceeded"
+    elif _MANDATORY_BUDGET.mandatory_aggregate_overflow(mandatory_chars, mandatory_tokens):
+        mandatory_error = "mandatory_budget_exceeded"
+    mandatory_overflow = bool(mandatory_error)
     if mandatory_overflow:
         omitted["mandatory_overflow"] = len(raw_mandatory) + len(invalid_mandatory_priorities)
-        if sensitive_mandatory:
-            omitted["sensitive"] += len(sensitive_mandatory)
-            omitted_details.extend(
-                {"memory_id": record.memory_id, "reason": "mandatory_sensitive"}
-                for record in sensitive_mandatory
-            )
-        mandatory_error = (
-            "mandatory_rule_package_invalid: active always rules exceed the "
-            "configured limit, are sensitive, contain invalid settings, or have a corrupt matched rule"
-        )
 
     mandatory_items: list[dict[str, Any]] = []
     mandatory_ids: list[str] = []
@@ -1028,6 +1070,12 @@ def build_context_packet(
                     session_source=effective_context.session_source,
                 ).to_dict()
             )
+    mandatory_warning = _MANDATORY_BUDGET.item_count_warning(len(mandatory_items))
+    mandatory_warnings = [mandatory_warning] if mandatory_warning else []
+    mandatory_used_chars = sum(len(item.get("body") or "") for item in mandatory_items)
+    mandatory_used_tokens = sum(
+        _MANDATORY_TOKEN_COUNTER.count(item.get("body") or "") for item in mandatory_items
+    )
 
     # Stage 2: ordinary task-relevant recall.  Mandatory records never consume
     # these slots/characters and are not reconsidered as preferences.
@@ -1242,9 +1290,18 @@ def build_context_packet(
             "per_item_max_chars": PER_ITEM_CHAR_LIMIT,
             "preference_max_items": PREFERENCE_MAX_ITEMS,
             "preference_char_budget": preference_char_budget,
-            "mandatory_max_items": MANDATORY_MAX_ITEMS,
-            "mandatory_max_chars": MANDATORY_MAX_CHARS,
-            "mandatory_used_items": len(raw_mandatory),
-            "mandatory_used_chars": mandatory_chars,
+            "mandatory_max_items": _MANDATORY_BUDGET.mandatory_max_items,
+            "mandatory_max_chars": _MANDATORY_BUDGET.mandatory_max_chars,
+            "mandatory_max_tokens": _MANDATORY_BUDGET.mandatory_max_tokens,
+            "mandatory_used_items": len(mandatory_items),
+            "mandatory_used_chars": mandatory_used_chars,
+            "mandatory_used_tokens": mandatory_used_tokens,
+            "warnings": mandatory_warnings,
+            "limits": _MANDATORY_BUDGET.to_dict(),
+            "mandatory": {
+                "items": len(mandatory_items),
+                "chars": mandatory_used_chars,
+                "tokens": mandatory_used_tokens,
+            },
         },
     }
