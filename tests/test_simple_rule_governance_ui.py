@@ -41,7 +41,7 @@ def test_agent_identity_contract_has_safe_fallback_and_current_marker() -> None:
     assert "user_alias" in source
     assert "display_name" in source
     assert "未知助手" in source
-    assert "slice(-4)" in source
+    assert "slice(-4)" not in source
     assert "（当前）" in source
 
 
