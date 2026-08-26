@@ -1733,12 +1733,8 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
   const discoveredName = match && (match.display_name || match.product || match.label || match.name);
   const provider = match && (match.provider || match.provider_name || match.product);
   const program = match && (match.program_name || match.program || match.client_name || match.host_name);
-  // Keep unknown identities readable without exposing the full stable ID.
-  // The short suffix still distinguishes multiple unmapped agents in lists.
-  const fallbackText = readableAgentPart(fallback, '');
-  const fallbackLabel = id
-    ? `未知助手${id.length > 4 ? ` · ${id.slice(-4)}` : ''}`
-    : (/^(?:未知\s+Agent|Agent)$/i.test(fallbackText) ? '未知助手' : (fallbackText || '未知助手'));
+  // Keep unknown identities readable without exposing a stable ID.
+  const fallbackLabel = readableAgentPart(fallback, id);
   const rawProject = match && (match.project_ref || match.project);
   const project = String(rawProject || '').replaceAll('\\', '/').replace(/\/+$/, '').split('/').filter(Boolean).pop() || '';
   let label = readableAgentPart(alias, id) || readableAgentPart(program, id) || readableAgentPart(provider, id)
@@ -1746,10 +1742,7 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
     || fallbackLabel
     || (readableAgentPart(program, id) && readableAgentPart(provider, id) ? `${program} · ${provider}` : '')
     || (readableAgentPart(provider, id) && readableAgentPart(project, id) ? `${provider} · ${project}` : '');
-  if (!label) {
-    if (id) label = fallbackLabel;
-    else return fallbackLabel;
-  }
+  if (!label) label = '未命名助手';
   if (/^codex$/i.test(label)) label = 'Codex';
   if (current && !label.includes('（当前）')) label += '（当前）';
   return label;

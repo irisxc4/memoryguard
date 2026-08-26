@@ -82,6 +82,10 @@ def _bare_system32_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) 
     system32.mkdir(parents=True)
     monkeypatch.chdir(system32)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    # Keep the POSIX XDG fallback pointed at the same fixture home as the
+    # Windows LOCALAPPDATA path.  The production resolver remains unchanged;
+    # this makes the cross-platform fixture assert the same stable home.
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "localappdata"))
     fake_home = tmp_path / "user-home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))

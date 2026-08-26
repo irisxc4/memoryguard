@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import gc
 import json
 import os
@@ -474,7 +475,21 @@ def test_native_audit_is_real_ro_receipt_without_report_writes(tmp_path: Path):
     assert first["data"]["status"] == "BLOCKED"
     assert first["data"]["blocked"] is True
     assert "row_hash" not in json.dumps(first, ensure_ascii=False)
-    assert first == second
+
+    def stable_receipt(receipt: dict) -> dict:
+        data = receipt["data"]
+        generated_at = data.get("generated_at")
+        completed_at = data.get("completed_at")
+        assert isinstance(generated_at, str) and generated_at
+        assert isinstance(completed_at, str) and completed_at
+        assert generated_at == completed_at
+        datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        stable = copy.deepcopy(receipt)
+        stable["data"].pop("generated_at", None)
+        stable["data"].pop("completed_at", None)
+        return stable
+
+    assert stable_receipt(first) == stable_receipt(second)
     assert sorted(
         str(path.relative_to(tmp_path))
         for path in tmp_path.rglob("*")

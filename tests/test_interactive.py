@@ -207,7 +207,8 @@ def test_agent_and_governance_display_fallbacks_match_current_api_shapes() -> No
     assert "clearSharedGovernance('stale_selection'" in html
     assert "当前没有活动绑定，不能作为共享治理范围" in html
     assert "audit_only" in html
-    assert "return id || fallback;" in html
+    assert "function agentDisplayName(agentOrId, fallback = '未知助手')" in html
+    assert "return label;" in html
     assert "e.agent_instance_id || e.actor" in html
 
 
@@ -694,7 +695,7 @@ def test_dashboard_chrome_exposes_seven_readable_pages() -> None:
 def test_agent_labels_do_not_expose_opaque_suffix_as_primary_name() -> None:
     html = render_interactive_html()
 
-    assert "if (id) label = '未命名助手';" in html
+    assert "if (!label) label = '未命名助手';" in html
     assert "id.slice(-4)" not in html
     assert "function looksLikeOpaqueAgentId" in html
     assert "readableAgentPart(program, id) || readableAgentPart(provider, id)" in html
