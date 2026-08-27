@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.5] - 2026-08-27
+
+### Fixed
+
+- Conflict responses now include bounded, redacted member snapshots sourced from
+  V2 atom/tombstone history. The GUI no longer needs a second `list_memory`
+  request that could turn stale or missing IDs into opaque rows.
+- Known conflict reason codes now have readable Chinese labels while bounded
+  diagnostic reasons remain available for troubleshooting.
+- Deleted, superseded, rejected, quarantined, shadowed, missing, and otherwise
+  invalid members cannot be selected as conflict keepers. Resolution fails
+  closed unless at least two members remain live and selectable.
+- Historical conflict groups remain visible for audit, while `actionable_total`
+  separately reports groups that can still be resolved; the governance overview
+  uses the actionable count.
+
 ## [0.7.4] - 2026-08-27
 
 ### Fixed

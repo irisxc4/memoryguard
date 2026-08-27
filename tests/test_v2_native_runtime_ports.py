@@ -1478,6 +1478,42 @@ def test_gui_governance_snapshot_is_scoped_and_has_stable_contract(tmp_path: Pat
     assert "bounded snapshot fixture" not in json.dumps(data, ensure_ascii=False)
 
 
+def test_gui_governance_snapshot_counts_only_actionable_conflicts(tmp_path: Path):
+    from _publish_helpers import seed_atom
+    from memoryguard.runtime_v2.group_native import GroupControlService
+
+    groups = GroupControlService(tmp_path, write=True)
+    groups.bind_agent("agent-bound", "group-bound")
+    groups.set_scope(
+        "agent-bound",
+        {"mode": "agent", "agent_instance_id": "agent-bound"},
+    )
+    conflict_meta = {
+        "conflict_group_id": "stale-overview-conflict",
+        "conflict_status": "unresolved",
+        "conflict_reason": "canonical_composition_conflict",
+    }
+    seed_atom(
+        tmp_path, "stale-live", "stale live claim", agent_id="agent-bound",
+        share_group_id="group-bound", metadata=conflict_meta,
+    )
+    seed_atom(
+        tmp_path, "stale-deleted", "stale deleted claim", agent_id="agent-bound",
+        share_group_id="group-bound", metadata=conflict_meta, status="deleted",
+    )
+
+    port = NativeV2RuntimePort(
+        tmp_path,
+        state_provider=lambda: {"state": "V2_ACTIVE", "generation": 1},
+    )
+    result = port.dispatch_gui(
+        "get_governance_snapshot", [], context=_trusted_native_context(tmp_path),
+        generation=1, state="V2_ACTIVE",
+    )
+    assert result["ok"] is True, result
+    assert result["data"]["conflicts"]["count"] == 0
+
+
 def test_server_admin_scope_get_uses_selected_agent_binding(tmp_path: Path):
     from memoryguard.runtime_v2.group_native import GroupControlService
     from memoryguard.runtime_v2.group_native import personal_group_id

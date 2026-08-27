@@ -36,6 +36,24 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.5
+
+v0.7.5 is a focused conflict-review correctness release:
+
+- **Readable conflict snapshots:** conflict members include bounded, redacted
+  previews from the V2 atom/tombstone history, so the review view remains useful
+  without exposing raw bodies.
+- **Clear reasons and safe candidates:** known conflict reasons have Chinese
+  labels, while deleted, superseded, rejected, quarantined, shadowed, missing,
+  or otherwise invalid members cannot be selected as the keeper.
+- **Fail-closed resolution:** a conflict can be resolved only when at least two
+  members are still live and selectable; stale historical groups remain visible
+  for audit instead of becoming mutation targets.
+- **Honest counts:** historical conflict-group totals stay separate from the
+  actionable count used by the governance overview.
+
+See [the v0.7.5 release record](docs/releases/v0.7.5.md).
+
 ## What's New in v0.7.4
 
 v0.7.4 is a governance correctness and runtime reliability release:
@@ -402,7 +420,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.4
+memoryguard --version                    # 0.7.5
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -732,6 +750,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.5 release record](docs/releases/v0.7.5.md)
 - [v0.7.4 release record](docs/releases/v0.7.4.md)
 - [v0.7.3 release record](docs/releases/v0.7.3.md)
 - [v0.7.2 release record](docs/releases/v0.7.2.md)
@@ -744,7 +763,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.4 unifies canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
+- **Current release line:** v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
   lifecycle and transport, and Python 3.10 compatibility corrections. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.

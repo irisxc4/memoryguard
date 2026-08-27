@@ -167,13 +167,19 @@ def test_governance_native_quarantine_conflict_and_decision_outbox(tmp_path: Pat
         "get_conflicts", ["group-a"], context=context, generation=11, state="V2_ACTIVE"
     )
     assert conflicts["ok"] is True, conflicts
-    assert conflicts["data"]["conflicts"] == [{
-        "group_id": "conflict-group-1",
-        "member_ids": ["conflict-drop", "conflict-keep"],
-        "status": "unresolved",
-        "reason": "same logical fact disagrees",
-        "created_at": conflicts["data"]["conflicts"][0]["created_at"],
-    }]
+    conflict = conflicts["data"]["conflicts"][0]
+    assert conflicts["data"]["total"] == 1
+    assert conflicts["data"]["history_total"] == 1
+    assert conflicts["data"]["actionable_total"] == 1
+    assert conflict["group_id"] == "conflict-group-1"
+    assert conflict["member_ids"] == ["conflict-drop", "conflict-keep"]
+    assert conflict["status"] == "unresolved"
+    assert conflict["reason"] == "同一事实的内容主张不一致，需选择保留版本"
+    assert conflict["reason_code"] == "same logical fact disagrees"
+    assert conflict["can_resolve"] is True
+    assert conflict["selectable_member_ids"] == ["conflict-drop", "conflict-keep"]
+    assert {item["memory_id"] for item in conflict["members"]} == {"conflict-drop", "conflict-keep"}
+    assert all(item["selectable"] is True and item["preview"] for item in conflict["members"])
 
     resolved = port.dispatch_gui(
         "resolve_conflict", ["conflict-group-1", "conflict-keep", "group-a"],
@@ -218,3 +224,94 @@ def test_governance_native_quarantine_conflict_and_decision_outbox(tmp_path: Pat
         decision_count = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
         outbox_count = conn.execute("SELECT COUNT(*) FROM decision_outbox").fetchone()[0]
     assert decision_count == outbox_count
+
+
+def test_conflict_snapshot_keeps_tombstone_history_and_blocks_stale_resolution(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    context = _native_context(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    boundary.tombstone(
+        "conflict-drop",
+        context=mutation,
+        reason="removed while reviewing conflict",
+    )
+    keeper = boundary.memory.get_atom(
+        "conflict-keep", scope=mutation.to_dict(), include_building=True,
+    )
+    assert keeper is not None
+    boundary.put_atom(
+        MemoryAtom(
+            **{
+                **keeper.to_dict(),
+                "metadata": {
+                    **dict(keeper.metadata),
+                    "conflict_peer_ids": ["conflict-drop", "missing-history-member"],
+                },
+            }
+        ),
+        context=mutation,
+        reason="retain conflict peer history",
+    )
+
+    port = _port(tmp_path)
+    conflicts = port.dispatch_gui(
+        "get_conflicts", ["group-a"], context=context, generation=11, state="V2_ACTIVE",
+    )
+    assert conflicts["ok"] is True, conflicts
+    conflict = conflicts["data"]["conflicts"][0]
+    assert conflict["status"] == "stale"
+    assert conflict["can_resolve"] is False
+    assert conflict["live_member_count"] == 1
+    assert conflicts["data"]["history_total"] == 1
+    assert conflicts["data"]["actionable_total"] == 0
+    details = {item["memory_id"]: item for item in conflict["members"]}
+    assert details["conflict-drop"]["status"] == "deleted"
+    assert details["conflict-drop"]["selectable"] is False
+    assert details["conflict-drop"]["history_available"] is True
+    assert details["conflict-drop"]["preview"] == "stale fact"
+    assert details["missing-history-member"]["snapshot_status"] == "snapshot_unavailable"
+    assert details["missing-history-member"]["selectable"] is False
+    assert "恢复" in details["missing-history-member"]["reason"]
+
+    blocked = port.dispatch_gui(
+        "resolve_conflict", ["conflict-group-1", "conflict-keep", "group-a"],
+        context=context, generation=11, mutation=True, state="V2_ACTIVE",
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"] == "conflict_group_stale"
+
+
+def test_conflict_snapshot_redacts_sensitive_body_and_localizes_reason(tmp_path: Path) -> None:
+    boundary = GovernanceV2(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    for memory_id, body in (
+        ("secret-a", "api_key=supersecret123456"),
+        ("secret-b", "a second conflicting claim"),
+    ):
+        boundary.put_atom(
+            MemoryAtom(
+                memory_id=memory_id,
+                body=body,
+                share_group_id="group-a",
+                agent_instance_id="agent-a",
+                project_ref=str(tmp_path.resolve()),
+                provider="gui",
+                runtime_role="gui",
+                metadata={
+                    "conflict_group_id": "secret-conflict",
+                    "conflict_status": "unresolved",
+                    "conflict_reason": "canonical_composition_conflict",
+                },
+            ),
+            context=mutation,
+            evidence=[{"source_ref": f"test:{memory_id}"}],
+            reason="seed sensitive conflict",
+        )
+    result = _port(tmp_path).dispatch_gui(
+        "get_conflicts", ["group-a"], context=_native_context(tmp_path),
+        generation=11, state="V2_ACTIVE",
+    )
+    conflict = next(item for item in result["data"]["conflicts"] if item["group_id"] == "secret-conflict")
+    assert conflict["reason"] == "相关记忆的内容主张互相矛盾，需选择保留版本"
+    assert conflict["reason_code"] == "canonical_composition_conflict"
+    assert all("supersecret123456" not in item["preview"] for item in conflict["members"])

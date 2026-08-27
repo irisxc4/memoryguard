@@ -34,6 +34,20 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.5 更新
+
+v0.7.5 是一次聚焦冲突复核正确性的修复版本：
+
+- **可读冲突快照：** 冲突成员从 V2 atom/tombstone 历史返回有界、脱敏的正文预览，
+  复核视图保留上下文，同时不暴露原始正文。
+- **原因清晰、候选安全：** 已知冲突原因显示中文说明；已删除、已替代、已拒绝、
+  已隔离、已覆盖、缺失或其他失效成员不可选为保留版本。
+- **失效时保持 fail-closed：** 只有至少两条仍有效且可选的成员才能解决冲突；失效的
+  历史冲突组仍可供审计查看，不会变成可变更目标。
+- **计数诚实分离：** 历史冲突组总数与治理概览使用的可处理冲突数分别统计。
+
+详见 [v0.7.5 发布记录](docs/releases/v0.7.5.md)。
+
 ## v0.7.4 更新
 
 v0.7.4 是一次治理正确性与运行时可靠性修复版本：
@@ -334,7 +348,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.4
+memoryguard --version                    # 0.7.5
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -510,6 +524,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.5 发布记录](docs/releases/v0.7.5.md)
 - [v0.7.4 发布记录](docs/releases/v0.7.4.md)
 - [v0.7.3 发布记录](docs/releases/v0.7.3.md)
 - [v0.7.2 发布记录](docs/releases/v0.7.2.md)
@@ -522,7 +537,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+- **当前发布线：** v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
   以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓

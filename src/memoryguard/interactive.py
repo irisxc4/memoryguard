@@ -7699,46 +7699,65 @@ async function renderConflictQueue() {
   if (!container) return;
   container.innerHTML = '<div class="loading">正在读取冲突队列</div>';
   try {
-    const [conflictsResult, memResult] = await Promise.all([
-      callApi('get_conflicts', activeShareGroupId),
-      callApi('list_memory', '', '', activeShareGroupId),
-    ]);
+    // get_conflicts is self-contained: member snapshots come from the V2
+    // atom/tombstone history.  A second list_memory request used to turn
+    // deleted or compatibility members into opaque, still-selectable IDs.
+    const conflictsResult = await callApi('get_conflicts', activeShareGroupId);
     if (conflictsResult.error) return showToast(conflictsResult.error, 'error');
-    const conflicts = (conflictsResult.conflicts || []).filter(c => c.status === 'unresolved');
+    const conflicts = (conflictsResult.conflicts || []).filter(c => !['resolved', 'closed'].includes(String(c.status || '').toLowerCase()));
     if (!conflicts.length) {
       container.innerHTML = '<div class="card empty-state"><div><div class="empty-orb"></div><p>暂无未解决冲突。</p></div></div>';
       return;
     }
-    const records = {};
-    (memResult.records || []).forEach(r => { records[r.memory_id] = r; });
+    const actionableCount = Number.isFinite(Number(conflictsResult.actionable_total))
+      ? Number(conflictsResult.actionable_total)
+      : conflicts.filter(c => c.can_resolve === true).length;
     const items = conflicts.map(c => {
-      const members = (c.member_ids || []).map(mid => {
-        const rec = records[mid];
-        const preview = rec ? escapeHtml((rec.body || '').slice(0, 100)) : '(记录不存在)';
-        return `<label class="raw-file-row" style="cursor:pointer;grid-template-columns:auto 1fr auto;align-items:center">
-          <input type="radio" name="conflict-${escapeHtml(c.group_id)}" value="${escapeHtml(mid)}">
+      const memberRows = Array.isArray(c.members) ? c.members : (Array.isArray(c.member_details) ? c.member_details : (c.member_ids || []).map(mid => ({memory_id: mid, status: 'missing', selectable: false, live: false, reason: '旧版响应未提供成员快照，历史正文不可恢复'})));
+      const liveMembers = memberRows.filter(member => member && (member.selectable === true || member.live === true));
+      // Even an optimistic compatibility flag cannot override the visible
+      // member evidence: never enable a resolve action without two explicit
+      // live/selectable snapshots.
+      const canResolve = liveMembers.length >= 2 && (c.can_resolve === true || !Object.prototype.hasOwnProperty.call(c, 'can_resolve'));
+      const members = memberRows.map(member => {
+        const item = member && typeof member === 'object' ? member : {memory_id: member};
+        const mid = String(item.memory_id || item.id || '');
+        if (!mid) return '';
+        const selectable = item.selectable === true || item.live === true;
+        const preview = item.preview || item.body_preview || item.body || item.reason || (item.missing ? '历史正文不可恢复（仅保留成员 ID）' : '成员详情不可用');
+        const radio = selectable ? `<input type="radio" name="conflict-${escapeHtml(c.group_id)}" value="${escapeHtml(mid)}" ${canResolve ? '' : 'disabled'} aria-label="选择保留 ${escapeHtml(mid)}">` : '';
+        const chipClass = selectable ? 'confirmed' : 'high';
+        const status = item.status || (item.missing ? 'missing' : 'unavailable');
+        return `<label class="raw-file-row" style="${selectable && canResolve ? 'cursor:pointer;' : 'cursor:default;'}grid-template-columns:auto 1fr auto;align-items:center">
+          ${radio}
           <div>
             <code>${escapeHtml(mid)}</code>
-            <div class="surface-meta">${preview}</div>
+            <div class="surface-meta">${escapeHtml(String(preview))}</div>
           </div>
-          <span class="chip chip-${rec ? 'confirmed' : 'high'}">${rec ? escapeHtml(rec.status || 'active') : 'missing'}</span>
+          <span class="chip chip-${chipClass}">${escapeHtml(status)}${!selectable ? ' · 不可选' : ''}</span>
         </label>`;
       }).join('');
+      const isStale = !canResolve || ['stale', 'invalid'].includes(String(c.status || '').toLowerCase());
+      const reasonLabels = {canonical_composition_conflict: '相关记忆的内容主张互相矛盾，需选择保留版本', explicit_composition_conflict: '相关记忆被明确标记为内容主张冲突，需选择保留版本'};
+      const reasonText = reasonLabels[String(c.reason || c.reason_code || '').toLowerCase()] || c.reason || c.reason_code || '相关记忆的内容主张存在差异，需选择保留版本';
+      const statusLabel = isStale ? '历史冲突 · 候选已失效/不可恢复' : (c.status || 'unresolved');
+      const invalidReason = c.invalid_reason || '历史冲突中没有至少 2 条仍有效的记忆，候选已失效或不可恢复。';
       return `<article class="plan-item">
         <div class="finding-header">
           <span class="finding-rule">冲突组 ${escapeHtml((c.group_id || '').slice(0, 16))}</span>
-          <span class="chip chip-high">${escapeHtml(c.status || 'unresolved')}</span>
+          <span class="chip chip-high">${escapeHtml(statusLabel)}</span>
         </div>
-        <div class="finding-evidence" style="margin-top:6px">原因：${escapeHtml(c.reason || '')}</div>
+        <div class="finding-evidence" style="margin-top:6px">原因：${escapeHtml(reasonText)}</div>
+        ${c.reason_code || c.raw_reason ? `<div class="surface-meta" style="margin-top:4px">诊断原因：${escapeHtml(c.reason_code || c.raw_reason)}</div>` : ''}
         <div class="row" style="margin-top:6px"><span class="key">创建时间</span><span>${escapeHtml(c.created_at || '')}</span></div>
         <div class="raw-file-list" style="margin-top:10px">${members}</div>
         <div class="finding-actions" style="margin-top:10px">
-          <button class="btn btn-primary" type="button" onclick="resolveConflict('${escapeHtml(c.group_id)}')">保留选中并解决</button>
+          ${canResolve ? `<button class="btn btn-primary" type="button" onclick="resolveConflict('${escapeHtml(c.group_id)}')">保留选中并解决</button>` : `<button class="btn btn-primary" type="button" disabled title="${escapeHtml(invalidReason)}">保留选中并解决</button><span class="surface-meta">${escapeHtml(invalidReason)}</span>`}
         </div>
       </article>`;
     }).join('');
     container.innerHTML = `<section class="card"><div class="card-head"><div><h2>冲突队列</h2>
-      <p>共 ${conflicts.length} 个未解决冲突组。选择保留哪条，其余将被软删除。</p></div></div>
+      <p>共 ${conflicts.length} 个历史冲突组，其中 ${actionableCount} 个可处理；失效组仅供查看。可处理冲突选择保留哪条，其余将被软删除。</p></div></div>
       ${items}</section>`;
   } catch (e) {
     showToast('加载失败：' + e, 'error');

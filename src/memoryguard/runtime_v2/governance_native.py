@@ -49,6 +49,50 @@ def _masked_preview(body: str) -> str:
     return "•" * min(max(length, 4), 24)
 
 
+# Conflict members are deliberately stricter than ordinary memory reads.
+# ``conflicted`` and ``low_confidence`` are the two states emitted by the
+# organizer while a conflict is waiting for an administrator; an atom in any
+# other state must not become a keeper merely because it still has a row.
+_CONFLICT_LIVE_STATUSES = frozenset({"active", "conflicted", "low_confidence"})
+_CONFLICT_STALE_STATUSES = frozenset({
+    "deleted", "superseded", "rejected", "quarantined", "shadowed", "missing",
+})
+_CONFLICT_REASON_LABELS = {
+    "canonical_composition_conflict": "相关记忆的内容主张互相矛盾，需选择保留版本",
+    "explicit_composition_conflict": "相关记忆被明确标记为内容主张冲突，需选择保留版本",
+    "automatic_semantic_conflict": "相关记忆的语义内容存在冲突，需选择保留版本",
+    "same logical fact disagrees": "同一事实的内容主张不一致，需选择保留版本",
+}
+
+
+def _conflict_reason_label(reason: str) -> str:
+    raw = str(reason or "").strip()
+    if not raw:
+        return "相关记忆的内容主张存在差异，需选择保留版本"
+    return _CONFLICT_REASON_LABELS.get(raw.casefold(), _CONFLICT_REASON_LABELS.get(raw, _safe_preview(raw, limit=240)))
+
+
+def _conflict_member_state(status: str, *, available: bool) -> tuple[bool, str]:
+    normalized = str(status or "missing").strip().casefold() or "missing"
+    if not available:
+        return False, "成员记录已不存在，且没有可恢复的历史正文"
+    if normalized in _CONFLICT_LIVE_STATUSES:
+        return True, "当前成员仍有效，可作为保留版本"
+    if normalized == "deleted":
+        return False, "成员已软删除，仅保留历史快照"
+    if normalized == "superseded":
+        return False, "成员已被更新版本替代，仅保留历史快照"
+    if normalized == "rejected":
+        return False, "成员已被拒绝，不可作为保留版本"
+    if normalized == "quarantined":
+        return False, "成员处于隔离状态，不可作为保留版本"
+    if normalized == "shadowed":
+        return False, "成员已被其他版本覆盖，不可作为保留版本"
+    if normalized in _CONFLICT_STALE_STATUSES:
+        return False, "成员当前已失效，不可作为保留版本"
+    return False, "成员当前状态不可作为保留版本"
+
+
 class GovernanceNativeService:
     def __init__(self, workspace: str | Path) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
@@ -278,24 +322,124 @@ class GovernanceNativeService:
         return {"ok": True, "status": "succeeded", "decisions": decisions, "total": len(decisions)}
 
     def conflicts(self, trusted: Mapping[str, Any]) -> dict[str, Any]:
-        groups: dict[str, list[MemoryAtom]] = {}
-        for atom in self._atoms(trusted):
-            group_id = str((atom.metadata or {}).get("conflict_group_id") or "").strip()
-            if group_id and atom.status not in {"deleted", "superseded", "rejected"}:
-                groups.setdefault(group_id, []).append(atom)
-        result = []
-        for group_id, members in sorted(groups.items()):
-            if len(members) < 2:
+        """Return self-contained, safe conflict snapshots for the GUI.
+
+        Conflict membership is a historical fact.  Do not derive it only from
+        currently live atoms: a tombstoned member still explains why the
+        conflict existed, and organizer metadata may retain a peer ID after a
+        compatibility import.  The atom body is already retained by the V2
+        tombstone path; only a bounded redacted preview crosses this API.
+        """
+        atoms = self._atoms(trusted)
+        groups: dict[str, dict[str, Any]] = {}
+        for atom in atoms:
+            metadata = dict(atom.metadata or {})
+            group_id = str(metadata.get("conflict_group_id") or "").strip()
+            if not group_id:
                 continue
-            metadata = dict(members[0].metadata or {})
+            group = groups.setdefault(group_id, {"atoms": {}, "member_ids": set()})
+            group["atoms"][atom.memory_id] = atom
+            group["member_ids"].add(atom.memory_id)
+            # New organizer rows stamp conflict_peer_ids.  Accept the older
+            # aliases as a compatibility seam, but never use arbitrary body
+            # text or records outside this trusted read scope.
+            for key in ("conflict_peer_ids", "conflict_member_ids", "member_ids"):
+                peers = metadata.get(key)
+                if isinstance(peers, str):
+                    peers = [peers]
+                if isinstance(peers, (list, tuple, set)):
+                    group["member_ids"].update(
+                        str(peer).strip() for peer in peers if str(peer).strip()
+                    )
+
+        result = []
+        for group_id, grouped in sorted(groups.items()):
+            group_atoms = grouped["atoms"]
+            members = [group_atoms[memory_id] for memory_id in sorted(group_atoms)]
+            metadata_values = [dict(atom.metadata or {}) for atom in members]
+            # A resolved keeper keeps conflict metadata for auditability.  Do
+            # not resurrect that group merely because its deleted losers are
+            # still retained as tombstones.
+            if any(
+                str(metadata.get("conflict_status") or "").strip().casefold() == "resolved"
+                for metadata in metadata_values
+            ):
+                continue
+            metadata = next(
+                (item for item in metadata_values if item.get("conflict_status") or item.get("conflict_reason")),
+                {},
+            )
+            raw_status = str(metadata.get("conflict_status") or "unresolved").strip().casefold() or "unresolved"
+            raw_reason = str(metadata.get("conflict_reason") or "conflicting governed memory records").strip()
+            member_ids = sorted(grouped["member_ids"])
+            member_details = []
+            for memory_id in member_ids:
+                atom = group_atoms.get(memory_id)
+                available = atom is not None
+                member_status = str(atom.status if atom is not None else "missing").strip().casefold() or "missing"
+                selectable, member_reason = _conflict_member_state(member_status, available=available)
+                body = str(atom.body or "") if atom is not None else ""
+                preview = _safe_preview(body)
+                member_details.append({
+                    "memory_id": memory_id,
+                    # ``body`` is intentionally the same bounded, redacted
+                    # preview; the raw atom body never crosses this seam.
+                    "body": preview,
+                    "preview": preview,
+                    "body_preview": preview,
+                    "kind": str(atom.kind or "fact") if atom is not None else "",
+                    "status": member_status,
+                    "selectable": bool(selectable),
+                    "live": bool(selectable),
+                    "available": bool(available),
+                    "missing": not available,
+                    "history_available": bool(available and body),
+                    "snapshot_status": "snapshot_available" if available else "snapshot_unavailable",
+                    "reason": member_reason,
+                    "revision": int(atom.revision) if atom is not None else None,
+                    "created_at": str(atom.created_at or "") if atom is not None else "",
+                    "updated_at": str(atom.updated_at or "") if atom is not None else "",
+                })
+            live_count = sum(1 for item in member_details if item["live"])
+            can_resolve = live_count >= 2
+            status = raw_status
+            if raw_status in {"unresolved", "pending", "open"} and not can_resolve:
+                status = "stale"
+            invalid_reason = "" if can_resolve else (
+                "冲突成员已失效或缺失；至少需要 2 条仍有效的记忆才能解决。"
+            )
+            created_candidates = [
+                str(item.get("conflict_created_at") or item.get("created_at") or "")
+                for item in metadata_values
+            ] + [str(item.get("created_at") or "") for item in member_details]
+            created_candidates = [item for item in created_candidates if item]
             result.append({
                 "group_id": group_id,
-                "member_ids": [item.memory_id for item in sorted(members, key=lambda item: item.memory_id)],
-                "status": str(metadata.get("conflict_status") or "unresolved"),
-                "reason": str(metadata.get("conflict_reason") or "conflicting governed memory records"),
-                "created_at": str(metadata.get("conflict_created_at") or members[0].created_at),
+                "member_ids": member_ids,
+                "members": member_details,
+                "member_details": member_details,
+                "live_member_count": live_count,
+                "selectable_member_ids": [item["memory_id"] for item in member_details if item["selectable"]],
+                "can_resolve": can_resolve,
+                "invalid_reason": invalid_reason,
+                "status": status,
+                "source_status": raw_status,
+                "reason": _conflict_reason_label(raw_reason),
+                "reason_code": _safe_preview(raw_reason, limit=240),
+                "raw_reason": _safe_preview(raw_reason, limit=240),
+                "created_at": min(created_candidates) if created_candidates else "",
             })
-        return {"ok": True, "status": "succeeded", "conflicts": result, "total": len(result)}
+        actionable_total = sum(1 for item in result if item["can_resolve"])
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "conflicts": result,
+            # ``total`` remains the historical queue size for compatibility;
+            # callers showing an actionable metric must use actionable_total.
+            "total": len(result),
+            "history_total": len(result),
+            "actionable_total": actionable_total,
+        }
 
     def quarantine(self, trusted: Mapping[str, Any]) -> dict[str, Any]:
         entries = []
@@ -406,14 +550,18 @@ class GovernanceNativeService:
         # capability before touching the conflict/group namespace so an
         # unprivileged caller cannot use lookup results as an oracle.
         self._require_admin(trusted)
-        members = [
+        all_group_atoms = [
             atom for atom in self._atoms(trusted)
             if str((atom.metadata or {}).get("conflict_group_id") or "") == group
-            and atom.status not in {"deleted", "superseded", "rejected"}
         ]
+        members = [atom for atom in all_group_atoms if atom.status in _CONFLICT_LIVE_STATUSES]
         keeper = next((atom for atom in members if atom.memory_id == keep), None)
-        if keeper is None or len(members) < 2:
+        if not all_group_atoms:
             raise GovernanceNativeError("conflict_group_not_found")
+        if keeper is None or len(members) < 2:
+            # Match the read surface: stale groups are visible for audit, but
+            # their historical IDs may never be used to trigger a mutation.
+            raise GovernanceNativeError("conflict_group_stale")
         governance = self._governance()
         ctx = self._context(self.workspace, trusted)
         decisions: list[str] = []

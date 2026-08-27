@@ -279,6 +279,25 @@ def test_governance_actions_use_choices_and_explicit_scope() -> None:
     assert "callApi('list_memory_versions', activeShareGroupId)" in html
 
 
+def test_conflict_queue_uses_self_contained_snapshots_and_fails_closed_for_stale_members() -> None:
+    html = render_interactive_html()
+    start = html.index("async function renderConflictQueue()")
+    end = html.index("async function renderQuarantine()", start)
+    queue = html[start:end]
+
+    assert "callApi('get_conflicts', activeShareGroupId)" in queue
+    assert "callApi('list_memory', '', '', activeShareGroupId)" not in queue
+    assert "item.preview || item.body_preview || item.body || item.reason" in queue
+    assert "item.selectable === true || item.live === true" in queue
+    assert "历史冲突 · 候选已失效/不可恢复" in queue
+    assert "历史冲突中没有至少 2 条仍有效的记忆，候选已失效或不可恢复。" in queue
+    assert "个历史冲突组，其中 ${actionableCount} 个可处理" in queue
+    assert "disabled title=\"${escapeHtml(invalidReason)}\"" in queue
+    # Missing/legacy ID-only members have no explicit selectable flag and
+    # therefore never get a radio input.
+    assert "历史正文不可恢复（仅保留成员 ID）" in queue
+
+
 def test_pywebview_bridge_prefers_dispatch_and_keeps_safe_legacy_fallback() -> None:
     html = render_interactive_html()
 

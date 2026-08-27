@@ -6821,7 +6821,13 @@ class NativeV2RuntimePort:
                 trusted["share_group_id"] = group_id
                 conflicts = governance.conflicts(trusted)
                 quarantine = governance.quarantine(trusted)
-                conflict_count = int(conflicts.get("total") or len(conflicts.get("conflicts", [])))
+                # ``total`` includes stale historical groups so the queue can
+                # explain them.  The overview KPI is an actionable metric;
+                # only fall back for pre-snapshot compatibility responses.
+                if "actionable_total" in conflicts:
+                    conflict_count = int(conflicts.get("actionable_total") or 0)
+                else:
+                    conflict_count = int(conflicts.get("total") or len(conflicts.get("conflicts", [])))
                 quarantine_count = int(quarantine.get("total") or len(quarantine.get("quarantine", [])))
             except Exception:
                 # Missing governance data is a stable empty queue, not a raw
