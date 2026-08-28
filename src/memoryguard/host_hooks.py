@@ -2957,12 +2957,22 @@ def _mark_bootstrap_failure(
         event == "stop" and _is_mandatory_overflow_error(reason, packet)
     ):
         return
-    _update_state(
-        workspace,
-        provider,
-        session_id,
-        updates=_bootstrap_failure_state(reason, packet),
-    )
+    try:
+        _update_state(
+            workspace,
+            provider,
+            session_id,
+            updates=_bootstrap_failure_state(reason, packet),
+        )
+    except Exception:
+        # A failed ordinary pre-tool sidecar write must not brick the host.
+        # The native packet remains authoritative for this invocation, so an
+        # explicit mandatory overflow is still denied by the caller even when
+        # its diagnostic state cannot be persisted.  Lifecycle/user-prompt
+        # writes retain their existing fail-closed behavior.
+        if event == "pre_tool":
+            return
+        raise
 
 
 def _needs_bootstrap_recovery(state: Mapping[str, Any]) -> bool:
@@ -3441,6 +3451,7 @@ def _v2_hook_cutover(
         # bypass the provider's explicit bootstrap gate.
         if provider == "cursor" and event == "user_prompt":
             bootstrap_ok = False
+            packet_error = packet_error or "cursor_bootstrap_required"
         state_updates: dict[str, Any] = {
             "bootstrap_ok": bootstrap_ok,
             "bootstrap_error": packet_error[:500] if not bootstrap_ok else "",
@@ -3474,10 +3485,22 @@ def _v2_hook_cutover(
                 "write_seen": False,
                 "stop_continued": False,
             })
-        _update_state(
-            workspace, provider, session_id,
-            updates=state_updates,
-        )
+        try:
+            _update_state(
+                workspace, provider, session_id,
+                updates=state_updates,
+            )
+        except Exception:
+            if event != "pre_tool":
+                raise
+            # The packet is still available for this call.  Do not let a
+            # non-mandatory runtime sidecar failure block an ordinary tool;
+            # mandatory overflow must remain fail-closed in this invocation.
+            if overflow:
+                return _deny_output(
+                    provider,
+                    "MemoryGuard mandatory rule package overflow; tool execution denied.",
+                )
 
     heartbeat_overflow = bool(
         packet.get("mandatory_overflow", data.get("mandatory_overflow", False))
@@ -3618,8 +3641,39 @@ def _run_hook_unlocked(
     pre_tool_recovery = False
     if event == "pre_tool":
         prior_state = _load_state(root, normalized_provider, session_id)
+        if normalized_provider == "cursor":
+            # Cursor's prompt hook only records the conversation boundary.
+            # Its first ordinary tool must wait for the host to execute a
+            # real CallMcpTool memoryguard_context_bootstrap.  In particular,
+            # never let the generic same-turn recovery claim this state.
+            is_subagent = bool(
+                payload.get("subagent_id") or payload.get("agent_id")
+            )
+            if (
+                prior_state
+                and not prior_state.get("bootstrap_ok")
+                and not is_subagent
+            ):
+                if prior_state.get("mandatory_overflow"):
+                    return _deny_output(
+                        normalized_provider,
+                        "MemoryGuard mandatory rule package overflow; tool execution denied.",
+                    )
+                return _deny_output(
+                    normalized_provider,
+                    "CallMcpTool memoryguard_context_bootstrap must succeed before the first tool.",
+                )
         if _needs_bootstrap_recovery(prior_state):
-            if _claim_bootstrap_recovery(root, normalized_provider, session_id):
+            try:
+                claimed = _claim_bootstrap_recovery(
+                    root, normalized_provider, session_id,
+                )
+            except Exception:
+                if normalized_provider == "cursor":
+                    claimed = False
+                else:
+                    raise
+            if claimed:
                 # Existing bootstrap debt gets one native recovery dispatch.
                 # Disable the post-failure retry here: this is already the
                 # single same-turn attempt for this session state.
