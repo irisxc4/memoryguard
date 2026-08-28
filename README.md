@@ -36,6 +36,23 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.7
+
+v0.7.7 is a focused provider-repair and runtime-alignment hotfix:
+
+- **Safe bare-shell repair:** `memoryguard provider repair ...` can use an
+  in-process trusted repair capability when the canonical control home is
+  verified and exactly one active binding is present. Missing or ambiguous
+  context remains fail-closed, and other CLI mutations are unchanged.
+- **One interpreter for installed repairs:** non-editable wheel repairs ignore
+  inherited stale snapshots and write the current `sys.executable` to the
+  Codex MCP entry and all seven lifecycle Hooks. Editable/local installs keep
+  their content-keyed immutable snapshot behavior.
+- **Binding continuity:** repairs preserve the existing Agent identity and
+  shared-group binding.
+
+See [the v0.7.7 release record](docs/releases/v0.7.7.md).
+
 ## What's New in v0.7.6
 
 v0.7.6 is a focused Codex Hook/MCP runtime reliability release:
@@ -445,7 +462,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.6
+memoryguard --version                    # 0.7.7
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -789,7 +806,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows for concurrent tools, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
+- **Current release line:** v0.7.7 makes bare provider repair safe in a verified, uniquely bound control home and aligns installed Codex MCP/Hook repairs to the current interpreter while preserving Agent and shared-group identity. v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows for concurrent tools, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
   lifecycle and transport, and Python 3.10 compatibility corrections. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.

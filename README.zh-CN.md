@@ -34,6 +34,16 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.7 更新
+
+v0.7.7 是一次聚焦 Provider 修复与运行时对齐的热修复版本：
+
+- **安全的普通 Shell 修复：** 当 canonical 控制目录已验证且只有一个活动绑定时，`memoryguard provider repair ...` 可获取进程内受信修复能力；缺少或存在歧义的上下文仍保持 fail-closed，其他 CLI 变更路径不放宽。
+- **已安装版本统一解释器：** 非 editable wheel 修复会忽略继承的旧 snapshot，并将当前 `sys.executable` 同时写入 Codex MCP 与 7 个生命周期 Hook；editable/本地源码安装继续使用按内容键控的不可变 snapshot。
+- **绑定连续性：** 修复保留既有 Agent 身份与共享组绑定，不会创建新的绑定。
+
+详见 [v0.7.7 发布记录](docs/releases/v0.7.7.md)。
+
 ## v0.7.6 更新
 
 v0.7.6 是一次聚焦 Codex Hook/MCP 运行时可靠性的修复版本：
@@ -368,7 +378,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.6
+memoryguard --version                    # 0.7.7
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -558,7 +568,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口以支持并发工具，并让 bootstrap 成功/失败状态保持一致，明确 mandatory overflow 的 fail-closed 行为；v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+- **当前发布线：** v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的 provider repair，并让已安装版 Codex MCP/Hook 修复统一使用当前解释器，同时保留 Agent 与共享组身份；v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口以支持并发工具，并让 bootstrap 成功/失败状态保持一致，明确 mandatory overflow 的 fail-closed 行为；v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
   以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓

@@ -131,6 +131,80 @@ def test_bare_gui_preflight_recovers_one_verified_router_control_home(
     assert default_home != Path(seen["workspace"]).resolve()
 
 
+def test_bare_provider_repair_mints_host_owned_context_from_verified_installation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bare shell may repair providers without self-reporting an agent/admin."""
+    _bare_system32_environment(monkeypatch, tmp_path)
+    control_home = tmp_path / "verified-v2"
+    _activate_v2(control_home)
+    _bind(control_home, "codex-stable")
+    router = tmp_path / "router"
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router))
+    _profile_config(
+        _router_profile(router, "acct-a"),
+        agent_id="codex-stable",
+        control_home=control_home,
+    )
+    monkeypatch.delenv("MEMORYGUARD_AGENT_ID", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_repair(providers):
+        calls.append(tuple(providers))
+        return {"ok": True, "status": "succeeded", "providers": list(providers)}
+
+    monkeypatch.setattr(
+        "memoryguard.provider_adapters.repair_global_provider_configs",
+        fake_repair,
+    )
+
+    assert cli.main(["provider", "repair", "codex"]) == 0
+    assert calls == [("codex",)]
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
+def test_bare_provider_repair_rejects_ambiguous_canonical_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _bare_system32_environment(monkeypatch, tmp_path)
+    control_home = tmp_path / "verified-v2"
+    _activate_v2(control_home)
+    _bind(control_home, "codex-a")
+    _bind(control_home, "codex-b")
+    router = tmp_path / "router"
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router))
+    _profile_config(
+        _router_profile(router, "acct-a"),
+        agent_id="codex-a",
+        control_home=control_home,
+    )
+    _profile_config(
+        _router_profile(router, "acct-b"),
+        agent_id="codex-b",
+        control_home=control_home,
+    )
+    monkeypatch.delenv("MEMORYGUARD_AGENT_ID", raising=False)
+    monkeypatch.delenv("MEMORYGUARD_ADMIN", raising=False)
+
+    calls: list[tuple[str, ...]] = []
+
+    def fake_repair(providers):
+        calls.append(tuple(providers))
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        "memoryguard.provider_adapters.repair_global_provider_configs",
+        fake_repair,
+    )
+
+    assert cli.main(["provider", "repair", "codex"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "native_context_required"
+    assert calls == []
+
+
 def test_explicit_data_home_and_memoryguard_home_outrank_profile_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

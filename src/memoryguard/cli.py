@@ -1620,14 +1620,20 @@ def gui_main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _cli_trusted_context(workspace: str | Path = ".") -> dict:
+def _cli_trusted_context(
+    workspace: str | Path = ".",
+    *,
+    allow_verified_provider_repair: bool = False,
+) -> dict:
     """Return one process-issued CLI authority for native and maintenance ports.
 
     CLI flags are business inputs, never identity.  Resolve the active binding
     from the trusted process AccessContext, mint the same NativeBoundContext
     used by MCP/GUI, then attach the narrower maintenance sentinel to that
-    envelope.  A missing/ambiguous binding returns no capability and all V2
-    mutations fail closed.
+    envelope. A bare shell has no host-injected AccessContext, so the provider
+    repair command alone may derive one from a verified Codex installation and
+    its unique active canonical binding. A missing/ambiguous binding returns no
+    capability and all other V2 mutations fail closed.
     """
     try:
         from .access_context import load_access_context
@@ -1637,9 +1643,50 @@ def _cli_trusted_context(workspace: str | Path = ".") -> dict:
 
         ctx = load_access_context()
         agent_id = str(getattr(ctx, "trusted_agent_id", "") or "").strip()
+        resolved_workspace = Path(workspace).expanduser().resolve()
+        if not agent_id and allow_verified_provider_repair:
+            # This is deliberately narrower than the normal host context:
+            # only a selected V2 control home with a unique, still-active
+            # Codex binding and verified installation evidence can mint the
+            # process-local admin capability needed by provider repair.
+            from .agent_locator import AgentLocator
+            from .provider_adapters import (
+                _resolve_codex_canonical_identity,
+                _select_verified_codex_control_home,
+            )
+
+            try:
+                verified_home = _select_verified_codex_control_home()
+            except Exception:
+                return {}
+            if verified_home.expanduser().resolve() != resolved_workspace:
+                return {}
+
+            binding_store = GroupControlService(resolved_workspace, write=False)
+            instances, _ = AgentLocator(resolved_workspace).detect_instances()
+            canonical, share_group_id, _aliases = _resolve_codex_canonical_identity(
+                binding_store,
+                instances,
+            )
+            if not canonical or not share_group_id:
+                return {}
+            binding = binding_store.active_binding_for_agent(canonical)
+            if binding is None or str(binding.get("share_group_id") or "").strip() != share_group_id:
+                return {}
+            from .access_context import AccessContext
+
+            ctx = AccessContext(
+                trusted_agent_id=canonical,
+                is_admin=True,
+                strict_binding=True,
+                allow_anon=False,
+                session_id=f"cli-provider-repair:{os.getpid()}",
+                session_source="host",
+                session_trusted=True,
+            )
+            agent_id = canonical
         if not agent_id:
             return {}
-        resolved_workspace = Path(workspace).expanduser().resolve()
         binding = GroupControlService(resolved_workspace, write=False).active_binding_for_agent(
             agent_id,
         )
@@ -1794,7 +1841,13 @@ def _dispatch_cutover(args: argparse.Namespace) -> int:
         from .maintenance_v2.runtime_port import MaintenanceRuntimePort
 
         maintenance_port = MaintenanceRuntimePort(workspace)
-    context = _cli_trusted_context(workspace)
+    context = _cli_trusted_context(
+        workspace,
+        allow_verified_provider_repair=(
+            str(getattr(args, "command", "") or "") == "provider"
+            and str(getattr(args, "action", "") or "").casefold() == "repair"
+        ),
+    )
     native = NativeV2RuntimePort(
         workspace,
         maintenance_port=maintenance_port,

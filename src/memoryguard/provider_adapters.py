@@ -522,6 +522,23 @@ def prepare_provider_mcp_launch(
             root = resolve_data_home() / MCP_RUNTIME_DIRNAME
         except Exception:
             root = None
+    # A non-editable wheel is already the trusted immutable runtime.  Ignore
+    # any inherited snapshot override: that value can point at a previous
+    # release and would split a repair between the installed package and an
+    # old MCP/Hook interpreter.
+    if _is_immutable_install(inspected):
+        result: dict[str, Any] = {
+            "ok": True,
+            "python": sys.executable,
+            "argv": _mcp_launch_argv(sys.executable),
+            "install_kind": str(inspected.get("install_kind") or "unknown"),
+            "install_reason": str(inspected.get("install_reason") or "metadata_unavailable"),
+            "editable": bool(inspected.get("editable")),
+            "snapshot": False,
+            "mutated": False,
+        }
+        return result
+
     selected = _explicit_runtime_python(snapshot_python)
     argv_python = selected or sys.executable
     result: dict[str, Any] = {
@@ -537,11 +554,6 @@ def prepare_provider_mcp_launch(
     if selected:
         result["python"] = selected
         result["argv"] = _mcp_launch_argv(selected)
-        return result
-    if _is_immutable_install(inspected):
-        result["python"] = sys.executable
-        result["argv"] = _mcp_launch_argv(sys.executable)
-        result["snapshot"] = False
         return result
     if not mutate:
         result["ok"] = True

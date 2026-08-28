@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.7] - 2026-08-28
+
+### Fixed
+
+- A bare `memoryguard provider repair ...` command in a normal shell can now
+  obtain an in-process trusted repair capability when the canonical control
+  home is verified and exactly one active binding is available. Missing or
+  ambiguous context remains fail-closed; no other CLI mutation path is
+  widened.
+- Non-editable wheel repairs ignore an inherited stale runtime snapshot and
+  write the current `sys.executable` to the Codex MCP entry and all seven
+  lifecycle Hooks. Editable and local-source installs continue to use their
+  content-keyed immutable snapshots.
+- Provider repair preserves the existing Agent identity and shared-group
+  binding instead of creating a new binding during runtime alignment.
+
 ## [0.7.6] - 2026-08-28
 
 ### Fixed

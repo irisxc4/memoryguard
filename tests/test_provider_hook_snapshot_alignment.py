@@ -223,3 +223,53 @@ def test_install_and_repair_share_snapshot_interpreter_and_rotate_atomically(
         (config_home / "hooks.json").read_bytes(),
     ) == before_second_rotation
     assert len(calls) == 2
+
+
+def test_noneditable_repair_ignores_stale_snapshot_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wheel repair must rotate both MCP and Hooks off an old snapshot."""
+    import sys
+
+    data_home = tmp_path / "control plane"
+    config_home = tmp_path / "Codex profile"
+    config_home.mkdir(parents=True)
+    stale = tmp_path / "old mcp snapshot" / "python.exe"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("agent-memguard 0.7.3", encoding="utf-8")
+
+    monkeypatch.setenv("MEMORYGUARD_RUNTIME_PYTHON", str(stale))
+    monkeypatch.setattr(
+        provider_adapters,
+        "inspect_distribution_origin",
+        lambda: {
+            "install_kind": "installed",
+            "install_reason": "distribution_installed",
+            "editable": False,
+        },
+    )
+    monkeypatch.setattr(provider_adapters, "_require_provider_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        provider_adapters.CodexAdapter,
+        "_require_active_binding",
+        lambda _self, *_a: "binding-id",
+    )
+    monkeypatch.setattr(host_hooks, "_validate_binding", lambda *_a, **_k: None)
+
+    adapter = CodexAdapter(data_home, config_home=config_home)
+    adapter._repair_data_home = data_home
+    adapter._repair_codex_homes = ()
+    installed = adapter.install(
+        data_home,
+        share_group_id=GROUP_ID,
+        agent_instance_id=AGENT_ID,
+        global_scope=True,
+    )
+
+    assert installed["configured"] is True
+    _assert_codex_runtime(config_home, sys.executable)
+    config_text = (config_home / "config.toml").read_text(encoding="utf-8")
+    hooks_text = (config_home / "hooks.json").read_text(encoding="utf-8")
+    assert str(stale) not in config_text
+    assert str(stale) not in hooks_text
