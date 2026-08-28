@@ -1021,6 +1021,40 @@ def _qoder_profile() -> AgentProfile:
     )
 
 
+def _grok_profile() -> AgentProfile:
+    """Grok CLI Profile.
+
+    The installed Grok client keeps its user-level runtime/configuration under
+    ``~/.grok``.  This profile proves program presence without claiming that
+    the provider's private account or cloud memory is locally readable.
+    """
+    surfaces = [
+        MemorySurface(
+            surface_id="grok_user_config",
+            path_template="%HOME%/.grok",
+            surface_role="control_surface",
+            scope="user", load_order=20,
+            loader_evidence="https://docs.x.ai/docs",
+            classification_confidence=0.90,
+            category=SourceCategory.CONTROL_SURFACE,
+            ingestion_policy=IngestionPolicy.GOVERN_ONLY,
+            ownership=Ownership.EXTERNAL_READ_ONLY,
+            target_role=TargetRole.NONE,
+        ),
+    ]
+    return AgentProfile(
+        profile_id="grok@profile-1",
+        product="grok",
+        profile_version="1",
+        supported_platforms=["windows", "macos", "linux"],
+        verified_product_versions=["1.0.5"],
+        detection_rules=[],
+        surfaces=surfaces,
+        target_capability=TargetCapability.EXPORT_ONLY,
+        evidence_urls=["https://docs.x.ai/docs"],
+    )
+
+
 _BUILTIN_PROFILES: list[AgentProfile] = []
 
 
@@ -1057,6 +1091,7 @@ def _load_builtins() -> None:
         _lingma_profile(),
         _openclaw_profile(),
         _qoder_profile(),
+        _grok_profile(),
     ]]
 
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.7.6] - 2026-08-28
+
+### Fixed
+
+- Codex lifecycle Hooks and the MCP server now use the same content-keyed,
+  immutable runtime snapshot instead of resolving different Python runtimes
+  through PATH and package metadata.
+- Hook session-state updates use short, re-entrant cross-process lock windows,
+  so concurrent tools and sub-agent dispatch do not wait behind a full hook
+  execution or leave stale temporary state files.
+- Bootstrap success and failure state is written consistently: failures clear
+  stale success hashes and recoveries clear old errors. Ordinary `Stop`
+  capability, signature, dispatch, and runtime failures remain fail-open;
+  an explicit mandatory-budget overflow is recorded for the next tool call to
+  fail closed.
+- Agent discovery recognizes the installed Grok client through its built-in
+  profile and exposes a stable, verified program identity. Unknown MCP names
+  remain unresolved rather than being guessed from a generic label.
+- The governance console now uses the seven-page reference shell: persistent
+  navigation, a central workspace, a context rail, readable Agent cards, and
+  safe family-aware icon fallbacks. Technical IDs stay in collapsed details.
+
 ## [0.7.5] - 2026-08-27
 
 ### Fixed

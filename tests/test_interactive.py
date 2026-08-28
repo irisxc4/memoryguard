@@ -131,6 +131,45 @@ def test_three_column_governance_shell_is_default_structure() -> None:
     assert "@media (max-width: 1100px)" not in html
 
 
+def test_reference_shell_has_exact_primary_navigation_and_responsive_columns() -> None:
+    html = render_interactive_html()
+
+    # The final reference-layout contract is intentionally asserted as a
+    # string: the browser owns the CSS, while this test prevents a later CSS
+    # pass from silently restoring the old horizontal navigation.
+    assert "grid-template-columns: 208px minmax(0, 1fr) 280px" in html
+    assert ".main-wrapper { display: contents; }" in html
+    assert 'grid-column: 1; grid-row: 1 / span 2' in html
+    assert 'grid-column: 2 / span 2' in html
+    assert 'grid-column: 3; grid-row: 2' in html
+    nav_items = re.findall(r'<button class="nav-item[^>]+data-tab="([^"]+)"', html)
+    assert nav_items == ['overview', 'sources', 'neurons', 'codegraph', 'rules', 'history', 'findings']
+    assert 'class="sidebar-settings"' in html
+    assert 'aria-label="打开设置"' in html
+    assert '@media (max-width: 720px)' in html
+
+
+def test_narrow_navigation_keeps_readable_labels_inside_horizontal_scroller() -> None:
+    html = render_interactive_html()
+
+    assert '.sidebar-nav { display: flex; align-items: stretch; gap: 2px; padding: 6px 10px; overflow-x: auto; overflow-y: hidden; }' in html
+    assert '.sidebar-nav .nav-item { flex: 0 0 auto; min-width: max-content; min-height: 34px; margin: 0; padding: 7px 10px; gap: 8px; justify-content: flex-start; overflow: visible; white-space: nowrap; font-size: 12px; }' in html
+    assert '.sidebar-nav .nav-item::before { flex: none; font-size: 9px; }' in html
+
+
+def test_agent_cards_use_readable_identity_and_collapsed_technical_ids() -> None:
+    html = render_interactive_html()
+
+    assert 'function agentFamily(agentOrId)' in html
+    assert 'data-agent-family="${family}"' in html
+    assert 'class="agent-avatar"' in html
+    assert 'class="agent-card ${active ? \'active\' : \'\'}" role="button" tabindex="0"' in html
+    assert 'agent-technical-id' in html
+    assert '未识别的 MCP 助手' in html
+    assert '尚未返回可读来源摘要；可从本机 Agent 检测或匹配入口接入。' in html
+    assert '远程favicon' not in html
+
+
 def test_governance_flow_cards_navigate_to_real_queues() -> None:
     html = render_interactive_html()
 
@@ -714,7 +753,7 @@ def test_dashboard_chrome_exposes_seven_readable_pages() -> None:
 def test_agent_labels_do_not_expose_opaque_suffix_as_primary_name() -> None:
     html = render_interactive_html()
 
-    assert "if (!label) label = '未命名助手';" in html
+    assert "if (!label || /^(?:未知助手|未知\\s*Agent|unknown)$/i.test(label)) label = '未识别的 MCP 助手';" in html
     assert "id.slice(-4)" not in html
     assert "function looksLikeOpaqueAgentId" in html
     assert "readableAgentPart(program, id) || readableAgentPart(provider, id)" in html

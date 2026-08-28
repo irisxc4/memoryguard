@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -395,6 +397,44 @@ def test_codex_hook_config_uses_utf8_commands_for_each_platform(
         "SubagentStart",
         "UserPromptSubmit",
     }
+
+
+def test_managed_hook_events_use_the_explicit_runtime_interpreter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A snapshot MCP and every Codex lifecycle handler share one interpreter."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "control"
+    runtime_python = tmp_path / "snapshot" / "venv" / "Scripts" / "python.exe"
+    home.mkdir()
+    workspace.mkdir()
+    runtime_python.parent.mkdir(parents=True)
+    runtime_python.write_text("snapshot", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    _bind(workspace, "codex-agent", "group-a")
+
+    HostHookManager(workspace).install(
+        "codex",
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        runtime_python=runtime_python,
+    )
+
+    data = json.loads(
+        (home / ".codex" / "hooks.json").read_text(encoding="utf-8")
+    )
+    commands = [
+        handler[key]
+        for groups in data["hooks"].values()
+        for group in groups
+        for handler in group.get("hooks", [])
+        for key in ("command", "commandWindows")
+    ]
+    assert len(commands) == 14
+    assert all(str(runtime_python) in command for command in commands)
+    assert all("python -X utf8" not in command for command in commands)
 
 
 def test_hook_cli_forces_utf8_stdio_when_windows_defaults_to_gbk(
@@ -971,6 +1011,417 @@ def test_successful_bootstrap_clears_prior_mandatory_budget_error(
 
 
 @pytest.mark.parametrize(
+    ("failure_kind", "failed_event"),
+    [("dispatch", "user_prompt"), ("capability", "pre_tool")],
+)
+def test_bootstrap_failure_clears_prior_success_state_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    failed_event: str,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = f"bootstrap-failure-{failure_kind}"
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "initial bootstrap"},
+    )
+    state_path = _state_path(workspace, "codex", session_id)
+    successful_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert successful_state["bootstrap_ok"] is True
+    assert successful_state["context_hash"]
+
+    if failure_kind == "dispatch":
+        class _DispatchFailureFacade(_TestV2Facade):
+            def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+                raise RuntimeError("fixture dispatch failure")
+
+        failure_facade = _DispatchFailureFacade()
+    else:
+        class _CapabilityMissingFacade:
+            def state_snapshot(self):
+                return {"state": "V2_ACTIVE", "generation": 1}
+
+        failure_facade = _CapabilityMissingFacade()
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: failure_facade,
+    )
+    failed = run_hook(
+        provider="codex",
+        event=failed_event,
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "prompt": "failed bootstrap",
+            "tool_name": "Read",
+            "tool_input": {},
+        },
+    )
+    failed_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert failed_state["bootstrap_ok"] is False
+    assert failed_state["bootstrap_error"]
+    assert len(failed_state["bootstrap_error"]) <= 500
+    assert failed_state["context_hash"] == ""
+    if failed_event == "pre_tool":
+        assert failed["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "recovered bootstrap"},
+    )
+    recovered_state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert recovered_state["bootstrap_ok"] is True
+    assert recovered_state["bootstrap_error"] == ""
+    assert recovered_state["context_hash"]
+
+
+def test_pre_tool_transient_bootstrap_failure_recovers_in_same_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    calls = 0
+
+    class _TransientFacade(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "ok": False,
+                    "packet": {
+                        "status": "blocked",
+                        "error": "context_build_failed",
+                        "mandatory": [],
+                        "relevant": [],
+                        "receipts": [],
+                    },
+                }
+            return {
+                "ok": True,
+                "packet": {
+                    "status": "ok",
+                    "mandatory": [],
+                    "relevant": [],
+                    "receipts": [],
+                },
+            }
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TransientFacade(),
+    )
+    session_id = "same-turn-recovery"
+    result = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(workspace / "README.md")},
+        },
+    )
+
+    assert result == {}
+    assert calls == 2
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["bootstrap_ok"] is True
+    assert state["bootstrap_error"] == ""
+    assert state["context_hash"]
+
+
+def test_pre_tool_retry_failure_remains_blocked_and_is_not_reentered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    calls = 0
+
+    class _AlwaysTransientFailure(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            nonlocal calls
+            calls += 1
+            return {
+                "ok": False,
+                "packet": {
+                    "status": "blocked",
+                    "error": "context_build_failed",
+                    "mandatory": [],
+                    "relevant": [],
+                    "receipts": [],
+                },
+            }
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _AlwaysTransientFailure(),
+    )
+    payload = {
+        "session_id": "same-turn-retry-failed",
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(workspace / "README.md")},
+    }
+    first = run_hook(
+        provider="codex", event="pre_tool", workspace=workspace,
+        agent_instance_id="codex-agent", share_group_id="group-a", payload=payload,
+    )
+    second = run_hook(
+        provider="codex", event="pre_tool", workspace=workspace,
+        agent_instance_id="codex-agent", share_group_id="group-a", payload=payload,
+    )
+
+    assert first["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert second["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "memoryguard_context_bootstrap" in second["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+    assert calls == 2
+    state = json.loads(
+        _state_path(workspace, "codex", payload["session_id"]).read_text(encoding="utf-8")
+    )
+    assert state["bootstrap_ok"] is False
+    assert state["bootstrap_error"] == "context_build_failed"
+    assert state["context_hash"] == ""
+    assert state["bootstrap_retry_claimed"] is True
+
+
+def test_pre_tool_mandatory_failure_never_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    calls = 0
+
+    class _MandatoryFailure(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            nonlocal calls
+            calls += 1
+            return {
+                "ok": False,
+                "packet": {
+                    "status": "blocked",
+                    "error": "mandatory_budget_exceeded",
+                    "mandatory": [],
+                    "relevant": [],
+                    "receipts": [],
+                },
+            }
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _MandatoryFailure(),
+    )
+    result = run_hook(
+        provider="codex", event="pre_tool", workspace=workspace,
+        agent_instance_id="codex-agent", share_group_id="group-a",
+        payload={
+            "session_id": "mandatory-no-retry",
+            "tool_name": "Read",
+            "tool_input": {},
+        },
+    )
+
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert calls == 1
+    state = json.loads(
+        _state_path(workspace, "codex", "mandatory-no-retry").read_text(encoding="utf-8")
+    )
+    assert state["mandatory_overflow"] is True
+    assert state.get("bootstrap_retry_claimed") is not True
+
+
+def test_pre_tool_recovery_claim_serializes_concurrent_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = "concurrent-recovery"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {
+            "bootstrap_ok": False,
+            "bootstrap_error": "context_build_failed",
+            "context_hash": "",
+            "mandatory_overflow": False,
+        },
+    )
+    calls = 0
+    calls_lock = threading.Lock()
+
+    class _SuccessfulFacade(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.05)
+            return {"ok": True, "packet": {"status": "ok", "items": []}}
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _SuccessfulFacade(),
+    )
+    payload = {
+        "session_id": session_id,
+        "tool_name": "Read",
+        "tool_input": {},
+    }
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda _index: run_hook(
+                provider="codex", event="pre_tool", workspace=workspace,
+                agent_instance_id="codex-agent", share_group_id="group-a",
+                payload=payload,
+            ),
+            range(8),
+        ))
+
+    assert calls == 1
+    assert any(result == {} for result in results)
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["bootstrap_ok"] is True
+    assert state["context_hash"]
+
+
+def test_pre_tool_reclaims_legacy_retry_claim_without_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Pre-patch state must not turn a transient error into permanent debt."""
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = "legacy-retry-claim"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {
+            "bootstrap_ok": False,
+            "bootstrap_error": "context_build_failed",
+            "context_hash": "",
+            "mandatory_overflow": False,
+            "bootstrap_retry_claimed": True,
+            # Deliberately omit bootstrap_retry_claimed_at: old state shape.
+        },
+    )
+    calls = 0
+
+    class _RecoveryFacade(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            nonlocal calls
+            calls += 1
+            return {"ok": True, "packet": {"status": "ok", "items": []}}
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _RecoveryFacade(),
+    )
+    started = time.monotonic()
+    result = run_hook(
+        provider="codex", event="pre_tool", workspace=workspace,
+        agent_instance_id="codex-agent", share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_input": {},
+        },
+    )
+    elapsed = time.monotonic() - started
+
+    assert result == {}
+    assert calls == 1
+    assert elapsed < 5.0
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["bootstrap_ok"] is True
+    assert state["context_hash"]
+
+
+def test_pre_tool_real_bootstrap_request_bypasses_legacy_failure_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A real MemoryGuard bootstrap request remains reachable for repair."""
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = "legacy-bootstrap-request"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {
+            "bootstrap_ok": False,
+            "bootstrap_error": "context_build_failed",
+            "context_hash": "",
+            "mandatory_overflow": False,
+            "bootstrap_retry_claimed": True,
+        },
+    )
+
+    def must_not_dispatch(_workspace):
+        raise AssertionError("real bootstrap request must remain reachable")
+
+    monkeypatch.setattr(host_hooks, "_v2_runtime_facade_factory", must_not_dispatch)
+    result = run_hook(
+        provider="codex", event="pre_tool", workspace=workspace,
+        agent_instance_id="codex-agent", share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "mcp__memoryguard__memoryguard_context_bootstrap",
+            "tool_input": {"task": "当前用户请求"},
+        },
+    )
+
+    assert result == {}
+    state = json.loads(_state_path(workspace, "codex", session_id).read_text(encoding="utf-8"))
+    assert state["bootstrap_ok"] is False
+    assert state["bootstrap_error"] == "context_build_failed"
+
+
+@pytest.mark.parametrize(
     ("provider", "tool_name", "tool_input"),
     [
         (
@@ -1059,6 +1510,42 @@ def test_stop_fails_open_when_v2_reports_mandatory_budget_exceeded(
     )
     assert state["mandatory_overflow"] is True
     assert state["bootstrap_error"] == "mandatory_budget_exceeded"
+
+
+def test_stop_runtime_failure_does_not_create_bootstrap_failure_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+
+    class _DispatchFailureFacade(_TestV2Facade):
+        def bootstrap_hook(self, event, payload, *, context=None, snapshot=None):
+            raise RuntimeError("fixture dispatch failure")
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _DispatchFailureFacade(),
+    )
+    monkeypatch.setattr(
+        host_hooks,
+        "_best_effort_codex_reconcile",
+        lambda **_kwargs: {"ok": True},
+    )
+
+    result = run_hook(
+        provider="codex",
+        event="stop",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": "ordinary-stop-failure"},
+    )
+
+    assert result == {}
+    assert not _state_path(workspace, "codex", "ordinary-stop-failure").exists()
 
 
 def test_v2_provider_install_routes_bound_identity_without_duplicate_hook_setup(
@@ -1848,6 +2335,132 @@ def test_context_build_failed_is_bootstrap_error_not_mandatory_overflow(
     assert recovered == {}
 
 
+def test_bootstrap_success_clears_previous_error_and_stamps_context_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _v2_bind(workspace)
+    session_id = "atomic-bootstrap-state"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {
+            "bootstrap_ok": False,
+            "bootstrap_error": "context_build_failed",
+            "context_hash": "stale-context",
+        },
+    )
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            packet={
+                "status": "ok",
+                "mandatory": [],
+                "relevant": [{"item_id": "relevant-1"}],
+                "receipts": [],
+            },
+        ),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "recover"},
+    )
+    recovered = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert recovered["bootstrap_ok"] is True
+    assert recovered["bootstrap_error"] == ""
+    assert recovered["context_hash"]
+
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(
+            ok=False,
+            error="context_build_failed",
+            packet={
+                "status": "blocked",
+                "error": "context_build_failed",
+                "mandatory": [],
+                "relevant": [],
+                "receipts": [],
+            },
+        ),
+    )
+    run_hook(
+        provider="codex",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={"session_id": session_id, "prompt": "fail again"},
+    )
+    failed = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert failed["bootstrap_ok"] is False
+    assert failed["bootstrap_error"] == "context_build_failed"
+    assert failed["context_hash"] == ""
+
+
+def test_state_updates_are_serialized_without_holding_bootstrap_lock(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    session_id = "state-update-concurrency"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {"bootstrap_ok": False, "bootstrap_error": "initial"},
+    )
+
+    def write_receipt(index: int) -> None:
+        if index % 2:
+            host_hooks._update_state(
+                workspace,
+                "codex",
+                session_id,
+                updates={
+                    "bootstrap_ok": True,
+                    "bootstrap_error": "",
+                    "context_hash": f"context-{index}",
+                },
+            )
+        else:
+            host_hooks._update_state(
+                workspace,
+                "codex",
+                session_id,
+                updates={
+                    "bootstrap_ok": False,
+                    "bootstrap_error": f"context_build_failed-{index}",
+                    "context_hash": "",
+                },
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write_receipt, range(16)))
+
+    state = json.loads(
+        _state_path(workspace, "codex", session_id).read_text(encoding="utf-8")
+    )
+    assert state["bootstrap_ok"] is (state["bootstrap_error"] == "")
+    if state["bootstrap_ok"]:
+        assert state["context_hash"]
+    else:
+        assert state["context_hash"] == ""
+
+
 def test_no_source_absent_packet_is_not_mandatory_overflow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2126,6 +2739,49 @@ def test_invalid_existing_hook_config_is_not_overwritten(
             share_group_id="group-a",
         )
     assert path.read_text(encoding="utf-8") == "{broken"
+
+
+def test_successful_bootstrap_post_tool_clears_recovery_claim(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    session_id = "post-tool-recovery-claim"
+    host_hooks._save_state(
+        workspace,
+        "codex",
+        session_id,
+        {
+            "bootstrap_ok": False,
+            "bootstrap_error": "context_build_failed",
+            "context_hash": "",
+            "bootstrap_retry_claimed": True,
+            "bootstrap_retry_claimed_at": time.time(),
+            "mandatory_overflow": False,
+        },
+    )
+
+    result = run_hook(
+        provider="codex",
+        event="post_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": session_id,
+            "tool_name": "mcp__memoryguard__memoryguard_context_bootstrap",
+            "tool_input": {"task": "恢复当前任务上下文"},
+            "tool_result": {"ok": True},
+        },
+    )
+
+    assert result == {}
+    state = host_hooks._load_state(workspace, "codex", session_id)
+    assert state["bootstrap_ok"] is True
+    assert state["bootstrap_error"] == ""
+    assert state["context_hash"]
+    assert state["bootstrap_retry_claimed"] is False
+    assert state["bootstrap_retry_claimed_at"] == 0
 
 
 def test_subagent_start_receives_bounded_governance_context(

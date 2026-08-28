@@ -34,6 +34,26 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
+## v0.7.6 更新
+
+v0.7.6 是一次聚焦 Codex Hook/MCP 运行时可靠性的修复版本：
+
+- **统一运行时快照：** Codex 生命周期 Hook 与 MCP 共用同一个按内容键控的不可变
+  runtime snapshot，不再因 PATH 与包元数据解析不同而发生版本漂移。
+- **并发工具安全：** session state 写入只在短暂、可重入的跨进程锁窗口内完成，不再
+  锁住整个 Hook 执行；并发工具与子代理调度不会互相等待至超时。
+- **Bootstrap 状态一致：** bootstrap 失败会清除过期成功状态，恢复后清除旧错误并记录
+  稳定 context hash。普通 Stop 故障保持 fail-open；明确的 mandatory budget 溢出会
+  留给下一次工具调用 fail-closed。
+- **Agent 身份稳定：** 内置 Grok Profile 会从已安装的用户级表面发现；只有已验证的
+  provider、CLI 或 MCP 元数据才会映射为稳定程序身份。通用或不透明值保持未解析，不会
+  猜测归类。
+- **治理台结构清晰：** GUI 按参考图采用七页信息架构，固定导航、中央工作区和上下文侧栏
+  分工明确。Agent 卡片显示可读名称、来源摘要和安全的程序族图标回退；技术 ID 仅在收起的
+  详情中展示。
+
+详见 [v0.7.6 发布记录](docs/releases/v0.7.6.md)。
+
 ## v0.7.5 更新
 
 v0.7.5 是一次聚焦冲突复核正确性的修复版本：
@@ -348,7 +368,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.5
+memoryguard --version                    # 0.7.6
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -524,6 +544,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.6 发布记录](docs/releases/v0.7.6.md)
 - [v0.7.5 发布记录](docs/releases/v0.7.5.md)
 - [v0.7.4 发布记录](docs/releases/v0.7.4.md)
 - [v0.7.3 发布记录](docs/releases/v0.7.3.md)
@@ -537,7 +558,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
+- **当前发布线：** v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口以支持并发工具，并让 bootstrap 成功/失败状态保持一致，明确 mandatory overflow 的 fail-closed 行为；v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
   以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓

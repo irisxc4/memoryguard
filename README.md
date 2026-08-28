@@ -36,6 +36,31 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
+## What's New in v0.7.6
+
+v0.7.6 is a focused Codex Hook/MCP runtime reliability release:
+
+- **One runtime snapshot:** Codex lifecycle Hooks and MCP now share the same
+  content-keyed, immutable runtime snapshot, avoiding PATH/package-metadata
+  version drift.
+- **Concurrent tool safety:** session-state writes use short, re-entrant
+  cross-process lock windows instead of locking around the whole Hook run, so
+  concurrent tools and sub-agent dispatch do not time out behind one another.
+- **Consistent bootstrap state:** a failed bootstrap clears stale success state;
+  recovery clears old errors and records a stable context hash. Ordinary Stop
+  failures stay fail-open, while explicit mandatory-budget overflow is retained
+  for the next tool call to fail closed.
+- **Stable Agent identity:** the built-in Grok profile is discovered from its
+  installed user surface. Verified provider/CLI/MCP metadata maps to a stable
+  program identity; generic or opaque values remain unresolved instead of being
+  guessed.
+- **Clearer governance shell:** the GUI follows the seven-page reference
+  information architecture with persistent navigation, a central workspace,
+  and a context rail. Agent cards show readable names, source summaries, and
+  safe family-aware icon fallbacks; technical IDs remain in collapsed details.
+
+See [the v0.7.6 release record](docs/releases/v0.7.6.md).
+
 ## What's New in v0.7.5
 
 v0.7.5 is a focused conflict-review correctness release:
@@ -420,7 +445,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.5
+memoryguard --version                    # 0.7.6
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -750,6 +775,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.6 release record](docs/releases/v0.7.6.md)
 - [v0.7.5 release record](docs/releases/v0.7.5.md)
 - [v0.7.4 release record](docs/releases/v0.7.4.md)
 - [v0.7.3 release record](docs/releases/v0.7.3.md)
@@ -763,7 +789,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
+- **Current release line:** v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows for concurrent tools, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
   lifecycle and transport, and Python 3.10 compatibility corrections. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.

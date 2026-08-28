@@ -45,6 +45,10 @@ class _PathThreadLockEntry:
 
 _PATH_THREAD_LOCKS: dict[str, _PathThreadLockEntry] = {}
 _PATH_THREAD_LOCKS_GUARD = threading.Lock()
+# A state transaction may call the normal atomic writer while already holding
+# the same cross-process sidecar lock.  Keep that nested path re-entrant for
+# this thread; other processes still serialize on the sidecar file.
+_CROSS_PROCESS_HELD = threading.local()
 _COMPACT_REMINDER = (
     "压缩前发现尚未沉淀的长期记忆候选；继续工作前用 "
     "memoryguard_memory_write 萃取保存，不得保存整段对话。"
@@ -214,6 +218,14 @@ def _cross_process_path_lock(path: Path, timeout_seconds: float = 3.0):
     bounded replace retries cover short-lived antivirus/indexer handles.
     """
     lock_path = path.with_name(f".{path.name}.memoryguard.lock")
+    key = os.path.normcase(os.path.abspath(os.fspath(lock_path)))
+    held = getattr(_CROSS_PROCESS_HELD, "paths", None)
+    if held is None:
+        held = set()
+        _CROSS_PROCESS_HELD.paths = held
+    if key in held:
+        yield
+        return
     with _thread_lock_for_sidecar(lock_path):
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         lock_fd: int | None = None
@@ -241,7 +253,11 @@ def _cross_process_path_lock(path: Path, timeout_seconds: float = 3.0):
                     if time.monotonic() >= deadline:
                         raise TimeoutError(f"timed out acquiring hook runtime lock: {path}")
                     time.sleep(0.01)
-            yield
+            held.add(key)
+            try:
+                yield
+            finally:
+                held.discard(key)
         finally:
             if lock_fd is not None:
                 try:
@@ -379,9 +395,15 @@ def _command(
     share_group_id: str,
     *,
     windows: bool | None = None,
+    runtime_python: str | Path | None = None,
 ) -> str:
+    # A generated handler must execute the same interpreter that launched the
+    # provider MCP.  Falling back to the process interpreter is safe for an
+    # ordinary wheel install, while the explicit snapshot path prevents PATH
+    # drift from mixing a global 0.7.3 hook with a newer MCP snapshot.
+    python = str(runtime_python or sys.executable).strip() or sys.executable
     argv = [
-        "python",
+        python,
         "-X",
         "utf8",
         "-m",
@@ -731,6 +753,7 @@ class HostHookAdapter:
         agent_instance_id: str,
         share_group_id: str,
         mode: str = "enforce",
+        runtime_python: str | Path | None = None,
     ) -> dict[str, Any]:
         capability = self.capability()
         if not capability.supported:
@@ -746,7 +769,10 @@ class HostHookAdapter:
         path = self.config_path()
         data = _load_json_config(path, strict=True)
         data = self._remove_owned(data)
-        data = self._add_owned(data, agent_instance_id, share_group_id)
+        data = self._add_owned(
+            data, agent_instance_id, share_group_id,
+            runtime_python=runtime_python,
+        )
         _write_json_config(path, data)
         set_hook_mode(
             self.workspace,
@@ -910,6 +936,8 @@ class _NestedJsonHookAdapter(HostHookAdapter):
         data: dict[str, Any],
         agent_instance_id: str,
         share_group_id: str,
+        *,
+        runtime_python: str | Path | None = None,
     ) -> dict[str, Any]:
         hooks = data.setdefault("hooks", {})
         if not isinstance(hooks, dict):
@@ -932,6 +960,7 @@ class _NestedJsonHookAdapter(HostHookAdapter):
                     agent_instance_id,
                     share_group_id,
                     windows=False,
+                    runtime_python=runtime_python,
                 ),
                 "timeout": 15,
             }
@@ -943,6 +972,7 @@ class _NestedJsonHookAdapter(HostHookAdapter):
                     agent_instance_id,
                     share_group_id,
                     windows=True,
+                    runtime_python=runtime_python,
                 )
             if (
                 self.provider == "codex"
@@ -1061,6 +1091,8 @@ class CursorHookAdapter(HostHookAdapter):
         data: dict[str, Any],
         agent_instance_id: str,
         share_group_id: str,
+        *,
+        runtime_python: str | Path | None = None,
     ) -> dict[str, Any]:
         data.setdefault("version", 1)
         hooks = data.setdefault("hooks", {})
@@ -1081,6 +1113,7 @@ class CursorHookAdapter(HostHookAdapter):
                     self.workspace,
                     agent_instance_id,
                     share_group_id,
+                    runtime_python=runtime_python,
                 ),
                 "timeout": 15,
             }
@@ -1195,6 +1228,7 @@ class HostHookManager:
         mode: str = "enforce",
         reconcile_trust: bool = False,
         config_home: str | Path | None = None,
+        runtime_python: str | Path | None = None,
     ) -> dict[str, Any]:
         normalized = (provider or "").strip().lower()
         adapter = self.adapter(provider)
@@ -1204,6 +1238,7 @@ class HostHookManager:
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
             mode=mode,
+            runtime_python=runtime_python,
         )
         if (
             normalized == "codex"
@@ -1484,6 +1519,32 @@ def _save_state(
     except Exception as exc:
         _emit_runtime_write_diagnostic("mandatory_state_write_failed", provider, "state", exc)
         raise
+
+
+def _update_state(
+    workspace: Path,
+    provider: str,
+    session_id: str,
+    *,
+    updates: Mapping[str, Any] | None = None,
+    mutator: Any = None,
+) -> dict[str, Any]:
+    """Apply a small state mutation under the per-session sidecar lock.
+
+    The lock intentionally covers only the local JSON read/modify/write.  It
+    must never surround the native bootstrap call or other host I/O.
+    """
+    if not session_id:
+        return {}
+    path = _state_path(workspace, provider, session_id)
+    with _cross_process_path_lock(path):
+        state = _load_json_config(path, strict=False)
+        if callable(mutator):
+            mutator(state)
+        if updates:
+            state.update(dict(updates))
+        _save_state(workspace, provider, session_id, state)
+        return state
 
 
 def _record_heartbeat(
@@ -2781,11 +2842,19 @@ _MANDATORY_FAIL_CLOSED_ERRORS = frozenset({
 })
 _BOOTSTRAP_RUNTIME_ERRORS = frozenset({
     "context_build_failed",
+    "context_hash_missing",
     "unknown_runtime_state",
     "missing_trusted_identity",
     "context_budget_required",
     "v2_hook_bootstrap_failed",
 })
+_BOOTSTRAP_REQUIRED_EVENTS = frozenset({
+    "session_start",
+    "subagent_start",
+    "user_prompt",
+    "pre_tool",
+})
+_BOOTSTRAP_RETRY_CLAIM_TTL_SECONDS = 30.0
 _NEUTRAL_CANONICAL_MARKERS = frozenset({
     "no_source", "absent", "empty", "not_configured",
 })
@@ -2850,6 +2919,7 @@ def _bootstrap_failure_state(
         return {
             "bootstrap_ok": True,
             "bootstrap_error": "",
+            "context_hash": "",
             "mandatory_overflow": False,
             "mandatory_invalid_reason": "",
             "mandatory_match_receipts": [],
@@ -2858,10 +2928,116 @@ def _bootstrap_failure_state(
     return {
         "bootstrap_ok": False,
         "bootstrap_error": clipped,
+        "context_hash": "",
         "mandatory_overflow": overflow,
         "mandatory_invalid_reason": clipped if overflow else "",
         "mandatory_match_receipts": [],
     }
+
+
+def _mark_bootstrap_failure(
+    *,
+    workspace: Path,
+    provider: str,
+    session_id: str,
+    event: str,
+    reason: str,
+    packet: Mapping[str, Any] | None = None,
+) -> None:
+    """Record a bounded bootstrap failure for events that gate execution.
+
+    Ordinary stop failures are deliberately excluded: lifecycle shutdown must
+    not create a new blocking debt for the next invocation.  An explicit
+    mandatory overflow is the exception because it is already a fail-closed
+    native decision that must survive until the next gated event.  The state
+    write is the same short per-session atomic update used by the successful
+    bootstrap path; it never surrounds native dispatch or other host I/O.
+    """
+    if event not in _BOOTSTRAP_REQUIRED_EVENTS and not (
+        event == "stop" and _is_mandatory_overflow_error(reason, packet)
+    ):
+        return
+    _update_state(
+        workspace,
+        provider,
+        session_id,
+        updates=_bootstrap_failure_state(reason, packet),
+    )
+
+
+def _needs_bootstrap_recovery(state: Mapping[str, Any]) -> bool:
+    """Return true for an ordinary stale/failed bootstrap in this session."""
+    if (
+        not state
+        or state.get("mandatory_overflow")
+        or state.get("canonical_fallback")
+    ):
+        return False
+    if state.get("bootstrap_error") or state.get("bootstrap_ok") is False:
+        return True
+    if state.get("bootstrap_ok") is True:
+        return not str(state.get("context_hash") or "").strip()
+    return "context_hash" in state and not str(state.get("context_hash") or "").strip()
+
+
+def _claim_bootstrap_recovery(
+    workspace: Path,
+    provider: str,
+    session_id: str,
+) -> bool:
+    """Claim one same-turn recovery under the short state transaction lock."""
+    claimed = False
+
+    def mutator(state: dict[str, Any]) -> None:
+        nonlocal claimed
+        claimed_at = state.get("bootstrap_retry_claimed_at")
+        try:
+            claim_age = time.time() - float(claimed_at)
+        except (TypeError, ValueError):
+            # State written before claim timestamps existed is recoverable.
+            claim_age = _BOOTSTRAP_RETRY_CLAIM_TTL_SECONDS
+        stale_claim = claim_age >= _BOOTSTRAP_RETRY_CLAIM_TTL_SECONDS
+        if (
+            _needs_bootstrap_recovery(state)
+            and (not state.get("bootstrap_retry_claimed") or stale_claim)
+            and not state.get("mandatory_overflow")
+        ):
+            state["bootstrap_retry_claimed"] = True
+            state["bootstrap_retry_claimed_at"] = time.time()
+            claimed = True
+
+    _update_state(workspace, provider, session_id, mutator=mutator)
+    return claimed
+
+
+def _clear_bootstrap_recovery_claim(
+    workspace: Path,
+    provider: str,
+    session_id: str,
+) -> None:
+    _update_state(
+        workspace,
+        provider,
+        session_id,
+        updates={
+            "bootstrap_retry_claimed": False,
+            "bootstrap_retry_claimed_at": 0,
+        },
+    )
+
+
+def _retryable_bootstrap_failure(
+    reason: str,
+    packet: Mapping[str, Any] | None = None,
+) -> bool:
+    """Retry only transient context/bootstrap failures, never policy failures."""
+    if _is_mandatory_overflow_error(reason, packet):
+        return False
+    code = _error_code(reason).casefold()
+    return (
+        code in {value.casefold() for value in _BOOTSTRAP_RUNTIME_ERRORS}
+        or code.startswith("v2_hook_dispatch_failed")
+    )
 
 
 def _normalize_native_v2_packet(
@@ -2967,13 +3143,32 @@ def _v2_hook_cutover(
     share_group_id: str,
     session_id: str,
     payload: dict[str, Any],
+    allow_same_turn_retry: bool = True,
 ) -> dict[str, Any]:
     """Route every Hook event through the V2 state gate and native hook port."""
     try:
         facade = _load_v2_runtime_facade(workspace)
-    except Exception:
+    except Exception as exc:
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason=f"v2_hook_facade_load_failed:{type(exc).__name__}",
+        )
+        if event == "stop":
+            return {}
         return _v2_upgrade_output(provider, event, "UNKNOWN")
     if facade is _V2_FACADE_MISSING:
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason="v2_hook_facade_missing",
+        )
+        if event == "stop":
+            return {}
         return _v2_upgrade_output(provider, event, "UNKNOWN")
     state, snapshot = _v2_facade_snapshot(facade)
     if state not in _V2_READ_STATES:
@@ -2983,6 +3178,17 @@ def _v2_hook_cutover(
 
     hook = getattr(facade, "bootstrap_hook", None)
     if not callable(hook):
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason="v2_hook_capability_missing",
+        )
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 hook capability unavailable; tool execution denied.")
+        if event == "stop":
+            return {}
         return _context_output(
             provider, event,
             "MemoryGuard V2 hook capability unavailable; bootstrap blocked.",
@@ -2995,10 +3201,24 @@ def _v2_hook_cutover(
         accepts_snapshot = "snapshot" in params or any(
             p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
         has_context = False
         accepts_snapshot = False
+        capability_error = f"v2_hook_capability_invalid:{type(exc).__name__}"
+    else:
+        capability_error = ""
     if not has_context:
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason=capability_error or "v2_hook_context_capability_missing",
+        )
+        if event == "pre_tool":
+            return _deny_output(provider, "MemoryGuard V2 hook context capability unavailable; tool execution denied.")
+        if event == "stop":
+            return {}
         return _context_output(
             provider, event,
             "MemoryGuard V2 hook context capability unavailable; bootstrap blocked.",
@@ -3041,25 +3261,65 @@ def _v2_hook_cutover(
             kwargs["snapshot"] = snapshot
         result = hook(event, _v2_hook_request_payload(payload), **kwargs)
     except Exception as exc:
+        reason = f"v2_hook_dispatch_failed:{type(exc).__name__}"
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason=reason,
+        )
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,
-            error=f"v2_hook_dispatch_failed:{type(exc).__name__}",
+            error=reason,
         )
+        if (
+            event == "pre_tool"
+            and allow_same_turn_retry
+            and _retryable_bootstrap_failure(reason)
+            and _claim_bootstrap_recovery(workspace, provider, session_id)
+        ):
+            retry_result = _v2_hook_cutover(
+                provider=provider,
+                event=event,
+                workspace=workspace,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+                session_id=session_id,
+                payload=payload,
+                allow_same_turn_retry=False,
+            )
+            retry_state = _load_state(workspace, provider, session_id)
+            if (
+                retry_state.get("bootstrap_ok")
+                and retry_state.get("context_hash")
+                and not retry_state.get("mandatory_overflow")
+            ):
+                _clear_bootstrap_recovery_claim(workspace, provider, session_id)
+            return retry_result
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
+        if event == "stop":
+            return {}
         return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
 
     if not isinstance(result, dict):
         reason = "v2 hook returned invalid envelope"
-        state_payload = _load_state(workspace, provider, session_id)
-        state_payload.update(_bootstrap_failure_state(reason))
-        _save_state(workspace, provider, session_id, state_payload)
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason=reason,
+        )
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event, error=reason,
             mandatory_overflow=False,
         )
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
+        if event == "stop":
+            return {}
         return _context_output(provider, event, "MemoryGuard V2 hook returned an invalid envelope; bootstrap blocked.")
 
     data, packet = _hook_data(result)
@@ -3072,6 +3332,25 @@ def _v2_hook_cutover(
         session_id=session_id,
         event=event,
     )
+    # Native facades normally provide a context hash.  A compatibility facade
+    # can omit it, but a successful packet still needs a stable receipt so a
+    # later event cannot look like a different/empty bootstrap context.
+    if packet and not context_identity.get("context_hash"):
+        context_identity["context_hash"] = _short_hash(json.dumps(
+            {
+                "workspace_id": context_identity["workspace_id"],
+                "agent_instance_id": context_identity["agent_instance_id"],
+                "share_group_id": context_identity["share_group_id"],
+                "provider": context_identity["provider"],
+                "runtime_role": context_identity["runtime_role"],
+                "project_ref": context_identity["project_ref"],
+                "session_id": context_identity["session_id"],
+                "packet": "native-v2-context",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ))
     status = str(data.get("status", "") or "").strip().casefold()
     packet_status = str(packet.get("status", "") or "").strip().casefold()
     combined_error = str(
@@ -3084,17 +3363,49 @@ def _v2_hook_cutover(
         or bool(data.get("error"))
         or bool(packet.get("error"))
     )
+    if not context_identity.get("context_hash"):
+        envelope_failed = True
+        combined_error = combined_error or "context_hash_missing"
     if envelope_failed and not _is_neutral_canonical_fallback(packet, combined_error):
         reason = combined_error or "v2_hook_bootstrap_failed"
-        state_payload = _load_state(workspace, provider, session_id)
-        state_payload.update(_bootstrap_failure_state(reason, packet))
-        _save_state(workspace, provider, session_id, state_payload)
+        _mark_bootstrap_failure(
+            workspace=workspace,
+            provider=provider,
+            session_id=session_id,
+            event=event,
+            reason=reason,
+            packet=packet,
+        )
         overflow = _is_mandatory_overflow_error(reason, packet)
         _record_heartbeat(
             workspace, provider, agent_instance_id, event=event,
             error=f"v2_hook_envelope_failed:{reason}",
             mandatory_overflow=overflow,
         )
+        if (
+            event == "pre_tool"
+            and allow_same_turn_retry
+            and _retryable_bootstrap_failure(reason, packet)
+            and _claim_bootstrap_recovery(workspace, provider, session_id)
+        ):
+            retry_result = _v2_hook_cutover(
+                provider=provider,
+                event=event,
+                workspace=workspace,
+                agent_instance_id=agent_instance_id,
+                share_group_id=share_group_id,
+                session_id=session_id,
+                payload=payload,
+                allow_same_turn_retry=False,
+            )
+            retry_state = _load_state(workspace, provider, session_id)
+            if (
+                retry_state.get("bootstrap_ok")
+                and retry_state.get("context_hash")
+                and not retry_state.get("mandatory_overflow")
+            ):
+                _clear_bootstrap_recovery_claim(workspace, provider, session_id)
+            return retry_result
         if event == "pre_tool":
             return _deny_output(provider, "MemoryGuard V2 hook failed; tool execution denied.")
         if event == "stop":
@@ -3107,16 +3418,21 @@ def _v2_hook_cutover(
             )
         return _context_output(provider, event, "MemoryGuard V2 hook failed; bootstrap blocked.")
 
-    if event in {"session_start", "subagent_start", "user_prompt", "stop"}:
+    if event in {"session_start", "subagent_start", "user_prompt", "pre_tool", "stop"}:
         receipts = packet.get(
             "mandatory_match_receipts",
             data.get("mandatory_match_receipts", []),
         )
-        state_payload = _load_state(workspace, provider, session_id)
         packet_error = str(packet.get("error") or data.get("error") or "").strip()
         overflow = _is_mandatory_overflow_error(packet_error, packet)
         blocked = packet_status in {"error", "blocked", "failed"}
         neutral = _is_neutral_canonical_fallback(packet, packet_error)
+        prior_overflow = False
+        if event == "pre_tool":
+            prior_overflow = bool(
+                _load_state(workspace, provider, session_id).get("mandatory_overflow")
+            )
+            overflow = overflow or prior_overflow
         bootstrap_ok = not overflow and (neutral or not (blocked or packet_error))
         # Cursor's beforeSubmitPrompt hook is only the conversation receipt
         # boundary.  Its first ordinary tool must remain locked until the
@@ -3125,9 +3441,14 @@ def _v2_hook_cutover(
         # bypass the provider's explicit bootstrap gate.
         if provider == "cursor" and event == "user_prompt":
             bootstrap_ok = False
-        state_payload.update({
+        state_updates: dict[str, Any] = {
             "bootstrap_ok": bootstrap_ok,
             "bootstrap_error": packet_error[:500] if not bootstrap_ok else "",
+            "context_hash": (
+                context_identity.get("context_hash", "")
+                if bootstrap_ok
+                else ""
+            ),
             "mandatory_overflow": overflow,
             "mandatory_invalid_reason": (
                 str(packet.get("mandatory_invalid_reason") or packet_error or "")[:500]
@@ -3139,15 +3460,24 @@ def _v2_hook_cutover(
             ),
             "mandatory_match_receipts": receipts if isinstance(receipts, list) else [],
             "context_identity": context_identity,
-        })
+            "canonical_fallback": neutral,
+        }
+        if event in {"session_start", "subagent_start", "user_prompt"}:
+            state_updates.update({
+                "bootstrap_retry_claimed": False,
+                "bootstrap_retry_claimed_at": 0,
+            })
         if event == "user_prompt":
-            state_payload.update({
+            state_updates.update({
                 "prompt_hash": _short_hash(_prompt(payload)),
                 "durable_candidate": _durable_candidate(_prompt(payload)),
                 "write_seen": False,
                 "stop_continued": False,
             })
-        _save_state(workspace, provider, session_id, state_payload)
+        _update_state(
+            workspace, provider, session_id,
+            updates=state_updates,
+        )
 
     heartbeat_overflow = bool(
         packet.get("mandatory_overflow", data.get("mandatory_overflow", False))
@@ -3196,7 +3526,7 @@ def _v2_hook_cutover(
 
 
 
-def run_hook(
+def _run_hook_unlocked(
     *,
     provider: str,
     event: str,
@@ -3272,12 +3602,47 @@ def run_hook(
             if normalized_provider == "cursor" and _is_memoryguard_bootstrap(
                 recovery_tool, recovery_input,
             ):
-                state = _load_state(root, normalized_provider, session_id)
-                if not state.get("mandatory_overflow"):
-                    state["bootstrap_ok"] = True
-                    state["bootstrap_error"] = ""
-                    _save_state(root, normalized_provider, session_id, state)
+                def mark_cursor_bootstrap(state: dict[str, Any]) -> None:
+                    if not state.get("mandatory_overflow"):
+                        state["bootstrap_ok"] = True
+                        state["bootstrap_error"] = ""
+                        state["context_hash"] = state.get("context_hash") or _short_hash(
+                            "cursor-recovery:" + session_id
+                        )
+                _update_state(
+                    root, normalized_provider, session_id,
+                    mutator=mark_cursor_bootstrap,
+                )
             return {}
+
+    pre_tool_recovery = False
+    if event == "pre_tool":
+        prior_state = _load_state(root, normalized_provider, session_id)
+        if _needs_bootstrap_recovery(prior_state):
+            if _claim_bootstrap_recovery(root, normalized_provider, session_id):
+                # Existing bootstrap debt gets one native recovery dispatch.
+                # Disable the post-failure retry here: this is already the
+                # single same-turn attempt for this session state.
+                pre_tool_recovery = True
+            else:
+                current_state = _load_state(root, normalized_provider, session_id)
+                if (
+                    current_state.get("bootstrap_ok")
+                    and current_state.get("context_hash")
+                    and not current_state.get("mandatory_overflow")
+                ):
+                    return {}
+                if current_state.get("mandatory_overflow"):
+                    return _deny_output(
+                        normalized_provider,
+                        "MemoryGuard 强制规则包异常，停止继续执行。请先修复共享记忆中的强制规则。",
+                    )
+                return _deny_output(
+                    normalized_provider,
+                    "MemoryGuard 上下文加载不可用；请先调用 "
+                    "memoryguard_context_bootstrap(task=当前用户请求) 完成恢复，"
+                    "当前工具保持阻断。",
+                )
 
     v2_result = _v2_hook_cutover(
         provider=normalized_provider,
@@ -3287,6 +3652,7 @@ def run_hook(
         share_group_id=share_group_id,
         session_id=session_id,
         payload=payload,
+        allow_same_turn_retry=not pre_tool_recovery,
     )
 
     # Retired/unknown states already carry the stable public error.  Return
@@ -3330,9 +3696,17 @@ def run_hook(
                 return _deny_output(normalized_provider, reason)
         if normalized_provider == "cursor":
             if _is_memoryguard_bootstrap(tool_name, tool_input):
-                if not state.get("mandatory_overflow"):
-                    state["bootstrap_ok"] = True
-                    _save_state(root, normalized_provider, session_id, state)
+                def mark_cursor_bootstrap(state: dict[str, Any]) -> None:
+                    if not state.get("mandatory_overflow"):
+                        state["bootstrap_ok"] = True
+                        state["bootstrap_error"] = ""
+                        state["context_hash"] = state.get("context_hash") or _short_hash(
+                            "cursor-bootstrap:" + session_id
+                        )
+                _update_state(
+                    root, normalized_provider, session_id,
+                    mutator=mark_cursor_bootstrap,
+                )
                 return v2_result
             is_subagent = bool(
                 payload.get("subagent_id") or payload.get("agent_id")
@@ -3351,28 +3725,35 @@ def run_hook(
         return v2_result
 
     if event == "post_tool":
-        state = _load_state(root, normalized_provider, session_id)
         tool_name = str(payload.get("tool_name", "") or "")
         tool_input = payload.get("tool_input", {})
         tool_result = payload.get("tool_result", payload.get("result"))
-        changed = False
-        if _is_memoryguard_bootstrap(tool_name, tool_input):
-            if not state.get("mandatory_overflow"):
-                state["bootstrap_ok"] = True
-                changed = True
-        if _is_memoryguard_write(tool_name, tool_input):
-            success, reason = _coerce_tool_result_status(tool_result)
-            if success is True:
-                state["write_seen"] = True
-                state.pop("write_failed", None)
-                state.pop("write_error", None)
-                changed = True
-            elif success is False:
-                state["write_failed"] = True
-                state["write_error"] = reason or "memoryguard write tool reported failure"
-                changed = True
-        if changed:
-            _save_state(root, normalized_provider, session_id, state)
+        def update_post_tool_state(state: dict[str, Any]) -> None:
+            if _is_memoryguard_bootstrap(tool_name, tool_input):
+                if not state.get("mandatory_overflow"):
+                    state["bootstrap_ok"] = True
+                    state["bootstrap_error"] = ""
+                    state["context_hash"] = state.get("context_hash") or _short_hash(
+                        "post-tool-bootstrap:" + session_id
+                    )
+                    state["bootstrap_retry_claimed"] = False
+                    state["bootstrap_retry_claimed_at"] = 0
+            if _is_memoryguard_write(tool_name, tool_input):
+                success, reason = _coerce_tool_result_status(tool_result)
+                if success is True:
+                    state["write_seen"] = True
+                    state.pop("write_failed", None)
+                    state.pop("write_error", None)
+                elif success is False:
+                    state["write_failed"] = True
+                    state["write_error"] = reason or "memoryguard write tool reported failure"
+        if _is_memoryguard_bootstrap(tool_name, tool_input) or _is_memoryguard_write(
+            tool_name, tool_input
+        ):
+            _update_state(
+                root, normalized_provider, session_id,
+                mutator=update_post_tool_state,
+            )
         _best_effort_codegraph_file_refresh(
             workspace=root,
             payload={
@@ -3396,6 +3777,9 @@ def run_hook(
             )
 
     return v2_result
+
+
+run_hook = _run_hook_unlocked
 
 
 

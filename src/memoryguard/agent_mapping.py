@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 # stale 判定阈值（秒）
 STALE_THRESHOLD_SECONDS = 30 * 24 * 3600       # 30 天
@@ -36,6 +36,7 @@ AGENT_PRODUCT_MAP: dict[str, str] = {
     ".codex": "codex",
     ".cursor": "cursor",
     ".codeium": "windsurf",
+    ".grok": "grok",              # xAI Grok CLI / MCP client
 
     # ---------- 国产 Agent（独立 IDE / CLI）----------
     ".trae-cn": "trae",       # 字节跳动 TRAE（含 MarsCode 继承），独立 IDE
@@ -115,6 +116,7 @@ PRODUCT_DISPLAY_NAMES: dict[str, str] = {
     "claude": "Claude",
     "codex": "Codex",
     "cursor": "Cursor",
+    "grok": "Grok",
     "trae": "Trae",
     "windsurf": "Windsurf",
     "zcode": "zcode",
@@ -129,6 +131,80 @@ PRODUCT_DISPLAY_NAMES: dict[str, str] = {
     "echobird": "EchoBird",
     "gumifox": "GumiFox",
 }
+
+# Stable program identity aliases.  Only exact, trusted tokens are accepted;
+# arbitrary account names and model names never become a program identity.
+PROGRAM_ID_ALIASES: dict[str, str] = {
+    **{name: name for name in PRODUCT_DISPLAY_NAMES},
+    "grok-cli": "grok",
+    "xai-grok": "grok",
+    "claude-code": "claude-code",
+    "cursor-agent": "cursor",
+    "codeium": "windsurf",
+}
+
+
+def _identity_token(value: Any) -> str:
+    """Normalize one trusted identity field to an exact alias token."""
+    text = str(value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    # CLI fields may be absolute paths.  Never inspect arguments or contents.
+    token = text.rsplit("/", 1)[-1].casefold()
+    for suffix in (".exe", ".cmd", ".bat", ".com"):
+        if token.endswith(suffix):
+            token = token[: -len(suffix)]
+            break
+    return token.replace("_", "-").replace(" ", "-")
+
+
+def normalize_program_identity(
+    provider: str = "",
+    *,
+    cli_path: str = "",
+    mcp_name: str = "",
+    mcp_display_name: str = "",
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Resolve a stable program identity from trusted discovery evidence.
+
+    Resolution order is explicit provider, CLI basename, MCP server name, and
+    MCP metadata provider/program fields.  Account/session identifiers are
+    intentionally ignored.  Unknown values remain unresolved and carry a
+    safe source hint for the UI instead of being guessed.
+    """
+    fields: list[tuple[str, str]] = [
+        ("provider", provider),
+        ("cli_basename", Path(cli_path).name if cli_path else ""),
+        ("mcp_name", mcp_name),
+        ("mcp_display_name", mcp_display_name),
+    ]
+    meta = metadata if isinstance(metadata, Mapping) else {}
+    for key in ("program", "program_id", "provider", "server", "server_name"):
+        fields.append((f"metadata.{key}", str(meta.get(key) or "")))
+
+    for source, raw in fields:
+        token = _identity_token(raw)
+        product = PROGRAM_ID_ALIASES.get(token)
+        if product:
+            return {
+                "program_id": product,
+                "provider": product,
+                "display_name": provider_display_name(product),
+                "resolution": "verified",
+                "source": source,
+                "source_hint": token,
+            }
+
+    hints = [f"{source}={_identity_token(raw)}" for source, raw in fields if _identity_token(raw)]
+    return {
+        "program_id": "unknown",
+        "provider": "",
+        "display_name": provider_display_name("unknown"),
+        "resolution": "unresolved",
+        "source": "",
+        "source_hint": "; ".join(hints[:3]),
+    }
 
 
 def product_for_dot_dir(dot_dir_name: str) -> str | None:

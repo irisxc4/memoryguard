@@ -174,17 +174,34 @@ _INSTRUCTION_BODY = _instruction_body()
 # ===========================================================================
 
 
-def _mcp_command() -> list[str]:
+def _mcp_command(
+    *,
+    runtime_python: str | Path | None = None,
+    launch: Mapping[str, Any] | None = None,
+) -> list[str]:
     """Return MemoryGuard MCP argv for provider config.
 
     PyPI/wheel installs keep the current interpreter. Editable or local-source
     installs must select or build an immutable snapshot before config write.
     Repository tests keep using src and do not run pip.
     """
+    if runtime_python:
+        return _mcp_launch_argv(str(runtime_python))
+    selected = dict(launch or prepare_provider_mcp_launch(mutate=True))
+    if not selected.get("ok"):
+        raise ValueError(str(selected.get("reason") or "mcp_runtime_unavailable"))
+    return list(selected["argv"])
+
+
+def _prepare_provider_runtime() -> dict[str, Any]:
+    """Select one MCP runtime for an install transaction and its Hook set."""
     launch = prepare_provider_mcp_launch(mutate=True)
     if not launch.get("ok"):
         raise ValueError(str(launch.get("reason") or "mcp_runtime_unavailable"))
-    return list(launch["argv"])
+    runtime_python = str(launch.get("python") or "").strip()
+    if not runtime_python or not Path(runtime_python).is_file():
+        raise ValueError("mcp_runtime_unavailable")
+    return dict(launch)
 
 
 def _is_immutable_install(origin: Mapping[str, Any] | None) -> bool:
@@ -579,9 +596,10 @@ def _mcp_server_config(
     memoryguard_workspace: str | Path = "",
     provider: str = "",
     control_scope: str = "project",
+    runtime_python: str | Path | None = None,
 ) -> dict[str, Any]:
     """返回 MemoryGuard MCP server 的配置片段（JSON 格式，Claude/Cursor 通用）。"""
-    cmd = _mcp_command()
+    cmd = _mcp_command(runtime_python=runtime_python)
     config: dict[str, Any] = {
         "command": cmd[0],
         "args": cmd[1:],
@@ -620,17 +638,34 @@ def _mcp_server_config(
     return config
 
 
+def _configured_codex_runtime_python(config_home: str | Path) -> str:
+    """Read an existing absolute MCP interpreter without creating a snapshot."""
+    path = Path(config_home).expanduser() / "config.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = tomllib.loads(text) if text.strip() else {}
+        server = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {})
+        command = str(server.get("command") or "").strip()
+        candidate = Path(command).expanduser()
+        if candidate.is_file() and candidate.is_absolute():
+            return str(candidate)
+    except (OSError, TypeError, ValueError):
+        pass
+    return ""
+
+
 def _mcp_toml_section(
     agent_instance_id: str = "",
     memoryguard_workspace: str | Path = "",
     provider: str = "codex",
     control_scope: str = "project",
+    runtime_python: str | Path | None = None,
 ) -> str:
     """返回 MemoryGuard MCP server 的 TOML 配置段落（Codex 用）。
 
     用 json.dumps 产出合法的 TOML basic string（自动转义反斜杠）。
     """
-    cmd = _mcp_command()
+    cmd = _mcp_command(runtime_python=runtime_python)
     command_str = json.dumps(cmd[0])  # TOML basic string 与 JSON string 语法兼容
     args_items = ", ".join(json.dumps(a) for a in cmd[1:])
     lines = [
@@ -1256,6 +1291,7 @@ class ProviderAdapter:
         agent_instance_id: str,
         share_group_id: str,
         config_home: str | Path | None = None,
+        runtime_python: str | Path | None = None,
     ) -> dict[str, Any]:
         """Install the user-level hook only for an explicit global takeover."""
         from .host_hooks import HostHookManager
@@ -1277,6 +1313,7 @@ class ProviderAdapter:
                 mode="enforce",
                 reconcile_trust=self.provider_name == "codex",
                 config_home=config_home,
+                runtime_python=runtime_python,
             )
         except Exception as exc:
             return {
@@ -1372,6 +1409,8 @@ class ClaudeAdapter(ProviderAdapter):
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
+        runtime = _prepare_provider_runtime()
+        runtime_python = str(runtime["python"])
 
         # 先生成并验证全部内容，再事务写入。
         instr_path = self._instruction_path()
@@ -1386,6 +1425,7 @@ class ClaudeAdapter(ProviderAdapter):
             MCP_SERVER_NAME,
             _mcp_server_config(
                 agent_instance_id, self.workspace, "claude", control_scope,
+                runtime_python=runtime_python,
             ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
@@ -1397,6 +1437,7 @@ class ClaudeAdapter(ProviderAdapter):
             enabled=global_scope,
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
+            runtime_python=runtime_python,
         )
         warnings = self._cleanup_superseded_project_override()
         return self._configured_result(
@@ -1522,6 +1563,8 @@ class CodexAdapter(ProviderAdapter):
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
+        runtime = _prepare_provider_runtime()
+        runtime_python = str(runtime["python"])
 
         instr_path = self._instruction_path()
         content = _read_text_for_update(instr_path)
@@ -1533,6 +1576,7 @@ class CodexAdapter(ProviderAdapter):
         toml_content = _reconcile_memoryguard_toml_tables(toml_content)
         section = _mcp_toml_section(
             agent_instance_id, self.workspace, control_scope=control_scope,
+            runtime_python=runtime_python,
         )
         new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
         _validate_toml(new_toml, mcp_path)
@@ -1546,6 +1590,7 @@ class CodexAdapter(ProviderAdapter):
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
             config_home=None if self._has_workspace else self._codex_user_dir(),
+            runtime_python=runtime_python,
         )
         warnings = (
             ["Codex 仅在用户信任该项目后加载项目级 .codex/config.toml"]
@@ -1561,6 +1606,7 @@ class CodexAdapter(ProviderAdapter):
                 binding_id=binding_id,
                 skip_config_home=self._codex_user_dir(),
                 homes=getattr(self, "_repair_codex_homes", None),
+                runtime_python=runtime_python,
             )
             warnings.extend(str(item) for item in replica.get("warnings") or ())
             try:
@@ -1729,6 +1775,8 @@ class CursorAdapter(ProviderAdapter):
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
+        runtime = _prepare_provider_runtime()
+        runtime_python = str(runtime["python"])
 
         instr_path = self._instruction_path()
         new_instruction = self._instruction_content(share_group_id)
@@ -1740,6 +1788,7 @@ class CursorAdapter(ProviderAdapter):
             MCP_SERVER_NAME,
             _mcp_server_config(
                 agent_instance_id, self.workspace, "cursor", control_scope,
+                runtime_python=runtime_python,
             ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
@@ -1751,6 +1800,7 @@ class CursorAdapter(ProviderAdapter):
             enabled=global_scope,
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
+            runtime_python=runtime_python,
         )
         warnings: list[str] = self._cleanup_superseded_project_override()
         global_path = Path.home() / ".cursor" / "mcp.json"
@@ -1884,6 +1934,8 @@ class TraeAdapter(ProviderAdapter):
         binding_id = self._require_active_binding(
             agent_instance_id, share_group_id
         )
+        runtime = _prepare_provider_runtime()
+        runtime_python = str(runtime["python"])
 
         instr_path = self._instruction_path()
         content = _read_text_for_update(instr_path)
@@ -1897,6 +1949,7 @@ class TraeAdapter(ProviderAdapter):
             MCP_SERVER_NAME,
             _mcp_server_config(
                 agent_instance_id, self.workspace, "trae", control_scope,
+                runtime_python=runtime_python,
             ),
         )
         new_mcp_content = json.dumps(data, ensure_ascii=False, indent=2)
@@ -1908,6 +1961,7 @@ class TraeAdapter(ProviderAdapter):
             enabled=global_scope,
             agent_instance_id=agent_instance_id,
             share_group_id=share_group_id,
+            runtime_python=runtime_python,
         )
 
         warnings: list[str] = self._cleanup_superseded_project_override()
@@ -2406,6 +2460,7 @@ def _codex_hooks_document(
     config_home: Path,
     agent_instance_id: str,
     share_group_id: str,
+    runtime_python: str | Path | None = None,
 ) -> str:
     from .host_hooks import CodexHookAdapter, _load_json_config
 
@@ -2413,7 +2468,12 @@ def _codex_hooks_document(
     adapter.set_config_home(config_home)
     data = _load_json_config(adapter.config_path(), strict=False)
     data = adapter._remove_owned(data)
-    data = adapter._add_owned(data, agent_instance_id, share_group_id)
+    data = adapter._add_owned(
+        data,
+        agent_instance_id,
+        share_group_id,
+        runtime_python=runtime_python,
+    )
     return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
@@ -2423,10 +2483,14 @@ def _write_codex_global_home(
     *,
     agent_instance_id: str,
     share_group_id: str,
+    runtime_python: str | Path | None = None,
 ) -> dict[str, Any]:
     """Atomically write MCP env, AGENTS.md, and hooks for one Codex home."""
     from .host_hooks import set_hook_mode
 
+    selected_runtime_python = str(
+        runtime_python or _configured_codex_runtime_python(config_home) or sys.executable
+    )
     adapter = CodexAdapter(data_home, config_home=config_home)
     adapter._has_workspace = False
     adapter.workspace = Path(data_home).expanduser().resolve()
@@ -2439,13 +2503,18 @@ def _write_codex_global_home(
     toml_content = _reconcile_memoryguard_toml_tables(_read_text_for_update(mcp_path))
     section = _mcp_toml_section(
         agent_instance_id, adapter.workspace, control_scope="global",
+        runtime_python=selected_runtime_python,
     )
     new_toml = _replace_section(toml_content, _TOML_BEGIN, _TOML_END, section)
     _validate_toml(new_toml, mcp_path)
     backup = _backup_toml_before_repair(mcp_path, toml_content, new_toml)
     hooks_path = Path(config_home) / "hooks.json"
     hooks_text = _codex_hooks_document(
-        adapter.workspace, Path(config_home), agent_instance_id, share_group_id,
+        adapter.workspace,
+        Path(config_home),
+        agent_instance_id,
+        share_group_id,
+        runtime_python=selected_runtime_python,
     )
     _apply_file_transaction([
         (instr_path, new_content),
@@ -2472,6 +2541,7 @@ def _repair_discovered_codex_homes(
     binding_id: str = "",
     skip_config_home: Path | None = None,
     homes: list[Path] | tuple[Path, ...] | None = None,
+    runtime_python: str | Path | None = None,
 ) -> dict[str, Any]:
     """Repair every discovered Codex home to the same program identity."""
     from .agent_locator import current_codex_home
@@ -2496,6 +2566,7 @@ def _repair_discovered_codex_homes(
                 home,
                 agent_instance_id=agent_instance_id,
                 share_group_id=share_group_id,
+                runtime_python=runtime_python,
             ))
         except Exception as exc:
             warnings.append(

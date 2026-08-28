@@ -934,6 +934,77 @@ tbody tr:last-child td { border-bottom: 0; }
   #content .overview-view .governance-stage { min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 7px; }
   #content .overview-view .governance-stage::before { left: 7px; transform: translateY(-50%); }
 }
+
+/* Reference shell: persistent 208px navigation, full-width workspace header,
+   readable central work area, and a 280px context rail.  The old template
+   accumulated several layout passes; this final contract intentionally wins
+   without changing any renderer's data or action ownership. */
+.app-shell { display: grid; grid-template-columns: 208px minmax(0, 1fr) 280px; grid-template-rows: 56px minmax(0, 1fr); height: 100%; min-width: 0; }
+.main-wrapper { display: contents; }
+.sidebar { position: relative; z-index: 12; grid-column: 1; grid-row: 1 / span 2; width: auto; height: auto; display: flex; flex-direction: column; padding: 18px 0 14px; overflow: hidden; border-right: 1px solid var(--line); border-bottom: 0; background: rgba(4, 11, 9, .94); }
+.sidebar-brand { display: flex; }
+.sidebar-footer { display: block; margin-top: auto; }
+.sidebar-nav { display: block; height: auto; padding: 0 10px; overflow-y: auto; overflow-x: clip; }
+.sidebar-nav .nav-section-label { display: block; }
+.sidebar-nav .nav-item { display: flex; min-height: 38px; margin-bottom: 3px; padding: 9px 10px 9px 13px; white-space: normal; }
+.sidebar-nav .nav-item { border: 0; background: transparent; text-align: left; }
+.sidebar-nav .nav-item .count { min-width: 18px; margin-left: auto; }
+.sidebar-settings { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 12px; text-align: left; }
+.sidebar-settings::before { content: '⚙'; width: 18px; color: var(--faint); text-align: center; }
+.sidebar-settings:hover, .sidebar-settings:focus-visible { color: var(--fg); }
+.local-badge { display: none; }
+.topbar { grid-column: 2 / span 2; grid-row: 1; min-width: 0; }
+.content { grid-column: 2; grid-row: 2; min-width: 0; overflow: auto; padding: 22px 24px 30px; }
+.status-rail { grid-column: 3; grid-row: 2; width: auto; min-width: 0; max-height: none; overflow-y: auto; border-left: 1px solid var(--line); border-top: 0; }
+.topbar-brand { display: none; }
+.topbar-left { gap: 12px; }
+.topbar-context { font-size: 12px; color: var(--fg); }
+.topbar-context::before { display: none; }
+.dashboard-view { max-width: 1240px; margin: 0 auto; }
+.page-heading { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; padding: 0 0 16px; margin-bottom: 18px; background: transparent; }
+.page-heading::before { width: 24px; height: 24px; border-radius: 6px; }
+.agent-discovery-grid { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+.agent-card { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 10px; align-items: start; min-height: 132px; padding: 14px; border-radius: 9px; }
+.agent-card[role="button"] { cursor: pointer; }
+.agent-card[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.agent-card .agent-avatar { grid-row: 1 / span 4; }
+.agent-card .agent-name, .agent-card .agent-meta, .agent-card .agent-badge, .agent-card > .chip, .agent-card .finding-actions, .agent-card .agent-technical-id { grid-column: 2; }
+.agent-card .agent-meta { margin-top: 6px; }
+.agent-card .agent-technical-id { margin-top: 4px; }
+.agent-card .agent-technical-id summary { color: var(--faint); cursor: pointer; font-size: 9px; }
+.agent-card .agent-technical-id code { display: block; margin-top: 3px; font-size: 9px; }
+.agent-avatar { display: grid; place-items: center; width: 34px; height: 34px; flex: none; border: 1px solid var(--line-strong); border-radius: 8px; background: rgba(110,231,196,.08); color: var(--accent-bright); font-size: 12px; font-weight: 750; letter-spacing: -.03em; }
+.agent-avatar[data-agent-family="grok"] { background: #050505; border-color: rgba(255,255,255,.38); color: #fff; font-size: 17px; }
+.agent-avatar[data-agent-family="chatgpt"] { background: rgba(110,231,196,.13); }
+.agent-avatar[data-agent-family="copilot"] { background: rgba(99,179,237,.13); color: #b9e7ff; }
+.agent-avatar[data-agent-family="claude"] { background: rgba(233,187,100,.13); color: #f3d697; }
+.agent-avatar[data-agent-family="cursor"] { background: rgba(205,205,205,.1); color: #f0f0f0; }
+.agent-avatar[data-agent-family="unknown"] { color: var(--muted); background: rgba(72,104,94,.14); }
+.agent-card > .chip { justify-self: start; margin-top: 9px; }
+.agent-card .finding-actions { margin-top: 8px; }
+.source-detail-row td:first-child strong { display: inline-flex; align-items: center; gap: 8px; }
+.source-detail-row td:first-child strong::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px rgba(110,231,196,.5); }
+.sources-view .dashboard-main > section { min-width: 0; }
+@media (max-width: 1024px) {
+  .app-shell { grid-template-columns: 208px minmax(0, 1fr); grid-template-rows: 56px auto auto; height: auto; min-height: 100%; }
+  .sidebar { grid-column: 1; grid-row: 1 / span 2; }
+  .topbar { grid-column: 2; grid-row: 1; }
+  .content { grid-column: 2; grid-row: 2; }
+  .status-rail { grid-column: 1 / span 2; grid-row: 3; width: auto; border-top: 1px solid var(--line); border-left: 0; }
+}
+@media (max-width: 720px) {
+  .app-shell { display: block; height: auto; min-height: 100%; }
+  .sidebar { position: sticky; top: 0; z-index: 40; width: 100%; height: auto; padding: 0; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar-brand, .sidebar-footer, .sidebar-nav .nav-section-label { display: none; }
+  .sidebar-nav { display: flex; align-items: stretch; gap: 2px; padding: 6px 10px; overflow-x: auto; overflow-y: hidden; }
+  .sidebar-nav .nav-item { flex: 0 0 auto; min-width: max-content; min-height: 34px; margin: 0; padding: 7px 10px; gap: 8px; justify-content: flex-start; overflow: visible; white-space: nowrap; font-size: 12px; }
+  .sidebar-nav .nav-item::before { flex: none; font-size: 9px; }
+  .topbar, .content, .status-rail { display: block; }
+  .topbar { min-height: 56px; }
+  .content { padding: 18px 12px 24px; }
+  .status-rail { border-top: 1px solid var(--line); border-left: 0; }
+  .agent-discovery-grid { grid-template-columns: 1fr; }
+}
 </style>
 </head>
 <body>
@@ -946,15 +1017,15 @@ tbody tr:last-child td { border-bottom: 0; }
     </div>
     <nav class="sidebar-nav" role="tablist" aria-label="治理模块">
       <div class="nav-section-label">治理视图</div>
-      <div class="nav-item active" role="tab" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源<span class="count" id="sources-count"></span></div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="codegraph" onclick="switchTab('codegraph')">CodeGraph<span class="count" id="codegraph-count"></span></div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="rules" onclick="switchTab('rules')">规则与习惯</div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="history" onclick="switchTab('history')">对话历史</div>
-      <div class="nav-item" role="tab" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号<span class="count" id="findings-count"></span></div>
+      <button class="nav-item active" type="button" role="tab" aria-selected="true" aria-controls="content" tabindex="0" data-tab="overview" onclick="switchTab('overview')">总览</button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="sources" onclick="switchTab('sources')">数据源与 Agent<span class="count" id="sources-count"></span></button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="neurons" onclick="switchTab('neurons')">记忆核心<span class="count" id="neuron-count"></span></button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="codegraph" onclick="switchTab('codegraph')">CodeGraph<span class="count" id="codegraph-count"></span></button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="rules" onclick="switchTab('rules')">规则与习惯</button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="history" onclick="switchTab('history')">对话历史</button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号与治理控制台<span class="count" id="findings-count"></span></button>
     </nav>
-    <div class="sidebar-footer"><span class="local-badge">Local only · Memory Projection / CodeGraph</span></div>
+    <div class="sidebar-footer"><button class="sidebar-settings" type="button" aria-label="打开设置" onclick="openSettings()">设置</button></div>
   </aside>
 
   <!-- 主工作区 -->
@@ -1742,7 +1813,7 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
     || fallbackLabel
     || (readableAgentPart(program, id) && readableAgentPart(provider, id) ? `${program} · ${provider}` : '')
     || (readableAgentPart(provider, id) && readableAgentPart(project, id) ? `${provider} · ${project}` : '');
-  if (!label) label = '未命名助手';
+  if (!label || /^(?:未知助手|未知\s*Agent|unknown)$/i.test(label)) label = '未识别的 MCP 助手';
   if (/^codex$/i.test(label)) label = 'Codex';
   if (current && !label.includes('（当前）')) label += '（当前）';
   return label;
@@ -1753,6 +1824,38 @@ function agentIdentityDetail(agentOrId) {
     ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || '')
     : String(agentOrId || '');
   return id;
+}
+
+// Presentation-only identity helpers. They consume trusted discovery metadata
+// and never fetch remote favicons or expose opaque IDs as the visible label.
+function agentFamily(agentOrId) {
+  const item = agentOrId && typeof agentOrId === 'object' ? agentOrId : {};
+  const text = [item.provider, item.provider_name, item.product, item.display_name,
+    item.program_name, item.program, item.client_name, item.host_name,
+    typeof agentOrId === 'string' ? agentOrId : ''].join(' ').toLowerCase();
+  if (/grok|xai|x\.ai/.test(text)) return 'grok';
+  if (/chatgpt|openai/.test(text)) return 'chatgpt';
+  if (/copilot|github/.test(text)) return 'copilot';
+  if (/claude|anthropic/.test(text)) return 'claude';
+  if (/cursor/.test(text)) return 'cursor';
+  return 'unknown';
+}
+
+function agentIconMarkup(agentOrId) {
+  const family = agentFamily(agentOrId);
+  const marks = {grok: '𝕏', chatgpt: '◎', copilot: '●', claude: 'AI', cursor: '◆', unknown: '?' };
+  return `<span class="agent-avatar" data-agent-family="${family}" aria-hidden="true">${marks[family]}</span>`;
+}
+
+function agentSourceSummary(agentOrId) {
+  const item = agentOrId && typeof agentOrId === 'object' ? agentOrId : {};
+  return readableAgentPart(item.source_summary || item.summary || item.description || item.capability_summary, '')
+    || '尚未返回可读来源摘要；可从本机 Agent 检测或匹配入口接入。';
+}
+
+function openSettings() {
+  switchTab('governance');
+  showToast('设置入口已打开治理控制台', 'info');
 }
 
 function agentNamesForIds(ids) {
@@ -8097,7 +8200,10 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
     const action = binding
       ? `<button class="btn" type="button" onclick="event.stopPropagation();viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button><button class="btn" type="button" onclick="event.stopPropagation();installMemoryGroupMcp('${escapeHtml(binding.share_group_id)}')">安装 MCP</button>${binding.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation();leaveSharedToPersonal('${escapeHtml(agent.instance_id)}')">回个人层</button>` : ''}`
       : `<button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(agent.instance_id)}')">启用个人层</button>`;
-    return `<article class="agent-card ${active ? 'active' : ''}" onclick="selectAgentCard('${escapeHtml(agent.instance_id)}')"><div class="agent-name" title="${escapeHtml(agentIdentityDetail(agent))}">${escapeHtml(agentDisplayName(agent))}</div><div class="agent-meta">${summary.sourceCount} 来源 · ${summary.foundSurfaceCount}/${summary.surfaceCount} 表面</div><span class="chip chip-${binding ? 'confirmed' : 'info'}">${binding ? (binding.group_kind === 'shared' ? '已绑定共享组' : '已启用个人层') : '可接入'}</span><div class="finding-actions">${action}</div></article>`;
+    const displayName = agentDisplayName(agent);
+    const sourceSummary = agentSourceSummary(agent);
+    const identity = agentIdentityDetail(agent);
+    return `<article class="agent-card ${active ? 'active' : ''}" role="button" tabindex="0" data-agent-id="${escapeHtml(agent.instance_id || '')}" onclick="selectAgentCard('${escapeHtml(agent.instance_id)}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectAgentCard('${escapeHtml(agent.instance_id)}'); }">${agentIconMarkup(agent)}<div class="agent-name">${escapeHtml(displayName)}</div><div class="agent-meta">${summary.sourceCount} 来源 · ${summary.foundSurfaceCount}/${summary.surfaceCount} 表面</div><div class="agent-meta agent-source-summary">${escapeHtml(sourceSummary)}</div><span class="chip chip-${binding ? 'confirmed' : 'info'}">${binding ? (binding.group_kind === 'shared' ? '已绑定共享组' : '已启用个人层') : '可接入'}</span><details class="agent-technical-id" onclick="event.stopPropagation()"><summary>技术标识</summary><code>${escapeHtml(identity || '未返回')}</code></details><div class="finding-actions">${action}</div></article>`;
   }).join('') || '<div class="empty-inline">未发现可接入 Agent。可执行本机检测或手工添加来源。</div>';
   const sourceRows = filteredSources.map(source => {
     const id = String(source.root_id || source.source_id || source.id || '');
@@ -8119,7 +8225,7 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
     <section><div class="compact-toolbar"><div class="toolbar-grow"><h2>发现的 Agent</h2><span class="muted">主名称使用程序、Provider 或别名；技术 ID 仅在详情显示。</span></div><button class="btn" type="button" onclick="enterMultiAgentMode()">管理记忆组</button></div><div class="agent-discovery-grid">${agentCards}</div></section>
     <section><div class="compact-toolbar"><div class="toolbar-grow"><h2>已接入来源</h2><span class="muted">点击行固定右侧来源详情。</span></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th>名称</th><th>类型</th><th>范围</th><th>状态</th><th>操作</th></tr></thead><tbody>${sourceRows}</tbody></table></div></section>
     <details class="compact-secondary"><summary>文件与扫描数据 · ${agentData?.total_files ?? 0} 个文件</summary><div class="data-table-wrap"><table class="data-table"><thead><tr><th>范围</th><th>分类</th><th>文件</th><th>操作</th></tr></thead><tbody>${scopeRows}</tbody></table></div><div class="chips"><span class="chip chip-info">候选 ${coverage.candidate_count ?? 0}</span><span class="chip chip-confirmed">可读 ${coverage.read ?? 0}</span><span class="chip chip-${Number(coverage.unaccounted_count || 0) ? 'high' : 'confirmed'}">未计入 ${coverage.unaccounted_count ?? 0}</span></div></details>
-    ${residuals.length ? `<details class="compact-secondary"><summary>未接入原生数据 · ${residuals.length}</summary><div class="agent-discovery-grid">${residuals.map(item => `<article class="agent-card" onclick="showResidualCleanup('${escapeHtml(item.instance_id)}')"><div class="agent-name">${escapeHtml(agentDisplayName(item))}</div><div class="agent-meta">原生数据 ${item.private_data_surface_count || 0}</div><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(item.instance_id)}')">启用个人层</button></div></article>`).join('')}</div></details>` : ''}
+    ${residuals.length ? `<details class="compact-secondary"><summary>未接入原生数据 · ${residuals.length}</summary><div class="agent-discovery-grid">${residuals.map(item => `<article class="agent-card" role="button" tabindex="0" data-agent-id="${escapeHtml(item.instance_id || '')}" onclick="showResidualCleanup('${escapeHtml(item.instance_id)}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showResidualCleanup('${escapeHtml(item.instance_id)}'); }">${agentIconMarkup(item)}<div class="agent-name">${escapeHtml(agentDisplayName(item))}</div><div class="agent-meta">${escapeHtml(agentSourceSummary(item))}</div><div class="agent-meta">原生数据 ${item.private_data_surface_count || 0}</div><details class="agent-technical-id" onclick="event.stopPropagation()"><summary>技术标识</summary><code>${escapeHtml(agentIdentityDetail(item) || '未返回')}</code></details><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(item.instance_id)}')">启用个人层</button></div></article>`).join('')}</div></details>` : ''}
   </div></div>`);
   renderSourcesRail();
 }

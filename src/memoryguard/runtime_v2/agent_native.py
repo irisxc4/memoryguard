@@ -20,7 +20,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from ..agent_locator import AgentLocator
-from ..agent_mapping import provider_display_name
+from ..agent_mapping import normalize_program_identity, provider_display_name
 from ..content.store import ContentStore, stable_id
 from ..storage.database import open_database
 from ..storage.transaction import transaction
@@ -169,6 +169,12 @@ class AgentNativeService:
             mark = marks.get(candidate, {})
             item["display_name"] = provider_display_name(instance.product)
             item["label"] = item["display_name"]
+            identity = normalize_program_identity(str(instance.product or ""))
+            item["program_id"] = identity["program_id"]
+            item["provider"] = identity["provider"]
+            item["identity_resolution"] = identity["resolution"]
+            item["identity_source"] = identity["source"]
+            item["identity_source_hint"] = identity["source_hint"]
             item["candidate_id"] = candidate
             item["lifecycle_state"] = "ignored" if mark.get("status") == "uninstalled" else "installed"
             # Keep the support grade (A/B/C/D) separate from the takeover
@@ -208,6 +214,17 @@ class AgentNativeService:
                 continue
             item["candidate_id"] = cid
             item["marked_uninstalled"] = marked
+            identity = normalize_program_identity(
+                str(candidate.product or ""),
+                cli_path=str(candidate.dir_path or ""),
+            )
+            item["program_id"] = identity["program_id"]
+            item["provider"] = identity["provider"]
+            item["display_name"] = identity["display_name"]
+            item["label"] = identity["display_name"]
+            item["identity_resolution"] = identity["resolution"]
+            item["identity_source"] = identity["source"]
+            item["identity_source_hint"] = identity["source_hint"]
             rows.append(item)
         return {"ok": True, "status": "succeeded", "candidates": rows, "total": len(rows)}
 
