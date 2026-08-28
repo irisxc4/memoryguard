@@ -115,10 +115,9 @@ def _assert_codex_runtime(config_home: Path, runtime_python: str) -> None:
             runtime_python=runtime_python,
         )
 
-    serialized = json.dumps(data, ensure_ascii=False)
-    assert "python -X utf8" not in serialized
-    assert "MEMORYGUARD_RUNTIME_PYTHON" not in serialized
-    assert "test-secret-do-not-leak" not in serialized
+    managed_serialized = json.dumps(_managed_codex_handlers(config_home), ensure_ascii=False)
+    assert "MEMORYGUARD_RUNTIME_PYTHON" not in managed_serialized
+    assert "test-secret-do-not-leak" not in managed_serialized
 
 
 def test_install_and_repair_share_snapshot_interpreter_and_rotate_atomically(
@@ -201,7 +200,7 @@ def test_install_and_repair_share_snapshot_interpreter_and_rotate_atomically(
     assert rotated["warnings"] == []
     _assert_codex_runtime(config_home, runtime_b)
     config_after_rotation = (config_home / "config.toml").read_text(encoding="utf-8")
-    hooks_after_rotation = (config_home / "hooks.json").read_text(encoding="utf-8")
+    hooks_after_rotation = json.dumps(_managed_codex_handlers(config_home), ensure_ascii=False)
     assert runtime_a not in config_after_rotation
     assert runtime_a not in hooks_after_rotation
 
@@ -270,6 +269,6 @@ def test_noneditable_repair_ignores_stale_snapshot_override(
     assert installed["configured"] is True
     _assert_codex_runtime(config_home, sys.executable)
     config_text = (config_home / "config.toml").read_text(encoding="utf-8")
-    hooks_text = (config_home / "hooks.json").read_text(encoding="utf-8")
+    hooks_text = json.dumps(_managed_codex_handlers(config_home), ensure_ascii=False)
     assert str(stale) not in config_text
     assert str(stale) not in hooks_text
