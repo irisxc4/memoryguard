@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question or discuss an idea
+    url: https://github.com/irisxc4/memoryguard/discussions
+    about: Use Discussions for questions, usage help, and ideas that are not yet a focused feature request.

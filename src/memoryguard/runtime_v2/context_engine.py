@@ -588,6 +588,22 @@ class ContextCandidate:
         material = "".join(f"{len(part)}:{part}" for part in parts)
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    @property
+    def cross_layer_dedup_key(self) -> tuple[str, str] | None:
+        """Return canonical identity shared by mandatory and relevant projections.
+
+        ``dedup_key`` keeps layer and governance metadata so a mandatory rule
+        and a relevant copy of the same body can coexist when their
+        obligations differ. Canonical ``semantic_identity`` is the injection
+        exception: the same governed fact must not consume two context slots.
+        Body text is not a fallback; that would collapse distinct governed
+        projections that only share wording.
+        """
+        semantic = _text(self.semantic_identity).casefold()
+        if not semantic:
+            return None
+        return ("semantic", semantic)
+
     def public(self) -> dict[str, Any]:
         return {
             "item_id": self.item_id,
@@ -677,6 +693,7 @@ class ContextPacket:
     knowledge: tuple[Mapping[str, Any], ...] = ()
     reference_only: tuple[Mapping[str, Any], ...] = ()
     budget: Mapping[str, Any] = field(default_factory=dict)
+    usage: Mapping[str, Any] = field(default_factory=dict)
     effective_agent: str = ""
     receipts: tuple[Mapping[str, Any], ...] = ()
     ready: bool = False
@@ -691,6 +708,7 @@ class ContextPacket:
             "knowledge": [dict(item) for item in self.knowledge],
             "reference_only": [dict(item) for item in self.reference_only],
             "budget": dict(self.budget),
+            "usage": dict(self.usage),
             "effective_agent": self.effective_agent,
             "receipts": [dict(item) for item in self.receipts],
             "ready": self.ready,
@@ -1123,6 +1141,11 @@ class ContextEngine:
                         continue
                     candidate = ContextCandidate.from_value(value, layer=layer, index=index)
                     index += 1
+                    ledger.record_candidate(
+                        layer,
+                        len(candidate.body),
+                        self._count(candidate.body),
+                    )
                     if candidate.layer_invalid:
                         receipts.append(ContextReceipt(candidate.item_id, layer, False, "unknown_layer", {}, {}))
                         ledger.omit("unknown_layer")
@@ -1195,6 +1218,9 @@ class ContextEngine:
             selected: dict[str, list[dict[str, Any]]] = {layer: [] for layer in groups}
             seen: set[str] = set()
             seen_bodies: set[str] = set()
+            # Same canonical identity across layers is one fact; mandatory wins.
+            # Same body without semantic_identity still coexists when obligations differ.
+            cross_layer_seen: set[tuple[str, str]] = set()
             for candidate in groups["mandatory"]:
                 if candidate.dedup_key in seen or (not candidate.has_governance_semantics and candidate.digest in seen_bodies):
                     receipts.append(ContextReceipt(candidate.item_id, "mandatory", False, "duplicate", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence)))
@@ -1218,14 +1244,20 @@ class ContextEngine:
                 selected["mandatory"].append(self._render(candidate, text, layer="mandatory"))
                 seen.add(candidate.dedup_key)
                 seen_bodies.add(candidate.digest)
-                ledger.mandatory_items += 1
-                ledger.mandatory_chars += char_cost
-                ledger.mandatory_tokens += token_cost
+                key = candidate.cross_layer_dedup_key
+                if key is not None:
+                    cross_layer_seen.add(key)
+                ledger.record_rendered("mandatory", char_cost, token_cost)
                 receipts.append(ContextReceipt(candidate.item_id, "mandatory", True, "included", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence), token_cost, char_cost))
             ledger.warn(active_budget.item_count_warning(ledger.mandatory_items))
 
             for layer in ("relevant", "knowledge", "reference_only"):
                 for candidate in groups[layer]:
+                    key = candidate.cross_layer_dedup_key
+                    if layer == "relevant" and key is not None and key in cross_layer_seen:
+                        receipts.append(ContextReceipt(candidate.item_id, layer, False, "duplicate", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence)))
+                        ledger.omit("duplicate")
+                        continue
                     if candidate.dedup_key in seen or (not candidate.has_governance_semantics and candidate.digest in seen_bodies):
                         receipts.append(ContextReceipt(candidate.item_id, layer, False, "duplicate", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence)))
                         ledger.omit("duplicate")
@@ -1251,17 +1283,19 @@ class ContextEngine:
                     selected[layer].append(self._render(candidate, text, layer=layer, truncated=truncated))
                     seen.add(candidate.dedup_key)
                     seen_bodies.add(candidate.digest)
-                    ledger.optional_items += 1
-                    ledger.optional_chars += char_cost
-                    ledger.optional_tokens += token_cost
+                    if layer == "relevant" and key is not None:
+                        cross_layer_seen.add(key)
+                    ledger.record_rendered(layer, char_cost, token_cost)
                     receipts.append(ContextReceipt(candidate.item_id, layer, True, "included", self._scope_public(candidate.scope), self._evidence_public(candidate.evidence), token_cost, char_cost))
 
+            budget_payload = {**ledger.to_dict(), "limits": active_budget.to_dict()}
             return ContextPacket(
                 mandatory=tuple(selected["mandatory"]),
                 relevant=tuple(selected["relevant"]),
                 knowledge=tuple(selected["knowledge"]),
                 reference_only=tuple(selected["reference_only"]),
-                budget={**ledger.to_dict(), "limits": active_budget.to_dict()},
+                budget=budget_payload,
+                usage=budget_payload["usage"],
                 effective_agent=req.effective_agent,
                 receipts=tuple(receipt.to_dict() for receipt in receipts),
                 ready=self.ready and self.state == "V2_ACTIVE",
@@ -1269,8 +1303,10 @@ class ContextEngine:
                 status="ok" if self.ready and self.state == "V2_ACTIVE" else "shadow",
             )
         except ContextSafetyError as exc:
+            budget_payload = {**ledger.to_dict(), "limits": active_budget.to_dict()}
             return ContextPacket(
-                budget={**ledger.to_dict(), "limits": active_budget.to_dict()},
+                budget=budget_payload,
+                usage=budget_payload["usage"],
                 effective_agent=req.effective_agent,
                 receipts=tuple(receipt.to_dict() for receipt in receipts),
                 ready=False,
@@ -1279,8 +1315,10 @@ class ContextEngine:
                 error=str(exc),
             )
         except (ContextEngineError, ContextBudgetError) as exc:
+            budget_payload = {**ledger.to_dict(), "limits": active_budget.to_dict()}
             return ContextPacket(
-                budget={**ledger.to_dict(), "limits": active_budget.to_dict()},
+                budget=budget_payload,
+                usage=budget_payload["usage"],
                 effective_agent=req.effective_agent,
                 receipts=tuple(receipt.to_dict() for receipt in receipts),
                 ready=False,
@@ -1291,8 +1329,10 @@ class ContextEngine:
         except Exception:
             # Retrieval/planner implementations are untrusted ports.  Never
             # leak their exception or partial raw payload into the packet.
+            budget_payload = {**ledger.to_dict(), "limits": active_budget.to_dict()}
             return ContextPacket(
-                budget={**ledger.to_dict(), "limits": active_budget.to_dict()},
+                budget=budget_payload,
+                usage=budget_payload["usage"],
                 effective_agent=req.effective_agent,
                 receipts=tuple(receipt.to_dict() for receipt in receipts),
                 ready=False,

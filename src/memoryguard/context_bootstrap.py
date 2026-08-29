@@ -564,15 +564,34 @@ def _folded_source_ids(store: Any, group_id: str) -> set[str]:
     empties rules that are supposed to remain available.
     """
     try:
-        from .rule_merge_store import RuleMergeStore
-        from .rule_reconciliation import RuleReconciliationStore
+        native_db = (
+            Path(store.workspace).resolve()
+            / ".memoryguard" / "rules" / "rules.db"
+        )
+        if native_db.is_file():
+            from .rules.v2_store import RuleV2Store
+
+            def _native_jobs(conn: Any) -> list[dict[str, Any]]:
+                return [
+                    dict(row) for row in conn.execute(
+                        "SELECT * FROM rule_reconciliation_jobs "
+                        "WHERE share_group_id=? ORDER BY created_at DESC, job_id DESC",
+                        (group_id,),
+                    ).fetchall()
+                ]
+
+            jobs = RuleV2Store(store.workspace, read_only=True)._read(_native_jobs)
+        else:
+            from .rule_merge_store import RuleMergeStore
+            from .rule_reconciliation import RuleReconciliationStore
+
+            jobs = RuleReconciliationStore(
+                RuleMergeStore(store.workspace, read_only=True),
+            ).list_jobs(share_group_id=group_id)
     except Exception:
         return set()
     try:
-        jobs = RuleReconciliationStore(
-            RuleMergeStore(store.workspace, read_only=True),
-        )
-        latest = jobs.latest_job(group_id)
+        latest = jobs[0] if jobs else None
         if not latest:
             return set()
         raw = latest.get("result_json") or ""

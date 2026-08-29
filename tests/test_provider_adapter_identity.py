@@ -472,7 +472,7 @@ def test_codex_global_takeover_removes_superseded_project_override(
     # A project-initiated global takeover is authorized by the V2 control
     # workspace that initiated it; the adapter then writes the stable data-home
     # path into the user-level configuration.
-    _v2_bind(project, "codex-current", "canonical-group")
+    binding = _v2_bind(project, "codex-current", "canonical-group")
 
     project_config = project / ".codex" / "config.toml"
     project_config.parent.mkdir(parents=True)
@@ -513,6 +513,151 @@ def test_codex_global_takeover_removes_superseded_project_override(
     assert not project_config.exists()
     assert not (project / "AGENTS.md").exists()
     assert any("项目级 MemoryGuard 覆盖" in item for item in result["warnings"])
+
+    status = CodexAdapter(project).status()
+    assert status["configured"] is True
+    assert status["installed"] is True
+    assert status["status"] == "configured"
+    assert status["configured_agent_instance_id"] == "codex-current"
+    assert status["binding_id"] == binding["binding_id"]
+    assert status["binding_status"] == "active"
+    assert status["runtime_verified"] is False
+    assert status["mcp_configured"] is True
+    assert status["instruction_file"] == str((home / ".codex" / "AGENTS.md").resolve())
+
+
+def _write_codex_managed_home(home: Path, agent_id: str) -> None:
+    config = home / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        "# BEGIN memoryguard:provider-redirect\n"
+        "[mcp_servers.memoryguard]\n"
+        'command = "python"\n'
+        'args = ["-m", "memoryguard.mcp_server"]\n'
+        f'env = {{ MEMORYGUARD_AGENT_ID = "{agent_id}" }}\n'
+        "# END memoryguard:provider-redirect\n",
+        encoding="utf-8",
+    )
+    (home / "AGENTS.md").write_text(
+        "<!-- BEGIN memoryguard:provider-redirect -->\n"
+        "global\n"
+        "<!-- END memoryguard:provider-redirect -->\n",
+        encoding="utf-8",
+    )
+
+
+def test_codex_status_falls_back_to_current_home_after_cleaned_override(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    _patch_home(monkeypatch, home)
+    binding = _v2_bind(workspace, "codex-global", "team-status")
+
+    leftover = workspace / ".codex" / "config.toml"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_text(
+        '[mcp_servers.other]\ncommand = "keep-me"\n',
+        encoding="utf-8",
+    )
+    (workspace / "AGENTS.md").write_text("# project agents\n", encoding="utf-8")
+    _write_codex_managed_home(home / ".codex", "codex-global")
+
+    status = CodexAdapter(workspace).status()
+    assert status["configured"] is True
+    assert status["status"] == "configured"
+    assert status["configured_agent_instance_id"] == "codex-global"
+    assert status["binding_id"] == binding["binding_id"]
+    assert status["binding_status"] == "active"
+    assert status["runtime_verified"] is False
+    assert status["instruction_file"] == str((home / ".codex" / "AGENTS.md").resolve())
+
+
+def test_codex_status_prefers_valid_project_block_over_global(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    _patch_home(monkeypatch, home)
+    binding = _v2_bind(workspace, "codex-project", "team-status")
+    _write_codex_managed_home(workspace / ".codex", "codex-project")
+    (workspace / "AGENTS.md").write_text(
+        "<!-- BEGIN memoryguard:provider-redirect -->\n"
+        "project\n"
+        "<!-- END memoryguard:provider-redirect -->\n",
+        encoding="utf-8",
+    )
+    _write_codex_managed_home(home / ".codex", "codex-global")
+
+    status = CodexAdapter(workspace).status()
+    assert status["configured"] is True
+    assert status["configured_agent_instance_id"] == "codex-project"
+    assert status["binding_id"] == binding["binding_id"]
+    assert status["runtime_verified"] is False
+    assert status["instruction_file"] == str((workspace / "AGENTS.md").resolve())
+
+
+@pytest.mark.parametrize(
+    "project_toml",
+    [
+        (
+            "# BEGIN memoryguard:provider-redirect\n"
+            "[mcp_servers.memoryguard]\n"
+            "command = 'python'\n"
+        ),
+        (
+            "# BEGIN memoryguard:provider-redirect\n"
+            "[mcp_servers.memoryguard]\n"
+            "command =\n"
+            "# END memoryguard:provider-redirect\n"
+        ),
+        (
+            "[mcp_servers.memoryguard]\n"
+            "command = 'python'\n"
+            "args = ['-m', 'memoryguard.mcp_server']\n"
+            "env = { MEMORYGUARD_AGENT_ID = 'stale' }\n"
+        ),
+        (
+            "# BEGIN memoryguard:provider-redirect\n"
+            "[mcp_servers.memoryguard]\n"
+            "command = 'python'\n"
+            "args = ['-m', 'memoryguard.mcp_server']\n"
+            "# END memoryguard:provider-redirect\n"
+        ),
+    ],
+    ids=["partial-no-end", "malformed-toml", "unmarked-leftover", "markers-without-agent"],
+)
+def test_codex_status_does_not_fallback_past_broken_project_block(
+    tmp_path, monkeypatch, project_toml,
+):
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir()
+    workspace.mkdir()
+    _patch_home(monkeypatch, home)
+    _v2_bind(workspace, "codex-global", "team-status")
+    project_config = workspace / ".codex" / "config.toml"
+    project_config.parent.mkdir(parents=True)
+    project_config.write_text(project_toml, encoding="utf-8")
+    (workspace / "AGENTS.md").write_text(
+        "<!-- BEGIN memoryguard:provider-redirect -->\n"
+        "project\n"
+        "<!-- END memoryguard:provider-redirect -->\n",
+        encoding="utf-8",
+    )
+    _write_codex_managed_home(home / ".codex", "codex-global")
+
+    status = CodexAdapter(workspace).status()
+    assert status["configured"] is False
+    assert status["installed"] is False
+    assert status["status"] == "not_configured"
+    assert status["mcp_configured"] is False
+    assert status["configured_agent_instance_id"] == ""
+    assert status["runtime_verified"] is False
 
 
 def test_governance_configures_trae_and_reports_other_adapter_errors(

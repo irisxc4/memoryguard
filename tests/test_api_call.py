@@ -76,7 +76,16 @@ def test_run_audit_and_get_audit_carry_completion_evidence(tmp_path) -> None:
         assert isinstance(data["blocked"], bool)
         assert isinstance(data["blockers"], list)
         assert isinstance(data["blocker_codes"], list)
-        assert "health_score" not in data
+        assert data["health_model"] == "v2_reference_integrity"
+        assert data["health_model_version"] == 1
+        assert data["health_scope"] == "reference_integrity"
+        assert data["health_available"] is True
+        assert data["health_status"] == "available"
+        assert data["health_score"] == 100.0
+        assert set(data["health_components"]) == {
+            "schema", "storage_integrity", "references", "delivery"
+        }
+        assert data["health_evidence"]["audit_status"] == "PASS"
 
 
 def test_get_neuron_graph_supports_empty_projection(tmp_path) -> None:

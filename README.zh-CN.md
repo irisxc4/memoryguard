@@ -16,7 +16,7 @@
 > Agent 可以正常写入，MemoryGuard 负责分类、去重、冲突识别、隔离和版本治理。
 > 每次变化保留证据，之后仍可修正、恢复或回滚。
 >
-> **无账号、无远端服务器、无遥测。数据默认留在本地。**
+> **无账号、无远端服务器、无远程遥测。可选的用量遥测仅保存在本地，且只记录有界的隐私保护汇总。**
 
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
@@ -34,186 +34,25 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.7.7 更新
+## v0.7.8 更新
 
-v0.7.7 是一次聚焦 Provider 修复与运行时对齐的热修复版本：
+v0.7.8 汇总了 v0.7.7 之后的治理、可观测性和宿主运行时修复：
 
-- **安全的普通 Shell 修复：** 当 canonical 控制目录已验证且只有一个活动绑定时，`memoryguard provider repair ...` 可获取进程内受信修复能力；缺少或存在歧义的上下文仍保持 fail-closed，其他 CLI 变更路径不放宽。
-- **已安装版本统一解释器：** 非 editable wheel 修复会忽略继承的旧 snapshot，并将当前 `sys.executable` 同时写入 Codex MCP 与 7 个生命周期 Hook；editable/本地源码安装继续使用按内容键控的不可变 snapshot。
-- **绑定连续性：** 修复保留既有 Agent 身份与共享组绑定，不会创建新的绑定。
+- **Canonical 记忆与规则治理：** 相关规则、习惯和记忆通过统一 canonical 读写路径合并，
+  同时保留证据、来源链接、神经图分支、覆盖历史、冲突复核和 settlement 审计，且可逆。
+- **可读的多 Agent 治理：** 已验证的程序身份、可读名称、安全的程序族图标、共享组作用域、
+  风险解释、失效冲突收口和七页治理台布局统一呈现，日常治理不再依赖技术 ID。
+- **本地用量与节省视图：** Token 页显示本地 MCP 转换事件，以及 7 天/30 天窗口的原始基线
+  与实际注入量估算。只有宿主真实上报 token 时才记录测量（当前支持 Codex、Grok）；Claude、
+  Cursor、Trae 明确显示为不支持。不会保存对话正文、账号、路径或实例标识。
+- **Codex 生命周期与运行时对齐：** 只有终止 thread 证据证明属于 Codex 的进程 cohort 才可回收，
+  普通对话轮次仍可恢复。已安装版修复会让 MCP 与生命周期 Hook 使用当前解释器，同时保留
+  Agent/共享组身份和 fail-closed 边界。
 
-详见 [v0.7.7 发布记录](docs/releases/v0.7.7.md)。
+详见 [v0.7.8 发布记录](docs/releases/v0.7.8.md)。
 
-## v0.7.6 更新
-
-v0.7.6 是一次聚焦 Codex Hook/MCP 运行时可靠性的修复版本：
-
-- **统一运行时快照：** Codex 生命周期 Hook 与 MCP 共用同一个按内容键控的不可变
-  runtime snapshot，不再因 PATH 与包元数据解析不同而发生版本漂移。
-- **并发工具安全：** session state 写入只在短暂、可重入的跨进程锁窗口内完成，不再
-  锁住整个 Hook 执行；并发工具与子代理调度不会互相等待至超时。
-- **Bootstrap 状态一致：** bootstrap 失败会清除过期成功状态，恢复后清除旧错误并记录
-  稳定 context hash。普通 Stop 故障保持 fail-open；明确的 mandatory budget 溢出会
-  留给下一次工具调用 fail-closed。
-- **Agent 身份稳定：** 内置 Grok Profile 会从已安装的用户级表面发现；只有已验证的
-  provider、CLI 或 MCP 元数据才会映射为稳定程序身份。通用或不透明值保持未解析，不会
-  猜测归类。
-- **治理台结构清晰：** GUI 按参考图采用七页信息架构，固定导航、中央工作区和上下文侧栏
-  分工明确。Agent 卡片显示可读名称、来源摘要和安全的程序族图标回退；技术 ID 仅在收起的
-  详情中展示。
-
-详见 [v0.7.6 发布记录](docs/releases/v0.7.6.md)。
-
-## v0.7.5 更新
-
-v0.7.5 是一次聚焦冲突复核正确性的修复版本：
-
-- **可读冲突快照：** 冲突成员从 V2 atom/tombstone 历史返回有界、脱敏的正文预览，
-  复核视图保留上下文，同时不暴露原始正文。
-- **原因清晰、候选安全：** 已知冲突原因显示中文说明；已删除、已替代、已拒绝、
-  已隔离、已覆盖、缺失或其他失效成员不可选为保留版本。
-- **失效时保持 fail-closed：** 只有至少两条仍有效且可选的成员才能解决冲突；失效的
-  历史冲突组仍可供审计查看，不会变成可变更目标。
-- **计数诚实分离：** 历史冲突组总数与治理概览使用的可处理冲突数分别统计。
-
-详见 [v0.7.5 发布记录](docs/releases/v0.7.5.md)。
-
-## v0.7.4 更新
-
-v0.7.4 是一次治理正确性与运行时可靠性修复版本：
-
-- **Canonical 合并更新：** 相关规则、习惯和记忆合并为持续演进的一条
-  canonical 记录，同时保留神经图分支、来源、作用域、证据和可逆历史。
-- **强制上下文有界治理：** 超过 20 条强制规则只产生健康告警，不再截断存储或注入；
-  字符/Token 预算、敏感内容和损坏治理状态仍然 fail-closed。
-- **治理信息可读：** Agent、自动决策和风险信号显示可读名称与解释；治理分组默认收起，
-  冲突和风险摘要可直接打开详情；风险条目显示原因、影响和建议；CodeGraph 与 GUI
-  共用受治理的身份、作用域和证据链路。
-- **审计状态可靠：** `run_audit` 和 `get_audit` 返回明确的完成状态与带时区时间；GUI
-  完成扫描后不再停留在“待扫描”，阅读弹层保持在导航之上；缺少数字健康证据时保持
-  不可用，不伪造分数。治理阶段显示可读的已完成、当前、待开始或不可判定状态。
-- **Codex 运行时安全：** Hook/bootstrap 错误分类准确，`NO_SOURCE` 作为中性回退；
-  Provider 安装使用内容键不可变、非 editable 的 MCP snapshot，构建失败原子保留旧运行时，
-  自动刷新包静态资源，并提供 PEP 610 copied-install 来源诊断。
-- **安全变更与迁移：** GUI 局部变更和 evidence 冲突保持原子性并保留最近有效状态；
-  system `group_outbox` 投影与 checkpoint 在同一事务推进，旧滞后 checkpoint 可安全修复，
-  pending/failed 事件保持 fail-closed，不会被当作成功投影；迁移 replay 契约验证幂等重试和失败证据。
-
-本版本采用既有增量 CI 尾段（`447/447` 通过）、相关专项测试和 `git diff --check` 作为证据；
-本次发布准备未重新运行全量测试。
-
-详见 [v0.7.4 发布记录](docs/releases/v0.7.4.md)。
-
-## v0.7.3 更新
-
-v0.7.3 放开共享组跨 provider 的历史召回。删除仍只限 owner。
-
-详见 [v0.7.3 发布记录](docs/releases/v0.7.3.md)。
-
-## v0.7.2 更新
-
-v0.7.2 是一次聚焦正确性与兼容性的修复版本：
-
-- **写入→读回与作用域：** trusted Agent/project scope 在写入与读回路径中保持一致，
-  成功写入的记忆可以在同一作用域下读回，同时不放宽隔离边界。
-- **Codex Hook 生命周期与传输：** 生命周期清理使用已验证的 Codex thread/workspace
-  证据，普通 `Stop` 仍可恢复，并谨慎收敛已终止或已删除的 thread。传输修复会规范当前
-  Python 解释器与 UTF-8 stdio，并验证 `initialize`、`tools/list`、`memory_status` 和
-  `memory_read`。
-- **Python 3.10 兼容：** Codex 传输修复路径统一使用项目的
-  `memoryguard.toml_compat` 接口；Python 3.11+ 使用标准库 `tomllib`，Python 3.10 使用
-  `tomli`。
-
-详见 [v0.7.2 发布记录](docs/releases/v0.7.2.md)。
-
-## v0.7.1 更新
-
-v0.7.1 补齐 V2-only 切换后暴露的迁移与桌面生命周期缺口：
-
-- **一条命令完成迁移：** 升级 Python 包后直接运行 `memoryguard upgrade`。
-  裸命令使用权威用户数据目录，迁移并验证 Binding、Group、记忆、规则、历史与来源，
-  激活 V2 后只清理本次成功迁移产生的备份。零写入检查使用
-  `memoryguard upgrade --preview`。
-- **统一控制目录：** 裸 `memoryguard gui`、`doctor`、`mcp-status`、`hooks`、
-  `groups` 与存储命令都指向同一用户级数据目录，不再随终端当前目录切换数据库。
-- **恢复 Agent / Group：** V1 迁移来的绑定和共享/个人组继续可编辑；已发现但未绑定、
-  也还没有原生记忆的 Agent，可以直接启用个人记忆层。检测只读取注册的产品/Profile
-  表面，不猜扫整台电脑，也不读取候选正文。
-- **真实构建引擎：** 重构弹窗只列出本机可执行的 Agent CLI，例如 Cursor Agent、
-  Codex。选中后由后台受治理任务真正执行抽取/富化；确定性模式明确标注，不再伪造
-  `host skill` 或“在其他对话继续”的文案。
-- **可靠启动与取消：** 每个可信 scope 同时只允许一个构建。TaskRun ID 可恢复，
-  僵尸 owner 会被安全回收；取消会停止归属 CLI 子进程，所有失败/取消/超时路径都回到
-  神经图页面，不再卡在 `starting / 0%`。
-- **治理链路收口：** canonical 规则、记忆去重、压缩、知识引用和有界上下文注入统一
-  保留 identity、policy、priority、audience、scope、provenance 与 evidence。
-  Graphify 仍作为 MemoryGuard CodeGraph 后的可选 metadata Provider 集成，不是独立
-  MemoryGuard runtime，也不单独发布 PyPI 包。
-
-最终本地全量回归：**1884 passed / 0 failed**，覆盖 **205 个测试文件**。详见
-[v0.7.1 发布记录](docs/releases/v0.7.1.md)。
-
-## v0.7.0 更新（V2-only；已于 2026-08-12 发布）
-
-v0.7.0 是 V2-only。本地发布验收已通过，并于 2026-08-12 发布到 GitHub
-与 PyPI。MemoryGuard 自己拥有 CodeGraph 边界；Graphify 只是可选的提取
-Provider，不是第二套 MemoryGuard runtime，也不单独作为 MemoryGuard 包发布。
-本节说明发布边界与证据。Graphify 结果是真实全仓 export/projection，不表示
-upstream Graphify 的全仓测试套件通过。
-
-- **V1 runtime 已物理淘汰：** 生产入口导入闭包不再包含 V1 runtime/store
-  模块。`V1_ACTIVE` 只是迁移起点，不是可运行 fallback；旧格式只允许由
-  `memoryguard.migration` 读取，其他入口统一 fail-closed 返回
-  `v2_upgrade_required`。V1 数据与 migration-backups 只作为回滚/审计证据，
-  不再是 V2 runtime 写入目标。
-- **V2 六个控制面：** Memory、Evidence、History、Source、Binding、Group
-  全部走 V2-native 边界。Memory atom 与 evidence/decision receipt 和原始
-  History 分离；授权 Source 文件/文件夹与 runtime 分离；可信 Agent Binding
-  决定所属治理 Group。
-- **Canonical governance：** canonical reconciliation 生成
-  `shared_baseline`、`agent_overlay`、`project_overlay`，保留 durable source
-  link，完成 parity 校验后才激活 canonical read path，再把旧重复项可恢复地
-  shadow。V2 自动整理在同一 share group 内做 exact/semantic 去重，结果明确为
-  deduplicated、superseded、conflicted 或 quarantined。规则重复扫描生成受治理
-  merge proposal；merge 与 supersede 均保留 evidence、scope、幂等和 undo receipt。
-- **跨 Agent 同组治理：** 同一可信 `share_group_id` 的成员共享有界候选与治理
-  视图，其他 Group 无法进入；Agent identity 仍保留在 provenance。
-- **知识库文件/文件夹：** 选中文件夹可建 book，选中文件可作为 document 入库；
-  Content Plane 独占正文，Knowledge 只保留 metadata/reference。支持 re-ingest、
-  remove/restore/purge，候选必须显式 review 后才进入长期记忆。
-- **GUI Agent 与 Group：** native GUI 可发现 Agent 名称/实例、保存来源选择、
-  查看 binding、把成员加入 shared/personal group、检查 drift、离开或解散 Group；
-  变更通过事务 receipt 与 system outbox 提交。
-- **GUI 构建与后台收尾：** projection、Knowledge、import、history、maintenance、
-  release、compatibility 使用持久 V2 `TaskRun`；状态可恢复，取消协作且有界，
-  shutdown 前必须完成 owned worker/process 清理。
-- **CodeGraph / Graphify：** MemoryGuard 自己拥有可信、无正文的 CodeGraph adapter
-  与 projection；Graphify 只是提供 metadata-only export 的可选提取 Provider，不单独
-  发布成 MemoryGuard runtime。CodeGraph 保留 source role、provenance、source map、
-  revision、tombstone、outbox，并提供有界 query/path/explain/affected 与
-  production-only 过滤。
-- **安全与回滚：** unknown/corrupt state、缺失 scope、非法 provenance、reparse
-  路径、不安全 metadata、过期幂等请求均 fail-closed。公共 receipt 脱敏正文和路径；
-  governance/audit/outbox 保留决策。release rollback 通过有 scope 的 receipt 恢复
-  Content Plane blob 与 held occurrence，不信任未绑定 backup path。
-- **本地发布验收证据：** `1761 / 1761`，无 skip/xfail；V1 retirement + CodeGraph
-  `15 / 15`；Graphify 专项 `3 / 3`；canonical reconciliation `ACCEPTED`；
-  RuleMerge `46 / 46`；v3.2 `27 / 27`。真实全仓 Graphify export/projection 为
-  `486 files / 11672 nodes / 38714 edges → 11667 canonical symbols / 38714 edges`；
-  query/path/affected 通过，失败原子性全为 `0`。
-- **最终制品证据：** clean wheel `206 files`、`legacy bad=0`；隔离包、CLI、MCP
-  均报告 `0.7.0`；desktop help 通过。
-
-local release acceptance passed。v0.7.0 已于 2026-08-12 发布到 GitHub 与 PyPI。
-上述 Graphify 仅表示专项 `3 / 3` 与真实全仓 export/projection 通过，
-不表示 upstream Graphify 的全仓测试套件通过。详见
-[v0.7.0 发布记录](docs/releases/v0.7.0.md)。
-
-### v0.6.2 兼容基线
-
-Python 3.10 SQLite 修复仍是 v0.7.0 升级基线：Memory、Evidence、Content 的 schema
-preflight 检查包含 `-wal`/`-shm` 的私有副本，物理只写验证不会观察或 checkpoint live
-database。历史发布说明保留在 [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md)。
+更早版本的细节请见[更新日志](CHANGELOG.md)和
+[GitHub Releases](https://github.com/irisxc4/memoryguard/releases)。
 
 ## v0.6.0 重大 V2 重构
 
@@ -378,7 +217,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.7
+memoryguard --version                    # 0.7.8
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -495,7 +334,10 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 ## 隐私与安全边界
 
 - MemoryGuard 以本地 MCP stdio 服务运行。
-- 除非你明确授权远程模型或 Embedding 操作，受治理数据不会离开本机。
+- 除非你明确授权远程模型或 Embedding 操作，受治理数据不会离开本机。可选用量遥测只写入
+  `.memoryguard/usage_telemetry.sqlite`，不会上传；其中宿主 token 事件与确定性 MCP 转换事件
+  均为本地保存。Token 节省比例是基于 MemoryGuard 确定性单位的估算，不是 Provider 账单；
+  不上报 token 的宿主在实际测量列中会明确标为不支持。
 - 知识库数据库位于 `MEMORYGUARD_HOME` 或平台用户数据目录；被选中的源文件夹不会
   获得一套独立知识库数据库。
 - V2 权威工作区状态按 Memory、Rules、Evidence、Content、Runtime、Projection、
@@ -554,6 +396,8 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.8 发布记录](docs/releases/v0.7.8.md)
+- [v0.7.7 发布记录](docs/releases/v0.7.7.md)
 - [v0.7.6 发布记录](docs/releases/v0.7.6.md)
 - [v0.7.5 发布记录](docs/releases/v0.7.5.md)
 - [v0.7.4 发布记录](docs/releases/v0.7.4.md)
@@ -568,8 +412,12 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的 provider repair，并让已安装版 Codex MCP/Hook 修复统一使用当前解释器，同时保留 Agent 与共享组身份；v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口以支持并发工具，并让 bootstrap 成功/失败状态保持一致，明确 mandatory overflow 的 fail-closed 行为；v0.7.5 为冲突复核提供自包含、fail-closed 的脱敏成员快照、中文原因、失效候选保护，以及历史/可处理计数分离；v0.7.4 统一 canonical 治理更新、强制上下文告警、可读治理标签和不可变 Codex MCP snapshot；v0.7.3 放开共享组跨 provider 的历史召回；v0.7.2 聚焦写入→读回与作用域、Codex Hook 生命周期与传输，
-  以及 Python 3.10 兼容性修复；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
+- **当前发布线：** v0.7.8 汇总 canonical 治理、可读的多 Agent GUI 治理、本地用量遥测以及
+  Codex 生命周期/运行时对齐。v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的
+  provider repair，并让已安装版 Codex MCP/Hook 修复统一使用当前解释器，同时保留 Agent 与
+  共享组身份；v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口，
+  并让 bootstrap 成功/失败状态保持一致。更早版本的冲突复核、canonical 治理、共享历史、写入→
+  读回与 Codex 生命周期细节见对应发布记录；v0.7.1 的 V2-only 迁移与桌面生命周期内容保留为
   历史发布背景。
 - **验收边界：** Graphify 证据是专项 `3 / 3` 加上前文所述真实全仓
   export/projection；不表示 upstream Graphify 的全仓测试套件通过。

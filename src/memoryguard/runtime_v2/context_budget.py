@@ -196,9 +196,60 @@ class BudgetLedger:
     optional_items: int = 0
     optional_chars: int = 0
     optional_tokens: int = 0
+    # Candidate counters are intentionally separate from rendered counters:
+    # rejected, deduplicated, or budget-omitted candidates still contribute to
+    # the deterministic baseline without changing the injection decision.
+    candidate_items: int = 0
+    candidate_chars: int = 0
+    candidate_tokens: int = 0
+    candidate_mandatory_items: int = 0
+    candidate_mandatory_chars: int = 0
+    candidate_mandatory_tokens: int = 0
+    candidate_relevant_items: int = 0
+    candidate_relevant_chars: int = 0
+    candidate_relevant_tokens: int = 0
+    rendered_relevant_items: int = 0
+    rendered_relevant_chars: int = 0
+    rendered_relevant_tokens: int = 0
     omitted: int = 0
     reasons: dict[str, int] = field(default_factory=dict)
     warnings: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_candidate(self, layer: str, chars: int, tokens: int) -> None:
+        """Record a candidate before filtering; never affects packing."""
+
+        if type(chars) is not int or type(tokens) is not int or chars < 0 or tokens < 0:
+            raise ContextBudgetError("invalid_candidate_measurement")
+        self.candidate_items += 1
+        self.candidate_chars += chars
+        self.candidate_tokens += tokens
+        if layer == "mandatory":
+            self.candidate_mandatory_items += 1
+            self.candidate_mandatory_chars += chars
+            self.candidate_mandatory_tokens += tokens
+        elif layer == "relevant":
+            self.candidate_relevant_items += 1
+            self.candidate_relevant_chars += chars
+            self.candidate_relevant_tokens += tokens
+
+    def record_rendered(self, layer: str, chars: int, tokens: int) -> None:
+        """Record selected rendered text while preserving existing totals."""
+
+        if layer == "mandatory":
+            self.mandatory_items += 1
+            self.mandatory_chars += chars
+            self.mandatory_tokens += tokens
+        elif layer == "relevant":
+            self.rendered_relevant_items += 1
+            self.rendered_relevant_chars += chars
+            self.rendered_relevant_tokens += tokens
+            self.optional_items += 1
+            self.optional_chars += chars
+            self.optional_tokens += tokens
+        else:
+            self.optional_items += 1
+            self.optional_chars += chars
+            self.optional_tokens += tokens
 
     def omit(self, reason: str) -> None:
         self.omitted += 1
@@ -221,6 +272,75 @@ class BudgetLedger:
         return self.mandatory_tokens + self.optional_tokens
 
     def to_dict(self) -> dict[str, Any]:
+        candidate = {
+            "items": self.candidate_items,
+            "chars": self.candidate_chars,
+            "tokens": self.candidate_tokens,
+        }
+        rendered = {
+            "items": self.total_items,
+            "chars": self.total_chars,
+            "tokens": self.total_tokens,
+        }
+        mandatory_candidate = {
+            "items": self.candidate_mandatory_items,
+            "chars": self.candidate_mandatory_chars,
+            "tokens": self.candidate_mandatory_tokens,
+        }
+        relevant_candidate = {
+            "items": self.candidate_relevant_items,
+            "chars": self.candidate_relevant_chars,
+            "tokens": self.candidate_relevant_tokens,
+        }
+        mandatory_rendered = {
+            "items": self.mandatory_items,
+            "chars": self.mandatory_chars,
+            "tokens": self.mandatory_tokens,
+        }
+        relevant_rendered = {
+            "items": self.rendered_relevant_items,
+            "chars": self.rendered_relevant_chars,
+            "tokens": self.rendered_relevant_tokens,
+        }
+        # The engine can measure only the body that was considered and the
+        # body that survived packing.  A host wrapper is added later by the
+        # Hook/provider boundary, so total/baseline units are deliberately
+        # unknown here instead of pretending that the wrapper is zero.
+        candidate_body_units = self.candidate_tokens
+        delivered_body_units = self.total_tokens
+        saved_body_units = max(0, candidate_body_units - delivered_body_units)
+        usage = {
+            "measurement_basis": "mg_deterministic_unit",
+            "counter": "deterministic_codepoint_v1",
+            "candidate_baseline": candidate,
+            "rendered": rendered,
+            # The context engine's rendered packet is the delivered payload
+            # before a host adds its provider-specific wrapper.  Host Hooks
+            # replace this with the final injected count when recording usage.
+            "delivered": dict(rendered),
+            "mandatory": {
+                "candidate_baseline": mandatory_candidate,
+                "rendered": mandatory_rendered,
+                "delivered": dict(mandatory_rendered),
+            },
+            "relevant": {
+                "candidate_baseline": relevant_candidate,
+                "rendered": relevant_rendered,
+                "delivered": dict(relevant_rendered),
+            },
+            "candidate_body_units": candidate_body_units,
+            "delivered_body_units": delivered_body_units,
+            "saved_body_units": saved_body_units,
+            "baseline_total_units": None,
+            "delivered_total_units": None,
+            "wrapper_overhead_units": None,
+            # Deprecated aliases remain explicit nulls.  They used to expose
+            # body counts under total-looking names and caused false savings
+            # when a provider wrapper was present.
+            "baseline_units": None,
+            "delivered_units": None,
+            "saved_units": None,
+        }
         return {
             "mandatory": {
                 "items": self.mandatory_items,
@@ -241,6 +361,7 @@ class BudgetLedger:
             "omitted": self.omitted,
             "reasons": dict(sorted(self.reasons.items())),
             "warnings": [dict(item) for item in self.warnings],
+            "usage": usage,
         }
 
 

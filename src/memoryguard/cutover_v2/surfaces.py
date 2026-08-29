@@ -185,6 +185,7 @@ _same(("get_governance_snapshot",), "governance", "read", "diagnostics_snapshot"
 for _name in ("get_recent_events", "get_auto_actions", "get_conflicts", "get_quarantine", "get_supersede_decisions"):
     _add(_name, _name.removeprefix("get_"), "governance", "read", "gui_governance_query", parameters=("share_group_id",))
 _add("resolve_conflict", "conflict_resolve", "governance", "mutation", "gui_governance_command", parameters=("conflict_group_id", "keep_id", "share_group_id"))
+_add("close_stale_conflict", "conflict_close_stale", "governance", "mutation", "gui_governance_command", parameters=("conflict_group_id", "group_id", "share_group_id"))
 _add("release_quarantine", "quarantine_release", "governance", "mutation", "gui_governance_command", parameters=("quarantine_id", "share_group_id"))
 _add("delete_quarantine", "quarantine_delete", "governance", "mutation", "gui_governance_command", parameters=("quarantine_id", "share_group_id"))
 _add("neuron_decide", "neuron_decide", "governance", "mutation", "gui_governance_command", parameters=("node_id", "action", "reason", "confirmed", "scope", "agent_instance_id", "share_group_id"))
@@ -322,6 +323,9 @@ _add("apply_enrichments", "enrichment_apply", "enrichment", "mutation", "apply_e
 # Maintenance.
 _add("plan_memoryguard_gc", "maintenance_plan", "maintenance", "read", "gui_maintenance_control", parameters=("older_than_days", "keep_releases", "keep_snapshots"))
 _add("apply_memoryguard_gc", "maintenance_apply", "maintenance", "mutation", "gui_maintenance_control", execution="task", parameters=("confirmed", "older_than_days", "keep_releases", "keep_snapshots"), cancel_operation="task_cancel")
+
+# Usage telemetry.
+_add("get_usage_telemetry", "usage_telemetry", "usage", "read", "gui_usage_query", parameters=("window_days", "agent_key"))
 
 # Hook / host modes.
 _add("get_host_hook_status", "host_hook_status", "host", "read", "hook_status", parameters=("target_provider", "target_agent_id"))

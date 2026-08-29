@@ -262,8 +262,12 @@ def test_conflict_snapshot_keeps_tombstone_history_and_blocks_stale_resolution(t
     assert conflict["status"] == "stale"
     assert conflict["can_resolve"] is False
     assert conflict["live_member_count"] == 1
+    assert conflicts["data"]["total"] == 1
+    assert conflicts["data"]["unresolved_total"] == 1
     assert conflicts["data"]["history_total"] == 1
     assert conflicts["data"]["actionable_total"] == 0
+    assert conflicts["data"]["selectable_total"] == 0
+    assert conflicts["data"]["closable_stale_total"] == 1
     details = {item["memory_id"]: item for item in conflict["members"]}
     assert details["conflict-drop"]["status"] == "deleted"
     assert details["conflict-drop"]["selectable"] is False
@@ -315,3 +319,65 @@ def test_conflict_snapshot_redacts_sensitive_body_and_localizes_reason(tmp_path:
     assert conflict["reason"] == "相关记忆的内容主张互相矛盾，需选择保留版本"
     assert conflict["reason_code"] == "canonical_composition_conflict"
     assert all("supersecret123456" not in item["preview"] for item in conflict["members"])
+
+
+def test_stale_conflict_can_be_closed_with_an_auditable_mutation(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    boundary.tombstone(
+        "conflict-drop",
+        context=mutation,
+        reason="removed while reviewing conflict",
+    )
+
+    service = GovernanceNativeService(tmp_path)
+    trusted = _native_context(tmp_path)
+
+    before = service.conflicts(trusted)
+    assert before["actionable_total"] == 0
+    assert before["conflicts"][0]["status"] == "stale"
+
+    # Exercise public GUI dispatch, including the legacy ``group_id`` alias.
+    # The stale-close action must be reachable through the same registry and
+    # trusted route used by the panel, not only through an internal service
+    # call.
+    closed = _port(tmp_path).dispatch_gui(
+        "close_stale_conflict",
+        [None, "conflict-group-1", "group-a"],
+        context=trusted,
+        generation=11,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+
+    assert closed["ok"] is True, closed
+    assert closed["data"]["status"] == "closed"
+    assert closed["data"]["closure_kind"] == "stale_unrecoverable"
+    assert closed["data"]["closed_memory_ids"] == ["conflict-keep"]
+    assert closed["data"]["decision_ids"]
+    assert service.conflicts(trusted)["total"] == 0
+
+    kept = boundary.memory.get_atom(
+        "conflict-keep", scope=mutation.to_dict(), include_building=True,
+    )
+    assert kept is not None
+    assert kept.metadata["conflict_status"] == "resolved"
+    assert kept.metadata["conflict_resolution"] == "stale_closed"
+
+
+def test_all_deleted_conflict_can_be_closed_without_resurrection(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    mutation = _mutation_context(tmp_path)
+    for memory_id in ("conflict-keep", "conflict-drop"):
+        boundary.tombstone(memory_id, context=mutation, reason="removed before review")
+
+    service = GovernanceNativeService(tmp_path)
+    closed = service.close_stale_conflict("conflict-group-1", _native_context(tmp_path))
+
+    assert closed["status"] == "closed"
+    assert service.conflicts(_native_context(tmp_path))["total"] == 0
+    for memory_id in ("conflict-keep", "conflict-drop"):
+        atom = boundary.memory.get_atom(
+            memory_id, scope=mutation.to_dict(), include_building=True,
+        )
+        assert atom is not None and atom.status == "deleted"

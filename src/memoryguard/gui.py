@@ -28,6 +28,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+_CLIENT_DISCONNECT_ERRORS = (
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionResetError,
+)
+
+
 class BuildCancelled(Exception):
     """用户取消构建投影。"""
 
@@ -550,17 +557,24 @@ def open_localhost_window(
             try:
                 result = _dispatch_gui_api_call(bridge, method, args)
                 self._json_response(200, result if result is not None else {})
+            except _CLIENT_DISCONNECT_ERRORS:
+                return
             except Exception:
                 self._json_response(500, {"ok": False, "error": "gui_dispatch_failed"})
 
         def _json_response(self, status: int, data: dict) -> None:
             payload = _json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            # 无通配 CORS：同源 only
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                # 无通配 CORS：同源 only
+                self.end_headers()
+                self.wfile.write(payload)
+            except _CLIENT_DISCONNECT_ERRORS:
+                # The browser may abort while the response is being written.
+                # There is no second response to send and no server error to log.
+                return
 
         def do_OPTIONS(self):  # noqa: N802
             # 同源 only，不需要 CORS 预检

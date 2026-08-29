@@ -344,6 +344,38 @@ def test_repair_uses_unique_verified_v2_hook_home_over_v1_default_and_binds(
     ] == [("old-router-agent", "shared-router")]
 
 
+def test_repair_ignores_empty_implicit_v2_default_home_when_router_home_is_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty auto-created global V2 root must not steal the bound plane."""
+    home = tmp_path / "home"
+    empty_default = tmp_path / "localappdata" / "MemoryGuard"
+    control = tmp_path / "router-control"
+    router_data = tmp_path / "codexrouter-data"
+    for path in (home, empty_default, control):
+        path.mkdir(parents=True)
+    _patch_home(monkeypatch, home)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router_data))
+    _activate_v2_workspace(empty_default)
+    _activate_v2_workspace(control)
+    _v2_bind(control, "router-stable", "router-group")
+    profile = _make_profile(router_data / "profiles", "acct-aaaa", "router-stable")
+    (profile / "hooks.json").write_text(
+        _managed_codex_hook(control, "router-stable", "router-group"),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(profile))
+
+    result = repair_global_provider_configs(["codex"])
+
+    assert result["ok"] is True, result
+    assert result["data_home"] == str(control.resolve())
+    assert _env_of(profile)["MEMORYGUARD_HOME"] == str(control.resolve())
+    assert _env_of(profile)["MEMORYGUARD_AGENT_ID"] == "router-stable"
+
+
 def test_repair_rejects_ambiguous_verified_v2_control_homes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

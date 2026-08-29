@@ -141,29 +141,37 @@ def resolve_runtime_data_home(
     falls back to the configured user data home; an explicit V2/isolated root
     remains available for tests and operator-managed V2 installations.  Bare
     program-level CLI controls may additionally opt into a narrowly verified
-    provider lookup when their default global home is still V1.
+    provider lookup when their default global home is empty or unbound.
     """
     resolved = resolve_data_home(explicit)
     explicit_or_env = bool(
         (explicit is not None and str(explicit).strip())
         or os.environ.get(_ENV_DATA_HOME, "").strip()
     )
-    if (
-        not discover_stable_control_home
-        or explicit_or_env
-        or is_v2_data_home(resolved)
-    ):
+    if not discover_stable_control_home or explicit_or_env:
         return resolved
 
     # Provider configuration is evidence only for bare program controls.  It
     # never affects MCP/runtime data-plane selection and never examines cwd.
-    from .provider_adapters import discover_verified_codex_control_homes
+    from .provider_adapters import (
+        _has_active_control_binding,
+        discover_verified_codex_control_homes,
+    )
 
-    candidates = discover_verified_codex_control_homes()
+    candidates = set(discover_verified_codex_control_homes())
+    # A V2 default is authoritative only when it still has an active binding.
+    # Include that live home in the same candidate set so a second verified
+    # provider home fails closed instead of silently splitting the control
+    # plane.  An empty V2 default remains recoverable to the unique provider
+    # home discovered above.
+    if is_v2_data_home(resolved) and _has_active_control_binding(resolved):
+        candidates.add(resolved)
     if len(candidates) == 1:
-        return candidates[0]
+        return next(iter(candidates))
     if len(candidates) > 1:
-        raise ControlHomeResolutionError(candidates)
+        raise ControlHomeResolutionError(
+            tuple(sorted(candidates, key=lambda path: str(path).casefold()))
+        )
     return resolved
 
 

@@ -100,7 +100,7 @@ def test_governance_semantics_split_same_body_but_same_semantics_still_dedup():
             {
                 "id": "remember",
                 "kind": "fact",
-                "body": body,
+                "body": "release verification durable procedure (relevant copy)",
                 "injection_policy": "relevant",
                 "rule_strength": "observation",
                 "semantic_identity": "release-verification",
@@ -117,7 +117,7 @@ def test_governance_semantics_split_same_body_but_same_semantics_still_dedup():
     })
 
     assert [item["item_id"] for item in packet.mandatory] == ["must"]
-    assert [item["item_id"] for item in packet.relevant] == ["remember"]
+    assert packet.relevant == ()
     assert any(
         receipt["reason"] == "duplicate_rejected"
         for receipt in packet.receipts
@@ -154,8 +154,52 @@ def test_planner_cannot_elevate_relevant_semantic_copy():
     })
 
     assert [item["item_id"] for item in packet.mandatory] == ["trusted-must"]
-    assert [item["item_id"] for item in packet.relevant] == ["relevant-copy"]
+    assert packet.relevant == ()
     assert "forged" not in str(packet.to_dict())
+
+
+def test_cross_layer_dedup_collapses_same_canonical_across_scopes():
+    packet = ContextEngine(state="V2_BUILDING").bootstrap(_request(), {
+        "mandatory": [{
+            "id": "agent-rule",
+            "kind": "rule",
+            "is_rule": True,
+            "body": "same governed fact",
+            "semantic_identity": "governed-fact",
+            "scope": {"target_type": "agent", "target_id": "agent-a"},
+        }],
+        "relevant": [{
+            "id": "project-fact",
+            "kind": "fact",
+            "body": "different scoped copy",
+            "semantic_identity": "governed-fact",
+            "scope": {"target_type": "project", "target_id": "project-a"},
+        }],
+    })
+
+    assert [item["item_id"] for item in packet.mandatory] == ["agent-rule"]
+    assert packet.relevant == ()
+
+
+def test_cross_layer_same_body_still_coexists():
+    packet = ContextEngine(state="V2_BUILDING").bootstrap(_request(), {
+        "mandatory": [{
+            "id": "must",
+            "kind": "procedure",
+            "is_rule": True,
+            "body": "shared release process",
+            "injection_policy": "always",
+        }],
+        "relevant": [{
+            "id": "obs",
+            "kind": "fact",
+            "body": "shared release process",
+            "injection_policy": "relevant",
+        }],
+    })
+
+    assert [item["item_id"] for item in packet.mandatory] == ["must"]
+    assert [item["item_id"] for item in packet.relevant] == ["obs"]
 
 
 def test_independent_mandatory_budget_and_optional_dual_limits():

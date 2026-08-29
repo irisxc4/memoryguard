@@ -849,6 +849,59 @@ def _memoryguard_env_blocks(text: str) -> list[dict[str, str]]:
     return blocks
 
 
+def _codex_toml_has_memoryguard_table(text: str) -> bool:
+    """True when a Codex config still names a memoryguard MCP table."""
+    target = f"mcp_servers.{MCP_SERVER_NAME}"
+    for line in text.splitlines():
+        table = _toml_table_name(line)
+        if table == target or table.startswith(target + "."):
+            return True
+        assignment = _toml_assignment(line)
+        if assignment is None:
+            continue
+        key, value = assignment
+        folded = str(key).casefold()
+        if folded == MCP_SERVER_NAME and isinstance(value, dict):
+            return True
+        if folded == "mcp_servers" and isinstance(value, dict) and MCP_SERVER_NAME in value:
+            return True
+    return False
+
+
+def _codex_managed_mcp_state(text: str) -> tuple[str, str]:
+    """Classify one Codex config.toml MemoryGuard block.
+
+    Returns ``(kind, agent_id)`` where kind is:
+    - ``valid``: complete managed markers and a parseable agent id
+    - ``absent``: no managed block and no leftover MemoryGuard table
+    - ``invalid``: malformed, partial, or conflicting MemoryGuard remnant
+    """
+    begin_idx = text.find(_TOML_BEGIN)
+    end_idx = text.find(_TOML_END)
+    has_begin = begin_idx != -1
+    has_end = end_idx != -1
+    if has_begin or has_end:
+        if not (has_begin and has_end and end_idx > begin_idx):
+            return "invalid", ""
+        try:
+            data = tomllib.loads(text) if text.strip() else {}
+        except tomllib.TOMLDecodeError:
+            return "invalid", ""
+        server = ((data.get("mcp_servers") or {}).get(MCP_SERVER_NAME) or {})
+        env = server.get("env") or {} if isinstance(server, dict) else {}
+        agent_id = (
+            str(env.get("MEMORYGUARD_AGENT_ID") or "").strip()
+            if isinstance(env, dict)
+            else ""
+        )
+        if not agent_id:
+            return "invalid", ""
+        return "valid", agent_id
+    if _codex_toml_has_memoryguard_table(text):
+        return "invalid", ""
+    return "absent", ""
+
+
 def _owned_memoryguard_env_table(lines: list[str]) -> bool:
     """Recognize an orphan env table only when all assignments are ours."""
     assignments = [item for item in (_toml_assignment(line) for line in lines[1:]) if item]
@@ -1702,20 +1755,34 @@ class CodexAdapter(ProviderAdapter):
         instruction_installed = _BEGIN_MARKER in content and _END_MARKER in content
 
         toml_content = _read_text(mcp_path)
-        mcp_configured = _TOML_BEGIN in toml_content and _TOML_END in toml_content
+        block_state, agent_id = _codex_managed_mcp_state(toml_content)
+        mcp_configured = block_state == "valid"
+        if not mcp_configured:
+            agent_id = ""
 
-        agent_id = ""
-        try:
-            data = tomllib.loads(toml_content) if toml_content.strip() else {}
-            agent_id = str(
-                data.get("mcp_servers", {})
-                .get(MCP_SERVER_NAME, {})
-                .get("env", {})
-                .get("MEMORYGUARD_AGENT_ID", "")
-                or ""
-            )
-        except tomllib.TOMLDecodeError:
-            mcp_configured = False
+        if self._has_workspace and block_state == "absent":
+            from .agent_locator import current_codex_home
+
+            global_home = current_codex_home()
+            global_mcp = global_home / "config.toml"
+            if global_mcp != mcp_path:
+                global_state, global_agent_id = _codex_managed_mcp_state(
+                    _read_text(global_mcp),
+                )
+                if global_state == "valid":
+                    mcp_configured = True
+                    agent_id = global_agent_id
+                    global_instr = global_home / "AGENTS.md"
+                    global_text = _read_text(global_instr)
+                    global_instruction = (
+                        _BEGIN_MARKER in global_text and _END_MARKER in global_text
+                    )
+                    if not instruction_installed and global_instruction:
+                        instr_path = global_instr
+                    instruction_installed = (
+                        instruction_installed or global_instruction
+                    )
+
         binding_id, binding_status = self._find_binding(agent_id)
         configured = instruction_installed and mcp_configured and bool(agent_id)
         return {
@@ -2273,6 +2340,30 @@ def _verified_v2_control_state(path: Path) -> str:
     return marker if marker in {"V2_READY", "V2_ACTIVE"} else ""
 
 
+def _has_active_control_binding(path: Path) -> bool:
+    """Return whether a verified control home still owns a live binding.
+
+    A V2 manifest alone is not provider-installation evidence: a newly
+    created default directory can be V2-active while containing no agent or
+    group.  Treating that empty root as authoritative is what lets Router
+    account profiles split MCP and Hook state across two control planes.
+    """
+    try:
+        from .runtime_v2.group_native import GroupControlService
+
+        bindings = GroupControlService(path, write=False).list_bindings(
+            include_inactive=False,
+        ).get("bindings") or []
+    except Exception:
+        return False
+    return any(
+        isinstance(item, Mapping)
+        and str(item.get("agent_instance_id") or "").strip()
+        and str(item.get("share_group_id") or "").strip()
+        for item in bindings
+    )
+
+
 def _absolute_control_home(raw: object) -> Path | None:
     """Normalize one explicit provider control-home value, never a relative hint."""
     text = str(raw or "").strip()
@@ -2373,29 +2464,33 @@ def _select_verified_codex_control_home() -> Path:
     """
     from .data_home import resolve_data_home
 
-    default_home = resolve_data_home()
-    # Explicit process/default control selection wins over recovered provider
-    # hints.  Repair must not turn a valid operator-selected V2 home into an
-    # ambiguity just because stale installed profiles still name another one.
-    if _verified_v2_control_state(default_home):
-        return default_home
-
     candidates: dict[Path, set[str]] = {}
 
-    def offer(raw: Path, source: str) -> None:
+    def offer(raw: Path, source: str, *, allow_pending: bool = False) -> None:
         try:
             candidate = raw.expanduser().resolve()
         except (OSError, RuntimeError, ValueError):
             return
         state = _verified_v2_control_state(candidate)
-        if state:
+        if state and (allow_pending or _has_active_control_binding(candidate)):
             candidates.setdefault(candidate, set()).add(f"{source}:{state}")
+
+    default_home = resolve_data_home()
+    # A V2 marker without an active binding is only an empty bootstrap root;
+    # it must not outrank a Router profile that still points at the live
+    # canonical plane.  If the default is itself active, include it in the
+    # candidate set so multiple valid control homes still fail closed.
+    offer(default_home, "default")
 
     for home in _iter_codex_homes():
         for candidate in _read_codex_profile_control_hints(home):
             offer(candidate, f"mcp:{home}")
         for _agent_id, _group_id, candidate in _read_codex_profile_hook_evidence(home):
-            offer(candidate, f"hook:{home}")
+            # A generated hook carries the exact agent/group pair needed
+            # by the narrow bootstrap path below.  Permit that pending
+            # candidate even before its active binding is recreated; a
+            # plain MCP/home hint still requires an existing binding.
+            offer(candidate, f"hook:{home}", allow_pending=True)
 
     if len(candidates) == 1:
         return next(iter(candidates))

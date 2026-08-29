@@ -507,7 +507,16 @@ def _phase9_gui_payload(surface: str, name: str, payload: Mapping[str, Any]) -> 
         # discarded below before the trusted scope is derived.
         if operation.canonical_name == "scope_set" and operation.parameters == ("requested_scope",):
             return {"requested_scope": dict(payload)}
-        return strip_business_selectors(payload)
+        result = strip_business_selectors(payload)
+        # ``group_id`` is a historical share-group identity alias globally,
+        # but the stale-conflict command also accepts it as the conflict
+        # group's business key.  Normalize that one operation before the
+        # identity gate so a conflict id cannot be mistaken for a scope claim.
+        if name == "close_stale_conflict" and result.get("group_id"):
+            if not _text(result.get("conflict_group_id")):
+                result["conflict_group_id"] = result["group_id"]
+            result.pop("group_id", None)
+        return result
     args = list(values)
     result = {
         key: args[index]
@@ -535,6 +544,12 @@ def _phase9_gui_payload(surface: str, name: str, payload: Mapping[str, Any]) -> 
         for key in ("session_id", "turn_id"):
             if result.get(key) == "":
                 result[key] = None
+    if name == "close_stale_conflict" and result.get("group_id"):
+        # See the mapping branch above: this is a business conflict id, not
+        # the caller's share-group identity alias.
+        if not _text(result.get("conflict_group_id")):
+            result["conflict_group_id"] = result["group_id"]
+        result.pop("group_id", None)
     return strip_business_selectors(result)
 
 
@@ -3025,7 +3040,63 @@ class NativeV2RuntimePort:
         try:
             if self.layout.memory_db.is_file():
                 memory = self._domain_store("memory")
-                atoms = memory.list_atoms(scope=scope, status="active", include_building=False)
+                atoms = memory.list_atoms(
+                    scope=scope,
+                    status="active",
+                    include_building=False,
+                )
+                mandatory_atoms = [
+                    atom for atom in atoms
+                    if _text(getattr(atom, "injection_policy", "relevant")).casefold() == "always"
+                ]
+                relevant_atoms: list[Any] = []
+                memory_query = " ".join(
+                    value for value in (
+                        _text(getattr(req, "task", "")),
+                        _text(getattr(req, "project_hint", "")),
+                    )
+                    if value
+                )
+                max_items = getattr(req, "max_items", None)
+                if max_items != 0 and memory_query:
+                    try:
+                        relevant_atoms = memory.search(
+                            memory_query,
+                            scope=scope,
+                            status="active",
+                            limit=max_items,
+                        )
+                        if not isinstance(relevant_atoms, (list, tuple)):
+                            relevant_atoms = []
+                            result["omissions"].append({
+                                "layer": "relevant",
+                                "reason": "retrieval_omitted",
+                            })
+                    except Exception:
+                        relevant_atoms = []
+                        result["omissions"].append({
+                            "layer": "relevant",
+                            "reason": "retrieval_omitted",
+                        })
+                else:
+                    result["omissions"].append({
+                        "layer": "relevant",
+                        "reason": "retrieval_omitted",
+                    })
+                atoms = list(mandatory_atoms)
+                seen_atom_ids = {
+                    _text(getattr(atom, "atom_id", ""))
+                    for atom in atoms
+                    if _text(getattr(atom, "atom_id", ""))
+                }
+                for atom in relevant_atoms:
+                    policy = _text(getattr(atom, "injection_policy", "relevant")).casefold()
+                    atom_id = _text(getattr(atom, "atom_id", ""))
+                    if policy == "always" or (atom_id and atom_id in seen_atom_ids):
+                        continue
+                    atoms.append(atom)
+                    if atom_id:
+                        seen_atom_ids.add(atom_id)
                 for atom in atoms:
                     policy = _text(getattr(atom, "injection_policy", "relevant")).casefold()
                     layer = "mandatory" if policy == "always" else "relevant"
@@ -3731,6 +3802,127 @@ class NativeV2RuntimePort:
             raise NativePortError(_text((result.get("error") or {}).get("code")) or "task_cancel_failed")
         return result
 
+    def _gui_usage_query(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        operation: str = "",
+        **_: Any,
+    ) -> Any:
+        self._gui_authority(context)
+        if operation not in {"usage_telemetry", "usage_telemetry_sync"}:
+            raise NativePortError("unknown_usage_query")
+        window_days = payload.get("window_days", 7)
+        if type(window_days) is not int or window_days not in {7, 30}:
+            raise NativePortError("invalid_usage_window")
+        agent_key = _text(payload.get("agent_key"))
+        share_group_id = _text(context.get("share_group_id"))
+        # Token page defaults to the trusted share group.  The current GUI
+        # workspace/project_ref is not an implicit conversion filter.
+        project_ref = ""
+
+        # The usage backend must receive the trusted, current binding roster.
+        # Do not use the global discovery list here: it includes installed but
+        # unbound products and historical endpoints, which would create
+        # phantom filter options and leak scope metadata into this view.
+        roster: list[dict[str, Any]] = []
+        try:
+            from ..agent_mapping import normalize_program_identity
+
+            binding_result = self._group_service(write=False).list_bindings(
+                include_inactive=False,
+            )
+            bindings = binding_result.get("bindings", []) if isinstance(binding_result, Mapping) else []
+            by_key: dict[tuple[str, str], dict[str, Any]] = {}
+            for binding in bindings:
+                if not isinstance(binding, Mapping):
+                    continue
+                if _text(binding.get("share_group_id") or binding.get("group_id")) != share_group_id:
+                    continue
+                raw_provider = _text(
+                    binding.get("provider")
+                    or binding.get("provider_identity_provider")
+                    or binding.get("canonical_program_id")
+                    or binding.get("program_id")
+                    or binding.get("mcp_server_name")
+                )
+                raw_program = _text(
+                    binding.get("canonical_program_id")
+                    or binding.get("program_id")
+                    or binding.get("program")
+                    or raw_provider
+                )
+                identity = normalize_program_identity(
+                    raw_provider or raw_program,
+                    mcp_name=_text(binding.get("mcp_server_name")),
+                    mcp_display_name=_text(binding.get("display_name") or binding.get("canonical_display_name")),
+                )
+                provider = _text(identity.get("provider")) or raw_provider or "unknown"
+                program = _text(identity.get("program_id")) or raw_program or "unknown"
+                key = (provider, program)
+                item = by_key.setdefault(
+                    key,
+                    {
+                        "provider": provider,
+                        "program": program,
+                        "display_name": (
+                            _text(binding.get("display_name"))
+                            or _text(binding.get("canonical_display_name"))
+                            or _text(identity.get("display_name"))
+                            or program
+                        ),
+                        "agent_key": f"{provider}:{program}",
+                        "agent_instance_ids": [],
+                        "binding_ids": [],
+                    },
+                )
+                instance_id = _text(binding.get("agent_instance_id") or binding.get("endpoint_id"))
+                binding_id = _text(binding.get("binding_id"))
+                if instance_id and instance_id not in item["agent_instance_ids"]:
+                    item["agent_instance_ids"].append(instance_id)
+                if binding_id and binding_id not in item["binding_ids"]:
+                    item["binding_ids"].append(binding_id)
+            roster = sorted(by_key.values(), key=lambda item: (item["provider"], item["program"]))
+        except Exception:
+            # A roster enrichment failure must not make measured data vanish.
+            # The backend still receives trusted scope and can expose observed
+            # rows; it must not be replaced with a hardcoded agent catalog.
+            roster = []
+        try:
+            from ..usage_telemetry import get_usage_summary
+
+            summary = dict(
+                get_usage_summary(
+                    self.workspace,
+                    window_days=window_days,
+                    share_group_id=share_group_id,
+                    project_ref=project_ref,
+                    agent_key=agent_key or None,
+                    agent_roster=roster,
+                )
+            )
+        except ValueError as exc:
+            raise NativePortError("invalid_usage_window") from exc
+        except Exception as exc:
+            raise NativePortError("usage_telemetry_unavailable") from exc
+
+        def with_agent_key(item: Any) -> dict[str, Any]:
+            row = dict(item) if isinstance(item, Mapping) else {}
+            key = _text(row.get("agent_key") or row.get("agent_stable_key"))
+            row["agent_key"] = key
+            return row
+
+        agents = [with_agent_key(item) for item in summary.get("agents", [])]
+        rows = [with_agent_key(item) for item in summary.get("rows", [])]
+        summary["agents"] = agents
+        summary["rows"] = rows
+        summary["share_group_id"] = share_group_id
+        summary["project_ref"] = project_ref
+        summary["agent_filter"] = agent_key
+        summary["summary_scope"] = "agent" if agent_key else "share_group"
+        return {"ok": True, "data": summary}
+
     def _gui_knowledge_query(
         self,
         payload: Mapping[str, Any],
@@ -4333,6 +4525,7 @@ class NativeV2RuntimePort:
         # been verified.  This keeps all resource names fail-closed.
         if operation in {
             "conflict_resolve",
+            "conflict_close_stale",
             "quarantine_release",
             "quarantine_delete",
             "neuron_decide",
@@ -4344,6 +4537,11 @@ class NativeV2RuntimePort:
                 return service.resolve_conflict(
                     _text(payload.get("conflict_group_id") or payload.get("group_id")),
                     _text(payload.get("keep_id") or payload.get("keep_memory_id")),
+                    context,
+                )
+            if operation == "conflict_close_stale":
+                return service.close_stale_conflict(
+                    _text(payload.get("conflict_group_id") or payload.get("group_id")),
                     context,
                 )
             if operation == "quarantine_release":
@@ -4834,7 +5032,14 @@ class NativeV2RuntimePort:
     def _audit_finding_id(code: str, domain: str, table: str) -> str:
         return "v2-" + hashlib.sha256(f"{code}\0{domain}\0{table}".encode("utf-8")).hexdigest()[:16]
 
-    def _reference_audit(self, payload: Mapping[str, Any], context: Mapping[str, Any], **_: Any) -> Any:
+    def _reference_audit(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        public_name: str = "",
+        **_: Any,
+    ) -> Any:
         """Run the native V2 reference audit in strict read-only mode."""
 
         del payload, context
@@ -4861,6 +5066,32 @@ class NativeV2RuntimePort:
             public["audit_state"] = "completed"
             public["generated_at"] = completed_at
             public["completed_at"] = completed_at
+            if public_name == "run_audit":
+                try:
+                    from ..usage_telemetry import sync_usage_telemetry
+
+                    usage_sync = sync_usage_telemetry(self.workspace)
+                except Exception as exc:
+                    usage_sync = {
+                        "status": "error",
+                        "error": type(exc).__name__,
+                        "ok": False,
+                    }
+                if not isinstance(usage_sync, Mapping):
+                    usage_sync = {"status": "error", "error": "sync_failed", "ok": False}
+                status = _text(usage_sync.get("status")).casefold() or "error"
+                state = usage_sync.get("sync_state")
+                state_map = state if isinstance(state, Mapping) else {}
+                state_status = _text(state_map.get("status")).casefold()
+                if usage_sync.get("error") or status in {"error", "failed"}:
+                    status = "error"
+                elif status == "success" and state_status and state_status != "success":
+                    status = state_status
+                public["usage_sync"] = {
+                    "status": status,
+                    "error": usage_sync.get("error") or state_map.get("last_error"),
+                    "providers": state_map.get("providers") or {},
+                }
             return {"ok": True, "status": "ok", "data": public}
         except NativePortError:
             raise
@@ -8199,6 +8430,7 @@ class NativeV2RuntimePort:
             "gui_import_control": self._gui_import_control,
             "gui_history_control": self._gui_history_control,
             "gui_audit_plan": self._gui_audit_plan,
+            "gui_usage_query": self._gui_usage_query,
             "reference_audit": self._reference_audit,
             "explain": self._explain,
             "projection_graph": self._projection_graph,

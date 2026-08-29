@@ -430,15 +430,19 @@ class GovernanceNativeService:
                 "created_at": min(created_candidates) if created_candidates else "",
             })
         actionable_total = sum(1 for item in result if item["can_resolve"])
+        stale_total = sum(1 for item in result if item["status"] == "stale")
         return {
             "ok": True,
             "status": "succeeded",
             "conflicts": result,
-            # ``total`` remains the historical queue size for compatibility;
-            # callers showing an actionable metric must use actionable_total.
+            # ``total`` is the unclosed queue size. Keep legacy aliases while
+            # exposing each user-facing disposition explicitly.
             "total": len(result),
+            "unresolved_total": len(result),
             "history_total": len(result),
             "actionable_total": actionable_total,
+            "selectable_total": actionable_total,
+            "closable_stale_total": stale_total,
         }
 
     def quarantine(self, trusted: Mapping[str, Any]) -> dict[str, Any]:
@@ -610,6 +614,80 @@ class GovernanceNativeService:
             "keep_memory_id": keeper.memory_id,
             "deleted_memory_ids": deleted,
             "decision_ids": decisions,
+        }
+
+    def close_stale_conflict(
+        self,
+        group_id: str,
+        trusted: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Close a conflict that no longer has two recoverable members.
+
+        A stale conflict is not recoverable resolution: no winner is chosen
+        and no deleted/missing atom is resurrected.  We record the closure on
+        one deterministic in-scope anchor atom through GovernanceV2, so the
+        queue is removed while the decision ledger retains the reason and
+        member inventory for audit/rollback review.
+        """
+        group = str(group_id or "").strip()
+        if not group:
+            raise GovernanceNativeError("conflict_group_id_required")
+        self._require_admin(trusted)
+
+        all_group_atoms = [
+            atom for atom in self._atoms(trusted)
+            if str((atom.metadata or {}).get("conflict_group_id") or "") == group
+        ]
+        if not all_group_atoms:
+            raise GovernanceNativeError("conflict_group_not_found")
+        live_members = [
+            atom for atom in all_group_atoms
+            if atom.status in _CONFLICT_LIVE_STATUSES
+        ]
+        if len(live_members) >= 2:
+            raise GovernanceNativeError("conflict_group_actionable")
+
+        # Prefer the remaining live member as the visible anchor.  If every
+        # member is stale, the newest revision is deterministic and still
+        # carries the historical conflict metadata.
+        if live_members:
+            anchor = max(
+                live_members,
+                key=lambda atom: (int(atom.revision), str(atom.updated_at), atom.memory_id),
+            )
+        else:
+            anchor = max(
+                all_group_atoms,
+                key=lambda atom: (int(atom.revision), str(atom.updated_at), atom.memory_id),
+            )
+        member_ids = sorted({atom.memory_id for atom in all_group_atoms})
+        anchor_meta = dict(anchor.metadata or {})
+        anchor_meta.update({
+            "conflict_status": "resolved",
+            "conflict_resolution": "stale_closed",
+            "conflict_close_reason": "no two recoverable conflict members remain",
+            "conflict_closed_member_ids": member_ids,
+        })
+        try:
+            _persisted, decision = self._update_atom(
+                anchor,
+                trusted,
+                metadata=anchor_meta,
+                reason=f"close stale conflict {group}: no two recoverable members remain",
+                operation_key=f"conflict:{group}:close-stale:{anchor.atom_id}:{anchor.revision}",
+            )
+        except GovernanceNativeError:
+            raise
+        except Exception as exc:
+            raise GovernanceNativeError("stale_conflict_close_failed") from exc
+        return {
+            "ok": True,
+            "status": "closed",
+            "closure_kind": "stale_unrecoverable",
+            "group_id": group,
+            "closed_memory_ids": [anchor.memory_id],
+            "member_ids": member_ids,
+            "decision_ids": [decision.decision_id],
         }
 
     def _find_quarantine(self, quarantine_id: str, trusted: Mapping[str, Any]) -> MemoryAtom:

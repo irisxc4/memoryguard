@@ -90,7 +90,7 @@ class Result:
         return bool(self.sweep.get("capability", False))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"status": self.status, "domains": list(self.domains), "references": [r.to_dict() for r in self.references], "blockers": [b.to_dict() for b in self.blockers], "candidates": list(self.candidates), "candidate_intersection": list(self.candidate_intersection), "epoch_candidates": [list(e) for e in self.epoch_candidates], "schema_fingerprints": dict(self.schema_fingerprints), "registry_digest": self.registry_digest, "manifest_generation": self.manifest_generation, "pages": [{"domain": p.domain, "table": p.table, "rows": [dict(r) for r in p.rows], "next_cursor": p.next_cursor, "done": p.done, "fingerprint": p.fingerprint} for p in self.pages], "sweep": dict(self.sweep)}
+        return {"status": self.status, "domains": list(self.domains), "references": [r.to_dict() for r in self.references], "blockers": [b.to_dict() for b in self.blockers], "candidates": list(self.candidates), "candidate_intersection": list(self.candidate_intersection), "epoch_candidates": [list(e) for e in self.epoch_candidates], "schema_fingerprints": dict(self.schema_fingerprints), "registry_digest": self.registry_digest, "manifest_generation": self.manifest_generation, "pages": [{"domain": p.domain, "table": p.table, "rows": [dict(r) for r in p.rows], "next_cursor": p.next_cursor, "done": p.done, "fingerprint": p.fingerprint} for p in self.pages], "sweep": dict(self.sweep), **self.health_receipt()}
 
     def to_public_dict(self) -> dict[str, Any]:
         """Return a stable receipt without authoritative row/reference IDs."""
@@ -114,9 +114,167 @@ class Result:
             "manifest_generation": self.manifest_generation,
             "page_count": len(self.pages),
             "sweep": dict(self.sweep),
+            **self.health_receipt(),
         }
 
     public_dict = to_public_dict
+
+    def health_receipt(self) -> dict[str, Any]:
+        """Return a scoped, evidence-backed health contract.
+
+        This is deliberately a reference-integrity score, not an overall
+        governance score.  Runtime bindings, projection freshness, memory
+        availability and host integration require separate evidence and are
+        therefore listed as outside this model's scope.
+        """
+
+        return _build_health_receipt(self)
+
+
+_HEALTH_MODEL = "v2_reference_integrity"
+_HEALTH_MODEL_VERSION = 1
+_HEALTH_COMPONENT_WEIGHTS: dict[str, int] = {
+    "schema": 25,
+    "storage_integrity": 25,
+    "references": 25,
+    "delivery": 25,
+}
+_HEALTH_COMPONENT_CODES: dict[str, frozenset[str]] = {
+    "schema": frozenset({
+        "future_schema",
+        "missing_or_unsupported_marker",
+        "metadata_marker_drift",
+        "schema_metadata_unreadable",
+        "partial_schema",
+        "unknown_authoritative_table",
+        "unknown_authoritative_column",
+        "schema_drift",
+        "registry_drift",
+        "manifest_generation_unavailable",
+        "manifest_generation_drift",
+        "unsafe_authoritative_path",
+        "missing_database",
+        "schema_unreadable",
+    }),
+    "storage_integrity": frozenset({
+        "integrity_check",
+        "foreign_key_check",
+        "domain_unreadable",
+        "logical_reference_unreadable",
+    }),
+    "references": frozenset({
+        "malformed_authoritative_json",
+        "unknown_reference_key",
+        "reference_rule_invalid",
+        "dangling_logical_reference",
+    }),
+    "delivery": frozenset({
+        "pagination_failed",
+        "candidate_scan_failed",
+        "unknown_ledger",
+        "blocked_migration",
+        "unconsumed_outbox",
+        "ledger_unreadable",
+    }),
+}
+# These findings mean the audit did not establish a complete, trustworthy
+# basis for scoring.  A data defect (for example a dangling reference) is
+# scoreable; missing or drifting evidence is not.
+_HEALTH_INCONCLUSIVE_CODES = frozenset({
+    "future_schema",
+    "missing_or_unsupported_marker",
+    "metadata_marker_drift",
+    "schema_metadata_unreadable",
+    "partial_schema",
+    "unknown_authoritative_table",
+    "unknown_authoritative_column",
+    "schema_drift",
+    "registry_drift",
+    "manifest_generation_unavailable",
+    "manifest_generation_drift",
+    "unsafe_authoritative_path",
+    "missing_database",
+    "schema_unreadable",
+    "domain_unreadable",
+    "logical_reference_unreadable",
+    "pagination_failed",
+    "candidate_scan_failed",
+    "ledger_unreadable",
+})
+
+
+def _build_health_receipt(result: Result) -> dict[str, Any]:
+    """Build a deterministic score from independently observed audit checks.
+
+    Each component is an equal-weight binary control: a component passes only
+    when its evidence has no blocker.  Missing/drifting evidence is
+    ``inconclusive`` rather than a fabricated zero or full score.  The score
+    is intentionally scoped to reference integrity; it says nothing about
+    bindings, projection freshness, runtime leases, or host token usage.
+    """
+
+    blocker_codes = frozenset(str(item.code) for item in result.blockers)
+    component_codes = frozenset(code for codes in _HEALTH_COMPONENT_CODES.values() for code in codes)
+    unclassified = sorted(blocker_codes - component_codes)
+    fingerprint_complete = bool(result.domains) and set(result.schema_fingerprints) == set(result.domains)
+    manifest_complete = type(result.manifest_generation) is int and result.manifest_generation >= 0
+    inconclusive_codes = sorted(blocker_codes & _HEALTH_INCONCLUSIVE_CODES)
+    if not fingerprint_complete:
+        inconclusive_codes.append("schema_fingerprints_incomplete")
+    if not manifest_complete:
+        inconclusive_codes.append("manifest_generation_unavailable")
+    if unclassified:
+        inconclusive_codes.extend(unclassified)
+    inconclusive_codes = sorted(set(inconclusive_codes))
+
+    components: dict[str, dict[str, Any]] = {}
+    for name, weight in _HEALTH_COMPONENT_WEIGHTS.items():
+        failed_codes = sorted(blocker_codes & _HEALTH_COMPONENT_CODES[name])
+        components[name] = {
+            "status": "BLOCKED" if failed_codes else "PASS",
+            "score": 0.0 if failed_codes else 100.0,
+            "weight": weight,
+            "blocker_codes": failed_codes,
+        }
+
+    available = not inconclusive_codes
+    score = None
+    if available:
+        score = round(sum(item["score"] * item["weight"] for item in components.values()) / 100, 1)
+
+    return {
+        "health_model": _HEALTH_MODEL,
+        "health_model_version": _HEALTH_MODEL_VERSION,
+        "health_scope": "reference_integrity",
+        "health_status": "available" if available else "unavailable",
+        "health_available": available,
+        "health_score": score,
+        "health_reason": "scoped_reference_integrity" if available else "audit_evidence_incomplete",
+        "health_components": components,
+        "health_coverage": {
+            "status": "complete" if available else "inconclusive",
+            "covered": list(_HEALTH_COMPONENT_WEIGHTS),
+            "out_of_scope": [
+                "bindings",
+                "projection_freshness",
+                "runtime_leases",
+                "host_integration",
+                "token_usage",
+            ],
+        },
+        "health_evidence": {
+            "audit_status": result.status,
+            "domain_count": len(result.domains),
+            "audited_domains": list(result.domains),
+            "schema_fingerprint_count": len(result.schema_fingerprints),
+            "manifest_generation_present": manifest_complete,
+            "reference_count": len(result.references),
+            "blocker_count": len(result.blockers),
+            "coverage_complete": available,
+            "inconclusive": bool(inconclusive_codes),
+            "inconclusive_codes": inconclusive_codes,
+        },
+    }
 
 
 @dataclass(frozen=True, slots=True)

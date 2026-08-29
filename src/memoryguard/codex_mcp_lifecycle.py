@@ -24,9 +24,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 
 
-ROOT_NAMES = frozenset({"node_repl.exe", "node.exe", "python.exe", "cmd.exe"})
+ROOT_NAMES = frozenset({"node_repl.exe", "node.exe", "python.exe", "cmd.exe", "uvx.exe"})
 ANCHOR_NAME = "node_repl.exe"
-COHORT_WINDOW_MS = 2_500
+# Observed Codex stdio MCP spawn waves can lag the node_repl anchor by 3–6s.
+COHORT_WINDOW_MS = 7_000
 ASSIGN_WINDOW_MS = 20_000
 NATIVE_CLEANUP_GRACE_MS = 5_000
 POST_TOOL_PROBE_INTERVAL_MS = 5_000
@@ -45,7 +46,7 @@ _STATE_SHARD_DIR = "codex-mcp-lifecycle"
 _STATE_INDEX_FILE = "codex-mcp-lifecycle.json"
 _STATE_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
 _MAX_STATE_GENERATIONS = 16
-SHIM_VERSION = "0.7.1.post17"
+SHIM_VERSION = "0.7.1.post18"
 
 _ORPHAN_MCP_ROOTS_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
@@ -573,17 +574,26 @@ def _cohorts(snapshot: ProcessSnapshot, self_pid: int) -> tuple[Cohort, ...]:
         and p.normalized_name in ROOT_NAMES
     ]
     anchors = [p for p in direct if p.normalized_name == ANCHOR_NAME]
+    others = [p for p in direct if p.normalized_name != ANCHOR_NAME]
     result: list[Cohort] = []
     used: set[int] = set()
     for anchor in sorted(anchors, key=lambda p: (p.start_ms, p.pid)):
-        roots = tuple(
-            p
-            for p in direct
-            if p.pid not in used and abs(p.start_ms - anchor.start_ms) <= COHORT_WINDOW_MS
-        )
-        if roots:
-            used.update(p.pid for p in roots)
-            result.append(Cohort(anchor.pid, anchor.start_ms, roots))
+        members = [anchor]
+        used.add(anchor.pid)
+        for process in sorted(others, key=lambda item: (item.start_ms, item.pid)):
+            if process.pid in used:
+                continue
+            if abs(process.start_ms - anchor.start_ms) > COHORT_WINDOW_MS:
+                continue
+            nearest = min(
+                anchors,
+                key=lambda item: (abs(process.start_ms - item.start_ms), item.pid),
+            )
+            if nearest.pid != anchor.pid:
+                continue
+            members.append(process)
+            used.add(process.pid)
+        result.append(Cohort(anchor.pid, anchor.start_ms, tuple(members)))
     return tuple(result)
 
 
@@ -694,6 +704,8 @@ def _clear_cohort_owners(
             continue
         if str((lease or {}).get("cohort_key") or "") == cohort_key:
             lease["cohort_key"] = ""
+            if str(lease.get("turn_state") or "") == "active":
+                lease["turn_state"] = "idle"
 
 
 def _reconcile_writer_evidence(
@@ -1187,17 +1199,28 @@ def _cleanup(
         }
     )
 
-    # Automatic lifecycle handling is deliberately observation-only. Killing
-    # a stdio MCP root can invalidate an in-flight tool result and force Codex
-    # to rebuild the whole session. Process termination therefore requires the
-    # explicit diagnostic ``force`` mode; auto only records the exact cohort it
-    # would reclaim after native cleanup had a chance to run.
-    if mode != "force":
+    # Generic auto observation never turns age or an unmatched replacement
+    # into a kill. The only automatic termination seam here is an exclusive
+    # writer-lock-superseded leftover that survived native cleanup grace and
+    # still matches PID/parent/name/start identity.
+    kill_targets: dict[str, Cohort] = {}
+    if mode == "force":
+        kill_targets = targets
+    elif mode == "auto":
+        for key, cohort in targets.items():
+            reason = str((retired.get(key) or {}).get("reason") or "")
+            if reason != "writer_lock_superseded":
+                continue
+            if key in owned or key in _owned(state):
+                continue
+            kill_targets[key] = cohort
+
+    if not kill_targets:
         return [], [], native_cleanup_count, reclaim_candidate_pids
 
     killed: list[int] = []
     failed: list[int] = []
-    for key, cohort in sorted(targets.items(), key=lambda item: item[1].anchor_start_ms):
+    for key, cohort in sorted(kill_targets.items(), key=lambda item: item[1].anchor_start_ms):
         just_killed, just_failed = _terminate(controller, cohort, self_pid)
         killed.extend(just_killed)
         failed.extend(just_failed)
@@ -1357,6 +1380,18 @@ def _locked_handle(
             if candidate is not None:
                 assignment_reason = "unique_unowned"
         assigned = candidate.key if candidate else ""
+        if (
+            not assigned
+            and previous_key
+            and any(cohort.key == previous_key for cohort in cohorts)
+        ):
+            # Writer-lock / snapshot-delta ownership survives a later pulse that
+            # cannot uniquely re-guess the cohort, including when host_thread_id
+            # is inherited/shared with another lease.
+            assigned = previous_key
+            assignment_reason = str(
+                previous.get("assignment_reason") or assignment_reason or "existing_lease"
+            )
         if previous_key and previous_key != assigned and previous_key not in _owned(state, thread_id):
             _retire(state, previous_key, now_ms, "replaced_by_new_cohort", thread_id)
         previous_reason = str(previous.get("assignment_reason") or "")
@@ -1435,7 +1470,7 @@ def _locked_handle(
         last_failed_pids=sorted(set(failed)),
         last_native_cleanup_count=native_cleanup_count,
         last_reclaim_candidate_pids=reclaim_candidate_pids,
-        termination_enabled=mode == "force",
+        termination_enabled=mode == "force" or bool(killed),
         last_probe_ms=now_ms,
         last_cohort_count=len(cohorts),
         observed_cohort_keys=sorted(cohort.key for cohort in cohorts),
@@ -1460,7 +1495,7 @@ def _locked_handle(
         "assigned_cohort": assigned,
         "assignment_reason": assignment_reason,
         "native_cleanup_count": native_cleanup_count,
-        "termination_enabled": mode == "force",
+        "termination_enabled": mode == "force" or bool(killed),
         "reclaim_candidate_pids": reclaim_candidate_pids,
         "killed_pids": sorted(set(killed)),
         "failed_pids": sorted(set(failed)),
@@ -1570,6 +1605,18 @@ def reclaim_terminal_codex_threads(
                     lease = threads.get(alias) or {}
                     cohort_key = str(lease.get("cohort_key") or "")
                     if cohort_key in by_key:
+                        candidate_keys.add(cohort_key)
+                for lease_id, lease in threads.items():
+                    if not isinstance(lease, dict):
+                        continue
+                    if str(lease.get("host_thread_id") or "").strip() != thread_id:
+                        continue
+                    aliases.add(str(lease_id))
+                    cohort_key = str(lease.get("cohort_key") or "")
+                    if (
+                        cohort_key in by_key
+                        and str(lease.get("turn_state") or "") != "active"
+                    ):
                         candidate_keys.add(cohort_key)
 
                 if len(candidate_keys) != 1:
@@ -1767,7 +1814,7 @@ def handle_codex_mcp_lifecycle(
         return {"status": "skipped", "reason": "non_windows", "mode": selected_mode}
 
     active_controller = controller or WindowsProcessController(
-        allow_termination=selected_mode == "force"
+        allow_termination=selected_mode in {"auto", "force"}
     )
     timestamp = int(now_ms if now_ms is not None else time.time() * 1000)
     current_pid = int(self_pid if self_pid is not None else os.getpid())

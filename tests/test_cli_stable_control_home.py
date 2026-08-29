@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from memoryguard import cli
+from memoryguard.data_home import ControlHomeResolutionError, resolve_runtime_data_home
 from memoryguard.evidence import EvidenceStore
 from memoryguard.governance_v2 import GovernanceV2
 from memoryguard.memory import MemoryAtomStore
@@ -129,6 +130,80 @@ def test_bare_gui_preflight_recovers_one_verified_router_control_home(
     assert cli.main(["gui"]) == 1
     assert Path(seen["workspace"]).resolve() == control_home.resolve()
     assert default_home != Path(seen["workspace"]).resolve()
+
+
+def test_bare_resolver_ignores_empty_v2_default_for_verified_provider_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty V2 default must not hide the live Router control plane."""
+    default_home = _bare_system32_environment(monkeypatch, tmp_path)
+    _activate_v2(default_home)
+    control_home = tmp_path / "verified-v2"
+    _activate_v2(control_home)
+    _bind(control_home, "codex-stable")
+    router = tmp_path / "router"
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router))
+    _profile_config(
+        _router_profile(router, "acct-a"),
+        agent_id="codex-stable",
+        control_home=control_home,
+    )
+
+    assert resolve_runtime_data_home(discover_stable_control_home=True) == control_home.resolve()
+
+
+@pytest.mark.parametrize("command", ["gui", "doctor"])
+def test_bare_gui_and_doctor_use_verified_provider_home_when_default_is_empty_v2(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_home = _bare_system32_environment(monkeypatch, tmp_path)
+    _activate_v2(default_home)
+    control_home = tmp_path / "verified-v2"
+    _activate_v2(control_home)
+    _bind(control_home, "codex-stable")
+    router = tmp_path / "router"
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router))
+    _profile_config(
+        _router_profile(router, "acct-a"),
+        agent_id="codex-stable",
+        control_home=control_home,
+    )
+    seen: dict[str, Path] = {}
+
+    def preflight(self, name, args, **kwargs):
+        del name, args, kwargs
+        seen["workspace"] = Path(self.workspace)
+        return {"ok": False, "status": "blocked", "code": "preflight_only"}
+
+    monkeypatch.setattr(
+        "memoryguard.runtime_v2.native_ports.NativeV2RuntimePort.dispatch_cli",
+        preflight,
+    )
+
+    assert cli.main([command]) == 1
+    assert seen["workspace"] == control_home.resolve()
+
+
+def test_bare_resolver_rejects_live_default_and_other_verified_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_home = _bare_system32_environment(monkeypatch, tmp_path)
+    _activate_v2(default_home)
+    _bind(default_home, "codex-default")
+    other_home = tmp_path / "other-v2"
+    _activate_v2(other_home)
+    _bind(other_home, "codex-other")
+    router = tmp_path / "router"
+    monkeypatch.setenv("CODEXROUTER_DATA", str(router))
+    _profile_config(
+        _router_profile(router, "acct-a"),
+        agent_id="codex-other",
+        control_home=other_home,
+    )
+
+    with pytest.raises(ControlHomeResolutionError) as raised:
+        resolve_runtime_data_home(discover_stable_control_home=True)
+    assert raised.value.candidates == (default_home.resolve(), other_home.resolve())
 
 
 def test_bare_provider_repair_mints_host_owned_context_from_verified_installation(

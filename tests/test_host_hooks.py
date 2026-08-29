@@ -2815,6 +2815,96 @@ def test_subagent_start_receives_bounded_governance_context(
     assert "配置幂等" not in context
 
 
+def test_successful_hook_records_final_conversion_without_changing_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _activate_v2_host_workspace(workspace)
+    _bind(workspace, "claude-agent", "group-a")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        host_hooks,
+        "_record_conversion_usage",
+        lambda **kwargs: calls.append(kwargs),
+    )
+    packet = {
+        "status": "ok",
+        "relevant": [{"item_id": "pref", "body": "保持简洁", "kind": "preference"}],
+        "usage": {"baseline_units": 100, "delivered_units": 20},
+    }
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(packet=packet),
+    )
+
+    result = run_hook(
+        provider="claude",
+        event="session_start",
+        workspace=workspace,
+        agent_instance_id="claude-agent",
+        share_group_id="group-a",
+        payload={"session_id": "session-usage", "task": "读取长期偏好"},
+    )
+
+    assert result["hookSpecificOutput"]["additionalContext"]
+    assert len(calls) == 1
+    assert calls[0]["provider"] == "claude"
+    assert calls[0]["event"] == "session_start"
+    assert calls[0]["text"] == result["hookSpecificOutput"]["additionalContext"]
+    assert calls[0]["packet"] is not packet
+    assert calls[0]["packet"]["usage"]["baseline_units"] == 100
+
+
+def test_conversion_telemetry_failure_is_best_effort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _activate_v2_host_workspace(workspace)
+    _bind(workspace, "claude-agent", "group-a")
+    packet = {
+        "status": "ok",
+        "relevant": [{"item_id": "pref", "body": "保持简洁", "kind": "preference"}],
+        "usage": {
+            "candidate_body_units": 100,
+            "delivered_body_units": 20,
+        },
+    }
+    monkeypatch.setattr(
+        host_hooks,
+        "_v2_runtime_facade_factory",
+        lambda _workspace: _TestV2Facade(packet=packet),
+    )
+    import memoryguard.usage_telemetry as usage_telemetry
+
+    def fail_record(*args, **kwargs):
+        raise RuntimeError("telemetry unavailable")
+
+    diagnostics: list[tuple[object, ...]] = []
+    monkeypatch.setattr(usage_telemetry, "record_conversion_event", fail_record)
+    monkeypatch.setattr(
+        host_hooks,
+        "_emit_runtime_write_diagnostic",
+        lambda *args, **kwargs: diagnostics.append(args),
+    )
+
+    result = run_hook(
+        provider="claude",
+        event="session_start",
+        workspace=workspace,
+        agent_instance_id="claude-agent",
+        share_group_id="group-a",
+        payload={"session_id": "session-usage-failure"},
+    )
+
+    assert result["hookSpecificOutput"]["additionalContext"]
+    assert diagnostics and diagnostics[0][0] == "usage_telemetry_record_failed"
+
+
 def test_codex_child_agent_id_is_runtime_identity_not_binding_spoof(
     tmp_path: Path,
 ):

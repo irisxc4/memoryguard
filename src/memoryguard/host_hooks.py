@@ -2935,6 +2935,99 @@ def _bootstrap_failure_state(
     }
 
 
+def _record_conversion_usage(
+    *,
+    workspace: Path,
+    provider: str,
+    event: str,
+    text: str,
+    packet: Mapping[str, Any] | None,
+    context_identity: Mapping[str, Any],
+) -> None:
+    """Best-effort numeric usage receipt after final Hook text exists.
+
+    The recorder receives only deterministic counts and trusted scope
+    metadata.  Telemetry failure must never change the already-built Hook
+    response or expose prompt/memory text.
+    """
+
+    if not text or not isinstance(packet, Mapping):
+        return
+    usage = packet.get("usage")
+    if not isinstance(usage, Mapping):
+        budget = packet.get("budget")
+        usage = budget.get("usage") if isinstance(budget, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return
+    measurement_basis = str(usage.get("measurement_basis") or "").strip()
+    if measurement_basis and measurement_basis != "mg_deterministic_unit":
+        return
+    def _units(value: Any) -> int | None:
+        return value if type(value) is int and value >= 0 else None
+
+    candidate_body_units = _units(usage.get("candidate_body_units"))
+    if candidate_body_units is None:
+        candidate = usage.get("candidate_baseline")
+        candidate_body_units = _units(
+            candidate.get("tokens") if isinstance(candidate, Mapping) else None
+        )
+    delivered_body_units = _units(usage.get("delivered_body_units"))
+    if delivered_body_units is None:
+        delivered = usage.get("delivered", usage.get("rendered"))
+        delivered_body_units = _units(
+            delivered.get("tokens") if isinstance(delivered, Mapping) else None
+        )
+    # A packet from an older/foreign runtime may not expose body measurements.
+    # Do not infer them from a total-looking field: that would create a false
+    # savings event.  The final Hook text is the only source of wrapper size.
+    if candidate_body_units is None or delivered_body_units is None:
+        return
+    # The Hook text is the provider-delivered payload, including its wrapper.
+    # Code-point counting is the same deterministic counter used by the
+    # ContextEngine and does not require retaining the text.
+    delivered_total_units = len(text)
+    formula_baseline_total_units = delivered_total_units + (
+        candidate_body_units - delivered_body_units
+    )
+    # A malformed/legacy packet can claim more delivered body than it ever
+    # considered.  Keep the persisted comparison non-negative while retaining
+    # the exact shared-wrapper formula for normal packets.
+    baseline_total_units = max(delivered_total_units, formula_baseline_total_units)
+    wrapper_overhead_units = max(0, delivered_total_units - delivered_body_units)
+    identity = "|".join(
+        str(context_identity.get(key) or "")
+        for key in ("provider", "runtime_role", "project_ref", "context_hash")
+    )
+    event_id = hashlib.sha256(
+        f"{identity}|{event}|{hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest()}".encode(
+            "utf-8", "surrogatepass"
+        )
+    ).hexdigest()
+    try:
+        from .usage_telemetry import record_conversion_event
+
+        record_conversion_event(
+            workspace,
+            provider=provider,
+            program=provider,
+            share_group_id=str(context_identity.get("share_group_id") or ""),
+            project_ref=str(context_identity.get("project_ref") or ""),
+            # The telemetry store's baseline/delivered columns represent the
+            # final provider payload totals.  Body-level measurements stay in
+            # the packet; the wrapper is intentionally not persisted as
+            # prompt text or an untrusted zero estimate.
+            baseline_units=max(0, baseline_total_units),
+            delivered_units=delivered_total_units,
+            measurement_basis="mg_deterministic_unit",
+            event_id=event_id,
+            source_cursor=event,
+        )
+    except Exception as exc:
+        _emit_runtime_write_diagnostic(
+            "usage_telemetry_record_failed", provider, event, exc
+        )
+
+
 def _mark_bootstrap_failure(
     *,
     workspace: Path,
@@ -3529,23 +3622,43 @@ def _v2_hook_cutover(
     )
 
     direct_output = data.get("output") or data.get("host_output")
+    final_text = ""
     if isinstance(direct_output, dict):
-        return direct_output
-    text = str(data.get("text", "") or "")
-    if not text and packet:
-        text = _render_context({"context_packet": packet, **packet})
-    if event == "session_start":
-        text = _static_session_context(provider) + ("\n" + text if text else "")
-        return _context_output(provider, event, text)
-    if event == "subagent_start":
-        return _context_output(
-            provider,
-            event,
-            _static_session_context(provider) + ("\n" + text if text else ""),
-        )
-    if event == "user_prompt":
-        return _context_output(provider, event, text) if text else _allow_output(provider, event)
-    return {}
+        # Native providers may return a fully formed host payload.  Keep this
+        # boundary observational: only record a textual context field, and
+        # never let telemetry alter or block the provider response.
+        if provider == "cursor":
+            final_text = str(direct_output.get("additional_context") or "")
+        else:
+            direct_hook = direct_output.get("hookSpecificOutput")
+            if isinstance(direct_hook, Mapping):
+                final_text = str(direct_hook.get("additionalContext") or "")
+        final_output = direct_output
+    else:
+        text = str(data.get("text", "") or "")
+        if not text and packet:
+            text = _render_context({"context_packet": packet, **packet})
+        if event == "session_start":
+            final_text = _static_session_context(provider) + ("\n" + text if text else "")
+            final_output = _context_output(provider, event, final_text)
+        elif event == "subagent_start":
+            final_text = _static_session_context(provider) + ("\n" + text if text else "")
+            final_output = _context_output(provider, event, final_text)
+        elif event == "user_prompt" and text:
+            final_text = text
+            final_output = _context_output(provider, event, text)
+        else:
+            return _allow_output(provider, event) if event == "user_prompt" else {}
+
+    _record_conversion_usage(
+        workspace=workspace,
+        provider=str(context_identity.get("provider") or provider),
+        event=event,
+        text=final_text,
+        packet=packet,
+        context_identity=context_identity,
+    )
+    return final_output
 
 
 

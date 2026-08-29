@@ -815,15 +815,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .page-heading .finding-actions, .page-heading .page-actions { grid-column: 2 / -1; grid-row: 4; margin-top: 8px; }
 .page-heading::after { content: attr(data-page-subtitle); grid-column: 3; grid-row: 1 / span 3; align-self: center; max-width: 170px; color: var(--faint); font-size: 10px; text-align: right; }
 .nav-item { padding-left: 13px; }
-.nav-item::before { width: 18px; height: 18px; border: 0; border-radius: 6px; background: rgba(110,231,196,.07); box-shadow: none; content: attr(data-page-index); display: grid; place-items: center; color: var(--faint); font-size: 9px; }
-.nav-item.active::before { background: var(--accent); color: #062019; box-shadow: 0 0 10px rgba(110,231,196,.26); }
-.nav-item[data-tab="overview"]::before { content: "1"; }
-.nav-item[data-tab="sources"]::before { content: "2"; }
-.nav-item[data-tab="neurons"]::before { content: "3"; }
-.nav-item[data-tab="codegraph"]::before { content: "4"; }
-.nav-item[data-tab="rules"]::before { content: "5"; }
-.nav-item[data-tab="history"]::before { content: "6"; }
-.nav-item[data-tab="findings"]::before { content: "7"; }
+.nav-item::before { width: 5px; height: 5px; border: 1px solid var(--faint); border-radius: 50%; background: transparent; box-shadow: none; content: ""; display: block; flex: none; }
+.nav-item.active::before { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 10px var(--accent); }
 .status-rail { padding-top: 18px; }
 .status-rail h3 { display: flex; align-items: center; gap: 7px; padding-bottom: 11px; border-bottom: 1px solid var(--line); }
 .status-rail h3::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 9px var(--accent); }
@@ -935,11 +928,11 @@ tbody tr:last-child td { border-bottom: 0; }
   #content .overview-view .governance-stage::before { left: 7px; transform: translateY(-50%); }
 }
 
-/* Reference shell: persistent 208px navigation, full-width workspace header,
+/* Reference shell: persistent 224px navigation, full-width workspace header,
    readable central work area, and a 280px context rail.  The old template
    accumulated several layout passes; this final contract intentionally wins
    without changing any renderer's data or action ownership. */
-.app-shell { display: grid; grid-template-columns: 208px minmax(0, 1fr) 280px; grid-template-rows: 56px minmax(0, 1fr); height: 100%; min-width: 0; }
+.app-shell { display: grid; grid-template-columns: 224px minmax(0, 1fr) 280px; grid-template-rows: 64px minmax(0, 1fr); height: 100%; min-width: 0; }
 .main-wrapper { display: contents; }
 .sidebar { position: relative; z-index: 12; grid-column: 1; grid-row: 1 / span 2; width: auto; height: auto; display: flex; flex-direction: column; padding: 18px 0 14px; overflow: hidden; border-right: 1px solid var(--line); border-bottom: 0; background: rgba(4, 11, 9, .94); }
 .sidebar-brand { display: flex; }
@@ -956,7 +949,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .topbar { grid-column: 2 / span 2; grid-row: 1; min-width: 0; }
 .content { grid-column: 2; grid-row: 2; min-width: 0; overflow: auto; padding: 22px 24px 30px; }
 .status-rail { grid-column: 3; grid-row: 2; width: auto; min-width: 0; max-height: none; overflow-y: auto; border-left: 1px solid var(--line); border-top: 0; }
-.topbar-brand { display: none; }
+.topbar-brand { display: inline-flex; }
 .topbar-left { gap: 12px; }
 .topbar-context { font-size: 12px; color: var(--fg); }
 .topbar-context::before { display: none; }
@@ -975,18 +968,25 @@ tbody tr:last-child td { border-bottom: 0; }
 .agent-card .agent-technical-id code { display: block; margin-top: 3px; font-size: 9px; }
 .agent-avatar { display: grid; place-items: center; width: 34px; height: 34px; flex: none; border: 1px solid var(--line-strong); border-radius: 8px; background: rgba(110,231,196,.08); color: var(--accent-bright); font-size: 12px; font-weight: 750; letter-spacing: -.03em; }
 .agent-avatar[data-agent-family="grok"] { background: #050505; border-color: rgba(255,255,255,.38); color: #fff; font-size: 17px; }
+.agent-avatar[data-agent-family="codex"] { background: rgba(154, 237, 214, .14); border-color: rgba(154,237,214,.44); color: #d8fff3; }
+.agent-avatar[data-agent-family="trae"] { background: rgba(125,211,252,.13); border-color: rgba(125,211,252,.38); color: #c7efff; }
 .agent-avatar[data-agent-family="chatgpt"] { background: rgba(110,231,196,.13); }
 .agent-avatar[data-agent-family="copilot"] { background: rgba(99,179,237,.13); color: #b9e7ff; }
 .agent-avatar[data-agent-family="claude"] { background: rgba(233,187,100,.13); color: #f3d697; }
 .agent-avatar[data-agent-family="cursor"] { background: rgba(205,205,205,.1); color: #f0f0f0; }
 .agent-avatar[data-agent-family="unknown"] { color: var(--muted); background: rgba(72,104,94,.14); }
+.agent-avatar .agent-icon-svg { display: block; width: 22px; height: 22px; fill: currentColor; stroke: none; }
+.agent-mark-text { display: block; color: currentColor; font-size: 10px; font-weight: 800; letter-spacing: -.04em; }
+.agent-avatar[data-agent-family="grok"] .agent-mark-text { font-size: 9px; letter-spacing: -.03em; }
+.agent-avatar[data-agent-family="codex"] .agent-mark-text { font-size: 9px; }
+.agent-avatar[data-agent-family="unknown"] .agent-icon-svg { stroke-width: 1.45; opacity: .82; }
 .agent-card > .chip { justify-self: start; margin-top: 9px; }
 .agent-card .finding-actions { margin-top: 8px; }
 .source-detail-row td:first-child strong { display: inline-flex; align-items: center; gap: 8px; }
 .source-detail-row td:first-child strong::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px rgba(110,231,196,.5); }
 .sources-view .dashboard-main > section { min-width: 0; }
 @media (max-width: 1024px) {
-  .app-shell { grid-template-columns: 208px minmax(0, 1fr); grid-template-rows: 56px auto auto; height: auto; min-height: 100%; }
+  .app-shell { grid-template-columns: 224px minmax(0, 1fr); grid-template-rows: 64px auto auto; height: auto; min-height: 100%; }
   .sidebar { grid-column: 1; grid-row: 1 / span 2; }
   .topbar { grid-column: 2; grid-row: 1; }
   .content { grid-column: 2; grid-row: 2; }
@@ -995,15 +995,89 @@ tbody tr:last-child td { border-bottom: 0; }
 @media (max-width: 720px) {
   .app-shell { display: block; height: auto; min-height: 100%; }
   .sidebar { position: sticky; top: 0; z-index: 40; width: 100%; height: auto; padding: 0; border-right: 0; border-bottom: 1px solid var(--line); }
-  .sidebar-brand, .sidebar-footer, .sidebar-nav .nav-section-label { display: none; }
+  .sidebar-footer, .sidebar-nav .nav-section-label { display: none; }
+  .sidebar-brand { display: flex; padding: 10px 14px 8px; }
   .sidebar-nav { display: flex; align-items: stretch; gap: 2px; padding: 6px 10px; overflow-x: auto; overflow-y: hidden; }
   .sidebar-nav .nav-item { flex: 0 0 auto; min-width: max-content; min-height: 34px; margin: 0; padding: 7px 10px; gap: 8px; justify-content: flex-start; overflow: visible; white-space: nowrap; font-size: 12px; }
-  .sidebar-nav .nav-item::before { flex: none; font-size: 9px; }
+  .sidebar-nav .nav-item::before { flex: none; width: 5px; height: 5px; }
   .topbar, .content, .status-rail { display: block; }
+  .topbar-brand { display: none; }
   .topbar { min-height: 56px; }
   .content { padding: 18px 12px 24px; }
   .status-rail { border-top: 1px solid var(--line); border-left: 0; }
   .agent-discovery-grid { grid-template-columns: 1fr; }
+}
+
+/* Token usage is a compact evidence view, not a second dashboard.  The page
+   keeps measured host traffic separate from MemoryGuard's deterministic
+   estimate and remains readable when no telemetry has been synced. */
+.token-usage-view { display: grid; gap: 14px; }
+.token-usage-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.token-usage-toolbar h2 { font-size: 17px; }
+.token-usage-toolbar p { margin-top: 4px; max-width: 760px; color: var(--muted); font-size: 11px; }
+.token-window-tabs { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: rgba(10,26,21,.50); }
+.token-window-tabs button { min-width: 56px; padding: 7px 10px; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; font-size: 11px; }
+.token-window-tabs button.active { color: var(--accent-bright); background: rgba(110,231,196,.13); box-shadow: inset 0 0 0 1px rgba(110,231,196,.30); }
+.token-agent-filter { min-width: 190px; max-width: 300px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--fg); background: var(--panel-solid); }
+.token-kpi-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.token-kpi { min-height: 96px; padding: 15px; border: 1px solid var(--line); border-radius: 11px; background: rgba(110,231,196,.035); }
+.token-kpi.measured { border-color: rgba(110,231,196,.34); }
+.token-kpi.estimated { border-color: rgba(233,187,100,.38); }
+.token-kpi.unavailable { border-color: rgba(72,104,94,.34); }
+.token-kpi span { display: block; color: var(--muted); font-size: 11px; }
+.token-kpi strong { display: block; margin-top: 7px; color: var(--accent-bright); font-size: 24px; line-height: 1.2; }
+.token-kpi.estimated strong { color: var(--orange); }
+.token-kpi.unavailable strong { color: var(--faint); }
+.token-kpi small { display: block; margin-top: 5px; color: var(--faint); font-size: 10px; }
+.token-chart-card { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: rgba(10,26,21,.50); }
+.token-chart-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+.token-chart-head h3 { font-size: 13px; }
+.token-chart-head p { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.token-chart { width: 100%; min-height: 218px; overflow-x: auto; }
+.token-chart svg { display: block; width: 100%; min-width: 560px; height: 218px; }
+.token-chart .chart-grid { stroke: rgba(110,231,196,.12); stroke-width: 1; }
+.token-chart .chart-axis { stroke: rgba(110,231,196,.28); stroke-width: 1; }
+.token-chart .chart-label { fill: var(--muted); font-size: 10px; }
+.token-chart .chart-line-raw { fill: none; stroke: var(--orange); stroke-width: 2.2; }
+.token-chart .chart-line-injected { fill: none; stroke: var(--accent); stroke-width: 2.2; }
+.token-chart .chart-dot-raw { fill: var(--orange); }
+.token-chart .chart-dot-injected { fill: var(--accent); }
+.token-legend { display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 10px; }
+.token-legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.token-legend-swatch { width: 18px; height: 2px; background: currentColor; }
+.token-legend-swatch.raw { color: var(--orange); }
+.token-legend-swatch.injected { color: var(--accent); }
+.token-table-wrap { overflow-x: auto; }
+.token-table { width: 100%; min-width: 840px; table-layout: fixed; }
+.token-table th, .token-table td { white-space: normal; }
+.token-table th:nth-child(1) { width: 11%; }
+.token-table th:nth-child(2) { width: 16%; }
+.token-table th:nth-child(3) { width: 12%; }
+.token-table th:nth-child(4) { width: 17%; }
+.token-table th:nth-child(5) { width: 13%; }
+.token-table th:nth-child(6) { width: 14%; }
+.token-table th:nth-child(7) { width: 10%; }
+.token-table th:nth-child(8) { width: 7%; }
+.token-flow-cell { display: grid; gap: 3px; min-width: 0; line-height: 1.35; }
+.token-flow-line { display: flex; justify-content: space-between; gap: 6px; }
+.token-flow-line strong { color: var(--fg); font-weight: 620; }
+.token-agent-name { color: var(--fg); font-weight: 600; }
+.token-agent-id { margin-top: 3px; }
+.token-agent-id summary { color: var(--faint); cursor: pointer; font-size: 9px; }
+.token-agent-id code { display: block; max-width: 190px; margin-top: 3px; font-size: 9px; overflow-wrap: anywhere; }
+.token-source-measured { color: var(--accent); }
+.token-source-estimated { color: var(--orange); }
+.token-source-mixed { color: #b8d98a; }
+.token-source-unavailable { color: var(--faint); }
+.token-unavailable-row td { color: var(--faint); }
+.token-scope-note { padding: 10px 12px; border: 1px dashed var(--line-strong); border-radius: 9px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.token-error { border-color: rgba(255,125,136,.45); color: var(--red); }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+@media (max-width: 720px) {
+  .token-kpi-grid { grid-template-columns: 1fr; }
+  .token-usage-toolbar { display: grid; }
+  .token-window-tabs, .token-agent-filter { width: 100%; max-width: none; }
+  .token-window-tabs button { flex: 1; }
 }
 </style>
 </head>
@@ -1024,6 +1098,7 @@ tbody tr:last-child td { border-bottom: 0; }
       <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="rules" onclick="switchTab('rules')">规则与习惯</button>
       <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="history" onclick="switchTab('history')">对话历史</button>
       <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="findings" onclick="switchTab('findings')">风险信号与治理控制台<span class="count" id="findings-count"></span></button>
+      <button class="nav-item" type="button" role="tab" aria-selected="false" aria-controls="content" tabindex="0" data-tab="token-usage" onclick="switchTab('token-usage')">Token 用量与节省</button>
     </nav>
     <div class="sidebar-footer"><button class="sidebar-settings" type="button" aria-label="打开设置" onclick="openSettings()">设置</button></div>
   </aside>
@@ -1061,7 +1136,7 @@ tbody tr:last-child td { border-bottom: 0; }
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-const knownGuiTabs = ['overview','sources','neurons','codegraph','rules','history','findings','releases','governance'];
+const knownGuiTabs = ['overview','sources','neurons','codegraph','rules','history','findings','token-usage','releases','governance'];
 const guiTabHashAliases = {memory: 'neurons'};
 function currentGuiHash() {
   try {
@@ -1121,6 +1196,33 @@ let selectedProjectionEngine = localStorage.getItem('memoryguard.projectionEngin
 let activeBuildRunId = '';
 let buildStartInFlight = false;
 let buildCancelInFlight = false;
+// Each full-page render gets a monotonically increasing token.  Async page
+// reads may finish out of order; only the render that still owns the active
+// tab is allowed to replace #content.  Sub-views use the current token
+// without advancing it, so legitimate updates inside one tab remain valid.
+let contentRenderGeneration = 0;
+let pendingContentRenderToken = null;
+let tokenUsageState = { windowDays: 7, agentKey: '', payload: null };
+
+function beginContentRender(tab = state.activeTab) {
+  contentRenderGeneration += 1;
+  return {tab, generation: contentRenderGeneration};
+}
+
+function currentContentRenderToken(tab = state.activeTab) {
+  return {tab, generation: contentRenderGeneration};
+}
+
+function takeContentRenderToken(tab) {
+  if (pendingContentRenderToken && pendingContentRenderToken.tab === tab) {
+    return pendingContentRenderToken;
+  }
+  return beginContentRender(tab);
+}
+
+function contentRenderIsCurrent(token) {
+  return !token || (token.tab === state.activeTab && token.generation === contentRenderGeneration);
+}
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -1136,6 +1238,11 @@ function finiteNumber(value, fallback = 0) {
 function finiteOrNull(value) {
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number) ? number : null;
+}
+
+function optionalFiniteNumber(value) {
+  if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return null;
+  return finiteOrNull(value);
 }
 
 function safeDisplayText(value, fallback = '') {
@@ -1219,14 +1326,31 @@ function governanceSnapshot(raw) {
     memory.total,
   );
   const conflictCount = finiteFirst(
+    counts.unresolved_conflicts,
     counts.conflicts,
     counts.conflict_count,
     source.conflict_count,
+    conflicts.unresolved_total,
+    conflicts.total,
     conflicts.count,
     memory.conflict_count,
     statusCounts.conflicts,
     statusCounts.conflict,
   );
+  const conflictSelectableCount = [
+    counts.selectable_conflicts,
+    counts.selectable_conflict_count,
+    source.selectable_conflicts,
+    conflicts.selectable_total,
+    conflicts.actionable_total,
+  ].map(finiteOrNull).find(value => value !== null) ?? null;
+  const conflictClosableStaleCount = [
+    counts.closable_stale_conflicts,
+    counts.closable_stale_conflict_count,
+    source.closable_stale_conflicts,
+    conflicts.closable_stale_total,
+    conflicts.stale_total,
+  ].map(finiteOrNull).find(value => value !== null) ?? null;
   const quarantineCount = finiteFirst(
     counts.quarantined,
     counts.quarantine_count,
@@ -1251,10 +1375,19 @@ function governanceSnapshot(raw) {
     counts: {
       active_memories: activeMemories,
       conflicts: conflictCount,
+      unresolved_conflicts: conflictCount,
+      selectable_conflicts: conflictSelectableCount,
+      closable_stale_conflicts: conflictClosableStaleCount,
       quarantined: quarantineCount,
       rollback_ready: rollbackCount,
     },
-    conflicts: {...conflicts, count: conflictCount},
+    conflicts: {
+      ...conflicts,
+      count: conflictCount,
+      unresolved_total: conflictCount,
+      selectable_total: conflictSelectableCount,
+      closable_stale_total: conflictClosableStaleCount,
+    },
     quarantine: {...quarantine, count: quarantineCount},
     rollback_ready: rollbackCount,
     members,
@@ -1446,6 +1579,57 @@ function auditStateLabel(report = {}) {
   return ({completed: '扫描完成', running: '扫描中', failed: '扫描失败', pending: '待扫描'})[state] || '状态待确认';
 }
 
+function healthEvidenceUnavailable(report = {}) {
+  const explicit = String(
+    report.health_status || report.health_state || report.health_availability || ''
+  ).trim().toLowerCase().replace(/[ -]+/g, '_');
+  if (report.health_available === false || report.health_ready === false) return true;
+  if (['pending', 'unavailable', 'stale', 'expired', 'not_scanned', 'unknown'].includes(explicit)) return true;
+  const auditState = normalizeAuditState(report.audit_state || report.auditStatus || report.status);
+  return !auditIsCompleted(report) || ['pending', 'running', 'failed', 'unknown'].includes(auditState);
+}
+
+function healthEvidenceLabel(report = {}) {
+  const explicit = String(
+    report.health_status || report.health_state || report.health_availability || ''
+  ).trim().toLowerCase().replace(/[ -]+/g, '_');
+  const labels = {pending: '待扫描', unavailable: '暂不可用', stale: '已过期', expired: '已过期', not_scanned: '待扫描', unknown: '暂不可用'};
+  return labels[explicit] || auditStateLabel(report);
+}
+
+function healthScopeLabel(report = {}) {
+  const health = report.health && typeof report.health === 'object' ? report.health : {};
+  const scope = String(report.health_scope || health.scope || '').trim().toLowerCase();
+  return ({reference_integrity: '引用完整性', governance: '治理健康度'})[scope] || '治理健康度';
+}
+
+function healthCoverageText(report = {}) {
+  const coverage = report.health_coverage && typeof report.health_coverage === 'object' ? report.health_coverage : {};
+  const components = report.health_components && typeof report.health_components === 'object' ? report.health_components : {};
+  const covered = Array.isArray(coverage.covered) ? coverage.covered.filter(Boolean) : [];
+  const outOfScope = Array.isArray(coverage.out_of_scope) ? coverage.out_of_scope.filter(Boolean) : [];
+  const labels = {
+    schema: '架构', storage_integrity: '存储完整性', references: '引用', delivery: '交付',
+    bindings: '绑定', projection_freshness: '投影新鲜度', runtime_leases: '运行租约',
+    host_integration: '宿主集成', token_usage: 'Token 用量',
+  };
+  const label = value => labels[String(value).trim()] || humanizeUiKey(value);
+  if (coverage.status === 'complete') {
+    const total = Object.keys(components).length || covered.length;
+    if (!total) return '覆盖范围未提供';
+    const checked = covered.length || total;
+    const coveredText = covered.map(label).join('、') || '检查项';
+    const outsideText = outOfScope.length ? '；未覆盖：' + outOfScope.map(label).join('、') : '';
+    return `${checked}/${total} 项有证据 · 范围：${coveredText}${outsideText}`;
+  }
+  if (coverage.status === 'inconclusive') {
+    const evidence = report.health_evidence && typeof report.health_evidence === 'object' ? report.health_evidence : {};
+    const reasons = Array.isArray(evidence.inconclusive_codes) ? evidence.inconclusive_codes.filter(Boolean).map(label) : [];
+    return '不可判定：' + (reasons.length ? '证据不完整（' + reasons.join('、') + '）' : '审计证据不完整');
+  }
+  return '覆盖范围未提供';
+}
+
 function normalizeAuditReport(raw) {
   const report = raw && typeof raw === 'object' ? {...raw} : {};
   const blockers = Array.isArray(report.blockers) ? report.blockers : [];
@@ -1480,10 +1664,10 @@ function normalizeAuditReport(raw) {
   const hasCompletedAudit = explicitState === 'completed'
     || Boolean(report.completed === true || report.audit_completed === true)
     || (explicitState === 'unknown' && Boolean(generatedAt));
-  const rawHealth = finiteNumber(report.health_score, NaN);
+  const rawHealth = optionalFiniteNumber(report.health_score);
   // Completion is an explicit backend fact. Health is optional evidence and
   // must never be fabricated from completion or a transport default.
-  const health = hasCompletedAudit && Number.isFinite(rawHealth)
+  const health = hasCompletedAudit && rawHealth !== null
     ? Math.max(0, Math.min(100, rawHealth))
     : null;
   summary.object_count = finiteNumber(summary.object_count, finiteNumber(report.reference_count, 0));
@@ -1785,7 +1969,7 @@ function readableAgentPart(value, id = '') {
 
 function agentDisplayName(agentOrId, fallback = '未知助手') {
   const id = typeof agentOrId === 'object'
-    ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || '')
+    ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || agentOrId.binding_id || '')
     : String(agentOrId || '');
   const direct = typeof agentOrId === 'object' ? agentOrId : null;
   const pools = [
@@ -1801,7 +1985,7 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
   }
   const current = id && id === activeAgentInstanceId;
   const alias = match && (match.user_alias || match.alias || match.user_label);
-  const discoveredName = match && (match.display_name || match.product || match.label || match.name);
+  const discoveredName = match && (match.display_name || match.product || match.label || match.name || match.agent_name || match.member_name);
   const provider = match && (match.provider || match.provider_name || match.product);
   const program = match && (match.program_name || match.program || match.client_name || match.host_name);
   // Keep unknown identities readable without exposing a stable ID.
@@ -1813,6 +1997,11 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
     || fallbackLabel
     || (readableAgentPart(program, id) && readableAgentPart(provider, id) ? `${program} · ${provider}` : '')
     || (readableAgentPart(provider, id) && readableAgentPart(project, id) ? `${provider} · ${project}` : '');
+  const productLabels = {codex: 'Codex', claude: 'Claude Code', cursor: 'Cursor', trae: 'Trae', grok: 'Grok', chatgpt: 'ChatGPT', copilot: 'GitHub Copilot'};
+  const family = agentFamily(match || agentOrId);
+  // Provider/program/display_name are identity hints, not user-facing names.
+  // Collapse known product slugs to family labels; keep opaque IDs in details.
+  if (!alias && productLabels[family]) label = productLabels[family];
   if (!label || /^(?:未知助手|未知\s*Agent|unknown)$/i.test(label)) label = '未识别的 MCP 助手';
   if (/^codex$/i.test(label)) label = 'Codex';
   if (current && !label.includes('（当前）')) label += '（当前）';
@@ -1821,7 +2010,7 @@ function agentDisplayName(agentOrId, fallback = '未知助手') {
 
 function agentIdentityDetail(agentOrId) {
   const id = typeof agentOrId === 'object'
-    ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || '')
+    ? String(agentOrId.instance_id || agentOrId.agent_instance_id || agentOrId.id || agentOrId.agent || agentOrId.binding_id || '')
     : String(agentOrId || '');
   return id;
 }
@@ -1830,10 +2019,12 @@ function agentIdentityDetail(agentOrId) {
 // and never fetch remote favicons or expose opaque IDs as the visible label.
 function agentFamily(agentOrId) {
   const item = agentOrId && typeof agentOrId === 'object' ? agentOrId : {};
-  const text = [item.provider, item.provider_name, item.product, item.display_name,
+  const text = [item.provider, item.provider_name, item.product, item.display_name, item.agent_name, item.member_name,
     item.program_name, item.program, item.client_name, item.host_name,
     typeof agentOrId === 'string' ? agentOrId : ''].join(' ').toLowerCase();
   if (/grok|xai|x\.ai/.test(text)) return 'grok';
+  if (/trae(?:\b|[-_.])|trae\.ai/.test(text)) return 'trae';
+  if (/codex|openai-codex/.test(text)) return 'codex';
   if (/chatgpt|openai/.test(text)) return 'chatgpt';
   if (/copilot|github/.test(text)) return 'copilot';
   if (/claude|anthropic/.test(text)) return 'claude';
@@ -1843,8 +2034,20 @@ function agentFamily(agentOrId) {
 
 function agentIconMarkup(agentOrId) {
   const family = agentFamily(agentOrId);
-  const marks = {grok: '𝕏', chatgpt: '◎', copilot: '●', claude: 'AI', cursor: '◆', unknown: '?' };
-  return `<span class="agent-avatar" data-agent-family="${family}" aria-hidden="true">${marks[family]}</span>`;
+  // Keep marks local and deterministic.  These are small product silhouettes,
+  // not remote favicons: the family is still resolved from trusted discovery
+  // metadata and the technical ID remains available below the card.
+  const marks = {
+    codex: '<span class="agent-mark-text">Codex</span>',
+    claude: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M21 10.5h3v3h-3v3h-1.5v3H18v-3h-1.5v3H15v-3H9v3H7.5v-3H6v3H4.5v-3H3v-3H0v-3h3v-6h18Zm-15 0h1.5v-3H6Zm10.5 0H18v-3h-1.5z"/></svg>',
+    cursor: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M11.503.131 1.891 5.678a.84.84 0 0 0-.42.726v11.188c0 .3.162.575.42.724l9.609 5.55a1 1 0 0 0 .998 0l9.61-5.55a.84.84 0 0 0 .42-.724V6.404a.84.84 0 0 0-.42-.726L12.497.131a1.01 1.01 0 0 0-.996 0M2.657 6.338h18.55c.263 0 .43.287.297.515L12.23 22.918c-.062.107-.229.064-.229-.06V12.335a.59.59 0 0 0-.295-.51l-9.11-5.257c-.109-.063-.064-.23.061-.23"/></svg>',
+    trae: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M24 20.5H3.5V17H0V3.5h24ZM3.5 17h17V7h-17Zm8.5-5-2.5 2.5L7 12l2.5-2.5Zm7 0-2.5 2.5L14 12l2.5-2.5z"/></svg>',
+    grok: '<span class="agent-mark-text">Grok</span>',
+    chatgpt: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4.1a4.2 4.2 0 0 1 7.2 3 4.2 4.2 0 0 1 1 7.8 4.2 4.2 0 0 1-4.2 5.8 4.2 4.2 0 0 1-7.2 0 4.2 4.2 0 0 1-5.1-5.8 4.2 4.2 0 0 1 1-7.8 4.2 4.2 0 0 1 7.3-3Z"/><path d="m8.1 15.6 7.8-4.5M8.5 9.4l7.8 4.5"/></svg>',
+    copilot: '<svg class="agent-icon-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M5 8.1c0-2 1.6-3.6 3.6-3.6h1.5c1 0 1.9.4 2.6 1.1l.3.3.3-.3c.7-.7 1.6-1.1 2.6-1.1h1.5c2 0 3.6 1.6 3.6 3.6v7.8c0 2-1.6 3.6-3.6 3.6h-1.5c-1 0-1.9-.4-2.6-1.1l-.3-.3-.3.3c-.7.7-1.6 1.1-2.6 1.1H8.6c-2 0-3.6-1.6-3.6-3.6V8.1Z"/><path d="M8 10.5h3M13 10.5h3M8 14h3M13 14h3"/></svg>',
+    unknown: '?',
+  };
+  return `<span class="agent-avatar" data-agent-family="${family}" aria-label="${family} product mark">${marks[family] || marks.unknown}</span>`;
 }
 
 function agentSourceSummary(agentOrId) {
@@ -1988,10 +2191,12 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   });
 }
 
-function setContent(html) {
+function setContent(html, renderToken = null) {
+  if (!contentRenderIsCurrent(renderToken)) return false;
   document.getElementById('content').innerHTML = html;
   decorateViewHeading();
   bindRuleHistoryActionDelegation();
+  return true;
 }
 
 const PAGE_CHROME = {
@@ -2002,6 +2207,7 @@ const PAGE_CHROME = {
   rules: {index: '5', label: 'Rules & Habits', subtitle: '规则与习惯'},
   history: {index: '6', label: 'Conversation History', subtitle: '对话历史'},
   findings: {index: '7', label: 'Risk Signals', subtitle: '风险信号与治理控制台'},
+  'token-usage': {index: '8', label: 'Token Usage', subtitle: 'Token 用量与 MCP 节省'},
   releases: {index: '·', label: 'Change Log', subtitle: '变更记录'},
   governance: {index: '·', label: 'Governance Console', subtitle: '治理控制台'},
 };
@@ -2060,17 +2266,20 @@ function renderAll() {
   if (!state.report) return;
   const r = state.report;
   const findings = Array.isArray(r.findings) ? r.findings : [];
-  const health = finiteOrNull(r.health_score);
+  const health = optionalFiniteNumber(r.health_score);
+  const healthUnavailable = healthEvidenceUnavailable(r);
   const hasCompletedAudit = auditIsCompleted(r);
   document.getElementById('ws-path').textContent = guiPathText(r.workspace, '');
   const badge = document.getElementById('health-badge');
   document.getElementById('reader-auto')?.classList.toggle('active', readerLanguage === 'auto');
   document.getElementById('reader-zh')?.classList.toggle('active', readerLanguage === 'zh');
   document.getElementById('reader-en')?.classList.toggle('active', readerLanguage === 'en');
-  badge.textContent = hasCompletedAudit
-    ? (health === null ? '健康度 ' + (findings.length ? `需处理 ${findings.length} 项` : '扫描完成') : '健康度 ' + Math.round(health) + '/100')
+  badge.textContent = healthUnavailable
+    ? '健康度 ' + healthEvidenceLabel(r)
+    : hasCompletedAudit
+    ? (health === null ? '健康度 ' + (findings.length ? `需处理 ${findings.length} 项` : '审计通过（未提供量化评分）') : healthScopeLabel(r) + ' ' + Math.round(health) + '/100')
     : '健康度 ' + auditStateLabel(r);
-  badge.style.color = !hasCompletedAudit ? 'var(--faint)'
+  badge.style.color = healthUnavailable ? 'var(--orange)' : !hasCompletedAudit ? 'var(--faint)'
     : health === null ? 'var(--orange)'
     : health >= 70 ? 'var(--accent)' : health >= 40 ? 'var(--orange)' : 'var(--red)';
   document.getElementById('findings-count').textContent = findings.length || '';
@@ -2088,11 +2297,19 @@ async function loadGovernanceSnapshot() {
     return;
   }
   try {
-    const [rawSnapshot, rawScope] = await Promise.all([
+    const [rawSnapshot, rawScope, rawConflicts] = await Promise.all([
       callApi('get_governance_snapshot', activeShareGroupId),
       callApi('get_governance_scope_state'),
+      callApi('get_conflicts', activeShareGroupId),
     ]);
-    const snapshot = governanceSnapshot(rawSnapshot);
+    // The snapshot endpoint keeps a compatibility count, while conflict
+    // queue owns the authoritative unclosed/actionable/stale totals. Merge
+    // that bounded summary before rendering the overview and status rail.
+    const snapshotInput = {...objectValue(rawSnapshot)};
+    if (rawConflicts && rawConflicts.ok !== false) {
+      snapshotInput.conflicts = {...objectValue(snapshotInput.conflicts), ...objectValue(rawConflicts)};
+    }
+    const snapshot = governanceSnapshot(snapshotInput);
     const runtimeScope = normalizeGovernanceScope(rawScope, activeShareGroupId);
     const snapshotScope = normalizeGovernanceScope(snapshot, activeShareGroupId);
     const trustedScope = runtimeScope.status === 'active' ? runtimeScope : snapshotScope;
@@ -2182,6 +2399,7 @@ function renderStatusRail() {
   const counts = objectValue(snap.counts);
   const activeCount = finiteNumber(counts.active_memories, 0);
   const conflictCount = finiteNumber(counts.conflicts, 0);
+  const conflictDetail = conflictDispositionText(snap);
   const quarantineCount = finiteNumber(counts.quarantined, 0);
   const rollbackCount = finiteNumber(counts.rollback_ready, 0);
   const conflictClass = conflictCount > 0 ? 'alert' : 'zero';
@@ -2194,7 +2412,7 @@ function renderStatusRail() {
     </div>
     <div class="status-item ${conflictClass}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('conflicts'),50)">
       <span class="status-label">冲突</span>
-      <span class="status-num">${conflictCount}</span>
+      <span><span class="status-num">${conflictCount}</span>${conflictDetail ? `<small class="surface-meta" style="display:block;text-align:right">${escapeHtml(conflictDetail)}</small>` : ''}</span>
     </div>
     <div class="status-item ${quarantineClass}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('quarantine'),50)">
       <span class="status-label">隔离</span>
@@ -2362,16 +2580,23 @@ function renderNeuronRailDetail(node) {
 }
 
 function renderContent() {
-  switch (state.activeTab) {
-    case 'overview': renderOverview(); break;
-    case 'sources': renderSources(); break;
-    case 'neurons': renderNeurons(); break;
-    case 'codegraph': renderCodeGraph(); break;
-    case 'rules': renderRulesHabits(); break;
-    case 'history': renderHistory(); break;
-    case 'findings': renderFindings(); break;
-    case 'releases': renderReleases(); break;
-    case 'governance': renderGovernance(); break;
+  const renderToken = beginContentRender(state.activeTab);
+  pendingContentRenderToken = renderToken;
+  try {
+    switch (state.activeTab) {
+      case 'overview': renderOverview(); break;
+      case 'sources': renderSources(); break;
+      case 'neurons': renderNeurons(); break;
+      case 'codegraph': renderCodeGraph(); break;
+      case 'rules': renderRulesHabits(); break;
+      case 'history': renderHistory(); break;
+      case 'findings': renderFindings(); break;
+      case 'token-usage': renderTokenUsage(); break;
+      case 'releases': renderReleases(); break;
+      case 'governance': renderGovernance(); break;
+    }
+  } finally {
+    pendingContentRenderToken = null;
   }
 }
 
@@ -4624,6 +4849,13 @@ function eventActionLabel(value) {
   return labels[key] || (key ? humanizeUiKey(key, '自动处理') : '自动处理');
 }
 
+function activityActorLabel(item = {}) {
+  const authority = String(item.authority || item.actor_type || item.actor_kind || '').trim().toLowerCase();
+  const actor = String(item.actor || item.actor_id || item.agent_instance_id || '').trim().toLowerCase();
+  if (authority === 'system' || actor.startsWith('organizer:')) return 'MemoryGuard 自动治理';
+  return agentDisplayName(item.agent_instance_id || item.actor || '', eventActionLabel(item.action || item.type || 'auto'));
+}
+
 function renderOverviewLegacy() {
   const report = state.report || {};
   const snap = state.governanceSnapshot && typeof state.governanceSnapshot === 'object'
@@ -4637,7 +4869,7 @@ function renderOverviewLegacy() {
 
   const evtCard = evt ? `<div class="flow-card cyan" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('recent_events'),50)">
     <div class="flow-kicker">最新记忆写入</div>
-     <div class="flow-title">${escapeHtml(agentDisplayName(evt.agent_instance_id, '未知 Agent'))}</div>
+     <div class="flow-title">${escapeHtml(activityActorLabel(evt))}</div>
     <div class="flow-body">${escapeHtml(evt.raw_content_preview || '(无内容)')}${evt.auto_actions && evt.auto_actions.length ? '<br>自动处理：' + evt.auto_actions.map(a => escapeHtml(eventActionLabel(a.action || a.type))).join('、') : ''}</div>
     <div class="flow-time">${escapeHtml(evt.created_at || '')}</div>
   </div>` : `<div class="flow-card empty cyan"><div class="flow-kicker">新写入</div><div class="flow-title">${hasEvents ? '暂无事件' : '等待事件'}</div><div class="flow-body">${hasEvents ? '' : 'Agent 写入记忆后，事件将出现在这里。'}</div></div>`;
@@ -4663,7 +4895,7 @@ function renderOverviewLegacy() {
 
   const summary = report.summary && typeof report.summary === 'object' ? report.summary : {};
   const findings = Array.isArray(report.findings) ? report.findings : [];
-  const health = finiteOrNull(report.health_score);
+  const health = optionalFiniteNumber(report.health_score);
   const hasCompletedAudit = report.audit_state === 'completed' && health !== null;
   const healthText = hasCompletedAudit ? `${Math.round(Math.max(0, Math.min(100, health)))}/100` : '待扫描';
   const healthColor = !hasCompletedAudit ? 'var(--faint)' : (health >= 70 ? 'var(--accent)' : health >= 40 ? 'var(--orange)' : 'var(--red)');
@@ -4951,7 +5183,8 @@ async function undoChange(changeId, planId) {
 // ===========================================================================
 
 async function renderSources() {
-  setContent('<div class="loading">正在加载数据页</div>');
+  const renderToken = takeContentRenderToken('sources');
+  setContent('<div class="loading">正在加载数据页</div>', renderToken);
   try {
     // v3.2：先加载 Agent 卡片
     agentCardsData = await callApi('list_agents');
@@ -4968,10 +5201,10 @@ async function renderSources() {
       callApi('get_raw_memory'),
       callApi('list_bindings'),
     ]);
-    renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult);
+    renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult, renderToken);
   } catch (e) {
     showToast('数据源加载失败：' + e, 'error');
-    setContent(`<div class="view-heading"><span class="eyebrow">Sources</span><h2>数据源与代理</h2><p>数据源加载失败。</p></div><div class="card empty-state"><div><div class="empty-orb"></div><p>数据源加载失败：${escapeHtml(e)}</p></div></div>`);
+    setContent(`<div class="view-heading"><span class="eyebrow">Sources</span><h2>数据源与代理</h2><p>数据源加载失败。</p></div><div class="card empty-state"><div><div class="empty-orb"></div><p>数据源加载失败：${escapeHtml(e)}</p></div></div>`, renderToken);
   }
 }
 
@@ -5240,6 +5473,7 @@ async function renderMultiAgentBinding() {
 }
 
 function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groupsResult) {
+  agentCardsData = agentsResult || agentCardsData;
   const discoveredAgents = (agentsResult && agentsResult.agents) || [];
   const residualAgents = (agentsResult && agentsResult.residuals) || [];
   const agents = Array.from(new Map([...discoveredAgents, ...residualAgents].map(item => [item.instance_id, item])).values());
@@ -5297,10 +5531,15 @@ function showMultiAgentBinding(agentsResult, bindingsResult, hooksResult, groups
   const agentNameById = new Map(agents.map(a => [a.instance_id, agentDisplayName(a)]));
   const groupOptionLabel = (group) => {
     const kind = group.group_kind === 'personal' ? '个人' : '共享';
-    const memberNames = [...new Set((group.members || []).map(id => agentNameById.get(id) || agentDisplayName(id)))].filter(Boolean);
-    const memberCount = Number(group.member_count || (group.members || []).length || 0);
+    const summary = governanceGroupProgramSummary(group);
+    const memberNames = summary.names.length
+      ? summary.names
+      : [...new Set((group.members || []).map(id => agentNameById.get(id) || agentDisplayName(id)))].filter(name => name !== '未识别的 MCP 助手');
+    const memberCount = summary.programCount;
+    const connectionCount = summary.connectionCount;
     const recordCount = Number(group.active_records || group.active_count || 0);
-    return `${kind} · ${memberNames.join('、') || '未显示成员'} · ${memberCount} Agent · ${recordCount} active`;
+    const unknown = summary.unknownCount ? `（${summary.unknownCount} 待识别连接）` : '';
+    return `${kind} · ${memberNames.join('、') || '程序名称待加载'} · ${memberCount} 个程序 · ${connectionCount} 条连接（其他 ${summary.otherCount}）${unknown} · ${recordCount} 条记忆`;
   };
   const existingGroupSelector = (agentId, selectedGroupId = '') => {
     if (!selectableGroups.length) return '';
@@ -7571,8 +7810,47 @@ async function archiveMemoryGroup(groupId) {
 // 治理台 tab：最近写入 / 覆盖记录 / 冲突队列 / 隔离队列 / 版本回滚
 // ===========================================================================
 
+function governanceGroupProgramSummary(group) {
+  const item = group && typeof group === 'object' ? group : {};
+  const discovered = [
+    ...(Array.isArray(agentCardsData?.agents) ? agentCardsData.agents : []),
+    ...(Array.isArray(agentCardsData?.program_members) ? agentCardsData.program_members : []),
+  ].filter(candidate => candidate && typeof candidate === 'object');
+  const byId = new Map(discovered.flatMap(candidate => {
+    const keys = [candidate.instance_id, candidate.agent_instance_id, candidate.agent_id, candidate.id, candidate.binding_id]
+      .map(value => String(value || '').trim()).filter(Boolean);
+    return keys.map(key => [key, candidate]);
+  }));
+  const preferredDetails = Array.isArray(item.program_member_details) ? item.program_member_details
+    : (Array.isArray(item.member_details) ? item.member_details : []);
+  const rawMembers = preferredDetails.length ? preferredDetails : (item.members || item.agent_instance_ids || []);
+  const members = rawMembers.map(member => {
+    if (member && typeof member === 'object') return member;
+    return byId.get(String(member || '').trim()) || null;
+  }).filter(Boolean);
+  const historicalStatuses = new Set(['historical', 'historical_unknown', 'history', 'stale', 'missing', 'unresolved', 'unknown', 'inactive', 'expired']);
+  const programs = Array.from(new Map(members
+    .filter(member => member.is_program_member !== false && member.program_member !== false)
+    .filter(member => !historicalStatuses.has(String(member.member_status || member.lifecycle_state || member.status || '').trim().toLowerCase()))
+    .filter(member => !isUnknownHistoricalMember(member))
+    .map((member, index) => [agentProgramKey(member) || `program-${index}`, member])).values());
+  const names = [...new Set(programs.map(member => agentDisplayName(member, '')).filter(name => name && name !== '未识别的 MCP 助手'))];
+  const programCount = optionalFiniteNumber(item.program_member_count) ?? programs.length;
+  const endpointCount = optionalFiniteNumber(item.member_count ?? item.endpoint_member_count);
+  const declaredOtherCount = optionalFiniteNumber(item.extra_connection_count);
+  const otherCount = declaredOtherCount === null
+    ? (endpointCount === null ? Math.max(0, members.length - programCount) : Math.max(0, endpointCount - programCount))
+    : Math.max(0, declaredOtherCount);
+  const connectionCount = endpointCount === null ? programCount + otherCount : Math.max(0, endpointCount);
+  const unknownCount = optionalFiniteNumber(item.unknown_member_count)
+    ?? optionalFiniteNumber(item.unresolved_member_count)
+    ?? members.filter(isUnknownHistoricalMember).length;
+  return {names, programCount, connectionCount, otherCount, unknownCount};
+}
+
 async function renderGovernance() {
-  setContent('<div class="loading">正在读取记忆治理组</div>');
+  const renderToken = takeContentRenderToken('governance');
+  setContent('<div class="loading">正在读取记忆治理组</div>', renderToken);
   let groups = [];
   try {
     const [groupsResult, agentsResult] = await Promise.all([
@@ -7581,15 +7859,17 @@ async function renderGovernance() {
     groups = groupsResult.groups || [];
     agentCardsData = agentsResult || agentCardsData;
   } catch (e) {
-    setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>记忆治理组加载失败：${escapeHtml(String(e))}</p></div></div>`);
+    setContent(`<div class="card empty-state"><div><div class="empty-orb"></div><p>记忆治理组加载失败：${escapeHtml(String(e))}</p></div></div>`, renderToken);
     return;
   }
   if (activeShareGroupId && !groups.some(g => g.share_group_id === activeShareGroupId)) {
     activeShareGroupId = '';
   }
   const groupOptions = groups.map(g => {
-    const memberNames = agentNamesForIds(g.members || g.agent_instance_ids || []);
-    const label = `${g.group_kind === 'personal' ? '个人' : '共享'} · ${memberNames.join('、') || '未显示成员'} · ${g.agent_count || g.member_count || memberNames.length || 0} Agent · ${g.active_records || 0} active`;
+    const summary = governanceGroupProgramSummary(g);
+    const names = summary.names.length ? summary.names.join('、') : '程序名称待加载';
+    const unknown = summary.unknownCount ? `（${summary.unknownCount} 待识别连接）` : '';
+    const label = `${g.group_kind === 'personal' ? '个人' : '共享'} · ${names} · ${summary.programCount} 个程序 · ${summary.connectionCount} 条连接（其他 ${summary.otherCount}）${unknown} · ${g.active_records || 0} 条记忆`;
     return `<option value="${escapeHtml(g.share_group_id)}" ${g.share_group_id === activeShareGroupId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
   }).join('');
   const groupSelector = groups.length
@@ -7601,7 +7881,7 @@ async function renderGovernance() {
         <div class="finding-actions"><button class="btn btn-primary" type="button" onclick="switchTab('sources')">去数据源启用记忆层</button></div></div></section>`;
   if (!activeShareGroupId) {
     setContent(`<div class="view-heading"><span class="eyebrow">Governance</span><h2>治理台</h2>
-      <p>请先选择个人或共享记忆层，系统不会再隐式使用 default。</p></div>${groupSelector}`);
+      <p>请先选择个人或共享记忆层，系统不会再隐式使用 default。</p></div>${groupSelector}`, renderToken);
     return;
   }
   const tabs = [
@@ -7628,7 +7908,8 @@ async function renderGovernance() {
       </div>
     </section>
     <div class="scope-tabs">${tabsHtml}</div>
-    <div id="governance-content"><div class="loading">正在加载</div></div>`);
+    <div id="governance-content"><div class="loading">正在加载</div></div>`, renderToken);
+  if (!contentRenderIsCurrent(renderToken)) return;
   renderGovernanceSub();
 }
 
@@ -7736,14 +8017,14 @@ async function renderRecentEvents() {
       const actions = (e.auto_actions || []).map(a => `<span class="chip chip-info">${escapeHtml(eventActionLabel(a.action || a.type || 'auto'))}</span>`).join('');
       return `<article class="plan-item" onclick="toggleEventDetail('${escapeHtml(e.event_id)}')">
         <div class="finding-header">
-           <span class="finding-rule">${escapeHtml(agentDisplayName(e.agent_instance_id || e.actor || e.provider, e.provider || '未知 Agent'))}</span>
+           <span class="finding-rule">${escapeHtml(activityActorLabel(e))}</span>
           <span class="chip chip-info">${escapeHtml(e.created_at || '')}</span>
         </div>
         <div class="finding-evidence">${preview}${(e.raw_content || '').length > 100 ? '…' : ''}</div>
         ${actions ? `<div class="chips" style="margin-top:6px">${actions}</div>` : ''}
         <div class="finding-detail" id="event-detail-${escapeHtml(e.event_id)}" style="display:none">
           <div class="row"><span class="key">event_id</span><code>${escapeHtml(e.event_id || '')}</code></div>
-           <div class="row"><span class="key">agent</span><span>${escapeHtml(agentDisplayName(e.agent_instance_id || e.actor || e.provider, e.provider || '未知 Agent'))}</span></div>
+           <div class="row"><span class="key">agent</span><span>${escapeHtml(activityActorLabel(e))}</span></div>
           <div class="row"><span class="key">group</span><span>${escapeHtml(e.share_group_id || '')}</span></div>
           <div class="row"><span class="key">时间</span><span>${escapeHtml(e.created_at || '')}</span></div>
           <div class="row"><span class="key">完整内容</span></div>
@@ -7797,6 +8078,71 @@ async function renderSupersedeChain() {
   }
 }
 
+function conflictMemberLabel(member) {
+  const item = member && typeof member === 'object' ? member : {memory_id: member};
+  const id = String(item.memory_id || item.id || item.record_id || '').trim();
+  const direct = [item.display_name, item.title, item.label, item.name]
+    .map(value => String(value || '').trim()).find(Boolean);
+  return direct || (id ? `记忆记录 ${id.slice(0, 16)}` : '未命名冲突记录');
+}
+
+function conflictActionDescriptors(conflict) {
+  const raw = conflict && (conflict.available_actions || conflict.actions || conflict.recovery_actions);
+  const rows = Array.isArray(raw) ? raw : [];
+  const labels = {
+    close_conflict: '关闭冲突', close: '关闭冲突',
+    close_stale_conflict: '关闭失效冲突', conflict_close_stale: '关闭失效冲突',
+    cleanup_conflict: '清理冲突', cleanup: '清理冲突',
+    restore_conflict: '恢复候选', restore: '恢复候选',
+    resolve_conflict: '保留所选并解决', resolve: '保留所选并解决',
+  };
+  const normalized = rows.map(row => {
+    const item = row && typeof row === 'object' ? row : {action: row};
+    const rawMethod = String(item.method || item.operation || item.action || item.id || '').trim().toLowerCase();
+    const method = rawMethod === 'conflict_close_stale' ? 'close_stale_conflict' : rawMethod;
+    if (!method) return null;
+    return {
+      method,
+      label: String(item.label_zh || item.label || labels[method] || method),
+      enabled: item.enabled !== false && item.available !== false,
+      reason: String(item.reason || item.disabled_reason || '').trim(),
+    };
+  }).filter(Boolean);
+  // Older V2 responses did not advertise recovery actions even though the
+  // close-stale operation was already available.  Keep an explicitly stale
+  // queue item actionable as a compatibility fallback; the call still goes
+  // through the normal bridge, so an actually old backend returns a visible
+  // API error instead of silently leaving an unusable disabled row.
+  const status = String(conflict?.status || conflict?.source_status || '').trim().toLowerCase();
+  const liveCount = optionalFiniteNumber(conflict?.live_member_count ?? conflict?.program_member_count);
+  const stale = ['stale', 'invalid', 'expired', 'unrecoverable'].includes(status)
+    || conflict?.can_resolve === false
+    || (Number.isFinite(liveCount) && liveCount < 2);
+  if (stale && !normalized.some(item => item.method === 'close_stale_conflict')) {
+    normalized.push({method: 'close_stale_conflict', label: '关闭失效冲突', enabled: true, reason: '候选不足，保留历史审计记录并关闭该冲突'});
+  }
+  return normalized;
+}
+
+async function invokeConflictAction(groupId, method) {
+  const supported = new Set(['close_conflict', 'close', 'close_stale_conflict', 'conflict_close_stale', 'cleanup_conflict', 'cleanup', 'restore_conflict', 'restore']);
+  const requested = String(method || '').trim().toLowerCase();
+  const action = requested === 'conflict_close_stale' ? 'close_stale_conflict' : requested;
+  if (!supported.has(action)) return showToast('该治理动作尚未由后端提供', 'error');
+  if (!confirm('确认执行“' + action + '”？\n\n该操作会更新冲突队列状态，并保留审计记录。')) return;
+  showToast('正在执行冲突治理…');
+  try {
+    const result = action === 'close_stale_conflict'
+      ? await callApi('close_stale_conflict', groupId)
+      : await callApi(action, groupId, activeShareGroupId);
+    if (result && (result.error || result.ok === false)) return showToast(apiErrorMessage(result, '冲突治理失败'), 'error');
+    showToast('冲突治理已提交', 'success');
+    renderConflictQueue();
+  } catch (error) {
+    showToast('冲突治理失败：' + error, 'error');
+  }
+}
+
 async function renderConflictQueue() {
   const container = document.getElementById('governance-content');
   if (!container) return;
@@ -7815,6 +8161,9 @@ async function renderConflictQueue() {
     const actionableCount = Number.isFinite(Number(conflictsResult.actionable_total))
       ? Number(conflictsResult.actionable_total)
       : conflicts.filter(c => c.can_resolve === true).length;
+    const closableStaleCount = Number.isFinite(Number(conflictsResult.closable_stale_total))
+      ? Number(conflictsResult.closable_stale_total)
+      : conflicts.filter(c => ['stale', 'invalid'].includes(String(c.status || '').toLowerCase()) || c.can_resolve === false).length;
     const items = conflicts.map(c => {
       const memberRows = Array.isArray(c.members) ? c.members : (Array.isArray(c.member_details) ? c.member_details : (c.member_ids || []).map(mid => ({memory_id: mid, status: 'missing', selectable: false, live: false, reason: '旧版响应未提供成员快照，历史正文不可恢复'})));
       const liveMembers = memberRows.filter(member => member && (member.selectable === true || member.live === true));
@@ -7822,20 +8171,29 @@ async function renderConflictQueue() {
       // member evidence: never enable a resolve action without two explicit
       // live/selectable snapshots.
       const canResolve = liveMembers.length >= 2 && (c.can_resolve === true || !Object.prototype.hasOwnProperty.call(c, 'can_resolve'));
+      const actions = conflictActionDescriptors(c);
+      const actionButtons = actions.map(action => {
+        const danger = ['close', 'close_conflict', 'close_stale_conflict', 'cleanup', 'cleanup_conflict'].includes(action.method);
+        const handler = action.enabled ? `onclick="invokeConflictAction('${escapeHtml(c.group_id)}','${escapeHtml(action.method)}')"` : `disabled title="${escapeHtml(action.reason || '后端暂不可用')}"`;
+        return `<button class="btn ${danger ? 'btn-danger' : ''}" type="button" data-conflict-action="${escapeHtml(action.method)}" ${handler}>${escapeHtml(action.label)}</button>`;
+      }).join('');
       const members = memberRows.map(member => {
         const item = member && typeof member === 'object' ? member : {memory_id: member};
         const mid = String(item.memory_id || item.id || '');
         if (!mid) return '';
         const selectable = item.selectable === true || item.live === true;
         const preview = item.preview || item.body_preview || item.body || item.reason || (item.missing ? '历史正文不可恢复（仅保留成员 ID）' : '成员详情不可用');
-        const radio = selectable ? `<input type="radio" name="conflict-${escapeHtml(c.group_id)}" value="${escapeHtml(mid)}" ${canResolve ? '' : 'disabled'} aria-label="选择保留 ${escapeHtml(mid)}">` : '';
+        const title = conflictMemberLabel(item);
+        const radio = selectable ? `<input type="radio" name="conflict-${escapeHtml(c.group_id)}" value="${escapeHtml(mid)}" aria-label="选择保留 ${escapeHtml(title)}">` : '';
         const chipClass = selectable ? 'confirmed' : 'high';
         const status = item.status || (item.missing ? 'missing' : 'unavailable');
-        return `<label class="raw-file-row" style="${selectable && canResolve ? 'cursor:pointer;' : 'cursor:default;'}grid-template-columns:auto 1fr auto;align-items:center">
+        const details = [item.kind, item.created_at, item.reason].filter(Boolean).join(' · ');
+        return `<label class="raw-file-row conflict-member-row" style="${selectable ? 'cursor:pointer;' : 'cursor:default;'}grid-template-columns:auto 1fr auto;align-items:start">
           ${radio}
           <div>
-            <code>${escapeHtml(mid)}</code>
+            <strong>${escapeHtml(title)}</strong>
             <div class="surface-meta">${escapeHtml(String(preview))}</div>
+            <details class="conflict-technical-id"><summary>技术详情</summary><code>${escapeHtml(mid || '未提供 ID')}</code>${details ? `<div class="surface-meta">${escapeHtml(details)}</div>` : ''}</details>
           </div>
           <span class="chip chip-${chipClass}">${escapeHtml(status)}${!selectable ? ' · 不可选' : ''}</span>
         </label>`;
@@ -7843,8 +8201,10 @@ async function renderConflictQueue() {
       const isStale = !canResolve || ['stale', 'invalid'].includes(String(c.status || '').toLowerCase());
       const reasonLabels = {canonical_composition_conflict: '相关记忆的内容主张互相矛盾，需选择保留版本', explicit_composition_conflict: '相关记忆被明确标记为内容主张冲突，需选择保留版本'};
       const reasonText = reasonLabels[String(c.reason || c.reason_code || '').toLowerCase()] || c.reason || c.reason_code || '相关记忆的内容主张存在差异，需选择保留版本';
-      const statusLabel = isStale ? '历史冲突 · 候选已失效/不可恢复' : (c.status || 'unresolved');
-      const invalidReason = c.invalid_reason || '历史冲突中没有至少 2 条仍有效的记忆，候选已失效或不可恢复。';
+      const statusLabel = isStale ? '历史冲突 · 候选失效，可关闭' : (c.status || 'unresolved');
+      const invalidReason = c.invalid_reason
+        ? `${c.invalid_reason} 该组不可二选一，但可关闭以保留审计记录。`
+        : '历史冲突中没有至少 2 条仍有效的记忆，不能二选一；可关闭以保留审计记录。';
       return `<article class="plan-item">
         <div class="finding-header">
           <span class="finding-rule">冲突组 ${escapeHtml((c.group_id || '').slice(0, 16))}</span>
@@ -7856,11 +8216,12 @@ async function renderConflictQueue() {
         <div class="raw-file-list" style="margin-top:10px">${members}</div>
         <div class="finding-actions" style="margin-top:10px">
           ${canResolve ? `<button class="btn btn-primary" type="button" onclick="resolveConflict('${escapeHtml(c.group_id)}')">保留选中并解决</button>` : `<button class="btn btn-primary" type="button" disabled title="${escapeHtml(invalidReason)}">保留选中并解决</button><span class="surface-meta">${escapeHtml(invalidReason)}</span>`}
+          ${actionButtons}
         </div>
       </article>`;
     }).join('');
     container.innerHTML = `<section class="card"><div class="card-head"><div><h2>冲突队列</h2>
-      <p>共 ${conflicts.length} 个历史冲突组，其中 ${actionableCount} 个可处理；失效组仅供查看。可处理冲突选择保留哪条，其余将被软删除。</p></div></div>
+      <p>共 ${conflicts.length} 个未闭合冲突组，可选择保留 ${actionableCount} 组、可关闭失效 ${closableStaleCount} 组。可处理冲突选择保留哪条，其余将被软删除；失效冲突不可二选一，但可关闭并保留审计记录。</p></div></div>
       ${items}</section>`;
   } catch (e) {
     showToast('加载失败：' + e, 'error');
@@ -8017,19 +8378,30 @@ function governanceCounts() {
   return {
     active: finiteOrNull(counts.active_memories),
     conflicts: finiteOrNull(counts.conflicts),
+    selectableConflicts: finiteOrNull(counts.selectable_conflicts),
+    closableStaleConflicts: finiteOrNull(counts.closable_stale_conflicts),
     quarantined: finiteOrNull(counts.quarantined),
     rollback: finiteOrNull(counts.rollback_ready),
   };
+}
+
+function conflictDispositionText(snapshot = state.governanceSnapshot) {
+  const conflict = objectValue(snapshot?.conflicts);
+  const selectable = finiteOrNull(conflict.selectable_total ?? conflict.actionable_total);
+  const closable = finiteOrNull(conflict.closable_stale_total ?? conflict.stale_total);
+  if (selectable === null && closable === null) return '';
+  return `可选择保留 ${selectable === null ? '暂不可用' : selectable} · 可关闭失效 ${closable === null ? '暂不可用' : closable}`;
 }
 
 function renderOverviewRail() {
   const snap = state.governanceSnapshot || {};
   const event = snap.latest_event || null;
   const counts = governanceCounts();
+  const conflictDetail = conflictDispositionText(snap);
   railTitle('最近动态', `
     ${event ? `<div class="rail-section"><h4>${escapeHtml(agentDisplayName(event.agent_instance_id, '最近写入'))}</h4><div class="rail-copy">${escapeHtml(event.raw_content_preview || '事件未返回内容摘要')}</div><div class="surface-meta">${escapeHtml(event.created_at || '')}</div></div>` : '<div class="empty-inline">暂无运行期事件。连接 Agent 后会在这里显示真实写入。</div>'}
     <div class="rail-section"><h4>快捷操作</h4><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button><button class="btn" type="button" onclick="switchTab('sources')">管理数据源</button><button class="btn" type="button" onclick="switchTab('findings')">查看风险</button></div></div>
-    <div class="rail-section"><h4>治理摘要</h4>${railKey('有效记忆', counts.active === null ? '暂不可用' : String(counts.active))}${railKey('待回滚版本', counts.rollback === null ? '暂不可用' : String(counts.rollback), counts.rollback ? '' : 'zero')}</div>`);
+    <div class="rail-section"><h4>治理摘要</h4>${railKey('有效记忆', counts.active === null ? '暂不可用' : String(counts.active))}<div class="status-item ${counts.conflicts ? 'alert' : 'zero'}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('conflicts'),50)"><span class="status-label">未解决冲突</span><span><span class="status-num">${counts.conflicts === null ? '暂不可用' : counts.conflicts}</span>${conflictDetail ? `<small class="surface-meta" style="display:block;text-align:right">${escapeHtml(conflictDetail)}</small>` : ''}</span></div>${railKey('待回滚版本', counts.rollback === null ? '暂不可用' : String(counts.rollback), counts.rollback ? '' : 'zero')}</div>`);
 }
 
 function openGovernanceSubtab(subTab) {
@@ -8090,26 +8462,28 @@ function renderOverview() {
   const findings = Array.isArray(report.findings) ? report.findings : [];
   const snap = state.governanceSnapshot || {};
   const counts = governanceCounts();
-  const health = finiteOrNull(report.health_score);
+  const health = optionalFiniteNumber(report.health_score);
+  const healthUnavailable = healthEvidenceUnavailable(report);
   const completed = auditIsCompleted(report);
   const objectCount = finiteOrNull(summary.object_count);
   const trend = Array.isArray(report.risk_trend) ? report.risk_trend : (Array.isArray(report.trend) ? report.trend : []);
   const topRules = Array.isArray(report.top_rules) ? report.top_rules : [];
   const latest = [snap.latest_event, snap.latest_supersede].filter(Boolean);
+  const conflictDetail = conflictDispositionText(snap);
   const stages = ['发现', '接入', '提取', '规范化', '监控', '审计'];
   const stageStates = governanceStageStates(report);
   const healthText = health === null
-    ? (completed ? (findings.length ? `需处理 ${findings.length} 项` : '扫描完成') : auditStateLabel(report))
-    : `${Math.round(Math.max(0, Math.min(100, health)))}/100`;
+    ? (healthUnavailable ? healthEvidenceLabel(report) : (completed ? (findings.length ? `需处理 ${findings.length} 项` : '审计通过（未提供量化评分）') : auditStateLabel(report)))
+    : (healthUnavailable ? healthEvidenceLabel(report) : `${Math.round(Math.max(0, Math.min(100, health)))}/100`);
   const riskRows = findings.slice(0, 5).map(finding => `<button type="button" aria-label="查看风险详情：${escapeHtml(riskRuleLabel(finding.rule_id, finding))}" onclick="openFinding('${escapeHtml(finding.id || '')}')"><span class="overview-risk-copy"><strong>${escapeHtml(riskRuleLabel(finding.rule_id, finding))}</strong><span>原因：${escapeHtml(riskReasonText(finding))}</span><small>建议：${escapeHtml(riskActionText(finding))}</small></span><span class="chip chip-${escapeHtml(finding.severity || 'info')}">${escapeHtml(riskSeverityLabel(finding.severity, finding))}</span></button>`).join('') || '<div class="empty-inline">当前审计未返回风险信号。</div>';
   const ruleRows = topRules.slice(0, 5).map(rule => `<button type="button" onclick="selectedRuleId='${escapeHtml(rule.memory_id || rule.rule_id || '')}';switchTab('rules')"><span>${escapeHtml(displayTitle(rule) || '未命名规则')}</span><span class="muted">${escapeHtml(rule.hit_count ?? rule.hits ?? '暂不可用')}</span></button>`).join('') || '<div class="empty-inline">当前审计未返回规则命中统计。</div>';
-  const activityRows = latest.map(item => `<button type="button" onclick="switchTab('governance')"><span>${escapeHtml(agentDisplayName(item.agent_instance_id, eventActionLabel(item.action || item.type || 'auto')))}</span><span class="muted">${escapeHtml(item.created_at || '')}</span></button>`).join('') || '<div class="empty-inline">暂无近期活动。</div>';
+  const activityRows = latest.map(item => `<button type="button" onclick="switchTab('governance')"><span>${escapeHtml(activityActorLabel(item))}</span><span class="muted">${escapeHtml(item.created_at || '')}</span></button>`).join('') || '<div class="empty-inline">暂无近期活动。</div>';
   setContent(`<div class="dashboard-view overview-view"><div class="dashboard-main">
     <div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Governance overview</span><h2>总览</h2></div><span class="muted">${escapeHtml(unavailableMetric(report.generated_at, '暂无扫描时间'))}</span><button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button></div>
     <div class="kpi-grid">
-      <div class="kpi ${completed ? '' : 'muted'}"><span>治理健康度</span><strong>${escapeHtml(healthText)}</strong></div>
+      <div class="kpi ${completed && !healthUnavailable ? '' : 'muted'}"><span>${escapeHtml(healthScopeLabel(report))}</span><strong>${escapeHtml(healthText)}</strong><small class="kpi-hint">${escapeHtml(healthCoverageText(report))}</small></div>
       <div class="kpi"><span>已识别对象</span><strong>${objectCount === null ? '暂不可用' : objectCount}</strong></div>
-      <div class="kpi ${counts.conflicts ? 'alert' : ''}" role="button" tabindex="0" aria-label="打开未解决冲突队列" onclick="openGovernanceSubtab('conflicts')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openGovernanceSubtab('conflicts')}"><span>未解决冲突</span><strong>${counts.conflicts === null ? '暂不可用' : counts.conflicts}</strong><small class="kpi-hint">点击查看详情</small></div>
+      <div class="kpi ${counts.conflicts ? 'alert' : ''}" role="button" tabindex="0" aria-label="打开未解决冲突队列" onclick="openGovernanceSubtab('conflicts')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openGovernanceSubtab('conflicts')}"><span>未解决冲突</span><strong>${counts.conflicts === null ? '暂不可用' : counts.conflicts}</strong><small class="kpi-hint">${escapeHtml(conflictDetail || '点击查看详情')}</small></div>
       <div class="kpi ${findings.length ? 'danger' : ''}" role="button" tabindex="0" aria-label="打开风险信号详情" onclick="switchTab('findings')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();switchTab('findings')}"><span>风险信号</span><strong>${findings.length}</strong><small class="kpi-hint">点击查看详情</small></div>
     </div>
     <section><div class="compact-toolbar"><div class="toolbar-grow"><h2>治理流程</h2><span class="muted">只展示后端明确状态；缺少证据的阶段标为不可判定。</span></div></div><div class="governance-timeline">${stages.map((label, index) => { const stage = stageStates[index]; return `<div class="governance-stage ${stage}" aria-label="${index + 1}. ${label}：${stageStateLabel(stage)}"><span class="stage-name">${index + 1}. ${label}</span><span class="stage-state">${stageStateLabel(stage)}</span></div>`; }).join('')}</div></section>
@@ -8164,16 +8538,33 @@ function renderSourcesRail() {
       ...activeScopeMemberIds,
       ...(Array.isArray(snapshot.members) ? snapshot.members.map(item => String(item?.instance_id || item?.agent_instance_id || item || '')) : []),
     ].filter(Boolean))];
-    const memberNames = agentNamesForIds(memberIds);
-    const memberCount = memberIds.length;
+    const programProjection = Array.isArray(agentCardsData?.program_member_details)
+      ? agentCardsData.program_member_details
+      : (Array.isArray(agentCardsData?.member_details)
+        ? agentCardsData.member_details
+        : (Array.isArray(agentCardsData?.program_members) ? agentCardsData.program_members : (agentCardsData?.agents || [])));
+    const railSummary = governanceGroupProgramSummary({...agentCardsData, members: programProjection});
+    const memberNames = railSummary.names.length ? railSummary.names : agentNamesForIds(memberIds).filter(name => name !== '未识别的 MCP 助手');
+    const declaredProgramCount = optionalFiniteNumber(agentCardsData?.program_member_count);
+    const endpointMemberCount = optionalFiniteNumber(agentCardsData?.member_count ?? agentCardsData?.endpoint_member_count);
+    const declaredOtherCount = optionalFiniteNumber(agentCardsData?.extra_connection_count);
+    const programCount = declaredProgramCount === null ? railSummary.programCount : Math.max(0, declaredProgramCount);
+    const otherCount = declaredOtherCount === null
+      ? (endpointMemberCount === null ? Math.max(0, memberIds.length - programCount) : Math.max(0, endpointMemberCount - programCount))
+      : Math.max(0, declaredOtherCount);
+    const connectionCount = endpointMemberCount === null ? programCount + otherCount : Math.max(0, endpointMemberCount);
+    const unknownCount = optionalFiniteNumber(agentCardsData?.unknown_member_count)
+      ?? optionalFiniteNumber(agentCardsData?.unresolved_member_count)
+      ?? railSummary.unknownCount;
     const counts = governanceCounts();
     const summary = memberNames.length
       ? `${memoryGroupLabel(activeShareGroupId)} · ${memberNames.join('、')}`
       : `${memoryGroupLabel(activeShareGroupId)} · 成员名称待加载`;
     railTitle('共享治理', `<div class="rail-section"><div class="rail-title">共享治理 · 已激活</div><div class="rail-copy">${escapeHtml(summary)}</div></div>
-      ${railKey('成员', `${memberCount} 个`)}
+      ${railKey('程序', `${programCount} 个`)}
+      ${railKey('连接', `${connectionCount} 条（其他 ${otherCount}${unknownCount ? `，待识别 ${unknownCount}` : ''}）`)}
       ${railKey('有效记忆', counts.active === null ? '暂不可用' : String(counts.active))}
-      <div class="rail-section"><div class="rail-copy">当前共享范围已覆盖 ${memberCount} 个成员。选择 Agent 卡片后，才切换到该 Agent 的详情。</div></div>
+      <div class="rail-section"><div class="rail-copy">当前共享范围包含 ${programCount} 个程序、${connectionCount} 条连接，其中 ${otherCount} 条为其他连接${unknownCount ? `（${unknownCount} 条待识别）` : ''}。选择 Agent 卡片后，才切换到该 Agent 的详情。</div></div>
       <details class="compact-secondary"><summary>技术详情</summary><div class="rail-copy">share_group_id: ${escapeHtml(activeShareGroupId)}</div></details>
       <div class="rail-section"><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="enterMultiAgentMode()">管理记忆组</button><button class="btn" type="button" onclick="discoverAgents()">检测本机 Agent</button></div></div>`);
     return;
@@ -8182,11 +8573,101 @@ function renderSourcesRail() {
   railTitle('Agent 详情', `<div class="rail-section"><div class="rail-title">${escapeHtml(agentDisplayName(agent, '未选择 Agent'))}</div><div class="rail-copy">选择数据源行后，在此查看来源细节。</div></div><div class="rail-section"><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="discoverAgents()">检测本机 Agent</button>${activeAgentInstanceId ? `<button class="btn" type="button" onclick="selectAgentInstance('${escapeHtml(activeAgentInstanceId)}')">勾选授权</button>` : ''}<button class="btn" type="button" onclick="enterMultiAgentMode()">管理记忆组</button></div></div>`);
 }
 
-function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) {
+function agentMemberKey(member) {
+  const item = member && typeof member === 'object' ? member : {};
+  return String(item.instance_id || item.agent_instance_id || item.agent_id || item.id || item.binding_id || '').trim();
+}
+
+function agentProgramKey(member) {
+  const item = member && typeof member === 'object' ? member : {};
+  return String(item.canonical_program_id || item.program_id || agentMemberKey(item)).trim();
+}
+
+function agentMemberLabel(member, index = 0) {
+  const label = agentDisplayName(member, '');
+  return label && label !== '未识别的 MCP 助手' ? label : `待识别/历史连接 ${index + 1}`;
+}
+
+function agentMemberStatus(member, binding, historical = false) {
+  if (binding?.status === 'active') return historical ? '历史连接 · 已绑定' : (binding.group_kind === 'shared' ? '已绑定共享组' : '已启用个人层');
+  const raw = String(member?.member_status || member?.lifecycle_state || member?.status || '').trim().toLowerCase();
+  const labels = {
+    active: '已连接', connected: '已连接', bound: '已绑定', ready: '可用',
+    stale: '历史连接 · 已失效', missing: '历史连接 · 待识别', expired: '历史连接 · 已过期',
+    unresolved: '待识别', unknown: '待识别', unavailable: '暂不可用',
+  };
+  return labels[raw] || (historical ? '历史连接 · 待识别' : '待确认');
+}
+
+function isUnknownHistoricalMember(member) {
+  const item = member && typeof member === 'object' ? member : {};
+  const status = String(item.member_status || item.lifecycle_state || item.status || '').trim().toLowerCase();
+  const label = [item.display_name, item.agent_name, item.member_name, item.provider_name,
+    item.provider, item.product, item.program_name, item.program, item.client_name]
+    .map(value => String(value || '').trim()).find(Boolean);
+  const readableLabel = readableAgentPart(label, agentMemberKey(item));
+  const genericLabel = !readableLabel || ['unknown', 'unresolved', 'missing', 'n/a', 'null', '未知助手', '未知 agent', '未识别', '未识别的 mcp 助手'].includes(readableLabel.toLowerCase());
+  const knownProduct = agentFamily(item) !== 'unknown' || !genericLabel;
+  const programId = String(item.canonical_program_id ?? item.program_id ?? '').trim().toLowerCase();
+  const unknownProgramId = !programId || ['unknown', 'unresolved', 'missing', 'n/a', 'null'].includes(programId);
+  const identityResolution = String(item.identity_resolution || item.identity_status || '').trim().toLowerCase();
+  if (status === 'historical_unknown') return !knownProduct;
+  if (knownProduct) return false;
+  if (['unknown', 'unresolved', 'missing'].includes(status)) return true;
+  return unknownProgramId && ['unknown', 'unresolved', 'missing'].includes(identityResolution);
+}
+
+async function unbindAgentBinding(bindingId) {
+  const id = String(bindingId || '').trim();
+  if (!id) return showToast('缺少 binding_id，无法解除连接', 'error');
+  if (!confirm('确认解除该 Agent 连接？\n\nMemoryGuard 记忆库不会被删除，只移除这条绑定。')) return;
+  try {
+    const result = await callApi('unbind_agent', id);
+    if (result && (result.error || result.ok === false)) return showToast(apiErrorMessage(result, '解除连接失败'), 'error');
+    showToast('连接已解除', 'success');
+    await renderSources();
+  } catch (error) {
+    showToast('解除连接失败：' + error, 'error');
+  }
+}
+
+function agentUnbindButton(member, binding) {
+  const id = String(member?.binding_id || binding?.binding_id || '').trim();
+  const allowed = member?.can_unbind === true || binding?.can_unbind === true;
+  return id && allowed
+    ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation();unbindAgentBinding('${escapeHtml(id)}')">解除连接</button>`
+    : '';
+}
+
+function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult, renderToken = currentContentRenderToken('sources')) {
   const sources = Array.isArray(sourcesResult?.sources) ? sourcesResult.sources : [];
-  const agents = Array.isArray(agentCardsData?.agents) ? agentCardsData.agents : [];
+  const listedAgents = Array.isArray(agentCardsData?.agents) ? agentCardsData.agents.filter(item => item && typeof item === 'object') : [];
+  const explicitProgramMembers = Array.isArray(agentCardsData?.program_members)
+    ? agentCardsData.program_members.filter(item => item && typeof item === 'object')
+    : [];
   const residuals = Array.isArray(agentCardsData?.residuals) ? agentCardsData.residuals : [];
   const bindings = Array.isArray(bindingsResult?.bindings) ? bindingsResult.bindings : [];
+  const memberDetails = Array.isArray(agentCardsData?.member_details)
+    ? agentCardsData.member_details
+    : (Array.isArray(agentCardsData?.members)
+      ? agentCardsData.members
+      : bindings.map(item => ({...item, member_status: item.member_status || item.status, historical: item.historical === true || item.status !== 'active'})));
+  const unresolvedMemberKeys = new Set(memberDetails
+    .filter(item => ['unresolved', 'missing', 'stale', 'history', 'historical', 'unknown', 'inactive'].includes(String(item?.member_status || item?.status || '').trim().toLowerCase()))
+    .map(agentMemberKey).filter(Boolean));
+  const discoveredAgents = listedAgents.length ? listedAgents : explicitProgramMembers;
+  const agents = Array.from(new Map(discoveredAgents
+    .filter(item => !unresolvedMemberKeys.has(agentMemberKey(item)))
+    .map((item, index) => [agentProgramKey(item) || `program-${index}`, item])).values());
+  const programKeys = new Set(agents.map(agentMemberKey).filter(Boolean));
+  const historicalMembers = Array.from(new Map(
+    [...residuals, ...memberDetails].filter(item => item && typeof item === 'object')
+      .filter(item => {
+        const key = agentMemberKey(item);
+        return !key || !programKeys.has(key) || item.is_program_member === false || item.program_member === false;
+      })
+      .map((item, index) => [agentMemberKey(item) || `history-${index}`, item]),
+  ).values());
   const activeBindings = bindings.filter(item => item.status === 'active');
   sourcePageRecords = new Map(sources.map(item => [String(item.root_id || item.source_id || item.id || ''), item]));
   sourcePageRecords.set('__sourcesResult', sourcesResult); sourcePageRecords.set('__rawResult', rawResult); sourcePageRecords.set('__agentData', agentData); sourcePageRecords.set('__bindingsResult', bindingsResult); sourcePageRecords.set('__bindings', activeBindings);
@@ -8196,14 +8677,16 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
   const agentCards = agents.map(agent => {
     const active = !isShareGroupScope() && agent.instance_id === activeAgentInstanceId;
     const summary = agentSummary(agent);
-    const binding = activeBindings.find(item => sameNonEmptyAgentId(item.agent_instance_id, agent.instance_id));
+    const agentKey = agentMemberKey(agent);
+    const binding = activeBindings.find(item => sameNonEmptyAgentId(item.agent_instance_id, agent.instance_id)
+      || (agent.binding_id && String(item.binding_id || '') === String(agent.binding_id)));
     const action = binding
-      ? `<button class="btn" type="button" onclick="event.stopPropagation();viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button><button class="btn" type="button" onclick="event.stopPropagation();installMemoryGroupMcp('${escapeHtml(binding.share_group_id)}')">安装 MCP</button>${binding.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation();leaveSharedToPersonal('${escapeHtml(agent.instance_id)}')">回个人层</button>` : ''}`
-      : `<button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(agent.instance_id)}')">启用个人层</button>`;
+      ? `<button class="btn" type="button" onclick="event.stopPropagation();viewMemoryLayer('${escapeHtml(binding.share_group_id)}')">进入记忆层</button><button class="btn" type="button" onclick="event.stopPropagation();installMemoryGroupMcp('${escapeHtml(binding.share_group_id)}')">安装 MCP</button>${binding.group_kind === 'shared' ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation();leaveSharedToPersonal('${escapeHtml(agent.instance_id)}')">回个人层</button>` : ''}${agentUnbindButton(agent, binding)}`
+      : `<button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(agent.instance_id || agentKey)}')">启用个人层</button>${agentUnbindButton(agent, binding)}`;
     const displayName = agentDisplayName(agent);
     const sourceSummary = agentSourceSummary(agent);
-    const identity = agentIdentityDetail(agent);
-    return `<article class="agent-card ${active ? 'active' : ''}" role="button" tabindex="0" data-agent-id="${escapeHtml(agent.instance_id || '')}" onclick="selectAgentCard('${escapeHtml(agent.instance_id)}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectAgentCard('${escapeHtml(agent.instance_id)}'); }">${agentIconMarkup(agent)}<div class="agent-name">${escapeHtml(displayName)}</div><div class="agent-meta">${summary.sourceCount} 来源 · ${summary.foundSurfaceCount}/${summary.surfaceCount} 表面</div><div class="agent-meta agent-source-summary">${escapeHtml(sourceSummary)}</div><span class="chip chip-${binding ? 'confirmed' : 'info'}">${binding ? (binding.group_kind === 'shared' ? '已绑定共享组' : '已启用个人层') : '可接入'}</span><details class="agent-technical-id" onclick="event.stopPropagation()"><summary>技术标识</summary><code>${escapeHtml(identity || '未返回')}</code></details><div class="finding-actions">${action}</div></article>`;
+    const identity = agentIdentityDetail(agent) || agent.binding_id || agent.agent_instance_id;
+    return `<article class="agent-card ${active ? 'active' : ''}" role="button" tabindex="0" data-agent-id="${escapeHtml(agent.instance_id || agentKey)}" onclick="selectAgentCard('${escapeHtml(agent.instance_id || agentKey)}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectAgentCard('${escapeHtml(agent.instance_id || agentKey)}'); }">${agentIconMarkup(agent)}<div class="agent-name">${escapeHtml(displayName)}</div><div class="agent-meta">${summary.sourceCount} 来源 · ${summary.foundSurfaceCount}/${summary.surfaceCount} 表面</div><div class="agent-meta agent-source-summary">${escapeHtml(sourceSummary)}</div><span class="chip chip-${binding ? 'confirmed' : 'info'}">${escapeHtml(agentMemberStatus(agent, binding))}</span><details class="agent-technical-id" onclick="event.stopPropagation()"><summary>技术标识</summary><code>${escapeHtml(identity || '未返回')}</code></details><div class="finding-actions">${action}</div></article>`;
   }).join('') || '<div class="empty-inline">未发现可接入 Agent。可执行本机检测或手工添加来源。</div>';
   const sourceRows = filteredSources.map(source => {
     const id = String(source.root_id || source.source_id || source.id || '');
@@ -8220,13 +8703,44 @@ function renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult) 
     return `<tr><td>${escapeHtml(item.scope)}</td><td>${escapeHtml(item.category)}</td><td><code>${escapeHtml(guiPathText(file.relative_path || file.path || file.display_name, '未命名文件'))}</code></td><td>${canOpen ? `<button class="btn" type="button" onclick="viewSourceFile(...${args})">查看</button>` : '<span class="muted">仅发现，需先授权</span>'}</td></tr>`;
   }).join('') || '<tr><td colspan="4" class="empty-note">选中 Agent 暂无已发现数据。</td></tr>';
   const coverage = rawResult?.coverage || {};
+  const declaredProgramCount = optionalFiniteNumber(agentCardsData?.program_member_count);
+  const endpointMemberCount = optionalFiniteNumber(agentCardsData?.member_count ?? agentCardsData?.endpoint_member_count);
+  const declaredHistoricalCount = optionalFiniteNumber(agentCardsData?.unresolved_member_count);
+  const declaredUnknownCount = optionalFiniteNumber(agentCardsData?.unknown_member_count)
+    ?? optionalFiniteNumber(agentCardsData?.unresolved_member_count);
+  const programCount = declaredProgramCount === null ? agents.length : Math.max(0, declaredProgramCount);
+  // ``member_count`` is the endpoint total, while program_member_count only
+  // counts recognized programs.  Keep redundant and unknown bindings visible
+  // as other connections instead of silently folding them into the headline.
+  const historicalCount = endpointMemberCount === null
+    ? (declaredHistoricalCount === null ? historicalMembers.length : Math.max(declaredHistoricalCount, historicalMembers.length))
+    : Math.max(0, endpointMemberCount - programCount);
+  const unknownCount = declaredUnknownCount === null
+    ? historicalMembers.filter(isUnknownHistoricalMember).length
+    : Math.max(0, declaredUnknownCount);
+  const historicalCards = historicalMembers.map((item, index) => {
+    const key = agentMemberKey(item);
+    const displayName = agentMemberLabel(item, index);
+    const identity = agentIdentityDetail(item) || item.binding_id || item.agent_instance_id;
+    const binding = activeBindings.find(candidate => (item.binding_id && String(candidate.binding_id || '') === String(item.binding_id))
+      || (item.agent_instance_id && sameNonEmptyAgentId(candidate.agent_instance_id, item.agent_instance_id)));
+    const details = [item.member_status || item.status, item.reason, item.last_seen_at || item.updated_at].filter(Boolean).join(' · ');
+    const actions = agentUnbindButton(item, binding) || (item.instance_id || item.agent_instance_id
+      ? `<button class="btn" type="button" onclick="event.stopPropagation();showResidualCleanup('${escapeHtml(item.instance_id || item.agent_instance_id)}')">查看原生数据</button>`
+      : `<button class="btn" type="button" onclick="event.stopPropagation();renderMultiAgentBinding()">管理连接</button>`);
+    return `<article class="agent-card historical-agent-card" data-agent-id="${escapeHtml(key)}">${agentIconMarkup(item)}<div class="agent-name">${escapeHtml(displayName)}</div><div class="agent-meta">${escapeHtml(agentSourceSummary(item))}</div><div class="agent-meta">${escapeHtml(details || '后端尚未提供可读状态')}</div><span class="chip chip-high">${escapeHtml(agentMemberStatus(item, binding, true))}</span><details class="agent-technical-id"><summary>技术详情</summary><code>${escapeHtml(identity || '未返回')}</code>${item.binding_id ? `<div class="surface-meta">binding_id · ${escapeHtml(item.binding_id)}</div>` : ''}</details><div class="finding-actions">${actions}</div></article>`;
+  }).join('');
+  const historicalSection = historicalCount || historicalCards
+    ? `<section class="agent-member-section historical-members"><div class="compact-toolbar"><div class="toolbar-grow"><h2>待识别/历史连接</h2><span class="muted">${historicalCount} 条其他连接${unknownCount ? `（${unknownCount} 待识别）` : ''}；保留记录并提供解除或查看入口。</span></div></div><div class="agent-discovery-grid">${historicalCards || `<div class="empty-inline">后端报告 ${historicalCount} 个其他连接，但尚未返回 member_details。</div>`}</div></section>`
+    : '';
   setContent(`<div class="dashboard-view sources-view"><div class="dashboard-main">
     <div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Data sources</span><h2>数据源与代理</h2></div><div class="page-tabs" role="tablist"><button class="${sourceViewTab === 'all' ? 'active' : ''}" onclick="setSourceViewTab('all')">全部 (${sources.length})</button><button class="${sourceViewTab === 'connected' ? 'active' : ''}" onclick="setSourceViewTab('connected')">已接入</button><button class="${sourceViewTab === 'available' ? 'active' : ''}" onclick="setSourceViewTab('available')">可用</button></div><button class="btn btn-primary" type="button" onclick="discoverAgents()">检测本机 Agent</button><button class="btn" type="button" onclick="addSourceDialog()">添加来源</button><button class="btn" type="button" onclick="importBundleDialog()">导入导出包</button></div>
-    <section><div class="compact-toolbar"><div class="toolbar-grow"><h2>发现的 Agent</h2><span class="muted">主名称使用程序、Provider 或别名；技术 ID 仅在详情显示。</span></div><button class="btn" type="button" onclick="enterMultiAgentMode()">管理记忆组</button></div><div class="agent-discovery-grid">${agentCards}</div></section>
+    <section class="agent-member-section"><div class="compact-toolbar"><div class="toolbar-grow"><h2>程序成员</h2><span class="muted">${programCount} 个程序 · ${historicalCount} 条其他连接${unknownCount ? `（${unknownCount} 待识别）` : ''}；名称来自程序/Provider/别名，技术 ID 仅在详情显示。</span></div><button class="btn" type="button" onclick="enterMultiAgentMode()">管理记忆组</button></div><div class="agent-discovery-grid">${agentCards}</div></section>
+    ${historicalSection}
     <section><div class="compact-toolbar"><div class="toolbar-grow"><h2>已接入来源</h2><span class="muted">点击行固定右侧来源详情。</span></div></div><div class="data-table-wrap"><table class="data-table"><thead><tr><th>名称</th><th>类型</th><th>范围</th><th>状态</th><th>操作</th></tr></thead><tbody>${sourceRows}</tbody></table></div></section>
     <details class="compact-secondary"><summary>文件与扫描数据 · ${agentData?.total_files ?? 0} 个文件</summary><div class="data-table-wrap"><table class="data-table"><thead><tr><th>范围</th><th>分类</th><th>文件</th><th>操作</th></tr></thead><tbody>${scopeRows}</tbody></table></div><div class="chips"><span class="chip chip-info">候选 ${coverage.candidate_count ?? 0}</span><span class="chip chip-confirmed">可读 ${coverage.read ?? 0}</span><span class="chip chip-${Number(coverage.unaccounted_count || 0) ? 'high' : 'confirmed'}">未计入 ${coverage.unaccounted_count ?? 0}</span></div></details>
     ${residuals.length ? `<details class="compact-secondary"><summary>未接入原生数据 · ${residuals.length}</summary><div class="agent-discovery-grid">${residuals.map(item => `<article class="agent-card" role="button" tabindex="0" data-agent-id="${escapeHtml(item.instance_id || '')}" onclick="showResidualCleanup('${escapeHtml(item.instance_id)}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); showResidualCleanup('${escapeHtml(item.instance_id)}'); }">${agentIconMarkup(item)}<div class="agent-name">${escapeHtml(agentDisplayName(item))}</div><div class="agent-meta">${escapeHtml(agentSourceSummary(item))}</div><div class="agent-meta">原生数据 ${item.private_data_surface_count || 0}</div><details class="agent-technical-id" onclick="event.stopPropagation()"><summary>技术标识</summary><code>${escapeHtml(agentIdentityDetail(item) || '未返回')}</code></details><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="event.stopPropagation();ensurePersonalLayer('${escapeHtml(item.instance_id)}')">启用个人层</button></div></article>`).join('')}</div></details>` : ''}
-  </div></div>`);
+  </div></div>`, renderToken);
   renderSourcesRail();
 }
 
@@ -8260,6 +8774,346 @@ function renderFindings() {
   renderRiskRail();
 }
 
+function tokenUsageNumber(...values) {
+  for (const value of values) {
+    const number = optionalFiniteNumber(value);
+    if (number !== null) return number;
+  }
+  return null;
+}
+
+function tokenUsageMode(value) {
+  const key = String(value || '').trim().toLowerCase().replace(/[ -]+/g, '_');
+  if (['measured', 'host_measured', 'host', 'actual', 'observed'].includes(key)) return 'measured';
+  if (['estimated', 'memoryguard', 'memoryguard_estimated', 'deterministic'].includes(key)) return 'estimated';
+  if (['mixed', 'combined', 'both'].includes(key)) return 'mixed';
+  if (['unavailable', 'unknown', 'not_available', 'not_ready', 'pending'].includes(key)) return 'unavailable';
+  return '';
+}
+
+function tokenUsageAgentKey(item = {}) {
+  if (typeof item === 'string') return item.trim();
+  return String(item.agent_key || item.agentKey || item.canonical_program_id || item.program_id
+    || item.program_key || item.agent_instance_id || item.instance_id || item.id || '').trim();
+}
+
+function tokenUsageAgentName(item = {}) {
+  if (typeof item === 'string') return agentDisplayName(item, '未识别 Agent');
+  const direct = item.display_name || item.program_name || item.program || item.provider_name
+    || item.provider || item.product || item.agent_name || item.member_name || '';
+  const resolved = agentDisplayName(item, '');
+  return resolved && resolved !== '未识别的 MCP 助手' ? resolved : (direct || '未识别 Agent');
+}
+
+function tokenUsageTimestamp(row = {}) {
+  return row.last_synced_at || row.synced_at || row.recorded_at || row.updated_at
+    || row.timestamp || row.created_at || '';
+}
+
+function tokenUsageHostReason(item = {}) {
+  const status = String(item.host_measurement_status || item.hostMeasurementStatus || '').trim().toLowerCase();
+  const reason = String(item.host_measurement_reason || item.hostMeasurementReason || item.last_error || '').trim().toLowerCase();
+  if (status === 'host_not_supported' || reason === 'host_does_not_report_tokens') return '宿主未提供实测用量';
+  if (status === 'source_not_found' || reason === 'source_not_detected') return '未检测到来源';
+  if (status === 'not_synced' || status === 'unavailable' || !status) return '未同步';
+  return '';
+}
+
+function tokenUsageMeasuredLabel(row = {}) {
+  if (['measured', 'mixed'].includes(row.mode)) {
+    return `${tokenUsageFormat(row.measuredInput)} / ${tokenUsageFormat(row.measuredOutput)}`;
+  }
+  if (row.mode === 'estimated') return '宿主未提供';
+  return tokenUsageHostReason(row) || '宿主未提供';
+}
+
+function tokenUsageEmptyCopy(payload = {}) {
+  const sync = payload.sync_state && typeof payload.sync_state === 'object' ? payload.sync_state : {};
+  const status = String(sync.status || payload.empty_reason || '').trim().toLowerCase();
+  const providers = sync.providers && typeof sync.providers === 'object' ? sync.providers : {};
+  if (!Object.keys(providers).length || status === 'unavailable' || status === 'not_synced') {
+    return {title: '当前窗口没有 MCP 转换记录。', detail: '未同步。查询本身不会采集宿主用量，请使用顶栏重新扫描。'};
+  }
+  if (status === 'no_measured_source' || status === 'source_not_found') {
+    return {title: '当前窗口没有 MCP 转换记录。', detail: '未检测到来源。已绑定宿主未提供可同步的实测用量文件。'};
+  }
+  if (status === 'host_not_supported') {
+    return {title: '当前窗口没有 MCP 转换记录。', detail: '宿主未提供实测用量。MemoryGuard 估算在有转换事件时单独显示。'};
+  }
+  return {title: '当前窗口没有 MCP 转换记录。', detail: '没有数据时不补零，也不推断节省量。'};
+}
+
+function tokenUsageNormalizeRow(row = {}) {
+  const item = row && typeof row === 'object' ? row : {};
+  const state = item.measurement_state || item.measurement_mode || item.measurement
+    || item.metering || item.source_kind || item.source || item.status;
+  const explicitMode = tokenUsageMode(state);
+  const baseline = tokenUsageNumber(item.estimated_baseline_units, item.baseline_units,
+    item.raw_candidates, item.raw_candidate_tokens, item.candidate_tokens, item.baseline_tokens,
+    item.raw_context_tokens, item.raw_tokens, item.original_tokens);
+  const delivered = tokenUsageNumber(item.estimated_delivered_units, item.delivered_units,
+    item.actual_injected, item.actual_injected_tokens, item.injected_tokens, item.mcp_tokens,
+    item.context_tokens, item.memoryguard_tokens, item.actual_tokens);
+  const measuredInput = tokenUsageNumber(item.measured_input, item.measured_input_tokens,
+    item.host_input_tokens, item.input_tokens);
+  const measuredOutput = tokenUsageNumber(item.measured_output, item.measured_output_tokens,
+    item.host_output_tokens, item.output_tokens);
+  const measuredTotal = tokenUsageNumber(item.measured_total, item.measured_total_tokens,
+    item.host_total_tokens, item.total_tokens);
+  const explicitSavings = tokenUsageNumber(item.estimated_saved_units, item.estimated_savings,
+    item.estimated_saved_tokens, item.saved_tokens, item.savings_tokens);
+  const savings = explicitSavings !== null
+    ? explicitSavings
+    : (baseline !== null && delivered !== null ? Math.max(0, baseline - delivered) : null);
+  const ratioValue = tokenUsageNumber(item.estimated_ratio, item.savings_ratio, item.saved_ratio,
+    item.estimated_savings_ratio);
+  const savingsRatio = ratioValue !== null
+    ? (ratioValue > 1 ? ratioValue / 100 : ratioValue)
+    : (savings !== null && baseline > 0 ? savings / baseline : null);
+  const resolvedMode = explicitMode || (baseline !== null && delivered !== null
+    ? (measuredInput !== null || measuredOutput !== null || measuredTotal !== null ? 'mixed' : 'estimated')
+    : (measuredInput !== null || measuredOutput !== null || measuredTotal !== null ? 'measured' : 'unavailable'));
+  return {
+    ...item,
+    date: String(item.date || item.day || item.period || item.period_start || '').trim(),
+    agentKey: tokenUsageAgentKey(item),
+    agentName: tokenUsageAgentName(item),
+    mode: resolvedMode,
+    rawCandidates: baseline,
+    actualInjected: delivered,
+    savings,
+    savingsRatio,
+    measuredInput,
+    measuredOutput,
+    measuredTotal: measuredTotal !== null
+      ? measuredTotal
+      : (measuredInput !== null || measuredOutput !== null
+        ? (measuredInput || 0) + (measuredOutput || 0) : null),
+    conversions: tokenUsageNumber(item.conversion_count, item.conversions,
+      item.mcp_conversions, item.packet_count, item.request_count),
+    syncedAt: tokenUsageTimestamp(item),
+  };
+}
+
+function normalizeTokenUsagePayload(raw = {}) {
+  const source = objectValue(raw?.data && typeof raw.data === 'object' ? raw.data : raw);
+  const rawRows = Array.isArray(source.rows) ? source.rows
+    : (Array.isArray(source.records) ? source.records
+      : (Array.isArray(source.daily) ? source.daily : []));
+  const rawAgents = Array.isArray(source.agents) ? source.agents
+    : (Array.isArray(source.agent_summaries) ? source.agent_summaries : []);
+  const rows = rawRows.map(tokenUsageNormalizeRow);
+  const status = tokenUsageMode(source.measurement_state || source.status || source.availability || source.measurement_status)
+    || (raw?.ok === false ? 'unavailable' : (rows.length ? 'available' : 'unavailable'));
+  const summary = source.summary && typeof source.summary === 'object' ? {...source.summary} : {};
+  const series = Array.isArray(source.series) ? source.series.map(tokenUsageNormalizeRow) : [];
+  return {
+    ...source,
+    rows,
+    agents: rawAgents,
+    series,
+    summary,
+    status,
+    windowDays: tokenUsageNumber(source.window_days, source.windowDays) || tokenUsageState.windowDays,
+    unit: source.unit || source.counter_unit || source.token_unit || '未提供单位',
+    generatedAt: source.generated_at || source.generatedAt || '',
+    error: raw?.error || source.error || '',
+  };
+}
+
+function tokenUsageErrorKind(payload = {}) {
+  const text = [payload.status, payload.error, payload.code, payload.reason].filter(Boolean)
+    .join(' ').toLowerCase();
+  return text.includes('unavailable') || text.includes('not_ready') || text.includes('not found')
+    || text.includes('operation_not_found') || text.includes('telemetry') ? 'unavailable' : 'error';
+}
+
+function tokenUsageCatalog(payload = {}, bindingsResult = {}) {
+  // Backend roster is authoritative.  Discovery cards contain installed and
+  // historical products, not necessarily members of the trusted group, so
+  // never use them to create token filter options.
+  const roster = Array.isArray(payload.agents) ? payload.agents : [];
+  const fallback = roster.length ? [] : (Array.isArray(bindingsResult?.bindings) ? bindingsResult.bindings : []);
+  const candidates = [...roster, ...fallback];
+  const byKey = new Map();
+  candidates.forEach((candidate, index) => {
+    const item = candidate && typeof candidate === 'object' ? candidate : {agent_key: candidate};
+    const key = tokenUsageAgentKey(item) || `unresolved-${index}`;
+    if (!byKey.has(key)) byKey.set(key, {...item, agentKey: key, agentName: tokenUsageAgentName(item)});
+  });
+  payload.rows.forEach(row => {
+    const key = row.agentKey || `unresolved-row-${byKey.size}`;
+    if (!byKey.has(key)) byKey.set(key, {agentKey: key, agentName: row.agentName || '未识别 Agent'});
+  });
+  return [...byKey.values()];
+}
+
+function tokenUsageRowsForView(payload = {}) {
+  const selected = String(tokenUsageState.agentKey || '').trim();
+  return (payload.rows || []).filter(row => !selected || row.agentKey === selected);
+}
+
+function tokenUsageFormat(value, suffix = '') {
+  const number = optionalFiniteNumber(value);
+  if (number === null) return '未提供';
+  return `${Math.round(number).toLocaleString('zh-CN')}${suffix}`;
+}
+
+function tokenUsagePercent(value) {
+  const number = optionalFiniteNumber(value);
+  return number === null ? '未提供' : `${(number * 100).toFixed(1)}%`;
+}
+
+function tokenUsageSum(rows, selector) {
+  const values = rows.map(row => optionalFiniteNumber(row?.[selector])).filter(value => value !== null);
+  return values.length ? values.reduce((total, value) => total + value, 0) : null;
+}
+
+function tokenUsageChart(series) {
+  const points = (Array.isArray(series) ? series : []).map(tokenUsageNormalizeRow).filter(row =>
+    row.rawCandidates !== null && row.actualInjected !== null);
+  if (!points.length) return '<div class="empty-state" style="min-height:170px"><div><div class="empty-orb"></div><p>暂无可绘制的 MG 估算数据。</p><p class="muted">宿主实测流量单独显示，不与估算线合计。</p></div></div>';
+  const width = 720;
+  const height = 218;
+  // Keep the first and last date labels inside the SVG viewBox.  The chart
+  // scales to its container, so a small symmetric gutter prevents the final
+  // centered label from being clipped at either edge on wide and narrow views.
+  const left = 52;
+  const right = 52;
+  const top = 14;
+  const bottom = 34;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const max = Math.max(1, ...points.flatMap(row => [row.rawCandidates, row.actualInjected]));
+  const x = index => left + (points.length === 1 ? chartWidth / 2 : index * chartWidth / (points.length - 1));
+  const y = value => top + chartHeight - (value / max) * chartHeight;
+  const rawPoints = points.map((row, index) => `${x(index).toFixed(1)},${y(row.rawCandidates).toFixed(1)}`).join(' ');
+  const injectedPoints = points.map((row, index) => `${x(index).toFixed(1)},${y(row.actualInjected).toFixed(1)}`).join(' ');
+  const labels = points.map((row, index) => {
+    const date = row.date || `第 ${index + 1} 日`;
+    return `<text class="chart-label" x="${x(index).toFixed(1)}" y="${height - 10}" text-anchor="middle">${escapeHtml(date.slice(0, 10))}</text>`;
+  }).join('');
+  const dots = points.map((row, index) => `<circle class="chart-dot-raw" cx="${x(index).toFixed(1)}" cy="${y(row.rawCandidates).toFixed(1)}" r="3"><title>${escapeHtml(row.date || '')} 原始候选 ${tokenUsageFormat(row.rawCandidates)}</title></circle><circle class="chart-dot-injected" cx="${x(index).toFixed(1)}" cy="${y(row.actualInjected).toFixed(1)}" r="3"><title>${escapeHtml(row.date || '')} 实际注入 ${tokenUsageFormat(row.actualInjected)}</title></circle>`).join('');
+  const grid = [0, .5, 1].map(ratio => {
+    const lineY = top + chartHeight * ratio;
+    return `<line class="chart-grid" x1="${left}" y1="${lineY.toFixed(1)}" x2="${width - right}" y2="${lineY.toFixed(1)}" /><text class="chart-label" x="${left - 7}" y="${(lineY + 3).toFixed(1)}" text-anchor="end">${tokenUsageFormat(max * (1 - ratio))}</text>`;
+  }).join('');
+  return `<div class="token-chart" role="img" aria-label="MemoryGuard 元开销与实际注入趋势"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true"><g>${grid}<line class="chart-axis" x1="${left}" y1="${top + chartHeight}" x2="${width - right}" y2="${top + chartHeight}" /><polyline class="chart-line-raw" points="${rawPoints}" /><polyline class="chart-line-injected" points="${injectedPoints}" />${dots}${labels}</g></svg></div>`;
+}
+
+function tokenUsageTable(rows, catalog, payload = {}) {
+  const visibleRows = [...rows].sort((left, right) => String(right.date || '').localeCompare(String(left.date || '')));
+  const existing = new Set(visibleRows.map(row => row.agentKey).filter(Boolean));
+  const unavailable = catalog.filter(item => !existing.has(item.agentKey)).map(item => ({
+    agentKey: item.agentKey,
+    agentName: item.agentName || '未识别 Agent',
+    mode: 'unavailable',
+    date: '',
+    rawCandidates: null,
+    actualInjected: null,
+    savings: null,
+    savingsRatio: null,
+    measuredInput: null,
+    measuredOutput: null,
+    conversions: null,
+    syncedAt: '',
+    host_measurement_status: item.host_measurement_status || item.hostMeasurementStatus || '',
+    host_measurement_reason: item.host_measurement_reason || item.hostMeasurementReason || '',
+  }));
+  const tableRows = [...visibleRows, ...unavailable];
+  if (!tableRows.length) {
+    const empty = tokenUsageEmptyCopy(payload);
+    return `<div class="empty-state" style="min-height:180px"><div><div class="empty-orb"></div><p>${escapeHtml(empty.title)}</p><p class="muted">${escapeHtml(empty.detail)}</p></div></div>`;
+  }
+  return `<div class="token-table-wrap"><table class="data-table token-table"><caption class="sr-only">按日期和 Agent 展示 Token 用量及 MCP 转换数据</caption><thead><tr><th>日期</th><th>Agent</th><th>口径</th><th>原始候选 / 实际注入</th><th>估算节省</th><th>实测输入 / 实测输出</th><th>实测总量</th><th>转换次数</th></tr></thead><tbody>${tableRows.map(row => {
+    const modeClass = row.mode === 'measured' ? 'token-source-measured' : row.mode === 'estimated' ? 'token-source-estimated' : row.mode === 'mixed' ? 'token-source-mixed' : 'token-source-unavailable';
+    const modeLabel = row.mode === 'measured' ? '宿主实测' : row.mode === 'estimated' ? 'MemoryGuard 估算' : row.mode === 'mixed' ? '实测 + 估算' : (tokenUsageHostReason(row) || '无数据');
+    const key = row.agentKey || '';
+    const estimated = ['estimated', 'mixed'].includes(row.mode) && row.savings !== null
+      ? `${tokenUsageFormat(row.savings)} <span class="muted">(${tokenUsagePercent(row.savingsRatio)})</span>` : (row.mode === 'unavailable' ? (tokenUsageHostReason(row) || '无数据') : '宿主未提供');
+    const measured = tokenUsageMeasuredLabel(row);
+    const measuredTotal = ['measured', 'mixed'].includes(row.mode)
+      ? tokenUsageFormat(row.measuredTotal)
+      : (row.mode === 'estimated' ? '宿主未提供' : (tokenUsageHostReason(row) || '宿主未提供'));
+    const flow = `<div class="token-flow-cell"><span class="token-flow-line"><span>原始候选</span><strong>${tokenUsageFormat(row.rawCandidates)}</strong></span><span class="token-flow-line"><span>实际注入</span><strong>${tokenUsageFormat(row.actualInjected)}</strong></span></div>`;
+    return `<tr class="${row.mode === 'unavailable' ? 'token-unavailable-row' : ''}"><td>${escapeHtml(row.date || (row.mode === 'unavailable' ? (tokenUsageHostReason(row) || '窗口内无数据') : '窗口内无同步数据'))}</td><td><div class="token-agent-name">${escapeHtml(row.agentName || '未识别 Agent')}</div>${key ? `<details class="token-agent-id"><summary>技术 ID</summary><code>${escapeHtml(key)}</code></details>` : ''}</td><td><span class="${modeClass}">${modeLabel}</span></td><td>${flow}</td><td>${estimated}</td><td>${measured}</td><td>${measuredTotal}</td><td>${tokenUsageFormat(row.conversions)}</td></tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+function setTokenUsageWindow(days) {
+  tokenUsageState.windowDays = Number(days) === 30 ? 30 : 7;
+  renderTokenUsage();
+}
+
+function setTokenUsageAgent(agentKey) {
+  tokenUsageState.agentKey = String(agentKey || '');
+  if (tokenUsageState.payload) renderTokenUsageView(tokenUsageState.payload, tokenUsageState.bindings || {}, currentContentRenderToken('token-usage'));
+}
+
+function renderTokenUsageView(payload = {}, bindingsResult = {}, renderToken = currentContentRenderToken('token-usage')) {
+  const rows = tokenUsageRowsForView(payload);
+  const catalog = tokenUsageCatalog(payload, bindingsResult);
+  const measuredRows = rows.filter(row => ['measured', 'mixed'].includes(row.mode));
+  const estimatedRows = rows.filter(row => ['estimated', 'mixed'].includes(row.mode));
+  const summary = {
+    ...(payload.summary && typeof payload.summary === 'object' ? payload.summary : {}),
+    ...Object.fromEntries(['estimated_baseline_units', 'estimated_delivered_units', 'estimated_saved_units',
+      'estimated_ratio', 'savings_ratio', 'measured_input', 'measured_output', 'measured_total']
+      .filter(key => payload[key] !== null && payload[key] !== undefined)
+      .map(key => [key, payload[key]])),
+  };
+  const hostTotal = tokenUsageNumber(summary.measured_total, tokenUsageSum(measuredRows, 'measuredTotal'));
+  const hostMeasuredLabel = hostTotal === null ? (estimatedRows.length ? '宿主未提供' : (tokenUsageEmptyCopy(payload).detail.includes('未同步') ? '未同步' : '宿主未提供')) : tokenUsageFormat(hostTotal);
+  const mgSavings = tokenUsageNumber(summary.estimated_saved_units, tokenUsageSum(estimatedRows, 'savings'));
+  const mgRaw = tokenUsageNumber(summary.estimated_baseline_units, tokenUsageSum(estimatedRows, 'rawCandidates'));
+  const mgRatio = tokenUsageNumber(summary.estimated_ratio, summary.savings_ratio,
+    mgSavings !== null && mgRaw ? mgSavings / mgRaw : null);
+  const rowsWithData = new Set(rows.filter(row => ['measured', 'estimated', 'mixed'].includes(row.mode)).map(row => row.agentKey));
+  const unavailableCount = catalog.filter(item => !rowsWithData.has(item.agentKey)).length;
+  const lastSync = rows.map(row => row.syncedAt).filter(Boolean).sort().pop() || payload.generatedAt || '未同步';
+  const options = catalog.map(item => `<option value="${escapeHtml(item.agentKey)}" ${item.agentKey === tokenUsageState.agentKey ? 'selected' : ''}>${escapeHtml(item.agentName || '未识别 Agent')}</option>`).join('');
+  const hostInput = tokenUsageNumber(summary.measured_input, tokenUsageSum(measuredRows, 'measuredInput'));
+  const hostOutput = tokenUsageNumber(summary.measured_output, tokenUsageSum(measuredRows, 'measuredOutput'));
+  const syncState = payload.sync_state && typeof payload.sync_state === 'object' ? payload.sync_state : {};
+  const syncStatus = String(syncState.status || payload.sync_status || '').trim().toLowerCase();
+  const syncError = payload.sync_error || syncState.error || syncState.message || '';
+  const syncNotice = syncError || ['error', 'failed', 'partial'].includes(syncStatus)
+    ? `<div class="token-sync-notice">同步状态：${escapeHtml(syncError || syncStatus || '失败')}。已显示可用历史数据，未将缺失数据补为 0。</div>` : '';
+  setContent(`<div class="dashboard-view token-usage-view"><div class="token-usage-toolbar"><div class="toolbar-grow"><span class="eyebrow">Token usage</span><h2>Token 用量与 MCP 节省</h2><p>按绑定 Agent 查看上下文转换量。宿主实测与 MemoryGuard 估算分开呈现，不把不同口径合计为一个实际 Token。</p></div><div class="token-window-tabs" role="tablist" aria-label="统计窗口"><button type="button" class="${tokenUsageState.windowDays === 7 ? 'active' : ''}" role="tab" aria-selected="${tokenUsageState.windowDays === 7}" onclick="setTokenUsageWindow(7)">7 日</button><button type="button" class="${tokenUsageState.windowDays === 30 ? 'active' : ''}" role="tab" aria-selected="${tokenUsageState.windowDays === 30}" onclick="setTokenUsageWindow(30)">30 日</button></div><label class="sr-only" for="token-agent-filter">选择 Agent</label><select id="token-agent-filter" class="token-agent-filter" onchange="setTokenUsageAgent(this.value)"><option value="">全部绑定 Agent</option>${options}</select></div><div class="token-scope-note">计量来源：绿色为宿主实测，琥珀为 MemoryGuard 确定性估算，灰色为宿主未提供或未同步。当前单位：${escapeHtml(payload.unit)}。缺少同步数据时显示未同步/未检测到来源/宿主未提供实测用量，不按 0 处理。宿主实测与估算结果不可合计。</div>${syncNotice}<div class="token-kpi-grid"><div class="token-kpi measured"><span>宿主实测流量</span><strong>${hostMeasuredLabel}</strong><small>输入 ${tokenUsageFormat(hostInput)} · 输出 ${tokenUsageFormat(hostOutput)}</small></div><div class="token-kpi estimated"><span>MG 估算节省</span><strong>${mgSavings === null ? (rows.length ? '宿主未提供' : '无数据') : tokenUsageFormat(mgSavings)}</strong><small>估算比例 ${tokenUsagePercent(mgRatio)} · 仅估算行</small></div><div class="token-kpi unavailable"><span>不可用 Agent</span><strong>${unavailableCount}</strong><small>窗口内没有可用的实测或估算记录</small></div></div><section class="token-chart-card"><div class="token-chart-head"><div><h3>MemoryGuard 估算趋势</h3><p>元开销（原始候选）与实际注入的两条线。宿主实测流量在上方独立显示。</p></div><div class="token-legend" aria-label="图例"><span class="token-legend-item"><i class="token-legend-swatch raw"></i>元开销 / 原始候选</span><span class="token-legend-item"><i class="token-legend-swatch injected"></i>实际注入</span></div></div>${tokenUsageChart(payload.series)}</section><section><div class="compact-toolbar"><div class="toolbar-grow"><h2>实际经 MCP 转换的数据</h2><span class="muted">最近同步：${escapeHtml(lastSync)} · 窗口：${tokenUsageState.windowDays} 日</span></div></div>${tokenUsageTable(rows, catalog, payload)}</section></div>`, renderToken);
+  renderTokenUsageRail(payload, rows, lastSync);
+}
+
+function renderTokenUsageRail(payload = {}, rows = [], lastSync = '') {
+  const measured = rows.filter(row => ['measured', 'mixed'].includes(row.mode)).length;
+  const estimated = rows.filter(row => ['estimated', 'mixed'].includes(row.mode)).length;
+  railTitle('Token 计量口径', `<div class="rail-section"><div class="rail-title">${payload.status === 'unavailable' ? '等待计量同步' : '数据已分口径'}</div><div class="rail-copy">宿主实测 ${measured} 行 · MemoryGuard 估算 ${estimated} 行</div></div><div class="rail-section"><h4>最近同步</h4><div class="rail-copy">${escapeHtml(lastSync || '未同步')}</div></div><div class="rail-section"><h4>口径说明</h4><div class="rail-copy">宿主输入与输出来自绑定 Agent 的实测同步。MemoryGuard 估算来自确定性上下文计数。两种来源不合计。</div></div>`);
+}
+
+async function renderTokenUsage() {
+  const renderToken = takeContentRenderToken('token-usage');
+  setContent('<div class="loading">正在加载 Token 计量</div>', renderToken);
+  try {
+    if (!agentCardsData) {
+      try { agentCardsData = await callApi('list_agents'); } catch (_) { agentCardsData = {agents: []}; }
+    }
+    const [rawTelemetry, bindingsResult] = await Promise.all([
+      callApi('get_usage_telemetry', tokenUsageState.windowDays, tokenUsageState.agentKey),
+      callApi('list_bindings').catch(() => ({bindings: []})),
+    ]);
+    const payload = normalizeTokenUsagePayload(rawTelemetry);
+    tokenUsageState.payload = payload;
+    tokenUsageState.bindings = bindingsResult;
+    if (rawTelemetry?.ok === false && tokenUsageErrorKind(payload) === 'error') {
+      throw new Error(apiErrorMessage(rawTelemetry, 'Token 计量读取失败'));
+    }
+    renderTokenUsageView(payload, bindingsResult, renderToken);
+  } catch (error) {
+    if (!contentRenderIsCurrent(renderToken)) return;
+    setContent(`<div class="dashboard-view token-usage-view"><div class="token-chart-card token-error"><h2>Token 计量读取失败</h2><p>${escapeHtml(apiErrorMessage(error, '当前无法读取 Token 计量。'))}</p><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="renderTokenUsage()">重新读取</button></div></div></div>`, renderToken);
+    railTitle('Token 计量口径', '<div class="empty-inline">计量读取失败，未生成估算或合计。</div>');
+  }
+}
+
 function renderStatusRail() {
   if (governanceScopeState.status === 'audit_only') {
     railTitle('治理状态', `${railKey('共享治理', '仅审计', 'danger')}<div class="rail-warning">当前共享组没有可用治理绑定，已停止共享治理投影。</div><div class="rail-link" onclick="switchTab('sources')">去数据源恢复绑定</div>`);
@@ -8272,6 +9126,10 @@ function renderStatusRail() {
   if (state.activeTab === 'overview') return renderOverviewRail();
   if (state.activeTab === 'sources') return renderSourcesRail();
   if (state.activeTab === 'findings') return renderRiskRail();
+  if (state.activeTab === 'token-usage') {
+    const payload = tokenUsageState.payload || {};
+    return renderTokenUsageRail(payload, tokenUsageRowsForView(payload), '');
+  }
   if (state.activeTab === 'codegraph') { railTitle('CodeGraph', renderCodeGraphRail()); return; }
   if (state.activeTab === 'neurons' && selectedNeuronNode) { railTitle('节点详情', renderNeuronRailDetail(selectedNeuronNode)); return; }
   if (state.activeTab === 'neurons') { railTitle('记忆核心', '<div class="empty-inline">选择图节点后，在这里查看正文、来源与治理操作。</div><div class="rail-section"><button class="btn" type="button" onclick="switchTab(\'governance\')">进入治理台</button></div>'); return; }

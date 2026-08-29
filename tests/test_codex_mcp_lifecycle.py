@@ -24,9 +24,12 @@ class FakeController:
         self.terminated: list[int] = []
         self.orphan_roots: tuple[ProcessInfo, ...] = ()
         self._lock = threading.Lock()
+        self.on_snapshot = None
 
     def snapshot(self) -> ProcessSnapshot:
         with self._lock:
+            if self.on_snapshot is not None:
+                self.on_snapshot(self)
             return ProcessSnapshot(
                 self.codex_pid,
                 tuple(self.processes.values()),
@@ -80,11 +83,20 @@ def cohort(start_ms: int, base: int, codex_pid: int = 900) -> tuple[ProcessInfo,
     )
 
 
-def call(tmp_path, controller, event, now_ms, thread="thread-a", mode="auto"):
+def call(
+    tmp_path,
+    controller,
+    event,
+    now_ms,
+    thread="thread-a",
+    mode="auto",
+    host_thread_id="",
+):
     return handle_codex_mcp_lifecycle(
         event=event,
         workspace=tmp_path,
         thread_id=thread,
+        host_thread_id=host_thread_id,
         controller=controller,
         now_ms=now_ms,
         self_pid=99999,
@@ -751,6 +763,7 @@ def test_writer_evidence_retires_exact_old_cohort_when_same_thread_has_newer_run
     )
     assert first["assigned_cohort"].startswith("200:")
     assert first["killed_pids"] == []
+    assert controller.terminated == []
 
     second = call(
         tmp_path,
@@ -759,10 +772,11 @@ def test_writer_evidence_retires_exact_old_cohort_when_same_thread_has_newer_run
         1_026_000,
         thread=evidence.lease_id,
     )
-    assert second["action"] == "reclaim_pending"
-    assert set(second["reclaim_candidate_pids"]) == {100, 101, 102, 103}
-    assert second["killed_pids"] == []
-    assert controller.terminated == []
+    assert second["action"] == "reclaimed"
+    assert second["termination_enabled"] is True
+    assert set(second["killed_pids"]) == {100, 101, 102, 103}
+    assert set(controller.terminated) == {100, 101, 102, 103}
+    assert not ({200, 201, 202, 203} & set(controller.terminated))
 
 
 def test_writer_evidence_corrects_wrong_owner_without_retiring_live_transport(
@@ -969,5 +983,327 @@ def test_concurrent_leases_do_not_overwrite_each_other(tmp_path):
 
     state_path = tmp_path / ".memoryguard" / "hook-runtime" / "codex-mcp-lifecycle.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["shim_version"] == "0.7.1.post17"
+    assert state["shim_version"] == "0.7.1.post18"
     assert set(state["threads"]) == {"a", "b"}
+
+
+def test_auto_reclaim_preserves_current_when_host_thread_id_is_shared(
+    tmp_path,
+    monkeypatch,
+):
+    old = cohort(995_000, 100)
+    current = cohort(1_009_000, 200)
+    controller = FakeController(
+        ProcessSnapshot(900, old + current, codex_start_ms=900_000)
+    )
+    evidence = ThreadLockEvidence(
+        thread_id="active-thread",
+        lock_mtime_ms=995_010,
+        created_at_ms=900_100,
+        updated_at_ms=1_010_000,
+        thread_source="user",
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_thread_lock_evidence",
+        lambda snapshot: (evidence,),
+    )
+    state_path = lifecycle_state_path(tmp_path, controller)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "codex_pid": 900,
+                "codex_start_ms": 900_000,
+                "threads": {
+                    evidence.lease_id: {
+                        "cohort_key": "200:1009000",
+                        "last_seen_ms": 1_010_000,
+                        "turn_started_ms": 900_100,
+                        "turn_state": "active",
+                        "host_thread_id": "shared-host",
+                    },
+                    "other-live": {
+                        "cohort_key": "200:1009000",
+                        "last_seen_ms": 1_010_000,
+                        "turn_started_ms": 900_100,
+                        "turn_state": "active",
+                        "host_thread_id": "shared-host",
+                    },
+                },
+                "retired": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = call(
+        tmp_path,
+        controller,
+        "post_tool",
+        1_020_000,
+        thread=evidence.lease_id,
+        host_thread_id="shared-host",
+    )
+    assert first["assigned_cohort"].startswith("200:")
+    assert first["killed_pids"] == []
+
+    second = call(
+        tmp_path,
+        controller,
+        "post_tool",
+        1_026_000,
+        thread=evidence.lease_id,
+        host_thread_id="shared-host",
+    )
+    assert set(second["killed_pids"]) == {100, 101, 102, 103}
+    assert not ({200, 201, 202, 203} & set(controller.terminated))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["threads"][evidence.lease_id]["cohort_key"].startswith("200:")
+    assert state["threads"][evidence.lease_id]["host_thread_id"] == "shared-host"
+
+
+def test_auto_mode_does_not_kill_shared_superseded_cohort(tmp_path):
+    roots = cohort(995_000, 100)
+    controller = FakeController(ProcessSnapshot(900, roots, codex_start_ms=900_000))
+    state_path = lifecycle_state_path(tmp_path, controller)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "codex_pid": 900,
+                "codex_start_ms": 900_000,
+                "threads": {
+                    "owner-a": {
+                        "cohort_key": "100:995000",
+                        "last_seen_ms": 1_010_000,
+                        "turn_state": "idle",
+                    },
+                    "owner-b": {
+                        "cohort_key": "100:995000",
+                        "last_seen_ms": 1_010_000,
+                        "turn_state": "idle",
+                    },
+                },
+                "retired": {
+                    "100:995000": {
+                        "retired_ms": 1_000_000,
+                        "reason": "writer_lock_superseded",
+                        "thread_id": "owner-a",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = call(tmp_path, controller, "post_tool", 1_010_000, thread="owner-a")
+    assert result["killed_pids"] == []
+    assert controller.terminated == []
+    assert 100 in {p.pid for p in controller.snapshot().direct_children}
+
+
+def test_auto_mode_does_not_kill_pid_reuse_start_mismatch(tmp_path):
+    roots = cohort(995_000, 100)
+    controller = FakeController(ProcessSnapshot(900, roots, codex_start_ms=900_000))
+    snapshots = {"n": 0}
+
+    def flip_identity(ctrl: FakeController) -> None:
+        snapshots["n"] += 1
+        if snapshots["n"] < 2:
+            return
+        for process in list(ctrl.processes.values()):
+            ctrl.processes[process.pid] = ProcessInfo(
+                process.pid,
+                process.parent_pid,
+                process.name,
+                process.start_ms + 1_000_000,
+            )
+
+    controller.on_snapshot = flip_identity
+    state = {
+        "version": 2,
+        "codex_pid": 900,
+        "codex_start_ms": 900_000,
+        "threads": {
+            "owner": {
+                "cohort_key": "200:1009000",
+                "last_seen_ms": 1_010_000,
+                "turn_state": "active",
+            }
+        },
+        "retired": {
+            "100:995000": {
+                "retired_ms": 1_000_000,
+                "reason": "writer_lock_superseded",
+                "thread_id": "owner",
+            }
+        },
+    }
+
+    killed, failed, native_cleanup_count, _candidates = lifecycle._cleanup(
+        controller,
+        state,
+        1_010_000,
+        99999,
+        "auto",
+    )
+    assert killed == []
+    assert failed == []
+    assert native_cleanup_count == 0
+    assert controller.terminated == []
+    assert 100 in controller.processes
+
+
+def test_uvx_spawn_wave_joins_anchor_cohort_and_is_reclaimed(tmp_path, monkeypatch):
+    old = (
+        root(100, "node_repl.exe", 995_000),
+        root(101, "python.exe", 995_020),
+        root(104, "uvx.exe", 995_000 + 4_500),
+    )
+    current = cohort(1_009_000, 200)
+    controller = FakeController(
+        ProcessSnapshot(900, old + current, codex_start_ms=900_000)
+    )
+    evidence = ThreadLockEvidence(
+        thread_id="active-thread",
+        lock_mtime_ms=995_010,
+        created_at_ms=900_100,
+        updated_at_ms=1_010_000,
+        thread_source="user",
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_thread_lock_evidence",
+        lambda snapshot: (evidence,),
+    )
+    state_path = lifecycle_state_path(tmp_path, controller)
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "codex_pid": 900,
+                "codex_start_ms": 900_000,
+                "threads": {
+                    evidence.lease_id: {
+                        "cohort_key": "200:1009000",
+                        "last_seen_ms": 1_010_000,
+                        "turn_started_ms": 900_100,
+                    }
+                },
+                "retired": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    grouped = lifecycle._cohorts(controller.snapshot(), 99999)
+    old_cohort = next(item for item in grouped if item.anchor_pid == 100)
+    assert {process.pid for process in old_cohort.roots} == {100, 101, 104}
+
+    call(
+        tmp_path,
+        controller,
+        "post_tool",
+        1_020_000,
+        thread=evidence.lease_id,
+    )
+    reclaimed = call(
+        tmp_path,
+        controller,
+        "post_tool",
+        1_026_000,
+        thread=evidence.lease_id,
+    )
+    assert set(reclaimed["killed_pids"]) == {100, 101, 104}
+    assert not ({200, 201, 202, 203} & set(controller.terminated))
+
+
+def test_pwsh_is_never_included_in_mcp_cohort(tmp_path):
+    assert "uvx.exe" in lifecycle.ROOT_NAMES
+    assert "pwsh.exe" not in lifecycle.ROOT_NAMES
+    roots = cohort(995_000, 100) + (
+        root(104, "uvx.exe", 995_080),
+        root(300, "pwsh.exe", 995_010),
+    )
+    snapshot = ProcessSnapshot(900, roots, codex_start_ms=900_000)
+    grouped = lifecycle._cohorts(snapshot, 99999)
+    assert len(grouped) == 1
+    assert {process.pid for process in grouped[0].roots} == {100, 101, 102, 103, 104}
+    assert 300 not in {process.pid for process in grouped[0].roots}
+
+    controller = FakeController(snapshot)
+    call(tmp_path, controller, "user_prompt", 1_000_000, mode="force")
+    call(tmp_path, controller, "stop", 1_001_000, mode="force")
+    assert 300 not in controller.terminated
+    assert 104 not in controller.terminated or 104 in {
+        process.pid for process in grouped[0].roots
+    }
+
+
+def test_shared_host_thread_id_with_exclusive_cohort_key_can_reclaim(
+    tmp_path,
+    monkeypatch,
+):
+    old = cohort(995_000, 100)
+    current = cohort(1_009_000, 200)
+    controller = FakeController(
+        ProcessSnapshot(900, old + current, codex_start_ms=900_000)
+    )
+    evidence = ThreadLockEvidence(
+        thread_id="child-thread",
+        lock_mtime_ms=995_010,
+        created_at_ms=900_100,
+        updated_at_ms=1_000_000,
+        thread_source="subagent",
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_read_thread_lock_evidence",
+        lambda snapshot: (evidence,),
+    )
+    state_path = lifecycle_state_path(tmp_path, controller)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "codex_pid": 900,
+                "codex_start_ms": 900_000,
+                "generation_key": "900:900000",
+                "threads": {
+                    evidence.lease_id: {
+                        "cohort_key": "100:995000",
+                        "last_seen_ms": 1_000_000,
+                        "turn_state": "idle",
+                        "host_thread_id": "shared-host",
+                    },
+                    "current-active": {
+                        "cohort_key": "200:1009000",
+                        "last_seen_ms": 1_000_000,
+                        "turn_state": "active",
+                        "host_thread_id": "shared-host",
+                    },
+                },
+                "retired": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = reclaim_terminal_codex_threads(
+        workspace=tmp_path,
+        thread_ids=["child-thread"],
+        controller=controller,
+        now_ms=1_010_000,
+        self_pid=99999,
+    )
+    assert result["status"] == "ok"
+    assert result["reclaimed_thread_ids"] == ["child-thread"]
+    assert set(result["killed_pids"]) == {100, 101, 102, 103}
+    assert not ({200, 201, 202, 203} & set(controller.terminated))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["threads"]["current-active"]["cohort_key"].startswith("200:")

@@ -152,7 +152,11 @@ class AgentNativeService:
                 return str(item.product), "", [str(item.dir_path)], cid
         raise AgentNativeError("candidate_not_found")
 
-    def discover_agents(self) -> dict[str, Any]:
+    def discover_agents(
+        self,
+        *,
+        identity_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         locator = self._locator()
         instances, ledgers = locator.detect_instances()
         # Discovery is intentionally Profile-bounded.  Return the registry
@@ -162,19 +166,29 @@ class AgentNativeService:
         profiles = registry.list_profiles() if registry is not None else []
         known_products = sorted({str(profile.product) for profile in profiles if str(profile.product).strip()})
         marks = self._marks()
+        identities = identity_catalog if identity_catalog is not None else self.control.identity_catalog()
         output: list[dict[str, Any]] = []
         for instance in instances:
             item = dict(instance.to_dict())
             candidate = _candidate_id(str(instance.product))
             mark = marks.get(candidate, {})
-            item["display_name"] = provider_display_name(instance.product)
+            identity = dict(identities.get(str(instance.instance_id)) or {})
+            if not identity:
+                identity = normalize_program_identity(str(instance.product or ""))
+            item["display_name"] = str(identity.get("display_name") or provider_display_name(instance.product))
             item["label"] = item["display_name"]
-            identity = normalize_program_identity(str(instance.product or ""))
-            item["program_id"] = identity["program_id"]
-            item["provider"] = identity["provider"]
-            item["identity_resolution"] = identity["resolution"]
-            item["identity_source"] = identity["source"]
-            item["identity_source_hint"] = identity["source_hint"]
+            item["program_id"] = str(identity.get("program_id") or "unknown")
+            item["canonical_program_id"] = str(identity.get("canonical_program_id") or item["program_id"])
+            item["provider"] = str(identity.get("provider") or "")
+            item["identity_resolution"] = str(identity.get("resolution") or "unresolved")
+            item["identity_source"] = str(identity.get("identity_source") or identity.get("source") or "")
+            item["identity_source_hint"] = str(identity.get("source_hint") or "")
+            item["canonical_display_name"] = str(identity.get("canonical_display_name") or identity.get("display_name") or item["display_name"])
+            item["canonical_agent_instance_id"] = str(identity.get("canonical_agent_instance_id") or "")
+            item["identity_role"] = str(identity.get("identity_role") or "current")
+            item["is_canonical_endpoint"] = bool(identity.get("is_canonical_endpoint"))
+            item["is_alias_endpoint"] = bool(identity.get("is_alias_endpoint"))
+            item["is_current_endpoint"] = True
             item["candidate_id"] = candidate
             item["lifecycle_state"] = "ignored" if mark.get("status") == "uninstalled" else "installed"
             # Keep the support grade (A/B/C/D) separate from the takeover
@@ -219,9 +233,11 @@ class AgentNativeService:
                 cli_path=str(candidate.dir_path or ""),
             )
             item["program_id"] = identity["program_id"]
+            item["canonical_program_id"] = identity["program_id"]
             item["provider"] = identity["provider"]
             item["display_name"] = identity["display_name"]
             item["label"] = identity["display_name"]
+            item["canonical_display_name"] = identity["display_name"]
             item["identity_resolution"] = identity["resolution"]
             item["identity_source"] = identity["source"]
             item["identity_source_hint"] = identity["source_hint"]
@@ -729,12 +745,28 @@ class AgentNativeService:
         return value
 
     def list_agents(self) -> dict[str, Any]:
-        discovered = self.discover_agents()
+        # Build identity/discovery context once.  Each card below reuses the
+        # same catalog and binding snapshot instead of probing every profile
+        # again while resolving aliases.
+        try:
+            identity_catalog = self.control.identity_catalog()
+        except AttributeError:
+            # Keep lightweight test/integration control doubles compatible;
+            # the real V2 service always exposes the public catalog.
+            identity_catalog = {}
+        discovered = self.discover_agents(identity_catalog=identity_catalog)
         agents = []
         residuals = []
+        binding_rows = self.control.list_bindings(
+            include_inactive=False,
+            identity_catalog=identity_catalog,
+        ).get("bindings", [])
+        active_binding_rows = [
+            dict(item) for item in binding_rows if isinstance(item, Mapping)
+        ]
         active_bindings = {
-            str(item.get("agent_instance_id") or ""): dict(item)
-            for item in self.control.list_bindings(include_inactive=False).get("bindings", [])
+            str(item.get("agent_instance_id") or ""): item
+            for item in active_binding_rows
             if isinstance(item, Mapping)
         }
         for item in discovered["instances"]:
@@ -750,8 +782,37 @@ class AgentNativeService:
             item["surface_count"] = int(len(all_surfaces))
             _selected, enabled_sources = self._selected_enabled_source_ids(str(item["instance_id"]))
             item["bound_source_count"] = int(len(enabled_sources))
-            binding = active_bindings.get(str(item["instance_id"]))
+            binding = None
+            resolver = getattr(self.control, "active_binding_for_agent", None)
+            if callable(resolver) and str(item.get("canonical_program_id") or "") not in {"", "unknown"}:
+                try:
+                    # Resolve through the canonical program so an alias card
+                    # cannot silently select a second endpoint binding.
+                    binding = resolver(
+                        str(item["instance_id"]),
+                        identity_catalog=identity_catalog,
+                    )
+                except (GroupControlError, AttributeError, TypeError):
+                    binding = None
+            if binding is None:
+                binding = active_bindings.get(str(item["instance_id"]))
+            if binding is None and callable(resolver):
+                # Bindings are keyed by an auditable instance id, while the
+                # user-facing program identity is stable across Router
+                # accounts.  GroupControlService resolves an exact canonical
+                # alias without guessing from opaque id suffixes.
+                try:
+                    binding = resolver(
+                        str(item["instance_id"]),
+                        identity_catalog=identity_catalog,
+                    )
+                except (GroupControlError, AttributeError, TypeError):
+                    binding = None
             if binding:
+                binding = dict(binding)
+                if str(binding.get("agent_instance_id") or "") != str(item["instance_id"]):
+                    binding["resolved_for_agent_instance_id"] = str(item["instance_id"])
+                    binding["binding_alias"] = True
                 item["binding"] = binding
                 item["binding_status"] = "active"
                 item["private_data_surface_count"] = len(private_surfaces)
@@ -779,6 +840,36 @@ class AgentNativeService:
                 self.residual_cleanup(instance_id=str(item["instance_id"]))
             except AgentNativeError:
                 pass
+        try:
+            member_projection = self.control.program_member_projection(active_binding_rows)
+        except AttributeError:
+            # Keep lightweight test/integration control doubles compatible;
+            # the real V2 service always exposes the public projection.
+            member_projection = {
+                "members": [],
+                "program_members": [],
+                "program_member_count": 0,
+                "unresolved_member_count": 0,
+                "unresolved_endpoint_count": 0,
+                "endpoint_member_count": len(active_binding_rows),
+                "extra_connection_count": len(active_binding_rows),
+            }
+        program_members: list[dict[str, Any]] = []
+        for member in member_projection["members"]:
+            if not member.get("known"):
+                continue
+            row = dict(member)
+            endpoint_id = str(row.get("representative_endpoint_id") or "")
+            binding_id = str((row.get("binding_ids") or [""])[0] or "")
+            row.update({
+                "instance_id": endpoint_id,
+                "agent_instance_id": endpoint_id,
+                "binding_id": binding_id,
+                "member_status": "active",
+                "status": "active",
+                "is_program_member": True,
+            })
+            program_members.append(row)
         return {
             "ok": True,
             "status": "succeeded",
@@ -787,6 +878,14 @@ class AgentNativeService:
             "residuals": residuals,
             "total": len(agents),
             "residual_total": len(residuals),
+            "program_members": program_members,
+            "program_member_count": len(program_members),
+            "member_details": active_binding_rows,
+            "member_count": int(member_projection["endpoint_member_count"]),
+            "endpoint_member_count": int(member_projection["endpoint_member_count"]),
+            "extra_connection_count": int(member_projection["extra_connection_count"]),
+            "unresolved_member_count": int(member_projection["unresolved_member_count"]),
+            "unresolved_endpoint_count": int(member_projection["unresolved_endpoint_count"]),
             "known_profile_count": discovered.get("known_profile_count", 0),
             "known_products": discovered.get("known_products", []),
         }

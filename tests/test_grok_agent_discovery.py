@@ -7,6 +7,7 @@ from memoryguard.agent_locator import AgentLocator, DetectionContext
 from memoryguard.agent_mapping import normalize_program_identity
 from memoryguard.agent_profiles import AgentProfileRegistry
 from memoryguard.runtime_v2.agent_native import AgentNativeService
+from memoryguard.runtime_v2.group_native import GroupControlService
 from memoryguard.schema_v3 import AgentInstance, DiscoveryLedger, stable_hash
 
 
@@ -195,3 +196,181 @@ def test_list_agents_does_not_inherit_binding_across_instances_or_generic(tmp_pa
     assert "binding" not in rows["grok-new-instance"]
     assert "binding" not in rows["cursor-new-instance"]
     assert "binding" not in rows["generic-new-instance"]
+
+
+def test_group_preview_projects_canonical_identity_and_keeps_orphan_manageable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A group must expose readable program members, including old bindings."""
+    home = tmp_path / "home"
+    (home / ".grok").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    locator = AgentLocator(tmp_path / "workspace")
+    grok = next(item for item in locator.detect_instances()[0] if item.product == "grok")
+    service = GroupControlService(tmp_path / "workspace", write=True)
+    service.bind_agent(grok.instance_id, "shared-grok", idempotency_key="bind-grok")
+    service.bind_agent("legacy-mcp-member", "shared-grok", idempotency_key="bind-legacy")
+
+    preview = service.group_preview("shared-grok")
+    by_id = {item["agent_instance_id"]: item for item in preview["member_details"]}
+
+    assert by_id[grok.instance_id]["canonical_program_id"] == "grok"
+    assert by_id[grok.instance_id]["display_name"] == "Grok"
+    assert by_id[grok.instance_id]["member_status"] == "active_detected"
+    assert by_id["legacy-mcp-member"]["display_name"] == "未识别的 MCP 助手"
+    assert by_id["legacy-mcp-member"]["member_status"] == "historical_unknown"
+    assert by_id["legacy-mcp-member"]["can_unbind"] is True
+    assert preview["unresolved_member_count"] == 1
+    assert preview["program_members"] == ["grok"]
+
+
+def test_group_binding_resolves_same_program_after_account_instance_switch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A new account instance can reuse the program's existing group binding."""
+    service = GroupControlService(tmp_path / "workspace", write=True)
+    service.bind_agent("codex-account-a", "shared-codex", idempotency_key="bind-codex")
+    codex_identity = {
+        "program_id": "codex",
+        "display_name": "Codex",
+        "resolution": "verified",
+        "source": "current_discovery",
+        "source_hint": "codex",
+    }
+    monkeypatch.setattr(
+        service,
+        "identity_catalog",
+        lambda: {
+            "codex-account-a": dict(codex_identity),
+            "codex-account-b": dict(codex_identity),
+        },
+    )
+
+    # The resolver keeps the original binding id for safe unbind/audit while
+    # exposing it to a new account instance under the same program identity.
+    resolved = service.active_binding_for_agent("codex-account-b")
+    assert resolved is not None
+    assert resolved["canonical_program_id"] == "codex"
+    assert resolved["share_group_id"] == "shared-codex"
+
+
+def test_provider_registry_collapses_same_program_endpoints_without_guessing_unknown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Canonical/alias ids share one member while every endpoint stays auditable."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+    service = GroupControlService(tmp_path / "workspace", write=True)
+    service.record_provider_identity(
+        "codex",
+        "codex-canonical",
+        "shared-codex",
+        aliases=["codex-router"],
+        idempotency_key="provider-codex-registry",
+    )
+    service.bind_agent("codex-canonical", "shared-codex", idempotency_key="bind-canonical")
+    service.bind_agent("codex-router", "shared-codex", idempotency_key="bind-alias")
+    service.bind_agent("2aee", "shared-codex", idempotency_key="bind-unknown")
+
+    preview = service.group_preview("shared-codex")
+    details = {item["agent_instance_id"]: item for item in preview["member_details"]}
+    assert preview["member_count"] == 3
+    assert preview["endpoint_member_count"] == 3
+    assert preview["program_members"] == ["codex"]
+    assert preview["program_member_count"] == 1
+    assert preview["unresolved_member_count"] == 1
+    assert details["codex-canonical"]["is_canonical_endpoint"] is True
+    assert details["codex-canonical"]["is_redundant_endpoint"] is False
+    assert details["codex-router"]["is_alias_endpoint"] is True
+    assert details["codex-router"]["is_redundant_endpoint"] is True
+    assert details["2aee"]["program_id"] == "unknown"
+    assert details["2aee"]["can_unbind"] is True
+    program = preview["program_member_details"][0]
+    assert program["canonical_program_id"] == "codex"
+    assert program["display_name"] == "Codex"
+    assert set(program["endpoint_ids"]) == {"codex-canonical", "codex-router"}
+
+    resolved = service.active_binding_for_agent("codex-router")
+    assert resolved is not None
+    assert resolved["agent_instance_id"] == "codex-canonical"
+    assert resolved["binding_alias"] is True
+
+
+def test_provider_registry_cross_group_binding_fails_closed(tmp_path: Path) -> None:
+    service = GroupControlService(tmp_path / "workspace", write=True)
+    service.record_provider_identity(
+        "codex",
+        "codex-canonical",
+        "shared-codex-a",
+        aliases=["codex-router"],
+        idempotency_key="provider-codex-cross-group",
+    )
+    service.bind_agent("codex-canonical", "shared-codex-a", idempotency_key="bind-a")
+    service.bind_agent("codex-router", "shared-codex-b", idempotency_key="bind-b")
+
+    import pytest
+
+    with pytest.raises(Exception) as error:
+        service.active_binding_for_agent("codex-router")
+    assert getattr(error.value, "code", "") == "multiple_active_bindings"
+
+
+def test_agent_native_lists_one_program_member_and_all_endpoint_audit_rows(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    control = GroupControlService(workspace, write=True)
+    control.record_provider_identity(
+        "codex",
+        "codex-canonical",
+        "shared-codex",
+        aliases=["codex-router"],
+        idempotency_key="provider-codex-native",
+    )
+    control.bind_agent("codex-canonical", "shared-codex", idempotency_key="native-bind-canonical")
+    control.bind_agent("codex-router", "shared-codex", idempotency_key="native-bind-alias")
+    (tmp_path / "canonical").mkdir()
+    (tmp_path / "router").mkdir()
+    instances = [
+        AgentInstance(
+            "codex-canonical", "codex@profile-1", "codex",
+            surfaces=[{"status": "found", "resolved_path": str(tmp_path / "canonical"), "evidence_role": "control_surface"}],
+        ),
+        AgentInstance(
+            "codex-router", "codex@profile-1", "codex",
+            surfaces=[{"status": "found", "resolved_path": str(tmp_path / "router"), "evidence_role": "control_surface"}],
+        ),
+    ]
+
+    class FakeLocator:
+        context = type("Context", (), {"platform": "windows", "host_id": "test-host"})()
+        registry = AgentProfileRegistry(tmp_path / "registry")
+
+        def detect_instances(self):
+            return instances, {
+                item.instance_id: DiscoveryLedger(item.instance_id, [])
+                for item in instances
+            }
+
+        def discover_candidates(self, **_kwargs):
+            return []
+
+    native = AgentNativeService(workspace, locator_factory=lambda _workspace: FakeLocator())
+    native.control = control
+    listed = native.list_agents()
+    assert listed["endpoint_member_count"] == 2
+    assert listed["program_member_count"] == 1
+    assert listed["extra_connection_count"] == 1
+    assert listed["unresolved_member_count"] == 0
+    assert len(listed["program_members"]) == 1
+    program = listed["program_members"][0]
+    assert program["canonical_program_id"] == "codex"
+    assert program["display_name"] == "Codex"
+    assert set(program["endpoint_ids"]) == {"codex-canonical", "codex-router"}
+    assert {item["agent_instance_id"] for item in listed["member_details"]} == {
+        "codex-canonical", "codex-router",
+    }

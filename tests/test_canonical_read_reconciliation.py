@@ -21,6 +21,7 @@ from memoryguard.rule_read_path import (
 from memoryguard.rule_reconciliation import (
     canonical_reconciliation_status,
     reconcile_historical_duplicates,
+    settle_native_canonical_snapshot,
 )
 from memoryguard.schema_v3 import MemoryKind, SharedMemoryRecord, SharedMemoryStatus
 from memoryguard.rule_binding import build_binding
@@ -515,3 +516,66 @@ def test_settle_native_snapshot_is_formal_reconciliation_entry(
     except RuntimeError as exc:
         assert str(exc).startswith("canonical_snapshot_not_settleable:")
     assert calls and calls[0] is store
+
+
+def test_imported_prepare_job_does_not_block_native_snapshot_settlement(
+    tmp_path: Path,
+) -> None:
+    """A migrated prepare row is provenance, not a live V2 coordinator lock."""
+
+    store = RuleV2Store(tmp_path)
+    definition = _seed_v2_duplicate(
+        store,
+        "Always use rtk for shell commands",
+        kind="procedure",
+        definition_id="v2-prepare-recovery",
+        source_id="source-prepare-recovery",
+    )
+    store.record_reconciliation_job({
+        "job_id": "prepare-stuck",
+        "share_group_id": GROUP,
+        "migration_id": "prepare-stuck",
+        "phase": "write_canonical",
+        "status": "applying",
+        "source_digest": "old-source",
+        "last_error": "process interrupted",
+    })
+
+    before = canonical_reconciliation_status(tmp_path, GROUP, store=store)
+    assert before["canonical_ready"] is False
+    assert "reconciliation_in_flight" not in before["failures"]
+    assert before["checks"]["historical_reconciliation_jobs"] == 1
+
+    settled = settle_native_canonical_snapshot(tmp_path, GROUP, store=store)
+    assert settled["canonical_ready"] is True
+    assert settled["checks"]["historical_reconciliation_jobs"] == 1
+    assert store.get_definition(definition.definition_id).status == "active"
+
+
+def test_unscoped_native_reconciliation_job_still_blocks_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = RuleV2Store(tmp_path)
+    _seed_v2_duplicate(
+        store,
+        "Always use rtk for shell commands",
+        kind="procedure",
+        definition_id="v2-live-job",
+        source_id="source-live-job",
+    )
+    store.record_reconciliation_job({
+        "job_id": "native-live-job",
+        "share_group_id": GROUP,
+        "phase": "write_canonical",
+        "status": "applying",
+    })
+
+    result = canonical_reconciliation_status(tmp_path, GROUP, store=store)
+    assert result["checks"]["reconciliation_in_flight"] == 1
+    assert "reconciliation_in_flight" in result["failures"]
+    try:
+        settle_native_canonical_snapshot(tmp_path, GROUP, store=store)
+    except RuntimeError as exc:
+        assert "canonical_snapshot_not_settleable" in str(exc)
+    else:
+        raise AssertionError("a live native reconciliation job must block settlement")

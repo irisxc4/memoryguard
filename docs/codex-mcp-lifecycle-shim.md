@@ -22,8 +22,8 @@ The shim is dynamically imported from the Codex host-hook path. Any import, disc
 8. `PostToolUse` is a throttled lifecycle pulse so long tool-heavy turns can notice a replacement before the conversation ends.
 9. Replacing a known live lease retires the prior cohort. Codex `Stop` is only a turn boundary: it marks the lease idle and preserves the live transport for a resumed turn.
 10. Codex gets a native-cleanup grace window. If Codex removes the cohort itself, MemoryGuard records native cleanup and performs no termination.
-11. Generic `auto` mode is observation-only. A retired cohort still alive after the grace window is reported through `reclaim_candidate_pids`, but generic lifecycle observation never calls `taskkill`.
-12. There is one automatic termination seam: a Codex child thread already proven terminal/deleted by `state_5.sqlite` reconciliation may reclaim its cohort only when that thread maps to exactly one live cohort and no other live lease shares it. Shared, ambiguous, or active branches are preserved.
+11. Generic `auto` mode is observation-only for unmatched, replaced, legacy, or age-only leftovers. Those retired cohorts are still reported through `reclaim_candidate_pids`, but generic lifecycle observation never calls `taskkill`.
+12. Automatic termination stays fail-closed. After the native-cleanup grace window, `auto` may terminate a cohort explicitly retired as `writer_lock_superseded` only when that cohort is still PID/parent/name/start-identity matched and no live lease still owns it. Shared, ambiguous, PID-reused, or currently active cohorts stay protected. A Codex child thread already proven terminal/deleted by `state_5.sqlite` may still reclaim its exclusive cohort even when another lease inherited the same `host_thread_id`, as long as the `cohort_key` itself is exclusive. Tests inject the process controller and never kill live host processes.
 13. Diagnostic `force` remains available for attended maintenance, but normal sub-agent cleanup does not depend on an operator choosing a PID or thread ID. Every termination path revalidates PID, parent PID, executable name, and process start time immediately before acting.
 14. Bookkeeping TTL removes only dead or empty receipts. A still-live process cohort keeps its lease regardless of turn inactivity; ordinary steady-state GC never kills an unknown cohort merely because it is old or unleased.
 15. When enabled part-way through an existing `codex.exe` generation, automatic mode may observe/adopt pre-existing cohorts but never drains unknown legacy cohorts by age. The old legacy/orphan cleanup path is restricted to explicit diagnostic `force` mode.
@@ -85,7 +85,7 @@ For an explicit A/B check or permanent disable after an upstream fix:
 MEMORYGUARD_CODEX_MCP_LIFECYCLE=off
 ```
 
-`force` retains broad diagnostic cleanup authority. Normal automatic process termination is narrower: it is reachable only from a Codex-owned terminal child-thread receipt and only for one exclusive, revalidated cohort.
+`force` retains broad diagnostic cleanup authority. Normal automatic process termination is narrower: `writer_lock_superseded` leftovers after native grace, and Codex-owned terminal child-thread receipts, each only for one exclusive, revalidated cohort.
 
 ## Sub-agent UI reconciliation
 
@@ -95,7 +95,7 @@ For top-level conversations, a normal `Stop` remains resumable and does not rele
 
 ## Safety boundary
 
-A reclaimable cohort must be anchored by a direct `node_repl.exe` child of the current `codex.exe`. Only direct Codex child roots in the same short startup window are associated with that cohort. Before each termination, PID, parent PID, executable name, and process start time are revalidated to prevent PID-reuse mistakes.
+A reclaimable cohort must be anchored by a direct `node_repl.exe` child of the current `codex.exe`. Direct Codex child roots in `ROOT_NAMES` (`node_repl.exe`, `node.exe`, `python.exe`, `cmd.exe`, `uvx.exe`) whose start times fall within the bounded spawn-wave window (`COHORT_WINDOW_MS`, 7000 ms) are associated with the nearest same-parent anchor. `pwsh.exe` is not an MCP root. Before each termination, PID, parent PID, executable name, and process start time are revalidated to prevent PID-reuse mistakes.
 
 The shim never targets `codex.exe`, `ChatGPT.exe`, renderer/GPU processes, unrelated application processes, or arbitrary descendant processes discovered by name. Descendants are terminated only through the validated Codex-owned cohort root tree.
 

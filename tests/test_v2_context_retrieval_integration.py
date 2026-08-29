@@ -282,7 +282,7 @@ def test_optional_reference_failure_keeps_native_memory_and_diagnostic(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("history down")),
     )
     result = NativeV2RuntimePort(tmp_path, state_provider=_ActiveManifest()).retrieve(
-        _request(tmp_path)
+        _request(tmp_path, task="relevant V2 memory")
     )
 
     assert [item["item_id"] for item in result["relevant"]] == ["relevant-a"]
@@ -318,7 +318,7 @@ def test_bound_agent_group_atoms_map_policies_and_hide_other_agents(tmp_path: Pa
     _seed_memory(tmp_path)
     port = NativeV2RuntimePort(tmp_path, state_provider=_ActiveManifest())
 
-    current = port.retrieve(_request(tmp_path))
+    current = port.retrieve(_request(tmp_path, task="relevant V2 memory"))
     assert [item["item_id"] for item in current["mandatory"]] == ["always-a"]
     assert [item["item_id"] for item in current["relevant"]] == ["relevant-a"]
     assert all(item["scope"]["project_ref"] == _project(tmp_path) for group in current.values() for item in group if isinstance(group, list) and isinstance(item, dict) and "scope" in item)
@@ -333,6 +333,96 @@ def test_bound_agent_group_atoms_map_policies_and_hide_other_agents(tmp_path: Pa
     ))
     assert other_agent["mandatory"] == []
     assert other_agent["relevant"] == []
+
+
+def _seed_task_aware_memories(root: Path) -> None:
+    memory = MemoryAtomStore(root)
+    evidence = EvidenceStore(root)
+    context = V2MutationContext(
+        workspace_id=str(root.resolve()),
+        share_group_id="group-a",
+        agent_instance_id="agent-a",
+        actor="task-aware-fixture",
+        authority="manual",
+        admin=True,
+    )
+    atoms = (
+        (
+            "always-a",
+            "always preserve this mandatory memory",
+            "always",
+            "procedure",
+        ),
+        (
+            "memoryguard-health",
+            "MemoryGuard health score uses bounded token budget",
+            "relevant",
+            "fact",
+        ),
+        (
+            "crazygame-combat",
+            "CrazyGame combat VFX uses boss motion offsets",
+            "relevant",
+            "fact",
+        ),
+        (
+            "merakstar-deployment",
+            "MerakStar deployment stays behind Cloudflare",
+            "relevant",
+            "fact",
+        ),
+    )
+    for memory_id, body, policy, kind in atoms:
+        memory.put_atom(
+            MemoryAtom(
+                memory_id=memory_id,
+                body=body,
+                kind=kind,
+                injection_policy=policy,
+                confidence=0.99,
+                agent_instance_id="agent-a",
+                share_group_id="group-a",
+            ),
+            context=context,
+            evidence=[{"source_ref": f"memory:{memory_id}"}],
+        )
+    memory.project_evidence(evidence)
+    memory.set_visibility("active")
+
+
+def test_task_aware_memory_search_excludes_unrelated_high_confidence_atoms(
+    tmp_path: Path,
+) -> None:
+    _seed_task_aware_memories(tmp_path)
+    result = NativeV2RuntimePort(tmp_path, state_provider=_ActiveManifest()).retrieve(
+        _request(tmp_path, task="health score token budget")
+    )
+
+    assert [item["item_id"] for item in result["mandatory"]] == ["always-a"]
+    assert [item["item_id"] for item in result["relevant"]] == ["memoryguard-health"]
+
+
+def test_empty_or_failed_task_search_keeps_mandatory_and_never_falls_back_to_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_task_aware_memories(tmp_path)
+    port = NativeV2RuntimePort(tmp_path, state_provider=_ActiveManifest())
+
+    empty = port.retrieve(_request(tmp_path, task=""))
+    assert [item["item_id"] for item in empty["mandatory"]] == ["always-a"]
+    assert empty["relevant"] == []
+
+    def fail_search(*_args: object, **_kwargs: object) -> list[MemoryAtom]:
+        raise RuntimeError("search unavailable")
+
+    monkeypatch.setattr(MemoryAtomStore, "search", fail_search)
+    failed = port.retrieve(_request(tmp_path, task="health score"))
+    assert [item["item_id"] for item in failed["mandatory"]] == ["always-a"]
+    assert failed["relevant"] == []
+    assert any(
+        item == {"layer": "relevant", "reason": "retrieval_omitted"}
+        for item in failed["omissions"]
+    )
 
 
 def test_rule_auto_read_uses_native_v2_compatibility_when_canonical_is_not_ready(
@@ -373,7 +463,7 @@ def test_bootstrap_retrieves_five_context_classes_as_bounded_reference_data(tmp_
 
     packet = port.dispatch_mcp(
         "memoryguard_context_bootstrap",
-        _request(tmp_path),
+        _request(tmp_path, task="relevant V2 memory Worker history knowledge"),
         context=_transport_context(tmp_path),
         generation=7,
         state="V2_ACTIVE",

@@ -137,13 +137,13 @@ def test_reference_shell_has_exact_primary_navigation_and_responsive_columns() -
     # The final reference-layout contract is intentionally asserted as a
     # string: the browser owns the CSS, while this test prevents a later CSS
     # pass from silently restoring the old horizontal navigation.
-    assert "grid-template-columns: 208px minmax(0, 1fr) 280px" in html
+    assert "grid-template-columns: 224px minmax(0, 1fr) 280px" in html
     assert ".main-wrapper { display: contents; }" in html
     assert 'grid-column: 1; grid-row: 1 / span 2' in html
     assert 'grid-column: 2 / span 2' in html
     assert 'grid-column: 3; grid-row: 2' in html
     nav_items = re.findall(r'<button class="nav-item[^>]+data-tab="([^"]+)"', html)
-    assert nav_items == ['overview', 'sources', 'neurons', 'codegraph', 'rules', 'history', 'findings']
+    assert nav_items == ['overview', 'sources', 'neurons', 'codegraph', 'rules', 'history', 'findings', 'token-usage']
     assert 'class="sidebar-settings"' in html
     assert 'aria-label="打开设置"' in html
     assert '@media (max-width: 720px)' in html
@@ -154,7 +154,54 @@ def test_narrow_navigation_keeps_readable_labels_inside_horizontal_scroller() ->
 
     assert '.sidebar-nav { display: flex; align-items: stretch; gap: 2px; padding: 6px 10px; overflow-x: auto; overflow-y: hidden; }' in html
     assert '.sidebar-nav .nav-item { flex: 0 0 auto; min-width: max-content; min-height: 34px; margin: 0; padding: 7px 10px; gap: 8px; justify-content: flex-start; overflow: visible; white-space: nowrap; font-size: 12px; }' in html
-    assert '.sidebar-nav .nav-item::before { flex: none; font-size: 9px; }' in html
+    assert '.sidebar-nav .nav-item::before { flex: none; width: 5px; height: 5px; }' in html
+
+
+def test_navigation_has_no_numeric_page_badges_and_keeps_token_entry() -> None:
+    html = render_interactive_html()
+
+    assert 'data-tab="token-usage"' in html
+    assert '.nav-item[data-tab="token-usage"]' not in html
+    for index in range(1, 8):
+        assert f'content: "{index}"' not in html
+
+
+def test_token_usage_view_has_separated_measurement_contract() -> None:
+    html = render_interactive_html()
+
+    assert 'data-tab="token-usage"' in html
+    assert "Token 用量与 MCP 节省" in html
+    assert "function renderTokenUsage" in html
+    assert "callApi('get_usage_telemetry'" in html
+    assert "window_days" in html
+    assert "宿主实测流量" in html
+    assert "MG 估算节省" in html
+    assert "不可用 Agent" in html
+    assert "宿主实测" in html
+    assert "MemoryGuard 估算" in html
+    assert "原始候选" in html
+    assert "实际注入" in html
+    assert "实测输入" in html
+    assert "实测输出" in html
+    assert "转换次数" in html
+    assert "最近同步" in html
+    assert "不可合计" in html
+    assert "宿主未提供" in html
+    assert "宿主未提供实测用量" in html
+    assert "未检测到来源" in html
+    assert "未同步" in html
+    assert "callApi('run_audit')" in html
+
+
+def test_token_usage_chart_keeps_edge_date_labels_inside_svg_viewbox() -> None:
+    html = render_interactive_html()
+
+    # Both edge labels use centered text anchors.  The symmetric SVG gutter is
+    # therefore part of the rendering contract, otherwise the final date is
+    # clipped when the chart fills a wide desktop container.
+    assert "const left = 52;" in html
+    assert "const right = 52;" in html
+    assert "const chartWidth = width - left - right;" in html
 
 
 def test_agent_cards_use_readable_identity_and_collapsed_technical_ids() -> None:
@@ -168,6 +215,122 @@ def test_agent_cards_use_readable_identity_and_collapsed_technical_ids() -> None
     assert '未识别的 MCP 助手' in html
     assert '尚未返回可读来源摘要；可从本机 Agent 检测或匹配入口接入。' in html
     assert '远程favicon' not in html
+
+
+def test_agent_cards_render_product_marks_without_remote_assets() -> None:
+    html = render_interactive_html()
+
+    # Product identity must be visible in the card itself.  A text glyph or a
+    # missing icon regresses to the opaque/unknown presentation seen in the
+    # GUI; inline SVG keeps the panel offline and deterministic.
+    assert "function agentIconMarkup(agentOrId)" in html
+    assert "agent-icon-svg" in html
+    assert "data-agent-family=\"${family}\"" in html
+    for family in ("codex", "claude", "cursor", "trae", "grok", "unknown"):
+        assert f"data-agent-family=\"{family}\"" in html
+    assert 'agent-mark-text">Codex' in html
+    assert 'agent-mark-text">Grok' in html
+    assert 'M21 10.5h3v3h-3v3h-1.5v3' in html
+    assert 'M11.503.131 1.891 5.678' in html
+    assert 'M24 20.5H3.5V17H0V3.5h24' in html
+    assert '.agent-avatar .agent-icon-svg { display: block; width: 22px; height: 22px; fill: currentColor; stroke: none; }' in html
+    assert "${agentIconMarkup(agent)}" in html
+    assert "${agentIconMarkup(item)}" in html
+    assert "<img" not in html[html.index("function agentIconMarkup"):html.index("function agentSourceSummary")]
+
+
+def test_unknown_health_is_not_presented_as_zero_score() -> None:
+    html = render_interactive_html()
+
+    assert "function healthEvidenceUnavailable(report = {})" in html
+    assert "function healthScopeLabel(report = {})" in html
+    assert "reference_integrity: '引用完整性'" in html
+    assert "health_available" in html
+    assert "health_status" in html
+    assert "function optionalFiniteNumber(value)" in html
+    assert "const rawHealth = optionalFiniteNumber(report.health_score);" in html
+    assert "const health = optionalFiniteNumber(report.health_score);" in html
+    assert "pending: '待扫描'" in html
+    assert "unavailable: '暂不可用'" in html
+    assert "stale: '已过期'" in html
+    assert "healthEvidenceUnavailable(r)" in html
+    assert "healthEvidenceUnavailable(report)" in html
+    assert "审计通过（未提供量化评分）" in html
+
+
+def test_health_kpi_exposes_evidence_coverage_and_inconclusive_reason() -> None:
+    html = render_interactive_html()
+
+    assert "function healthCoverageText(report = {})" in html
+    assert "health_coverage" in html
+    assert "health_components" in html
+    assert "4/4" not in html
+    assert "coverage.status === 'complete'" in html
+    assert "coverage.status === 'inconclusive'" in html
+    assert "证据不完整" in html
+    assert "out_of_scope" in html
+
+
+def test_shell_uses_real_app_frame_with_no_dead_corner() -> None:
+    html = render_interactive_html()
+
+    assert ".app-shell { display: grid; grid-template-columns: 224px minmax(0, 1fr) 280px; grid-template-rows: 64px" in html
+    assert ".status-rail { grid-column: 3; grid-row: 2;" in html
+    assert ".topbar { grid-column: 2 / span 2; grid-row: 1;" in html
+    assert ".sidebar { position: relative;" in html
+    assert ".topbar-brand { display: inline-flex; }" in html
+    assert "!important" not in html[html.index("/* Reference shell:"):html.index("</style>")]
+
+
+def test_conflict_queue_keeps_missing_members_visible_and_exposes_backend_actions() -> None:
+    html = render_interactive_html()
+    start = html.index("async function renderConflictQueue()")
+    end = html.index("async function renderQuarantine()", start)
+    queue = html[start:end]
+
+    assert "function conflictMemberLabel(member)" in html
+    assert "function conflictActionDescriptors(conflict)" in html
+    assert "item.display_name, item.title, item.label" in html
+    assert "const preview = item.preview || item.body_preview || item.body" in queue
+    assert "available_actions" in html
+    assert "data-conflict-action" in queue
+    assert "invokeConflictAction" in queue
+    # A stale conflict may not have two keepable records, but it must remain
+    # operable when the backend advertises close/cleanup/restore.
+    assert "关闭冲突" in html
+    assert "关闭失效冲突" in html
+    assert "清理冲突" in html
+    assert "恢复候选" in html
+    assert "rawMethod === 'conflict_close_stale' ? 'close_stale_conflict'" in html
+
+
+def test_agent_member_panel_separates_programs_from_historical_connections() -> None:
+    html = render_interactive_html()
+
+    assert "program_member_count" in html
+    assert "endpoint_member_count" in html
+    assert "unresolved_member_count" in html
+    assert "member_details" in html
+    assert "Math.max(0, endpointMemberCount - programCount)" in html
+    assert "extra_connection_count" in html
+    assert "function isUnknownHistoricalMember(member)" in html
+    assert "historical_unknown" in html
+    assert "item.canonical_program_id ?? item.program_id" in html
+    assert "identity_resolution || item.identity_status" in html
+    assert "agentFamily(item) !== 'unknown' || !genericLabel" in html
+    assert "未识别的 mcp 助手" in html
+    assert "optionalFiniteNumber(agentCardsData?.unknown_member_count)" in html
+    assert "optionalFiniteNumber(agentCardsData?.unresolved_member_count)" in html
+    assert "const programProjection = Array.isArray(agentCardsData?.program_member_details)" in html
+    assert "const memberNames = railSummary.names.length ? railSummary.names" in html
+    assert "function governanceGroupProgramSummary(group)" in html
+    assert "program_member_details" in html
+    assert "const unknown = summary.unknownCount ?" in html
+    assert "条连接（其他 ${summary.otherCount}）" in html
+    assert "待识别/历史连接" in html
+    assert "agentMemberStatus(item, binding, true)" in html
+    assert "unbindAgentBinding" in html
+    assert "can_unbind" in html
 
 
 def test_governance_flow_cards_navigate_to_real_queues() -> None:
@@ -248,7 +411,7 @@ def test_agent_and_governance_display_fallbacks_match_current_api_shapes() -> No
     assert "audit_only" in html
     assert "function agentDisplayName(agentOrId, fallback = '未知助手')" in html
     assert "return label;" in html
-    assert "e.agent_instance_id || e.actor" in html
+    assert "activityActorLabel(item)" in html
 
 
 def test_multi_agent_ui_keeps_existing_personal_and_shared_groups_selectable() -> None:
@@ -326,11 +489,15 @@ def test_conflict_queue_uses_self_contained_snapshots_and_fails_closed_for_stale
 
     assert "callApi('get_conflicts', activeShareGroupId)" in queue
     assert "callApi('list_memory', '', '', activeShareGroupId)" not in queue
+    assert "const [rawSnapshot, rawScope, rawConflicts]" in html
+    assert "unresolved_total" in html
+    assert "selectable_total" in html
+    assert "closable_stale_total" in html
     assert "item.preview || item.body_preview || item.body || item.reason" in queue
     assert "item.selectable === true || item.live === true" in queue
-    assert "历史冲突 · 候选已失效/不可恢复" in queue
-    assert "历史冲突中没有至少 2 条仍有效的记忆，候选已失效或不可恢复。" in queue
-    assert "个历史冲突组，其中 ${actionableCount} 个可处理" in queue
+    assert "历史冲突 · 候选失效，可关闭" in queue
+    assert "该组不可二选一，但可关闭以保留审计记录。" in queue
+    assert "个未闭合冲突组，可选择保留 ${actionableCount} 组、可关闭失效 ${closableStaleCount} 组" in queue
     assert "disabled title=\"${escapeHtml(invalidReason)}\"" in queue
     # Missing/legacy ID-only members have no explicit selectable flag and
     # therefore never get a radio input.
@@ -794,7 +961,7 @@ def test_overview_uses_explicit_scan_state_and_does_not_fabricate_health() -> No
     assert "function normalizeAuditState(value)" in html
     assert "const explicitState = normalizeAuditState(report.audit_state || report.auditStatus || report.status);" in html
     assert "const completed = auditIsCompleted(report);" in html
-    assert "health === null ? '健康度 ' + (findings.length ? `需处理 ${findings.length} 项` : '扫描完成')" in html
+    assert "health === null ? '健康度 ' + (findings.length ? `需处理 ${findings.length} 项` : '审计通过（未提供量化评分）')" in html
     assert "const healthText = health === null" in html
     assert "扫描完成/需处理" not in html
 
@@ -883,6 +1050,21 @@ def test_automatic_scope_decisions_stay_collapsed_with_chinese_event_labels() ->
     assert "Active memories" not in html
 
 
+def test_system_and_organizer_activity_has_a_stable_governance_label() -> None:
+    html = render_interactive_html()
+
+    assert "function activityActorLabel(item = {})" in html
+    assert "authority === 'system'" in html
+    assert "actor.startsWith('organizer:')" in html
+    assert "MemoryGuard 自动治理" in html
+    assert "activityActorLabel(item)" in html
+    start = html.index("async function renderRecentEvents()")
+    end = html.index("async function renderSupersedeChain()", start)
+    recent_events = html[start:end]
+    assert "activityActorLabel(e)" in recent_events
+    assert recent_events.count("activityActorLabel(e)") >= 2
+
+
 def test_projection_source_map_has_readable_shared_empty_state() -> None:
     html = render_interactive_html()
 
@@ -913,6 +1095,81 @@ def test_reference_information_architecture_keeps_seven_primary_views_and_contex
     assert "function sortNeuronGraph" in html
     assert "@media (max-width: 768px)" in html
     assert "@media (max-width: 1024px)" in html
+
+
+def test_async_tab_renders_reject_stale_full_page_results() -> None:
+    """A late tab request must not replace the page owned by the active tab."""
+    html = render_interactive_html()
+
+    assert "let contentRenderGeneration = 0;" in html
+    assert "function contentRenderIsCurrent(token)" in html
+    assert "if (!contentRenderIsCurrent(renderToken)) return false;" in html
+    assert "const renderToken = beginContentRender(state.activeTab);" in html
+    assert "const renderToken = takeContentRenderToken('sources');" in html
+    assert "const renderToken = takeContentRenderToken('governance');" in html
+    sources = html[html.index("async function renderSources()"):html.index("async function selectAgentCard", html.index("async function renderSources()"))]
+    assert "renderSourcesView(sourcesResult, rawResult, agentData, bindingsResult, renderToken);" in sources
+    assert "setContent(`<div class=\"view-heading\"><span class=\"eyebrow\">Sources</span>" in sources
+    governance = html[html.index("async function renderGovernance()"):html.index("async function selectGovernanceGroup", html.index("async function renderGovernance()"))]
+    assert "setContent(`<div class=\"view-heading\"><span class=\"eyebrow\">Governance</span>" in governance
+    assert "renderGovernanceSub();" in governance
+    assert "if (!contentRenderIsCurrent(renderToken)) return;" in governance
+
+
+def test_edge_async_tab_switch_keeps_latest_root_content(tmp_path: Path) -> None:
+    """Reproduce the slow sources response after switching to governance."""
+    edge = _edge_executable()
+    if edge is None:
+        pytest.skip("Microsoft Edge is not installed for the async tab probe")
+
+    probe = r'''
+<pre id="async-tab-probe"></pre>
+<script>
+(async () => {
+  let releaseSourceAgents;
+  let listAgentsCalls = 0;
+  window.callApi = (method) => {
+    if (method === 'list_agents' && ++listAgentsCalls === 1) {
+      return new Promise(resolve => { releaseSourceAgents = resolve; });
+    }
+    if (method === 'list_share_groups') return Promise.resolve({groups: []});
+    return Promise.resolve({agents: [], residuals: [], sources: [], coverage: {}, bindings: []});
+  };
+  state.report = {summary: {}, findings: [], audit_state: 'completed', health_score: null};
+  switchTab('sources');
+  switchTab('governance');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const before = document.querySelector('#content h2')?.textContent || '';
+  releaseSourceAgents({agents: [], residuals: []});
+  await new Promise(resolve => setTimeout(resolve, 40));
+  const after = document.querySelector('#content h2')?.textContent || '';
+  document.getElementById('async-tab-probe').textContent = JSON.stringify({
+    activeTab: state.activeTab, before, after,
+    governanceVisible: document.getElementById('content').textContent.includes('治理台'),
+    sourcesVisible: document.getElementById('content').textContent.includes('数据源与代理'),
+  });
+})();
+</script>
+'''
+    page = tmp_path / "interactive-async-tab.html"
+    page.write_text(render_interactive_html().replace("</body>", probe + "</body>"), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            str(edge), "--headless=new", "--disable-gpu", "--no-first-run",
+            "--disable-background-networking", "--user-data-dir=" + str(tmp_path / "edge-profile"),
+            "--virtual-time-budget=1000", "--dump-dom", "--window-size=1200,800", page.as_uri(),
+        ],
+        capture_output=True, check=False, encoding="utf-8", errors="replace", text=True, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr[-1000:]
+    match = re.search(r'<pre id="async-tab-probe">(.*?)</pre>', completed.stdout, re.DOTALL)
+    assert match, completed.stderr[-1000:]
+    payload = json.loads(unescape(match.group(1)))
+    assert payload["activeTab"] == "governance"
+    assert payload["before"] == "治理台"
+    assert payload["after"] == "治理台"
+    assert payload["governanceVisible"] is True
+    assert payload["sourcesVisible"] is False
 
 
 def test_overview_narrow_layout_stacks_kpis_and_governance_stages() -> None:
@@ -956,7 +1213,9 @@ def test_initial_hash_navigation_and_shared_sources_rail_have_explicit_state_pat
     rail = html[start:end]
     assert "if (isShareGroupScope())" in rail
     assert "共享治理 · 已激活" in rail
-    assert "const memberCount = memberIds.length;" in rail
+    assert "const declaredProgramCount = optionalFiniteNumber(agentCardsData?.program_member_count);" in rail
+    assert "const endpointMemberCount = optionalFiniteNumber(agentCardsData?.member_count ?? agentCardsData?.endpoint_member_count);" in rail
+    assert "const connectionCount = endpointMemberCount === null ? programCount + otherCount : Math.max(0, endpointMemberCount);" in rail
     assert "选择 Agent 卡片后，才切换到该 Agent 的详情。" in rail
     assert "share_group_id:" in rail
 

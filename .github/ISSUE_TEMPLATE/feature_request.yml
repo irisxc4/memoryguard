@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a focused improvement to MemoryGuard.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem first. Do not include secrets, tokens, personal data, or private repository content.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who is affected, and what is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: minimum-requirement
+    attributes:
+      label: Smallest useful requirement
+      description: State the minimum behavior that would solve the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or existing features did you try?
+    validations:
+      required: false
+  - type: textarea
+    id: governance-privacy
+    attributes:
+      label: Governance and privacy impact
+      description: Explain any effect on memory scope, retention, permissions, auditability, local data, or external data.
+    validations:
+      required: true

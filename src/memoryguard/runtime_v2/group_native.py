@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..content.store import ContentStore, stable_id
+from ..agent_mapping import normalize_program_identity
 from ..storage.database import execute_sql_script, open_database, open_database_snapshot
 from ..storage.layout import WorkspaceV2Layout
 from ..storage.schema import (
@@ -294,6 +295,298 @@ class GroupControlService:
             "updated_at": str(row[10]),
         }
 
+    def identity_catalog(self) -> dict[str, dict[str, Any]]:
+        """Build a bounded instance-id -> program identity catalog.
+
+        Bindings are persisted with an opaque instance id for auditability, but
+        the product identity is stable across Router accounts and sessions.  A
+        current discovery entry is preferred; the profile registry is also
+        consulted so a previously discovered (now missing) member remains
+        readable and governable instead of becoming an invisible count.
+        """
+        catalog: dict[str, dict[str, Any]] = {}
+        try:
+            from ..agent_locator import AgentLocator
+            from ..schema_v3 import stable_hash
+            locator = AgentLocator(self.workspace)
+            profiles = list(locator.registry.list_profiles())
+            # Read the persisted identity records through the existing service
+            # API.  Only exact canonical/alias ids from that registry are
+            # eligible for endpoint mapping.
+            registry: dict[str, dict[str, Any]] = {}
+            for provider in sorted({str(item.product or "").strip() for item in profiles}):
+                record = self.provider_identity(provider)
+                if record:
+                    registry[provider.casefold()] = record
+            for provider, record in registry.items():
+                identity = normalize_program_identity(provider)
+                if identity["program_id"] == "unknown":
+                    continue
+                canonical = str(record.get("canonical_id") or "").strip()
+                for endpoint_id in [
+                    canonical,
+                    *[str(item).strip() for item in (record.get("aliases") or ())],
+                ]:
+                    if not endpoint_id:
+                        continue
+                    is_canonical = endpoint_id == canonical
+                    catalog[endpoint_id] = {
+                        **identity,
+                        "canonical_program_id": identity["program_id"],
+                        "canonical_agent_instance_id": canonical,
+                        "provider_identity_provider": provider,
+                        "provider_identity_group_id": str(record.get("share_group_id") or ""),
+                        "identity_source": "provider_identity_registry",
+                        "resolution": "canonical" if is_canonical else "alias",
+                        "member_status": "historical_missing",
+                        "identity_role": "canonical" if is_canonical else "alias",
+                        "is_canonical_endpoint": is_canonical,
+                        "is_alias_endpoint": not is_canonical,
+                        "is_current_endpoint": False,
+                    }
+            for profile in profiles:
+                identity = normalize_program_identity(str(getattr(profile, "product", "") or ""))
+                expected_id = stable_hash(
+                    str(getattr(profile, "profile_id", "") or ""),
+                    str(locator.context.host_id or ""),
+                    str(self.workspace),
+                )
+                if expected_id and identity["program_id"] != "unknown":
+                    fallback = {
+                        **identity,
+                        "member_status": "historical_missing",
+                        "identity_source": "profile_registry",
+                        "is_canonical_endpoint": False,
+                        "is_alias_endpoint": False,
+                        "is_current_endpoint": False,
+                    }
+                    # Exact provider-registry rows win over profile-derived
+                    # guesses.  A profile may still enrich an existing row
+                    # with current status below.
+                    catalog.setdefault(expected_id, fallback)
+            instances, _ledgers = locator.detect_instances()
+            for instance in instances:
+                identity = normalize_program_identity(str(getattr(instance, "product", "") or ""))
+                instance_id = str(getattr(instance, "instance_id", "") or "").strip()
+                if instance_id:
+                    existing = dict(catalog.get(instance_id) or {})
+                    provider = str(identity.get("program_id") or "")
+                    record = registry.get(provider) if provider else None
+                    if record and provider != "unknown" and not existing:
+                        canonical = str(record.get("canonical_id") or "").strip()
+                        aliases = {
+                            str(item).strip()
+                            for item in (record.get("aliases") or ())
+                            if str(item).strip()
+                        }
+                        catalog[instance_id] = {
+                            **identity,
+                            "canonical_program_id": provider,
+                            "canonical_agent_instance_id": canonical,
+                            "provider_identity_provider": provider,
+                            "provider_identity_group_id": str(record.get("share_group_id") or ""),
+                            "member_status": "active_detected",
+                            "identity_source": "current_discovery",
+                            "resolution": "verified_program",
+                            "identity_role": (
+                                "canonical" if instance_id == canonical
+                                else ("alias" if instance_id in aliases else "current")
+                            ),
+                            "is_canonical_endpoint": instance_id == canonical,
+                            "is_alias_endpoint": instance_id in aliases,
+                            "is_current_endpoint": True,
+                        }
+                    else:
+                        existing.update({
+                            **({} if existing else identity),
+                            "member_status": "active_detected",
+                            "is_current_endpoint": True,
+                        })
+                        catalog[instance_id] = existing
+        except Exception:
+            # Identity is presentation/enrichment only.  A failed probe must
+            # never hide a persisted binding or block its safe unbind action.
+            return catalog
+        return catalog
+
+    @staticmethod
+    def _unknown_member_identity(binding: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "canonical_program_id": "",
+            "program_id": "unknown",
+            "display_name": "未识别的 MCP 助手",
+            "canonical_display_name": "未识别的 MCP 助手",
+            "identity_resolution": "unresolved",
+            "identity_source": "historical_binding",
+            "member_status": "historical_unknown",
+            "member_source": str(binding.get("mcp_server_name") or "") or "MCP binding",
+            "can_unbind": bool(str(binding.get("binding_id") or "").strip()),
+        }
+
+    def _enrich_binding(
+        self,
+        binding: Mapping[str, Any],
+        catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Add human identity and safe-management metadata to one binding."""
+        item = dict(binding)
+        identities = catalog if catalog is not None else self.identity_catalog()
+        agent_id = str(item.get("agent_instance_id") or "").strip()
+        identity = dict(identities.get(agent_id) or {})
+        if not identity:
+            identity = normalize_program_identity(
+                "",
+                mcp_name=str(item.get("mcp_server_name") or ""),
+            )
+            identity["member_status"] = "historical_unknown"
+            identity["identity_source"] = "historical_binding"
+        if str(identity.get("program_id") or "") == "unknown":
+            identity = {**self._unknown_member_identity(item), **identity}
+            # The localized label is a product-level UI contract, not an
+            # opaque token supplied by an MCP server.
+            identity["display_name"] = "未识别的 MCP 助手"
+            identity["canonical_display_name"] = "未识别的 MCP 助手"
+            identity["program_id"] = "unknown"
+        else:
+            identity.setdefault("canonical_program_id", str(identity.get("program_id") or ""))
+            identity.setdefault("canonical_display_name", str(identity.get("display_name") or ""))
+            identity.setdefault("can_unbind", bool(str(item.get("binding_id") or "").strip()))
+            identity.setdefault("member_source", str(item.get("mcp_server_name") or "") or "discovery")
+        canonical_program_id = "" if str(identity.get("program_id") or "") == "unknown" else str(
+            identity.get("canonical_program_id") or identity.get("program_id") or ""
+        )
+        item.update({
+            "canonical_program_id": canonical_program_id,
+            "program_id": str(identity.get("program_id") or "unknown"),
+            "provider": str(identity.get("provider") or ""),
+            "product": str(identity.get("program_id") or ""),
+            "display_name": str(identity.get("display_name") or "未识别的 MCP 助手"),
+            "canonical_display_name": str(identity.get("canonical_display_name") or identity.get("display_name") or "未识别的 MCP 助手"),
+            "identity_resolution": str(identity.get("resolution") or "unresolved"),
+            "identity_source": str(identity.get("identity_source") or identity.get("source") or "historical_binding"),
+            "member_status": str(identity.get("member_status") or "historical_unknown"),
+            "member_source": str(identity.get("member_source") or item.get("mcp_server_name") or "MCP binding"),
+            "can_unbind": bool(identity.get("can_unbind")),
+            "canonical_agent_instance_id": str(identity.get("canonical_agent_instance_id") or ""),
+            "provider_identity_provider": str(identity.get("provider_identity_provider") or ""),
+            "provider_identity_group_id": str(identity.get("provider_identity_group_id") or ""),
+            "identity_role": str(identity.get("identity_role") or "unknown"),
+            "is_canonical_endpoint": bool(identity.get("is_canonical_endpoint")),
+            "is_alias_endpoint": bool(identity.get("is_alias_endpoint")),
+            "is_current_endpoint": bool(
+                identity.get("is_current_endpoint")
+                or str(identity.get("member_status") or "") == "active_detected"
+            ),
+        })
+        item["endpoint_id"] = agent_id
+        item["canonical_member_key"] = (
+            item["canonical_program_id"]
+            or "unknown-binding:" + str(item.get("binding_id") or agent_id)
+        )
+        return item
+
+    def _enriched_bindings(
+        self,
+        *,
+        include_inactive: bool = True,
+        group_id: str = "",
+        identity_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        catalog = identity_catalog if identity_catalog is not None else self.identity_catalog()
+        rows = [
+            self._enrich_binding(item, catalog)
+            for item in self._read_bindings(include_inactive=include_inactive, group_id=group_id)
+        ]
+        # Preserve every endpoint for audit and unbind, while designating one
+        # deterministic representative per program/group for user-facing
+        # projections. Unknown endpoints never share a bucket: opaque ids are
+        # not evidence that two records belong to the same program.
+        buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            program = str(row.get("canonical_program_id") or "")
+            bucket_key = (
+                str(row.get("share_group_id") or ""),
+                program or "unknown-binding:" + str(row.get("binding_id") or row.get("endpoint_id") or ""),
+            )
+            buckets.setdefault(bucket_key, []).append(row)
+        for bucket in buckets.values():
+            bucket.sort(key=lambda value: (
+                0 if value.get("is_canonical_endpoint") else 1,
+                0 if value.get("is_current_endpoint") else 1,
+                str(value.get("endpoint_id") or value.get("agent_instance_id") or ""),
+            ))
+            for index, row in enumerate(bucket):
+                row["is_redundant_endpoint"] = index > 0
+                row["user_member_representative"] = index == 0
+                row["endpoint_role"] = (
+                    "canonical" if row.get("is_canonical_endpoint") else
+                    ("alias" if row.get("is_alias_endpoint") else
+                     ("current" if row.get("is_current_endpoint") else "historical"))
+                )
+        return rows
+
+    @staticmethod
+    def program_member_projection(bindings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """Collapse endpoint bindings into readable program members.
+
+        ``member_details`` remains the complete endpoint-level audit surface.
+        This companion projection is intentionally derived, deterministic and
+        body-free so GUI callers can show one row per program without losing
+        the endpoint ids/actions needed to unbind a stale or redundant entry.
+        """
+        buckets: dict[str, list[Mapping[str, Any]]] = {}
+        for item in bindings:
+            program = str(item.get("canonical_program_id") or "")
+            key = program or "unknown-binding:" + str(
+                item.get("binding_id") or item.get("endpoint_id") or item.get("agent_instance_id") or ""
+            )
+            buckets.setdefault(key, []).append(item)
+        details: list[dict[str, Any]] = []
+        for key, rows in sorted(buckets.items()):
+            representative = next(
+                (item for item in rows if item.get("user_member_representative")),
+                sorted(rows, key=lambda item: str(item.get("endpoint_id") or item.get("agent_instance_id") or ""))[0],
+            )
+            known = bool(str(representative.get("canonical_program_id") or ""))
+            details.append({
+                "canonical_program_id": str(representative.get("canonical_program_id") or ""),
+                "program_id": str(representative.get("program_id") or "unknown"),
+                "provider": str(representative.get("provider") or representative.get("program_id") or ""),
+                "product": str(representative.get("product") or representative.get("program_id") or ""),
+                "display_name": str(representative.get("display_name") or "未识别的 MCP 助手"),
+                "canonical_display_name": str(representative.get("canonical_display_name") or representative.get("display_name") or "未识别的 MCP 助手"),
+                "canonical_agent_instance_id": str(representative.get("canonical_agent_instance_id") or ""),
+                "representative_endpoint_id": str(representative.get("endpoint_id") or representative.get("agent_instance_id") or ""),
+                "endpoint_count": len(rows),
+                "endpoint_ids": [str(item.get("endpoint_id") or item.get("agent_instance_id") or "") for item in rows],
+                "binding_ids": [str(item.get("binding_id") or "") for item in rows],
+                "current": any(bool(item.get("is_current_endpoint")) for item in rows),
+                "redundant": any(bool(item.get("is_redundant_endpoint")) for item in rows),
+                "known": known,
+                "identity_source": str(representative.get("identity_source") or "historical_binding"),
+                "can_unbind": any(bool(item.get("can_unbind")) for item in rows),
+            })
+        program_members = sorted({
+            str(item.get("canonical_program_id") or "")
+            for item in details
+            if str(item.get("canonical_program_id") or "")
+        })
+        return {
+            "members": details,
+            "program_members": program_members,
+            "program_member_count": len(program_members),
+            # Unknown records remain separate in ``members`` and retain their
+            # own unbind ids. This count is the unresolved identity category
+            # (normally one), while endpoint count exposes its true size.
+            "unresolved_member_count": sum(1 for item in details if not item["known"]),
+            "unresolved_endpoint_count": sum(1 for item in details if not item["known"]),
+            "endpoint_member_count": sum(int(item.get("endpoint_count") or 0) for item in details),
+            "extra_connection_count": max(
+                0,
+                sum(int(item.get("endpoint_count") or 0) for item in details) - len(program_members),
+            ),
+        }
+
     def _read_bindings(self, *, include_inactive: bool = True, group_id: str = "", agent_id: str = "") -> list[dict[str, Any]]:
         if not self.store.db_path.is_file() or self.store._preflight() != "current":
             return []
@@ -315,15 +608,92 @@ class GroupControlService:
             ).fetchall()
         return [self._binding(row) for row in rows]
 
-    def list_bindings(self, *, include_inactive: bool = True) -> dict[str, Any]:
-        rows = self._read_bindings(include_inactive=bool(include_inactive))
+    def list_bindings(
+        self,
+        *,
+        include_inactive: bool = True,
+        identity_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        rows = self._enriched_bindings(
+            include_inactive=bool(include_inactive),
+            identity_catalog=identity_catalog,
+        )
         return {"ok": True, "status": "succeeded", "bindings": rows, "total": len(rows)}
 
-    def active_binding_for_agent(self, agent_instance_id: str) -> dict[str, Any] | None:
-        rows = self._read_bindings(include_inactive=False, agent_id=str(agent_instance_id))
+    def active_binding_for_agent(
+        self,
+        agent_instance_id: str,
+        *,
+        identity_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        agent = str(agent_instance_id or "").strip()
+        rows = self._read_bindings(include_inactive=False, agent_id=agent)
         if len(rows) > 1:
             raise GroupControlError("multiple_active_bindings")
-        return rows[0] if rows else None
+        catalog = identity_catalog if identity_catalog is not None else self.identity_catalog()
+        requested = catalog.get(agent) or {}
+        requested_program = str(requested.get("canonical_program_id") or requested.get("program_id") or "")
+        if requested_program == "unknown":
+            requested_program = ""
+        requested_group = str(requested.get("provider_identity_group_id") or "")
+        # Validate all exact/alias endpoints for this program even when the
+        # requested id has a direct row. Two active groups are ambiguous and
+        # must fail closed instead of silently selecting one.
+        enriched_all = [
+            self._enrich_binding(item, catalog)
+            for item in self._read_bindings(include_inactive=False)
+        ]
+        if rows:
+            result = self._enrich_binding(rows[0], catalog)
+            program = str(result.get("canonical_program_id") or "") or requested_program
+            if program:
+                matches = [
+                    item for item in enriched_all
+                    if str(item.get("canonical_program_id") or "") == program
+                ]
+                groups = {str(item.get("share_group_id") or "") for item in matches}
+                if len(groups) > 1:
+                    raise GroupControlError("multiple_active_bindings")
+                if requested_group and any(group != requested_group for group in groups):
+                    raise GroupControlError("provider_identity_group_mismatch")
+                # One governed program has one effective binding. Prefer the
+                # registry's canonical endpoint when both canonical and alias
+                # rows exist; the alias remains in member_details for audit
+                # and can still be explicitly unbound there.
+                preferred = next(
+                    (item for item in matches if item.get("is_canonical_endpoint")),
+                    next(
+                        (item for item in matches if item.get("is_current_endpoint")),
+                        matches[0] if matches else result,
+                    ),
+                )
+                if str(preferred.get("binding_id") or "") != str(result.get("binding_id") or ""):
+                    preferred = dict(preferred)
+                    preferred["resolved_for_agent_instance_id"] = agent
+                    preferred["binding_alias"] = True
+                return preferred
+            return result
+
+        # A Router/account switch must not split one program's governed group.
+        # Resolve only exact canonical identities from the trusted profile
+        # registry/current discovery; never infer from an opaque id substring.
+        if not requested_program:
+            return None
+        matches = [
+            item for item in enriched_all
+            if str(item.get("canonical_program_id") or "") == requested_program
+        ]
+        groups = {str(item.get("share_group_id") or "") for item in matches}
+        if len(groups) > 1:
+            raise GroupControlError("multiple_active_bindings")
+        if requested_group and any(group != requested_group for group in groups):
+            raise GroupControlError("provider_identity_group_mismatch")
+        if not matches:
+            return None
+        result = dict(matches[0])
+        result["resolved_for_agent_instance_id"] = agent
+        result["binding_alias"] = True
+        return result
 
     @staticmethod
     def _group_lifecycle_key(group_id: str) -> str:
@@ -371,13 +741,15 @@ class GroupControlService:
         database, directory, WAL, receipt, or other side effect.
         """
 
-        bindings = self._read_bindings(include_inactive=False)
+        bindings = self._enriched_bindings(include_inactive=False)
         members: dict[str, list[str]] = {}
+        member_details: dict[str, list[dict[str, Any]]] = {}
         for item in bindings:
             group = str(item["share_group_id"] or "")
             agent = str(item["agent_instance_id"] or "")
             if group and agent:
                 members.setdefault(group, []).append(agent)
+                member_details.setdefault(group, []).append(dict(item))
 
         memory_groups: dict[str, dict[str, Any]] = {}
         memory_db = self.store.layout.memory_db
@@ -447,6 +819,8 @@ class GroupControlService:
         total_visibility_counts: dict[str, int] = {}
         for group in group_ids:
             item = memory_groups.get(group, {})
+            group_member_details = member_details.get(group, [])
+            member_projection = self.program_member_projection(group_member_details)
             status_counts = dict(item.get("status_counts") or {})
             visibility_counts = dict(item.get("visibility_counts") or {})
             version_rows = list(item.get("version_rows") or [])
@@ -478,7 +852,27 @@ class GroupControlService:
                 "group_id": group,
                 "group_kind": _group_kind(group),
                 "members": sorted(set(members.get(group, []))),
+                # Keep the historical endpoint-count contract. Consumers
+                # wanting the readable projection use program_member_count
+                # and the program_member_details list below.
                 "member_count": len(set(members.get(group, []))),
+                "endpoint_member_count": int(member_projection["endpoint_member_count"]),
+                "extra_connection_count": int(member_projection["extra_connection_count"]),
+                # ``members`` remains the opaque audit ids for compatibility;
+                # these projections are the user-facing, canonical view. An
+                # unresolved historical binding gets its own key so two
+                # unknown records are never guessed to be the same program.
+                "member_details": sorted(
+                    group_member_details,
+                    key=lambda value: (str(value.get("display_name") or ""), str(value.get("agent_instance_id") or "")),
+                ),
+                "program_members": member_projection["program_members"],
+                "program_member_count": int(member_projection["program_member_count"]),
+                "unresolved_member_count": int(member_projection["unresolved_member_count"]),
+                "unresolved_endpoint_count": int(member_projection["unresolved_endpoint_count"]),
+                "program_member_details": [
+                    value for value in member_projection["members"] if value.get("known")
+                ],
                 "record_count": int(item.get("record_count", 0)),
                 "total_records": int(item.get("record_count", 0)),
                 "active_count": active_count,
@@ -981,7 +1375,7 @@ class GroupControlService:
 
     def group_preview(self, group_id: str) -> dict[str, Any]:
         group = str(group_id or "").strip()
-        bindings = self._read_bindings(include_inactive=False, group_id=group)
+        bindings = self._enriched_bindings(include_inactive=False, group_id=group)
         memory_count = 0
         try:
             from ..memory.store import MemoryAtomStore, MemoryReadScope
@@ -990,7 +1384,27 @@ class GroupControlService:
                 memory_count = len(memory.list_atoms(scope=MemoryReadScope(workspace_id=str(self.workspace), share_group_id=group, admin=True), include_building=True))
         except Exception:
             memory_count = 0
-        return {"ok": True, "status": "succeeded", "share_group_id": group, "group_kind": _group_kind(group), "bindings": bindings, "members": [item["agent_instance_id"] for item in bindings], "member_count": len(bindings), "memory_count": memory_count}
+        member_projection = self.program_member_projection(bindings)
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "share_group_id": group,
+            "group_kind": _group_kind(group),
+            "bindings": bindings,
+            "members": [item["agent_instance_id"] for item in bindings],
+            "member_details": bindings,
+            "member_count": len(bindings),
+            "endpoint_member_count": int(member_projection["endpoint_member_count"]),
+            "extra_connection_count": int(member_projection["extra_connection_count"]),
+            "program_members": member_projection["program_members"],
+            "program_member_count": int(member_projection["program_member_count"]),
+            "program_member_details": [
+                item for item in member_projection["members"] if item.get("known")
+            ],
+            "unresolved_member_count": int(member_projection["unresolved_member_count"]),
+            "unresolved_endpoint_count": int(member_projection["unresolved_endpoint_count"]),
+            "memory_count": memory_count,
+        }
 
     def check_drift(self, binding_id: str) -> dict[str, Any]:
         target = next((item for item in self._read_bindings(include_inactive=True) if item["binding_id"] == str(binding_id)), None)
@@ -1175,6 +1589,8 @@ class GroupControlService:
                 "canonical_id": canonical,
                 "share_group_id": str(data.get("share_group_id") or "").strip(),
                 "aliases": aliases,
+                "program_id": normalize_program_identity(str(provider or "")).get("program_id", "unknown"),
+                "display_name": normalize_program_identity(str(provider or "")).get("display_name", "unknown"),
             }
         return None
 

@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible problem in MemoryGuard.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove secrets, tokens, personal data, and private paths before posting.
+  - type: input
+    id: version
+    attributes:
+      label: MemoryGuard version
+      description: Include the output of `memoryguard --version`.
+      placeholder: "0.7.8"
+    validations:
+      required: true
+  - type: input
+    id: operating-system
+    attributes:
+      label: Operating system
+      placeholder: "Windows 11 24H2, Ubuntu 24.04, or macOS 15"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "Python 3.12.5"
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Agent host and integration
+      description: Name the host and whether this is CLI, MCP, Hook, or GUI.
+      placeholder: "Codex + MCP and Hook"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Give the smallest reliable reproduction, including the command or UI action.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste relevant error text or status output after removing secrets, tokens, personal data, and private paths.
+      render: text
+    validations:
+      required: false

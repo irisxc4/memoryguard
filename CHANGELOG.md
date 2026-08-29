@@ -1,5 +1,39 @@
 # Changelog
 
+## [0.7.8] - 2026-08-29
+
+### Added
+
+- Added local-only usage telemetry for MCP conversion events and host-reported
+  token measurements, with separate seven- and thirty-day views and explicit
+  measurement-basis metadata. Token savings are estimates from deterministic
+  MemoryGuard units; hosts without token reporting remain unsupported rather
+  than receiving guessed values.
+
+### Fixed
+
+- Canonical memory/rule reads and writes now converge related rules, habits, and
+  memories while preserving source links, evidence, graph branches, reversible
+  history, and settlement receipts. Mandatory context remains independently
+  budgeted and fail-closed on invalid or overflowing state.
+- Governance surfaces expose stable, readable provider/program identities,
+  shared-group scope, safe icons, automatic decisions, risk explanations, and
+  stale-conflict closure. The GUI uses the seven-page governance shell and
+  keeps technical identifiers in details.
+- Codex lifecycle cleanup remains evidence-gated for terminal threads, while
+  ordinary turns stay resumable. Provider repair/runtime alignment preserves
+  the existing Agent/shared-group binding and makes installed MCP and lifecycle
+  Hooks use the current interpreter.
+
+### Privacy
+
+- Usage telemetry is stored only in the local `.memoryguard/usage_telemetry.sqlite`
+  database. It does not upload data and does not retain conversation bodies,
+  account names, raw paths, or instance identifiers.
+
+This release note records the source/documentation scope. CI and PyPI results
+are reported by the release workflow after its gates complete.
+
 ## [0.7.7] - 2026-08-28
 
 ### Fixed

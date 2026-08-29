@@ -17,7 +17,8 @@
 > MemoryGuard organizes each write, preserves the evidence behind changes, and
 > keeps governance decisions reversible.
 >
-> **No account. No remote server. No telemetry. Memory stays local.**
+> **No account. No remote server. No remote telemetry. Local-only usage telemetry
+> is optional and stores bounded, privacy-preserving aggregates locally.**
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
@@ -36,245 +37,32 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.7
+## What's New in v0.7.8
 
-v0.7.7 is a focused provider-repair and runtime-alignment hotfix:
+v0.7.8 consolidates the governance, observability, and host-runtime fixes
+prepared after v0.7.7:
 
-- **Safe bare-shell repair:** `memoryguard provider repair ...` can use an
-  in-process trusted repair capability when the canonical control home is
-  verified and exactly one active binding is present. Missing or ambiguous
-  context remains fail-closed, and other CLI mutations are unchanged.
-- **One interpreter for installed repairs:** non-editable wheel repairs ignore
-  inherited stale snapshots and write the current `sys.executable` to the
-  Codex MCP entry and all seven lifecycle Hooks. Editable/local installs keep
-  their content-keyed immutable snapshot behavior.
-- **Binding continuity:** repairs preserve the existing Agent identity and
-  shared-group binding.
+- **Canonical memory and rule governance:** related rules, habits, and memories
+  converge through one canonical read/write path while evidence, source links,
+  graph branches, supersede history, conflict review, and settlement remain
+  auditable and reversible.
+- **Readable multi-agent governance:** verified program identities, readable
+  labels, safe family icons, shared-group scope, risk explanations, stale-conflict
+  closure, and the seven-page GUI shell keep daily governance understandable.
+- **Local usage and savings view:** the Token page shows local MCP conversion
+  events and seven-/thirty-day estimated baseline-versus-delivered units.
+  Provider token measurements are used only when reported (currently Codex and
+  Grok); Claude, Cursor, and Trae remain explicitly unsupported. No conversation
+  body, account, path, or instance identifier is stored.
+- **Codex lifecycle and runtime alignment:** terminal-thread evidence gates
+  reclamation of Codex-owned leaked cohorts; ordinary turns remain resumable.
+  Installed repair aligns MCP and lifecycle Hooks to the current interpreter
+  while preserving Agent/shared-group identity and fail-closed boundaries.
 
-See [the v0.7.7 release record](docs/releases/v0.7.7.md).
+See [the v0.7.8 release record](docs/releases/v0.7.8.md).
 
-## What's New in v0.7.6
-
-v0.7.6 is a focused Codex Hook/MCP runtime reliability release:
-
-- **One runtime snapshot:** Codex lifecycle Hooks and MCP now share the same
-  content-keyed, immutable runtime snapshot, avoiding PATH/package-metadata
-  version drift.
-- **Concurrent tool safety:** session-state writes use short, re-entrant
-  cross-process lock windows instead of locking around the whole Hook run, so
-  concurrent tools and sub-agent dispatch do not time out behind one another.
-- **Consistent bootstrap state:** a failed bootstrap clears stale success state;
-  recovery clears old errors and records a stable context hash. Ordinary Stop
-  failures stay fail-open, while explicit mandatory-budget overflow is retained
-  for the next tool call to fail closed.
-- **Stable Agent identity:** the built-in Grok profile is discovered from its
-  installed user surface. Verified provider/CLI/MCP metadata maps to a stable
-  program identity; generic or opaque values remain unresolved instead of being
-  guessed.
-- **Clearer governance shell:** the GUI follows the seven-page reference
-  information architecture with persistent navigation, a central workspace,
-  and a context rail. Agent cards show readable names, source summaries, and
-  safe family-aware icon fallbacks; technical IDs remain in collapsed details.
-
-See [the v0.7.6 release record](docs/releases/v0.7.6.md).
-
-## What's New in v0.7.5
-
-v0.7.5 is a focused conflict-review correctness release:
-
-- **Readable conflict snapshots:** conflict members include bounded, redacted
-  previews from the V2 atom/tombstone history, so the review view remains useful
-  without exposing raw bodies.
-- **Clear reasons and safe candidates:** known conflict reasons have Chinese
-  labels, while deleted, superseded, rejected, quarantined, shadowed, missing,
-  or otherwise invalid members cannot be selected as the keeper.
-- **Fail-closed resolution:** a conflict can be resolved only when at least two
-  members are still live and selectable; stale historical groups remain visible
-  for audit instead of becoming mutation targets.
-- **Honest counts:** historical conflict-group totals stay separate from the
-  actionable count used by the governance overview.
-
-See [the v0.7.5 release record](docs/releases/v0.7.5.md).
-
-## What's New in v0.7.4
-
-v0.7.4 is a governance correctness and runtime reliability release:
-
-- **Canonical updates:** related rules, habits, and memories merge into one
-  evolving canonical record while graph branches, provenance, scope, evidence,
-  and reversible history remain available.
-- **Bounded mandatory context:** more than 20 mandatory rules raises a health
-  warning instead of truncating storage or injection; character/token budget,
-  sensitive-content, and corrupt-state failures remain fail-closed.
-- **Readable governance:** Agent identities, automatic decisions, and risk
-  signals use readable labels and explanations. GUI governance groups start
-  collapsed; conflict and risk summaries open their details; risk entries
-  explain reason, impact, and action; CodeGraph shares the same governed
-  identity/scope/evidence path.
-- **Reliable audit state:** `run_audit` and `get_audit` return explicit
-  completion state and timezone-aware timestamps. The GUI no longer leaves a
-  completed scan at `待扫描` and keeps the reader popover above navigation;
-  missing numeric health evidence remains unknown instead of becoming a
-  fabricated score. Governance phases show readable completed/current/
-  pending/undetermined states.
-- **Codex runtime safety:** Hook/bootstrap errors are classified accurately;
-  `NO_SOURCE` is a neutral fallback. Provider installation uses content-keyed,
-  non-editable MCP snapshots with atomic failure behavior, packaged static
-  asset refresh, and PEP 610 copied-install diagnostics.
-- **Safe mutation and migration:** GUI partial mutations and evidence
-  conflicts preserve the last valid state. System `group_outbox` projection
-  advances event and checkpoint atomically; safe repair handles old lag while
-  pending/failed events remain fail-closed. Migration replay contracts verify
-  idempotent retries and failure evidence.
-
-Validation for this release uses the existing incremental CI tail (`447/447`
-passed), related focused suites, and `git diff --check`; the full suite was not
-rerun for this release preparation.
-
-See [the v0.7.4 release record](docs/releases/v0.7.4.md).
-
-## What's New in v0.7.3
-
-v0.7.3 is a focused shared-history visibility fix.
-
-See [the v0.7.3 release record](docs/releases/v0.7.3.md).
-
-## What's New in v0.7.2
-
-v0.7.2 is a focused correctness and compatibility release:
-
-- **Write → read-back and scope:** trusted Agent/project scope now stays aligned
-  across the write and read paths, so a successful write can be read back under
-  the same scope without weakening isolation.
-- **Codex Hook lifecycle and transport:** lifecycle cleanup uses verified Codex
-  thread/workspace evidence, keeps ordinary `Stop` resumable, and reconciles
-  terminal or deleted threads conservatively. The transport repair normalizes
-  the current interpreter and UTF-8 stdio, then verifies `initialize`,
-  `tools/list`, `memory_status`, and `memory_read`.
-- **Python 3.10 compatibility:** the Codex transport repair path uses the
-  project's `memoryguard.toml_compat` interface, selecting stdlib `tomllib`
-  where available and `tomli` on Python 3.10.
-
-See [the v0.7.2 release record](docs/releases/v0.7.2.md).
-
-## What's New in v0.7.1
-
-v0.7.1 closes the migration and desktop lifecycle gaps found after the V2-only
-cutover:
-
-- **One-command migration:** after upgrading the Python package, run
-  `memoryguard upgrade`. The bare command uses the canonical user data home,
-  migrates and verifies bindings, groups, memory, rules, history, and sources,
-  activates V2, then removes only the successful migration backup batch.
-  `memoryguard upgrade --preview` is the zero-write inspection path.
-- **One canonical control workspace:** bare `memoryguard gui`, `doctor`,
-  `mcp-status`, `hooks`, `groups`, and storage commands all use the same
-  user-level data home, independent of the terminal's current directory.
-- **Recovered Agent and Group control:** migrated bindings and groups remain
-  editable; discovered but unbound Agents can enable a personal memory layer.
-  Discovery exposes registered product/profile surfaces without guessing every
-  directory on the machine or reading source bodies.
-- **Real projection engines:** the build dialog lists only executable local
-  Agent CLIs such as Cursor Agent and Codex. A selected CLI runs the governed
-  extraction/enrichment pipeline inside the tracked task; deterministic mode
-  is labeled honestly. There is no synthetic `host skill` engine.
-- **Reliable start/cancel:** one active build is allowed per trusted scope.
-  Durable task IDs survive reloads, stale owners recover safely, cancellation
-  stops owned CLI children, and every terminal/error path restores the neuron
-  page instead of leaving `starting / 0%` spinning.
-- **Unified governance:** canonical rules, memory deduplication, compaction,
-  knowledge references, and bounded context injection preserve identity,
-  policy, priority, audience, scope, provenance, and evidence. Graphify stays
-  integrated as an optional metadata provider behind MemoryGuard CodeGraph; it
-  is not a separate MemoryGuard package.
-- **History, Governance, and Knowledge UI repaired:** raw History sessions now
-  open through the real SafeBridge/native V2 path, governance activity shows
-  the responsible Agent instead of `Unknown Agent`, and `/knowledge` is again
-  a full V2 bookshelf/detail experience instead of a JSON debug page.
-- **Clearer governance visualization:** dominant automatic decisions collapse
-  into readable groups, while the neuron graph uses a tighter level-aware
-  layout and root-outward soft signal bands instead of projectile-like particles.
-
-Final local regression: **1884 passed / 0 failed** across **205 test files**. See
-[the v0.7.1 release record](docs/releases/v0.7.1.md).
-
-## What's New in v0.7.0 (V2-only; published 2026-08-12)
-
-v0.7.0 is V2-only. Local release acceptance passed and the release was
-published to GitHub and PyPI on 2026-08-12. MemoryGuard owns the CodeGraph
-boundary; Graphify is an optional extraction provider, not a second MemoryGuard
-runtime or a separate MemoryGuard package. The boundary and evidence below
-describe the release. The Graphify result is a real full-repository
-export/projection result, not a claim that upstream Graphify's full-repository
-test suite passed.
-
-- **V1 runtime physically retired:** production entrypoint import closure has no
-  V1 runtime/store modules. `V1_ACTIVE` is a migration starting state, not a
-  runnable fallback. Legacy formats are readable only under
-  `memoryguard.migration`; every other entrypoint fails closed with
-  `v2_upgrade_required`. V1 data and migration backups remain rollback/audit
-  evidence, never V2 runtime write targets.
-- **V2 control planes:** Memory, Evidence, History, Source, Binding, and Group
-  are V2-native boundaries. Memory atoms and evidence/decision receipts are
-  separate from raw conversation History; authorized Source files/folders are
-  separate from runtime state; trusted Agent Bindings select the governing
-  Group.
-- **Canonical governance:** canonical reconciliation folds rules into
-  `shared_baseline`, `agent_overlay`, and `project_overlay` bundles, keeps
-  durable source links, verifies parity, activates the canonical read path,
-  then shadows old duplicates for recovery. V2 automatic organization performs
-  exact/semantic duplicate detection inside one share group and records
-  deduplicated, superseded, conflicted, or quarantined outcomes. Rule duplicate
-  scans produce governed merge proposals; merge and supersede decisions keep
-  evidence, scope, idempotency, and undo receipts.
-- **Cross-agent same-group governance:** all members of one trusted
-  `share_group_id` participate in the same bounded candidate and governance
-  view; another group cannot enter it. Agent identity remains in provenance.
-- **Knowledge files and folders:** a selected folder becomes a governed book and
-  selected files become traceable documents. Content Plane owns source bodies;
-  Knowledge stores metadata/references, supports re-ingest, remove/restore/
-  purge, and requires explicit review before memory candidates are accepted.
-- **GUI Agent and Group control:** the native GUI discovers Agent names and
-  instances, records source selections, lists bindings, binds members to shared
-  or personal groups, checks drift, and can leave or dissolve a group. Group
-  changes commit receipts and system outbox events transactionally.
-- **GUI builds and process cleanup:** projection, Knowledge, import, history,
-  maintenance, release, and compatibility work use durable V2 `TaskRun`
-  status. Status survives reload, cancellation is cooperative and bounded, and
-  owned background workers/process cleanup must finish before shutdown.
-- **CodeGraph / Graphify:** MemoryGuard owns the trusted, body-free CodeGraph
-  adapter and projection. Graphify is an optional extraction provider that
-  supplies metadata-only exports; it is not a separate MemoryGuard runtime or
-  package. CodeGraph preserves source role, provenance, source maps, revisions,
-  tombstones, and outbox state, and exposes bounded query/path/explain/affected
-  operations with production-only filtering.
-- **Security and rollback:** unknown/corrupt state, missing scope, invalid
-  provenance, reparse paths, unsafe metadata, and stale idempotency fail closed.
-  Public receipts redact source bodies and paths; governance/audit/outbox
-  records retain decisions. Release rollback restores a Content Plane blob and
-  held occurrence through a scoped receipt rather than trusting an unbound
-  backup path.
-- **Local release acceptance evidence:** `1761 / 1761`, with no skip or xfail;
-  V1 retirement + CodeGraph `15 / 15`; Graphify focused checks `3 / 3`;
-  canonical reconciliation `ACCEPTED`; RuleMerge `46 / 46`; v3.2 `27 / 27`.
-  The real full-repository Graphify export/projection covered `486 files / 11672
-  nodes / 38714 edges → 11667 canonical symbols / 38714 edges`; query/path/
-  affected passed and failure atomicity was `0` throughout.
-- **Final packaging evidence:** clean wheel `206 files`, `legacy bad=0`;
-  isolated package, CLI, and MCP all reported `0.7.0`; desktop help passed.
-
-Local release acceptance passed. v0.7.0 was published to GitHub and PyPI on
-2026-08-12. These Graphify results cover the focused checks and the real
-full-repository export/projection only; they do not claim upstream Graphify's
-full-repository tests passed. See [the v0.7.0 release record](docs/releases/v0.7.0.md).
-
-### v0.6.2 compatibility baseline
-
-The Python 3.10 SQLite correction remains part of the v0.7.0 upgrade baseline:
-Memory, Evidence, and Content schema preflights inspect a private copy of the
-SQLite main file plus `-wal`/`-shm` companions, and physical no-write checks do
-not observe or checkpoint the live database. The historical release note is
-preserved at [docs/releases/v0.6.2.md](docs/releases/v0.6.2.md).
+Earlier release details are kept in the [Changelog](CHANGELOG.md) and
+[GitHub release records](https://github.com/irisxc4/memoryguard/releases).
 
 ## Major V2 refactor in v0.6.0
 
@@ -462,7 +250,7 @@ home:
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.7
+memoryguard --version                    # 0.7.8
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -721,7 +509,12 @@ Evidence remains traceable without being treated as automatically trusted memory
 
 - MemoryGuard runs as a local MCP stdio server.
 - All governed data stays local unless you explicitly authorize a remote model
-  or embedding operation.
+  or embedding operation. Optional usage telemetry is local-only: its measured
+  host token events and deterministic conversion events are stored under
+  `.memoryguard/usage_telemetry.sqlite`; it does not upload data. Token savings
+  are estimates based on MemoryGuard deterministic units, not a provider billing
+  statement. Hosts without token reporting remain unsupported in the measured
+  columns.
 - The Knowledge Library database uses `MEMORYGUARD_HOME` or the platform user
   data directory, so a selected source folder does not receive its own
   knowledge database.
@@ -792,6 +585,8 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
+- [v0.7.8 release record](docs/releases/v0.7.8.md)
+- [v0.7.7 release record](docs/releases/v0.7.7.md)
 - [v0.7.6 release record](docs/releases/v0.7.6.md)
 - [v0.7.5 release record](docs/releases/v0.7.5.md)
 - [v0.7.4 release record](docs/releases/v0.7.4.md)
@@ -806,8 +601,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current release line:** v0.7.7 makes bare provider repair safe in a verified, uniquely bound control home and aligns installed Codex MCP/Hook repairs to the current interpreter while preserving Agent and shared-group identity. v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows for concurrent tools, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. v0.7.5 makes conflict review self-contained and fail-closed with redacted member snapshots, localized reasons, invalid-candidate protection, and separate historical/actionable counts. v0.7.4 unified canonical governance updates, bounded mandatory context warnings, readable governance labels, and immutable Codex MCP snapshots. The v0.7.3 shared-group history recall, v0.7.2 write/read scope, Codex Hook
-  lifecycle and transport, and Python 3.10 compatibility corrections. The
+- **Current release line:** v0.7.8 consolidates canonical governance, readable multi-agent GUI governance, local-only usage telemetry, and Codex lifecycle/runtime alignment. v0.7.7 makes bare provider repair safe in a verified, uniquely bound control home and aligns installed Codex MCP/Hook repairs to the current interpreter while preserving Agent and shared-group identity. v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. Earlier release records retain the detailed v0.7.5 conflict-review, v0.7.4 canonical-governance, v0.7.3 shared-history, and v0.7.2 write/read and Codex lifecycle changes. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.
 - **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result

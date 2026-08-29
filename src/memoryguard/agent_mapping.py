@@ -112,7 +112,7 @@ IGNORED_DIRS: set[str] = {
 
 
 PRODUCT_DISPLAY_NAMES: dict[str, str] = {
-    "claude-code": "Claude",
+    "claude-code": "Claude Code",
     "claude": "Claude",
     "codex": "Codex",
     "cursor": "Cursor",

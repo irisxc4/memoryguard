@@ -2225,6 +2225,24 @@ def _normalize_canonical_read_path(value: Any) -> str:
     return ""
 
 
+def _is_imported_reconciliation_job(job: Mapping[str, Any]) -> bool:
+    """Identify reconciliation rows copied from the pre-V2 migration ledger.
+
+    ``rule_reconciliation_jobs`` in ``rules.db`` is a provenance table for
+    migration output, not the live coordinator for native canonical
+    publication.  The migration importer preserves the old ``prepare-*``
+    identity and stamps the V2 ``migration_id``.  Treating those rows as a
+    live V2 saga leaves a crashed/partial prepare row permanently blocking the
+    first native snapshot.  Keep the row visible for diagnostics, but do not
+    use it as an in-flight lock.  Native runtime jobs (which have no
+    migration_id) remain blocking by default.
+    """
+
+    migration_id = str(job.get("migration_id") or "").strip()
+    job_id = str(job.get("job_id") or "").strip().casefold()
+    return bool(migration_id or job_id.startswith("prepare-"))
+
+
 def _native_canonical_reconciliation_status(
     workspace: str | Path,
     share_group_id: str,
@@ -2448,13 +2466,20 @@ def _native_canonical_reconciliation_status(
         if missing_evidence:
             failures.append("evidence_anchor_missing")
 
+        in_flight_statuses = {
+            "pending_model", "model_running", "staged", "applying", "retryable_failed",
+        }
+        historical_jobs = [
+            item for item in data["jobs"]
+            if _is_imported_reconciliation_job(item)
+        ]
         jobs = [
             item for item in data["jobs"]
             if str(item.get("job_id") or "") != str(exclude_job_id or "")
-            and str(item.get("status") or "") in {
-                "pending_model", "model_running", "staged", "applying", "retryable_failed",
-            }
+            and str(item.get("status") or "") in in_flight_statuses
+            and not _is_imported_reconciliation_job(item)
         ]
+        checks["historical_reconciliation_jobs"] = len(historical_jobs)
         checks["reconciliation_in_flight"] = len(jobs)
         if jobs:
             failures.append("reconciliation_in_flight")
