@@ -138,15 +138,26 @@ def _source_inventory(
     workspace: Path,
     *,
     data_home: Path | None,
+    source_workspace: Path | None = None,
     migration_id: str,
     immutable: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     """Collect metadata and hashes through existing read-only inventory APIs."""
 
     layout = WorkspaceV2Layout(workspace)
-    validator = V2MigrationValidator(layout, data_home=data_home, migration_id=migration_id)
+    selected_source_workspace = source_workspace or workspace
+    validator = V2MigrationValidator(
+        layout,
+        data_home=data_home,
+        migration_id=migration_id,
+        source_workspace=selected_source_workspace,
+    )
     inventory = validator.source_inventory()
-    roots = (workspace, data_home) if data_home is not None else (workspace,)
+    roots = (
+        (selected_source_workspace, data_home)
+        if data_home is not None
+        else (selected_source_workspace,)
+    )
     files: dict[str, dict[str, Any]] = {}
     hashes: dict[str, str] = {}
     backup_root = (workspace / ".memoryguard" / _BACKUP_DIR).resolve(strict=False)
@@ -176,7 +187,7 @@ def _source_inventory(
     # Exclude V2 target domains from the legacy scan on resume; otherwise a
     # newly-created ``.memoryguard/knowledge`` database could be mistaken for
     # a V1 source.
-    reader = V1Reader(workspace, data_home=data_home, v2_root=layout.root)
+    reader = V1Reader(selected_source_workspace, data_home=data_home, v2_root=layout.root)
     # Dry-run inventory uses the immutable reader transport so SQLite never
     # opens/updates a WAL or SHM sidecar.  Apply keeps the established scan
     # behaviour because it already enters the explicit write envelope below.
@@ -631,6 +642,7 @@ def prepare_v2_workspace(
     *,
     apply: bool = False,
     data_home: str | Path | None = None,
+    source_workspace: str | Path | None = None,
     migration_id: str | None = None,
     expected_generation: int | None = None,
     fail_at: str | None = None,
@@ -644,6 +656,7 @@ def prepare_v2_workspace(
 
     workspace_path = _safe_path(workspace)
     data_path = _safe_path(data_home) if data_home is not None else None
+    source_workspace_path = _safe_path(source_workspace) if source_workspace is not None else workspace_path
     layout = WorkspaceV2Layout(workspace_path)
     manifest = ManifestManager(layout)
     if not apply:
@@ -660,6 +673,7 @@ def prepare_v2_workspace(
     files, hashes = _source_inventory(
         workspace_path,
         data_home=data_path,
+        source_workspace=source_workspace_path,
         migration_id=effective_id,
         immutable=not apply,
     )
@@ -673,7 +687,12 @@ def prepare_v2_workspace(
     validator_payload: dict[str, Any] = {}
 
     if not apply:
-        validator = V2MigrationValidator(layout, data_home=data_path, migration_id=effective_id)
+        validator = V2MigrationValidator(
+            layout,
+            data_home=data_path,
+            migration_id=effective_id,
+            source_workspace=source_workspace_path,
+        )
         validation = validator.validate(migration_id=effective_id)
         validator_payload = validation.to_dict()
         report = _base_report(
@@ -713,7 +732,7 @@ def prepare_v2_workspace(
             effective_id = _select_prepare_migration_id(current, migration_id, apply=True)
         backup_root, backups = _backup_sources(workspace_path, effective_id, files)
         snapshot = _materialize_frozen_sources(
-            workspace_path, data_path, backup_root, backups,
+            source_workspace_path, data_path, backup_root, backups,
         )
         archived_shadow: list[dict[str, Any]] = []
         if current.state is ManifestState.V1_ACTIVE:

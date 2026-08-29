@@ -40,6 +40,7 @@ def prepare_v2_ready(
     *,
     apply: bool = False,
     data_home: str | Path | None = None,
+    source_workspace: str | Path | None = None,
     migration_id: str | None = None,
     expected_generation: int | None = None,
 ) -> dict[str, Any]:
@@ -60,6 +61,7 @@ def prepare_v2_ready(
                 root,
                 apply=False,
                 data_home=resolved_data_home,
+                source_workspace=source_workspace,
                 migration_id=migration_id,
                 expected_generation=expected_generation,
             )
@@ -100,6 +102,7 @@ def prepare_v2_ready(
         root,
         apply=True,
         data_home=resolved_data_home,
+        source_workspace=source_workspace,
         migration_id=migration_id,
         expected_generation=expected_generation,
     )

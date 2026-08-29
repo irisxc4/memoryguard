@@ -175,6 +175,8 @@ def test_bare_upgrade_with_explicit_data_home_never_reads_or_retires_ambient_leg
     source = tmp_path / "explicit-v1-source"
     _legacy_0_6_2_fixture(source)
     target = tmp_path / "canonical-v2-data-home"
+    source_db = source / ".memoryguard" / "shared-memory" / "shared-team" / "memory.db"
+    before_source_db = source_db.read_bytes()
 
     monkeypatch.chdir(nested_cwd)
     monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
@@ -187,6 +189,17 @@ def test_bare_upgrade_with_explicit_data_home_never_reads_or_retires_ambient_leg
         "memoryguard.data_home.resolve_runtime_data_home",
         lambda: target.resolve(),
     )
+
+    preview_code = cli_main(["upgrade", "--data-home", str(source), "--preview"])
+    preview = json.loads(capsys.readouterr().out)
+
+    assert preview_code == 0, preview
+    preview_hashes = preview["stages"]["preflight"]["detail"]["prepare"]["build"]["source_hashes"]
+    assert preview_hashes["validator:memory:shared-team"] == hashlib.sha256(before_source_db).hexdigest()
+    assert not target.exists()
+    assert source_db.read_bytes() == before_source_db
+    assert binding.read_bytes() == before_binding
+    assert legacy_db.read_bytes() == before_db
 
     code = cli_main(["upgrade", "--data-home", str(source)])
     report = json.loads(capsys.readouterr().out)

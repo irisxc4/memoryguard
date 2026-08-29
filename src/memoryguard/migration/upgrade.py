@@ -1398,6 +1398,7 @@ def run_upgrade(
                 root,
                 apply=False,
                 data_home=resolved_data_home,
+                source_workspace=(source_root if data_home is not None else None),
                 migration_id=migration_id,
                 expected_generation=expected_generation,
             )
@@ -1450,6 +1451,7 @@ def run_upgrade(
                 root,
                 apply=True,
                 data_home=resolved_data_home,
+                source_workspace=(source_root if data_home is not None else None),
                 migration_id=migration_id,
                 expected_generation=expected_generation,
             )
