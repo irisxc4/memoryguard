@@ -150,7 +150,7 @@ def _source_inventory(
         layout,
         data_home=data_home,
         migration_id=migration_id,
-        source_workspace=selected_source_workspace,
+        source_workspace=source_workspace,
     )
     inventory = validator.source_inventory()
     roots = (
@@ -673,7 +673,7 @@ def prepare_v2_workspace(
     files, hashes = _source_inventory(
         workspace_path,
         data_home=data_path,
-        source_workspace=source_workspace_path,
+        source_workspace=(source_workspace_path if source_workspace is not None else None),
         migration_id=effective_id,
         immutable=not apply,
     )
@@ -691,7 +691,7 @@ def prepare_v2_workspace(
             layout,
             data_home=data_path,
             migration_id=effective_id,
-            source_workspace=source_workspace_path,
+            source_workspace=(source_workspace_path if source_workspace is not None else None),
         )
         validation = validator.validate(migration_id=effective_id)
         validator_payload = validation.to_dict()
