@@ -1917,12 +1917,20 @@ def main(argv: list[str] | None = None) -> int:
 
             control_home = resolve_runtime_data_home().expanduser().resolve()
             # Bare upgrade is the one explicit migration affordance allowed to
-            # inspect a project-local V1 tree.  Ambient MEMORYGUARD_WORKSPACE
-            # must not redirect this decision: only cwd and bounded ancestors
-            # are eligible sources, and the runtime control home stays global.
-            source = discover_migration_source(
-                cwd=Path.cwd(), data_home=control_home,
-            )
+            # inspect a project-local V1 tree. An explicitly configured data
+            # home is an operator-selected isolated target, never permission
+            # to inspect, migrate, or clean cwd/ancestor V1 trees.
+            source = None
+            if (
+                requested.data_home is None
+                and not os.environ.get("MEMORYGUARD_HOME", "").strip()
+            ):
+                # Ambient MEMORYGUARD_WORKSPACE must not redirect this
+                # decision: only cwd and bounded ancestors are eligible
+                # sources, and the runtime control home stays global.
+                source = discover_migration_source(
+                    cwd=Path.cwd(), data_home=control_home,
+                )
             # Upgrade target is canonical user V2 Data Home.  A discovered
             # cwd/ancestor V1 tree is source only; never make it the V2
             # control root or the runtime will split across two planes.

@@ -160,6 +160,53 @@ def test_bare_public_upgrade_completes_verified_activation(tmp_path: Path, capsy
     assert ManifestManager(root).current().state is ManifestState.V2_ACTIVE
 
 
+def test_bare_upgrade_with_explicit_data_home_never_reads_or_retires_ambient_legacy_source(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    ambient = tmp_path / "ambient-legacy-project"
+    binding = _legacy_0_6_2_fixture(ambient)
+    legacy_db = ambient / ".memoryguard" / "shared-memory" / "shared-team" / "memory.db"
+    before_binding = binding.read_bytes()
+    before_db = legacy_db.read_bytes()
+    nested_cwd = ambient / "nested" / "project"
+    nested_cwd.mkdir(parents=True)
+    source = tmp_path / "explicit-v1-source"
+    _legacy_0_6_2_fixture(source)
+    target = tmp_path / "canonical-v2-data-home"
+
+    monkeypatch.chdir(nested_cwd)
+    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
+
+    def unexpected_discovery(*_args, **_kwargs):
+        raise AssertionError("explicit --data-home must not inspect ambient migration sources")
+
+    monkeypatch.setattr("memoryguard.cli.discover_migration_source", unexpected_discovery)
+    monkeypatch.setattr(
+        "memoryguard.data_home.resolve_runtime_data_home",
+        lambda: target.resolve(),
+    )
+
+    code = cli_main(["upgrade", "--data-home", str(source)])
+    report = json.loads(capsys.readouterr().out)
+
+    assert code == 0, report
+    assert report["workspace"] == str(target.resolve())
+    assert report["data_home"] == str(source.resolve())
+    assert report["status"] == ManifestState.V2_ACTIVE.value
+    assert report["v2_active"] is True
+    assert ManifestManager(target).current().state is ManifestState.V2_ACTIVE
+    assert GroupControlService(target).active_binding_for_agent("agent-1")["share_group_id"] == "shared-team"
+    with sqlite3.connect(WorkspaceV2Layout(target).memory_db) as conn:
+        assert conn.execute("SELECT body FROM atoms WHERE memory_id='memory-1'").fetchone()[0] == "keep this V1 memory"
+
+    assert binding.is_file()
+    assert legacy_db.is_file()
+    assert binding.read_bytes() == before_binding
+    assert legacy_db.read_bytes() == before_db
+
+
 def test_public_upgrade_control_failure_stays_ready_and_never_activates(tmp_path: Path, capsys) -> None:
     root = tmp_path / "global-memoryguard-home"
     binding = _legacy_0_6_2_fixture(root)

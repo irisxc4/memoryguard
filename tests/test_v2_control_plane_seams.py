@@ -130,8 +130,12 @@ def test_bare_upgrade_routes_to_v1_ancestor_not_ambient_workspace(
     ambient = tmp_path / "ambient-project"
     ambient.mkdir()
     monkeypatch.chdir(nested)
-    monkeypatch.setenv("MEMORYGUARD_HOME", str(data_home))
+    monkeypatch.delenv("MEMORYGUARD_HOME", raising=False)
     monkeypatch.setenv("MEMORYGUARD_WORKSPACE", str(ambient))
+    monkeypatch.setattr(
+        "memoryguard.data_home.resolve_runtime_data_home",
+        lambda: data_home.resolve(),
+    )
 
     captured: list[str] = []
 
