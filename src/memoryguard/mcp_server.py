@@ -1775,7 +1775,7 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "capabilities": {"tools": {}, "resources": {}},
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
             },
         }
 
@@ -1791,6 +1791,9 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             "id": req_id,
             "result": {"resourceTemplates": []},
         }
+
+    if method == "prompts/list":
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}}
 
     if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
