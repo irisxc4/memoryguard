@@ -1,5 +1,7 @@
 <h1 align="center">MemoryGuard</h1>
 
+<!-- mcp-name: io.github.irisxc4/memoryguard -->
+
 <p align="center">
   <strong>Governed shared memory for coding agents.</strong><br />
   Local-first MCP memory with automatic organization, scoped rules, evidence, and rollback.
@@ -149,6 +151,16 @@ flowchart TB
 ```
 
 ## Quick start
+
+### MCP Registry metadata
+
+This package exposes a local stdio MCP server as `io.github.irisxc4/memoryguard`.
+The registry metadata is kept in [`server.json`](server.json). The marker above
+is required in the PyPI package README. The current `agent-memguard` `0.7.8`
+PyPI artifact has no marker, so `0.7.8` still cannot be published to the MCP
+Registry. For the next release, first bump both `server.json` versions to the
+new package version, publish a marker-bearing PyPI artifact, confirm its
+version and marker are visible, then run `mcp-publisher publish`.
 
 ### 1. Install
 

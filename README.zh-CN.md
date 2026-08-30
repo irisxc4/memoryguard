@@ -1,5 +1,7 @@
 <h1 align="center">MemoryGuard</h1>
 
+<!-- mcp-name: io.github.irisxc4/memoryguard -->
+
 <p align="center">
   <strong>面向编程 Agent 的受治理共享记忆。</strong><br />
   本地优先的 MCP 记忆层，提供自动整理、范围规则、证据链和可逆治理。
@@ -125,6 +127,14 @@ flowchart TB
 ```
 
 ## 快速开始
+
+### MCP Registry 元数据
+
+本包以 `io.github.irisxc4/memoryguard` 提供本地 stdio MCP 服务，注册表元数据见
+[`server.json`](server.json)。上方 marker 必须随 PyPI 包 README 一并发布；
+当前 `agent-memguard` `0.7.8` 的 PyPI artifact 尚无 marker，因此 `0.7.8` 仍不可发布到
+MCP Registry。下一版发布时，必须先将 `server.json` 中两个版本号同步 bump 到新版本，
+发布含 marker 的 PyPI artifact，确认版本和 marker 已可见，再运行 `mcp-publisher publish`。
 
 ### 1. 安装
 

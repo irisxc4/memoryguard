@@ -20,7 +20,7 @@ displayName: MemoryGuard
 description: >
   Local-first MCP memory backend and governance console for coding agents.
   Auto-organize, quarantine, supersede, and rollback shared memories.
-  22 MCP tools. SQLite backend. No account, no server, no telemetry.
+  SQLite backend. No account, no server, no telemetry.
 homepage: https://github.com/irisxc4/memoryguard
 repository: https://github.com/irisxc4/memoryguard
 license: MIT

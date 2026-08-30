@@ -1,0 +1,33 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.irisxc4/memoryguard",
+  "title": "MemoryGuard",
+  "description": "Local-first governed MCP memory backend for coding agents.",
+  "repository": {
+    "url": "https://github.com/irisxc4/memoryguard",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/irisxc4/memoryguard",
+  "version": "0.7.8",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "agent-memguard",
+      "version": "0.7.8",
+      "runtimeHint": "python",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "-m"
+        },
+        {
+          "type": "positional",
+          "value": "memoryguard.mcp_server"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
