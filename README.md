@@ -607,6 +607,8 @@ the installed version.
 - [v0.7.1 release record](docs/releases/v0.7.1.md)
 - [v0.7.0 release gate](docs/releases/v0.7.0.md)
 - [Memory continuity and lossless storage spec](docs/memory-continuity-storage-spec-v1.md)
+- [Privacy policy](PRIVACY.md)
+- [Terms of use](TERMS.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Contributor License Agreement](CLA.md)
 - [Issue tracker](https://github.com/irisxc4/memoryguard/issues)

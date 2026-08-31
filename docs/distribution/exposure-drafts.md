@@ -39,13 +39,37 @@ account-based service is claimed. Adapt fields to the form's current limits.
 
 ### Listing fields
 
+**Category**
+
+Developer Tools
+
+**Website**
+
+https://github.com/irisxc4/memoryguard
+
+**Support**
+
+https://github.com/irisxc4/memoryguard/discussions
+
+**Privacy policy**
+
+https://github.com/irisxc4/memoryguard/blob/main/PRIVACY.md
+
+**Terms of service**
+
+https://github.com/irisxc4/memoryguard/blob/main/TERMS.md
+
+**Logo**
+
+https://raw.githubusercontent.com/irisxc4/memoryguard/main/plugins/memoryguard/assets/memoryguard-icon.png
+
 **Name**
 
 MemoryGuard
 
 **Short description**
 
-Local-first governed memory for coding agents: organize, scope, quarantine, and roll back shared context through a local MCP server.
+Govern local agent memory.
 
 **Long description**
 

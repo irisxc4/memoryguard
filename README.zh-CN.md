@@ -416,6 +416,8 @@ MCP 服务提供：
 - [v0.7.1 发布记录](docs/releases/v0.7.1.md)
 - [v0.7.0 发布门禁](docs/releases/v0.7.0.md)
 - [长期记忆连续性与无损控体积 Spec](docs/memory-continuity-storage-spec-v1.md)
+- [隐私政策](PRIVACY.md)
+- [使用条款](TERMS.md)
 - [贡献指南](CONTRIBUTING.md)
 - [贡献者许可协议](CLA.md)
 - [Issue](https://github.com/irisxc4/memoryguard/issues)

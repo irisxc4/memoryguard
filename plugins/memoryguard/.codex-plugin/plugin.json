@@ -21,10 +21,13 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "MemoryGuard",
-    "shortDescription": "Install and govern local agent-memguard on Windows.",
+    "shortDescription": "Govern local agent memory.",
     "longDescription": "Guides local PyPI installation, Codex MCP/provider setup, repair, diagnostics, and evidence-first memory governance. Codex lifecycle support is an external best-effort Windows compatibility shim; this plugin does not change Codex itself.",
     "developerName": "MemoryGuard Contributors",
     "category": "Developer Tools",
+    "websiteURL": "https://github.com/irisxc4/memoryguard",
+    "privacyPolicyURL": "https://github.com/irisxc4/memoryguard/blob/main/PRIVACY.md",
+    "termsOfServiceURL": "https://github.com/irisxc4/memoryguard/blob/main/TERMS.md",
     "capabilities": [
       "Install",
       "Configure",
@@ -32,6 +35,8 @@
       "Govern"
     ],
     "brandColor": "#226F6C",
+    "composerIcon": "./assets/memoryguard-icon.png",
+    "logo": "./assets/memoryguard-icon.png",
     "defaultPrompt": [
       "Install agent-memguard and verify it on Windows.",
       "Repair MemoryGuard's Codex MCP integration.",
