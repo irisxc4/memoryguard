@@ -1,6 +1,16 @@
 # Changelog
 
-## [0.7.10] - Unreleased
+## [0.7.11] - 2026-09-04
+
+### Changed
+
+- Made public documentation and discovery copy durable: it now links readers
+  to live GitHub, PyPI, and official MCP Registry records instead of embedding
+  a release-state claim that can become stale.
+- Clarified that runtime behavior summarized in public documentation originates
+  in v0.7.9; this release changes documentation and discovery consistency only.
+
+## [0.7.10] - 2026-09-04
 
 ### Changed
 
@@ -9,7 +19,8 @@
 - Clarified that the desktop console has seven governance pages plus one
   independent Token usage-and-savings entry, for eight visible navigation
   entries.
-- Kept v0.7.10 explicitly unpublished; no runtime behavior changed.
+- Published v0.7.10 documentation and discovery metadata through GitHub OIDC
+  to PyPI and the official MCP Registry; no runtime behavior changed.
 
 ## [0.7.9] - 2026-09-04
 

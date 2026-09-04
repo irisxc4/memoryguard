@@ -9,10 +9,10 @@ copy, and perform each account action manually.
 
 Copy below is based on the repository at draft time:
 
-- Package: `agent-memguard`, Python `>=3.10`, MIT license, current unpublished
-  source line `0.7.10` in [`pyproject.toml`](../../pyproject.toml) and
-  [`src/memoryguard/__init__.py`](../../src/memoryguard/__init__.py). Latest
-  published package: `0.7.9`.
+- Package: `agent-memguard`, Python `>=3.10`, MIT license. Preparation source
+  line `0.7.11` is in [`pyproject.toml`](../../pyproject.toml) and
+  [`src/memoryguard/__init__.py`](../../src/memoryguard/__init__.py); verify
+  published package status through the live PyPI and GitHub Release links.
 - Repository: [irisxc4/memoryguard](https://github.com/irisxc4/memoryguard).
 - Transport: local MCP stdio server, entry point `python -m
   memoryguard.mcp_server`.
@@ -27,10 +27,10 @@ Copy below is based on the repository at draft time:
   [changelog](../../CHANGELOG.md). GitHub Release/CI, PyPI, and official MCP
   Registry publication are verified for v0.7.9.
 
-Registry status: released `agent-memguard` `0.7.9` carries the `mcp-name`
-marker and the official MCP Registry lists `io.github.irisxc4/memoryguard` as
-active/latest. Current `server.json` source metadata is `0.7.10` and remains
-unpublished until its release workflow succeeds.
+Registry status: published artifacts carry the `mcp-name` marker. The official
+MCP Registry entry is `io.github.irisxc4/memoryguard`; verify active/latest
+state and version through the live registry before an external submission.
+Current preparation metadata is `0.7.11` in [`server.json`](../../server.json).
 
 ## OpenAI skills-only listing draft
 
@@ -149,8 +149,8 @@ a Glama score or any third-party directory acceptance.
 **Project**: MemoryGuard — governed local memory for coding agents
 **Repository**: https://github.com/irisxc4/memoryguard
 **License**: MIT
-**Current source line**: v0.7.10 (unpublished documentation/metadata revision);
-latest published package: v0.7.9
+**Current preparation line**: v0.7.11 documentation/metadata consistency
+revision; verify published package status through live release links
 **Primary stack**: Python, MCP stdio, SQLite-backed local domains
 
 **Project summary**
@@ -265,8 +265,8 @@ asset rights, contact details, and any form attestations personally.
 
 | Gap | Evidence / action | Owner |
 |---|---|---|
-| Version alignment | Source metadata now says `0.7.10`; latest published package/Registry version is `0.7.9`. Confirm each future built artifact before publishing. | Maintainer |
-| Registry marker timing | Completed for `0.7.9`: the PyPI artifact carries the `mcp-name` marker and the official Registry is active/latest. Repeat this check for any future release. | Maintainer |
+| Version alignment | Preparation metadata says `0.7.11`. Confirm each future built artifact and public release record before publishing. | Maintainer |
+| Registry marker timing | Published PyPI artifacts carry the `mcp-name` marker and the official Registry has an entry. Repeat the live marker/status check for every release. | Maintainer |
 | Tool count — verified | The stale `22 MCP tools` claim was removed from `smithery.yaml`; the current source runtime exposes `61` tools (`len(memoryguard.mcp_server.TOOLS)`), verified on 2026-09-04. Earlier Glama evidence cited a successful 57-tool introspection; retain it as historical evidence only, not as the current count. Record the target Smithery build/smoke-test `tools/list` receipt before publishing any target-specific tool-count claim. | Maintainer |
 | Build/runtime | Dockerfile currently uses `pip install -e .`; verify Smithery build behavior and decide whether a published, non-editable package is required for the target runtime. | Maintainer |
 | Publication state | No Smithery listing URL or successful target-build receipt is recorded here. The stale `22 MCP tools` claim is fixed, but official local MCPB packaging validation is incomplete; no half-finished MCPB artifacts are retained. Implement and validate MCPB separately before publication; do not claim publish readiness. | Maintainer |

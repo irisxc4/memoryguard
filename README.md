@@ -39,11 +39,10 @@
   <sub>A synthetic governed projection: signals move through memory categories while raw conversation text remains outside the graph.</sub>
 </p>
 
-## What's New in v0.7.10
+## What's New in v0.7.11
 
-v0.7.10 is an unreleased documentation and discovery-metadata consistency
-revision; it does not change runtime behavior. The latest published behavior
-release is v0.7.9:
+v0.7.11 is a public documentation and discovery consistency release. Runtime
+behavior summarized here originates in v0.7.9:
 
 - **Canonical memory and rule governance:** related rules, habits, and memories
   converge through one canonical read/write path while evidence, source links,
@@ -64,14 +63,14 @@ release is v0.7.9:
   while preserving Agent/shared-group identity and fail-closed boundaries.
 - **Evidence and discovery:** `scripts/benchmark_usage_telemetry.py` documents
   reproducible seven-/thirty-day local measurements with explicit coverage and
-  no-sample semantics. v0.7.9 is published on
-  [GitHub](https://github.com/irisxc4/memoryguard/releases/tag/v0.7.9) and
-  [PyPI](https://pypi.org/project/agent-memguard/0.7.9/); the official MCP
-  Registry lists the local stdio server as `io.github.irisxc4/memoryguard`.
-  No Glama score or third-party directory listing is implied.
+  no-sample semantics. Releases are published through GitHub OIDC to
+  [GitHub Releases](https://github.com/irisxc4/memoryguard/releases),
+  [PyPI](https://pypi.org/project/agent-memguard/), and the official MCP
+  Registry. Verify current package and registry status through those live
+  records. No Glama score or third-party directory listing is implied.
 
-See the [v0.7.10 source note](docs/releases/v0.7.10.md) and the published
-[v0.7.9 release record](docs/releases/v0.7.9.md).
+See the [v0.7.11 release note](docs/releases/v0.7.11.md) and
+[release history](CHANGELOG.md).
 
 Earlier release details are kept in the [Changelog](CHANGELOG.md) and
 [GitHub release records](https://github.com/irisxc4/memoryguard/releases).
@@ -179,11 +178,10 @@ flowchart TB
 ### MCP Registry metadata
 
 This package exposes a local stdio MCP server as `io.github.irisxc4/memoryguard`.
-The registry metadata is kept in [`server.json`](server.json). The marker above
-is required in the PyPI package README. The marker-bearing `agent-memguard`
-`0.7.9` package is published, and the official MCP Registry lists it as active
-and latest under `io.github.irisxc4/memoryguard`. This checkout's `0.7.10`
-metadata is not a published package until its release workflow succeeds.
+Registry metadata is kept in [`server.json`](server.json), and the marker above
+ships with the PyPI package README. Releases are published through GitHub OIDC
+to PyPI and the official MCP Registry. Verify the current package version and
+the Registry entry's active/latest state through their live public records.
 
 ### 1. Install
 
@@ -622,7 +620,7 @@ the installed version.
 - [PyPI package](https://pypi.org/project/agent-memguard/)
 - [GitHub releases](https://github.com/irisxc4/memoryguard/releases)
 - [Changelog](CHANGELOG.md)
-- [v0.7.10 source note](docs/releases/v0.7.10.md)
+- [v0.7.11 release note](docs/releases/v0.7.11.md)
 - [v0.7.9 release record](docs/releases/v0.7.9.md)
 - [v0.7.8 release record](docs/releases/v0.7.8.md)
 - [v0.7.7 release record](docs/releases/v0.7.7.md)
@@ -642,7 +640,7 @@ the installed version.
 
 ## Roadmap
 
-- **Current source line:** v0.7.10 aligns documentation and discovery metadata only; it is not published yet. The latest published release, v0.7.9, consolidates canonical governance, local-only token evidence, readable multi-agent governance, and public distribution through GitHub, PyPI, and the official MCP Registry. v0.7.8 records the preceding governance, telemetry, and Codex runtime work; v0.7.7 makes bare provider repair safe in a verified, uniquely bound control home and aligns installed Codex MCP/Hook repairs to the current interpreter while preserving Agent and shared-group identity. v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. Earlier release records retain the detailed v0.7.5 conflict-review, v0.7.4 canonical-governance, v0.7.3 shared-history, and v0.7.2 write/read and Codex lifecycle changes. The
+- **Release history:** v0.7.9 consolidates canonical governance, local-only token evidence, readable multi-agent governance, and public distribution through GitHub, PyPI, and the official MCP Registry. v0.7.8 records the preceding governance, telemetry, and Codex runtime work; v0.7.7 makes bare provider repair safe in a verified, uniquely bound control home and aligns installed Codex MCP/Hook repairs to the current interpreter while preserving Agent and shared-group identity. v0.7.6 makes Codex Hook/MCP runtime selection consistent through one immutable snapshot, shortens Hook state lock windows, and keeps bootstrap success/failure state honest with explicit mandatory-overflow fail-closed handling. Earlier release records retain the detailed v0.7.5 conflict-review, v0.7.4 canonical-governance, v0.7.3 shared-history, and v0.7.2 write/read and Codex lifecycle changes. The
   v0.7.1 V2-only migration and desktop lifecycle work remains documented as
   historical release context.
 - **Acceptance boundary:** the Graphify evidence is the focused `3 / 3` result
