@@ -36,14 +36,14 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.7.9 更新
+## v0.7.10 更新
 
-v0.7.9 汇总了 v0.7.8 之后的治理、遥测和公开分发准备：
+v0.7.10 是尚未发布的文档与发现性元数据一致性修订，不改变运行时行为；当前已发布的功能版本仍是 v0.7.9：
 
 - **Canonical 记忆与规则治理：** 相关规则、习惯和记忆通过统一 canonical 读写路径合并，
   同时保留证据、来源链接、神经图分支、覆盖历史、冲突复核和 settlement 审计，且可逆。
 - **可读的多 Agent 治理：** 已验证的程序身份、可读名称、安全的程序族图标、共享组作用域、
-  风险解释、失效冲突收口和七页治理台布局统一呈现，日常治理不再依赖技术 ID。
+  风险解释、失效冲突收口、七个治理页及独立 Token 用量与节省入口统一呈现，日常治理不再依赖技术 ID。
 - **本地用量与节省视图：** Token 页显示本地 MCP 转换事件，以及 7 天/30 天窗口的原始基线
   与实际注入量估算。只有宿主真实上报 token 时才记录测量（当前支持 Codex、Grok）；Claude、
   Cursor、Trae 明确显示为不支持。不会保存对话正文、账号、路径或实例标识。
@@ -52,9 +52,14 @@ v0.7.9 汇总了 v0.7.8 之后的治理、遥测和公开分发准备：
   Agent/共享组身份和 fail-closed 边界。
 - **证据与曝光准备：** `scripts/benchmark_usage_telemetry.py` 提供 7 天/30 天本地测量，
   明确区分宿主上报、派生总量、确定性估算和无样本状态。`server.json`、PyPI `mcp-name`
-  标记以及贡献/安全文档已准备好后续收录检查；这里不宣称任何评分或目录已收录。
+  标记以及贡献/安全文档已完成。v0.7.9 已发布至
+  [GitHub](https://github.com/irisxc4/memoryguard/releases/tag/v0.7.9) 和
+  [PyPI](https://pypi.org/project/agent-memguard/0.7.9/)；官方 MCP Registry
+  已将本地 stdio 服务列为 `io.github.irisxc4/memoryguard`。这里不宣称 Glama
+  评分或其他第三方目录已收录。
 
-详见 [v0.7.9 发布记录](docs/releases/v0.7.9.md)。
+详见 [v0.7.10 源码说明](docs/releases/v0.7.10.md) 与已发布的
+[v0.7.9 发布记录](docs/releases/v0.7.9.md)。
 
 更早版本的细节请见[更新日志](CHANGELOG.md)和
 [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)。
@@ -146,10 +151,10 @@ flowchart TB
 ### MCP Registry 元数据
 
 本包以 `io.github.irisxc4/memoryguard` 提供本地 stdio MCP 服务，注册表元数据见
-[`server.json`](server.json)。上方 marker 必须随 PyPI 包 README 一并发布；当前已发布的
-`agent-memguard` `0.7.8` artifact 早于该 marker，因此不能提交到 MCP Registry。本次发布
-需构建并发布含 marker 的 `0.7.9` artifact，确认版本和 marker 可见，再运行
-`mcp-publisher validate`、完成认证并发布 `server.json`。
+[`server.json`](server.json)。上方 marker 必须随 PyPI 包 README 一并发布；含 marker 的
+`agent-memguard` `0.7.9` artifact 已发布，官方 MCP Registry 已将
+`io.github.irisxc4/memoryguard` 列为 active/latest。当前 checkout 的 `0.7.10`
+元数据在其发布流程成功前不是已发布包。
 
 ### 1. 安装
 
@@ -242,7 +247,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.9
+memoryguard --version                    # 确认已安装版本
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -306,7 +311,7 @@ Knowledge metadata 不会变成第二个正文存储。
 
 ### 桌面治理台页面
 
-GUI 按七页信息架构组织：
+GUI 有 8 个可见导航入口：7 个治理页，加上独立的 Token 用量与节省页：
 
 1. 治理总览
 2. 数据源与 Agent
@@ -315,6 +320,7 @@ GUI 按七页信息架构组织：
 5. 规则与习惯
 6. 对话历史
 7. 风险信号与治理控制台
+8. Token 用量与节省（独立于七个治理页）
 
 Agent 列表显示可读的程序/provider 名称，底层 ID 只在详情中展示；没有数据时明确
 显示空态。
@@ -421,6 +427,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.10 源码说明](docs/releases/v0.7.10.md)
 - [v0.7.9 发布记录](docs/releases/v0.7.9.md)
 - [v0.7.8 发布记录](docs/releases/v0.7.8.md)
 - [v0.7.7 发布记录](docs/releases/v0.7.7.md)
@@ -440,8 +447,7 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.9 汇总 canonical 治理、本地 Token 证据、可读的多 Agent 治理以及
-  公开分发准备。v0.7.8 记录前一阶段的治理、遥测与 Codex 运行时工作；v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的
+- **当前源码线：** v0.7.10 仅对齐文档与发现性元数据，尚未发布。当前已发布的 v0.7.9 汇总 canonical 治理、本地 Token 证据、可读的多 Agent 治理，并已通过 GitHub、PyPI 与官方 MCP Registry 公开分发。v0.7.8 记录前一阶段的治理、遥测与 Codex 运行时工作；v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的
   provider repair，并让已安装版 Codex MCP/Hook 修复统一使用当前解释器，同时保留 Agent 与
   共享组身份；v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口，
   并让 bootstrap 成功/失败状态保持一致。更早版本的冲突复核、canonical 治理、共享历史、写入→

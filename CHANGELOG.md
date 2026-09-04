@@ -1,13 +1,24 @@
 # Changelog
 
+## [0.7.10] - Unreleased
+
+### Changed
+
+- Synchronized source version metadata and public documentation after the
+  v0.7.9 GitHub, PyPI, and official MCP Registry publication.
+- Clarified that the desktop console has seven governance pages plus one
+  independent Token usage-and-savings entry, for eight visible navigation
+  entries.
+- Kept v0.7.10 explicitly unpublished; no runtime behavior changed.
+
 ## [0.7.9] - 2026-09-04
 
 ### Added
 
 - Added a marker-bearing MCP Registry metadata path for the local stdio server,
   plus concise contributor and security guidance for public discovery and
-  responsible reports. Registry and package publication remain separate
-  post-release checks.
+  responsible reports. The released v0.7.9 package is active/latest in the
+  official MCP Registry as `io.github.irisxc4/memoryguard`.
 - Added a local token-evidence benchmark with explicit seven- and thirty-day
   windows, host coverage, measured-versus-derived totals, and a no-sample
   boundary. It never turns missing host telemetry into zero usage or a savings
@@ -29,9 +40,9 @@
 
 ### Validation boundary
 
-This source-preparation entry records repository changes only. It does not
-claim CI, PyPI, MCP Registry, directory, or third-party listing success; those
-must be recorded from their respective live checks after publication.
+This source-preparation entry does not claim any Glama score, Smithery
+publication, directory listing, or other third-party acceptance. GitHub CI,
+PyPI, and official MCP Registry publication were verified for v0.7.9.
 
 ## [0.7.8] - 2026-08-29
 

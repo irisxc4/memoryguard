@@ -1,16 +1,18 @@
 # MemoryGuard distribution and exposure drafts
 
-Status: internal drafts. Nothing in this document has been submitted, approved,
-published, or endorsed. Replace bracketed fields, review copy, and perform each
-account action manually.
+Status: internal submission drafts. v0.7.9 GitHub, PyPI, and official MCP
+Registry facts below are verified; nothing here claims a Glama score, Smithery
+publication, or other third-party approval. Replace bracketed fields, review
+copy, and perform each account action manually.
 
 ## Evidence boundary
 
 Copy below is based on the repository at draft time:
 
-- Package: `agent-memguard`, Python `>=3.10`, MIT license, current source line
-  `0.7.9` in [`pyproject.toml`](../../pyproject.toml) and
-  [`src/memoryguard/__init__.py`](../../src/memoryguard/__init__.py).
+- Package: `agent-memguard`, Python `>=3.10`, MIT license, current unpublished
+  source line `0.7.10` in [`pyproject.toml`](../../pyproject.toml) and
+  [`src/memoryguard/__init__.py`](../../src/memoryguard/__init__.py). Latest
+  published package: `0.7.9`.
 - Repository: [irisxc4/memoryguard](https://github.com/irisxc4/memoryguard).
 - Transport: local MCP stdio server, entry point `python -m
   memoryguard.mcp_server`.
@@ -22,15 +24,13 @@ Copy below is based on the repository at draft time:
   local-only and does not upload data or retain conversation bodies, account
   names, raw source paths, or instance identifiers. See [privacy and safety](../../README.md#privacy-and-safety).
 - Release evidence: [v0.7.9 release record](../releases/v0.7.9.md) and
-  [changelog](../../CHANGELOG.md). The release record does not assert CI, wheel,
-  or PyPI publication success.
+  [changelog](../../CHANGELOG.md). GitHub Release/CI, PyPI, and official MCP
+  Registry publication are verified for v0.7.9.
 
-Registry status: `server.json` and source package metadata are aligned at
-`0.7.9`, and the source README carries the `mcp-name` marker. The currently
-published `agent-memguard` `0.7.8` artifact predates that marker, so it cannot
-be published to the MCP Registry. After the 0.7.9 artifact is published,
-confirm its version and marker are visible, then run `mcp-publisher validate`,
-authenticate, and publish `server.json`.
+Registry status: released `agent-memguard` `0.7.9` carries the `mcp-name`
+marker and the official MCP Registry lists `io.github.irisxc4/memoryguard` as
+active/latest. Current `server.json` source metadata is `0.7.10` and remains
+unpublished until its release workflow succeeds.
 
 ## OpenAI skills-only listing draft
 
@@ -121,12 +121,13 @@ folders, host configuration, and any remote provider they authorize.
 
 ### Release notes for listing
 
-**v0.7.9 draft note**
+**v0.7.9 released note**
 
 - Canonical memory/rule reads and writes preserve evidence, source links,
   supersede history, conflict decisions, and reversible settlement receipts.
 - Governance views expose readable provider identity, shared-group scope, risk
-  explanations, stale-conflict closure, and a seven-page GUI shell.
+  explanations, stale-conflict closure, seven governance pages, and a separate
+  Token usage-and-savings entry.
 - Optional local usage telemetry records bounded MCP conversion events and
   host-reported measurements; savings remain deterministic estimates, not
   provider billing results.
@@ -140,15 +141,16 @@ folders, host configuration, and any remote provider they authorize.
   product capture or usage/savings evidence; use the demo checklist before
   publishing a real recording.
 
-Link to [the release record](../releases/v0.7.9.md). Confirm the published
-package version and release workflow result before replacing this draft note.
+See [the published release record](../releases/v0.7.9.md). This does not claim
+a Glama score or any third-party directory acceptance.
 
 ### Codex for OSS application draft
 
 **Project**: MemoryGuard — governed local memory for coding agents
 **Repository**: https://github.com/irisxc4/memoryguard
 **License**: MIT
-**Current source line**: v0.7.9; publication status to be confirmed at submission
+**Current source line**: v0.7.10 (unpublished documentation/metadata revision);
+latest published package: v0.7.9
 **Primary stack**: Python, MCP stdio, SQLite-backed local domains
 
 **Project summary**
@@ -263,8 +265,8 @@ asset rights, contact details, and any form attestations personally.
 
 | Gap | Evidence / action | Owner |
 |---|---|---|
-| Version alignment | `pyproject.toml`, README/release notes, and both `server.json` versions now say `0.7.9`; confirm the built package metadata before publishing. | Maintainer |
-| Registry marker timing | The published `0.7.8` PyPI artifact predates the `mcp-name` marker. Confirm the marker-bearing `0.7.9` artifact and version are visible before `mcp-publisher validate` and `publish`. | Maintainer |
+| Version alignment | Source metadata now says `0.7.10`; latest published package/Registry version is `0.7.9`. Confirm each future built artifact before publishing. | Maintainer |
+| Registry marker timing | Completed for `0.7.9`: the PyPI artifact carries the `mcp-name` marker and the official Registry is active/latest. Repeat this check for any future release. | Maintainer |
 | Tool count — verified | The stale `22 MCP tools` claim was removed from `smithery.yaml`; the current source runtime exposes `61` tools (`len(memoryguard.mcp_server.TOOLS)`), verified on 2026-09-04. Earlier Glama evidence cited a successful 57-tool introspection; retain it as historical evidence only, not as the current count. Record the target Smithery build/smoke-test `tools/list` receipt before publishing any target-specific tool-count claim. | Maintainer |
 | Build/runtime | Dockerfile currently uses `pip install -e .`; verify Smithery build behavior and decide whether a published, non-editable package is required for the target runtime. | Maintainer |
 | Publication state | No Smithery listing URL or successful target-build receipt is recorded here. The stale `22 MCP tools` claim is fixed, but official local MCPB packaging validation is incomplete; no half-finished MCPB artifacts are retained. Implement and validate MCPB separately before publication; do not claim publish readiness. | Maintainer |

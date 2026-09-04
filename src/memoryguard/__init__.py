@@ -5,5 +5,5 @@ Binding, and Group planes. Legacy formats are readable only through the
 explicit ``memoryguard.migration`` upgrade flow.
 """
 
-__version__ = "0.7.9"
+__version__ = "0.7.10"
 __all__ = ["__version__"]
