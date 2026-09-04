@@ -22,7 +22,7 @@ from ..memory import MemoryAtom, MemoryAtomStore, MemoryReadScope
 from ..memory.store import stable_digest
 from ..sensitive_content import SENSITIVE_PATTERNS
 from .dedup import V2DedupMatch, V2SemanticDeduplicator, canonical_hash, canonical_text
-from .canonical_claims import claims_related, compose_canonical_bodies, topic_affinity
+from .canonical_claims import _heading, claims_related, compose_canonical_bodies, topic_affinity
 from .governance_semantics import (
     GovernanceRelation,
     classify_governance_relation,
@@ -1547,16 +1547,19 @@ class V2MemoryOrganizer:
                         ),
                     }
 
+                composition_claims = tuple(
+                    self._composition_value(composition, "claims", ()) or ()
+                )
+                same_named_claim = bool(
+                    len(composition_claims) == 1
+                    and _heading(candidate.body)
+                    and _heading(candidate.body) == _heading(str(prepared["body"]))
+                )
                 should_supersede = (
                     not candidate.locked
                     and not (
-                        composition is not None
-                        and len(
-                            tuple(
-                                self._composition_value(composition, "claims", ())
-                                or ()
-                            )
-                        ) > 1
+                        len(composition_claims) > 1
+                        or (relation.kind == "update" and same_named_claim)
                     )
                     and (
                         is_correction

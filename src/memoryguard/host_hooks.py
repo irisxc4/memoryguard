@@ -108,27 +108,221 @@ _SHELL_WRITE_PATTERN = re.compile(
 
 
 
+def _repair_json_invalid_escapes(text: str) -> str:
+    """Turn illegal JSON backslash escapes into escaped backslashes."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    hexdigits = "0123456789abcdefABCDEF"
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in '"\\/bfnrt':
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < n and all(c in hexdigits for c in text[i + 2:i + 6]):
+                out.append(text[i:i + 6])
+                i += 6
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+_LAST_STDIN_META: dict[str, Any] = {}
+
+
+def _record_stdin_meta(**fields: Any) -> None:
+    _LAST_STDIN_META.clear()
+    _LAST_STDIN_META.update(fields)
+
+
 def read_hook_stdin_json(stdin_buffer=None) -> dict[str, Any]:
     """Decode hook stdin JSON.
 
     Always read bytes and decode with utf-8-sig so Cursor BOM stdin and
-    Codex plain UTF-8 both parse. Install/upgrade ships this path; hosts
-    must not depend on emergency site-packages patches.
+    Codex plain UTF-8 both parse. Windows hosts sometimes deliver tool
+    paths with raw backslashes (L:\workdir). Those are invalid JSON
+    escapes and used to crash PreToolUse fail-closed. Repair only after
+    json.loads fails.
+
+    Read the binary buffer before any stdin reconfigure. Cursor already
+    launches this command with ``python -X utf8``; reconfiguring stdin
+    first can drain the wrapper and leave ``buffer.read()`` empty.
     """
-    buf = sys.stdin.buffer if stdin_buffer is None else stdin_buffer
-    raw = buf.read(2_000_000)
+    # memoryguard-windows-json-escape-repair
+    raw = b""
+    source = "empty"
+    if stdin_buffer is None:
+        raw = sys.stdin.buffer.read(2_000_000)
+        if raw and raw.strip():
+            source = "buffer"
+        else:
+            leftover = ""
+            try:
+                leftover = sys.stdin.read(2_000_000)
+            except Exception:
+                leftover = ""
+            if leftover and leftover.strip():
+                raw = leftover.encode("utf-8", errors="surrogatepass")
+                source = "text"
+    else:
+        raw = stdin_buffer.read(2_000_000)
+        source = "buffer" if raw and raw.strip() else "empty"
+    _record_stdin_meta(
+        nbytes=len(raw or b""),
+        source=source,
+        head_hex=(raw or b"")[:24].hex(),
+        raw_hex=(raw or b"")[:800].hex(),
+        repair=False,
+    )
     if not raw or not raw.strip():
         return {}
-    # Byte-level decode: strict UTF-8 first (current correct path, BOM-aware);
-    # if the host shipped locale-encoded bytes (Windows GBK pipe) the intended
-    # text is recovered instead of failing the whole hook.
     from .encoding_guard import decode_hook_bytes
 
     text = decode_hook_bytes(raw, source="hook_stdin")
-    data = json.loads(text)
+    data = _loads_hook_stdin_object(text)
+    if data is not None:
+        _LAST_STDIN_META.pop("raw_hex", None)
+        return data
+    repaired = _repair_json_invalid_escapes(text)
+    _LAST_STDIN_META["repair"] = True
+    data = _loads_hook_stdin_object(repaired)
+    if data is not None:
+        _LAST_STDIN_META.pop("raw_hex", None)
+        return data
+    stripped = _neutralize_broken_hook_path_fields(repaired)
+    _LAST_STDIN_META["neutralized"] = stripped != repaired
+    data = _loads_hook_stdin_object(stripped)
+    if data is not None:
+        _LAST_STDIN_META.pop("raw_hex", None)
+        return data
+    salvaged = _salvage_hook_tool_payload(repaired)
+    if salvaged:
+        _LAST_STDIN_META["salvaged"] = True
+        _LAST_STDIN_META.pop("raw_hex", None)
+        return salvaged
+    print(json.dumps({
+        "memoryguard_hook_diagnostic": "stdin_json_repair_failed",
+        "error": _LAST_STDIN_META.get("error", "unparsed"),
+    }, ensure_ascii=True), file=sys.stderr)
+    return {}
+
+
+def _loads_hook_stdin_object(text: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        pos = int(getattr(exc, "pos", 0) or 0)
+        _LAST_STDIN_META["error"] = str(exc)[:200]
+        _LAST_STDIN_META["error_pos"] = pos
+        _LAST_STDIN_META["around"] = text[max(0, pos - 80): pos + 80]
+        return None
     if not isinstance(data, dict):
         raise ValueError("hook input must be a JSON object")
     return data
+
+
+def _neutralize_broken_hook_path_fields(text: str) -> str:
+    """Drop host path arrays Cursor sometimes emits with a truncated quote."""
+    return re.sub(
+        r'"workspace_roots"\s*:\s*\[[^\]]*\]',
+        '"workspace_roots":[]',
+        text,
+        count=1,
+    )
+
+
+def _salvage_hook_tool_payload(text: str) -> dict[str, Any]:
+    """Recover tool identity when the host JSON envelope is truncated."""
+    data: dict[str, Any] = {}
+    for key in (
+        "tool_name",
+        "toolName",
+        "conversation_id",
+        "session_id",
+        "generation_id",
+        "hook_event_name",
+    ):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+        if match:
+            data[key] = json.loads(f'"{match.group(1)}"')
+    match = re.search(r'"tool_input"\s*:\s*\{', text)
+    if match:
+        blob = _slice_balanced_object(text, match.end() - 1)
+        if blob:
+            try:
+                parsed = json.loads(blob)
+            except json.JSONDecodeError:
+                try:
+                    parsed = json.loads(_repair_json_invalid_escapes(blob))
+                except json.JSONDecodeError:
+                    parsed = None
+            if isinstance(parsed, dict):
+                data["tool_input"] = parsed
+    inferred = _infer_hook_result_from_text(text)
+    if inferred is not None:
+        data.setdefault("tool_output", inferred)
+    return data
+
+
+def _infer_hook_result_from_text(text: str) -> dict[str, Any] | None:
+    """Best-effort status from a truncated Cursor ``tool_output`` blob."""
+    window = text
+    marker = re.search(
+        r'"(?:tool_output|tool_result|tool_response|result)"\s*:\s*',
+        text,
+    )
+    if marker:
+        window = text[marker.end(): marker.end() + 8000]
+    error_at = _search_span(r'\\*"isError\\*"\s*:\s*true', window)
+    ok_false = _search_span(r'\\*"ok\\*"\s*:\s*false', window)
+    ok_true = _search_span(r'\\*"ok\\*"\s*:\s*true', window)
+    if error_at is not None and (ok_true is None or error_at < ok_true):
+        return {"isError": True}
+    if ok_false is not None and (ok_true is None or ok_false < ok_true):
+        return {"ok": False, "status": "error"}
+    ready = _search_span(r'\\*"ready\\*"\s*:\s*true', window) is not None
+    status_ok = _search_span(r'\\*"status\\*"\s*:\s*\\*"ok\\*"', window) is not None
+    if ok_true is not None or ready or status_ok:
+        return {"ok": True, "status": "ok", "ready": True}
+    return None
+
+
+def _search_span(pattern: str, text: str) -> int | None:
+    match = re.search(pattern, text)
+    return match.start() if match else None
+
+
+def _slice_balanced_object(text: str, start: int) -> str:
+    depth = 0
+    in_str = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_str:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_str = False
+            continue
+        if char == '"':
+            in_str = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    return ""
+
 
 
 def _now_iso() -> str:
@@ -321,6 +515,36 @@ def _load_json_config(path: Path, *, strict: bool) -> dict[str, Any]:
     return data
 
 
+def _hook_tool_result(payload: dict[str, Any]) -> Any:
+    """Read Cursor/Codex tool results, including JSON-string ``tool_output``."""
+    for key in (
+        "tool_result",
+        "result",
+        "tool_output",
+        "output",
+        "tool_response",
+        "response",
+    ):
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text[:1] in "{[":
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    try:
+                        return json.loads(_repair_json_invalid_escapes(text))
+                    except json.JSONDecodeError:
+                        return value
+            return value
+        return value
+    return None
+
+
 def _coerce_tool_result_status(payload: Any) -> tuple[bool | None, str | None]:
     """Return ``(ok, reason)`` for tool execution feedback.
 
@@ -345,8 +569,13 @@ def _coerce_tool_result_status(payload: Any) -> tuple[bool | None, str | None]:
         ok_value = payload.get("ok")
         if isinstance(ok_value, bool):
             return (True, None) if ok_value else (False, "ok=false")
-        if payload.get("status") in {"error", "failed", "failure"}:
+        status_value = str(payload.get("status") or "").strip().casefold()
+        if status_value in {"error", "failed", "failure"}:
             return False, f"status={payload.get('status')}"
+        if status_value in {"ok", "success", "succeeded"}:
+            return True, None
+        if payload.get("ready") is True:
+            return True, None
         positive_signals = ("memory_id", "decision_id", "version_id", "record")
         if any(sig in payload for sig in positive_signals):
             return True, None
@@ -2331,43 +2560,203 @@ def _targets_native_memory(tool_name: str, tool_input: Any) -> bool:
     return False
 
 
+_MEMORYGUARD_MCP_PREFIXES = (
+    "",
+    "memoryguard:",
+    "memoryguard/",
+    "memoryguard-",
+    "user-memoryguard:",
+    "user-memoryguard/",
+    "user-memoryguard-",
+)
+
+
 def _is_memoryguard_tool(tool_name: str, operation: str = "") -> bool:
+    operation = operation.casefold()
+    if not operation:
+        return False
+    expected = f"memoryguard_{operation}"
     value = (tool_name or "").casefold()
-    return "memoryguard" in value and operation.casefold() in value
+    if value in {
+        expected,
+        f"mcp__memoryguard__{expected}",
+        f"mcp:{expected}",
+    }:
+        return True
+    if value.startswith("mcp:") and value.endswith(expected):
+        return value[4:-len(expected)] in _MEMORYGUARD_MCP_PREFIXES
+    return False
 
 
-def _cursor_mcp_inner_tool_name(tool_name: str, tool_input: Any = None) -> str:
-    """Cursor agents wrap MCP as CallMcpTool; real MCP tool name is in tool_input."""
+_MEMORYGUARD_CURSOR_SERVER_NAMES = frozenset({
+    "memoryguard",
+    "user-memoryguard",
+})
+
+
+def _coerce_mapping(value: Any) -> dict[str, Any]:
+    """Accept host-structured mappings, including JSON-string Cursor inputs."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) >= 2 and text[0] == "{" and text[-1] == "}":
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    parsed = json.loads(_repair_json_invalid_escapes(text))
+                except json.JSONDecodeError:
+                    return {}
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+
+def _is_cursor_mcp_wrapper(tool_name: str) -> bool:
     raw = (tool_name or "").casefold()
-    compact = raw.replace("_", "").replace("-", "")
-    if "callmcptool" not in compact and compact not in {"callmcptool"}:
+    compact = raw.replace("_", "").replace("-", "").replace(":", "").replace(" ", "")
+    return compact in {"callmcptool", "calldynamictool"}
+
+
+def _cursor_mcp_wrapper_fields(tool_name: str, tool_input: Any) -> tuple[str, str]:
+    """Return server/tool fields from a Cursor MCP wrapper.
+
+    Cursor may send several aliases at once (``namespace`` plus
+    ``serverName``, ``toolName`` plus wrapper ``name``). Trust the first
+    MemoryGuard server alias and prefer ``toolName`` over generic ``name``.
+    """
+    if not _is_cursor_mcp_wrapper(tool_name):
+        return "", ""
+    mapping = _coerce_mapping(tool_input)
+    arguments = _coerce_mapping(mapping.get("arguments"))
+    containers = (mapping, arguments)
+
+    servers: list[str] = []
+    for container in containers:
+        for key in ("serverName", "server_name", "server", "namespace"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                servers.append(value.strip())
+    allowed = [
+        item for item in servers
+        if item.casefold() in _MEMORYGUARD_CURSOR_SERVER_NAMES
+    ]
+    unique_servers = {item.casefold() for item in servers}
+    if allowed:
+        server = allowed[0]
+    elif len(unique_servers) == 1:
+        server = servers[0]
+    else:
+        server = ""
+
+    inner = ""
+    for container in containers:
+        for key in ("toolName", "tool_name"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                inner = value.strip()
+                break
+        if inner:
+            break
+    if not inner:
+        for container in containers:
+            value = container.get("name")
+            if (
+                isinstance(value, str)
+                and value.strip()
+                and "memoryguard_" in value.casefold()
+            ):
+                inner = value.strip()
+                break
+    return server, inner
+
+
+def _cursor_mcp_inner_tool_name_unverified(tool_name: str, tool_input: Any) -> str:
+    """Read a wrapper's host field for deny classification, never for trust."""
+    _server, inner = _cursor_mcp_wrapper_fields(tool_name, tool_input)
+    return inner
+
+
+def _cursor_mcp_inner_tool_name(
+    tool_name: str,
+    tool_input: Any = None,
+    *,
+    operation: str,
+) -> str:
+    """Return an exact MemoryGuard operation from a verified Cursor wrapper."""
+    server, inner = _cursor_mcp_wrapper_fields(tool_name, tool_input)
+    expected = f"memoryguard_{operation.casefold()}"
+    if (
+        server.casefold() not in _MEMORYGUARD_CURSOR_SERVER_NAMES
+        or inner.casefold() != expected
+    ):
         return ""
-    if not isinstance(tool_input, dict):
-        return ""
-    inner = (
-        tool_input.get("toolName")
-        or tool_input.get("tool_name")
-        or tool_input.get("name")
-        or ""
-    )
-    if not inner and isinstance(tool_input.get("arguments"), dict):
-        args = tool_input["arguments"]
-        inner = args.get("toolName") or args.get("tool_name") or args.get("name") or ""
-    return str(inner)
+    return expected
+
+
+def _hook_tool_parts(payload: dict[str, Any]) -> tuple[str, Any]:
+    """Read tool name/input from flat Cursor payloads and nested envelopes."""
+    name = str(payload.get("tool_name") or payload.get("toolName") or "")
+    raw_input = payload.get("tool_input", payload.get("toolInput"))
+    if raw_input is None:
+        raw_input = payload.get("arguments", payload.get("input"))
+    tool = payload.get("tool")
+    if isinstance(tool, str) and not name:
+        name = tool
+    if isinstance(tool, dict):
+        name = name or str(
+            tool.get("name") or tool.get("toolName") or tool.get("tool_name") or ""
+        )
+        if raw_input in (None, "", {}):
+            raw_input = (
+                tool.get("input")
+                or tool.get("args")
+                or tool.get("arguments")
+                or tool.get("tool_input")
+            )
+    event = payload.get("event")
+    if isinstance(event, dict):
+        name = name or str(event.get("tool_name") or event.get("toolName") or "")
+        ev_tool = event.get("tool")
+        if isinstance(ev_tool, dict):
+            name = name or str(
+                ev_tool.get("name") or ev_tool.get("toolName") or ""
+            )
+            if raw_input in (None, "", {}):
+                raw_input = (
+                    ev_tool.get("input")
+                    or ev_tool.get("args")
+                    or ev_tool.get("arguments")
+                )
+    if not name:
+        fallback = payload.get("name")
+        if isinstance(fallback, str) and fallback.strip():
+            name = fallback.strip()
+    parsed = _coerce_mapping(raw_input)
+    if parsed:
+        raw_input = parsed
+    return name, raw_input
 
 
 def _is_memoryguard_bootstrap(tool_name: str, tool_input: Any = None) -> bool:
     if _is_memoryguard_tool(tool_name, "context_bootstrap"):
         return True
-    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
-    return bool(inner) and _is_memoryguard_tool(inner, "context_bootstrap")
+    return bool(
+        _cursor_mcp_inner_tool_name(
+            tool_name, tool_input, operation="context_bootstrap"
+        )
+    )
 
 
 def _is_memoryguard_write(tool_name: str, tool_input: Any = None) -> bool:
     if _is_memoryguard_tool(tool_name, "memory_write"):
         return True
-    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
-    return bool(inner) and _is_memoryguard_tool(inner, "memory_write")
+    return bool(
+        _cursor_mcp_inner_tool_name(
+            tool_name, tool_input, operation="memory_write"
+        )
+    )
 
 
 _RECOVERY_TOOL_OPERATIONS = frozenset({
@@ -2380,6 +2769,19 @@ _RECOVERY_TOOL_OPERATIONS = frozenset({
     "rule_merge_cooldown_clear",
 })
 
+_VERIFIED_MEMORYGUARD_OPERATIONS = _RECOVERY_TOOL_OPERATIONS | frozenset({
+    "memory_write",
+})
+
+
+def _is_verified_memoryguard_tool(tool_name: str, tool_input: Any = None) -> bool:
+    """Accept only explicitly supported MemoryGuard host tool identities."""
+    return any(
+        _is_memoryguard_tool(tool_name, operation)
+        or _cursor_mcp_inner_tool_name(tool_name, tool_input, operation=operation)
+        for operation in _VERIFIED_MEMORYGUARD_OPERATIONS
+    )
+
 
 def _is_memoryguard_recovery_tool(tool_name: str, tool_input: Any = None) -> bool:
     """Allow only bounded MemoryGuard repair surfaces through a broken hook.
@@ -2390,15 +2792,10 @@ def _is_memoryguard_recovery_tool(tool_name: str, tool_input: Any = None) -> boo
     is the thing that needs repair.
     """
 
-    candidates = [str(tool_name or "")]
-    inner = _cursor_mcp_inner_tool_name(tool_name, tool_input)
-    if inner:
-        candidates.append(inner)
-    for candidate in candidates:
-        value = candidate.casefold()
-        if "memoryguard" not in value:
-            continue
-        if any(operation in value for operation in _RECOVERY_TOOL_OPERATIONS):
+    for operation in _RECOVERY_TOOL_OPERATIONS:
+        if _is_memoryguard_tool(tool_name, operation) or _cursor_mcp_inner_tool_name(
+            tool_name, tool_input, operation=operation
+        ):
             return True
     return False
 
@@ -2427,16 +2824,30 @@ def _best_effort_codegraph_file_refresh(
         return
 
 
-def _is_other_memory_write(tool_name: str) -> bool:
-    value = (tool_name or "").casefold()
-    if "memoryguard" in value or "memory" not in value:
+def _is_other_memory_write(tool_name: str, tool_input: Any = None) -> bool:
+    """Block non-MemoryGuard MCP memory writers without substring trust."""
+    parsed_input = _coerce_mapping(tool_input) or tool_input
+    if _is_verified_memoryguard_tool(tool_name, parsed_input):
         return False
-    is_mcp = value.startswith("mcp__") or value.startswith("mcp:")
-    is_write = any(
-        token in value
-        for token in ("write", "add", "create", "update", "delete", "store", "remember")
-    )
-    return is_mcp and is_write
+    direct = (tool_name or "").casefold()
+    is_wrapper = _is_cursor_mcp_wrapper(tool_name)
+    if is_wrapper and not isinstance(parsed_input, dict):
+        # Cursor MCP calls must carry a structured wrapper. An opaque blob
+        # cannot prove it is a read-only non-MemoryGuard operation.
+        return True
+    wrapped = _cursor_mcp_inner_tool_name_unverified(tool_name, parsed_input).casefold()
+    candidates = [direct]
+    if wrapped:
+        candidates.append(wrapped)
+    for value in candidates:
+        is_mcp = is_wrapper or value.startswith("mcp__") or value.startswith("mcp:")
+        is_write = any(
+            token in value
+            for token in ("write", "add", "create", "update", "delete", "store", "remember")
+        )
+        if is_mcp and "memory" in value and is_write:
+            return True
+    return False
 
 
 def _load_store(
@@ -3570,6 +3981,7 @@ def _v2_hook_cutover(
             state_updates.update({
                 "bootstrap_retry_claimed": False,
                 "bootstrap_retry_claimed_at": 0,
+                "bootstrap_pending": False,
             })
         if event == "user_prompt":
             state_updates.update({
@@ -3728,26 +4140,20 @@ def _run_hook_unlocked(
     # PreToolUse bootstrap is bypassed.  Ordinary shell/file/tool execution is
     # never included here and remains fail-closed.
     if event == "pre_tool":
-        recovery_tool = str(payload.get("tool_name", "") or "")
-        recovery_input = payload.get("tool_input", {})
+        recovery_tool, recovery_input = _hook_tool_parts(payload)
         if _is_memoryguard_recovery_tool(recovery_tool, recovery_input):
             # The recovery lane intentionally bypasses the V2 hook dispatch,
             # but a real Cursor CallMcpTool bootstrap must still satisfy the
-            # per-conversation tool gate.  Record only the bounded state bit;
-            # mandatory overflow remains fail-closed.
-            if normalized_provider == "cursor" and _is_memoryguard_bootstrap(
-                recovery_tool, recovery_input,
-            ):
-                def mark_cursor_bootstrap(state: dict[str, Any]) -> None:
+            # per-conversation tool gate. PreToolUse can only record a pending
+            # invocation; PostToolUse must verify its result before any later
+            # tool can rely on bootstrap_ok.
+            if _is_memoryguard_bootstrap(recovery_tool, recovery_input):
+                def mark_bootstrap_pending(state: dict[str, Any]) -> None:
                     if not state.get("mandatory_overflow"):
-                        state["bootstrap_ok"] = True
-                        state["bootstrap_error"] = ""
-                        state["context_hash"] = state.get("context_hash") or _short_hash(
-                            "cursor-recovery:" + session_id
-                        )
+                        state["bootstrap_pending"] = True
                 _update_state(
                     root, normalized_provider, session_id,
-                    mutator=mark_cursor_bootstrap,
+                    mutator=mark_bootstrap_pending,
                 )
             return {}
 
@@ -3767,15 +4173,22 @@ def _run_hook_unlocked(
                 and not prior_state.get("bootstrap_ok")
                 and not is_subagent
             ):
-                if prior_state.get("mandatory_overflow"):
+                gate_tool, gate_input = _hook_tool_parts(payload)
+                if (
+                    _is_memoryguard_bootstrap(gate_tool, gate_input)
+                    or _is_memoryguard_recovery_tool(gate_tool, gate_input)
+                ):
+                    pass
+                elif prior_state.get("mandatory_overflow"):
                     return _deny_output(
                         normalized_provider,
                         "MemoryGuard mandatory rule package overflow; tool execution denied.",
                     )
-                return _deny_output(
-                    normalized_provider,
-                    "CallMcpTool memoryguard_context_bootstrap must succeed before the first tool.",
-                )
+                else:
+                    return _deny_output(
+                        normalized_provider,
+                        "CallMcpTool memoryguard_context_bootstrap must succeed before the first tool.",
+                    )
         if _needs_bootstrap_recovery(prior_state):
             try:
                 claimed = _claim_bootstrap_recovery(
@@ -3845,8 +4258,7 @@ def _run_hook_unlocked(
                 normalized_provider,
                 "MemoryGuard 上下文加载不可用，工具执行已安全停止。请检查绑定或 Hook 状态。",
             )
-        tool_name = str(payload.get("tool_name", "") or "")
-        tool_input = payload.get("tool_input", {})
+        tool_name, tool_input = _hook_tool_parts(payload)
         if _targets_native_memory(tool_name, tool_input):
             reason = (
                 "MemoryGuard 已接管长期记忆：禁止 Agent 写入宿主原生记忆路径。"
@@ -3854,7 +4266,7 @@ def _run_hook_unlocked(
             )
             if mode == "enforce":
                 return _deny_output(normalized_provider, reason)
-        elif _is_other_memory_write(tool_name):
+        elif _is_other_memory_write(tool_name, tool_input):
             reason = (
                 "检测到其他记忆 MCP 写入。正式接管模式只允许 "
                 "MemoryGuard 作为长期记忆写入端。"
@@ -3863,16 +4275,12 @@ def _run_hook_unlocked(
                 return _deny_output(normalized_provider, reason)
         if normalized_provider == "cursor":
             if _is_memoryguard_bootstrap(tool_name, tool_input):
-                def mark_cursor_bootstrap(state: dict[str, Any]) -> None:
+                def mark_cursor_bootstrap_pending(state: dict[str, Any]) -> None:
                     if not state.get("mandatory_overflow"):
-                        state["bootstrap_ok"] = True
-                        state["bootstrap_error"] = ""
-                        state["context_hash"] = state.get("context_hash") or _short_hash(
-                            "cursor-bootstrap:" + session_id
-                        )
+                        state["bootstrap_pending"] = True
                 _update_state(
                     root, normalized_provider, session_id,
-                    mutator=mark_cursor_bootstrap,
+                    mutator=mark_cursor_bootstrap_pending,
                 )
                 return v2_result
             is_subagent = bool(
@@ -3892,12 +4300,13 @@ def _run_hook_unlocked(
         return v2_result
 
     if event == "post_tool":
-        tool_name = str(payload.get("tool_name", "") or "")
-        tool_input = payload.get("tool_input", {})
-        tool_result = payload.get("tool_result", payload.get("result"))
+        tool_name, tool_input = _hook_tool_parts(payload)
+        tool_result = _hook_tool_result(payload)
         def update_post_tool_state(state: dict[str, Any]) -> None:
             if _is_memoryguard_bootstrap(tool_name, tool_input):
-                if not state.get("mandatory_overflow"):
+                success, reason = _coerce_tool_result_status(tool_result)
+                state["bootstrap_pending"] = False
+                if success is True and not state.get("mandatory_overflow"):
                     state["bootstrap_ok"] = True
                     state["bootstrap_error"] = ""
                     state["context_hash"] = state.get("context_hash") or _short_hash(
@@ -3905,6 +4314,14 @@ def _run_hook_unlocked(
                     )
                     state["bootstrap_retry_claimed"] = False
                     state["bootstrap_retry_claimed_at"] = 0
+                elif success is False:
+                    state["bootstrap_ok"] = False
+                    state["context_hash"] = ""
+                    state["bootstrap_error"] = "bootstrap_tool_failed"
+                elif not state.get("bootstrap_ok"):
+                    state["bootstrap_ok"] = False
+                    state["context_hash"] = ""
+                    state["bootstrap_error"] = "bootstrap_result_unverified"
             if _is_memoryguard_write(tool_name, tool_input):
                 success, reason = _coerce_tool_result_status(tool_result)
                 if success is True:
@@ -3956,7 +4373,9 @@ def _read_stdin_json() -> dict[str, Any]:
 
 
 def _configure_utf8_stdio() -> None:
-    for name in ("stdin", "stdout", "stderr"):
+    # Hook command already uses ``python -X utf8``. Reconfiguring stdin
+    # here can drain the text wrapper and make buffer.read() return empty.
+    for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
         reconfigure = getattr(stream, "reconfigure", None)
         if not callable(reconfigure):
@@ -3965,10 +4384,77 @@ def _configure_utf8_stdio() -> None:
         reconfigure(encoding="utf-8", errors=errors)
 
 
+_PRETOOL_REDACT_KEYS = frozenset({
+    "authorization",
+    "x-api-key",
+    "api_key",
+    "apikey",
+    "access_token",
+    "token",
+    "secret",
+    "password",
+    "cookie",
+})
+
+
+def _redact_hook_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).casefold()
+            if lowered in _PRETOOL_REDACT_KEYS or (
+                "api" in lowered and "key" in lowered
+            ):
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = _redact_hook_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_hook_payload(item) for item in value[:32]]
+    if isinstance(value, str) and len(value) > 4000:
+        return value[:4000] + "…"
+    return value
+
+
+def _dump_last_pretool(
+    workspace: str | Path,
+    payload: dict[str, Any],
+    *,
+    name: str = "last_pretool.json",
+) -> None:
+    try:
+        path = _runtime_root(Path(workspace)) / name
+        blob = {
+            "at": _now_iso(),
+            "tool_name": str(
+                payload.get("tool_name")
+                or payload.get("toolName")
+                or payload.get("name")
+                or ""
+            ),
+            "keys": sorted(str(key) for key in payload),
+            "stdin": dict(_LAST_STDIN_META),
+            "payload": _redact_hook_payload(payload),
+        }
+        text = json.dumps(blob, ensure_ascii=False, indent=2)
+        if len(text) > 16000:
+            text = text[:16000] + "\n"
+        _atomic_write_text(path, text + "\n")
+    except Exception:
+        return
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    _configure_utf8_stdio()
     try:
         payload = _read_stdin_json()
+        _configure_utf8_stdio()
+        if args.event in {"pre_tool", "post_tool"}:
+            kind = "pretool" if args.event == "pre_tool" else "posttool"
+            _dump_last_pretool(
+                args.workspace,
+                payload,
+                name=f"last_{kind}-{args.provider}.json",
+            )
         result = run_hook(
             provider=args.provider,
             event=args.event,
@@ -3983,11 +4469,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # PreToolUse is the only fail-closed runtime event.  Other failures
         # surface through status/heartbeat without bricking the host session.
         if args.event == "pre_tool":
-            result = _deny_output(
-                args.provider,
-                f"MemoryGuard Hook 执行失败，已阻止本次工具调用：{exc}",
-            )
-            sys.stdout.write(json.dumps(result, ensure_ascii=False))
+            try:
+                result = _deny_output(
+                    args.provider,
+                    f"MemoryGuard Hook 执行失败，已阻止本次工具调用：{exc}",
+                )
+                sys.stdout.write(json.dumps(result, ensure_ascii=False))
+            except Exception:
+                sys.stdout.write("{}")
             return 0
         sys.stderr.write(f"memoryguard hook error: {exc}\n")
         return 1

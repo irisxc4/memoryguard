@@ -2564,6 +2564,8 @@ def reconcile_historical_duplicates(
     *,
     store: Any = None,
     actor: str = "memoryguard-reconciliation",
+    definition_ids: Iterable[str] | None = None,
+    canonical_definition_id: str = "",
 ) -> dict[str, Any]:
     """Fold safe historical duplicate Definitions into one canonical head.
 
@@ -2589,6 +2591,8 @@ def reconcile_historical_duplicates(
     if isinstance(native_store, RuleV2Store):
         return native_store.reconcile_historical_duplicates(
             share_group_id, actor=actor,
+            definition_ids=definition_ids,
+            canonical_definition_id=canonical_definition_id,
         )
     if native_store is None:
         rules_db = Path(workspace).expanduser().resolve() / ".memoryguard" / "rules" / "rules.db"
@@ -2596,8 +2600,12 @@ def reconcile_historical_duplicates(
             native_store = RuleV2Store(workspace)
             return native_store.reconcile_historical_duplicates(
                 share_group_id, actor=actor,
+                definition_ids=definition_ids,
+                canonical_definition_id=canonical_definition_id,
             )
         native_store = RuleMergeStore(workspace)
+    if definition_ids is not None or str(canonical_definition_id or "").strip():
+        raise ValueError("rule_merge_native_store_required")
     group = str(share_group_id or "").strip()
     if not group:
         raise ValueError("share_group_id_required")
@@ -2765,6 +2773,7 @@ def settle_native_canonical_snapshot(
     share_group_id: str,
     *,
     store: Any = None,
+    reconcile: bool = True,
 ) -> dict[str, Any]:
     """Activate one fully anchored native rule snapshot.
 
@@ -2778,9 +2787,12 @@ def settle_native_canonical_snapshot(
     # Snapshot settlement is existing explicit migration/publication entry.
     # Reconcile before readiness/digest calculation so historical duplicate
     # heads cannot survive into a newly activated canonical generation.
-    reconcile_historical_duplicates(
-        workspace, share_group_id, store=native,
-    )
+    # Targeted merge already folded its requested pair; skip so settlement
+    # cannot swallow an unrequested sibling.
+    if reconcile:
+        reconcile_historical_duplicates(
+            workspace, share_group_id, store=native,
+        )
     probe = _native_canonical_reconciliation_status(
         workspace, share_group_id, store=native,
     )

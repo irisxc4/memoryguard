@@ -816,6 +816,8 @@ class NativeV2RuntimePort:
         "memoryguard_memory_write": ("memory_write", "implemented", True),
         "memoryguard_memory_update": ("memory_update", "implemented", True),
         "memoryguard_memory_delete": ("memory_delete", "implemented", True),
+        "memoryguard_memory_merge_safe": ("memory_merge_safe", "implemented", True),
+        "memoryguard_memory_merge_safe_preview": ("memory_merge_safe_preview", "implemented", False),
         "memoryguard_context_bootstrap": ("context_bootstrap", "implemented", False),
         "memoryguard_rule_create_auto": ("rule_create_auto", "implemented", True),
         "memoryguard_rule_feedback": ("rule_feedback", "implemented", True),
@@ -828,6 +830,8 @@ class NativeV2RuntimePort:
         "memoryguard_rule_merge_approve": ("rule_merge_approve", "implemented", True),
         "memoryguard_rule_merge_acknowledge": ("rule_merge_acknowledge", "implemented", True),
         "memoryguard_rule_merge_cooldown_clear": ("rule_merge_cooldown_clear", "implemented", True),
+        "memoryguard_rule_merge_safe": ("rule_merge_safe", "implemented", True),
+        "memoryguard_rule_merge_safe_preview": ("rule_merge_safe_preview", "implemented", False),
         "memoryguard_extract_memories": ("extract_memories", "implemented", True),
         "memoryguard_accept_candidates": ("accept_candidates", "implemented", True),
         "memoryguard_list_pending_enrichments": ("list_pending_enrichments", "implemented", False),
@@ -1883,6 +1887,7 @@ class NativeV2RuntimePort:
         # test capability may not replace the builtin GovernanceV2 route.
         if handler in {
             "memory_write", "memory_update", "memory_delete",
+            "memory_merge_safe", "memory_merge_safe_preview",
             # Phase 9 services are production builtins.  A test/host service
             # mapping must not be able to replace the real history/source/
             # import/diagnostics implementation or promote coverage by DI.
@@ -3811,7 +3816,7 @@ class NativeV2RuntimePort:
         **_: Any,
     ) -> Any:
         self._gui_authority(context)
-        if operation not in {"usage_telemetry", "usage_telemetry_sync"}:
+        if operation != "usage_telemetry":
             raise NativePortError("unknown_usage_query")
         window_days = payload.get("window_days", 7)
         if type(window_days) is not int or window_days not in {7, 30}:
@@ -3922,6 +3927,56 @@ class NativeV2RuntimePort:
         summary["agent_filter"] = agent_key
         summary["summary_scope"] = "agent" if agent_key else "share_group"
         return {"ok": True, "data": summary}
+
+    def _gui_usage_sync(
+        self,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        **_: Any,
+    ) -> Any:
+        del payload
+        self._gui_authority(context)
+        try:
+            from ..usage_telemetry import (
+                _safe_agent_name,
+                _safe_sync_status,
+                sync_usage_telemetry,
+            )
+
+            result = sync_usage_telemetry(self.workspace)
+        except Exception as exc:
+            raise NativePortError("usage_telemetry_sync_failed") from exc
+        if not isinstance(result, Mapping):
+            raise NativePortError("usage_telemetry_sync_failed")
+
+        state = result.get("sync_state")
+        state_map = state if isinstance(state, Mapping) else {}
+        providers = state_map.get("providers")
+        provider_map = providers if isinstance(providers, Mapping) else {}
+
+        def count(value: Any) -> int:
+            return value if type(value) is int and value >= 0 else 0
+
+        safe_providers = {
+            _safe_agent_name(name): {
+                "status": _safe_sync_status(item.get("status")),
+                "inserted": count(item.get("inserted_count")),
+                "rotated": count(item.get("rotated_count")),
+                "sources": count(item.get("source_count")),
+            }
+            for name, item in provider_map.items()
+            if _text(name) and isinstance(item, Mapping)
+        }
+        return {
+            "ok": True,
+            "data": {
+                "status": _safe_sync_status(result.get("status")),
+                "inserted": count(result.get("inserted")),
+                "rotated": count(result.get("rotated")),
+                "sources": count(result.get("sources")),
+                "providers": safe_providers,
+            },
+        }
 
     def _gui_knowledge_query(
         self,
@@ -4538,6 +4593,7 @@ class NativeV2RuntimePort:
                     _text(payload.get("conflict_group_id") or payload.get("group_id")),
                     _text(payload.get("keep_id") or payload.get("keep_memory_id")),
                     context,
+                    confirmed=payload.get("confirmed") is True,
                 )
             if operation == "conflict_close_stale":
                 return service.close_stale_conflict(
@@ -5066,32 +5122,6 @@ class NativeV2RuntimePort:
             public["audit_state"] = "completed"
             public["generated_at"] = completed_at
             public["completed_at"] = completed_at
-            if public_name == "run_audit":
-                try:
-                    from ..usage_telemetry import sync_usage_telemetry
-
-                    usage_sync = sync_usage_telemetry(self.workspace)
-                except Exception as exc:
-                    usage_sync = {
-                        "status": "error",
-                        "error": type(exc).__name__,
-                        "ok": False,
-                    }
-                if not isinstance(usage_sync, Mapping):
-                    usage_sync = {"status": "error", "error": "sync_failed", "ok": False}
-                status = _text(usage_sync.get("status")).casefold() or "error"
-                state = usage_sync.get("sync_state")
-                state_map = state if isinstance(state, Mapping) else {}
-                state_status = _text(state_map.get("status")).casefold()
-                if usage_sync.get("error") or status in {"error", "failed"}:
-                    status = "error"
-                elif status == "success" and state_status and state_status != "success":
-                    status = state_status
-                public["usage_sync"] = {
-                    "status": status,
-                    "error": usage_sync.get("error") or state_map.get("last_error"),
-                    "providers": state_map.get("providers") or {},
-                }
             return {"ok": True, "status": "ok", "data": public}
         except NativePortError:
             raise
@@ -7409,7 +7439,51 @@ class NativeV2RuntimePort:
             context=context,
             generation=generation,
             state=state,
-            mutation=mutation,
+            mutation=False if operation == "merge_safe_preview" else mutation,
+        )
+
+    def _memory_merge_operation(
+        self,
+        operation: str,
+        payload: Mapping[str, Any],
+        context: Mapping[str, Any],
+        *,
+        generation: int,
+        state: Any = None,
+        mutation: bool = True,
+        **_: Any,
+    ) -> Any:
+        from .memory_merge_native import NativeMemoryMergeService
+
+        write = operation != "merge_safe_preview"
+        if write:
+            self._preflight_memory_governance()
+        service = NativeMemoryMergeService(
+            self.workspace,
+            memory_store=self._domain_store("memory", write=write),
+            governance=self._governance_boundary() if write else None,
+            state_provider=self.state_provider,
+        )
+        if write:
+            scope = self._scope(context)
+            with _native_memory_mutation_lock(self.workspace, scope["share_group_id"]):
+                return self._service_result(
+                    service,
+                    operation,
+                    payload,
+                    context=context,
+                    generation=generation,
+                    state=state,
+                    mutation=mutation,
+                )
+        return self._service_result(
+            service,
+            operation,
+            payload,
+            context=context,
+            generation=generation,
+            state=state,
+            mutation=False,
         )
 
     @staticmethod
@@ -8366,6 +8440,8 @@ class NativeV2RuntimePort:
             "memory_write": self._memory_write,
             "memory_update": self._memory_update,
             "memory_delete": self._memory_delete,
+            "memory_merge_safe": lambda p, context, **k: self._memory_merge_operation("merge_safe", p, context, **k),
+            "memory_merge_safe_preview": lambda p, context, **k: self._memory_merge_operation("merge_safe_preview", p, context, **k),
             "gui_memory_edit": self._gui_memory_edit,
             "gui_memory_lock": self._gui_memory_lock,
             "gui_memory_unlock": self._gui_memory_unlock,
@@ -8397,6 +8473,8 @@ class NativeV2RuntimePort:
             "rule_merge_approve": lambda p, context, **k: self._rule_merge_operation("approve", p, context, **k),
             "rule_merge_acknowledge": lambda p, context, **k: self._rule_merge_operation("acknowledge", p, context, **k),
             "rule_merge_cooldown_clear": lambda p, context, **k: self._rule_merge_operation("cooldown_clear", p, context, **k),
+            "rule_merge_safe": lambda p, context, **k: self._rule_merge_operation("merge_safe", p, context, **k),
+            "rule_merge_safe_preview": lambda p, context, **k: self._rule_merge_operation("merge_safe_preview", p, context, **k),
             "extract_memories": self._extract_memories,
             "gui_extract_preview": self._gui_extract_preview,
             "gui_extract_by_path": self._gui_extract_by_path,
@@ -8431,6 +8509,7 @@ class NativeV2RuntimePort:
             "gui_history_control": self._gui_history_control,
             "gui_audit_plan": self._gui_audit_plan,
             "gui_usage_query": self._gui_usage_query,
+            "gui_usage_sync": self._gui_usage_sync,
             "reference_audit": self._reference_audit,
             "explain": self._explain,
             "projection_graph": self._projection_graph,

@@ -18,10 +18,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..access_context import AccessContext
-from ..rules.v2_store import RuleV2Store, RULES_SCHEMA_MARKER, RULES_SCHEMA_VERSION, stable_digest
+from ..rules.v2_store import (
+    RuleV2Store,
+    RULES_SCHEMA_MARKER,
+    RULES_SCHEMA_VERSION,
+    stable_digest,
+    _canonical_relation_kind,
+    _runtime_injection_layer,
+)
 from ..governance_capability import (
     CAPABILITY_SCOPE,
     CapabilityIssueError,
@@ -43,16 +50,25 @@ RULE_MERGE_OPERATIONS = (
     "approve",
     "acknowledge",
     "cooldown_clear",
+    "merge_safe",
+    "merge_safe_preview",
 )
+_READ_OPERATIONS = frozenset({"merge_safe_preview"})
 
 _ALIASES = {
     **{name: name for name in RULE_MERGE_OPERATIONS},
     **{f"memoryguard_rule_merge_{name}": name for name in RULE_MERGE_OPERATIONS},
     "issue": "capability_issue",
+    "safe": "merge_safe",
+    "safe_preview": "merge_safe_preview",
     "rule_merge_capability_issue": "capability_issue",
     "rule_merge_approve": "approve",
     "rule_merge_acknowledge": "acknowledge",
     "rule_merge_cooldown_clear": "cooldown_clear",
+    "rule_merge_safe": "merge_safe",
+    "rule_merge_safe_preview": "merge_safe_preview",
+    "memoryguard_rule_merge_safe": "merge_safe",
+    "memoryguard_rule_merge_safe_preview": "merge_safe_preview",
 }
 
 _IDENTITY_KEYS = frozenset(
@@ -85,6 +101,15 @@ class NativeRuleMergeError(NativePortError):
 class _MutationReceipt:
     receipt_id: str
     values: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class _SafeMergePlan:
+    group: str
+    canonical_id: str
+    ordered_dups: tuple[str, ...]
+    by_source: Mapping[str, frozenset[str]]
+    source_by_definition: Mapping[str, str]
 
 
 def _text(value: Any, *, field: str = "", max_len: int = 512) -> str:
@@ -146,7 +171,21 @@ def _error_code(error: Exception) -> str:
         return error.code
     if isinstance(error, NativeContextError):
         return error.code
-    message = str(error).casefold()
+    raw = str(error or "")
+    token = raw.split(":", 1)[0].strip()
+    coded = {
+        "rule_merge_definition_not_found": "rule_merge_definition_not_found",
+        "rule_merge_canonical_mismatch": "rule_merge_canonical_mismatch",
+        "rule_merge_definition_ids_required": "rule_merge_definition_ids_required",
+        "rule_merge_native_store_required": "rule_merge_native_store_required",
+        "share_group_id_required": "share_group_id_required",
+        "canonical_composition_rejected": "canonical_composition_rejected",
+        "canonical_snapshot_not_settleable": "canonical_snapshot_not_settleable",
+        "canonical_snapshot_settle_failed": "canonical_snapshot_settle_failed",
+    }
+    if token in coded:
+        return coded[token]
+    message = raw.casefold()
     exact = {
         "trusted accesscontext required": "native_admin_capability_required",
         "admin capability required (set memoryguard_admin=1)": "native_admin_capability_required",
@@ -895,6 +934,374 @@ class NativeRuleMergeService:
             raise NativeRuleMergeError("proposal_revision_invalid")
         return normalized
 
+    @staticmethod
+    def _id_list(value: Any, *, field: str) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = _text(value, field=field, max_len=256)
+            return [text] if text else []
+        if not isinstance(value, list):
+            raise NativeRuleMergeError(f"invalid_{field}")
+        seen: set[str] = set()
+        result: list[str] = []
+        for item in value:
+            text = _text(item, field=field, max_len=256)
+            if not text:
+                raise NativeRuleMergeError(f"invalid_{field}")
+            if text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
+
+    def _rules_store(self, store: Any) -> Any:
+        rules = getattr(store, "_store", store)
+        if not hasattr(rules, "reconcile_historical_duplicates"):
+            raise NativeRuleMergeError("rule_merge_store_unavailable")
+        return rules
+
+    def _readonly_rules(self) -> Any:
+        self._preflight_schema()
+        try:
+            return RuleV2Store(self.workspace, read_only=True)
+        except NativeRuleMergeError:
+            raise
+        except (sqlite3.DatabaseError, OSError, ValueError, TypeError, RuntimeError) as exc:
+            raise NativeRuleMergeError("rule_merge_store_unavailable") from exc
+
+    def _plan_merge_safe(
+        self,
+        rules: Any,
+        payload: Mapping[str, Any],
+        raw_context: Any,
+    ) -> _SafeMergePlan:
+        authority = resolve_native_transport_context(raw_context)
+        group = str(authority.share_group_id or "").strip()
+        if not group:
+            raise NativeRuleMergeError("context_group_required")
+        links = rules.list_source_links(share_group_id=group, status="active")
+        by_source: dict[str, set[str]] = {}
+        reachable: set[str] = set()
+        for link in links:
+            source = str(link.get("memory_id") or "").strip()
+            definition = str(
+                link.get("canonical_definition_id")
+                or link.get("original_definition_id")
+                or ""
+            ).strip()
+            if source and definition:
+                by_source.setdefault(source, set()).add(definition)
+                reachable.add(definition)
+        for binding in rules.list_bindings(share_group_id=group, status="active"):
+            if str(getattr(binding, "effect", "") or "include") != "include":
+                continue
+            definition = str(getattr(binding, "definition_id", "") or "").strip()
+            if definition:
+                reachable.add(definition)
+        source_by_definition: dict[str, str] = {}
+
+        def resolve(source_id: str, definition_id: str, *, field: str) -> str:
+            source_token = _text(source_id, field=field, max_len=256)
+            definition_token = _text(definition_id, field=field, max_len=256)
+            resolved = ""
+            if source_token:
+                matched = by_source.get(source_token) or set()
+                if len(matched) != 1:
+                    raise NativeRuleMergeError("rule_merge_target_not_found")
+                resolved = next(iter(matched))
+                source_by_definition.setdefault(resolved, source_token)
+            if definition_token:
+                if definition_token not in reachable:
+                    raise NativeRuleMergeError("rule_merge_target_not_found")
+                if resolved and resolved != definition_token:
+                    raise NativeRuleMergeError("rule_merge_target_not_found")
+                resolved = definition_token
+            if not resolved:
+                raise NativeRuleMergeError("rule_merge_target_required")
+            definition = rules.get_definition(resolved)
+            if (
+                definition is None
+                or str(definition.status or "") != "active"
+                or resolved not in reachable
+            ):
+                raise NativeRuleMergeError("rule_merge_target_not_found")
+            if resolved not in source_by_definition:
+                matches = [
+                    source for source, defs in by_source.items()
+                    if resolved in defs
+                ]
+                if len(matches) == 1:
+                    source_by_definition[resolved] = matches[0]
+            return resolved
+
+        canonical_source = payload.get("canonical_source_id")
+        canonical_definition = payload.get("canonical_definition_id")
+        if canonical_source not in (None, "") and not isinstance(canonical_source, str):
+            raise NativeRuleMergeError("invalid_canonical_source_id")
+        if canonical_definition not in (None, "") and not isinstance(canonical_definition, str):
+            raise NativeRuleMergeError("invalid_canonical_definition_id")
+        canonical_id = resolve(
+            str(canonical_source or ""),
+            str(canonical_definition or ""),
+            field=(
+                "canonical_source_id"
+                if str(canonical_source or "").strip()
+                else "canonical_definition_id"
+            ),
+        )
+        duplicate_sources = self._id_list(
+            payload.get("duplicate_source_ids"), field="duplicate_source_ids",
+        )
+        duplicate_definitions = self._id_list(
+            payload.get("duplicate_definition_ids"), field="duplicate_definition_ids",
+        )
+        if not duplicate_sources and not duplicate_definitions:
+            raise NativeRuleMergeError("rule_merge_duplicate_ids_required")
+        ordered_dups: list[str] = []
+        seen_dups: set[str] = set()
+        for source_id in duplicate_sources:
+            item = resolve(source_id, "", field="duplicate_source_ids")
+            if item in seen_dups:
+                continue
+            seen_dups.add(item)
+            ordered_dups.append(item)
+        for definition_id in duplicate_definitions:
+            item = resolve("", definition_id, field="duplicate_definition_ids")
+            if item in seen_dups:
+                continue
+            seen_dups.add(item)
+            ordered_dups.append(item)
+        if canonical_id in seen_dups:
+            raise NativeRuleMergeError("rule_merge_self_merge_rejected")
+        if not ordered_dups:
+            raise NativeRuleMergeError("rule_merge_duplicate_ids_required")
+        return _SafeMergePlan(
+            group=group,
+            canonical_id=canonical_id,
+            ordered_dups=tuple(ordered_dups),
+            by_source={key: frozenset(value) for key, value in by_source.items()},
+            source_by_definition=dict(source_by_definition),
+        )
+
+    @staticmethod
+    def _assert_requested_pairs_mergeable(
+        merged: Mapping[str, Any],
+        ordered_dups: Sequence[str],
+    ) -> list[Mapping[str, Any]]:
+        details = [
+            item for item in (merged.get("details") or ())
+            if isinstance(item, Mapping)
+        ]
+        merged_ids = [
+            str(item.get("merged") or "")
+            for item in details
+            if str(item.get("status") or "") == "merged"
+        ]
+        if set(merged_ids) != set(ordered_dups):
+            raise NativeRuleMergeError("rule_merge_pair_not_mergeable")
+        return details
+
+    def _evaluate_merge_pairs(
+        self,
+        rules: Any,
+        plan: _SafeMergePlan,
+        *,
+        actor: str,
+        dry_run: bool,
+    ) -> list[Mapping[str, Any]]:
+        merged = rules.reconcile_historical_duplicates(
+            plan.group,
+            actor=actor,
+            definition_ids=[plan.canonical_id, *plan.ordered_dups],
+            canonical_definition_id=plan.canonical_id,
+            dry_run=dry_run,
+        )
+        return self._assert_requested_pairs_mergeable(merged, plan.ordered_dups)
+
+    def _candidate_record(
+        self,
+        rules: Any,
+        plan: _SafeMergePlan,
+        definition_id: str,
+        *,
+        pair: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        definition = rules.get_definition(definition_id)
+        if definition is None:
+            raise NativeRuleMergeError("rule_merge_target_not_found")
+        record: dict[str, Any] = {
+            "source_id": str(plan.source_by_definition.get(definition_id) or ""),
+            "definition_id": definition_id,
+            "revision": int(definition.revision or 0),
+            "strength": str(definition.rule_strength or ""),
+            "layer": _runtime_injection_layer(definition),
+            "status": str(definition.status or ""),
+        }
+        if pair is not None:
+            canonical = rules.get_definition(plan.canonical_id)
+            relation = str(pair.get("relation") or "")
+            if not relation and canonical is not None:
+                relation = _canonical_relation_kind(
+                    str(canonical.canonical_text or ""),
+                    str(definition.canonical_text or ""),
+            )
+            record["relation"] = relation
+            record["reason"] = str(pair.get("reason") or "historical_duplicate_fold")
+        return record
+
+    def _merge_safe_preview(
+        self,
+        rules: Any,
+        payload: Mapping[str, Any],
+        *,
+        access: AccessContext,
+        raw_context: Any,
+    ) -> dict[str, Any]:
+        plan = self._plan_merge_safe(rules, payload, raw_context)
+        details = self._evaluate_merge_pairs(
+            rules, plan, actor=access.principal, dry_run=True,
+        )
+        pair_by_dup = {
+            str(item.get("merged") or ""): item
+            for item in details
+            if str(item.get("status") or "") == "merged"
+        }
+        canonical = self._candidate_record(rules, plan, plan.canonical_id)
+        duplicates = [
+            self._candidate_record(rules, plan, definition_id, pair=pair_by_dup.get(definition_id))
+            for definition_id in plan.ordered_dups
+        ]
+        expected = {
+            canonical["definition_id"]: canonical["revision"],
+            **{item["definition_id"]: item["revision"] for item in duplicates},
+        }
+        return {
+            "canonical": canonical,
+            "duplicates": duplicates,
+            "expected_definition_revisions": expected,
+        }
+
+    def _merge_safe(
+        self,
+        store: Any,
+        payload: Mapping[str, Any],
+        *,
+        access: AccessContext,
+        raw_context: Any,
+    ) -> dict[str, Any]:
+        if payload.get("confirmed") is not True:
+            raise NativeRuleMergeError("confirmation_required")
+        rules = self._rules_store(store)
+        plan = self._plan_merge_safe(rules, payload, raw_context)
+        canonical_id = plan.canonical_id
+        ordered_dups = list(plan.ordered_dups)
+        by_source = {key: set(value) for key, value in plan.by_source.items()}
+
+        expected = payload.get("expected_definition_revisions")
+        if not isinstance(expected, Mapping) or not expected:
+            raise NativeRuleMergeError("definition_revision_required")
+        involved = [canonical_id, *ordered_dups]
+        normalized: dict[str, int] = {}
+        for key, value in expected.items():
+            if type(value) is not int or isinstance(value, bool) or value < 0:
+                raise NativeRuleMergeError("definition_revision_invalid")
+            token = str(key or "").strip()
+            if not token:
+                raise NativeRuleMergeError("definition_revision_invalid")
+            if token in involved:
+                mapped = token
+            else:
+                matched = by_source.get(token) or set()
+                if len(matched) != 1:
+                    raise NativeRuleMergeError("definition_revision_invalid")
+                mapped = next(iter(matched))
+            if mapped in normalized and normalized[mapped] != value:
+                raise NativeRuleMergeError("definition_revision_invalid")
+            normalized[mapped] = value
+        if set(normalized) != set(involved):
+            raise NativeRuleMergeError("definition_revision_invalid")
+        for definition_id, revision in normalized.items():
+            current = rules.get_definition(definition_id)
+            if current is None or int(current.revision or 0) != revision:
+                raise NativeRuleMergeError("definition_revision_mismatch")
+
+        details = self._evaluate_merge_pairs(
+            rules, plan, actor=access.principal, dry_run=False,
+        )
+
+        from ..rule_reconciliation import settle_native_canonical_snapshot
+
+        try:
+            settle_native_canonical_snapshot(
+                self.workspace, plan.group, store=rules, reconcile=False,
+            )
+        except RuntimeError as exc:
+            raise NativeRuleMergeError(_error_code(exc)) from exc
+
+        decision_ids = [
+            str(item.get("decision_id") or "")
+            for item in details
+            if str(item.get("status") or "") == "merged" and item.get("decision_id")
+        ]
+        undo_ids = [
+            str(item.get("undo_id") or item.get("decision_id") or "")
+            for item in details
+            if str(item.get("status") or "") == "merged"
+        ]
+        requested_sources: list[str] = []
+        canonical_source = payload.get("canonical_source_id")
+        if isinstance(canonical_source, str) and canonical_source.strip():
+            requested_sources.append(canonical_source.strip())
+        requested_sources.extend(self._id_list(
+            payload.get("duplicate_source_ids"), field="duplicate_source_ids",
+        ))
+        source_ids: list[str] = []
+        seen_sources: set[str] = set()
+        for item in requested_sources:
+            if item and item not in seen_sources:
+                seen_sources.add(item)
+                source_ids.append(item)
+        involved_set = {canonical_id, *ordered_dups}
+        for link in rules.list_source_links(share_group_id=plan.group, status="active"):
+            definition = str(link.get("canonical_definition_id") or "")
+            original = str(link.get("original_definition_id") or "")
+            if definition not in involved_set and original not in involved_set:
+                continue
+            memory_id = str(link.get("memory_id") or "").strip()
+            if memory_id and memory_id not in seen_sources:
+                seen_sources.add(memory_id)
+                source_ids.append(memory_id)
+        return {
+            "canonical_definition_id": canonical_id,
+            "merged_definition_ids": ordered_dups,
+            "decision_ids": decision_ids,
+            "undo_ids": undo_ids,
+            "source_ids": source_ids,
+        }
+
+    def _preview(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        context: Any,
+        generation: Any,
+        state: Any,
+    ) -> dict[str, Any]:
+        try:
+            access = self._access_context(context)
+            state_snapshot = self._state_gate(generation, state)
+            rules = self._readonly_rules()
+            result = self._merge_safe_preview(
+                rules, payload, access=access, raw_context=context,
+            )
+            self._assert_state_unchanged(state_snapshot)
+            return result
+        except NativeRuleMergeError:
+            raise
+        except Exception as exc:
+            raise NativeRuleMergeError(_error_code(exc)) from exc
+
     # ---- operations -----------------------------------------------------
     def _execute(
         self,
@@ -907,6 +1314,8 @@ class NativeRuleMergeService:
         mutation_receipt: Any,
         idempotency_key: Any,
     ) -> dict[str, Any]:
+        if operation in _READ_OPERATIONS:
+            raise NativeRuleMergeError("rule_merge_operation_rejected")
         access = self._access_context(context)
         state_snapshot = self._state_gate(generation, state)
         receipt = self._receipt(payload, mutation_receipt)
@@ -930,6 +1339,17 @@ class NativeRuleMergeService:
                             request_key=key,
                         )
                     return self._ledger_replay(existing, operation)
+                if operation == "merge_safe":
+                    result = self._merge_safe(
+                        store, payload, access=access, raw_context=context,
+                    )
+                    self._assert_state_unchanged(state_snapshot)
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        "UPDATE rule_merge_native_requests SET status='committed', result_json=?, updated_at=? WHERE request_key=?",
+                        (self._ledger_result(result, operation), now, key),
+                    )
+                    return result
                 proposal_id = self._proposal_id(payload)
                 if operation == "capability_issue":
                     kwargs: dict[str, Any] = {}
@@ -1023,10 +1443,15 @@ class NativeRuleMergeService:
         effective_context = context if context is not None else trusted_context
         try:
             data = self._payload(payload)
-            result = self._execute(
-                name, data, context=effective_context, generation=generation, state=state,
-                mutation_receipt=mutation_receipt, idempotency_key=idempotency_key,
-            )
+            if name in _READ_OPERATIONS:
+                result = self._preview(
+                    data, context=effective_context, generation=generation, state=state,
+                )
+            else:
+                result = self._execute(
+                    name, data, context=effective_context, generation=generation, state=state,
+                    mutation_receipt=mutation_receipt, idempotency_key=idempotency_key,
+                )
             return {"ok": True, "status": "ok", "operation": name, "data": result}
         except Exception as exc:
             code = _error_code(exc)
@@ -1047,6 +1472,12 @@ class NativeRuleMergeService:
 
     def cooldown_clear(self, payload: Any = None, **kwargs: Any) -> dict[str, Any]:
         return self.dispatch("cooldown_clear", payload, **kwargs)
+
+    def merge_safe(self, payload: Any = None, **kwargs: Any) -> dict[str, Any]:
+        return self.dispatch("merge_safe", payload, **kwargs)
+
+    def merge_safe_preview(self, payload: Any = None, **kwargs: Any) -> dict[str, Any]:
+        return self.dispatch("merge_safe_preview", payload, **kwargs)
 
     call = dispatch
 

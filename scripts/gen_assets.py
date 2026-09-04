@@ -259,8 +259,9 @@ d3.text((68, 666), 'DEMO_TOKEN_not_real_123', font=font(14, True, True), fill=RE
 d3.text((380, 666), 'not in active memory', font=font(13), fill=(120, 60, 60))
 
 # Stats
-d3.text((720, 780), '22 MCP tools  -  Auto-organize  -  SQLite backend  -  No account  -  No telemetry', font=font(18), fill=GRAY, anchor='ms')
-d3.text((720, 830), 'pip install agent-memguard', font=font(22, True, True), fill=CYAN, anchor='ms')
+d3.text((720, 780), '61 MCP tools  -  Auto-organize  -  SQLite backend  -  No account  -  Optional local telemetry', font=font(18), fill=GRAY, anchor='ms')
+d3.text((720, 808), 'Codex/Grok measurements when reported  -  Claude/Cursor/Trae unsupported  -  No remote upload', font=font(16), fill=GRAY, anchor='ms')
+d3.text((720, 850), 'pip install agent-memguard', font=font(22, True, True), fill=CYAN, anchor='ms')
 
 img3.save(os.path.join(OUT, 'write-organize-rollback.png'))
 print('Demo saved')

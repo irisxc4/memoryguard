@@ -6,7 +6,7 @@ description: Install, configure, repair, diagnose, and govern local PyPI agent-m
 # MemoryGuard local operations
 
 Use this skill for the repository's `agent-memguard` package (the current
-checkout declares version `0.7.8`). Scope is local Windows installation,
+checkout declares version `0.7.9`). Scope is local Windows installation,
 configuration, repair, diagnostics, and governed memory operations.
 
 This is a skills-only plugin. It does not bundle `agent-memguard`, add a

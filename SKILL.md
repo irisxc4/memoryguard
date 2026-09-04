@@ -138,6 +138,8 @@ Add to your agent's MCP config:
 - `memoryguard_memory_update` - Update a memory (body / kind / status)
 - `memoryguard_memory_delete` - Soft-delete a memory
 - `memoryguard_memory_status` - Get shared memory group status
+- `memoryguard_memory_merge_safe_preview` - Admin-only read-only pair check before a governed memory supersede
+- `memoryguard_memory_merge_safe` - Admin-only governed supersede of one same-group duplicate atom into a stronger canonical atom
 - `memoryguard_binding_create` - Bind an agent to a share group
 - `memoryguard_binding_list` - List agent bindings
 - `memoryguard_extract_memories` - Extract memory segments from a source file

@@ -17,10 +17,12 @@ MCP_TOOL_NAMES = frozenset({
     "memoryguard_scan_summary", "memoryguard_neuron_graph", "memoryguard_import_preview",
     "memoryguard_memory_read", "memoryguard_memory_search", "memoryguard_memory_write",
     "memoryguard_memory_update", "memoryguard_memory_delete", "memoryguard_memory_status",
+    "memoryguard_memory_merge_safe", "memoryguard_memory_merge_safe_preview",
     "memoryguard_context_bootstrap", "memoryguard_rule_feedback", "memoryguard_rule_create_auto",
     "memoryguard_rule_decision_read", "memoryguard_rule_undo", "memoryguard_rule_scope_stats",
     "memoryguard_rule_merge_capability_issue", "memoryguard_rule_merge_approve",
     "memoryguard_rule_merge_acknowledge", "memoryguard_rule_merge_cooldown_clear",
+    "memoryguard_rule_merge_safe", "memoryguard_rule_merge_safe_preview",
     "memoryguard_binding_create", "memoryguard_binding_list", "memoryguard_external_mcp_list",
     "memoryguard_external_mcp_import", "memoryguard_extract_memories", "memoryguard_accept_candidates",
     "memoryguard_semantic_check", "memoryguard_provider_install", "memoryguard_resolve_group",
@@ -184,7 +186,7 @@ _add("rollback_memory", "memory_rollback", "memory", "mutation", "gui_memory_rol
 _same(("get_governance_snapshot",), "governance", "read", "diagnostics_snapshot")
 for _name in ("get_recent_events", "get_auto_actions", "get_conflicts", "get_quarantine", "get_supersede_decisions"):
     _add(_name, _name.removeprefix("get_"), "governance", "read", "gui_governance_query", parameters=("share_group_id",))
-_add("resolve_conflict", "conflict_resolve", "governance", "mutation", "gui_governance_command", parameters=("conflict_group_id", "keep_id", "share_group_id"))
+_add("resolve_conflict", "conflict_resolve", "governance", "mutation", "gui_governance_command", parameters=("conflict_group_id", "keep_id", "share_group_id", "confirmed"))
 _add("close_stale_conflict", "conflict_close_stale", "governance", "mutation", "gui_governance_command", parameters=("conflict_group_id", "group_id", "share_group_id"))
 _add("release_quarantine", "quarantine_release", "governance", "mutation", "gui_governance_command", parameters=("quarantine_id", "share_group_id"))
 _add("delete_quarantine", "quarantine_delete", "governance", "mutation", "gui_governance_command", parameters=("quarantine_id", "share_group_id"))
@@ -326,6 +328,7 @@ _add("apply_memoryguard_gc", "maintenance_apply", "maintenance", "mutation", "gu
 
 # Usage telemetry.
 _add("get_usage_telemetry", "usage_telemetry", "usage", "read", "gui_usage_query", parameters=("window_days", "agent_key"))
+_add("sync_usage_telemetry", "usage_telemetry_sync", "usage", "mutation", "gui_usage_sync")
 
 # Hook / host modes.
 _add("get_host_hook_status", "host_hook_status", "host", "read", "hook_status", parameters=("target_provider", "target_agent_id"))
@@ -362,12 +365,14 @@ RULE_MUTATION_MCP_NAMES = frozenset({
     "memoryguard_rule_feedback", "memoryguard_rule_create_auto", "memoryguard_rule_undo",
     "memoryguard_rule_merge_capability_issue", "memoryguard_rule_merge_approve",
     "memoryguard_rule_merge_acknowledge", "memoryguard_rule_merge_cooldown_clear",
+    "memoryguard_rule_merge_safe",
     "memoryguard_binding_create",
 })
 MCP_MUTATION_NAMES = frozenset({
     "memoryguard_audit", "memoryguard_list_sources", "memoryguard_scan_summary",
     "memoryguard_extract_memories", "memoryguard_build_and_enrich",
     "memoryguard_memory_write", "memoryguard_memory_update", "memoryguard_memory_delete",
+    "memoryguard_memory_merge_safe",
     "memoryguard_binding_create", "memoryguard_external_mcp_import", "memoryguard_accept_candidates",
     "memoryguard_provider_install", "memoryguard_apply_enrichments", "memoryguard_history_delete",
     "memoryguard_codegraph_update",

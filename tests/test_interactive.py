@@ -173,6 +173,13 @@ def test_token_usage_view_has_separated_measurement_contract() -> None:
     assert "Token 用量与 MCP 节省" in html
     assert "function renderTokenUsage" in html
     assert "callApi('get_usage_telemetry'" in html
+    assert "callApi('sync_usage_telemetry')" in html
+    assert "同步用量数据" in html
+    assert "function tokenUsageVerifiedHostTotals" in html
+    assert "measured_total_coverage" in html
+    assert "coverage.provider_reported === 'complete'" in html
+    assert "coverage.input_output_derived === 'complete'" in html
+    assert "tokenUsageSum(measuredRows, 'measuredTotal')" not in html
     assert "window_days" in html
     assert "宿主实测流量" in html
     assert "MG 估算节省" in html
@@ -191,6 +198,7 @@ def test_token_usage_view_has_separated_measurement_contract() -> None:
     assert "未检测到来源" in html
     assert "未同步" in html
     assert "callApi('run_audit')" in html
+    assert "用量数据：${tokenUsageSyncStatusText(sync)}；扫描：完成" in html
 
 
 def test_token_usage_chart_keeps_edge_date_labels_inside_svg_viewbox() -> None:

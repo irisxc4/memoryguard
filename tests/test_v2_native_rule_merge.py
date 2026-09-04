@@ -405,3 +405,7 @@ def test_native_rule_merge_registry_activates_all_four_operations(tmp_path: Path
         "memoryguard_rule_merge_cooldown_clear",
     }
     assert all(entries[name]["status"] == "implemented" and entries[name]["mutation"] for name in names)
+    preview = "memoryguard_rule_merge_safe_preview"
+    assert entries[preview]["status"] == "implemented"
+    assert entries[preview]["mutation"] is False
+    assert entries[preview]["handler"] == "rule_merge_safe_preview"

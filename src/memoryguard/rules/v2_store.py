@@ -20,7 +20,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Protocol, Sequence
 
 from ..governance_lock import WorkspaceGovernanceLock
 from ..storage.database import connect_database
@@ -46,10 +46,11 @@ _CANONICAL_RULE_KIND_PRIORITY = {
 }
 
 # ``RuleDefinition`` keeps modality as provenance, but modality also selects
-# the runtime injection channel.  A historical fold may therefore never cross
-# the mandatory/relevant boundary: the same body must remain available in both
-# channels when both governed definitions exist.  Within one channel this
-# ordering still selects the deterministic canonical head.
+# the runtime injection channel.  Automatic historical folds therefore leave
+# equal/equivalent bodies on opposite channels in place.  An explicit merge
+# may fold a relevant duplicate into a mandatory canonical head, never the
+# reverse, and never by demoting the mandatory obligation.  Within one
+# channel this ordering still selects the deterministic canonical head.
 _CANONICAL_RULE_STRENGTH_PRIORITY = {
     "unknown": -1,
     "observation": 0,
@@ -2264,6 +2265,9 @@ class RuleV2Store:
         share_group_id: str,
         *,
         actor: str = "memoryguard-reconciliation",
+        definition_ids: Iterable[str] | None = None,
+        canonical_definition_id: str = "",
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Fold safe historical duplicates in production V2 storage.
 
@@ -2273,10 +2277,19 @@ class RuleV2Store:
         are limited to exact/equivalent, non-expanding claims.  Polarity,
         strength, and noisy intent projections are canonicalized metadata,
         not duplicate gates.
+
+        ``definition_ids`` optionally pins the candidate set so an explicit
+        merge cannot fold an unrequested pair.  ``canonical_definition_id``
+        refuses to write when ranking would pick a different head.
+        ``dry_run`` reuses the same selection and pair-safety function on a
+        read-only connection and never opens a write transaction.
         """
         group = str(share_group_id or "").strip()
         if not group:
             raise ValueError("share_group_id_required")
+        requested_filter = definition_ids
+        required_canonical = str(canonical_definition_id or "").strip()
+        preview_only = bool(dry_run)
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             links = [
@@ -2311,6 +2324,28 @@ class RuleV2Store:
                 ).fetchall()
                 if str(row["definition_id"] or "") in reachable_ids
             ]
+            if requested_filter is not None:
+                if isinstance(requested_filter, (str, bytes)):
+                    raise ValueError("rule_merge_definition_ids_required")
+                try:
+                    requested_ids = {
+                        str(item or "").strip()
+                        for item in requested_filter
+                        if str(item or "").strip()
+                    }
+                except TypeError as exc:
+                    raise ValueError("rule_merge_definition_ids_required") from exc
+                if not requested_ids:
+                    raise ValueError("rule_merge_definition_ids_required")
+                present = {str(row["definition_id"] or "") for row in definition_rows}
+                if requested_ids - present:
+                    raise ValueError("rule_merge_definition_not_found")
+                definition_rows = [
+                    row for row in definition_rows
+                    if str(row["definition_id"] or "") in requested_ids
+                ]
+                if required_canonical and required_canonical not in requested_ids:
+                    raise ValueError("rule_merge_canonical_mismatch")
             definitions = [self._definition_row(row) for row in definition_rows]
             definition_bodies = {
                 str(row["definition_id"]): str(
@@ -2322,10 +2357,33 @@ class RuleV2Store:
             # Build conservative pairwise-safe clusters.  Exact compatibility
             # keys miss additive claims; a transitive semantic cluster can also
             # swallow a conflict.  Every pair must pass the shared topic
-            # composer plus the hard audience-scope gate.  Equal/equivalent
-            # claims on opposite injection channels must coexist; additive
-            # topic members still fold and canonicalize stored metadata.
+            # composer plus the hard audience-scope gate.  Automatic
+            # reconciliation still keeps equal/equivalent claims on opposite
+            # injection channels; an explicit mandatory head may absorb a
+            # relevant exact/equivalent/update duplicate.  Additive topic
+            # members still fold and canonicalize stored metadata.
             clusters: list[list[RuleDefinition]] = []
+            required_canonical_layer = ""
+            if required_canonical:
+                for item in definitions:
+                    if item.definition_id == required_canonical:
+                        required_canonical_layer = _runtime_injection_layer(item)
+                        break
+
+            def _safe_relevant_into_mandatory(
+                left: RuleDefinition,
+                right: RuleDefinition,
+                relation_kind: str,
+            ) -> bool:
+                if not required_canonical or required_canonical_layer != "mandatory":
+                    return False
+                if relation_kind not in {"exact", "equivalent", "update"}:
+                    return False
+                layers = {
+                    _runtime_injection_layer(left),
+                    _runtime_injection_layer(right),
+                }
+                return layers == {"mandatory", "relevant"}
 
             def pair_result(
                 left: RuleDefinition, right: RuleDefinition,
@@ -2354,10 +2412,17 @@ class RuleV2Store:
                 )
                 topic_related = _claims_share_canonical_topic(left_body, right_body)
                 relation_kind = _canonical_relation_kind(left_body, right_body)
-                if (
+                layers_differ = (
                     _runtime_injection_layer(left)
                     != _runtime_injection_layer(right)
+                )
+                safe_relevant_fold = _safe_relevant_into_mandatory(
+                    left, right, relation_kind,
+                )
+                if (
+                    layers_differ
                     and relation_kind in {"exact", "equivalent", "update"}
+                    and not safe_relevant_fold
                 ):
                     return None
                 result = _compose_canonical_bodies([
@@ -2371,10 +2436,7 @@ class RuleV2Store:
                     or not getattr(result, "claims", ())
                 ):
                     return None
-                if (
-                    _runtime_injection_layer(left)
-                    != _runtime_injection_layer(right)
-                ):
+                if layers_differ and not safe_relevant_fold:
                     left_count = len(
                         _compose_canonical_bodies([left_body]).claims or (),
                     )
@@ -2487,6 +2549,8 @@ class RuleV2Store:
                     ),
                 )
                 winner = ordered[0]
+                if required_canonical and winner.definition_id != required_canonical:
+                    raise ValueError("rule_merge_canonical_mismatch")
                 for loser in ordered[1:]:
                     winner_scope = self._reconciliation_scope_conn(
                         conn, winner.definition_id,
@@ -2511,6 +2575,41 @@ class RuleV2Store:
                             ),
                             "winner_scope_digest": self._reconciliation_scope_digest(winner_scope),
                             "candidate_scope_digest": self._reconciliation_scope_digest(loser_scope),
+                        })
+                        continue
+                    relation_kind = _canonical_relation_kind(
+                        definition_bodies.get(
+                            winner.definition_id, winner.canonical_text,
+                        ),
+                        definition_bodies.get(
+                            loser.definition_id, loser.canonical_text,
+                        ),
+                    )
+                    if preview_only:
+                        composed = _compose_canonical_bodies([
+                            definition_bodies.get(
+                                winner.definition_id, winner.canonical_text,
+                            ),
+                            definition_bodies.get(
+                                loser.definition_id, loser.canonical_text,
+                            ),
+                        ])
+                        if (
+                            composed.rejected_conflicts
+                            or composed.rejected_unrelated
+                            or not composed.claims
+                        ):
+                            raise ValueError("canonical_composition_rejected")
+                        definition_bodies[winner.definition_id] = str(
+                            composed.body or ""
+                        ).strip()
+                        merged += 1
+                        details.append({
+                            "status": "merged",
+                            "winner": winner.definition_id,
+                            "merged": loser.definition_id,
+                            "relation": relation_kind,
+                            "reason": "historical_duplicate_fold",
                         })
                         continue
                     decision_id = stable_digest((
@@ -2664,6 +2763,8 @@ class RuleV2Store:
                         "merged": loser.definition_id,
                         "decision_id": decision_id,
                         "undo_id": decision_id,
+                        "relation": relation_kind,
+                        "reason": "historical_duplicate_fold",
                     })
             return {
                 "share_group_id": group,
@@ -2672,6 +2773,8 @@ class RuleV2Store:
                 "details": details,
             }
 
+        if preview_only:
+            return self._read(op)
         return self._write(op)
 
     def undo_historical_duplicate(

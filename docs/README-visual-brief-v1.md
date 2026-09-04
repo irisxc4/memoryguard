@@ -1,6 +1,6 @@
 # MemoryGuard README Visual Brief v1
 
-**Purpose:** make the README immediately legible in a GitHub feed, then prove the product with authentic artifacts. This is an implementation brief, not a request to fabricate UI states.
+**Purpose:** make the README immediately legible in a GitHub feed, then prove the product with verified artifacts. This is an implementation brief, not a request to fabricate UI states.
 
 ## Visual direction
 
@@ -14,13 +14,15 @@
 | File | Size | Content | Acceptance rule |
 |---|---:|---|---|
 | `docs/assets/hero-governance-console.png` | 1600×960, PNG | A real governance-console view with the event stream, an organization result, a supersede chain, and a version-history element visible in one frame | A visitor can identify what changed, why it changed, and that it can be reversed without reading body copy |
-| `docs/assets/write-organize-rollback.gif` | 1440×900, GIF, ≤12 MB | 15–20 second authentic demo: write a duplicate → auto-supersede → inspect → restore an earlier version | No jump cuts that hide the result; cursor and text remain readable at 900 px embed width |
+| `docs/assets/write-organize-rollback.gif` | 1440×900, GIF, ≤12 MB | Reserved for a 15–20 second real product recording: write a duplicate → auto-supersede → inspect → restore an earlier version | Current file is a 1×1 placeholder; do not embed or describe it as a live demo. Replace it only with a recording that meets this acceptance rule |
 | `docs/assets/governance-evidence.png` | 1600×960, PNG | Four labelled panels from the actual product: conflict, quarantine, supersede chain, version history | Sensitive values are synthetic/redacted; labels correspond exactly to available UI/API concepts |
 | `docs/assets/social-preview.png` | 1280×640, PNG | GitHub/X/Discord Open Graph card using a cropped real UI state | Text remains readable in a small feed card and contains no badge clutter |
 
-Use lossless PNG for static UI. Record GIF at 12–15 fps; if it exceeds GitHub's practical weight, publish an MP4 demo elsewhere and retain a short GIF preview in the README.
+Use lossless PNG for static UI. The current GIF is unavailable as a demo; follow the [demo recording checklist](benchmarks/demo-script.md) before replacing it. Record GIF at 12–15 fps; if it exceeds GitHub's practical weight, publish an MP4 demo elsewhere and retain a short GIF preview in the README.
 
-## Shot list for the demo GIF
+## Planned shot list for the demo GIF
+
+This is a recording plan, not evidence that the current placeholder is a working demo. Do not embed `write-organize-rollback.gif` until a real capture passes the [demo recording checklist](benchmarks/demo-script.md).
 
 1. **0–3 s — write:** an agent writes a synthetic memory, `Use PostgreSQL for production analytics`.
 2. **3–7 s — organization:** write a newer conflicting/duplicate memory, `Use SQLite locally; production analytics moved to Postgres`, and show the old record being superseded with its reason.
@@ -54,7 +56,7 @@ Use the English card as the repository's default social-preview image. The GitHu
 | README location | Asset | Alt text |
 |---|---|---|
 | Above project title | `hero-governance-console.png` | `MemoryGuard governance console showing organized shared memory, a supersede chain, and rollback history` |
-| Governance-loop section | `write-organize-rollback.gif` | `Agent writes a duplicate memory, MemoryGuard supersedes the stale version, and an operator restores a previous version` |
+| Governance-loop section | `write-organize-rollback.gif` (after replacement) | `Planned recording: Agent writes a duplicate memory, MemoryGuard supersedes the stale version, and an operator restores a previous version` |
 | What-you-can-govern section | `governance-evidence.png` | `Conflict, quarantine, supersede chain, and version-history evidence views in MemoryGuard` |
 
 ## Release and distribution checklist
@@ -62,7 +64,7 @@ Use the English card as the repository's default social-preview image. The GitHu
 - Set `social-preview.png` in **GitHub repository Settings → General → Social preview**.
 - Set the repository About description to: `Local-first, reversible memory governance for coding agents — shared MCP memory, automatic cleanup, visual audit, and rollback.`
 - Add Topics: `mcp`, `mcp-server`, `model-context-protocol`, `agent-memory`, `ai-agents`, `coding-agents`, `memory-management`, `local-first`, `sqlite`, `claude-code`, `codex`, `cursor`, `developer-tools`, `ai-governance`, `privacy`.
-- Publish a GitHub release only after the PyPI package metadata is corrected; release notes should include the GIF, one install command, supported-agent matrix, and a link to known limitations.
+- Publish a GitHub release only after the PyPI package metadata is corrected; once a real recording exists, release notes may include the GIF, one install command, supported-agent matrix, and a link to known limitations.
 - Use the hero sentence, one demo GIF, and one concrete before/after story in every launch post. Do not lead with the number of MCP tools.
 
 ## Non-negotiable accuracy checks

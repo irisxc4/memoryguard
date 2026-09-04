@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from memoryguard.usage_telemetry import (
@@ -74,7 +75,17 @@ def test_sync_is_idempotent_and_keeps_measured_tokens_separate(tmp_path: Path) -
     assert summary["window_days"] == 7
     assert summary["summary"]["measured_input"] == 150
     assert summary["summary"]["measured_output"] == 30
-    assert summary["summary"]["measured_total"] == 180
+    # Grok reports prompt/completion fields, not a provider total.  Keep the
+    # verified fields separate rather than presenting their sum as one.
+    assert summary["summary"]["measured_total"] == 120
+    assert summary["summary"]["measured_derived_total"] == 180
+    assert summary["summary"]["measured_provider_total_event_count"] == 1
+    assert summary["summary"]["measured_derived_total_event_count"] == 2
+    assert summary["summary"]["measured_total_coverage"] == {
+        "provider_reported": "partial",
+        "input_output_derived": "complete",
+        "measured_event_count": 2,
+    }
     assert summary["summary"]["measured_event_count"] == 2
     assert summary["summary"]["estimated_baseline_units"] is None
     assert summary["summary"]["estimated_delivered_units"] is None
@@ -299,6 +310,114 @@ def test_sync_exposes_state_and_sqlite_uses_wal(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / "workspace" / ".memoryguard" / "usage_telemetry.sqlite") as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] >= 1000
+
+
+def test_legacy_sync_state_is_publicly_whitelisted(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    record_conversion_event(
+        workspace,
+        provider="codex",
+        program="codex",
+        observed_at_utc="2026-08-28T01:00:00Z",
+        baseline_units=8,
+        delivered_units=4,
+        event_id="legacy-sync-state",
+    )
+    database = workspace / ".memoryguard" / "usage_telemetry.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO usage_sync_state "
+            "(provider, status, last_success_at, last_error_at, last_error, "
+            "inserted_count, rotated_count, source_count) VALUES (?, ?, ?, ?, ?, 0, 0, 0)",
+            (
+                r"C:\\Users\\private\\account\\provider",
+                "totally-unknown-status",
+                r"C:\\Users\\private\\success",
+                r"C:\\Users\\private\\error",
+                r"RuntimeError: token=/secret/account",
+            ),
+        )
+        connection.commit()
+
+    summary = get_usage_summary(workspace, now_utc="2026-08-28T02:00:00Z")
+    encoded = json.dumps(summary, ensure_ascii=False)
+    assert r"C:\\Users\\private" not in encoded
+    assert "RuntimeError" not in encoded
+    assert "/secret/account" not in encoded
+    assert summary["sync_state"]["providers"] == {
+        "unknown": {
+            "status": "unavailable",
+            "last_success_at": None,
+            "last_error_at": None,
+            "last_error": "sync_failed",
+            "inserted_count": 0,
+            "rotated_count": 0,
+            "source_count": 0,
+        }
+    }
+
+
+def test_usage_query_missing_database_has_no_filesystem_side_effects(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+
+    summary = get_usage_summary(workspace, now_utc="2026-08-28T02:00:00Z")
+
+    assert summary["status"] == "unavailable"
+    assert summary["summary"]["measured_total"] is None
+    assert not (workspace / ".memoryguard").exists()
+
+
+def test_usage_query_old_schema_fails_closed_without_migration(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    database = workspace / ".memoryguard" / "usage_telemetry.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE usage_events (event_key TEXT PRIMARY KEY)")
+        connection.commit()
+
+    summary = get_usage_summary(workspace, now_utc="2026-08-28T02:00:00Z")
+
+    assert summary["status"] == "unavailable"
+    with sqlite3.connect(database) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    assert tables == {"usage_events"}
+
+
+def test_host_sync_skips_invalid_timestamps_and_summary_excludes_future_events(
+    tmp_path: Path, monkeypatch
+) -> None:
+    codex_home = tmp_path / "codex"
+    missing_timestamp = _codex_token_row("2026-08-28T02:00:00Z", 40, 5)
+    missing_timestamp.pop("timestamp")
+    monkeypatch.setattr(
+        "memoryguard.usage_telemetry._utc_now",
+        lambda: datetime(2026, 8, 28, 2, tzinfo=timezone.utc),
+    )
+    _write_jsonl(
+        codex_home / "sessions/2026/08/28/rollout-time-window.jsonl",
+        [
+            _codex_token_row("2026-08-28T01:00:00Z", 10, 2),
+            _codex_token_row("not-a-timestamp", 20, 3),
+            missing_timestamp,
+            _codex_token_row("2026-08-28T03:00:00Z", 30, 4),
+        ],
+    )
+    workspace = tmp_path / "workspace"
+
+    sync_usage_telemetry(
+        workspace,
+        codex_home=codex_home,
+        grok_home=tmp_path / "grok",
+        now_utc="2026-08-28T02:00:00Z",
+    )
+    summary = get_usage_summary(workspace, now_utc="2026-08-28T02:00:00Z")
+
+    assert summary["summary"]["measured_input"] == 10
+    assert summary["summary"]["measured_output"] == 2
+    assert summary["summary"]["measured_total"] == 12
 
 
 def test_share_group_aggregates_conversions_across_project_refs(tmp_path: Path) -> None:

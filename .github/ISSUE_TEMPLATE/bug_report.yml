@@ -11,7 +11,7 @@ body:
     attributes:
       label: MemoryGuard version
       description: Include the output of `memoryguard --version`.
-      placeholder: "0.7.8"
+      placeholder: "0.7.9"
     validations:
       required: true
   - type: input

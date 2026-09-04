@@ -286,8 +286,40 @@ def test_mcp_bootstrap_persists_mandatory_receipt_with_trusted_runtime_context(t
 
     packet = _mcp_json(execute_tool("memoryguard_context_bootstrap", {"task": "修复定向测试流程"}))
     assert packet["data"]["mandatory"]
+    assert any(
+        item["memory_id"] == "mandatory"
+        for item in packet["data"]["mandatory"]
+    )
+    assert any(
+        receipt["hit"]
+        and receipt["item_id"] == "mandatory"
+        and receipt["layer"] == "mandatory"
+        for receipt in packet["data"]["receipts"]
+    )
     assert packet["data"]["mandatory"][0]["body"] == "始终先运行定向测试"
     assert any(receipt["hit"] and receipt["layer"] == "mandatory" for receipt in packet["data"]["receipts"])
+
+    deleted = execute_tool("memoryguard_memory_delete", {
+        "memory_id": "mandatory",
+        "idempotency_key": "delete-mandatory",
+    })
+    assert deleted.get("isError") is not True, deleted
+    deleted_result = _mcp_json(deleted)
+    assert deleted_result["ok"] is True, deleted_result
+    assert deleted_result["data"]["atom"]["status"] == "deleted"
+
+    deleted_packet = _mcp_json(execute_tool(
+        "memoryguard_context_bootstrap",
+        {"task": "修复定向测试流程"},
+    ))
+    assert all(
+        item.get("memory_id") != "mandatory"
+        for item in deleted_packet["data"]["mandatory"]
+    )
+    assert not any(
+        receipt.get("hit") and receipt.get("item_id") == "mandatory"
+        for receipt in deleted_packet["data"]["receipts"]
+    )
 
 
 def test_mcp_bootstrap_fails_closed_when_receipt_persistence_fails(tmp_path, monkeypatch):

@@ -1119,7 +1119,7 @@ tbody tr:last-child td { border-bottom: 0; }
         <details class="topbar-reader"><summary>阅读</summary><div class="reader-toggle"><div class="reader-toggle-label">阅读语言</div><div class="reader-toggle-buttons" title="英文模式优先显示英文内容；无英文版本时显示来源原文"><button type="button" id="reader-auto" onclick="setReaderLanguage('auto')">自动</button><button type="button" id="reader-zh" class="active" onclick="setReaderLanguage('zh')">中文</button><button type="button" id="reader-en" onclick="setReaderLanguage('en')">English</button></div></div></details>
         <button class="btn" type="button" onclick="openKnowledge()">知识书库<span class="count" id="knowledge-count"></span></button>
         <span class="health-badge" id="health-badge">健康度 --</span>
-        <button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button>
+        <button class="btn btn-primary audit-refresh-button" type="button" onclick="runAudit()">重新扫描</button>
       </div>
     </header>
     <main class="content" id="content"><div class="loading">正在建立本地治理视图</div></main>
@@ -1202,7 +1202,7 @@ let buildCancelInFlight = false;
 // without advancing it, so legitimate updates inside one tab remain valid.
 let contentRenderGeneration = 0;
 let pendingContentRenderToken = null;
-let tokenUsageState = { windowDays: 7, agentKey: '', payload: null };
+let tokenUsageState = { windowDays: 7, agentKey: '', payload: null, syncResult: null, syncInFlight: null, auditInFlight: null };
 
 function beginContentRender(tab = state.activeTab) {
   contentRenderGeneration += 1;
@@ -2133,10 +2133,35 @@ async function init() {
   refreshKnowledgeCount();
 }
 
+function setAuditBusy(busy) {
+  document.querySelectorAll('.audit-refresh-button').forEach(button => {
+    button.disabled = busy;
+    button.setAttribute('aria-busy', busy ? 'true' : 'false');
+  });
+}
+
 async function runAudit() {
-  setContent('<div class="loading">正在重新扫描工作区</div>');
-  try { state.report = await callApi('run_audit'); showToast('扫描完成', 'success'); renderAll(); }
-  catch (e) { showToast('扫描失败：' + e, 'error'); }
+  if (tokenUsageState.auditInFlight) return tokenUsageState.auditInFlight;
+  const request = (async () => {
+    setAuditBusy(true);
+    setContent('<div class="loading">正在同步用量数据并重新扫描工作区</div>');
+    const sync = await syncUsageTelemetry({refresh: false});
+    const syncFailed = !sync || sync.ok === false || ['error', 'failed'].includes(String(sync.status || '').toLowerCase());
+    try {
+      state.report = await callApi('run_audit');
+      showToast(`用量数据：${tokenUsageSyncStatusText(sync)}；扫描：完成`, syncFailed ? 'error' : 'success');
+      renderAll();
+    } catch (e) {
+      showToast(`用量数据：${tokenUsageSyncStatusText(sync)}；扫描失败：${e}`, 'error');
+    }
+  })();
+  tokenUsageState.auditInFlight = request;
+  try {
+    return await request;
+  } finally {
+    if (tokenUsageState.auditInFlight === request) tokenUsageState.auditInFlight = null;
+    setAuditBusy(false);
+  }
 }
 
 function syncNavigationState(tab = state.activeTab) {
@@ -8236,7 +8261,7 @@ async function resolveConflict(groupId) {
   if (!confirm('确认解决冲突？\n\n· 保留记忆：' + keepId + '\n· 其他成员将被软删除')) return;
   showToast('正在解决冲突…');
   try {
-    const result = await callApi('resolve_conflict', groupId, keepId, activeShareGroupId);
+    const result = await callApi('resolve_conflict', groupId, keepId, activeShareGroupId, true);
     if (result.error) return showToast(result.error, 'error');
     showToast('冲突已解决', 'success');
     renderConflictQueue();
@@ -8400,7 +8425,7 @@ function renderOverviewRail() {
   const conflictDetail = conflictDispositionText(snap);
   railTitle('最近动态', `
     ${event ? `<div class="rail-section"><h4>${escapeHtml(agentDisplayName(event.agent_instance_id, '最近写入'))}</h4><div class="rail-copy">${escapeHtml(event.raw_content_preview || '事件未返回内容摘要')}</div><div class="surface-meta">${escapeHtml(event.created_at || '')}</div></div>` : '<div class="empty-inline">暂无运行期事件。连接 Agent 后会在这里显示真实写入。</div>'}
-    <div class="rail-section"><h4>快捷操作</h4><div class="finding-actions"><button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button><button class="btn" type="button" onclick="switchTab('sources')">管理数据源</button><button class="btn" type="button" onclick="switchTab('findings')">查看风险</button></div></div>
+    <div class="rail-section"><h4>快捷操作</h4><div class="finding-actions"><button class="btn btn-primary audit-refresh-button" type="button" onclick="runAudit()">重新扫描</button><button class="btn" type="button" onclick="switchTab('sources')">管理数据源</button><button class="btn" type="button" onclick="switchTab('findings')">查看风险</button></div></div>
     <div class="rail-section"><h4>治理摘要</h4>${railKey('有效记忆', counts.active === null ? '暂不可用' : String(counts.active))}<div class="status-item ${counts.conflicts ? 'alert' : 'zero'}" onclick="switchTab('governance');setTimeout(()=>switchGovernanceSub('conflicts'),50)"><span class="status-label">未解决冲突</span><span><span class="status-num">${counts.conflicts === null ? '暂不可用' : counts.conflicts}</span>${conflictDetail ? `<small class="surface-meta" style="display:block;text-align:right">${escapeHtml(conflictDetail)}</small>` : ''}</span></div>${railKey('待回滚版本', counts.rollback === null ? '暂不可用' : String(counts.rollback), counts.rollback ? '' : 'zero')}</div>`);
 }
 
@@ -8479,7 +8504,7 @@ function renderOverview() {
   const ruleRows = topRules.slice(0, 5).map(rule => `<button type="button" onclick="selectedRuleId='${escapeHtml(rule.memory_id || rule.rule_id || '')}';switchTab('rules')"><span>${escapeHtml(displayTitle(rule) || '未命名规则')}</span><span class="muted">${escapeHtml(rule.hit_count ?? rule.hits ?? '暂不可用')}</span></button>`).join('') || '<div class="empty-inline">当前审计未返回规则命中统计。</div>';
   const activityRows = latest.map(item => `<button type="button" onclick="switchTab('governance')"><span>${escapeHtml(activityActorLabel(item))}</span><span class="muted">${escapeHtml(item.created_at || '')}</span></button>`).join('') || '<div class="empty-inline">暂无近期活动。</div>';
   setContent(`<div class="dashboard-view overview-view"><div class="dashboard-main">
-    <div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Governance overview</span><h2>总览</h2></div><span class="muted">${escapeHtml(unavailableMetric(report.generated_at, '暂无扫描时间'))}</span><button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button></div>
+    <div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Governance overview</span><h2>总览</h2></div><span class="muted">${escapeHtml(unavailableMetric(report.generated_at, '暂无扫描时间'))}</span><button class="btn btn-primary audit-refresh-button" type="button" onclick="runAudit()">重新扫描</button></div>
     <div class="kpi-grid">
       <div class="kpi ${completed && !healthUnavailable ? '' : 'muted'}"><span>${escapeHtml(healthScopeLabel(report))}</span><strong>${escapeHtml(healthText)}</strong><small class="kpi-hint">${escapeHtml(healthCoverageText(report))}</small></div>
       <div class="kpi"><span>已识别对象</span><strong>${objectCount === null ? '暂不可用' : objectCount}</strong></div>
@@ -8770,7 +8795,7 @@ function renderFindings() {
   const findings = Array.isArray(report.findings) ? report.findings : [];
   const counts = findings.reduce((all, item) => { const key = String(item.severity || '').toLowerCase(); all[key] = (all[key] || 0) + 1; return all; }, {});
   const rows = findings.map(finding => `<tr class="risk-row ${String(finding.id || '') === selectedFindingId ? 'is-selected' : ''}" data-finding-id="${escapeHtml(finding.id || '')}" onclick="selectFinding('${escapeHtml(finding.id || '')}')"><td><span class="chip chip-${escapeHtml(finding.severity || 'info')}">${escapeHtml(riskSeverityLabel(finding.severity, finding))}</span></td><td><strong>${escapeHtml(riskRuleLabel(finding.rule_id, finding))}</strong></td><td>${escapeHtml(riskDimensionLabel(finding.dimension, finding))}</td><td><span class="risk-reason">${escapeHtml(riskReasonText(finding))}</span></td><td><div class="table-actions"><button class="btn" type="button" onclick="event.stopPropagation();selectFinding('${escapeHtml(finding.id || '')}')">详情</button><button class="btn" type="button" onclick="event.stopPropagation();copyFindingForAgent('${escapeHtml(finding.id || '')}')">复制</button></div></td></tr>`).join('') || '<tr><td colspan="5" class="empty-note">没有发现需要处理的风险信号。</td></tr>';
-  setContent(`<div class="dashboard-view findings-view"><div class="dashboard-main"><div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Risk signals</span><h2>风险信号</h2></div><button class="btn" type="button" onclick="copyAllFindingsForAgent()">复制全部风险给 Agent</button><button class="btn btn-primary" type="button" onclick="runAudit()">重新扫描</button></div><div class="kpi-grid"><div class="kpi danger"><span>极高/高风险</span><strong>${(counts.critical || 0) + (counts.high || 0)}</strong></div><div class="kpi alert"><span>中风险</span><strong>${counts.medium || 0}</strong></div><div class="kpi"><span>低风险</span><strong>${counts.low || 0}</strong></div><div class="kpi"><span>风险总数</span><strong>${findings.length}</strong></div></div><section><div class="compact-toolbar"><div class="toolbar-grow"><h2>最新风险</h2><span class="muted">主列表不展示内部技术来源；选择后在右栏查看证据与处置建议。</span></div></div><div class="data-table-wrap"><table class="data-table risk-table"><thead><tr><th>严重度</th><th>风险</th><th>维度</th><th>原因摘要</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div></section></div></div>`);
+  setContent(`<div class="dashboard-view findings-view"><div class="dashboard-main"><div class="compact-toolbar"><div class="toolbar-grow"><span class="eyebrow">Risk signals</span><h2>风险信号</h2></div><button class="btn" type="button" onclick="copyAllFindingsForAgent()">复制全部风险给 Agent</button><button class="btn btn-primary audit-refresh-button" type="button" onclick="runAudit()">重新扫描</button></div><div class="kpi-grid"><div class="kpi danger"><span>极高/高风险</span><strong>${(counts.critical || 0) + (counts.high || 0)}</strong></div><div class="kpi alert"><span>中风险</span><strong>${counts.medium || 0}</strong></div><div class="kpi"><span>低风险</span><strong>${counts.low || 0}</strong></div><div class="kpi"><span>风险总数</span><strong>${findings.length}</strong></div></div><section><div class="compact-toolbar"><div class="toolbar-grow"><h2>最新风险</h2><span class="muted">主列表不展示内部技术来源；选择后在右栏查看证据与处置建议。</span></div></div><div class="data-table-wrap"><table class="data-table risk-table"><thead><tr><th>严重度</th><th>风险</th><th>维度</th><th>原因摘要</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table></div></section></div></div>`);
   renderRiskRail();
 }
 
@@ -8969,6 +8994,61 @@ function tokenUsageSum(rows, selector) {
   return values.length ? values.reduce((total, value) => total + value, 0) : null;
 }
 
+function tokenUsageVerifiedHostTotals(summary = {}) {
+  const coverage = summary.measured_total_coverage && typeof summary.measured_total_coverage === 'object'
+    ? summary.measured_total_coverage : {};
+  const providerTotal = optionalFiniteNumber(summary.measured_total);
+  if (coverage.provider_reported === 'complete' && providerTotal !== null) {
+    return {available: true, basis: 'provider', total: providerTotal, input: null, output: null};
+  }
+  const input = optionalFiniteNumber(summary.measured_input);
+  const output = optionalFiniteNumber(summary.measured_output);
+  const derivedTotal = optionalFiniteNumber(summary.measured_derived_total);
+  if (coverage.input_output_derived === 'complete' && input !== null && output !== null
+      && derivedTotal !== null && derivedTotal === input + output) {
+    return {available: true, basis: 'derived', total: derivedTotal, input, output};
+  }
+  return {available: false, basis: '', total: null, input: null, output: null};
+}
+
+function tokenUsageSyncStatusText(result = {}, fallback = {}) {
+  const item = result && typeof result === 'object' ? result : {};
+  const fallbackState = fallback && typeof fallback === 'object' ? fallback : {};
+  const status = String(item.status || fallbackState.status || '').trim().toLowerCase();
+  if (item.ok === false || ['error', 'failed'].includes(status)) {
+    return `失败${item.error ? `（${item.error}）` : ''}`;
+  }
+  if (status === 'success') {
+    return `完成，新增 ${tokenUsageFormat(item.inserted || 0)} 条`;
+  }
+  if (status === 'source_not_found' || status === 'no_measured_source') return '未检测到可同步来源';
+  if (status === 'host_not_supported') return '宿主未提供实测用量';
+  return '未同步';
+}
+
+function renderTokenUsageSyncControl(payload = {}, renderToken = currentContentRenderToken('token-usage')) {
+  if (!contentRenderIsCurrent(renderToken)) return;
+  const toolbar = document.querySelector('.token-usage-toolbar');
+  if (!toolbar) return;
+  const syncState = payload.sync_state && typeof payload.sync_state === 'object' ? payload.sync_state : {};
+  const busy = Boolean(tokenUsageState.syncInFlight);
+  toolbar.insertAdjacentHTML('beforeend', `<div class="token-usage-sync"><button id="token-usage-sync-button" class="btn btn-primary" type="button" onclick="syncUsageTelemetry()" ${busy ? 'disabled aria-busy="true"' : 'aria-busy="false"'}>${busy ? '同步中…' : '同步用量数据'}</button><span class="muted">${escapeHtml(tokenUsageSyncStatusText(tokenUsageState.syncResult, syncState))}</span></div>`);
+}
+
+function renderTokenUsageHostTotal(total = {}, renderToken = currentContentRenderToken('token-usage')) {
+  if (!contentRenderIsCurrent(renderToken)) return;
+  const card = document.querySelector('.token-kpi.measured');
+  if (!card) return;
+  const label = total.basis === 'provider'
+    ? '宿主报告全量'
+    : total.basis === 'derived' ? '宿主输入/输出派生全量' : '宿主实测全量不可用';
+  const detail = total.basis === 'derived'
+    ? `输入 ${tokenUsageFormat(total.input)} · 输出 ${tokenUsageFormat(total.output)}`
+    : total.basis === 'provider' ? '仅在提供方报告覆盖完整时显示' : '提供方覆盖不完整或缺少可验证摘要字段';
+  card.querySelector('span').textContent = label;
+  card.querySelector('small').textContent = detail;
+}
+
 function tokenUsageChart(series) {
   const points = (Array.isArray(series) ? series : []).map(tokenUsageNormalizeRow).filter(row =>
     row.rawCandidates !== null && row.actualInjected !== null);
@@ -9058,12 +9138,14 @@ function renderTokenUsageView(payload = {}, bindingsResult = {}, renderToken = c
   const summary = {
     ...(payload.summary && typeof payload.summary === 'object' ? payload.summary : {}),
     ...Object.fromEntries(['estimated_baseline_units', 'estimated_delivered_units', 'estimated_saved_units',
-      'estimated_ratio', 'savings_ratio', 'measured_input', 'measured_output', 'measured_total']
+      'estimated_ratio', 'savings_ratio', 'measured_input', 'measured_output', 'measured_total',
+      'measured_derived_total', 'measured_total_coverage']
       .filter(key => payload[key] !== null && payload[key] !== undefined)
       .map(key => [key, payload[key]])),
   };
-  const hostTotal = tokenUsageNumber(summary.measured_total, tokenUsageSum(measuredRows, 'measuredTotal'));
-  const hostMeasuredLabel = hostTotal === null ? (estimatedRows.length ? '宿主未提供' : (tokenUsageEmptyCopy(payload).detail.includes('未同步') ? '未同步' : '宿主未提供')) : tokenUsageFormat(hostTotal);
+  const verifiedHostTotal = tokenUsageVerifiedHostTotals(summary);
+  const hostTotal = verifiedHostTotal.total;
+  const hostMeasuredLabel = hostTotal === null ? '不可用' : tokenUsageFormat(hostTotal);
   const mgSavings = tokenUsageNumber(summary.estimated_saved_units, tokenUsageSum(estimatedRows, 'savings'));
   const mgRaw = tokenUsageNumber(summary.estimated_baseline_units, tokenUsageSum(estimatedRows, 'rawCandidates'));
   const mgRatio = tokenUsageNumber(summary.estimated_ratio, summary.savings_ratio,
@@ -9072,14 +9154,16 @@ function renderTokenUsageView(payload = {}, bindingsResult = {}, renderToken = c
   const unavailableCount = catalog.filter(item => !rowsWithData.has(item.agentKey)).length;
   const lastSync = rows.map(row => row.syncedAt).filter(Boolean).sort().pop() || payload.generatedAt || '未同步';
   const options = catalog.map(item => `<option value="${escapeHtml(item.agentKey)}" ${item.agentKey === tokenUsageState.agentKey ? 'selected' : ''}>${escapeHtml(item.agentName || '未识别 Agent')}</option>`).join('');
-  const hostInput = tokenUsageNumber(summary.measured_input, tokenUsageSum(measuredRows, 'measuredInput'));
-  const hostOutput = tokenUsageNumber(summary.measured_output, tokenUsageSum(measuredRows, 'measuredOutput'));
+  const hostInput = verifiedHostTotal.basis === 'derived' ? verifiedHostTotal.input : null;
+  const hostOutput = verifiedHostTotal.basis === 'derived' ? verifiedHostTotal.output : null;
   const syncState = payload.sync_state && typeof payload.sync_state === 'object' ? payload.sync_state : {};
   const syncStatus = String(syncState.status || payload.sync_status || '').trim().toLowerCase();
   const syncError = payload.sync_error || syncState.error || syncState.message || '';
   const syncNotice = syncError || ['error', 'failed', 'partial'].includes(syncStatus)
     ? `<div class="token-sync-notice">同步状态：${escapeHtml(syncError || syncStatus || '失败')}。已显示可用历史数据，未将缺失数据补为 0。</div>` : '';
   setContent(`<div class="dashboard-view token-usage-view"><div class="token-usage-toolbar"><div class="toolbar-grow"><span class="eyebrow">Token usage</span><h2>Token 用量与 MCP 节省</h2><p>按绑定 Agent 查看上下文转换量。宿主实测与 MemoryGuard 估算分开呈现，不把不同口径合计为一个实际 Token。</p></div><div class="token-window-tabs" role="tablist" aria-label="统计窗口"><button type="button" class="${tokenUsageState.windowDays === 7 ? 'active' : ''}" role="tab" aria-selected="${tokenUsageState.windowDays === 7}" onclick="setTokenUsageWindow(7)">7 日</button><button type="button" class="${tokenUsageState.windowDays === 30 ? 'active' : ''}" role="tab" aria-selected="${tokenUsageState.windowDays === 30}" onclick="setTokenUsageWindow(30)">30 日</button></div><label class="sr-only" for="token-agent-filter">选择 Agent</label><select id="token-agent-filter" class="token-agent-filter" onchange="setTokenUsageAgent(this.value)"><option value="">全部绑定 Agent</option>${options}</select></div><div class="token-scope-note">计量来源：绿色为宿主实测，琥珀为 MemoryGuard 确定性估算，灰色为宿主未提供或未同步。当前单位：${escapeHtml(payload.unit)}。缺少同步数据时显示未同步/未检测到来源/宿主未提供实测用量，不按 0 处理。宿主实测与估算结果不可合计。</div>${syncNotice}<div class="token-kpi-grid"><div class="token-kpi measured"><span>宿主实测流量</span><strong>${hostMeasuredLabel}</strong><small>输入 ${tokenUsageFormat(hostInput)} · 输出 ${tokenUsageFormat(hostOutput)}</small></div><div class="token-kpi estimated"><span>MG 估算节省</span><strong>${mgSavings === null ? (rows.length ? '宿主未提供' : '无数据') : tokenUsageFormat(mgSavings)}</strong><small>估算比例 ${tokenUsagePercent(mgRatio)} · 仅估算行</small></div><div class="token-kpi unavailable"><span>不可用 Agent</span><strong>${unavailableCount}</strong><small>窗口内没有可用的实测或估算记录</small></div></div><section class="token-chart-card"><div class="token-chart-head"><div><h3>MemoryGuard 估算趋势</h3><p>元开销（原始候选）与实际注入的两条线。宿主实测流量在上方独立显示。</p></div><div class="token-legend" aria-label="图例"><span class="token-legend-item"><i class="token-legend-swatch raw"></i>元开销 / 原始候选</span><span class="token-legend-item"><i class="token-legend-swatch injected"></i>实际注入</span></div></div>${tokenUsageChart(payload.series)}</section><section><div class="compact-toolbar"><div class="toolbar-grow"><h2>实际经 MCP 转换的数据</h2><span class="muted">最近同步：${escapeHtml(lastSync)} · 窗口：${tokenUsageState.windowDays} 日</span></div></div>${tokenUsageTable(rows, catalog, payload)}</section></div>`, renderToken);
+  renderTokenUsageHostTotal(verifiedHostTotal, renderToken);
+  renderTokenUsageSyncControl(payload, renderToken);
   renderTokenUsageRail(payload, rows, lastSync);
 }
 
@@ -9087,6 +9171,39 @@ function renderTokenUsageRail(payload = {}, rows = [], lastSync = '') {
   const measured = rows.filter(row => ['measured', 'mixed'].includes(row.mode)).length;
   const estimated = rows.filter(row => ['estimated', 'mixed'].includes(row.mode)).length;
   railTitle('Token 计量口径', `<div class="rail-section"><div class="rail-title">${payload.status === 'unavailable' ? '等待计量同步' : '数据已分口径'}</div><div class="rail-copy">宿主实测 ${measured} 行 · MemoryGuard 估算 ${estimated} 行</div></div><div class="rail-section"><h4>最近同步</h4><div class="rail-copy">${escapeHtml(lastSync || '未同步')}</div></div><div class="rail-section"><h4>口径说明</h4><div class="rail-copy">宿主输入与输出来自绑定 Agent 的实测同步。MemoryGuard 估算来自确定性上下文计数。两种来源不合计。</div></div>`);
+}
+
+async function syncUsageTelemetry({refresh = true} = {}) {
+  if (tokenUsageState.syncInFlight) return tokenUsageState.syncInFlight;
+  const request = (async () => {
+    let result;
+    try {
+      result = await callApi('sync_usage_telemetry');
+    } catch (error) {
+      result = {ok: false, status: 'error', error: apiErrorMessage(error, '用量同步失败')};
+    }
+    tokenUsageState.syncResult = result;
+    if (refresh && state.activeTab === 'token-usage') await renderTokenUsage();
+    return result;
+  })();
+  tokenUsageState.syncInFlight = request;
+  const button = document.getElementById('token-usage-sync-button');
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = '同步中…';
+  }
+  try {
+    return await request;
+  } finally {
+    if (tokenUsageState.syncInFlight === request) tokenUsageState.syncInFlight = null;
+    const currentButton = document.getElementById('token-usage-sync-button');
+    if (currentButton) {
+      currentButton.disabled = false;
+      currentButton.setAttribute('aria-busy', 'false');
+      currentButton.textContent = '同步用量数据';
+    }
+  }
 }
 
 async function renderTokenUsage() {

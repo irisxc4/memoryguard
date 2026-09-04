@@ -9,7 +9,7 @@ account action manually.
 Copy below is based on the repository at draft time:
 
 - Package: `agent-memguard`, Python `>=3.10`, MIT license, current source line
-  `0.7.8` in [`pyproject.toml`](../../pyproject.toml) and
+  `0.7.9` in [`pyproject.toml`](../../pyproject.toml) and
   [`src/memoryguard/__init__.py`](../../src/memoryguard/__init__.py).
 - Repository: [irisxc4/memoryguard](https://github.com/irisxc4/memoryguard).
 - Transport: local MCP stdio server, entry point `python -m
@@ -21,16 +21,16 @@ Copy below is based on the repository at draft time:
   embedding operation is explicitly authorized. Optional usage telemetry is
   local-only and does not upload data or retain conversation bodies, account
   names, raw source paths, or instance identifiers. See [privacy and safety](../../README.md#privacy-and-safety).
-- Release evidence: [v0.7.8 release record](../releases/v0.7.8.md) and
+- Release evidence: [v0.7.9 release record](../releases/v0.7.9.md) and
   [changelog](../../CHANGELOG.md). The release record does not assert CI, wheel,
   or PyPI publication success.
 
-Registry status: `server.json` is aligned at `0.7.8` with package metadata and
-release notes. The current `agent-memguard` `0.7.8` PyPI artifact has no
-`mcp-name` marker, so `0.7.8` still cannot be published to the MCP Registry.
-For the next release, first bump both `server.json` versions to the new package
-version, publish a marker-bearing PyPI artifact, confirm its version and marker
-are visible, then run `mcp-publisher publish`.
+Registry status: `server.json` and source package metadata are aligned at
+`0.7.9`, and the source README carries the `mcp-name` marker. The currently
+published `agent-memguard` `0.7.8` artifact predates that marker, so it cannot
+be published to the MCP Registry. After the 0.7.9 artifact is published,
+confirm its version and marker are visible, then run `mcp-publisher validate`,
+authenticate, and publish `server.json`.
 
 ## OpenAI skills-only listing draft
 
@@ -121,7 +121,7 @@ folders, host configuration, and any remote provider they authorize.
 
 ### Release notes for listing
 
-**v0.7.8 draft note**
+**v0.7.9 draft note**
 
 - Canonical memory/rule reads and writes preserve evidence, source links,
   supersede history, conflict decisions, and reversible settlement receipts.
@@ -130,11 +130,17 @@ folders, host configuration, and any remote provider they authorize.
 - Optional local usage telemetry records bounded MCP conversion events and
   host-reported measurements; savings remain deterministic estimates, not
   provider billing results.
+- The documented benchmark command exposes seven-/thirty-day evidence,
+  measured-versus-derived totals, coverage, and no-sample semantics without
+  storing conversation bodies or raw paths.
 - Codex lifecycle handling remains evidence-gated for terminal/deleted threads;
   ordinary turns remain resumable. Provider repair aligns installed MCP and
   lifecycle Hooks to the current interpreter while preserving Agent/group scope.
+- The neuron-graph artwork is synthetic documentation imagery, not a live
+  product capture or usage/savings evidence; use the demo checklist before
+  publishing a real recording.
 
-Link to [the release record](../releases/v0.7.8.md). Confirm the published
+Link to [the release record](../releases/v0.7.9.md). Confirm the published
 package version and release workflow result before replacing this draft note.
 
 ### Codex for OSS application draft
@@ -142,7 +148,7 @@ package version and release workflow result before replacing this draft note.
 **Project**: MemoryGuard — governed local memory for coding agents
 **Repository**: https://github.com/irisxc4/memoryguard
 **License**: MIT
-**Current source line**: v0.7.8; publication status to be confirmed at submission
+**Current source line**: v0.7.9; publication status to be confirmed at submission
 **Primary stack**: Python, MCP stdio, SQLite-backed local domains
 
 **Project summary**
@@ -228,7 +234,7 @@ usage telemetry, and explicit opt-in for remote model or embedding work.
 
 - Repository: https://github.com/irisxc4/memoryguard
 - Install path: [`docs/install-codex.md`](../install-codex.md)
-- Release context: [`docs/releases/v0.7.8.md`](../releases/v0.7.8.md)
+- Release context: [`docs/releases/v0.7.9.md`](../releases/v0.7.9.md)
 - Sanitized visual asset: [`docs/assets/neuron-graph-live.gif`](../assets/neuron-graph-live.gif)
 - Contact/demo URL: `[USER TO COMPLETE]`
 
@@ -257,9 +263,9 @@ asset rights, contact details, and any form attestations personally.
 
 | Gap | Evidence / action | Owner |
 |---|---|---|
-| Version alignment | `pyproject.toml`, README/release notes, and both `server.json` versions now say `0.7.8`. For the next release, bump both `server.json` versions before building and publishing the new package. | Maintainer |
-| Registry marker timing | The current `0.7.8` PyPI artifact has no `mcp-name` marker, so `0.7.8` cannot be published to the MCP Registry. Confirm the next marker-bearing artifact and version are visible before `mcp-publisher publish`. | Maintainer |
-| Tool count — resolved | The stale `22 MCP tools` claim was removed from `smithery.yaml`; the local runtime currently exposes `57` tools (`len(memoryguard.mcp_server.TOOLS)`). Remaining: run the target Smithery build/smoke test and record its `tools/list` receipt before publishing any tool-count claim. | Maintainer |
+| Version alignment | `pyproject.toml`, README/release notes, and both `server.json` versions now say `0.7.9`; confirm the built package metadata before publishing. | Maintainer |
+| Registry marker timing | The published `0.7.8` PyPI artifact predates the `mcp-name` marker. Confirm the marker-bearing `0.7.9` artifact and version are visible before `mcp-publisher validate` and `publish`. | Maintainer |
+| Tool count — verified | The stale `22 MCP tools` claim was removed from `smithery.yaml`; the current source runtime exposes `61` tools (`len(memoryguard.mcp_server.TOOLS)`), verified on 2026-09-04. Earlier Glama evidence cited a successful 57-tool introspection; retain it as historical evidence only, not as the current count. Record the target Smithery build/smoke-test `tools/list` receipt before publishing any target-specific tool-count claim. | Maintainer |
 | Build/runtime | Dockerfile currently uses `pip install -e .`; verify Smithery build behavior and decide whether a published, non-editable package is required for the target runtime. | Maintainer |
 | Publication state | No Smithery listing URL or successful target-build receipt is recorded here. The stale `22 MCP tools` claim is fixed, but official local MCPB packaging validation is incomplete; no half-finished MCPB artifacts are retained. Implement and validate MCPB separately before publication; do not claim publish readiness. | Maintainer |
 | Account action | Smithery authentication, ownership, and final publish confirmation require the maintainer's account. | User |
@@ -282,6 +288,11 @@ asset rights, contact details, and any form attestations personally.
 ### Glama tool-definition-quality-score issue #4
 
 > Following up on [issue #4](https://github.com/glama-ai/tool-definition-quality-score/issues/4).
+> Historical evidence only: an earlier Glama run successfully introspected 57
+> tools. That receipt does not describe the current 61-tool surface and must
+> not be presented as the current count; rerun `tools/list` before making
+> current tool-count or quality claims.
+>
 > MemoryGuard's current repository copy emphasizes explicit scope, evidence,
 > reversible governance, local-only operation by default, and fail-closed
 > handling for sensitive or mismatched writes. We are preparing a sanitized

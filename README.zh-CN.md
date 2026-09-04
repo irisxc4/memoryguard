@@ -36,9 +36,9 @@
   <sub>神经图展示受治理投影；原始对话正文不会直接进入图谱或自动注入上下文。</sub>
 </p>
 
-## v0.7.8 更新
+## v0.7.9 更新
 
-v0.7.8 汇总了 v0.7.7 之后的治理、可观测性和宿主运行时修复：
+v0.7.9 汇总了 v0.7.8 之后的治理、遥测和公开分发准备：
 
 - **Canonical 记忆与规则治理：** 相关规则、习惯和记忆通过统一 canonical 读写路径合并，
   同时保留证据、来源链接、神经图分支、覆盖历史、冲突复核和 settlement 审计，且可逆。
@@ -50,11 +50,26 @@ v0.7.8 汇总了 v0.7.7 之后的治理、可观测性和宿主运行时修复�
 - **Codex 生命周期与运行时对齐：** 只有终止 thread 证据证明属于 Codex 的进程 cohort 才可回收，
   普通对话轮次仍可恢复。已安装版修复会让 MCP 与生命周期 Hook 使用当前解释器，同时保留
   Agent/共享组身份和 fail-closed 边界。
+- **证据与曝光准备：** `scripts/benchmark_usage_telemetry.py` 提供 7 天/30 天本地测量，
+  明确区分宿主上报、派生总量、确定性估算和无样本状态。`server.json`、PyPI `mcp-name`
+  标记以及贡献/安全文档已准备好后续收录检查；这里不宣称任何评分或目录已收录。
 
-详见 [v0.7.8 发布记录](docs/releases/v0.7.8.md)。
+详见 [v0.7.9 发布记录](docs/releases/v0.7.9.md)。
 
 更早版本的细节请见[更新日志](CHANGELOG.md)和
 [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)。
+
+### Token 证据与演示
+
+仅在已授权的本地工作区运行基准：
+
+```powershell
+python scripts/benchmark_usage_telemetry.py --workspace . --window-days 7 --sync
+```
+
+请阅读[用量基准说明](docs/benchmarks/README.md)了解宿主上报、派生、估算和不支持状态，
+并按[演示录制清单](docs/benchmarks/demo-script.md)制作脱敏演示。仓库中的神经图是合成插图，
+不是实际产品录屏，也不能作为用量或节省证据。
 
 ## v0.6.0 重大 V2 重构
 
@@ -131,10 +146,10 @@ flowchart TB
 ### MCP Registry 元数据
 
 本包以 `io.github.irisxc4/memoryguard` 提供本地 stdio MCP 服务，注册表元数据见
-[`server.json`](server.json)。上方 marker 必须随 PyPI 包 README 一并发布；
-当前 `agent-memguard` `0.7.8` 的 PyPI artifact 尚无 marker，因此 `0.7.8` 仍不可发布到
-MCP Registry。下一版发布时，必须先将 `server.json` 中两个版本号同步 bump 到新版本，
-发布含 marker 的 PyPI artifact，确认版本和 marker 已可见，再运行 `mcp-publisher publish`。
+[`server.json`](server.json)。上方 marker 必须随 PyPI 包 README 一并发布；当前已发布的
+`agent-memguard` `0.7.8` artifact 早于该 marker，因此不能提交到 MCP Registry。本次发布
+需构建并发布含 marker 的 `0.7.9` artifact，确认版本和 marker 可见，再运行
+`mcp-publisher validate`、完成认证并发布 `server.json`。
 
 ### 1. 安装
 
@@ -227,7 +242,7 @@ python -m pip install --upgrade "agent-memguard[gui]"
 
 ```bash
 python -m pip install --upgrade agent-memguard
-memoryguard --version                    # 0.7.8
+memoryguard --version                    # 0.7.9
 memoryguard upgrade
 memoryguard doctor
 ```
@@ -406,6 +421,7 @@ MCP 服务提供：
 - [PyPI 包](https://pypi.org/project/agent-memguard/)
 - [GitHub Releases](https://github.com/irisxc4/memoryguard/releases)
 - [更新日志](CHANGELOG.md)
+- [v0.7.9 发布记录](docs/releases/v0.7.9.md)
 - [v0.7.8 发布记录](docs/releases/v0.7.8.md)
 - [v0.7.7 发布记录](docs/releases/v0.7.7.md)
 - [v0.7.6 发布记录](docs/releases/v0.7.6.md)
@@ -424,8 +440,8 @@ MCP 服务提供：
 
 ## 路线图
 
-- **当前发布线：** v0.7.8 汇总 canonical 治理、可读的多 Agent GUI 治理、本地用量遥测以及
-  Codex 生命周期/运行时对齐。v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的
+- **当前发布线：** v0.7.9 汇总 canonical 治理、本地 Token 证据、可读的多 Agent 治理以及
+  公开分发准备。v0.7.8 记录前一阶段的治理、遥测与 Codex 运行时工作；v0.7.7 让已验证且唯一绑定的控制目录可以安全执行普通 Shell 下的
   provider repair，并让已安装版 Codex MCP/Hook 修复统一使用当前解释器，同时保留 Agent 与
   共享组身份；v0.7.6 统一 Codex Hook/MCP 的不可变 runtime snapshot，缩短 Hook 状态锁窗口，
   并让 bootstrap 成功/失败状态保持一致。更早版本的冲突复核、canonical 治理、共享历史、写入→

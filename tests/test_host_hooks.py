@@ -752,6 +752,291 @@ def test_pre_tool_blocks_native_memory_write_but_allows_project_file(
     assert allowed == {}
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "Write"])
+def test_bootstrap_text_in_non_mcp_input_does_not_bypass_native_memory_guard(
+    tmp_path: Path,
+    tool_name: str,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "codex-agent", "group-a")
+    native_memory = tmp_path / "home" / ".codex" / "memories" / "MEMORY.md"
+    tool_input = (
+        {
+            "command": (
+                "printf memoryguard_context_bootstrap "
+                f">> {native_memory}"
+            ),
+        }
+        if tool_name == "Bash"
+        else {
+            "file_path": str(native_memory),
+            "content": "memoryguard_context_bootstrap",
+        }
+    )
+
+    result = run_hook(
+        provider="codex",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="codex-agent",
+        share_group_id="group-a",
+        payload={
+            "session_id": f"bootstrap-text-{tool_name}",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        },
+    )
+
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_cursor_bootstrap_requires_verified_mcp_envelope(tmp_path: Path):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "cursor-agent", "group-a")
+    session_id = "cursor-verified-bootstrap"
+
+    assert host_hooks._is_memoryguard_bootstrap(
+        "mcp__memoryguard__memoryguard_context_bootstrap"
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "MCP:memoryguard_context_bootstrap"
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "CallMcpTool",
+        {
+            "serverName": "memoryguard",
+            "toolName": "memoryguard_context_bootstrap",
+            "arguments": {"task": "current request"},
+        },
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        {
+            "server_name": "memoryguard",
+            "tool_name": "memoryguard_context_bootstrap",
+        },
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        {
+            "namespace": "user-memoryguard",
+            "toolName": "memoryguard_context_bootstrap",
+            "arguments": {"task": "current request"},
+        },
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        {
+            "namespace": "user-memoryguard",
+            "serverName": "memoryguard",
+            "toolName": "memoryguard_context_bootstrap",
+            "name": "CallDynamicTool",
+            "arguments": {"task": "current request"},
+        },
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        json.dumps({
+            "namespace": "user-memoryguard",
+            "toolName": "memoryguard_context_bootstrap",
+            "arguments": {"task": "current request"},
+        }),
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "MCP:user-memoryguard:memoryguard_context_bootstrap"
+    )
+    assert host_hooks._is_memoryguard_bootstrap(
+        "MCP:user-memoryguard/memoryguard_context_bootstrap"
+    )
+    assert not host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        {
+            "namespace": "user-OpenSea",
+            "toolName": "get_collection_stats",
+            "arguments": {"slug": "pudgypenguins"},
+        },
+    )
+    assert not host_hooks._is_memoryguard_bootstrap(
+        "CallDynamicTool",
+        {
+            "namespace": "user-OpenSea",
+            "toolName": "memoryguard_context_bootstrap",
+        },
+    )
+    for tool_name, tool_input in (
+        (
+            "Bash",
+            {
+                "serverName": "memoryguard",
+                "toolName": "memoryguard_context_bootstrap",
+            },
+        ),
+        (
+            "CallMcpTool",
+            {"toolName": "memoryguard_context_bootstrap"},
+        ),
+        (
+            "CallMcpTool",
+            {
+                "serverName": "other-server",
+                "toolName": "memoryguard_context_bootstrap",
+            },
+        ),
+        (
+            "CallMcpTool",
+            {
+                "serverName": "memoryguard",
+                "toolName": "memoryguard_context_bootstrap_extra",
+            },
+        ),
+        (
+            "mcp__memoryguard__memoryguard_context_bootstrap_extra",
+            {},
+        ),
+    ):
+        assert not host_hooks._is_memoryguard_bootstrap(tool_name, tool_input)
+
+    result = run_hook(
+        provider="cursor",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={
+            "conversation_id": session_id,
+            "tool": {
+                "name": "CallMcpTool",
+                "arguments": {
+                    "serverName": "memoryguard",
+                    "toolName": "memoryguard_context_bootstrap",
+                    "arguments": {"task": "current request"},
+                },
+            },
+        },
+    )
+
+    assert result == {}
+    state = json.loads(
+        _state_path(workspace, "cursor", session_id).read_text(encoding="utf-8")
+    )
+    assert state["bootstrap_pending"] is True
+    assert state.get("bootstrap_ok") is not True
+    assert run_hook(
+        provider="cursor",
+        event="post_tool",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={
+            "conversation_id": session_id,
+            "tool": {
+                "name": "CallMcpTool",
+                "arguments": {
+                    "serverName": "memoryguard",
+                    "toolName": "memoryguard_context_bootstrap",
+                    "arguments": {"task": "current request"},
+                },
+            },
+            "tool_result": {"ok": True},
+        },
+    ) == {}
+    state = json.loads(
+        _state_path(workspace, "cursor", session_id).read_text(encoding="utf-8")
+    )
+    assert state["bootstrap_ok"] is True
+
+
+def test_cursor_calldynamictool_namespace_bootstrap_passes_first_tool_gate(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "cursor-agent", "group-a")
+    session_id = "cursor-dynamictool-bootstrap"
+    assert run_hook(
+        provider="cursor",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={"conversation_id": session_id, "prompt": "查 floor"},
+    ) == {"continue": True}
+
+    denied = run_hook(
+        provider="cursor",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={
+            "conversation_id": session_id,
+            "tool_name": "CallDynamicTool",
+            "tool_input": {
+                "namespace": "user-OpenSea",
+                "toolName": "get_collection_stats",
+                "arguments": {"slug": "pudgypenguins"},
+            },
+        },
+    )
+    assert denied["permission"] == "deny"
+
+    allowed = run_hook(
+        provider="cursor",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={
+            "conversation_id": session_id,
+            "tool_name": "CallDynamicTool",
+            "tool_input": {
+                "namespace": "user-memoryguard",
+                "toolName": "memoryguard_context_bootstrap",
+                "arguments": {"task": "查 floor"},
+            },
+        },
+    )
+    assert allowed == {}
+
+
+def test_cursor_calldynamictool_string_and_alias_bootstrap_passes_first_tool_gate(
+    tmp_path: Path,
+):
+    workspace = tmp_path / "control"
+    workspace.mkdir()
+    _bind(workspace, "cursor-agent", "group-a")
+    session_id = "cursor-dynamictool-alias-bootstrap"
+    assert run_hook(
+        provider="cursor",
+        event="user_prompt",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={"conversation_id": session_id, "prompt": "修钩子"},
+    ) == {"continue": True}
+
+    allowed = run_hook(
+        provider="cursor",
+        event="pre_tool",
+        workspace=workspace,
+        agent_instance_id="cursor-agent",
+        share_group_id="group-a",
+        payload={
+            "conversation_id": session_id,
+            "name": "CallDynamicTool",
+            "input": json.dumps({
+                "namespace": "user-memoryguard",
+                "toolName": "memoryguard_context_bootstrap",
+                "name": "CallDynamicTool",
+                "arguments": {"task": "修钩子"},
+            }),
+        },
+    )
+    assert allowed == {}
+
+
 def test_cursor_requires_bootstrap_before_first_tool_and_stop_continues_once(
     tmp_path: Path,
 ):
@@ -796,6 +1081,7 @@ def test_cursor_requires_bootstrap_before_first_tool_and_stop_continues_once(
         payload={
             "conversation_id": "conversation-1",
             "tool_name": "MCP:memoryguard_context_bootstrap",
+            "tool_result": {"ok": True},
         },
     )
     allowed = run_hook(
@@ -1433,6 +1719,7 @@ def test_pre_tool_real_bootstrap_request_bypasses_legacy_failure_state(
             "cursor",
             "CallMcpTool",
             {
+                "serverName": "memoryguard",
                 "toolName": "memoryguard_memory_delete",
                 "arguments": {"memory_id": "duplicate-rule"},
             },

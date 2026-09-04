@@ -12,6 +12,14 @@ from memoryguard.runtime_v2.native_ports import (
 from memoryguard.usage_telemetry import record_conversion_event
 
 
+def _freeze_usage_clock(monkeypatch) -> None:
+    monkeypatch.setattr(
+        usage_telemetry,
+        "_utc_now",
+        lambda: usage_telemetry._parse_utc("2026-08-28T02:00:00Z"),
+    )
+
+
 def _context(workspace: Path, *, group: str = "group-a"):
     return bind_native_transport_context(
         AccessContext(
@@ -45,7 +53,10 @@ def _record(workspace: Path, provider: str, baseline: int, delivered: int, event
     )
 
 
-def test_gui_usage_telemetry_is_scoped_and_agent_filter_only_filters_results(tmp_path: Path) -> None:
+def test_gui_usage_telemetry_is_scoped_and_agent_filter_only_filters_results(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _freeze_usage_clock(monkeypatch)
     _record(tmp_path, "codex", 100, 40, "codex-1")
     _record(tmp_path, "grok", 80, 20, "grok-1")
     port = NativeV2RuntimePort(tmp_path)
@@ -74,6 +85,11 @@ def test_gui_usage_telemetry_is_scoped_and_agent_filter_only_filters_results(tmp
     )
     assert codex["ok"] is True, codex
     assert codex["data"]["window_days"] == 30
+    assert codex["data"]["summary"]["estimated_baseline_units"] == 100
+    assert sum(
+        item["estimated_baseline_units"] or 0
+        for item in codex["data"]["series"]
+    ) == 100
     assert {row["agent_key"] for row in codex["data"]["rows"]} == {"codex:codex"}
     assert {agent["agent_key"] for agent in codex["data"]["agents"]} == {"codex:codex"}
 
@@ -101,6 +117,84 @@ def test_gui_usage_telemetry_rejects_scope_spoof_and_invalid_window(tmp_path: Pa
     )
     assert invalid["ok"] is False
     assert invalid["code"] == "invalid_usage_window"
+
+
+def test_gui_usage_sync_is_mutation_gated_and_returns_safe_summary(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[Path] = []
+
+    def fake_sync(workspace, **_kwargs):
+        calls.append(Path(workspace))
+        return {
+            "status": "error",
+            "inserted": 2,
+            "rotated": 1,
+            "sources": 3,
+            "sync_state": {
+                "providers": {
+                    "codex": {
+                        "status": "success",
+                        "inserted_count": 2,
+                        "rotated_count": 1,
+                        "source_count": 1,
+                        "last_error": r"C:\\private\\source.jsonl",
+                    },
+                    "grok": {
+                        "status": "error",
+                        "inserted_count": 0,
+                        "rotated_count": 0,
+                        "source_count": 2,
+                        "last_error": "adapter_failed",
+                    },
+                }
+            },
+        }
+
+    monkeypatch.setattr(usage_telemetry, "sync_usage_telemetry", fake_sync)
+    context = _context(tmp_path)
+
+    class Manifest:
+        def __init__(self, state: str) -> None:
+            self.state = state
+
+        def current(self) -> dict[str, object]:
+            return {"state": self.state, "generation": 1}
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest("V2_READY"))
+
+    inactive = port.dispatch_gui(
+        "sync_usage_telemetry",
+        [],
+        context=context,
+        generation=1,
+        state="V2_READY",
+    )
+    assert inactive["ok"] is False
+    assert inactive["code"] == "v2_not_active"
+    assert calls == []
+
+    port = NativeV2RuntimePort(tmp_path, state_provider=Manifest("V2_ACTIVE"))
+    synced = port.dispatch_gui(
+        "sync_usage_telemetry",
+        [],
+        context=context,
+        generation=1,
+        state="V2_ACTIVE",
+    )
+    assert synced["ok"] is True, synced
+    assert calls == [tmp_path.resolve()]
+    assert synced["data"] == {
+        "status": "error",
+        "inserted": 2,
+        "rotated": 1,
+        "sources": 3,
+        "providers": {
+            "codex": {"status": "success", "inserted": 2, "rotated": 1, "sources": 1},
+            "grok": {"status": "error", "inserted": 0, "rotated": 0, "sources": 2},
+        },
+    }
+    assert "private" not in str(synced)
 
 
 def test_gui_usage_telemetry_forwards_trusted_scope_and_current_binding_roster(
@@ -166,7 +260,10 @@ def test_gui_usage_telemetry_forwards_trusted_scope_and_current_binding_roster(
     ]
 
 
-def test_gui_usage_telemetry_aggregates_share_group_not_current_project(tmp_path: Path) -> None:
+def test_gui_usage_telemetry_aggregates_share_group_not_current_project(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _freeze_usage_clock(monkeypatch)
     record_conversion_event(
         tmp_path,
         provider="codex",
@@ -209,7 +306,10 @@ def test_gui_usage_telemetry_aggregates_share_group_not_current_project(tmp_path
     assert all(row["measurement_state"] == "estimated" for row in data["rows"])
 
 
-def test_gui_roster_placeholder_does_not_hide_real_codex_row(tmp_path: Path) -> None:
+def test_gui_roster_placeholder_does_not_hide_real_codex_row(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _freeze_usage_clock(monkeypatch)
     record_conversion_event(
         tmp_path,
         provider="codex",
@@ -263,7 +363,7 @@ def test_gui_roster_placeholder_does_not_hide_real_codex_row(tmp_path: Path) -> 
     assert all(row["agent_key"] == "codex:codex" for row in result["data"]["rows"])
 
 
-def test_run_audit_syncs_usage_telemetry_and_does_not_mask_failure(
+def test_run_audit_does_not_implicitly_sync_usage_telemetry(
     tmp_path: Path, monkeypatch
 ) -> None:
     calls: list[object] = []
@@ -303,11 +403,9 @@ def test_run_audit_syncs_usage_telemetry_and_does_not_mask_failure(
         generation=1,
         state="V2_ACTIVE",
     )
-    assert calls, audited
+    assert calls == [], audited
     assert audited["ok"] is True, audited
-    usage_sync = audited["data"]["usage_sync"]
-    assert usage_sync["status"] != "success"
-    assert usage_sync["status"] in {"error", "failed"}
+    assert "usage_sync" not in audited["data"]
 
     calls.clear()
     queried = port.dispatch_gui(

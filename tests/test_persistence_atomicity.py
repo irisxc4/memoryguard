@@ -341,7 +341,7 @@ def test_lifecycle_conflict_resolution_preserves_unrelated_members(tmp_path: Pat
     assert conflicts["ok"] is True
     assert {item["group_id"] for item in conflicts["data"]["conflicts"]} == {"group-1", "group-2"}
     resolved = port.dispatch_gui(
-        "resolve_conflict", ["group-1", "conflict-keep", group],
+        "resolve_conflict", ["group-1", "conflict-keep", group, True],
         context=context, generation=1, mutation=True, state="V2_ACTIVE",
     )
     assert resolved["ok"] is True, resolved

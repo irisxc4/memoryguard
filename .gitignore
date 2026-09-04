@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 *.egg
+docs/benchmarks/local-sample.*.json
 build/
 dist/
 .eggs/

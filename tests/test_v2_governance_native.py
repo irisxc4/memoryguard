@@ -285,6 +285,156 @@ def test_conflict_snapshot_keeps_tombstone_history_and_blocks_stale_resolution(t
     assert blocked["error"] == "conflict_group_stale"
 
 
+def test_conflict_resolution_requires_explicit_confirmation_for_always_loser(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    port = _port(tmp_path)
+    context = _native_context(tmp_path)
+
+    # Promote the losing member through the existing governance update path;
+    # the resolver must treat an always-injected rule as protected.
+    promoted = port.dispatch_gui(
+        "set_memory_injection_policy",
+        {"memory_id": "conflict-drop", "injection_policy": "always", "priority": 20},
+        context=context,
+        generation=11,
+        state="V2_ACTIVE",
+    )
+    assert promoted["ok"] is True, promoted
+
+    service = GovernanceNativeService(tmp_path)
+    before_decisions = [item.decision_id for item in service._read_decisions()]
+    before_atoms = {
+        memory_id: boundary.memory.get_atom(
+            memory_id,
+            scope=_mutation_context(tmp_path).to_dict(),
+            include_building=True,
+        )
+        for memory_id in ("conflict-keep", "conflict-drop")
+    }
+
+    for confirmed in (None, False):
+        args = ["conflict-group-1", "conflict-keep", "group-a"]
+        if confirmed is not None:
+            args.append(confirmed)
+        blocked = port.dispatch_gui(
+            "resolve_conflict",
+            args,
+            context=context,
+            generation=11,
+            mutation=True,
+            state="V2_ACTIVE",
+        )
+        assert blocked["ok"] is False
+        assert blocked["error"] == "conflict_always_rule_protected"
+    assert [item.decision_id for item in service._read_decisions()] == before_decisions
+    for memory_id, before in before_atoms.items():
+        after = boundary.memory.get_atom(
+            memory_id,
+            scope=_mutation_context(tmp_path).to_dict(),
+            include_building=True,
+        )
+        assert after is not None and before is not None
+        assert after.to_dict() == before.to_dict()
+
+
+def test_conflict_resolution_rejects_confirmed_always_removal_without_admin(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    port = _port(tmp_path)
+    admin_context = _native_context(tmp_path)
+    promoted = port.dispatch_gui(
+        "set_memory_injection_policy",
+        {"memory_id": "conflict-drop", "injection_policy": "always", "priority": 20},
+        context=admin_context,
+        generation=11,
+        state="V2_ACTIVE",
+    )
+    assert promoted["ok"] is True, promoted
+
+    non_admin_context = bind_native_transport_context(
+        AccessContext(
+            trusted_agent_id="agent-a",
+            is_admin=False,
+            strict_binding=True,
+            allow_anon=False,
+            session_id="governance-native-user-session",
+            session_source="transport",
+            session_trusted=True,
+        ),
+        workspace_id=str(tmp_path.resolve()),
+        share_group_id="group-a",
+        project_ref=str(tmp_path.resolve()),
+        provider="gui",
+        runtime_role="gui",
+        entrypoint="gui",
+        namespace_id="knowledge-governance-native",
+        sensitivity="normal",
+        policy_class="private",
+    )
+    service = GovernanceNativeService(tmp_path)
+    before_decisions = [item.decision_id for item in service._read_decisions()]
+    before_atoms = {
+        memory_id: boundary.memory.get_atom(
+            memory_id,
+            scope=_mutation_context(tmp_path).to_dict(),
+            include_building=True,
+        )
+        for memory_id in ("conflict-keep", "conflict-drop")
+    }
+
+    blocked = port.dispatch_gui(
+        "resolve_conflict",
+        ["conflict-group-1", "conflict-keep", "group-a", True],
+        context=non_admin_context,
+        generation=11,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+
+    assert blocked["ok"] is False
+    assert blocked["error"] == "admin_capability_required"
+    assert [item.decision_id for item in service._read_decisions()] == before_decisions
+    for memory_id, before in before_atoms.items():
+        after = boundary.memory.get_atom(
+            memory_id,
+            scope=_mutation_context(tmp_path).to_dict(),
+            include_building=True,
+        )
+        assert after is not None and before is not None
+        assert after.to_dict() == before.to_dict()
+
+
+def test_conflict_resolution_allows_confirmed_admin_to_remove_always_loser(tmp_path: Path) -> None:
+    boundary = _seed(tmp_path)
+    port = _port(tmp_path)
+    context = _native_context(tmp_path)
+
+    promoted = port.dispatch_gui(
+        "set_memory_injection_policy",
+        {"memory_id": "conflict-drop", "injection_policy": "always", "priority": 20},
+        context=context,
+        generation=11,
+        state="V2_ACTIVE",
+    )
+    assert promoted["ok"] is True, promoted
+
+    resolved = port.dispatch_gui(
+        "resolve_conflict",
+        ["conflict-group-1", "conflict-keep", "group-a", True],
+        context=context,
+        generation=11,
+        mutation=True,
+        state="V2_ACTIVE",
+    )
+    assert resolved["ok"] is True, resolved
+    assert resolved["data"]["deleted_memory_ids"] == ["conflict-drop"]
+    dropped = boundary.memory.get_atom(
+        "conflict-drop",
+        scope=_mutation_context(tmp_path).to_dict(),
+        include_building=True,
+    )
+    assert dropped is not None and dropped.status == "deleted"
+
+
 def test_conflict_snapshot_redacts_sensitive_body_and_localizes_reason(tmp_path: Path) -> None:
     boundary = GovernanceV2(tmp_path)
     mutation = _mutation_context(tmp_path)

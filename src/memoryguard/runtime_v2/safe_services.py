@@ -596,16 +596,6 @@ class PureSourceReadService:
             _budget(payload_map)
         except SafeServiceError as exc:
             return _error(exc.code, service=self.service_name)
-        # Usage telemetry is a supplemental local projection.  A failed
-        # provider adapter must never make source scanning unavailable; the
-        # telemetry module owns its cursor/generation idempotence and stores
-        # no source body, account, or raw path.
-        try:
-            from ..usage_telemetry import sync_usage_telemetry
-
-            sync_usage_telemetry(self.workspace)
-        except Exception:
-            pass
         status, roots, code = self._load_roots()
         if status == "NO_SOURCE":
             return _ready(self.service_name, status="NO_SOURCE", coverage={"candidate_count": 0}, roots=[])

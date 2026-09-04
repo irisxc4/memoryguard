@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.7.9] - 2026-09-04
+
+### Added
+
+- Added a marker-bearing MCP Registry metadata path for the local stdio server,
+  plus concise contributor and security guidance for public discovery and
+  responsible reports. Registry and package publication remain separate
+  post-release checks.
+- Added a local token-evidence benchmark with explicit seven- and thirty-day
+  windows, host coverage, measured-versus-derived totals, and a no-sample
+  boundary. It never turns missing host telemetry into zero usage or a savings
+  claim.
+
+### Fixed
+
+- Governed writes now reconcile related rules, habits, and memories through one
+  canonical path while retaining source links, evidence, graph branches,
+  supersede history, conflict decisions, and reversible settlement receipts.
+- Governance and GUI responses preserve readable Agent/provider identities,
+  shared-group context, safe family icons, actionable conflict states, and
+  explicit stale-conflict closure instead of exposing opaque IDs as the main
+  user-facing label.
+- Local telemetry synchronization now accepts bounded data from every
+  supported connected host, separates provider-reported totals from derived
+  input/output totals, and removes raw paths, account identifiers, and legacy
+  error text at the public boundary.
+
+### Validation boundary
+
+This source-preparation entry records repository changes only. It does not
+claim CI, PyPI, MCP Registry, directory, or third-party listing success; those
+must be recorded from their respective live checks after publication.
+
 ## [0.7.8] - 2026-08-29
 
 ### Added

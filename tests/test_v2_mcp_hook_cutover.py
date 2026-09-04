@@ -647,7 +647,25 @@ def test_all_mcp_mutations_receive_trusted_context(monkeypatch, tmp_path):
         payload = {"agent_instance_id": "attacker"}
         if name == "memoryguard_provider_install":
             payload["provider"] = "codex"
-        if name in mcp_server._V2_RULE_MERGE_TOOLS:
+        if name == "memoryguard_memory_merge_safe":
+            payload.update(
+                {
+                    "confirmed": True,
+                    "expected_atom_revisions": {"canonical": 1, "duplicate": 1},
+                    "mutation_receipt": {"receipt_id": f"receipt-{name}"},
+                    "idempotency_key": f"key-{name}",
+                }
+            )
+        elif name == "memoryguard_rule_merge_safe":
+            payload.update(
+                {
+                    "confirmed": True,
+                    "expected_definition_revisions": {"canonical": 1, "duplicate": 1},
+                    "mutation_receipt": {"receipt_id": f"receipt-{name}"},
+                    "idempotency_key": f"key-{name}",
+                }
+            )
+        elif name in mcp_server._V2_RULE_MERGE_TOOLS:
             payload.update(
                 {
                     "proposal_id": "proposal",
@@ -664,6 +682,7 @@ def test_all_mcp_mutations_receive_trusted_context(monkeypatch, tmp_path):
         _mcp_call(monkeypatch, tmp_path, facade, name, payload)
     assert len(facade.mcp_calls) == len(mcp_server._MUTATING_TOOLS)
     assert all(call[2]["agent_instance_id"] == "bound-agent" for call in facade.mcp_calls)
+    assert mcp_server._MUTATING_TOOLS == mcp_server.MCP_MUTATION_NAMES
 
 
 def test_real_facade_receives_one_manifest_snapshot(monkeypatch, tmp_path):

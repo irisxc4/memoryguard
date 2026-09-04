@@ -57,9 +57,7 @@ MemoryGuard is the local control layer between your coding agents and their shar
 
 ## See the governance loop
 
-<p align="center">
-  <img src="docs/assets/write-organize-rollback.gif" alt="A MemoryGuard demo: an agent writes a duplicate memory, MemoryGuard supersedes the stale version, then the operator restores a previous version" width="900" />
-</p>
+> Demo recording pending: `docs/assets/write-organize-rollback.gif` is currently a placeholder and must not be embedded or presented as a live product capture. Record it using the [demo checklist](benchmarks/demo-script.md) before replacing this note.
 
 ```text
 Agent writes memory
@@ -252,9 +250,7 @@ MemoryGuard 是本地的控制层，位于编程 Agent 与其共享记忆之间�
 
 ## 看看治理闭环
 
-<p align="center">
-  <img src="docs/assets/write-organize-rollback.gif" alt="演示：Agent 写入重复记忆，MemoryGuard 覆盖过期版本，操作者再恢复到先前版本" width="900" />
-</p>
+> 演示录屏待补：`docs/assets/write-organize-rollback.gif` 当前只是占位文件，不得嵌入或描述为真实产品录屏。请按[演示录制清单](benchmarks/demo-script.md)完成真实录制后再替换此说明。
 
 ```text
 Agent 写入记忆

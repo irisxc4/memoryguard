@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import memoryguard.runtime_v2.canonical_claims as canonical_claims
 from memoryguard.runtime_v2.canonical_claims import (
     claims_related,
     compose_canonical_bodies,
     topic_affinity,
 )
+from memoryguard.governance_v2 import GovernanceV2
+from memoryguard.memory import MemoryAtomStore
+from memoryguard.runtime_v2.governance_semantics import classify_governance_relation
+from memoryguard.runtime_v2.organizer import V2MemoryOrganizer
 
 
 def test_composes_bullets_and_deduplicates_equivalent_claims() -> None:
@@ -215,6 +221,75 @@ def test_delegation_guardrails_are_not_false_conflicts() -> None:
     )
 
     assert result.rejected_conflicts == ()
+
+
+def test_sol_luna_grok_delegation_guardrails_are_distinct_claims() -> None:
+    sol_rule = (
+        "Sol 负责规划、风险判断与验收；明确执行用 Luna xhigh；"
+        "复杂跨模块或高不确定性实现用 Grok Build MCP 的 Grok 4.6 xhigh；"
+        "禁止无新增风险证据的反复委派和审核。"
+    )
+    delegation_rule = (
+        "用户不希望小型/局部任务被拆成大量并行子任务，造成多个 Codex 对话长期显示处理中。"
+        "后续优先直接处理；确需委派时减少数量，并在交付前等待完成或明确收口子任务状态。"
+    )
+
+    relation = classify_governance_relation(sol_rule, delegation_rule)
+    result = compose_canonical_bodies([sol_rule, delegation_rule])
+
+    assert relation.kind == "distinct"
+    assert result.rejected_conflicts == ()
+
+
+def test_organizer_keeps_sol_luna_grok_guardrails_out_of_conflict(tmp_path: Path) -> None:
+    """The real write path must not tombstone compatible delegation rules."""
+
+    group = "sol-luna-grok-guardrails"
+    memory = MemoryAtomStore(tmp_path)
+    organizer = V2MemoryOrganizer(
+        tmp_path,
+        group,
+        memory_store=memory,
+        governance=GovernanceV2(tmp_path, memory_store=memory),
+    )
+    peer_body = (
+        "用户不希望小型/局部任务被拆成大量并行子任务，造成多个 Codex 对话长期显示处理中。"
+        "后续优先直接处理；确需委派时减少数量，并在交付前等待完成或明确收口子任务状态。"
+    )
+    target_body = (
+        "Sol 负责规划、风险判断与验收；明确执行用 Luna xhigh；"
+        "复杂跨模块或高不确定性实现用 Grok Build MCP 的 Grok 4.6 xhigh；"
+        "禁止无新增风险证据的反复委派和审核。"
+    )
+
+    def write(body: str, event_id: str) -> dict:
+        return organizer.write(
+            {
+                "body": body,
+                "kind": "procedure",
+                "event_id": event_id,
+                "agent_instance_id": "agent-a",
+                "share_group_id": group,
+                "project_ref": "project-a",
+                "provider": "codex",
+                "runtime_role": "root",
+                "visibility": "active",
+                "injection_policy": "always",
+            }
+        )
+
+    peer = write(peer_body, "event-peer")
+    target = write(target_body, "event-target")
+
+    assert peer["ok"] is True
+    assert target["ok"] is True
+    assert target["mutation_kind"] != "conflicted"
+    assert target["status"] != "conflicted"
+    assert not any("conflict_group_id" in action for action in target["actions"])
+    peer_atom = memory.get_atom(peer["memory_id"], scope=organizer.scope, include_building=True)
+    assert peer_atom is not None
+    assert peer_atom.status != "deleted"
+    assert peer_atom.metadata.get("conflict_group_id") is None
 
 
 def test_order_and_recomposition_are_idempotent() -> None:

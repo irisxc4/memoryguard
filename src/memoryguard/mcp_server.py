@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__ as PACKAGE_VERSION
+from .cutover_v2.surfaces import MCP_MUTATION_NAMES
 from .runtime_v2.public_safety import (
     safe_error_code,
     safe_exception_diagnostic,
@@ -34,36 +35,10 @@ from .runtime_v2.public_safety import (
 )
 
 
-# 写操作工具列表：执行前做本地参数预检，避免无效请求写入状态。
-# 注：memoryguard_extract_memories 现为只读 preview（§8.5 两步流程步骤 1）。
-#     memoryguard_accept_candidates 写入共享记忆（§8.5 步骤 2）。
-_MUTATING_TOOLS = {
-    # Current handlers persist report/extraction/snapshot/projection state;
-    # keep the canonical transport gate conservative until pure services
-    # replace those side effects.
-    "memoryguard_audit",
-    "memoryguard_list_sources",
-    "memoryguard_scan_summary",
-    "memoryguard_extract_memories",
-    "memoryguard_build_and_enrich",
-    "memoryguard_memory_write",
-    "memoryguard_memory_update",
-    "memoryguard_memory_delete",
-    "memoryguard_binding_create",
-    "memoryguard_external_mcp_import",
-    "memoryguard_accept_candidates",
-    "memoryguard_provider_install",
-    "memoryguard_apply_enrichments",
-    "memoryguard_history_delete",
-    "memoryguard_rule_feedback",
-    "memoryguard_rule_create_auto",
-    "memoryguard_rule_undo",
-    "memoryguard_rule_merge_capability_issue",
-    "memoryguard_rule_merge_approve",
-    "memoryguard_rule_merge_acknowledge",
-    "memoryguard_rule_merge_cooldown_clear",
-    "memoryguard_codegraph_update",
-}
+# MCP mutation classification has one source of truth.  This gate controls
+# trusted-context injection, runtime lease checks, and V2_READY blocking, so a
+# local copy can silently leave a newly registered writer on a weaker path.
+_MUTATING_TOOLS = MCP_MUTATION_NAMES
 
 # Tools that physically write SQLite state even though their business role is
 # mostly read.  They must pass the runtime split-brain lease, but they should
@@ -372,6 +347,111 @@ TOOLS = [
         },
     },
     {
+        "name": "memoryguard_memory_merge_safe_preview",
+        "description": (
+            "Read-only preflight for memoryguard_memory_merge_safe. Resolves one "
+            "explicit canonical/duplicate atom pair in the trusted share group, "
+            "returns current atom revisions, policies, priorities, and relation "
+            "safety, and does not write transactions, decisions, undo, or "
+            "idempotency records. There is no force or bypass."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "canonical_memory_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active canonical memory_id in the trusted share group",
+                },
+                "canonical_atom_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active canonical atom_id in the trusted share group",
+                },
+                "duplicate_memory_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active duplicate memory_id in the same share group",
+                },
+                "duplicate_atom_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active duplicate atom_id in the same share group",
+                },
+                "workspace": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_memory_merge_safe",
+        "description": (
+            "Admin-only governed supersede of one active same-group duplicate "
+            "memory atom into a stronger canonical atom. Reuses GovernanceV2."
+            "supersede. Requires confirmed=true. There is no force or bypass; "
+            "owner update/delete stay unchanged."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "canonical_memory_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active canonical memory_id in the trusted share group",
+                },
+                "canonical_atom_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active canonical atom_id in the trusted share group",
+                },
+                "duplicate_memory_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active duplicate memory_id in the same share group",
+                },
+                "duplicate_atom_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active duplicate atom_id in the same share group",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "must be true; the mutation refuses any other value",
+                },
+                "expected_atom_revisions": {
+                    "type": "object",
+                    "description": "CAS map of involved atom or memory ids to current revisions",
+                },
+                "mutation_receipt": {
+                    "type": "object",
+                    "description": "native mutation receipt for this supersede transaction",
+                    "properties": {
+                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    },
+                },
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+                "workspace": {"type": "string"},
+            },
+            "required": [
+                "confirmed",
+                "expected_atom_revisions",
+                "mutation_receipt",
+                "idempotency_key",
+            ],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "memoryguard_context_bootstrap",
         "description": (
             "Build one bounded, read-only long-term-memory context packet for a new task. "
@@ -655,6 +735,108 @@ TOOLS = [
                 "workspace": {"type": "string"},
             },
             "required": ["proposal_id", "capability_token", "mutation_receipt", "idempotency_key"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_safe_preview",
+        "description": (
+            "Read-only preflight for memoryguard_rule_merge_safe. Resolves the "
+            "requested canonical/duplicate source or definition ids in the "
+            "trusted share group, returns current definition revisions and pair "
+            "safety, and does not write transactions, decisions, undo, "
+            "settlement, or idempotency records. There is no force or bypass; "
+            "composer/pair safety still decides mergeability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "canonical_source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active rule_source_links.memory_id in the trusted share group",
+                },
+                "canonical_definition_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active definition id in the trusted share group",
+                },
+                "duplicate_source_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "description": "active duplicate source ids in the same share group",
+                },
+                "duplicate_definition_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "description": "active duplicate definition ids in the same share group",
+                },
+                "workspace": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "memoryguard_rule_merge_safe",
+        "description": (
+            "Admin-only source-aware fold of active same-group duplicate rules "
+            "into one canonical definition. Reuses the V2 historical "
+            "reconciliation transaction. Requires confirmed=true. There is no "
+            "force or bypass; composer/pair safety still decides mergeability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "canonical_source_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active rule_source_links.memory_id in the trusted share group",
+                },
+                "canonical_definition_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "active definition id in the trusted share group",
+                },
+                "duplicate_source_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "description": "active duplicate source ids in the same share group",
+                },
+                "duplicate_definition_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "description": "active duplicate definition ids in the same share group",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "must be true; the mutation refuses any other value",
+                },
+                "expected_definition_revisions": {
+                    "type": "object",
+                    "description": "CAS map of involved definition or source ids to current revisions",
+                },
+                "mutation_receipt": {
+                    "type": "object",
+                    "description": "native mutation receipt for this merge transaction",
+                    "properties": {
+                        "receipt_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    },
+                },
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+                "workspace": {"type": "string"},
+            },
+            "required": [
+                "confirmed",
+                "expected_definition_revisions",
+                "mutation_receipt",
+                "idempotency_key",
+            ],
             "additionalProperties": False,
         },
     },
@@ -1385,6 +1567,12 @@ _V2_RULE_MERGE_TOOLS = frozenset({
     "memoryguard_rule_merge_approve",
     "memoryguard_rule_merge_acknowledge",
     "memoryguard_rule_merge_cooldown_clear",
+    "memoryguard_rule_merge_safe",
+    "memoryguard_rule_merge_safe_preview",
+})
+_V2_MEMORY_MERGE_TOOLS = frozenset({
+    "memoryguard_memory_merge_safe",
+    "memoryguard_memory_merge_safe_preview",
 })
 
 
@@ -1399,10 +1587,59 @@ def _validate_v2_mcp_arguments(name: str, args: Mapping[str, Any]) -> None:
     diagnostic or response payload.
     """
 
+    if name in _V2_MEMORY_MERGE_TOOLS:
+        if not isinstance(args, Mapping):
+            raise ValueError("invalid_tool_arguments")
+        if name == "memoryguard_memory_merge_safe_preview":
+            return
+        receipt = args.get("mutation_receipt")
+        if not isinstance(receipt, Mapping):
+            raise ValueError("mutation_receipt_required")
+        receipt_id = receipt.get("receipt_id") or receipt.get("id")
+        if not isinstance(receipt_id, str) or not receipt_id.strip() or len(receipt_id.strip()) > 256:
+            raise ValueError("mutation_receipt_required")
+        idempotency_key = args.get("idempotency_key")
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key.strip()) > 256
+        ):
+            raise ValueError("idempotency_key_required")
+        if args.get("confirmed") is not True:
+            raise ValueError("confirmation_required")
+        revisions = args.get("expected_atom_revisions")
+        if not isinstance(revisions, Mapping) or not revisions:
+            raise ValueError("atom_revision_required")
+        return
+
     if name not in _V2_RULE_MERGE_TOOLS:
         return
     if not isinstance(args, Mapping):
         raise ValueError("invalid_tool_arguments")
+
+    if name == "memoryguard_rule_merge_safe_preview":
+        return
+
+    if name == "memoryguard_rule_merge_safe":
+        receipt = args.get("mutation_receipt")
+        if not isinstance(receipt, Mapping):
+            raise ValueError("mutation_receipt_required")
+        receipt_id = receipt.get("receipt_id") or receipt.get("id")
+        if not isinstance(receipt_id, str) or not receipt_id.strip() or len(receipt_id.strip()) > 256:
+            raise ValueError("mutation_receipt_required")
+        idempotency_key = args.get("idempotency_key")
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key.strip()) > 256
+        ):
+            raise ValueError("idempotency_key_required")
+        if args.get("confirmed") is not True:
+            raise ValueError("confirmation_required")
+        revisions = args.get("expected_definition_revisions")
+        if not isinstance(revisions, Mapping) or not revisions:
+            raise ValueError("definition_revision_required")
+        return
 
     proposal_id = args.get("proposal_id")
     if not isinstance(proposal_id, str) or not proposal_id.strip() or len(proposal_id.strip()) > 256:

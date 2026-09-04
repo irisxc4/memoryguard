@@ -50,6 +50,21 @@ _SYNC_REASON_CODES = frozenset({
     "sync_failed",
     "not_synced",
 })
+_PUBLIC_SYNC_STATUSES = frozenset({
+    "success",
+    "source_not_found",
+    "host_not_supported",
+    "error",
+    "no_measured_source",
+    "unavailable",
+    "not_synced",
+})
+_PUBLIC_MEASUREMENT_STATES = frozenset({
+    "measured",
+    "estimated",
+    "mixed",
+    "unavailable",
+})
 _COMPLETED_SYNC_STATUSES = frozenset({
     "success",
     "source_not_found",
@@ -98,6 +113,25 @@ def _safe_int(value: Any) -> int | None:
 
 def _safe_units(value: Any) -> int | None:
     return _safe_int(value)
+
+
+def _safe_sync_status(value: Any) -> str:
+    status = str(value or "").strip().casefold()
+    return status if status in _PUBLIC_SYNC_STATUSES else "unavailable"
+
+
+def _safe_sync_reason(value: Any, *, default: str = "not_synced") -> str:
+    reason = str(value or "").strip().casefold()
+    return reason if reason in _SYNC_REASON_CODES else default
+
+
+def _safe_timestamp(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        return _iso_utc(str(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _text(value: Any) -> str:
@@ -185,6 +219,53 @@ def _connect(workspace: str | Path) -> sqlite3.Connection:
         # active, and the caller receives the same data contract.
         pass
     _ensure_schema(connection)
+    return connection
+
+
+_READ_REQUIRED_COLUMNS = {
+    "usage_events": frozenset({
+        "event_key", "event_kind", "provider", "program", "agent_stable_key",
+        "observed_at_utc", "measurement_basis", "input_tokens", "output_tokens",
+        "total_tokens", "baseline_units", "delivered_units", "conversion_count",
+        "share_group_hash", "project_ref_hash",
+    }),
+    "usage_sync_state": frozenset({
+        "provider", "status", "last_success_at", "last_error_at", "last_error",
+        "inserted_count", "rotated_count", "source_count",
+    }),
+}
+
+
+class _TelemetryReadUnavailable(RuntimeError):
+    pass
+
+
+def _connect_readonly(workspace: str | Path) -> sqlite3.Connection:
+    """Open only a complete existing telemetry schema without mutating it."""
+
+    path = telemetry_db_path(workspace)
+    if not path.is_file():
+        raise _TelemetryReadUnavailable("telemetry_database_missing")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        _execute_retry(connection, "PRAGMA busy_timeout=2000")
+        for table, required_columns in _READ_REQUIRED_COLUMNS.items():
+            columns = {
+                row[1]
+                for row in _execute_retry(connection, f"PRAGMA table_info({table})")
+            }
+            if not required_columns <= columns:
+                raise _TelemetryReadUnavailable("telemetry_schema_unavailable")
+    except _TelemetryReadUnavailable:
+        if connection is not None:
+            connection.close()
+        raise
+    except sqlite3.Error as exc:
+        if connection is not None:
+            connection.close()
+        raise _TelemetryReadUnavailable("telemetry_database_unavailable") from exc
     return connection
 
 
@@ -331,18 +412,26 @@ def _sync_state(connection: sqlite3.Connection) -> dict[str, Any]:
         connection,
         "SELECT * FROM usage_sync_state ORDER BY provider",
     ).fetchall()
-    providers = {
-        str(row["provider"]): {
-            "status": row["status"],
-            "last_success_at": row["last_success_at"],
-            "last_error_at": row["last_error_at"],
-            "last_error": row["last_error"],
-            "inserted_count": int(row["inserted_count"] or 0),
-            "rotated_count": int(row["rotated_count"] or 0),
-            "source_count": int(row["source_count"] or 0),
+    providers: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        # Legacy databases are untrusted input.  Keep only the bounded public
+        # provider identity and reason codes; never echo raw adapter values.
+        provider = _safe_agent_name(row["provider"])
+        status = _safe_sync_status(row["status"])
+        providers[provider] = {
+            "status": status,
+            "last_success_at": _safe_timestamp(row["last_success_at"]),
+            "last_error_at": _safe_timestamp(row["last_error_at"]),
+            "last_error": (
+                None if status == "success"
+                else _safe_sync_reason(row["last_error"], default=(
+                    "sync_failed" if row["last_error"] else "not_synced"
+                ))
+            ),
+            "inserted_count": _safe_int(row["inserted_count"]) or 0,
+            "rotated_count": _safe_int(row["rotated_count"]) or 0,
+            "source_count": _safe_int(row["source_count"]) or 0,
         }
-        for row in rows
-    }
     successes = [item["last_success_at"] for item in providers.values() if item["last_success_at"]]
     statuses = {item["status"] for item in providers.values()}
     if "error" in statuses:
@@ -360,7 +449,10 @@ def _sync_state(connection: sqlite3.Connection) -> dict[str, Any]:
             (item["last_error_at"] for item in providers.values() if item["last_error_at"]),
             default=None,
         ),
-        "last_error": next((item["last_error"] for item in reversed(list(providers.values())) if item["last_error"]), None),
+        "last_error": next(
+            (item["last_error"] for item in reversed(list(providers.values())) if item["last_error"]),
+            None,
+        ),
         "providers": providers,
     }
 
@@ -448,8 +540,6 @@ def _event_from_usage(
     output_tokens = _safe_int(usage.get("output_tokens"))
     reasoning = _safe_int(usage.get("reasoning_output_tokens"))
     total = _safe_int(usage.get("total_tokens"))
-    if total is None and (input_tokens is not None or output_tokens is not None):
-        total = (input_tokens or 0) + (output_tokens or 0)
     if input_tokens is None and output_tokens is None and total is None:
         return None
     event_key = _digest(
@@ -511,7 +601,6 @@ def _grok_usage(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
         "cached_input_tokens": _safe_int(context.get("cached_prompt_tokens")),
         "output_tokens": completion,
         "reasoning_output_tokens": _safe_int(context.get("reasoning_tokens")),
-        "total_tokens": (prompt or 0) + (completion or 0),
     }
 
 
@@ -602,10 +691,12 @@ def _sync_jsonl(
                 if not usage:
                     continue
                 observed = record.get("timestamp", record.get("ts"))
+                if observed is None or not str(observed).strip():
+                    continue
                 try:
                     observed_at = _iso_utc(observed)
                 except (TypeError, ValueError, OverflowError):
-                    observed_at = now_utc
+                    continue
                 event = _event_from_usage(
                     provider=provider,
                     program=program,
@@ -927,7 +1018,7 @@ write_conversion_event = record_conversion_event
 
 
 def _sum_or_none(values: Iterable[Any]) -> int | None:
-    cleaned = [int(value) for value in values if value is not None]
+    cleaned = [value for value in (_safe_int(item) for item in values) if value is not None]
     return sum(cleaned) if cleaned else None
 
 
@@ -940,7 +1031,15 @@ def _empty_metrics() -> dict[str, Any]:
         "savings_ratio": None,
         "measured_input": None,
         "measured_output": None,
+        "measured_derived_total": None,
         "measured_total": None,
+        "measured_provider_total_event_count": 0,
+        "measured_derived_total_event_count": 0,
+        "measured_total_coverage": {
+            "provider_reported": "none",
+            "input_output_derived": "none",
+            "measured_event_count": 0,
+        },
         "conversion_count": 0,
         "measured_event_count": 0,
     }
@@ -954,7 +1053,38 @@ def _metrics(rows: list[sqlite3.Row]) -> dict[str, Any]:
     result["measured_output"] = _sum_or_none(row["output_tokens"] for row in measured)
     result["measured_total"] = _sum_or_none(row["total_tokens"] for row in measured)
     result["measured_event_count"] = len(measured)
-    result["conversion_count"] = sum(int(row["conversion_count"] or 0) for row in rows if row["event_kind"] == "conversion")
+    provider_total_rows = [
+        row for row in measured if _safe_int(row["total_tokens"]) is not None
+    ]
+    derived_total_rows = [
+        row for row in measured
+        if _safe_int(row["input_tokens"]) is not None
+        and _safe_int(row["output_tokens"]) is not None
+    ]
+    result["measured_provider_total_event_count"] = len(provider_total_rows)
+    result["measured_derived_total_event_count"] = len(derived_total_rows)
+    result["measured_derived_total"] = (
+        sum(
+            _safe_int(row["input_tokens"]) + _safe_int(row["output_tokens"])
+            for row in derived_total_rows
+        )
+        if derived_total_rows else None
+    )
+    result["measured_total_coverage"] = {
+        "provider_reported": (
+            "complete" if measured and len(provider_total_rows) == len(measured)
+            else "partial" if provider_total_rows else "none"
+        ),
+        "input_output_derived": (
+            "complete" if measured and len(derived_total_rows) == len(measured)
+            else "partial" if derived_total_rows else "none"
+        ),
+        "measured_event_count": len(measured),
+    }
+    result["conversion_count"] = sum(
+        _safe_int(row["conversion_count"]) or 0
+        for row in rows if row["event_kind"] == "conversion"
+    )
     baseline = _sum_or_none(row["baseline_units"] for row in estimated)
     delivered = _sum_or_none(row["delivered_units"] for row in estimated)
     result["estimated_baseline_units"] = baseline
@@ -992,11 +1122,17 @@ def _host_measurement_fields(
     item = providers.get(provider) if isinstance(providers, Mapping) else None
     if not isinstance(item, Mapping) or not item.get("status"):
         return "not_synced", "not_synced"
-    status = str(item.get("status") or "not_synced")
-    reason = str(item.get("last_error") or "")
+    status = _safe_sync_status(item.get("status"))
+    reason = _safe_sync_reason(item.get("last_error"), default="not_synced")
     if status == "success":
         return status, ""
     return status, reason or status
+
+
+def _event_identity(row: sqlite3.Row) -> tuple[str, str, str]:
+    """Normalize legacy event identities before exposing them through a read."""
+
+    return _agent_identity(row["provider"], row["program"])
 
 
 def _roster_entries(agent_roster: Any) -> dict[tuple[str, str], dict[str, Any]]:
@@ -1087,20 +1223,24 @@ def get_usage_summary(
     days = _validate_window(window_days)
     anchor = _parse_utc(now_utc)
     start = anchor.date() - timedelta(days=days - 1)
-    end_exclusive = anchor.date() + timedelta(days=1)
+    end_at = _iso_utc(anchor)
     share_group_hash = _scope_hash(share_group_id)
     project_ref_hash = _scope_hash(project_ref)
-    with _connect(workspace) as connection:
-        raw_rows = _execute_retry(
-            connection,
-            """
-            SELECT * FROM usage_events
-            WHERE observed_at_utc >= ? AND observed_at_utc < ?
-            ORDER BY observed_at_utc, event_key
-            """,
-            (f"{start.isoformat()}T00:00:00.000Z", f"{end_exclusive.isoformat()}T00:00:00.000Z"),
-        ).fetchall()
-        sync_state = _sync_state(connection)
+    try:
+        with _connect_readonly(workspace) as connection:
+            raw_rows = _execute_retry(
+                connection,
+                """
+                SELECT * FROM usage_events
+                WHERE observed_at_utc >= ? AND observed_at_utc <= ?
+                ORDER BY observed_at_utc, event_key
+                """,
+                (f"{start.isoformat()}T00:00:00.000Z", end_at),
+            ).fetchall()
+            sync_state = _sync_state(connection)
+    except _TelemetryReadUnavailable:
+        raw_rows = []
+        sync_state = {"status": "unavailable", "providers": {}}
     rows = [
         row for row in raw_rows
         if _event_in_scope(
@@ -1109,13 +1249,20 @@ def get_usage_summary(
             project_ref_hash=project_ref_hash,
         )
     ]
+    selected_key = _text(agent_key)
+    if selected_key:
+        rows = [
+            row for row in rows
+            if _event_identity(row)[2] == selected_key
+        ]
     overall = _metrics(rows)
     roster = _roster_entries(agent_roster)
     roster_was_empty = not roster
     grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
     daily_grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
-        key = (row["provider"], row["program"])
+        provider, program, _ = _event_identity(row)
+        key = (provider, program)
         grouped.setdefault(key, []).append(row)
         day_key = (row["observed_at_utc"][:10], *key)
         daily_grouped.setdefault(day_key, []).append(row)
@@ -1142,19 +1289,10 @@ def get_usage_summary(
                 },
             )
 
-    selected_key = _text(agent_key)
     if selected_key:
         roster = {
             key: item for key, item in roster.items()
             if item["agent_stable_key"] == selected_key or item["agent_key"] == selected_key
-        }
-        grouped = {
-            key: values for key, values in grouped.items()
-            if f"{key[0]}:{key[1]}" == selected_key
-        }
-        daily_grouped = {
-            key: values for key, values in daily_grouped.items()
-            if f"{key[1]}:{key[2]}" == selected_key
         }
 
     agents: list[dict[str, Any]] = []

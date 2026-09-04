@@ -545,6 +545,8 @@ class GovernanceNativeService:
         group_id: str,
         keep_memory_id: str,
         trusted: Mapping[str, Any],
+        *,
+        confirmed: bool = False,
     ) -> dict[str, Any]:
         group = str(group_id or "").strip()
         keep = str(keep_memory_id or "").strip()
@@ -566,6 +568,18 @@ class GovernanceNativeService:
             # Match the read surface: stale groups are visible for audit, but
             # their historical IDs may never be used to trigger a mutation.
             raise GovernanceNativeError("conflict_group_stale")
+        # An always-injected rule is a protected governance input.  A generic
+        # conflict resolution must never silently tombstone it.  Keep this
+        # check before creating a decision or mutating any member so an absent
+        # or rejected confirmation is fully fail-closed.
+        protected_losers = [
+            atom.memory_id
+            for atom in members
+            if atom.atom_id != keeper.atom_id
+            and str(atom.injection_policy or "").strip().casefold() == "always"
+        ]
+        if protected_losers and confirmed is not True:
+            raise GovernanceNativeError("conflict_always_rule_protected")
         governance = self._governance()
         ctx = self._context(self.workspace, trusted)
         decisions: list[str] = []

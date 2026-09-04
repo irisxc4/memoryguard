@@ -53,6 +53,24 @@ def test_missing_source_is_no_source_and_does_not_create_layout(tmp_path: Path) 
     assert not (tmp_path / ".memoryguard").exists()
 
 
+def test_scan_summary_does_not_implicitly_sync_usage_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[Path] = []
+
+    def fail_if_called(workspace, **_kwargs):
+        calls.append(Path(workspace))
+        raise AssertionError("scan must remain read-only")
+
+    import memoryguard.usage_telemetry as usage_telemetry
+
+    monkeypatch.setattr(usage_telemetry, "sync_usage_telemetry", fail_if_called)
+    result = PureSourceReadService(tmp_path).scan_summary({}, context={})
+
+    assert result["status"] == "NO_SOURCE"
+    assert calls == []
+
+
 def test_source_read_and_preview_are_contained_and_hash_only(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()

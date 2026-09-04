@@ -1,0 +1,85 @@
+name: Publish to MCP Registry
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_REF: ${{ github.ref_name }}
+      MCP_PUBLISHER_VERSION: v1.8.1
+
+    steps:
+      - name: Check out release
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Verify release metadata
+        run: |
+          python - "$RELEASE_REF" <<'PY'
+          import json
+          import sys
+          import tomllib
+          from pathlib import Path
+
+          tag = sys.argv[1]
+          version = tag.removeprefix("v")
+          if not tag.startswith("v") or not version:
+              raise SystemExit(f"release ref must be a v-prefixed tag: {tag!r}")
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          server = json.loads(Path("server.json").read_text(encoding="utf-8"))
+          versions = {
+              "tag": version,
+              "pyproject.toml": project["project"]["version"],
+              "server.json": server["version"],
+              "server package": server["packages"][0]["version"],
+          }
+          if len(set(versions.values())) != 1:
+              raise SystemExit(f"release metadata mismatch: {versions}")
+
+          marker = "mcp-name: io.github.irisxc4/memoryguard"
+          if marker not in Path("README.md").read_text(encoding="utf-8"):
+              raise SystemExit("README.md is missing required PyPI mcp-name marker")
+          PY
+
+      - name: Wait for PyPI artifact
+        run: |
+          VERSION="${RELEASE_REF#v}"
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --proto '=https' --tlsv1.2 \
+              "https://pypi.org/pypi/agent-memguard/${VERSION}/json" >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "agent-memguard ${VERSION} was not visible on PyPI within five minutes" >&2
+          exit 1
+
+      - name: Install MCP Publisher
+        run: |
+          ARCHIVE="$RUNNER_TEMP/mcp-publisher.tar.gz"
+          BIN_DIR="$RUNNER_TEMP/mcp-publisher-bin"
+          mkdir -p "$BIN_DIR"
+          curl --fail --location --retry 3 --retry-delay 2 --show-error \
+            --proto '=https' --tlsv1.2 --output "$ARCHIVE" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz"
+          tar -xzf "$ARCHIVE" -C "$BIN_DIR" mcp-publisher
+          chmod 0755 "$BIN_DIR/mcp-publisher"
+          "$BIN_DIR/mcp-publisher" --version
+          echo "$BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Validate registry manifest
+        run: mcp-publisher validate server.json
+
+      - name: Authenticate to MCP Registry
+        run: mcp-publisher login github-oidc
+
+      - name: Publish registry manifest
+        run: mcp-publisher publish
