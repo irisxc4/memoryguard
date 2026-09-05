@@ -74,8 +74,9 @@ receipt is observed.
   when the user explicitly asks for a long-term mandatory rule (for example,
   “must”, “always”, or a default rule). Facts, preferences, and ordinary
   procedures remain `relevant`; never promote every procedure to mandatory.
-- `memoryguard_memory_update` can switch `injection_policy`/`priority`. The
-  GUI can switch a rule back to on-demand or delete/restore it.
+- `memoryguard_memory_update` can switch `injection_policy`/`priority`, but it
+  cannot change lifecycle status or restore a deleted record. The GUI can switch
+  a rule back to on-demand or perform governed delete/restore actions.
 - Bootstrap injects mandatory rules in an independent budget before relevant
   recall. Sensitive or over-limit mandatory packages fail closed.
 
@@ -132,30 +133,29 @@ Add to your agent's MCP config:
 
 ## Tools
 
-- `memoryguard_memory_read` - Read a single memory record by ID
-- `memoryguard_memory_search` - Search memories by query, kind, or status
-- `memoryguard_memory_write` - Write a new memory; auto-organizes on write
-- `memoryguard_memory_update` - Update a memory (body / kind / status)
-- `memoryguard_memory_delete` - Soft-delete a memory
-- `memoryguard_memory_status` - Get shared memory group status
-- `memoryguard_memory_merge_safe_preview` - Admin-only read-only pair check before a governed memory supersede
-- `memoryguard_memory_merge_safe` - Admin-only governed supersede of one same-group duplicate atom into a stronger canonical atom
-- `memoryguard_binding_create` - Bind an agent to a share group
-- `memoryguard_binding_list` - List agent bindings
-- `memoryguard_extract_memories` - Extract memory segments from a source file
-- `memoryguard_accept_candidates` - Accept extracted candidates and write to shared memory
-- `memoryguard_semantic_check` - Check text for semantic duplicates / conflicts
-- `memoryguard_provider_install` - Install/repair global MCP + rules + verified
-  Hook (Claude / Codex / Cursor; TRAE gets an explicit MCP+rules fallback)
-- `memoryguard_build_and_enrich` - Build projection; **host Skill is the default enricher**
-- `memoryguard_list_pending_enrichments` - List pending classify/translate tasks
-- `memoryguard_apply_enrichments` - Apply host enrichment results (then rebuild)
-- `memoryguard_enrichment_status` - Pending/applied queue counts
-- `memoryguard_history_search` - Search scoped local history without raw text
-- `memoryguard_history_timeline` - Read a bounded preview around a result
-- `memoryguard_history_read` - Read an explicitly selected raw turn/session
-- `memoryguard_history_extract_preview` - Preview candidates; never writes memory
-- `memoryguard_history_list_sessions` / `memoryguard_history_export` / `memoryguard_history_delete` - Manage the trusted Agent's archive (`delete` requires `confirmed=true` and preserves evidence tombstones)
+The default MCP discovery surface exposes nine day-to-day tools:
+
+- `memoryguard_context_bootstrap` - Load bounded mandatory rules and relevant memory context
+- `memoryguard_memory_search` - Search governed memories by query, lifecycle status,
+  and bounded limit. `kind` is not forwarded as an MCP search filter; semantic
+  duplicate/conflict checks are a separate advanced governance operation.
+- `memoryguard_memory_read` - Read one governed memory record
+- `memoryguard_memory_write` - Write and organize a governed memory
+- `memoryguard_memory_update` - Update the body, kind, recall policy, or priority
+  of one known memory. It does not change lifecycle status or restore deleted
+  records; restoration is a GUI governance action.
+- `memoryguard_memory_delete` - Soft-delete a governed memory
+- `memoryguard_memory_status` - Inspect shared-memory status
+- `memoryguard_audit` - Run a read-only local governance audit
+- `memoryguard_explain` - Explain one audit finding and its evidence
+
+Advanced governance remains available through the GUI and CLI, including rule
+lifecycle, bindings and shared groups, source scanning, CodeGraph, knowledge and
+history review, provider controls, external MCP import, and maintenance.
+Previously advertised advanced MCP names remain callable for compatibility when
+an installed client invokes an exact name, but they are not returned by the
+default `tools/list`. Use the live MCP surface as the source of truth; do not
+assume that a compatibility-only name is part of default discovery.
 
 ## Host AI enrichment (Skill interface — automatic)
 

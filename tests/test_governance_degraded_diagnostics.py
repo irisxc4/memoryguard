@@ -26,6 +26,7 @@ from memoryguard.evidence import EvidenceStore
 from memoryguard.governance_v2 import GovernanceV2
 from memoryguard.memory import MemoryAtomStore
 from memoryguard.mcp_server import (
+    TOOL_DEFINITIONS,
     TOOLS,
     execute_tool,
     handle_request,
@@ -132,7 +133,7 @@ def _configure_identity(monkeypatch, ws: Path) -> None:
 
 
 def _tool_def(name: str) -> dict:
-    return next(t for t in TOOLS if t["name"] == name)
+    return TOOL_DEFINITIONS[name]
 
 
 # ---------------------------------------------------------------------------
@@ -461,10 +462,11 @@ def test_runtime_processes_redacts_paths_for_non_admin(tmp_path, monkeypatch):
     assert str(ws.resolve()) not in json.dumps(payload, ensure_ascii=False)
 
 
-def test_diagnostics_tools_are_registered_in_tools_list():
+def test_diagnostics_tools_are_callable_but_not_in_default_tools_list():
     names = {t["name"] for t in TOOLS}
     for name in DIAGNOSTIC_TOOLS:
-        assert name in names
+        assert name not in names
+        assert name in TOOL_DEFINITIONS
         assert "additionalProperties" in _tool_def(name)["inputSchema"]
         schema_props = _tool_def(name)["inputSchema"]["properties"]
         assert "workspace" in schema_props

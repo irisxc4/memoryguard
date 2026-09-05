@@ -793,11 +793,10 @@ class NativeV2RuntimePort:
     # names below are aliases to these semantic handlers; all other names are
     # explicit blockers rather than accidental success paths.
     _MCP_HANDLERS: Mapping[str, tuple[str, str, bool]] = {
-        # Phase 9 native evidence/source/diagnostics services.  These are
-        # production builtins (never generic ``services=`` overrides).  Keep
-        # list/scan conservative writes because the canonical MCP ledger still
-        # classifies them as mutation surfaces until that ledger is revised.
-        "memoryguard_audit": ("reference_audit", "implemented", True),
+        # Phase 9 native evidence/source/diagnostics services. These are
+        # production builtins (never generic ``services=`` overrides). Audit
+        # uses ReferenceAudit(mode="ro") and is therefore a read operation.
+        "memoryguard_audit": ("reference_audit", "implemented", False),
         "memoryguard_explain": ("explain", "implemented", False),
         "memoryguard_list_sources": ("list_sources", "implemented", True),
         "memoryguard_scan_summary": ("scan_summary", "implemented", True),

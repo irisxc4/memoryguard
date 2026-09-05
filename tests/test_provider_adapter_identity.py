@@ -243,6 +243,13 @@ def test_json_install_writes_real_identity_without_fake_binding(tmp_path):
     assert "injection_policy" in instruction_text
     assert "不得把所有 procedure 自动设为强制" in instruction_text
     assert "强制包敏感或超限会失败封闭" in instruction_text
+    assert "`memoryguard_memory_search`：按 query、status、limit 搜索 governed memories" in instruction_text
+    assert "不支持 kind 或 semantic 过滤" in instruction_text
+    assert "`memoryguard_memory_update`：更新已知记忆的 body / kind / injection_policy / priority / audience" in instruction_text
+    assert "不支持 status" in instruction_text
+    assert "不要用 `memoryguard_memory_update` 恢复 deleted 记录" in instruction_text
+    assert "按 query / kind / status 搜索" not in instruction_text
+    assert "更新 body / kind / status" not in instruction_text
     assert 'query="用户 长期 偏好"' not in instruction_text
     assert first["binding_id"] == binding["binding_id"]
     assert second["binding_id"] == binding["binding_id"]

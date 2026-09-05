@@ -39,6 +39,22 @@ MCP_TOOL_NAMES = frozenset({
     "memoryguard_codegraph_affected", "memoryguard_codegraph_update", "memoryguard_codegraph_status",
 })
 
+# Default MCP discovery is intentionally limited to the durable, day-to-day
+# memory contract.  ``MCP_TOOL_NAMES`` remains the complete callable V2
+# registry so installed clients can keep using previously advertised advanced
+# operations during the compatibility window.
+MCP_DEFAULT_PUBLIC_TOOL_NAMES = (
+    "memoryguard_context_bootstrap",
+    "memoryguard_memory_search",
+    "memoryguard_memory_read",
+    "memoryguard_memory_write",
+    "memoryguard_memory_update",
+    "memoryguard_memory_delete",
+    "memoryguard_memory_status",
+    "memoryguard_audit",
+    "memoryguard_explain",
+)
+
 
 @dataclass(frozen=True)
 class GuiOperationSpec:
@@ -369,7 +385,7 @@ RULE_MUTATION_MCP_NAMES = frozenset({
     "memoryguard_binding_create",
 })
 MCP_MUTATION_NAMES = frozenset({
-    "memoryguard_audit", "memoryguard_list_sources", "memoryguard_scan_summary",
+    "memoryguard_list_sources", "memoryguard_scan_summary",
     "memoryguard_extract_memories", "memoryguard_build_and_enrich",
     "memoryguard_memory_write", "memoryguard_memory_update", "memoryguard_memory_delete",
     "memoryguard_memory_merge_safe",
@@ -391,7 +407,7 @@ GUI_MUTATION_METHOD_NAMES = GUI_MUTATION_NAMES
 
 __all__ = [
     "GuiOperationSpec", "GUI_OPERATION_SPECS", "get_gui_operation_spec", "gui_registry_payload",
-    "MCP_TOOL_NAMES", "SAFE_BRIDGE_METHOD_NAMES",
+    "MCP_TOOL_NAMES", "MCP_DEFAULT_PUBLIC_TOOL_NAMES", "SAFE_BRIDGE_METHOD_NAMES",
     "GUI_METHOD_NAMES", "CLI_COMMAND_NAMES",
     "RULE_MUTATION_MCP_NAMES", "MCP_MUTATION_NAMES",
     "MUTATING_MCP_TOOL_NAMES", "RULE_MUTATION_GUI_NAMES",

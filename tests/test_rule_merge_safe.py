@@ -12,7 +12,7 @@ from memoryguard.cutover_v2.surfaces import (
     RULE_MUTATION_MCP_NAMES,
 )
 from memoryguard.mcp_server import (
-    TOOLS,
+    TOOL_DEFINITIONS,
     _MUTATING_TOOLS,
     _V2_RULE_MERGE_TOOLS,
     _validate_v2_mcp_arguments,
@@ -575,7 +575,7 @@ def test_rule_merge_safe_public_mcp_cutover_contract(tmp_path: Path) -> None:
     assert name in RULE_MUTATION_MCP_NAMES
     assert name in _MUTATING_TOOLS
     assert name in _V2_RULE_MERGE_TOOLS
-    tools = {item["name"]: item for item in TOOLS}
+    tools = TOOL_DEFINITIONS
     schema = tools[name]["inputSchema"]
     required = set(schema["required"])
     assert {
@@ -933,7 +933,7 @@ def test_rule_merge_safe_preview_public_mcp_cutover_contract(tmp_path: Path) -> 
     assert name not in RULE_MUTATION_MCP_NAMES
     assert name not in _MUTATING_TOOLS
     assert name in _V2_RULE_MERGE_TOOLS
-    tools = {item["name"]: item for item in TOOLS}
+    tools = TOOL_DEFINITIONS
     schema = tools[name]["inputSchema"]
     properties = schema["properties"]
     required = set(schema.get("required") or ())

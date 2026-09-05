@@ -77,12 +77,12 @@ globs: []
 - `share_group_id`（可选）：共享组 ID，默认 "default"
 
 ### 搜索 / 读取
-- `memoryguard_memory_search`：按 query / kind / status 搜索
+- `memoryguard_memory_search`：按 query / status / limit 搜索；MCP 不转发 `kind` 过滤，语义重复/冲突检查是独立的高级治理操作
 - `memoryguard_memory_read`：按 memory_id 读取单条
 - `memoryguard_memory_status`：查看共享组状态
 
 ### 更新 / 删除
-- `memoryguard_memory_update`：更新 body / kind / status
+- `memoryguard_memory_update`：更新已知记录的 body / kind / 召回策略 / priority；不改生命周期状态，也不能恢复 deleted 记录，恢复仅由 GUI 治理
 - `memoryguard_memory_delete`：软删除
 
 ### 规则

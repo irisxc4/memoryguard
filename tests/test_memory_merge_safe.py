@@ -8,7 +8,7 @@ from memoryguard.access_context import AccessContext
 from memoryguard.cutover_v2.surfaces import MCP_MUTATION_NAMES, MCP_TOOL_NAMES
 from memoryguard.evidence import EvidenceStore
 from memoryguard.governance_v2 import GovernanceV2, V2MutationContext
-from memoryguard.mcp_server import TOOLS, _MUTATING_TOOLS, _V2_MEMORY_MERGE_TOOLS, _validate_v2_mcp_arguments
+from memoryguard.mcp_server import TOOL_DEFINITIONS, _MUTATING_TOOLS, _V2_MEMORY_MERGE_TOOLS, _validate_v2_mcp_arguments
 from memoryguard.memory import MemoryAtom, MemoryAtomStore
 from memoryguard.rules.v2_store import RuleV2Store
 from memoryguard.runtime_v2.native_ports import NativeV2RuntimePort, bind_native_transport_context
@@ -480,7 +480,7 @@ def test_memory_merge_safe_public_mcp_cutover_contract(tmp_path: Path) -> None:
     assert name in _MUTATING_TOOLS
     assert preview not in _MUTATING_TOOLS
     assert {name, preview} <= _V2_MEMORY_MERGE_TOOLS
-    tools = {item["name"]: item for item in TOOLS}
+    tools = TOOL_DEFINITIONS
     required = set(tools[name]["inputSchema"]["required"])
     assert {"confirmed", "expected_atom_revisions", "mutation_receipt", "idempotency_key"} <= required
     properties = tools[name]["inputSchema"]["properties"]

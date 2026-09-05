@@ -406,7 +406,26 @@ MemoryGuard 会如实报告 redirected、observed、operational 或 unsupported�
 
 ## MCP API
 
-MCP 服务提供：
+默认 MCP 发现面保持精简。新 MCP 客户端通过 `tools/list` 获得以下 9 个日常工具：
+
+| 工具 | 用途 |
+|---|---|
+| `memoryguard_context_bootstrap` | 加载有界的强制规则和相关记忆上下文 |
+| `memoryguard_memory_search` | 按查询词、生命周期状态和有界条数搜索受治理记忆。`kind` 不是 MCP 搜索过滤项；语义重复/冲突检查属于独立的高级治理能力。 |
+| `memoryguard_memory_read` | 读取单条受治理记忆 |
+| `memoryguard_memory_write` | 写入并整理受治理记忆 |
+| `memoryguard_memory_update` | 更新已知记录的正文、类型、召回策略或优先级；不改变生命周期状态，也不能恢复已删除记录，恢复仅由 GUI 治理完成。 |
+| `memoryguard_memory_delete` | 软删除受治理记忆 |
+| `memoryguard_memory_status` | 查看共享记忆状态 |
+| `memoryguard_audit` | 执行只读本地治理审计 |
+| `memoryguard_explain` | 解释审计发现及其证据 |
+
+高级治理能力仍保留在 GUI 和 CLI：规则生命周期、绑定与共享组、来源扫描、
+CodeGraph、知识库与历史复核、Provider 控制、外部 MCP 导入及维护操作。
+已有高级 MCP 名称在已安装客户端按精确名称调用时仍保持兼容，但不会出现在默认
+`tools/list` 中。这样减少发现和 schema 的上下文负担，不会删除这些治理能力。
+
+底层兼容调用目录还覆盖：
 
 - 长期记忆读、搜索、写、更新、删除和状态查询；
 - 强制规则隔离预算与有界上下文 bootstrap（条数告警、字符/Token 失败关闭）；

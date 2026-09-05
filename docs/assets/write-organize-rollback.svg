@@ -128,7 +128,7 @@
   <rect x="1350" y="660" width="40" height="32" rx="4" fill="#EA6A6A" opacity="0.2"/>
   
   <!-- Bottom stats -->
-  <text x="720" y="780" font-size="18" fill="#3E556B" text-anchor="middle">61 MCP tools &#183; Auto-organize &#183; SQLite backend &#183; No account &#183; Optional local telemetry</text>
+  <text x="720" y="780" font-size="18" fill="#3E556B" text-anchor="middle">9 default MCP tools &#183; Advanced governance in GUI/CLI &#183; SQLite backend &#183; No account &#183; Optional local telemetry</text>
   <text x="720" y="808" font-size="16" fill="#3E556B" text-anchor="middle">Codex/Grok measurements when reported &#183; Claude/Cursor/Trae unsupported &#183; No remote upload</text>
   <text x="720" y="850" font-size="22" font-weight="600" fill="#38D5C8" text-anchor="middle" font-family="'Cascadia Code', 'Consolas', monospace">pip install agent-memguard</text>
 </svg>

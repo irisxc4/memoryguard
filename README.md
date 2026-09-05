@@ -599,7 +599,30 @@ reference.
 
 ## MCP API
 
-The MCP server exposes tools for:
+The default MCP discovery surface is intentionally compact. New MCP clients
+receive these nine day-to-day tools through `tools/list`:
+
+| Tool | Purpose |
+|---|---|
+| `memoryguard_context_bootstrap` | Load bounded mandatory rules and relevant memory context |
+| `memoryguard_memory_search` | Search governed memories by query, lifecycle status, and bounded limit. `kind` is not an MCP search filter; semantic duplicate/conflict checks are separate advanced governance. |
+| `memoryguard_memory_read` | Read one governed memory |
+| `memoryguard_memory_write` | Write and organize a governed memory |
+| `memoryguard_memory_update` | Update the body, kind, recall policy, or priority of one known memory. It does not change lifecycle status or restore deleted records; restoration is a GUI governance action. |
+| `memoryguard_memory_delete` | Soft-delete a governed memory |
+| `memoryguard_memory_status` | Inspect shared-memory status |
+| `memoryguard_audit` | Run a read-only local governance audit |
+| `memoryguard_explain` | Explain one audit finding and its evidence |
+
+Advanced governance remains available through the GUI and CLI: rule lifecycle,
+bindings and shared groups, source scanning, CodeGraph, knowledge and history
+review, provider controls, external MCP import, and maintenance operations.
+Existing advanced MCP names remain callable for compatibility when an installed
+client invokes an exact name, but they are not returned by the default
+`tools/list`. This reduces discovery/schema overhead without removing those
+governance capabilities.
+
+The underlying compatibility catalog also covers:
 
 - governed memory read, search, write, update, delete, and status;
 - bounded context bootstrap with mandatory-rule isolation;

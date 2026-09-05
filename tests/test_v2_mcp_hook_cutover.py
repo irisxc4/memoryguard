@@ -55,12 +55,17 @@ def test_mcp_state_matrix_ready_routes_reads_and_blocks_mutations(monkeypatch, t
     assert read_payload["code"] == "v2_not_active"
     assert len(facade.mcp_calls) == 0
 
+    audit = _mcp_call(monkeypatch, tmp_path, facade, "memoryguard_audit")
+    assert audit.get("isError") is not True
+    assert json.loads(audit["content"][0]["text"])["data"]["name"] == "memoryguard_audit"
+    assert len(facade.mcp_calls) == 1
+
     denied = _mcp_call(monkeypatch, tmp_path, facade, "memoryguard_memory_write", {"body": "x"})
     payload = json.loads(denied["content"][0]["text"])
     assert denied["isError"] is True
     assert payload["code"] == "v2_not_active"
-    assert len(facade.mcp_calls) == 0
-    assert facade.state_calls == 2
+    assert len(facade.mcp_calls) == 1
+    assert facade.state_calls == 3
 
 
 def test_v2_mcp_and_hook_dispatch_never_import_or_construct_retired_runtime(
@@ -450,7 +455,7 @@ def test_provider_install_keeps_business_target_but_not_identity_spoof(monkeypat
 
 
 def test_public_v2_merge_and_undo_schemas_expose_native_mutation_proof():
-    tools = {item["name"]: item for item in mcp_server.TOOLS}
+    tools = mcp_server.TOOL_DEFINITIONS
     merge_requirements = {
         "memoryguard_rule_merge_capability_issue": {
             "proposal_id", "mutation_receipt", "idempotency_key", "recovery_secret",

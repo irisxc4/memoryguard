@@ -141,7 +141,7 @@ def _instruction_body(share_group_id: str = "default") -> str:
 
 ### 搜索 / 读取
 - `memoryguard_context_bootstrap`：新任务开始时一次性加载有预算的长期记忆上下文
-- `memoryguard_memory_search`：按 query / kind / status 搜索
+- `memoryguard_memory_search`：按 query、status、limit 搜索 governed memories；不支持 kind 或 semantic 过滤。已知 memory_id 时不要用于发现，改用 `memoryguard_memory_read`
 - `memoryguard_memory_read`：按 memory_id 读取单条
 - `memoryguard_memory_status`：查看共享组状态
 
@@ -155,9 +155,9 @@ def _instruction_body(share_group_id: str = "default") -> str:
 - 需要精确原文时再用 `memoryguard_memory_read` 读取命中的单条记录
 
 ### 更新 / 删除
-- `memoryguard_memory_update`：更新 body / kind / status，也可在 `injection_policy` 与 `priority` 间切换策略
+- `memoryguard_memory_update`：更新已知记忆的 body / kind / injection_policy / priority / audience；memory_id 必填，atom_id 仅在迁移 ID 歧义时使用；不支持 status
 - `memoryguard_memory_delete`：软删除
-- GUI 可将强制规则改回按需，或删除/恢复；不要绕过治理路径。
+- 不要用 `memoryguard_memory_update` 恢复 deleted 记录；删除是软删除，恢复或强制规则治理走 MemoryGuard GUI 治理流程，不要绕过治理路径。
 
 ### 规则
 - 不要为了"记住"而编辑 CLAUDE.md / AGENTS.md / .cursorrules 等指令文件

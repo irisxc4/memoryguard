@@ -3,7 +3,7 @@
 让宿主通过 MCP stdio 调用 MemoryGuard，获得结构化结果。
 首期实现 MCP 2024-11-05 基础协议子集:
 - initialize: 能力协商
-- tools/list: 返回 memoryguard_audit/open/explain 工具
+- tools/list: 返回面向日常记忆工作的精简默认工具集
 - tools/call: 执行工具，返回结构化结果
 
 纯标准库实现，不依赖 MCP SDK。无网络。
@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from . import __version__ as PACKAGE_VERSION
-from .cutover_v2.surfaces import MCP_MUTATION_NAMES
+from .cutover_v2.surfaces import (
+    MCP_DEFAULT_PUBLIC_TOOL_NAMES,
+    MCP_MUTATION_NAMES,
+    MCP_TOOL_NAMES,
+)
 from .runtime_v2.public_safety import (
     safe_error_code,
     safe_exception_diagnostic,
@@ -106,10 +110,13 @@ PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memoryguard"
 SERVER_VERSION = PACKAGE_VERSION
 
-TOOLS = [
+_FULL_TOOLS = [
     {
         "name": "memoryguard_audit",
-        "description": "Read-only scan of an Agent workspace: instructions, skills, memory, local RAG. Returns findings with evidence. No network, no writes.",
+        "description": (
+            "Use when checking local V2 reference integrity before repair or release. "
+            "Do not use to read a memory record, modify data, or assess general Agent quality."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -119,7 +126,10 @@ TOOLS = [
     },
     {
         "name": "memoryguard_explain",
-        "description": "Explain a finding's evidence, impact, suggestion, and confidence.",
+        "description": (
+            "Use when a memoryguard_audit finding_id needs its evidence, impact, and suggested repair. "
+            "Do not use for generic memory lookup or to apply a repair."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -159,6 +169,23 @@ TOOLS = [
                 "mode": {"type": "string", "description": "native | reconstructed (default: reconstructed)"},
                 "agent_instance_id": {"type": "string", "description": "single-agent governance scope"},
                 "share_group_id": {"type": "string", "description": "MCP shared-memory scope (mutually exclusive with agent)"},
+            },
+        },
+    },
+    {
+        "name": "memoryguard_codegraph_graph",
+        "description": (
+            "Read one bounded scoped CodeGraph overview: symbol metadata, "
+            "edges, and source-file references. Source bodies are never returned."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace": {"type": "string", "description": "workspace path (default: .)"},
+                "codegraph_project_ref": {"type": "string", "description": "trusted CodeGraph project selector"},
+                "codegraph_source_id": {"type": "string", "description": "trusted CodeGraph source selector"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 500, "description": "maximum graph nodes (default 100)"},
+                "provenance": {"type": "string", "enum": ["production", "test", "fixture", "generated", "vendor", "unknown"], "description": "optional source provenance filter"},
             },
         },
     },
@@ -259,7 +286,10 @@ TOOLS = [
     # --- v3.2 memory backend tools ---
     {
         "name": "memoryguard_memory_read",
-        "description": "Read a single shared memory record by memory_id. Read-only.",
+        "description": (
+            "Use when an exact memory_id is already known and its governed record is needed. "
+            "Do not use for discovery; use memoryguard_memory_search instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -271,31 +301,35 @@ TOOLS = [
     },
     {
         "name": "memoryguard_memory_search",
-        "description": "Search shared memory records by query, kind, or status. Read-only.",
+        "description": (
+            "Use when finding governed memories by text and lifecycle status. "
+            "Do not use when an exact memory_id is known; use memoryguard_memory_read instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "search query"},
-                "kind": {"type": "string", "description": "filter by kind: preference|fact|project|procedure|episode|correction"},
-                "status": {"type": "string", "description": "filter by status: active (default)|low_confidence|shadowed|conflicted|quarantined|deleted"},
+                "status": {"type": "string", "enum": ["active", "low_confidence", "shadowed", "conflicted", "quarantined", "deleted"], "description": "lifecycle status filter; defaults to active"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "maximum results to return (default: 5 for conversation recall)"},
-                "semantic": {"type": "string", "enum": ["off", "heuristic", "model"], "description": "optional semantic recall mode (default: off)"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
         },
     },
     {
         "name": "memoryguard_memory_write",
-        "description": "Write a new memory record. Auto-organizes: classify, dedup, supersede, conflict, quarantine. Returns memory_id and auto_actions.",
+        "description": (
+            "Use when user explicitly asks to retain a durable fact, preference, project decision, or procedure. "
+            "Do not use for raw transcripts or temporary task notes. Writes locally and may organize duplicates or conflicts."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "body": {"type": "string", "description": "memory content"},
-                "kind": {"type": "string", "description": "override kind (default: auto-classify). Valid: preference|fact|project|procedure|episode|correction"},
+                "kind": {"type": "string", "enum": ["preference", "fact", "project", "procedure", "episode", "correction"], "description": "optional kind override; omit for native classification"},
                 "injection_policy": {"type": "string", "enum": ["relevant", "always"], "default": "relevant", "description": "relevant participates in task recall; always is a mandatory rule"},
                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "default": 0, "description": "stable ordering within the mandatory rule package"},
                 "audience": {"type": "array", "description": "mandatory-rule assignments; omitted always defaults to the trusted current agent", "items": {"type": "object"}},
-                "write_policy": {"type": "string", "description": "write policy: auto_accept (default) | auto_quarantine_on_risk | propose_only. propose_only creates a low_confidence candidate without modifying existing memories"},
+                "write_policy": {"type": "string", "description": "optional write policy; propose_only creates a low_confidence candidate, while omission uses automatic organization"},
                 "metadata": {"type": "object", "description": "optional metadata from agent"},
                 "idempotency_key": {"type": "string", "description": "optional retry key bound to content, metadata, kind and policy"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
@@ -305,15 +339,17 @@ TOOLS = [
     },
     {
         "name": "memoryguard_memory_update",
-        "description": "Update an existing memory record (body, kind, status). Records a DecisionEvent.",
+        "description": (
+            "Use when owner must correct body, kind, recall policy, or priority of one known memory. "
+            "Do not use to create a record, change lifecycle status, or modify another owner's memory."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "memory record ID"},
                 "atom_id": {"type": "string", "description": "V2 atom ID; use the source-mapping target when a migrated logical ID is ambiguous"},
                 "body": {"type": "string", "description": "new body"},
-                "kind": {"type": "string", "description": "new kind"},
-                "status": {"type": "string", "description": "new status"},
+                "kind": {"type": "string", "enum": ["preference", "fact", "project", "procedure", "episode", "correction"], "description": "replacement kind; omit to preserve current kind"},
                 "injection_policy": {"type": "string", "enum": ["relevant", "always"], "description": "new injection policy"},
                 "priority": {"type": "integer", "minimum": -100, "maximum": 100, "description": "new priority"},
                 "audience": {"type": "array", "description": "replace mandatory-rule assignments; only allowed for always records", "items": {"type": "object"}},
@@ -325,20 +361,27 @@ TOOLS = [
     },
     {
         "name": "memoryguard_memory_delete",
-        "description": "Soft-delete a memory record (status=deleted). Records a DecisionEvent.",
+        "description": (
+            "Use when owner must remove one known memory from future recall. "
+            "Do not use for irreversible erasure: this is a local soft-delete recorded as status=deleted."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "memory_id": {"type": "string", "description": "memory record ID"},
-                "idempotency_key": {"type": "string", "description": "optional retry key bound to this target"},
+                "idempotency_key": {"type": "string", "description": "required retry key bound to this target; makes repeated deletion safe"},
                 "agent_instance_id": {"type": "string", "description": "optional identity consistency check; trusted MCP environment is authoritative"},
             },
-            "required": ["memory_id"],
+            "required": ["memory_id", "idempotency_key"],
         },
     },
     {
         "name": "memoryguard_memory_status",
-        "description": "Get shared memory group status: record counts, event counts, conflicts, quarantine. Read-only.",
+        "description": (
+            "Use when checking shared-memory availability, bound scope, total and active records, "
+            "lifecycle and kind counts, and evidence-link count. "
+            "Do not use to search or read individual memory content."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -454,10 +497,8 @@ TOOLS = [
     {
         "name": "memoryguard_context_bootstrap",
         "description": (
-            "Build one bounded, read-only long-term-memory context packet for a new task. "
-            "Uses the trusted MCP identity/binding, includes active preferences plus "
-            "task-relevant governed memories, omits sensitive/unsafe states, and never "
-            "replaces or repeats the host's current conversation."
+            "Use when starting one new task to build bounded mandatory rules and relevant governed memory context. "
+            "Do not use for exact record lookup or repeatedly within same task. Uses trusted binding and may mark one pending local CodeGraph receipt consumed."
         ),
         "inputSchema": {
             "type": "object",
@@ -476,12 +517,14 @@ TOOLS = [
                     "minimum": 1,
                     "maximum": 20,
                     "default": 12,
+                    "description": "maximum optional memories to include; mandatory rules use their separate budget",
                 },
                 "max_chars": {
                     "type": "integer",
                     "minimum": 256,
                     "maximum": 12000,
                     "default": 6000,
+                    "description": "maximum characters for optional recalled content; mandatory rules use their separate budget",
                 },
                 "max_tokens": {
                     "type": "integer",
@@ -1102,20 +1145,50 @@ TOOLS = [
 
 # V2-native history and knowledge surfaces are described locally so importing
 # the MCP entrypoint cannot pull retired storage adapters into the process.
-TOOLS.extend([
+_FULL_TOOLS.extend([
     {
-        "name": name,
-        "description": "V2-native read surface.",
-        "inputSchema": {"type": "object"},
-    }
-    for name in (
-        "memoryguard_history_search",
-        "memoryguard_history_timeline",
-        "memoryguard_history_read",
-        "memoryguard_history_extract_preview",
-    )
+        "name": "memoryguard_history_search",
+        "description": "Search trusted local history by query. Returns bounded identifiers and summaries, never raw turn bodies.",
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "required full-text query"},
+            "scope": {"type": "object", "description": "optional trusted history scope hint"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        }, "required": ["query"]},
+    },
+    {
+        "name": "memoryguard_history_timeline",
+        "description": "Read a bounded metadata-only timeline around one authorized history turn. Does not write long-term memory.",
+        "inputSchema": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "authorized session identifier"},
+            "anchor_turn_id": {"type": "string", "description": "authorized anchor turn identifier"},
+            "scope": {"type": "object", "description": "optional trusted history scope hint"},
+            "radius": {"type": "integer", "minimum": 0, "maximum": 50, "default": 4},
+        }, "required": ["session_id", "anchor_turn_id"]},
+    },
+    {
+        "name": "memoryguard_history_read",
+        "description": "Read one explicitly selected authorized history session or turn. Raw content is returned only on this explicit read path.",
+        "inputSchema": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "read exactly one session; mutually exclusive with turn_id"},
+            "turn_id": {"type": "string", "description": "read exactly one turn; mutually exclusive with session_id"},
+            "scope": {"type": "object", "description": "optional trusted history scope hint"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 250, "default": 100},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+        }},
+    },
+    {
+        "name": "memoryguard_history_extract_preview",
+        "description": "Preview possible long-term-memory candidates from one authorized history session. Read-only; never writes memory.",
+        "inputSchema": {"type": "object", "properties": {
+            "session_id": {"type": "string", "description": "authorized session identifier"},
+            "turn_ids": {"type": "array", "items": {"type": "string"}, "description": "optional selected turns"},
+            "scope": {"type": "object", "description": "optional trusted history scope hint"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
+        }, "required": ["session_id"]},
+    },
 ])
-TOOLS.extend([
+_FULL_TOOLS.extend([
     {
         "name": "memoryguard_history_list_sessions",
         "description": "List the trusted Agent's local conversation-history sessions. Read-only; raw text is not returned.",
@@ -1144,20 +1217,109 @@ TOOLS.extend([
     },
 ])
 
-TOOLS.extend([
+_FULL_TOOLS.extend([
     {
-        "name": name,
-        "description": "V2-native knowledge surface.",
-        "inputSchema": {"type": "object"},
-    }
-    for name in (
-        "memoryguard_knowledge_list",
-        "memoryguard_knowledge_search",
-        "memoryguard_knowledge_read",
-        "memoryguard_knowledge_book",
-        "memoryguard_knowledge_candidates",
-    )
+        "name": "memoryguard_knowledge_list",
+        "description": "List bounded reference-only knowledge occurrences in the trusted V2 knowledge scope. Never returns source bodies or writes data.",
+        "inputSchema": {"type": "object", "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
+            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
+            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
+        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
+    },
+    {
+        "name": "memoryguard_knowledge_search",
+        "description": "Search reference-only V2 knowledge occurrences in the trusted scope. Returns references and summaries, never source bodies or writes data.",
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "required search text"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
+            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
+            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
+        }, "required": ["query", "namespace_id", "sensitivity", "policy_class"]},
+    },
+    {
+        "name": "memoryguard_knowledge_read",
+        "description": "Read one reference-only V2 knowledge occurrence by occurrence_id in the trusted scope. Source body text is never returned and no data is written.",
+        "inputSchema": {"type": "object", "properties": {
+            "occurrence_id": {"type": "string", "description": "required occurrence identifier from a knowledge result"},
+            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
+            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
+            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
+        }, "required": ["occurrence_id", "namespace_id", "sensitivity", "policy_class"]},
+    },
+    {
+        "name": "memoryguard_knowledge_book",
+        "description": "Filter reference-only V2 knowledge occurrences by optional book or occurrence identifier. Returns references only; never source bodies or writes data.",
+        "inputSchema": {"type": "object", "properties": {
+            "book_id": {"type": "string", "description": "optional book or occurrence identifier"},
+            "query": {"type": "string", "description": "optional reference filter"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
+            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
+            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
+        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
+    },
+    {
+        "name": "memoryguard_knowledge_candidates",
+        "description": "List reference-only V2 knowledge-review candidates in the trusted scope. Candidate approval remains a governed GUI command; this tool never writes data.",
+        "inputSchema": {"type": "object", "properties": {
+            "status": {"type": "string", "description": "candidate status (default pending)"},
+            "query": {"type": "string", "description": "optional candidate summary/reference filter"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 100},
+            "namespace_id": {"type": "string", "description": "must exactly match the trusted knowledge namespace"},
+            "sensitivity": {"type": "string", "description": "must exactly match trusted sensitivity"},
+            "policy_class": {"type": "string", "description": "must exactly match trusted policy class"},
+        }, "required": ["namespace_id", "sensitivity", "policy_class"]},
+    },
 ])
+
+# ``MCP_TOOL_NAMES`` is the one full callable-name ledger shared with V2
+# dispatch.  The definitions below remain the source of JSON schema and copy;
+# fail at import if either ledger drifts instead of silently exposing a broken
+# or undiscoverable operation.
+TOOL_DEFINITIONS = {
+    str(item["name"]): item
+    for item in _FULL_TOOLS
+    if isinstance(item, dict) and isinstance(item.get("name"), str)
+}
+if len(TOOL_DEFINITIONS) != len(_FULL_TOOLS):
+    raise RuntimeError("mcp_tool_definition_duplicate")
+CALLABLE_TOOL_NAMES = frozenset(TOOL_DEFINITIONS)
+if CALLABLE_TOOL_NAMES != MCP_TOOL_NAMES:
+    missing_definitions = sorted(MCP_TOOL_NAMES - CALLABLE_TOOL_NAMES)
+    extra_definitions = sorted(CALLABLE_TOOL_NAMES - MCP_TOOL_NAMES)
+    raise RuntimeError(
+        "mcp_tool_registry_drift:"
+        f"missing={','.join(missing_definitions)};extra={','.join(extra_definitions)}"
+    )
+if not set(MCP_DEFAULT_PUBLIC_TOOL_NAMES) <= CALLABLE_TOOL_NAMES:
+    raise RuntimeError("mcp_default_tool_not_callable")
+
+# These annotations describe actual public effects, not V2 readiness gates.
+# Bootstrap consumes one pending local CodeGraph receipt when present; all
+# other read tools below use read-only stores/adapters.
+_DEFAULT_TOOL_ANNOTATIONS = {
+    "memoryguard_context_bootstrap": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    "memoryguard_memory_search": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "memoryguard_memory_read": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "memoryguard_memory_write": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    "memoryguard_memory_update": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+    "memoryguard_memory_delete": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "memoryguard_memory_status": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "memoryguard_audit": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+    "memoryguard_explain": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+}
+if set(_DEFAULT_TOOL_ANNOTATIONS) != set(MCP_DEFAULT_PUBLIC_TOOL_NAMES):
+    raise RuntimeError("mcp_default_tool_annotation_drift")
+for _tool_name, _annotations in _DEFAULT_TOOL_ANNOTATIONS.items():
+    TOOL_DEFINITIONS[_tool_name]["annotations"] = _annotations
+
+# Complete catalog supports older direct calls.  ``TOOLS`` alone is the
+# current discovery surface returned by tools/list for new MCP clients.
+CALLABLE_TOOLS = tuple(_FULL_TOOLS)
+TOOLS = [TOOL_DEFINITIONS[name] for name in MCP_DEFAULT_PUBLIC_TOOL_NAMES]
 
 
 # ---------------------------------------------------------------------------
@@ -1761,6 +1923,45 @@ def _v2_result_envelope(result: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]}
 
 
+def _hidden_tool_deprecation(result: dict[str, Any], name: str) -> dict[str, Any]:
+    """Annotate every direct result for an undiscovered legacy tool.
+
+    The MCP result payload is already JSON for every V2 mapping response.  Put
+    the machine-readable notice beside that business payload; preserve the
+    original CallToolResult shape and error state.  A top-level copy remains
+    available to callers that do not parse text content.
+    """
+    if name in MCP_DEFAULT_PUBLIC_TOOL_NAMES or name not in CALLABLE_TOOL_NAMES:
+        return result
+    notice = {
+        "deprecated": True,
+        "code": "mcp_tool_not_listed",
+        "message": "Advanced legacy tool remains callable but is not listed for new MCP clients.",
+    }
+    updated = dict(result)
+    updated["deprecated"] = True
+    updated["deprecation"] = notice
+    content = updated.get("content")
+    if not isinstance(content, list) or not content or not isinstance(content[0], Mapping):
+        return updated
+    text = content[0].get("text")
+    if not isinstance(text, str):
+        return updated
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return updated
+    if not isinstance(payload, Mapping):
+        return updated
+    body = dict(payload)
+    body["deprecated"] = True
+    body["deprecation"] = notice
+    first = dict(content[0])
+    first["text"] = json.dumps(body, ensure_ascii=False, indent=2)
+    updated["content"] = [first, *content[1:]]
+    return updated
+
+
 def _v2_compensate_evidence_after_undo(
     workspace: Path,
     context: Any,
@@ -1876,11 +2077,10 @@ def _v2_cutover_dispatch(name: str, args: dict[str, Any], workspace: Path) -> di
     state, snapshot = _v2_facade_state(facade, workspace)
     if state not in _V2_READ_STATES:
         return _mcp_json_error(v2_upgrade_payload(state, surface="MCP"))
-    known_tools = {str(item.get("name", "")) for item in TOOLS if isinstance(item, dict)}
-    if name not in known_tools:
+    if name not in CALLABLE_TOOL_NAMES:
         return _mcp_error(f"unknown tool: {name}")
     # V2_READY permits reads/bootstrap only; mutations must never touch either
-    # port.  The list mirrors _MUTATING_TOOLS and remains intentionally local.
+    # port. The imported mutation ledger is the sole classifier.
     if state == "V2_READY" and name in _MUTATING_TOOLS:
         return _mcp_json_error({"ok": False, "error": "v2_not_active", "code": "v2_not_active"})
     lease_error = _runtime_lease_guard(name, args, workspace)
@@ -1983,15 +2183,16 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         from .workspace_resolver import WorkspaceResolutionError
 
         if isinstance(exc, WorkspaceResolutionError):
-            return _mcp_json_error(exc.to_payload(surface="MCP"))
-        payload = v2_upgrade_payload("UNKNOWN", surface="MCP")
-        payload["diagnostic"] = safe_exception_diagnostic(
-            exc, code="v2_manifest_state_unavailable",
-        )
-        return _mcp_json_error(payload)
-    if result is not None:
-        return result
-    return _mcp_json_error(v2_upgrade_payload("UNKNOWN", surface="MCP"))
+            result = _mcp_json_error(exc.to_payload(surface="MCP"))
+        else:
+            payload = v2_upgrade_payload("UNKNOWN", surface="MCP")
+            payload["diagnostic"] = safe_exception_diagnostic(
+                exc, code="v2_manifest_state_unavailable",
+            )
+            result = _mcp_json_error(payload)
+    if result is None:
+        result = _mcp_json_error(v2_upgrade_payload("UNKNOWN", surface="MCP"))
+    return _hidden_tool_deprecation(result, name)
 
 
 # ---------------------------------------------------------------------------
